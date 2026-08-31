@@ -115,7 +115,7 @@ See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerab
 
 ## How this is built
 
-Almost all of the code is written with AI assistants (primarily [Claude](https://claude.ai), later also [Grok](https://x.ai)). A human owns the architecture, the product rules, review, and what is allowed to run on a live network. Tests, CI, and a real resolver are the gate, not the model's confidence.
+The code and the documentation are written with AI assistants (primarily [Claude](https://claude.ai), later also [Grok](https://x.ai)). A human owns the architecture, the product rules, review, and what is allowed to run on a live network. Tests, CI, and a real resolver are the gate, not the model's confidence.
 
 We say this so credit is not mistaken: the model typed; a person decided.
 
