@@ -1,0 +1,141 @@
+# Warnings-only v1 fixture (rev-2606 rev2606-lint-warn-channel).
+#
+# Identical to ../minimal-v1/config.toml EXCEPT for the trailing
+# `inert-list` blocklist, which carries `base = "ignore"`: it is
+# downloaded and refreshed and contributes nothing to any profile that
+# does not override it. That trips the validator's P6 WARN
+# (BASE_IGNORE_LIST_IS_INERT) — an audit-channel warning, NOT an error —
+# so the config loads cleanly with zero errors but `warden config lint`
+# surfaces the warning.
+#
+# The row used to be `orphan-list`, carrying `tags = ["orphan-no-match"]`
+# to provoke BLOCKLIST_TAGS_MATCH_NOTHING. That diagnostic was computed
+# from tags, which stopped deciding which lists reach which profile at the
+# plp cutover, and it left with them. `base = "ignore"` is the shape that
+# means the same thing under the new model, and it is the shape P6 exists
+# to keep from being silent — so the fixture keeps its contract by naming
+# the live rule rather than by keeping a dead one alive.
+#
+# This file MUST load with zero validator ERRORS and at least one WARNING.
+
+schema_version = 3
+
+[server]
+default_profile = "default"
+default_block_response = "zero"
+default_blocked_ttl_secs = 60
+
+[[retired]]
+id = "legacy-nothing"
+type = "device"
+retired_at = "2020-01-01T00:00:00Z"
+
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Privacy: Ads"
+url = "https://lists.purge.cc/privacy/ads.txt"
+format = "domains"
+refresh_interval_hours = 12
+max_entries = 5000000
+enabled = true
+
+[[blocklists]]
+id = "security-malicious"
+display_name = "Security: Malicious"
+url = "https://lists.purge.cc/security/malicious.txt"
+format = "domains"
+
+# plp P6: base = "ignore" — loaded, refreshed, contributes nothing → inert WARN.
+[[blocklists]]
+id = "inert-list"
+display_name = "Inert list (base = ignore)"
+url = "https://lists.purge.cc/x/orphan.txt"
+format = "domains"
+base = "ignore"
+enabled = true
+
+[profiles.default]
+display_name = "Default household policy"
+tags = ["uncategorized"]
+block_response = "zero"
+blocked_ttl_secs = 60
+admin_rules = ["allow-github"]
+
+[profiles.kids-night]
+display_name = "Kids night lockdown"
+tags = ["uncategorized"]
+block_response = "soa_nodata"
+
+[[devices]]
+id = "alex-iphone"
+display_name = "Alex's phone"
+ip = "192.0.2.107"
+mac = "AA:BB:CC:DD:EE:FF"
+mac_aliases = ["22:33:44:55:66:77"]
+profile = "default"
+groups = ["famiglia"]
+tags = ["mobile", "personal"]
+owner = "Alex"
+device = "iPhone personale"
+department = "famiglia"
+
+[[devices]]
+id = "kids-tablet"
+display_name = "Tablet dei bambini"
+ip = "192.0.2.150"
+profile = "default"
+groups = ["kids"]
+
+[[groups]]
+id = "famiglia"
+display_name = "Famiglia"
+profile = "default"
+priority = 5
+devices = ["alex-iphone"]
+
+[[groups]]
+id = "kids"
+display_name = "Bambini"
+profile = "default"
+priority = 10
+devices = ["kids-tablet"]
+
+[[subnets]]
+id = "lan"
+display_name = "LAN di casa"
+cidrs = ["192.0.2.0/24"]
+profile = "default"
+priority = 10
+
+[[schedules]]
+id = "quiet-hours"
+display_name = "Quiet hours"
+target_type = "device"
+target_id = "alex-iphone"
+profile = "default"
+days = ["all"]
+hours = "22:00-06:00"
+
+[[schedules]]
+id = "kids-night-lockdown"
+display_name = "Kids night lockdown"
+target_type = "group"
+target_id = "kids"
+profile = "kids-night"
+days = ["all"]
+hours = "21:00-07:00"
+
+[[admin_rules]]
+id = "allow-github"
+rule = "@@||github.com^"
+
+[[admin_rules]]
+id = "deny-tiktok"
+rule = "||tiktok.com^"
+
+# neutrality-10: `upstream.servers` has no default — a config that omits it
+# is REFUSED (`UPSTREAM_SERVERS_EMPTY`) rather than silently pointed at a
+# resolver warden chose. Every fixture that must load clean therefore has to
+# name one. RFC 5737 TEST-NET-1: documentation-only, unroutable, names nobody.
+[upstream]
+servers = ["192.0.2.1:53"]

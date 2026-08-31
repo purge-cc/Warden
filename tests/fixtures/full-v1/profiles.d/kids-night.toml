@@ -1,0 +1,4 @@
+[profiles.kids-night]
+display_name = "Kids night lockdown"
+tags = ["uncategorized"]
+block_response = "soa_nodata"

@@ -1,0 +1,6 @@
+[[groups]]
+id = "kids"
+display_name = "Bambini"
+profile = "kids-night"
+priority = 10
+devices = ["kids-tablet"]

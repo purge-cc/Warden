@@ -1,0 +1,102 @@
+[Unit]
+Description=purge-warden DNS filtering server
+Documentation=https://purge.cc
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=purge-warden
+Group=purge-warden
+
+# No explicit --config: path discovery is the source of truth
+# (src/cli/config_discovery.rs). As the non-root purge-warden user the
+# process resolves /etc/purge-warden/config.toml when present, else
+# /var/lib/purge-warden/config.toml (fresh `warden init` writes there).
+# Pinning either path splits the brain: a host whose master lives in
+# /etc would silently run against a stale or absent /var/lib file.
+# The sandbox (no $HOME, ProtectHome, WorkingDirectory=/) makes the
+# dev-only CWD/$HOME candidates unreachable, so discovery here is
+# /etc then /var/lib.
+# ExecStart must be the real binary, never /usr/local/bin/warden —
+# that path is the operator wrapper (a sh script that routes a human
+# to the purge-warden user). Pointing the unit at it would make the
+# daemon route to itself.
+ExecStart=/usr/local/libexec/purge-warden/warden --pid-file /run/purge-warden/purge-warden.pid start
+ExecReload=/bin/kill -HUP $MAINPID
+
+# ── Capabilities ─────────────────────────────────────────────────
+# CAP_NET_BIND_SERVICE: bind to port 53 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# ── Filesystem ───────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# /etc/purge-warden is the canonical v1 config root (see
+# `src/cli/config_discovery.rs` — preferred over the legacy
+# /var/lib/purge-warden/config.toml). The daemon rewrites config.toml
+# on every IPC mutation (warden device add / promote / etc.), so the
+# directory must be writable inside the unit's namespace even though
+# ProtectSystem=strict makes the rest of /etc read-only.
+# /var/lib/purge-warden is kept for the StateDirectory + legacy
+# config fallback. /run/purge-warden holds the unix socket + PID.
+# The '-' prefix on /etc/purge-warden = ignore-if-absent: fresh
+# installs write /var/lib only, and a missing /etc/purge-warden
+# would otherwise fail namespace setup (status=226/NAMESPACE)
+# before the daemon runs. Migrated/FHS hosts where the dir exists
+# still get the bind mount.
+ReadWritePaths=-/etc/purge-warden /var/lib/purge-warden /run/purge-warden
+
+# State and runtime directories (systemd creates and chowns these).
+RuntimeDirectory=purge-warden
+RuntimeDirectoryMode=0755
+StateDirectory=purge-warden
+StateDirectoryMode=0750
+
+# ── Kernel hardening ─────────────────────────────────────────────
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+# ProcSubset=pid would hide /proc/net/ and break the IP→MAC snapshot
+# (`/proc/net/arp`). The directive is omitted on purpose (systemd
+# default is all).
+ProtectHostname=yes
+ProtectClock=yes
+
+# ── Network ──────────────────────────────────────────────────────
+# AF_INET/AF_INET6: the DNS listener + upstream forwarding. AF_UNIX: the
+# control socket + tracing/journald. AF_NETLINK: glibc's resolver opens a
+# NETLINK_ROUTE socket inside getaddrinfo() when resolving hostname
+# upstreams (DoH/DoT) and list-fetch URLs. `getent ahosts` opens
+# AF_NETLINK; `warden --version` opens no socket — this is not a
+# jemalloc requirement.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# ── Security ─────────────────────────────────────────────────────
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+UMask=0077
+
+# ── Syscall filtering ────────────────────────────────────────────
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# ── Restart policy ───────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

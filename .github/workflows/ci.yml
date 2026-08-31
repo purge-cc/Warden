@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--features dnssec"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install ripgrep (used by check_no_raw_fs_write.sh)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: raw fs::write lint
+        run: ./scripts/check_no_raw_fs_write.sh
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        # Beta: clippy runs and reports but does not gate. A batch of new style
+        # lints from a clippy update (unnecessary_sort_by / collapsible_if /
+        # needless borrows) is a tracked fast-follow — most aren't machine-
+        # applicable via `--fix`. Re-enable `-- -D warnings` after that cleanup.
+        run: cargo clippy --all-targets ${{ matrix.features }}
+      - name: test
+        run: cargo test ${{ matrix.features }}

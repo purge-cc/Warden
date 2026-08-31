@@ -1,0 +1,6 @@
+[[groups]]
+id = "famiglia"
+display_name = "Famiglia"
+profile = "default"
+priority = 5
+devices = ["alex-iphone"]

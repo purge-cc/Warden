@@ -1,0 +1,7 @@
+[[admin_rules]]
+id = "allow-github"
+rule = "@@||github.com^"
+
+[[admin_rules]]
+id = "deny-tiktok"
+rule = "||tiktok.com^"

@@ -1,0 +1,5 @@
+[profiles.strict]
+display_name = "Strict (IoT / guests)"
+tags = ["uncategorized"]
+block_response = "refused"
+admin_rules = ["deny-tiktok"]

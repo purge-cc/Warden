@@ -1,0 +1,81 @@
+[Unit]
+Description=purge-warden config backup (oneshot, scheduled by .timer)
+Documentation=https://purge.cc
+# Soft ordering: don't run while the daemon is fighting through
+# startup, but don't bind to its lifecycle either — a stopped daemon
+# is not a reason to skip config backups, and a running daemon is not
+# a precondition for one.
+After=purge-warden.service
+
+[Service]
+Type=oneshot
+User=purge-warden
+Group=purge-warden
+
+# `--auto` is the scheduler-aware mode: it consults
+# [backup] auto_interval, disable_after_failures, and the
+# .auto_state file under the resolved backup dir, and exits 0 cleanly
+# when not due / disabled / auto_interval absent.
+#
+# No explicit --config: mirrors purge-warden.service — path discovery
+# (src/cli/config_discovery.rs) resolves /etc then /var/lib so the
+# oneshot reads the same master the daemon does. Pinning /var/lib
+# here would back up a stale or absent file on hosts whose master
+# lives in /etc.
+# ExecStart is the real binary. /usr/local/bin/warden is the operator
+# wrapper (a sh script); a timer that fired it would fork and su
+# every run.
+ExecStart=/usr/local/libexec/purge-warden/warden config backup --auto
+
+# ── Filesystem ───────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# /etc/purge-warden holds the master config tree the oneshot reads;
+# /var/lib/purge-warden holds the backups dir it writes into (default
+# `<config-parent>/backups`, kept under StateDirectory). The '-'
+# prefix = ignore-if-absent: fresh installs never create
+# /etc/purge-warden and a hard reference fails namespace setup
+# (status=226/NAMESPACE).
+ReadWritePaths=-/etc/purge-warden /var/lib/purge-warden
+
+# ── Kernel hardening (mirrors purge-warden.service) ──────────────
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProtectHostname=yes
+ProtectClock=yes
+
+# ── Network ──────────────────────────────────────────────────────
+# The oneshot binds no network sockets, so AF_INET/AF_INET6 stay omitted.
+# AF_UNIX: tracing / journald. AF_NETLINK: granted for parity with
+# purge-warden.service. It runs the SAME binary against the SAME glibc, and
+# glibc's resolver opens a NETLINK_ROUTE socket the instant any code path
+# calls getaddrinfo(). The current `config backup --auto` path is pure file
+# I/O and resolves no names, but matching the daemon's grant stops the shared
+# binary from a silent SIGSYS if a future backup path ever resolves a host.
+# Not a jemalloc requirement: `warden --version` opens no socket.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# ── Security ─────────────────────────────────────────────────────
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+UMask=0077
+
+# ── Syscall filtering ────────────────────────────────────────────
+# Mirrors the daemon unit. The oneshot runs as the purge-warden user
+# (never root), so @privileged is not needed; @resources covers
+# nothing the backup engine relies on.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# No [Install] — oneshot is pulled by purge-warden-backup.timer.

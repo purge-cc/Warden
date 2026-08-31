@@ -1,0 +1,6 @@
+# Optional helper if you use the `cross` crate to produce the aarch64
+# musl binary. The documented path is `cargo build --release --target
+# aarch64-unknown-linux-musl` with `aarch64-linux-gnu-gcc` on PATH.
+
+[target.aarch64-unknown-linux-musl]
+# jemalloc needs a C compiler for the target.

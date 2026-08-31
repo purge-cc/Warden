@@ -1,0 +1,5 @@
+[[devices]]
+id = "iot-hub"
+display_name = "Smart home hub"
+ip = "10.10.5.10"
+groups = ["iot"]

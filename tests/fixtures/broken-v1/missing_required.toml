@@ -1,0 +1,5 @@
+# Broken fixture: missing required schema_version. ConfigV1 requires the
+# field (no #[serde(default)] on schema_version).
+# Must surface as ConfigError::MissingRequired.
+[server]
+default_blocked_ttl_secs = 60

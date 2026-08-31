@@ -1,0 +1,15 @@
+# Broken fixture: a device is defined with id = "freshly-retired" but the
+# [[retired]] list marks that id as retired within the last 90 days.
+# The retired_at below is not absolute — the test injects `now` such that
+# `now - retired_at < 90 days`, so the validator rejects the re-use.
+schema_version = 1
+
+[[retired]]
+id = "freshly-retired"
+type = "device"
+retired_at = "2026-04-01T00:00:00Z"
+
+[[devices]]
+id = "freshly-retired"
+display_name = "Collided"
+ip = "192.0.2.42"

@@ -1,0 +1,28 @@
+name: audit
+
+on:
+  push:
+    paths: ["Cargo.lock", "Cargo.toml", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["Cargo.lock", "Cargo.toml"]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        # Two hickory-proto advisories are ignored with rationale (see SECURITY.md):
+        # - RUSTSEC-2026-0118 (NSEC3 unbounded loop): no fixed release. Not exposed —
+        #   DNSSEC is a default-off feature and warden uses its own NSEC3 validation
+        #   (src/dnssec/denial.rs), never hickory's verify_nsec3.
+        # - RUSTSEC-2026-0119 (O(n^2) name-compression on encode): fixed in hickory
+        #   0.26, a breaking API migration tracked as a fast-follow; mitigated by
+        #   small/canned responses + response rate limiting.
+        run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119

@@ -1,0 +1,5 @@
+[[devices]]
+id = "thermostat"
+display_name = "Thermostat (IoT strict)"
+ip = "10.10.5.11"
+groups = ["iot"]

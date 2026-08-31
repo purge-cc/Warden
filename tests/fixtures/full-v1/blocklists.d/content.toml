@@ -1,0 +1,5 @@
+[[blocklists]]
+id = "content-adult"
+display_name = "Content: Adult"
+url = "https://lists.purge.cc/content/adult.txt"
+format = "domains"

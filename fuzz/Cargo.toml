@@ -1,0 +1,34 @@
+[package]
+name = "purge-warden-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+purge-warden = { path = ".." }
+ahash = "0.8"
+compact_str = "0.8"
+
+[[bin]]
+name = "fuzz_domain_parser"
+path = "fuzz_targets/fuzz_domain_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_adguard_parser"
+path = "fuzz_targets/fuzz_adguard_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hosts_parser"
+path = "fuzz_targets/fuzz_hosts_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_domain_validation"
+path = "fuzz_targets/fuzz_domain_validation.rs"
+doc = false

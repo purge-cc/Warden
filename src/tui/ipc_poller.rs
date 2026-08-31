@@ -1,0 +1,646 @@
+//! Async IPC data fetching — wraps socket_client::send_command for each data type.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use anyhow::Result;
+
+use std::net::IpAddr;
+
+use crate::config::settings::ClientConfig;
+#[cfg(feature = "cluster")]
+use crate::ipc::protocol::ClusterStatusDto;
+use crate::ipc::protocol::{
+    DaemonLogDto, DevicePatch, DeviceViewDto, IpcCommand, IpcResponse, LocalRecordsHitEntry,
+    ProfileUpdatePatch, QueryLogDto, QueryLogFileState, QueryLogRequest, TrackingPatch,
+};
+use crate::ipc::socket_client::send_command;
+use crate::lists::status::BlocklistStatusDto;
+use crate::tracking::query_log::QueryLogCursor;
+use crate::tui::app::{DaemonStatus, TrackingData};
+
+pub struct IpcPoller {
+    socket_path: PathBuf,
+    /// Sprint §4.4 P2 — previous `prefetch_promotions_total` plus the
+    /// instant of the previous fetch. Used to derive a per-minute rate
+    /// for the Dashboard Pulse row. `None` on first poll; the rate
+    /// stays `0.0` until a second poll establishes a baseline.
+    prev_prefetch: Mutex<Option<(u64, Instant)>>,
+}
+
+/// Bundled result of `fetch_query_logs`. Carries the three fields the
+/// TUI needs to render the Sprint 37 empty-state messages without
+/// inferring: the DTO list, the live `query_log_enabled` flag as the
+/// daemon sees it, and the file-read outcome.
+#[derive(Debug, Clone)]
+pub struct QueryLogPollResult {
+    pub entries: Vec<QueryLogDto>,
+    pub logging_enabled: bool,
+    pub file_state: QueryLogFileState,
+    /// Resume point for the next older page, or `None` when the walk
+    /// reached the end of the retained window.
+    pub next_cursor: Option<QueryLogCursor>,
+    /// The cursor sent was stale (its file rotated) and this page is the
+    /// live tail instead.
+    pub cursor_stale: bool,
+}
+
+/// `logs-tab`: bundled result of [`IpcPoller::fetch_daemon_logs`].
+///
+/// `dropped` and `capacity` travel with the entries rather than being
+/// fetched separately: they describe THIS page's honesty — how much the
+/// ring can hold and how much capture lost to contention — and a
+/// separately-fetched pair could describe a different moment.
+#[derive(Debug, Clone)]
+pub struct DaemonLogPage {
+    pub entries: Vec<DaemonLogDto>,
+    pub dropped: u64,
+    pub capacity: usize,
+}
+
+impl IpcPoller {
+    pub fn new(socket_path: &Path) -> Self {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+            prev_prefetch: Mutex::new(None),
+        }
+    }
+
+    /// Compute promotions-per-minute from the inter-poll delta of the
+    /// daemon's cumulative `prefetch_promotions_total`. Updates the
+    /// stored baseline as a side effect. Returns `0.0` on the first
+    /// call (no baseline yet) and on a same-instant call (delta = 0s).
+    fn prefetch_promotions_per_min(&self, current_total: u64) -> f64 {
+        let now = Instant::now();
+        // Recover from a poisoned lock instead of a second panic: the
+        // critical section is a trivial Copy-tuple swap and cannot leave
+        // the guarded value in a torn state, so the prior-panic poison is
+        // safe to ignore. Keeps the client path panic-free.
+        let mut guard = self.prev_prefetch.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = match *guard {
+            Some((prev_total, prev_at)) => {
+                let delta_promotions = current_total.saturating_sub(prev_total);
+                let elapsed = now.saturating_duration_since(prev_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    (delta_promotions as f64) * 60.0 / elapsed
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        *guard = Some((current_total, now));
+        rate
+    }
+
+    /// Sprint 43 T3: borrow the socket path so callers (e.g. the Lists
+    /// assignment modal commit handler) can chain a manual
+    /// `ipc_reload::attempt_reload` after a batch of inline writes,
+    /// keeping the modal flow async-friendly without re-creating the
+    /// poller.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub async fn fetch_status(&self) -> Result<DaemonStatus> {
+        Self::status_from_response(send_command(&self.socket_path, &IpcCommand::Status).await?)
+    }
+
+    /// Project an `IpcResponse` onto the TUI's [`DaemonStatus`].
+    ///
+    /// Split out of [`IpcPoller::fetch_status`] rather than left inline,
+    /// because inline is where `tui-blind-to-corpus-refusal` was able to
+    /// hide: the projection sat inside an `async fn` that needs a live Unix
+    /// socket to call, so nothing exercised it, and a field vanishing into
+    /// the `..` cost nothing at gate time. As a pure function over a value
+    /// the test can build, the mapping is finally checkable.
+    fn status_from_response(response: IpcResponse) -> Result<DaemonStatus> {
+        match response {
+            // T2.9 / H-20: `query_log_drops` skipped via `..` — the TUI's
+            // own status panel doesn't surface drop counters yet (out of
+            // scope for the surgical fix), and a fresh field would
+            // otherwise break this exhaustive destructure.
+            //
+            // §4.19: `version` / `cache_cap` / `lists_active` /
+            // `lists_total` flow through to `DaemonStatus` so the
+            // dashboard can replace its `cache_capacity` extrapolation
+            // and surface real list / version counters.
+            //
+            // `tui-blind-to-corpus-refusal`: `lists_corpus_refusal` and
+            // `lists_truncated` were BOTH swallowed by the `..` below, and
+            // that is the one class of field where doing so is not merely
+            // "not surfaced yet" — both describe an outcome that the
+            // counters beside them actively contradict. A refused or
+            // truncated cycle still reports `lists_active == lists_total`,
+            // because every source really did fetch. Anything added here
+            // that qualifies an existing counter must be destructured, not
+            // defaulted away.
+            IpcResponse::Status {
+                pid,
+                listen,
+                upstream_mode,
+                upstream_count,
+                domain_count,
+                cache_entries,
+                list_count,
+                uptime_secs,
+                version,
+                cache_cap,
+                lists_active,
+                lists_total,
+                resource_budget,
+                lists_corpus_refusal,
+                lists_truncated,
+                ..
+            } => Ok(DaemonStatus {
+                pid,
+                listen,
+                upstream_mode,
+                upstream_count,
+                domain_count,
+                cache_entries,
+                list_count,
+                uptime_secs,
+                version,
+                cache_cap,
+                lists_active,
+                lists_total,
+                resource_budget,
+                lists_corpus_refusal,
+                lists_truncated,
+            }),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// §4.11-4b (CS9): live cluster view for the dashboard dot + Cluster
+    /// tab. Mirrors `fetch_status` — `ClusterStatus` is a ReadOnly,
+    /// token-less command (no `token: None` plumbing needed). Returns the
+    /// whole `ClusterStatusDto` verbatim; the dot/tab renderers project it.
+    #[cfg(feature = "cluster")]
+    pub async fn fetch_cluster_status(&self) -> Result<ClusterStatusDto> {
+        match send_command(&self.socket_path, &IpcCommand::ClusterStatus).await? {
+            IpcResponse::ClusterStatus { status } => Ok(status),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    pub async fn fetch_tracking_stats(&self) -> Result<TrackingData> {
+        // P0-3: send_command auto-attaches the plaintext token from
+        // ~/.config/purge-warden/token for Mutating/Admin commands, so
+        // passing None here is correct at this layer.
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::TrackingStats { token: None },
+        )
+        .await?
+        {
+            IpcResponse::TrackingStats {
+                queries_total,
+                blocked_total,
+                blocked_pct,
+                cache_hit_rate,
+                cache_negative_hits,
+                uptime_secs: _,
+                top_blocked,
+                top_queried,
+                hourly,
+                daily,
+                cache_hit_rate_24h,
+                blocked_pct_24h,
+                cache_hit_rate_delta_1h,
+                blocked_pct_delta_1h,
+                qtype_distribution,
+                // Sprint E — second bar of the Dashboard QTYPE chart
+                // card. Same shape + canonical order as
+                // `qtype_distribution`; only the daemon-side counter
+                // semantics differ (blocked-only).
+                qtype_blocked_distribution,
+                // Sprint F — 24h rolling window variants of the two
+                // qtype distributions above. The chart card reads these
+                // directly; the cumulative pair stays on TrackingData
+                // for future surfacing.
+                qtype_distribution_24h,
+                qtype_blocked_distribution_24h,
+                // Sprint §4.4 P2 — wired into the Dashboard Pulse row.
+                prefetch_pool_size,
+                prefetch_promotions_total,
+                prefetch_demotions_total,
+                // Sprint C Dashboard v2 — daemon-resolved scope/topic
+                // labels for the Top Lists card on row 4. Already
+                // sorted desc + capped at 5 by Sprint B's
+                // `extract_top_n_u8`; renderer truncates defensively.
+                top_blocked_lists,
+                // 24h-rolling siblings of the lifetime Top-N vectors
+                // above. Drive the retitled row-4 cards. Empty on
+                // pre-Sprint-N daemons, in which case the row-4 cards
+                // render `collecting…` placeholder.
+                top_blocked_24h,
+                top_queried_24h,
+                top_blocked_lists_24h,
+            } => {
+                // Compute the per-minute rate before constructing the
+                // struct so the renderer is purely formatting (and the
+                // baseline mutation is centralised here, not in the App
+                // poll loop).
+                let prefetch_promotions_per_min =
+                    self.prefetch_promotions_per_min(prefetch_promotions_total);
+                Ok(TrackingData {
+                    queries_total,
+                    blocked_total,
+                    blocked_pct,
+                    cache_hit_rate,
+                    cache_negative_hits,
+                    top_blocked,
+                    top_queried,
+                    hourly,
+                    daily,
+                    cache_hit_rate_24h,
+                    blocked_pct_24h,
+                    cache_hit_rate_delta_1h,
+                    blocked_pct_delta_1h,
+                    qtype_distribution,
+                    qtype_blocked_distribution,
+                    qtype_distribution_24h,
+                    qtype_blocked_distribution_24h,
+                    prefetch_pool_size,
+                    prefetch_promotions_total,
+                    prefetch_demotions_total,
+                    prefetch_promotions_per_min,
+                    top_blocked_lists,
+                    top_blocked_24h,
+                    top_queried_24h,
+                    top_blocked_lists_24h,
+                })
+            }
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Sprint 43 T2: snapshot all per-blocklist runtime telemetry for
+    /// the Lists tab. ReadOnly tier — no token attached. Returns the
+    /// `Vec<BlocklistStatusDto>` in the same order as `[lists].sources`
+    /// (the manager preserves insertion order in the registry).
+    pub async fn fetch_blocklist_stats(&self) -> Result<Vec<BlocklistStatusDto>> {
+        let cmd = IpcCommand::BlocklistStats { source_id: None };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::BlocklistStatsList { stats } => Ok(stats),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Sprint 44 follow-up (`s44-hits-ipc-verb`): snapshot the per-record
+    /// `LocalRecordsHits` counter for the `Leaf::LocalDns` hits column.
+    /// ReadOnly tier — no token attached. Daemon-side iteration order is
+    /// unspecified; the TUI builds its own `(scope, domain) → count`
+    /// lookup at render time.
+    pub async fn fetch_local_records_hits(&self) -> Result<Vec<LocalRecordsHitEntry>> {
+        let cmd = IpcCommand::LocalRecordsHits;
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::LocalRecordsHitsList { entries } => Ok(entries),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// `logs-tab`: a filtered page of the daemon's own `tracing` events.
+    ///
+    /// Admin tier — the daemon's log text carries client IPs and query
+    /// names. `send_command` attaches the auto-discovered token, the same
+    /// way `fetch_query_logs` gets its.
+    ///
+    /// Both filters go DOWN with the request so the daemon applies them
+    /// while walking its ring; filtering the response here would search
+    /// only the newest `limit` rows.
+    pub async fn fetch_daemon_logs(
+        &self,
+        limit: usize,
+        level: Option<crate::tracking::log_ring::LogLevel>,
+        contains: Option<String>,
+    ) -> Result<DaemonLogPage> {
+        let cmd = IpcCommand::DaemonLogs {
+            limit,
+            level,
+            contains,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::DaemonLogs {
+                entries,
+                dropped,
+                capacity,
+            } => Ok(DaemonLogPage {
+                entries,
+                dropped,
+                capacity,
+            }),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Fetch the full device view (mapped + unmapped + block flag).
+    /// Uses the Sprint 22 `GetAllDevices` endpoint, which is ReadOnly
+    /// (no token needed) so the Dashboard widget works on a fresh
+    /// install and on locked-out networks.
+    pub async fn fetch_device_view(&self) -> Result<DeviceViewDto> {
+        match send_command(&self.socket_path, &IpcCommand::GetAllDevices).await? {
+            IpcResponse::DeviceView(view) => Ok(view),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// `cursor` of `None` reads the live tail (page 0). Anything else is
+    /// a resume point minted by a previous response's `next_cursor`.
+    pub async fn fetch_query_logs(&self, req: QueryLogRequest) -> Result<QueryLogPollResult> {
+        let QueryLogRequest {
+            limit,
+            client,
+            blocked_only,
+            domain,
+            since_secs,
+            cursor,
+            advanced,
+        } = req;
+        let cmd = IpcCommand::QueryLogs {
+            limit,
+            client,
+            blocked_only,
+            domain,
+            since_secs,
+            cursor,
+            advanced,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::QueryLogs {
+                entries,
+                logging_enabled,
+                file_state,
+                next_cursor,
+                cursor_stale,
+            } => Ok(QueryLogPollResult {
+                entries,
+                logging_enabled,
+                file_state,
+                next_cursor,
+                cursor_stale,
+            }),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    pub async fn send_reload(&self) -> Result<String> {
+        match send_command(&self.socket_path, &IpcCommand::Reload { token: None }).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Sprint 39: submit the TUI Settings → Tracking panel patch as
+    /// an `IpcCommand::TrackingConfigUpdate`. Success returns the
+    /// daemon's "tracking config updated" message; any daemon-side
+    /// rejection (e.g. retention out of range) is bubbled up as the
+    /// error body for the TUI to render in its status line.
+    pub async fn send_tracking_update(&self, patch: TrackingPatch) -> Result<String> {
+        let cmd = IpcCommand::TrackingConfigUpdate { patch, token: None };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Submit a `DeviceAdd` IPC mutation. Returns the daemon's success
+    /// message on Ok or bubbles the daemon error verbatim. Used by the
+    /// TUI device form modal on submit. The parameter is a
+    /// `ClientConfig` — the v0 legacy struct kept as the `[[devices]]`
+    /// pass-through type per §14.4 judgment call.
+    pub async fn send_device_add(&self, device: ClientConfig) -> Result<String> {
+        let cmd = IpcCommand::DeviceAdd {
+            client: device,
+            token: None, // socket_client::send_command auto-attaches
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Submit a `DeviceUpdate` IPC mutation with a partial patch. `id` is the
+    /// device's stable id (mod-10.1) — the IPC `name` field is keyed by id,
+    /// not display name; reconciling the wire field name is §07's call.
+    pub async fn send_device_update(&self, id: String, patch: DevicePatch) -> Result<String> {
+        let cmd = IpcCommand::DeviceUpdate {
+            name: id,
+            patch,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Submit a `DeviceRemove` IPC mutation. The TUI delete confirmation
+    /// modal calls this after the user picks "yes".
+    pub async fn send_device_remove(&self, name: String) -> Result<String> {
+        let cmd = IpcCommand::DeviceRemove { name, token: None };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// Submit a `DevicePromote` IPC mutation. The daemon strictly
+    /// requires an ARP MAC for the IP — the keybindings layer should
+    /// already have rejected this call if ARP was stale, but if it
+    /// slips through the daemon's plain-English error surfaces here.
+    pub async fn send_device_promote(&self, fields: PromoteFields) -> Result<String> {
+        let cmd = IpcCommand::DevicePromote {
+            ip: fields.ip,
+            name: fields.name,
+            profile: fields.profile,
+            owner: fields.owner,
+            device_type: fields.device_type,
+            department: fields.department,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// §4.26 Phase 2: submit a `ProfileCreate` IPC mutation. Used by the
+    /// Profiles tab Add modal on submit. The daemon handler validates the
+    /// id, refuses duplicates, writes + validates the TOML, and
+    /// self-reloads via `notify_reload` — the TUI only needs to refresh
+    /// its offline `loaded_config` cache afterwards. `token: None` — the
+    /// socket client auto-attaches the plaintext token for Mutating verbs.
+    pub async fn send_profile_create(&self, id: String, display_name: String) -> Result<String> {
+        let cmd = IpcCommand::ProfileCreate {
+            id,
+            display_name,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// §4.26 Phase 2: submit a `ProfileUpdate` IPC mutation. The `patch`
+    /// carries every changed MUTATE field — the daemon applies them in a
+    /// single atomic TOML rewrite. Used by the Profiles tab Edit modal.
+    pub async fn send_profile_update(
+        &self,
+        id: String,
+        patch: ProfileUpdatePatch,
+    ) -> Result<String> {
+        let cmd = IpcCommand::ProfileUpdate {
+            id,
+            patch,
+            token: None,
+        };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+
+    /// §4.26 Phase 2: submit a `ProfileDelete` IPC mutation. The daemon
+    /// validator refuses the delete if any device / group / subnet /
+    /// schedule still references the id; that rejection bubbles up here
+    /// as the error body for the modal to render. Used by the Profiles
+    /// tab Delete confirm.
+    pub async fn send_profile_delete(&self, id: String) -> Result<String> {
+        let cmd = IpcCommand::ProfileDelete { id, token: None };
+        match send_command(&self.socket_path, &cmd).await? {
+            IpcResponse::Ok { message } => Ok(message),
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            _ => anyhow::bail!("unexpected response"),
+        }
+    }
+}
+
+/// Fields the TUI form collects for a Promote action — mirrors the
+/// IPC `DevicePromote` payload minus the auth token. Wrapping in a
+/// struct keeps `IpcPoller::send_device_promote` under the
+/// `clippy::too_many_arguments` threshold without bypassing the lint.
+pub struct PromoteFields {
+    pub ip: IpAddr,
+    pub name: String,
+    pub profile: String,
+    pub owner: Option<String>,
+    pub device_type: Option<String>,
+    pub department: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lists::status::CorpusRefusal;
+
+    /// Build a `Status` response with every field named explicitly.
+    ///
+    /// Deliberately NOT `..Default::default()`: `tui-blind-to-corpus-refusal`
+    /// existed because a field could join the wire and be defaulted away
+    /// without anything going red, and a fixture that spreads a default
+    /// reproduces exactly that blindness inside the test meant to catch it.
+    /// Naming all of them costs one compile error when the wire grows — which
+    /// is the notification this projection never had.
+    fn status_response(
+        lists_corpus_refusal: Option<CorpusRefusal>,
+        lists_truncated: u32,
+    ) -> IpcResponse {
+        IpcResponse::Status {
+            pid: 1234,
+            listen: "127.0.0.1:15353".into(),
+            upstream_mode: "plain".into(),
+            upstream_count: 2,
+            domain_count: 500_000,
+            cache_entries: 1234,
+            list_count: 3,
+            uptime_secs: 3600,
+            query_log_drops: None,
+            version: "0.37.0".into(),
+            cache_cap: 0,
+            lists_active: 8,
+            lists_total: 8,
+            lists_truncated,
+            lists_corpus_refusal,
+            lists_cycle: None,
+            lc2_list_diagnostics: Default::default(),
+            resource_budget: None,
+            cache_weighted_size: 0,
+        }
+    }
+
+    fn refusal() -> CorpusRefusal {
+        CorpusRefusal {
+            unique: 14_200_000,
+            ceiling: 14_000_000,
+            novel_by_source: vec![("privacy-ads".to_string(), 2_100_000)],
+        }
+    }
+
+    /// The projection must CARRY the refusal, not merely compile.
+    ///
+    /// The mutation this is built to catch is not deletion — dropping the
+    /// field from the destructure fails to build, which is not evidence.
+    /// It is a projection that keeps the field and hardcodes
+    /// `lists_corpus_refusal: None`, which compiles, renders a healthy
+    /// dashboard, and is precisely the defect that shipped.
+    #[test]
+    fn corpus_refusal_survives_the_poller_projection() {
+        let status = IpcPoller::status_from_response(status_response(Some(refusal()), 0)).unwrap();
+        let carried = status
+            .lists_corpus_refusal
+            .expect("the refusal must survive the projection, not vanish into the `..`");
+        assert_eq!(carried.unique, 14_200_000);
+        assert_eq!(carried.ceiling, 14_000_000);
+        assert_eq!(
+            carried.novel_by_source.first().map(|(s, _)| s.as_str()),
+            Some("privacy-ads"),
+            "the largest-contributor diagnostic must survive too — it is the \
+             only part of the refusal that tells the operator what to remove"
+        );
+    }
+
+    /// The second blind spot of the same shape, found by the check
+    /// `tui-blind-to-corpus-refusal` step 5 asked for.
+    #[test]
+    fn truncation_count_survives_the_poller_projection() {
+        let status = IpcPoller::status_from_response(status_response(None, 3)).unwrap();
+        assert_eq!(
+            status.lists_truncated, 3,
+            "a truncated source is also `active`, so this counter is the only \
+             thing that can contradict a healthy-looking N/N"
+        );
+    }
+
+    /// The control arm. Without it, a projection that hardcoded
+    /// `Some(refusal)` would pass the two tests above and alarm on every
+    /// healthy daemon.
+    #[test]
+    fn a_healthy_cycle_projects_no_refusal_and_no_truncation() {
+        let status = IpcPoller::status_from_response(status_response(None, 0)).unwrap();
+        assert!(status.lists_corpus_refusal.is_none());
+        assert_eq!(status.lists_truncated, 0);
+    }
+}

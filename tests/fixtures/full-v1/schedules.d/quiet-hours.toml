@@ -1,0 +1,8 @@
+[[schedules]]
+id = "quiet-hours"
+display_name = "Quiet hours on Alex's iPhone"
+target_type = "device"
+target_id = "alex-iphone"
+profile = "kids-night"
+days = ["all"]
+hours = "22:00-06:00"

@@ -1,0 +1,6 @@
+[[blocklists]]
+id = "security-malicious"
+display_name = "Security: Malicious"
+url = "https://lists.purge.cc/security/malicious.txt"
+format = "domains"
+refresh_interval_hours = 6

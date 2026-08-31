@@ -1,0 +1,201 @@
+schema_version = 2
+
+[api]
+token_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[blocklists]]
+display_name = "Security: malicious"
+id = "security-malicious"
+tags = ["uncategorized"]
+url = "https://lists.purge.cc/malicious.txt"
+
+[[blocklists]]
+display_name = "Privacy: ads"
+enabled = false
+format = "domains"
+id = "privacy-ads"
+kind = "deny"
+max_consecutive_failures = 5
+max_entries = 10000000
+tags = ["uncategorized"]
+trust = "remote-unsigned"
+update_interval_hours = 12
+url = "https://lists.purge.cc/ads.txt"
+
+[[blocklists]]
+display_name = "Privacy: tracking"
+id = "privacy-tracking"
+tags = ["uncategorized"]
+url = "https://lists.purge.cc/tracking.txt"
+
+[[blocklists]]
+display_name = "Content: Adult"
+enabled = true
+format = "domains"
+id = "content-adult"
+kind = "deny"
+url = "https://lists.purge.cc/adult.txt"
+
+[[blocklists]]
+display_name = "Content: Dating"
+enabled = true
+format = "domains"
+id = "content-dating"
+kind = "deny"
+url = "https://lists.purge.cc/dating.txt"
+
+[[blocklists]]
+display_name = "Content: Gambling"
+enabled = true
+format = "domains"
+id = "content-gambling"
+kind = "deny"
+url = "https://lists.purge.cc/gambling.txt"
+
+[[blocklists]]
+display_name = "Content: Hate"
+enabled = true
+format = "domains"
+id = "content-hate"
+kind = "deny"
+url = "https://lists.purge.cc/hate.txt"
+
+[[blocklists]]
+display_name = "Privacy: Devices"
+enabled = true
+format = "domains"
+id = "privacy-devices"
+kind = "deny"
+url = "https://lists.purge.cc/devices.txt"
+
+[[blocklists]]
+display_name = "Privacy: General"
+enabled = true
+format = "domains"
+id = "privacy-general"
+kind = "deny"
+url = "https://lists.purge.cc/general.txt"
+
+[[blocklists]]
+display_name = "Privacy: Mobile"
+enabled = true
+format = "domains"
+id = "privacy-mobile"
+kind = "deny"
+url = "https://lists.purge.cc/mobile.txt"
+
+[[blocklists]]
+display_name = "Security: Suspicious"
+enabled = true
+format = "domains"
+id = "security-suspicious"
+kind = "deny"
+url = "https://lists.purge.cc/suspicious.txt"
+
+[[blocklists]]
+display_name = "Services: Microsoft"
+enabled = true
+format = "domains"
+id = "services-microsoft"
+kind = "deny"
+url = "https://lists.purge.cc/microsoft.txt"
+
+[[blocklists]]
+display_name = "Services: DoH Resolvers"
+enabled = true
+format = "domains"
+id = "services-resolvers"
+kind = "deny"
+url = "https://lists.purge.cc/resolvers.txt"
+
+[[blocklists]]
+display_name = "Services: TikTok"
+enabled = true
+format = "domains"
+id = "services-tiktok"
+kind = "deny"
+url = "https://lists.purge.cc/tiktok.txt"
+
+[[blocklists]]
+display_name = "services/meta"
+id = "services-meta"
+kind = "deny"
+trust = "remote-unsigned"
+url = "https://lists.purge.cc/meta.txt"
+
+[cache]
+max_entries = 10000
+max_ttl_secs = 3600
+min_ttl_secs = 60
+negative_ttl_secs = 300
+
+[[devices]]
+department = "living-room"
+display_name = "decoder-sky"
+id = "decoder-sky"
+ip = "192.0.2.51"
+mac = "02:00:00:00:00:01"
+profile = "default"
+
+[[devices]]
+display_name = "nvidia-shield"
+id = "nvidia-shield"
+ip = "192.0.2.207"
+mac = "02:00:00:00:00:02"
+profile = "default"
+
+[[devices]]
+display_name = "hue-lights"
+id = "hue-lights"
+ip = "192.0.2.243"
+mac = "02:00:00:00:00:03"
+profile = "default"
+
+[[devices]]
+display_name = "apple-tv"
+id = "apple-tv"
+ip = "192.0.2.52"
+mac = "02:00:00:00:00:04"
+profile = "default"
+
+[[devices]]
+display_name = "printer-hp"
+id = "printer-hp"
+ip = "192.0.2.4"
+mac = "02:00:00:00:00:05"
+profile = "default"
+
+[[devices]]
+display_name = "Host-A (workstation)"
+id = "host-a"
+mac = "02:00:00:00:00:06"
+network_name = "host-a"
+
+[[labels]]
+description = "Living Room of Our Home"
+display_name = "living-room"
+id = "living-room"
+kind = "department"
+
+[lists]
+sources = []
+update_interval_secs = 43200
+max_total_domains = 20000000
+
+[profiles.default]
+display_name = "Default household profile"
+tags = ["uncategorized"]
+
+[server]
+allow_from = ["192.0.2.0/24", "100.64.0.0/10", "127.0.0.0/8"]
+default_profile = "default"
+listen = "0.0.0.0:53"
+log_level = "info"
+
+[socket]
+path = "/run/purge-warden/control.sock"
+
+[upstream]
+mode = "plain"
+servers = ["192.0.2.1:53", "192.0.2.2:53"]
+timeout_ms = 5000

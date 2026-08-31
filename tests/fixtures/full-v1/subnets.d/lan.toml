@@ -1,0 +1,6 @@
+[[subnets]]
+id = "lan"
+display_name = "LAN di casa"
+cidrs = ["192.0.2.0/24"]
+profile = "default"
+priority = 10

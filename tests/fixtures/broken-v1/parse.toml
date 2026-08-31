@@ -1,0 +1,6 @@
+# Broken fixture: invalid TOML syntax — unterminated string value.
+# Must surface as ConfigError::Parse at schema-load time.
+schema_version = 1
+
+[server]
+default_profile = "default

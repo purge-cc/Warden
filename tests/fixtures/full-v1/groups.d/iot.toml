@@ -1,0 +1,6 @@
+[[groups]]
+id = "iot"
+display_name = "IoT devices (strict)"
+profile = "strict"
+priority = 20
+devices = ["iot-hub", "thermostat"]

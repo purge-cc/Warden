@@ -1,0 +1,6 @@
+[[devices]]
+id = "kids-tablet"
+display_name = "Tablet dei bambini"
+ip = "192.0.2.150"
+profile = "default"
+groups = ["kids"]

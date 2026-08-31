@@ -1,0 +1,8 @@
+[[schedules]]
+id = "kids-night-lockdown"
+display_name = "Kids night lockdown"
+target_type = "group"
+target_id = "kids"
+profile = "kids-night"
+days = ["all"]
+hours = "21:00-07:00"

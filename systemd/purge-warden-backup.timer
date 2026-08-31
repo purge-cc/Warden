@@ -1,0 +1,20 @@
+[Unit]
+Description=Schedule the purge-warden config backup
+Documentation=https://purge.cc
+
+[Timer]
+# Fire every hour. The `--auto` flag in the service consults the
+# operator-configured `[backup] auto_interval` and exits 0 if the
+# previous run was within the interval. Cheap hourly wakeup beats
+# baking the interval into the timer (which would require rerunning
+# install.sh / `systemctl daemon-reload` whenever the operator
+# tweaks the TOML).
+OnUnitActiveSec=1h
+OnBootSec=15min
+
+# If the machine was off when the timer should have fired, run on
+# the next boot instead of silently skipping the period.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

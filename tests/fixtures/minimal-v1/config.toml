@@ -1,0 +1,137 @@
+# Minimal v1 configuration fixture — exercises every entity type the
+# schema defines. Loaded by `config::schema::validator::tests` to pin the
+# happy-path deserialisation contract. Mirrored round-trip through
+# `toml::to_string` + `from_str` verifies stability across serde versions.
+#
+# This file MUST load cleanly with zero validator errors.
+
+schema_version = 3
+
+[server]
+default_profile = "default"
+default_block_response = "zero"
+default_blocked_ttl_secs = 60
+
+[[retired]]
+# N8: a previously-used id still in its 90-day quarantine. `2020-01-01`
+# is deep in the past so the retirement window has already elapsed —
+# this entry documents the shape without actually blocking any id.
+id = "legacy-nothing"
+type = "device"
+retired_at = "2020-01-01T00:00:00Z"
+
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Privacy: Ads"
+url = "https://lists.purge.cc/privacy/ads.txt"
+format = "domains"
+update_interval_hours = 12
+max_entries = 5000000
+enabled = true
+
+[[blocklists]]
+id = "security-malicious"
+display_name = "Security: Malicious"
+url = "https://lists.purge.cc/security/malicious.txt"
+format = "domains"
+
+[profiles.default]
+display_name = "Default household policy"
+block_response = "zero"
+blocked_ttl_secs = 60
+admin_rules = ["allow-github"]
+
+[profiles.kids-night]
+display_name = "Kids night lockdown"
+block_response = "soa_nodata"
+
+[[devices]]
+id = "alex-iphone"
+display_name = "Alex's phone"
+ip = "192.0.2.107"
+mac = "AA:BB:CC:DD:EE:FF"
+mac_aliases = ["22:33:44:55:66:77"]
+profile = "default"
+groups = ["famiglia"]
+owner = "Alex"
+# Legacy field name `device` kept here on purpose: exercises the
+# serde alias that maps `device` → `device_type` for TOML files
+# written before the v0.4.3 rename. New fixtures should use
+# `device_type`.
+device = "iPhone personale"
+department = "famiglia"
+
+[[devices]]
+id = "kids-tablet"
+display_name = "Tablet dei bambini"
+ip = "192.0.2.150"
+profile = "default"
+groups = ["kids"]
+
+[[groups]]
+id = "famiglia"
+display_name = "Famiglia"
+profile = "default"
+priority = 5
+devices = ["alex-iphone"]
+
+[[groups]]
+id = "kids"
+display_name = "Bambini"
+profile = "default"
+priority = 10
+devices = ["kids-tablet"]
+
+[[subnets]]
+id = "lan"
+display_name = "LAN di casa"
+cidrs = ["192.0.2.0/24"]
+profile = "default"
+priority = 10
+
+[[schedules]]
+id = "quiet-hours"
+display_name = "Quiet hours"
+target_type = "device"
+target_id = "alex-iphone"
+profile = "default"
+days = ["all"]
+hours = "22:00-06:00"
+
+[[schedules]]
+id = "kids-night-lockdown"
+display_name = "Kids night lockdown"
+target_type = "group"
+target_id = "kids"
+profile = "kids-night"
+days = ["all"]
+hours = "21:00-07:00"
+
+[[admin_rules]]
+id = "allow-github"
+rule = "@@||github.com^"
+
+[[admin_rules]]
+id = "deny-tiktok"
+rule = "||tiktok.com^"
+
+# neutrality-10: `upstream.servers` has no default — a config that omits it
+# is REFUSED (`UPSTREAM_SERVERS_EMPTY`) rather than silently pointed at a
+# resolver warden chose. Every fixture that must load clean therefore has to
+# name one. RFC 5737 TEST-NET-1: documentation-only, unroutable, names nobody.
+[upstream]
+servers = ["192.0.2.1:53"]
+
+# `[anti_bypass]` is OMITTED on purpose, and an edit that added it here was
+# reverted on 2026-08-16. Omitting the section is exactly what `warden init`
+# writes and what the live CTs carry, so this fixture keeps looking like a
+# real install — which is its whole value. Since `neutrality-01` deleted the
+# built-in resolver list, the section's defaults (`enabled = true`,
+# `extra_domains = []`) build no checker at all, and the validator warns on
+# every load. That warning is the finding, not fixture noise: it is pinned by
+# `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture` and
+# tracked as a product decision (`anti-bypass-default-on-protects-nothing`).
+#
+# So this file is NOT the warning-free control arm for `config lint --strict`
+# and must not be edited into one — `strict_leaves_a_clean_config_alone`
+# derives its own clean config from this text at test time.

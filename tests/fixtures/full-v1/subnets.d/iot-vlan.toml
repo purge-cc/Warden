@@ -1,0 +1,6 @@
+[[subnets]]
+id = "iot-vlan"
+display_name = "IoT VLAN"
+cidrs = ["10.10.5.0/24"]
+profile = "strict"
+priority = 20

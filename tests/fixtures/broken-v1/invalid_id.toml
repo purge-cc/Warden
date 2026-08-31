@@ -1,0 +1,9 @@
+# Broken fixture: blocklist.id fails the [a-z0-9-] charset ("UPPER CASE"
+# with spaces). The Id newtype rejects via serde try_from.
+# Must surface as ConfigError::InvalidId.
+schema_version = 1
+
+[[blocklists]]
+id = "BAD ID"
+display_name = "Bad"
+url = "https://example.com/a.txt"

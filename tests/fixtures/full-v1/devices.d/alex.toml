@@ -1,0 +1,9 @@
+[[devices]]
+id = "alex-iphone"
+display_name = "Alex's phone"
+ip = "192.0.2.107"
+mac = "AA:BB:CC:DD:EE:FF"
+profile = "default"
+groups = ["famiglia"]
+tags = ["mobile", "personal"]
+owner = "Alex"

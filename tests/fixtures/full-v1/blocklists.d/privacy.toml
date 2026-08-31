@@ -1,0 +1,12 @@
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Privacy: Ads"
+url = "https://lists.purge.cc/privacy/ads.txt"
+format = "domains"
+refresh_interval_hours = 12
+
+[[blocklists]]
+id = "privacy-tracking"
+display_name = "Privacy: Tracking"
+url = "https://lists.purge.cc/privacy/tracking.txt"
+format = "domains"

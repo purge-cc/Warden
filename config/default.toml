@@ -1,0 +1,326 @@
+# purge-warden configuration reference (schema v2)
+# https://purge.cc
+#
+# Commented values show defaults — uncomment and edit as needed.
+# `warden init` generates a working starter config; this file documents
+# the option surface. Validate after editing: warden config lint
+#
+# v2 model in one line: lists live as [[blocklists]] entities carrying
+# `tags`; profiles/devices/subnets carry `tags` too; a list applies
+# where the tag sets intersect.
+
+schema_version = 3
+
+# ── Server ───────────────────────────────────────────────────────
+[server]
+# Address and port for DNS queries.
+# Use 0.0.0.0:53 for production (requires root or CAP_NET_BIND_SERVICE).
+# listen = "127.0.0.1:15353"
+
+# Source networks allowed to query (CIDR notation). REQUIRED to be
+# non-empty when listen binds 0.0.0.0 or [::] — the validator refuses
+# the open-resolver combination. ["0.0.0.0/0", "::/0"] deliberately
+# answers everyone. Queries from non-matching sources get REFUSED.
+# allow_from = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+
+# Log verbosity: trace, debug, info, warn, error
+# log_level = "info"
+
+# Profile applied to every source IP that doesn't match a [[devices]],
+# [[groups]] or [[subnets]] row. Unset means REFUSED for unknown clients.
+# default_profile = "default"
+
+# Canned answer for blocked domains: "zero" (A→0.0.0.0 / AAAA→::) or
+# "nxdomain". Per-profile override: [profiles.<id>] block_response.
+# default_block_response = "zero"
+
+# TTL (seconds) for canned blocked responses.
+# Set low for fast unblocking during testing.
+# default_blocked_ttl_secs = 60
+
+# Idle timeout (seconds) for incoming TCP connections.
+# Clients use TCP for large responses (DNSSEC, DKIM TXT records).
+# tcp_timeout_secs = 10
+
+# Verify device MAC addresses against /proc/net/arp at query time.
+# Prevents ARP-spoof profile hijack for MAC-pinned devices.
+# enforce_device_mac = true
+
+# ── Upstream DNS ─────────────────────────────────────────────────
+[upstream]
+# Resolution mode: "plain" (UDP/53), "doh" (HTTPS), "dot" (TLS/853).
+# (DNS-over-QUIC is available in builds with the `doq` feature: mode = "doq".)
+# mode = "plain"
+
+# DNS servers for forwarding non-blocked queries.
+# Format depends on mode:
+#   plain: "IP:port"     (e.g. "192.0.2.53:53")
+#   doh:   URL           (e.g. "https://dns.example.net/dns-query")
+#   dot:   "host:port"   (e.g. "192.0.2.53:853" or "dns.example.net:853")
+# There is no default: warden does not pick a resolver for you.
+# `warden init` proposes the one this machine already uses.
+# servers = ["192.0.2.53:53", "192.0.2.54:53"]
+
+# Per-query timeout in milliseconds.
+# timeout_ms = 5000
+
+# Optional fallback upstream (activated when primary circuit-breaks).
+# [upstream.fallback]
+# mode = "plain"
+# servers = ["192.0.2.60:53", "192.0.2.61:53"]
+
+# ── Blocklists (v2 entities) ─────────────────────────────────────
+# Each subscribed list is a [[blocklists]] row. `tags` drives which
+# profiles/devices the list applies to (tag intersection). URLs for the
+# purge.cc catalog are FLAT: https://lists.purge.cc/<topic>.txt —
+# browse ids + URLs with: warden lists catalog
+# Add from the CLI: warden blocklist add <id> --url <url>
+#
+# [[blocklists]]
+# id = "security-malicious"
+# display_name = "Security: malicious"
+# url = "https://lists.purge.cc/malicious.txt"
+# tags = ["uncategorized"]
+#
+# [[blocklists]]
+# id = "privacy-ads"
+# display_name = "Privacy: ads"
+# url = "https://lists.purge.cc/ads.txt"
+# tags = ["uncategorized"]
+
+# ── Lists (download engine) ──────────────────────────────────────
+[lists]
+# Legacy slug channel. Leave empty: subscriptions belong in
+# [[blocklists]] rows above — only entities carry the tags that join
+# lists to profiles. Do NOT mirror an entity here as a slug; the two
+# channels get separate filter bits and the profile ends up masking
+# bits the downloads never populate (silent no-blocking).
+# sources = []
+
+# How often to re-download lists, in seconds.
+# update_interval_secs = 43200
+
+# Maximum size (bytes) for a single blocklist download. Aborts mid-stream.
+# Default: 200 MB. Lower on constrained hardware (Pi: 50-100 MB).
+# max_body_bytes = 209715200
+
+# Maximum entries per list. Lists exceeding this are truncated with a warning.
+# max_entries = 5000000
+
+# ── Cache ────────────────────────────────────────────────────────
+[cache]
+# Maximum number of cached DNS responses.
+# max_entries = 10000
+
+# Maximum TTL for cached responses (seconds). Upstream TTLs are clamped.
+# max_ttl_secs = 3600
+
+# Minimum TTL for cached responses (seconds). Short TTLs are raised.
+# min_ttl_secs = 60
+
+# TTL for negative responses (NXDOMAIN, NODATA).
+# negative_ttl_secs = 300
+
+# TTL-triggered prefetching. When a cache hit is within the last 10% of its
+# TTL, serve immediately and refresh in the background so the next query
+# gets a fresh entry. Popular domains stay warm indefinitely.
+# prefetch = true
+# prefetch_threshold = 0.1
+# prefetch_max_concurrent = 16
+
+# Maximum CNAME chain depth before giving up.
+# cname_max_depth = 16
+
+# ── Profiles ─────────────────────────────────────────────────────
+# Named filtering profiles. A profile's `tags` select which
+# [[blocklists]] apply (tag intersection). Custom allow/deny rules are
+# [[admin_rules]] entities referenced by id — see CONFIG_GUIDE.
+#
+# [profiles.default]
+# display_name = "Default household profile"
+# tags = ["uncategorized"]
+#
+# [profiles.kids]
+# display_name = "Kids"
+# tags = ["uncategorized", "kids-safe"]
+# safe_search = true           # force Google/Bing/DDG/YouTube SafeSearch
+# block_response = "nxdomain"  # per-profile override of the canned answer
+#
+# [profiles.night]
+# display_name = "Night clamp"
+# tags = []
+# block_all = true
+
+# ── Devices / Groups / Subnets ───────────────────────────────────
+# Map sources to profiles. Resolution order: device > group > subnet >
+# server.default_profile. Manage from the CLI: warden device add …
+#
+# [[devices]]
+# id = "laptop-anna"
+# display_name = "Anna's laptop"
+# ip = "192.168.1.42"
+# mac = "AA:BB:CC:DD:EE:FF"
+# profile = "default"
+#
+# [[groups]]
+# id = "famiglia"
+# display_name = "Family devices"
+# profile = "default"
+#
+# [[subnets]]
+# id = "lan-guest"
+# display_name = "Guest VLAN"
+# cidrs = ["192.168.2.0/24"]
+# profile = "default"
+
+# ── Socket ───────────────────────────────────────────────────────
+[socket]
+# Unix domain socket for CLI↔daemon IPC.
+# Dev: "./control.sock"  Prod: "/run/purge-warden/control.sock"
+# path = "./control.sock"
+
+# ── Tracking ─────────────────────────────────────────────────────
+[tracking]
+# Enable stats tracking (global + per-device counters).
+# enabled = true
+
+# How often to write stats snapshot to disk (seconds).
+# On graceful shutdown (SIGTERM, incl. `systemctl restart`) a final
+# snapshot is always written, so clean restarts preserve all stats.
+# This interval caps data loss on abrupt crashes/power-cuts only.
+# snapshot_interval_secs = 120
+
+# Number of top domains to track (top-blocked, top-queried).
+# top_n_limit = 20
+
+# How often to recompute top-N from frequency maps (seconds).
+# top_n_interval_secs = 10
+
+# Maximum number of devices to track.
+# max_clients = 1024
+
+# Enable query logging to file.
+# query_log_enabled = false
+
+# Path to the query log file.
+# query_log_path = "./query.log"
+
+# Max query log file size before rotation (MB).
+# query_log_max_size_mb = 100
+
+# Max number of rotated log files to keep.
+# query_log_max_files = 7
+
+# ── REST API ─────────────────────────────────────────────────────
+[api]
+# Enable the REST API server.
+# enabled = false
+
+# Listen address for the API.
+# listen = "127.0.0.1:8053"
+
+# TLS certificate and key (required if listen is non-loopback).
+# tls_cert = ""
+# tls_key = ""
+
+# SHA-256 hash of the API token. Set by: warden token generate
+# token_hash = ""
+
+# Expose the OpenMetrics endpoint at /metrics (off by default — the
+# route is not even mounted without this).
+# metrics_enabled = false
+
+# ── Security ─────────────────────────────────────────────────────
+[security]
+# Master switch for all security features (RRL, rate limiting, tunneling).
+# enabled = true
+
+# Response Rate Limiting — prevents DNS amplification attacks.
+# Tracks response rate per destination /24 subnet.
+# [security.rrl]
+# enabled = true
+# responses_per_second = 5
+# window_secs = 15
+# slip_rate = 2              # 1-in-N throttled responses get TC flag
+
+# Per-client query rate limiting (token bucket).
+# [security.rate_limit]
+# enabled = true
+# queries_per_second = 100
+# burst = 200
+
+# DNS tunneling detection heuristics.
+# The rate counter is the primary defence; the two shape filters are coarse
+# backstops. Every check refuses on its own — they are OR'd, not scored.
+# [security.tunneling]
+# enabled = true
+# subdomain_rate = 50        # Max cache-missing queries per (device, base domain) per window
+# window_secs = 60
+# label_len_threshold = 48   # A single non-base label this long is refused (DNS caps a label at 63)
+# max_unbroken_run = 40      # Longest run with no `-` across the non-base labels
+# entropy_min_len = 64       # Entropy is not evaluated below this concatenated length
+# entropy_threshold = 3.5    # Inert on its own: uncommenting this alone changes nothing
+#                            # until a name's concatenated labels reach entropy_min_len
+# exempt_domains = []        # Suffixes skipped by every tunneling heuristic
+
+# ── Anti-Bypass ──────────────────────────────────────────────────
+[anti_bypass]
+# Block queries to known public DoH/DoT resolver domains.
+# Prevents clients from circumventing the filter.
+# enabled = true
+
+# Additional domains to block beyond the built-in list (40+ resolvers).
+# extra_domains = []
+
+# ── Local DNS ────────────────────────────────────────────────────
+# Custom DNS records. Bypass the filter and upstream — served directly.
+# Useful for LAN hostnames, home server aliases, and split-horizon DNS.
+[local_dns]
+# TTL for locally-served records (seconds).
+# ttl_secs = 3600
+
+# Static records:
+# [[local_dns.records]]
+# domain = "nas.home"
+# type = "A"
+# value = "192.168.1.100"
+#
+# [[local_dns.records]]
+# domain = "printer.home"
+# type = "A"
+# value = "192.168.1.101"
+#
+# [[local_dns.records]]
+# domain = "media.home"
+# type = "CNAME"
+# value = "nas.home"
+
+# ── Conditional Forwarding ───────────────────────────────────────
+# Route queries for specific domain suffixes to different upstream servers.
+# Useful for internal corporate DNS or VPN split-tunnel setups.
+#
+# [[forwarding]]
+# suffix = "corp.example.com"
+# mode = "plain"
+# servers = ["10.0.0.1:53"]
+#
+# [[forwarding]]
+# suffix = "vpn.internal"
+# mode = "dot"
+# servers = ["10.10.0.1:853"]
+
+# ── IP Blocklists ────────────────────────────────────────────────
+# Block upstream responses that resolve to known-bad IP addresses.
+# Catches domains that bypass domain-level filtering via IP rotation.
+[ip_blocklists]
+# enabled = false
+# sources = ["https://example.com/bad-ips.txt"]
+# inline = ["203.0.113.0/24"]
+
+# ── Backup ───────────────────────────────────────────────────────
+# Config backup engine (CLI: warden config backup / restore; TUI:
+# Settings tab). Archives land 0600 in <config-parent>/backups.
+[backup]
+# Auto-backup cadence for the hourly systemd timer: "1h", "6h", "24h".
+# Unset/absent = auto-backup disabled (manual backups always work).
+# auto_interval = "24h"

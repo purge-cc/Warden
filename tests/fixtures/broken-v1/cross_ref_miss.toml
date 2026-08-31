@@ -1,0 +1,12 @@
+# Broken fixture: a device references a profile that does not exist.
+# Must surface as ConfigError::CrossRefMiss at validator time.
+schema_version = 1
+
+[profiles.default]
+display_name = "Default"
+
+[[devices]]
+id = "iphone"
+display_name = "iPhone"
+ip = "192.0.2.107"
+profile = "ghost"

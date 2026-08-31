@@ -1,0 +1,234 @@
+[package]
+name = "purge-warden"
+version = "0.38.0"
+edition = "2021"
+# Minimum supported Rust version. cargo enforces this at build time even
+# for a `publish = false` crate, so an outsider on an older toolchain gets a
+# clear "requires rustc 1.94" error instead of a cryptic mid-build failure.
+rust-version = "1.94"
+description = "Ultra-lightweight DNS filtering server for Linux, powered by purge.cc"
+license = "AGPL-3.0-or-later"
+# The lib target is an internal implementation detail of the `warden`
+# binary (see src/lib.rs doc header) — never publish to a registry.
+publish = false
+
+[lib]
+name = "purge_warden"
+path = "src/lib.rs"
+
+[[bin]]
+name = "warden"
+path = "src/main.rs"
+
+# Build helper that converts the IEEE OUI registry CSV into the binary
+# layout served by `src/oui/`. Run once at release packaging — the
+# generated `oui.bin` + `oui.strings` are committed under `assets/oui/`
+# and shipped to `/var/lib/purge-warden/data/` at install time.
+[[bin]]
+name = "oui-pack"
+path = "tools/oui_pack.rs"
+
+[dependencies]
+# Core DNS
+hickory-server = "0.26"
+hickory-proto = "0.26"
+hickory-resolver = "0.26"
+# 0.26 split the network/transport layer (xfer::Protocol, runtime::Time) out of
+# hickory-proto into a new hickory-net crate. Declared direct + pinned to the
+# same 0.26 line the other three resolve to so the transport enum stays nameable.
+hickory-net = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
+# Networking (list downloads + DoH upstream)
+#
+# `gzip` and ONLY `gzip`. reqwest's decompression is a compile-time feature,
+# not a runtime header: without it the client advertises no `Accept-Encoding`
+# and decodes nothing, so warden was discarding a ~3.3x saving the origin was
+# already serving (679.6 MB of published lists against ~206.9 MB compressed).
+#
+# The other codecs are deliberately NOT here. `zstd` compresses ~6% better and
+# costs `zstd-sys`, a C library, in the DEFAULT build. gzip is acceptable
+# precisely because its decoder is pure Rust (miniz_oxide, already in the graph
+# transitively); pulling a C library into the lean default build is the line the
+# doq/dnssec/cluster gating draws elsewhere, and 6% is not a price worth it.
+# `brotli` and `deflate` add codecs the origin does not serve.
+# Content negotiation degrades gracefully: we advertise gzip, the origin picks
+# gzip, everyone else keeps sending identity.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2", "gzip"] }
+
+# TLS (DoT upstream)
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+
+# DNS-over-QUIC upstream (RFC 9250) — optional, default OFF (feature `doq`).
+# Pinned to the same rustls 0.23 + ring crypto provider as DoT so the tree keeps
+# a single rustls version and a single crypto provider (rustls-ring, NOT
+# rustls-aws-lc-rs). default-features=false also drops quinn's `platform-verifier`
+# so DoQ reuses the shared webpki-roots store like DoT. Gated to keep the default
+# and Raspberry Pi binaries byte-for-byte unchanged (quinn adds binary size).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+
+# Data structures
+dashmap = "6"
+arc-swap = "1"
+moka = { version = "0.12", features = ["future"] }
+ahash = "0.8"
+compact_str = { version = "0.8", features = ["serde"] }
+
+# Config & serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# `toml` is the serde front door; `toml_edit` is the format-preserving one.
+# Both are needed and they are the same codebase: `toml` 0.8 is a thin serde
+# layer over this exact crate, so declaring it directly pulls in no new
+# dependency tree and no new version -- 0.22 is already what Cargo.lock
+# resolves for it transitively. Used by the CLI's config write seat, where a
+# `toml::Value` round-trip would drop every comment in the operator's master
+# and re-sort its keys.
+toml_edit = { version = "0.22", features = ["serde"] }
+
+# HTTP API
+axum = "0.8"
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout", "trace"] }
+
+# Auth / crypto
+sha2 = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+subtle = "2"
+# base32hex (RFC 4648 extended-hex) for NSEC3 owner-name hashes (§4.10-3c).
+# Already in the build graph transitively via hickory-proto; declared direct +
+# optional so it is nameable only under the `dnssec` feature — adds NO new crate.
+data-encoding = { version = "2", optional = true }
+
+# Async
+async-trait = "0.1"
+
+# Regex (rule pattern matching)
+regex = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Zero secret material on drop (rev-2606 secrets-03).
+# Promoted from transitive to direct: zeroize was ALREADY in Cargo.lock,
+# pulled by rustls, rustls-pki-types and aws-lc-rs, so this compiles no new
+# code and adds no new supply-chain surface — which is what the original
+# deferral (raised right after the section-13 supply-chain review) was
+# guarding against. Operator-approved before it landed.
+zeroize = "1.8"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Daily-rotating file appender for daemon mode (Sprint 24 s24-daemon-file-logging).
+# Background worker thread + WorkerGuard for graceful flush on process exit.
+tracing-appender = "0.2"
+
+# Time (schedule matching)
+libc = "0.2"
+# Time (RFC 3339 / OffsetDateTime — Sprint 23 schedule expires_at).
+# Per project rules "Don't use chrono — use time crate (lighter, no unsafe)".
+time = { version = "0.3", features = ["serde", "parsing", "formatting", "macros"] }
+# Human-friendly duration parsing for `warden client quiet --for 15m`.
+# Sprint 23 design decision: usability trumps lean-deps for user input.
+# Parser runs once at CLI startup, zero DNS hot-path cost.
+humantime = "2"
+
+# Performance
+tikv-jemallocator = "0.6"
+# OUI vendor lookup — disk-resident table mmap'd at startup, kernel
+# page cache serves hot pages, no allocation in process RSS for the
+# OUI data itself. Pi-friendly.
+memmap2 = "0.9"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+[features]
+# DNS-over-QUIC (RFC 9250) upstream transport. OFF by default — opt in with
+# `--features doq`. Sprint §4.9-1 ships the QUIC transport + handshake only;
+# message framing + the Upstream::Doq config variant land in §4.9-2.
+doq = ["dep:quinn"]
+
+# DNSSEC validation (RFC 4033-4035) of upstream answers. OFF by default — opt in
+# with `--features dnssec`. Gates hickory-proto's ring-backed DNSSEC primitives
+# (DNSKEY/DS/RRSIG/Algorithm/TrustAnchors). `ring` is already the rustls crypto
+# provider, so this adds NO new crypto backend (mirrors the §4.9 doq decision:
+# rustls-ring, never aws-lc-rs). §4.10-1 ships the embedded root trust anchor +
+# DNSKEY/DS parsing only — signature validation lands in §4.10-2+. Kept gated so
+# the default and Raspberry Pi binaries stay byte-for-byte unchanged.
+dnssec = ["hickory-proto/dnssec-ring", "dep:data-encoding"]
+
+# §4.11 primary/secondary cluster replication. OFF by default — opt in with
+# `--features cluster`. Gates the serve-side endpoints (`/api/cluster/*`), the
+# policy serialiser, and the generation/hash bookkeeping. The `[cluster]` CONFIG
+# section is parsed unconditionally (§4.11-1) so a clustered config deserialises
+# on any build; a feature-less binary with `cluster.enabled` bails at startup
+# (mirrors the dnssec/doq `--features` contract). Kept gated so the default and
+# Raspberry Pi binaries stay byte-for-byte unchanged.
+#
+# Carries no extra dependencies since S1: the postcard+zstd domain-map codec was
+# deleted with the map transfer (`cluster_sync_policy_only.md` §3). Only policy
+# crosses the wire now, as TOML.
+cluster = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+proptest = "1"
+tempfile = "3"
+# `start_paused` for tests that must prove a WAIT happens. Dev-only: the
+# feature adds tokio's clock control, which no production path touches.
+# Needed because the property "this code waits" is temporal — a version that
+# returns instantly prints the same text, so only elapsed time separates
+# them, and asserting on a real 90s wait would put 90s in the suite.
+tokio = { version = "1", features = ["test-util"] }
+# Self-signed certs for the in-process DoQ test server (feature `doq` tests).
+# Dev-only — never compiled into the release/Pi binary.
+rcgen = "0.13"
+# gzip ENCODER for the mock origin in the list-download tests. reqwest gives us
+# the decoder; a test that proves decompression works has to produce genuinely
+# compressed bytes on the wire, and asserting against a hand-embedded blob would
+# pin the fixture rather than the behaviour.
+#
+# Adds NO crate to the build graph: `flate2` is already there transitively
+# (reqwest[gzip] -> async-compression -> compression-codecs -> flate2), and it
+# is pure Rust (miniz_oxide) — which is also the distinction that makes gzip
+# acceptable in the default build where zstd-sys is not. Dev-only, so it never
+# reaches the release/Pi binary either way.
+flate2 = "1"
+
+[[bench]]
+name = "filter_bench"
+harness = false
+
+[[bench]]
+name = "parser_bench"
+harness = false
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "z"
+
+# Line tables only, not full debuginfo: keeps backtraces file:line-accurate
+# for the dev/test loop without paying to generate and link variable-level
+# debug info nobody attaches a debugger to. Cuts both compile+link time and
+# on-disk artifact size — the two axes that matter for a 101-binary test tree.
+[profile.dev]
+debug = "line-tables-only"

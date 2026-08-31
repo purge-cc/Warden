@@ -1,0 +1,5 @@
+# Broken fixture: top-level unknown field (`extra_section`).
+# Must surface as ConfigError::UnknownField because ConfigV1 uses
+# #[serde(deny_unknown_fields)].
+schema_version = 1
+extra_section = "not a known field"

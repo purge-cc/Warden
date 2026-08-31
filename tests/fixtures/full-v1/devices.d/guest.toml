@@ -1,0 +1,5 @@
+[[devices]]
+id = "guest-ipad"
+display_name = "Guest iPad"
+ip = "10.10.9.22"
+profile = "strict"

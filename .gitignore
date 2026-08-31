@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo.lock is tracked (binary crate): reproducible release builds and
+# honest cargo-audit CI baselines.
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# purge-warden runtime data
+/lists/
+/data/
+/logs/
+*.pid
+*.sock
+
+# Fuzz artifacts
+fuzz/artifacts/
+fuzz/corpus/

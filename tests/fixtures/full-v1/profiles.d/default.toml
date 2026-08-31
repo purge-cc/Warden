@@ -1,0 +1,6 @@
+[profiles.default]
+display_name = "Default household policy"
+tags = ["uncategorized"]
+block_response = "zero"
+blocked_ttl_secs = 60
+admin_rules = ["allow-github"]

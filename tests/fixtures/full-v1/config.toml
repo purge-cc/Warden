@@ -1,0 +1,28 @@
+# Full v1 multi-file fixture (Sprint 29 — include + merge loader).
+# Master file only holds schema_version, the global [server] table,
+# and the `includes` directives. Every entity definition lives in a
+# dedicated `.d/*.toml` file to exercise the merge rules from §7.3.
+
+schema_version = 3
+
+includes = [
+  "blocklists.d/*.toml",
+  "profiles.d/*.toml",
+  "devices.d/*.toml",
+  "groups.d/*.toml",
+  "subnets.d/*.toml",
+  "schedules.d/*.toml",
+  "rules.d/*.toml",
+]
+
+[server]
+default_profile = "default"
+default_block_response = "zero"
+default_blocked_ttl_secs = 60
+
+# neutrality-10: `upstream.servers` has no default — a config that omits it
+# is REFUSED (`UPSTREAM_SERVERS_EMPTY`) rather than silently pointed at a
+# resolver warden chose. Every fixture that must load clean therefore has to
+# name one. RFC 5737 TEST-NET-1: documentation-only, unroutable, names nobody.
+[upstream]
+servers = ["192.0.2.1:53"]

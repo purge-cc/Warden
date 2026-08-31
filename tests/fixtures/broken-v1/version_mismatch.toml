@@ -1,0 +1,4 @@
+# Broken fixture: schema_version = 1 (legacy v1 from the lists_categories_v2
+# foundation bump). Sprint A bumped SCHEMA_VERSION_V1 from 1 to 2; the
+# loader now refuses any value other than 2 with ConfigError::VersionMismatch.
+schema_version = 1

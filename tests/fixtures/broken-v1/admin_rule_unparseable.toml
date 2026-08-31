@@ -1,0 +1,12 @@
+# Broken fixture (rev-2606 schema-validator-05): an [[admin_rules]] entry
+# whose rule text the filter engine cannot parse — an unclosed regex
+# group. Before the fix this linted clean and silently enforced nothing;
+# now it triggers ConfigError::ValidationFailed at validator time.
+schema_version = 3
+
+[profiles.default]
+display_name = "Default"
+
+[[admin_rules]]
+id = "poster-child"
+rule = "/broken(/"

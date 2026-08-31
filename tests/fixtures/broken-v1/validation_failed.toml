@@ -1,0 +1,19 @@
+# Broken fixture: a subnet with an empty cidrs array and another with an
+# invalid CIDR string. Triggers ConfigError::ValidationFailed /
+# MissingRequired at validator time.
+schema_version = 1
+
+[profiles.default]
+display_name = "Default"
+
+[[subnets]]
+id = "empty"
+display_name = "Empty"
+cidrs = []
+profile = "default"
+
+[[subnets]]
+id = "broken"
+display_name = "Broken CIDR"
+cidrs = ["10.0.0.0/99"]
+profile = "default"
