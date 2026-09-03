@@ -2,7 +2,7 @@
 
 pub mod audit_ecs;
 pub mod cache;
-/// §4.10-4b — DNSSEC response-path consumer (the `dnssec.mode` wiring).
+/// DNSSEC response-path consumer (the `dnssec.mode` wiring).
 #[cfg(feature = "dnssec")]
 pub mod dnssec_validator;
 pub mod edns;

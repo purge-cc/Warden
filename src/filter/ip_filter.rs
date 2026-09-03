@@ -53,9 +53,9 @@ impl IpFilter {
     ///
     /// # `policy`
     ///
-    /// F4 / F5 (incident 2026-07-27): this was the last decision point on
-    /// the query path with **no** access to the operator's policy — not a
-    /// missing comparison but a missing parameter, so a name the operator
+    /// This is the last decision point on the query path with **no** access
+    /// to the operator's policy — not a missing comparison but a missing
+    /// parameter, so a name the operator
     /// had explicitly allowed was still blocked when its answer landed in
     /// a blocked IP range. The verdict now arrives pre-resolved from
     /// [`NamePolicy::resolve`], and any explicit allow on the queried name
@@ -224,7 +224,7 @@ mod tests {
             .is_some());
     }
 
-    // ── F4 / F5 (incident 2026-07-27): the policy parameter ─────────────
+    // ── the policy parameter ─────────────────────────────────────────
 
     /// The discriminator for the two allow tests below: identical filter,
     /// identical records, `Neutral` policy → still blocked. Without it
@@ -240,8 +240,8 @@ mod tests {
         );
     }
 
-    /// F4: a name the operator allowed at *profile* level must not be
-    /// blocked because its answer landed in a blocked IP range.
+    /// A name the operator allowed at *profile* level must not be blocked
+    /// because its answer landed in a blocked IP range.
     #[test]
     fn profile_allow_suppresses_the_ip_blocklist() {
         let filter = IpFilter::with_ips(ipset(["198.51.100.66"]));
@@ -251,9 +251,9 @@ mod tests {
             .is_none());
     }
 
-    /// F4, device arm — the incident's own scope. The IP blocklist has no
-    /// per-entry attribution, so `override_profile_deny` does not gate it:
-    /// there is no profile deny in play for that flag to guard.
+    /// The IP blocklist has no per-entry attribution, so
+    /// `override_profile_deny` does not gate it: there is no profile deny
+    /// in play for that flag to guard.
     #[test]
     fn device_allow_suppresses_the_ip_blocklist_regardless_of_override() {
         let filter = IpFilter::with_ips(ipset(["198.51.100.66"]));

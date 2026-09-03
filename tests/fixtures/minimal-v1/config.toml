@@ -46,14 +46,14 @@ display_name = "Kids night lockdown"
 block_response = "soa_nodata"
 
 [[devices]]
-id = "alex-iphone"
-display_name = "Alex's phone"
-ip = "192.0.2.107"
+id = "operator-iphone"
+display_name = "iPhone di Operator"
+ip = "10.10.1.107"
 mac = "AA:BB:CC:DD:EE:FF"
 mac_aliases = ["22:33:44:55:66:77"]
 profile = "default"
 groups = ["famiglia"]
-owner = "Alex"
+owner = "Operator"
 # Legacy field name `device` kept here on purpose: exercises the
 # serde alias that maps `device` → `device_type` for TOML files
 # written before the v0.4.3 rename. New fixtures should use
@@ -64,7 +64,7 @@ department = "famiglia"
 [[devices]]
 id = "kids-tablet"
 display_name = "Tablet dei bambini"
-ip = "192.0.2.150"
+ip = "10.10.1.150"
 profile = "default"
 groups = ["kids"]
 
@@ -73,7 +73,7 @@ id = "famiglia"
 display_name = "Famiglia"
 profile = "default"
 priority = 5
-devices = ["alex-iphone"]
+devices = ["operator-iphone"]
 
 [[groups]]
 id = "kids"
@@ -85,7 +85,7 @@ devices = ["kids-tablet"]
 [[subnets]]
 id = "lan"
 display_name = "LAN di casa"
-cidrs = ["192.0.2.0/24"]
+cidrs = ["10.10.1.0/24"]
 profile = "default"
 priority = 10
 
@@ -93,7 +93,7 @@ priority = 10
 id = "quiet-hours"
 display_name = "Quiet hours"
 target_type = "device"
-target_id = "alex-iphone"
+target_id = "operator-iphone"
 profile = "default"
 days = ["all"]
 hours = "22:00-06:00"

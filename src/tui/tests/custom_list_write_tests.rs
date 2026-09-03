@@ -56,7 +56,7 @@ fn reload(master: &Path) -> crate::config::loader::LoadedConfig {
 ///
 /// `upsert_id_keyed` replaces the entry it finds, so any field
 /// `custom_list_value` omits is reset to its serde default on the next
-/// save — of anything, not of that field. This is the class project rules
+/// save — of anything, not of that field. This is the class CLAUDE.md
 /// records as `build_blocklist_value`, where the omitted field was
 /// `accept_unsigned_allow` and the loss was silent.
 ///
@@ -526,5 +526,217 @@ fn the_operators_comments_survive_a_mount() {
     assert!(
         after.contains("# ---- household policy, do not reorder ----"),
         "a comment was destroyed by the write; got:\n{after}"
+    );
+}
+
+/// An app whose rule pane has actually read the pack, with the cursor on
+/// `line`. The pane's line numbers come from that read, which is what the
+/// edit path keys on.
+fn app_on_line(master: &Path, line: usize) -> App {
+    let mut app = app_on(master);
+    refresh_custom_list_pack(&mut app, true);
+    app.custom_lists.focus = CustomListsFocus::Rules;
+    app.custom_lists.selected_line = Some(line);
+    app
+}
+
+fn press(app: &mut App, c: char) {
+    handle_custom_lists_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+}
+
+/// **`e` means the rule on the right pane and the list on the left, and
+/// only the pair proves it.**
+///
+/// The arm has to sit INSIDE the `CustomListsFocus::Rules` guard. Placed
+/// one block lower it would fall through to the list edit — which is
+/// today's behaviour and is correct on the left pane — and a test of the
+/// rule pane alone would go green on a form the operator never asked for.
+#[test]
+fn e_edits_the_rule_on_the_rule_pane_and_the_list_on_the_list_pane() {
+    use crate::tui::custom_list_modal::Stage;
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let pack = dir.path().join("packs").join("videogames.txt");
+    std::fs::write(&pack, MESSY_PACK).unwrap();
+
+    // Line 3 of MESSY_PACK is `||tracking.example.com^`.
+    let mut app = app_on_line(&master, 3);
+    press(&mut app, 'e');
+    match &app
+        .custom_lists
+        .modal
+        .as_ref()
+        .expect("e must open a modal")
+        .stage
+    {
+        Stage::AddingRule(form) => {
+            assert_eq!(form.domain, "tracking.example.com", "seeded from the row");
+            assert!(!form.allow, "the direction is seeded too");
+            assert_eq!(
+                form.replacing(),
+                Some((3, "tracking.example.com", false)),
+                "the form must remember the file line and what was on it"
+            );
+        }
+        other => panic!("the rule pane must open the rule form, got {other:?}"),
+    }
+
+    let mut app = app_on_line(&master, 3);
+    app.custom_lists.focus = CustomListsFocus::Lists;
+    press(&mut app, 'e');
+    match &app
+        .custom_lists
+        .modal
+        .as_ref()
+        .expect("e must still open the list form")
+        .stage
+    {
+        Stage::EditingForm(form) => assert_eq!(form.id, "videogames"),
+        other => panic!("the list pane must keep editing the LIST, got {other:?}"),
+    }
+}
+
+/// A line the grammar refused is DRAWN — it is the only surface where a
+/// degraded file is legible — so the cursor can rest on it. It carries no
+/// domain, so it cannot say what the operator saw, and the writer would
+/// have nothing to check the file against.
+#[test]
+fn e_on_a_line_the_reader_refused_opens_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let pack = dir.path().join("packs").join("videogames.txt");
+    std::fs::write(&pack, MESSY_PACK).unwrap();
+
+    // Line 6 is `*.wildcard.example.com`, kept as a Skipped row.
+    let mut app = app_on_line(&master, 6);
+    assert!(
+        app.custom_lists
+            .pack
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.number == 6),
+        "the fixture must put a refused line under the cursor, or this \
+         test cannot see the case it exists for"
+    );
+    press(&mut app, 'e');
+    assert!(
+        app.custom_lists.modal.is_none(),
+        "a form that can never save must not open"
+    );
+}
+
+/// The same trip-wire as the add path, from the edit side.
+///
+/// Mutation: rebuild the file from the rows the pane drew instead of
+/// substituting one line, and the comment count goes from 2 to 0.
+#[test]
+fn replacing_a_rule_from_the_tui_destroys_no_comment_and_no_broken_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let pack = dir.path().join("packs").join("videogames.txt");
+    std::fs::write(&pack, MESSY_PACK).unwrap();
+    let before = std::fs::read_to_string(&pack).unwrap();
+    assert!(
+        count_comments(&before) >= 2,
+        "the fixture must carry comments"
+    );
+
+    let app = app_on_line(&master, 3);
+    replace_rule_in_pack(
+        &app,
+        "videogames",
+        3,
+        ("tracking.example.com", false),
+        "telemetry.example.com",
+        true,
+    )
+    .expect("the replacement must land");
+
+    let after = std::fs::read_to_string(&pack).unwrap();
+    assert_eq!(count_comments(&after), count_comments(&before), "\n{after}");
+    assert_eq!(count_refused(&after), count_refused(&before), "\n{after}");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count(),
+        "a replacement changes one line, it does not add or drop any:\n{after}"
+    );
+    assert!(after.contains("@@||telemetry.example.com^"));
+    assert!(!after.contains("tracking.example.com"));
+    assert!(
+        after.lines().nth(2) == Some("@@||telemetry.example.com^"),
+        "the rule stays on its own line, under the heading that \
+         describes it:\n{after}"
+    );
+}
+
+/// **The counter-proof, built to fail.** A flip composed as remove+add
+/// would take the opposite direction of the same domain with it — a rule
+/// the operator never touched.
+#[test]
+fn flipping_one_direction_from_the_tui_leaves_the_other_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let pack = dir.path().join("packs").join("videogames.txt");
+    std::fs::write(
+        &pack,
+        "# both ways\n@@||both.example.com^\n||both.example.com^\n",
+    )
+    .unwrap();
+
+    let app = app_on_line(&master, 2);
+    replace_rule_in_pack(
+        &app,
+        "videogames",
+        2,
+        ("both.example.com", true),
+        "renamed.example.com",
+        true,
+    )
+    .expect("the edit must land");
+
+    assert_eq!(
+        std::fs::read_to_string(&pack).unwrap(),
+        "# both ways\n@@||renamed.example.com^\n||both.example.com^\n",
+        "the deny for the same domain must survive"
+    );
+}
+
+/// **The pack view is a stale read by construction.**
+///
+/// `refresh_custom_list_pack` returns early while the selection has not
+/// changed, so the pane's line numbers are those of the last read. A CLI
+/// write, a hand edit or another session moves them — and a writer keyed
+/// on the number alone would edit whatever now sits there.
+#[test]
+fn a_replacement_whose_line_moved_under_the_pane_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let pack = dir.path().join("packs").join("videogames.txt");
+    std::fs::write(&pack, "||a.example.com^\n||b.example.com^\n").unwrap();
+
+    let app = app_on_line(&master, 2);
+    // Somebody else rewrites the file behind the pane's back.
+    std::fs::write(&pack, "||b.example.com^\n||c.example.com^\n").unwrap();
+    let before = std::fs::read_to_string(&pack).unwrap();
+
+    let err = replace_rule_in_pack(
+        &app,
+        "videogames",
+        2,
+        ("b.example.com", false),
+        "d.example.com",
+        false,
+    )
+    .expect_err("the line no longer holds what the pane rendered");
+    assert!(
+        err.contains("line 2"),
+        "the error must name the line: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pack).unwrap(),
+        before,
+        "c.example.com was never the operator's to edit"
     );
 }

@@ -192,9 +192,9 @@ Must be run as root from a git clone of the purge-warden repo.
 OPTIONS:
   --lan-cidr <cidr[,cidr...]>
                           Subnet(s) allowed to query this resolver.
-                          Example: --lan-cidr 192.0.2.0/24
+                          Example: --lan-cidr 10.10.1.0/24
                           Dual-homed (LAN + VPN), comma-separated:
-                            --lan-cidr 192.0.2.0/24,100.64.0.0/10
+                            --lan-cidr 10.10.1.0/24,100.64.0.0/10
                           Auto-detected from the default route if omitted.
 
   --listen <addr:port>    Address purge-warden binds to.
@@ -501,8 +501,8 @@ validate_cidr() {
 # starts accepting more is how a validator stops validating.
 #
 # The list form exists because a dual-homed host is the normal case, not the
-# exotic one — the lab host answers on 192.0.2.5/24 (LAN) and
-# 100.64.0.3/32 (tailnet), and with only the LAN range every query arriving
+# exotic one — the lab host answers on 10.10.1.5/24 (LAN) and
+# 192.0.2.3/32 (tailnet), and with only the LAN range every query arriving
 # over the VPN is REFUSED. `warden init --allow-from` has always taken a
 # comma-separated list; it was only this flag that could not express one.
 #
@@ -845,6 +845,34 @@ installed_binary_path() {
 	else
 		printf '(missing)'
 	fi
+}
+
+# Terms the operator must see before anything is changed on the host.
+# Printed unconditionally — including under --yes and on a headless run —
+# so the acceptance is always in the install log. The interactive gate
+# that follows in main() is what turns it from a notice into consent.
+show_disclaimer() {
+	step "Before you continue"
+	cat <<EOF
+  purge-warden is free and open-source software, released under the GNU
+  Affero General Public License, version 3 or later.
+
+  It is provided "as is", WITHOUT WARRANTY OF ANY KIND, either express or
+  implied. Sections 15 and 16 of that licence set out the full disclaimer
+  of warranty and limitation of liability, and they apply to this
+  installation.
+
+  purge-warden becomes the DNS resolver for every device you point at it.
+  You alone are responsible for how you configure it: which blocklists you
+  load, which upstream resolvers you trust, and which clients you permit.
+  A mistake in that configuration can block legitimate traffic, or leave
+  your network unable to resolve names at all.
+
+  The authors and contributors accept no liability for any loss, damage,
+  or disruption arising from the use or misuse of this software. If you do
+  not accept these terms, do not install it.
+EOF
+	printf '\n'
 }
 
 show_plan() {
@@ -2229,13 +2257,14 @@ main() {
 
 	preflight
 	show_plan
+	show_disclaimer
 
 	# Ask for confirmation unless --yes, --dry-run, or no TTY at all.
 	# /dev/tty lets the prompt work even when stdin is piped (curl | bash).
 	if [[ $YES != "true" && $DRY_RUN != "true" ]]; then
 		if [[ ! -t 0 && ! -r /dev/tty ]]; then
 			warn "no TTY detected — proceeding with defaults (use --yes to silence)"
-		elif ! confirm "Proceed with install?"; then
+		elif ! confirm "Accept these terms and proceed with the install?"; then
 			log "aborted by user"
 			exit 0
 		fi

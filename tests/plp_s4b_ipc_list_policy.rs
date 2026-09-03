@@ -45,7 +45,7 @@ use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 /// defaulted the other way would fail **open** on exactly this row.
 ///
 /// Upstream is RFC 5737 TEST-NET-1 — warden ships no provider defaults
-/// (project rules §Neutrality) and a fixture is not the place to reintroduce one.
+/// (CLAUDE.md §Neutrality) and a fixture is not the place to reintroduce one.
 const MASTER_SEED: &str = r#"schema_version = 3
 
 [server]
@@ -112,6 +112,7 @@ async fn spawn_fixture() -> Fixture {
         listen_addr: "127.0.0.1:15353".into(),
         upstream_mode: "plain".into(),
         upstream_count: 0,
+        upstream_servers: Vec::new(),
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -724,6 +725,7 @@ async fn spawn_split_fixture() -> Fixture {
         listen_addr: "127.0.0.1:15353".into(),
         upstream_mode: "plain".into(),
         upstream_count: 0,
+        upstream_servers: Vec::new(),
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,

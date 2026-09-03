@@ -12,8 +12,8 @@
 //! - /run/purge-warden/                (control socket, PID file)
 //! - /var/lib/purge-warden/config.toml (default config, only if missing)
 //!
-//! With `--config <path>` every one of those moves with it. Before
-//! cli-h9 the flag was parsed, accepted, and discarded: `run_init` took
+//! With `--config <path>` every one of those moves with it. Historically
+//! the flag was parsed, accepted, and discarded: `run_init` took
 //! no path at all and wrote to the constant regardless, so
 //! `warden --config /tmp/x/config.toml init` provisioned
 //! `/var/lib/purge-warden` and reported success.
@@ -39,7 +39,7 @@ const USER: &str = "purge-warden";
 /// `--config` is honoured, and the unflagged default stays put.
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "/var/lib/purge-warden/config.toml";
 
-/// neutrality-03: the whole message an operator sees when they run
+/// The whole message an operator sees when they run
 /// `warden init` without `--upstream`. It is the ONLY thing standing
 /// between them and a dead-end, because there is no compiled-in default
 /// to fall back on any more — so it must name the flag, show the shape,
@@ -64,7 +64,7 @@ const DEFAULT_ALLOW_FROM: &[&str] = &[
     "127.0.0.0/8",
 ];
 const DEFAULT_LISTEN: &str = "0.0.0.0:53";
-/// neutrality-03: there is deliberately **no** default upstream.
+/// There is deliberately **no** default upstream.
 ///
 /// This used to be Cloudflare, so every fresh install routed the whole
 /// household's DNS to one named company that warden — not the operator —
@@ -72,14 +72,14 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:53";
 /// scaffold therefore ships an empty `upstream.servers`, which the
 /// validator already rejects with the frozen `UPSTREAM_SERVERS_EMPTY`
 /// message, so the operator is told exactly what to supply instead of
-/// silently inheriting our preference. See project rules §Neutrality.
+/// silently inheriting our preference.
 const NO_DEFAULT_UPSTREAMS: &[&str] = &[];
 
 /// The config body `warden init --yes` writes with no overrides.
 ///
 /// Delegates to [`render_default_config`] so there is exactly ONE
 /// template in the tree — the former `DEFAULT_CONFIG` const drifted
-/// from the render path (rev-2606: the const shipped dual-channel
+/// from the render path (the const once shipped dual-channel
 /// list wiring with 404 entity URLs while tests exercised the const,
 /// not the render). Consumers: `config edit`'s missing-file seed and
 /// the tests below.
@@ -102,7 +102,7 @@ pub(crate) fn default_config() -> String {
 /// Every directory and file `warden init` provisions, derived from one
 /// config path.
 ///
-/// One derivation, one owner. The pre-cli-h9 code carried four unrelated
+/// One derivation, one owner. The old code carried four unrelated
 /// constants (`BASE_DIR`, `RUN_DIR`, `CONFIG_PATH`, and a socket path
 /// baked into the render), which is why `--config` could move none of
 /// them.
@@ -199,10 +199,10 @@ impl InitLayout {
     }
 }
 
-/// CLI override values for `warden init` (rev-2606 P0-2: these back
+/// CLI override values for `warden init` — these back
 /// the `--listen` / `--upstream` / `--allow-from` / `--lists` flags so
 /// provisioning scripts — install.sh first among them — can drive a
-/// fully non-interactive, fully specified scaffold). `None` falls back
+/// fully non-interactive, fully specified scaffold. `None` falls back
 /// to the interactive prompt where one exists, or the baked-in default
 /// under `--yes`.
 #[derive(Debug, Default)]
@@ -218,7 +218,7 @@ pub struct InitOverrides {
     /// Path to the `upstreams.toml` menu catalog. Defaults to
     /// `<config_dir>/upstreams.toml`; absent is a supported state.
     pub upstream_catalog: Option<PathBuf>,
-    /// `--cluster-secondary --peer <url>`: scaffold a §5.3 secondary
+    /// `--cluster-secondary --peer <url>`: scaffold a secondary
     /// master — node-local sections only, no policy at all. `None` is the
     /// ordinary standalone scaffold.
     pub cluster_secondary_peer: Option<String>,
@@ -266,7 +266,7 @@ pub fn run_init(
         Some(v) => validated_listen(v)?,
         None => DEFAULT_LISTEN.to_string(),
     };
-    // §5.3 — a cluster secondary's scaffold. Branches BEFORE upstream
+    // A cluster secondary's scaffold. Branches BEFORE upstream
     // resolution and before every prompt, because each of the three things
     // the standalone path gathers next (`[upstream]`, `[profiles.*]`,
     // `[[blocklists]]`) is policy the primary supplies, and a secondary's
@@ -275,7 +275,7 @@ pub fn run_init(
         return run_init_cluster_secondary(&layout, force, &listen, peer, overrides);
     }
 
-    // neutrality-03/-09: no vendor fallback, and warden still picks
+    // No vendor fallback, and warden still picks
     // nobody. The operator's flag wins; otherwise `init` proposes the
     // resolver THIS MACHINE already uses (its network chose it, we did
     // not) plus whatever the operator put in `upstreams.toml`.
@@ -340,7 +340,7 @@ pub fn run_init(
             ))
             .map_err(|e| anyhow::anyhow!("failed to format timestamp: {}", e))?;
         // Bump the name on a same-second collision so a rapid `--force`
-        // re-run can't silently clobber the pre-init rollback copy (cli §9 #8).
+        // re-run can't silently clobber the pre-init rollback copy.
         let backup = crate::cli::commands::make_unique_path(
             config_path.with_extension(format!("toml.pre-init-{ts}")),
         );
@@ -348,10 +348,10 @@ pub fn run_init(
         println!("renamed previous config to {}", backup.display());
     }
 
-    // §4.31 DISC-2: route the first-boot master through the hardened
+    // Route the first-boot master through the hardened
     // atomic-write helper. Explicit mode 0o640 closes the 0o644 race
     // window the previous `fs::write` + `set_permissions` pair left
-    // open (same antipattern documented at `src/config/audit.rs:476`).
+    // open (the same antipattern documented in `src/config/audit.rs`).
     // The owner-preservation branch of the helper only fires when the
     // target already existed; we are on the first-write path so the
     // explicit `chown` call afterwards keeps the daemon-owned semantics.
@@ -395,7 +395,7 @@ pub fn run_init(
     Ok(())
 }
 
-/// `warden init --cluster-secondary --peer <url>` (§5.3).
+/// `warden init --cluster-secondary --peer <url>`.
 ///
 /// Writes the keep-list and nothing else: `schema_version`, `[server]`
 /// (node-local fields only), `[api]`, `[socket]`, `[tracking]`, `[backup]`,
@@ -466,7 +466,7 @@ fn run_init_cluster_secondary(
     Ok(())
 }
 
-/// Write the §5.3 scaffold at `0o640`.
+/// Write the cluster-secondary scaffold at `0o640`.
 ///
 /// A seam, not decoration. [`run_init_cluster_secondary`] is unreachable from a
 /// test — [`run_init`] bails on [`is_root`], and the two steps that need root
@@ -489,7 +489,7 @@ fn write_cluster_secondary_scaffold(config_path: &Path, body: &str) -> anyhow::R
     Ok(())
 }
 
-/// Render the §5.3 keep-list body for [`run_init_cluster_secondary`].
+/// Render the cluster-secondary keep-list body for [`run_init_cluster_secondary`].
 ///
 /// Built from typed parts, like [`render_default_config`], so the result is
 /// valid TOML regardless of the answers. The absences are the point: any
@@ -723,7 +723,7 @@ fn prompt_line(question: &str) -> anyhow::Result<String> {
     Ok(buf.trim().to_string())
 }
 
-/// Q1 — default profile. We ship with `default` because every scaffold
+/// Default profile prompt. We ship with `default` because every scaffold
 /// already defines a matching profile section; naming a different id
 /// would leave the config referencing a non-existent profile.
 fn prompt_default_profile() -> anyhow::Result<String> {
@@ -742,7 +742,7 @@ fn prompt_default_profile() -> anyhow::Result<String> {
     })
 }
 
-/// Q2 — blocklist subscriptions. Default keeps the canonical three
+/// Blocklist subscriptions prompt. Default keeps the canonical three
 /// (security/malicious + privacy/ads + privacy/tracking).
 fn prompt_lists() -> anyhow::Result<Vec<String>> {
     let answer = prompt_line(&format!(
@@ -757,7 +757,7 @@ fn prompt_lists() -> anyhow::Result<Vec<String>> {
     })
 }
 
-/// Q3 — client ACL (rev-2606 P0-2 / init-01). The scaffold binds
+/// Client ACL prompt. The scaffold binds
 /// 0.0.0.0, and an unspecified bind with an empty `allow_from` is an
 /// open resolver the validator refuses — so init must collect a
 /// non-empty ACL on every path.
@@ -808,7 +808,7 @@ fn validated_upstreams(csv: &str) -> anyhow::Result<Vec<String>> {
     Ok(items)
 }
 
-/// Typed-parse gate for `default_profile` (init render escape, roundup-01).
+/// Typed-parse gate for `default_profile` (init render escape).
 ///
 /// `default_profile` is interpolated raw into the generated TOML
 /// (`default_profile = "{x}"`, `[profiles.{x}]`). The other scaffold inputs are
@@ -862,7 +862,7 @@ struct ScaffoldList {
 /// becomes a `[[blocklists]]` entity with the URL the catalog's
 /// offline fallback table maps the slug to — the SAME table the
 /// daemon's fetcher falls back to, so the scaffold can never invent a
-/// URL shape the CDN doesn't serve (rev-2606 discovery: the previous
+/// URL shape the CDN doesn't serve (a previous
 /// hand-rolled `https://lists.purge.cc/<scope>/<topic>.txt` form was
 /// 404 fiction; the catalog serves flat `<topic>.txt`).
 ///
@@ -954,7 +954,7 @@ fn render_default_config(
     out.push_str("log_level = \"info\"\n");
     if default_profile.is_empty() {
         out.push_str(
-            "# SN2: leaving default_profile commented out means REFUSED for every\n\
+            "# Leaving default_profile commented out means REFUSED for every\n\
              # source IP that doesn't match a [[devices]], [[groups]] or [[subnets]] row.\n\
              # default_profile = \"default\"\n",
         );
@@ -1008,7 +1008,7 @@ fn render_default_config(
     //
     // `warden init` used to stamp `tags = ["uncategorized"]` on both,
     // because tag intersection was what made the bundled lists apply. It
-    // has not been since the `plp-s3` cutover: `effective_direction` is
+    // has not been since the tag-model cutover: `effective_direction` is
     // `profile.lists[list]` if present, else `list.base`, and `base`
     // defaults to `deny`. Filtering is ON out of the box for exactly the
     // same configs, by a mechanism that reads the key the operator can
@@ -1055,7 +1055,7 @@ fn render_default_config(
     out.push_str(
         "\n# Example [[devices]] / [[groups]] / [[subnets]] entries (commented out)\n\
          # — uncomment and adapt to bind specific sources to specific profiles.\n\
-         # See `_docs/features/config_architecture.md` §8 for the full schema.\n\
+         # See PROJECT.md for the full schema.\n\
          #\n\
          # Field order below matches the Device struct. Any field left out\n\
          # (not just commented) is simply treated as \"not set\" — the file\n\
@@ -1063,15 +1063,15 @@ fn render_default_config(
          # else is optional.\n\
          #\n\
          # [[devices]]\n\
-         # id           = \"alex-iphone-01\"        # stable key, lowercase-ascii-dashes; never rename\n\
-         # display_name = \"Alex's phone\"        # human label shown in TUI / logs\n\
-         # ip           = \"192.0.2.107\"              # optional static IP pin\n\
+         # id           = \"operator-iphone-01\"        # stable key, lowercase-ascii-dashes; never rename\n\
+         # display_name = \"iPhone di Operator\"        # human label shown in TUI / logs\n\
+         # ip           = \"10.10.1.107\"              # optional static IP pin\n\
          # mac          = \"AA:BB:CC:DD:EE:FF\"        # optional primary MAC (uppercase)\n\
          # mac_aliases  = [\"22:33:44:55:66:77\"]      # optional extra MACs (iOS/Android randomisation)\n\
          # profile      = \"default\"                  # optional; wins over group/subnet\n\
          # groups       = [\"famiglia\"]               # optional group memberships (see [[groups]])\n\
          # tags         = [\"mobile\", \"personal\"]     # optional free-form labels (UI filter only)\n\
-         # owner        = \"Alex\"                  # optional; purely descriptive\n\
+         # owner        = \"Operator\"                  # optional; purely descriptive\n\
          # device       = \"iPhone personale\"         # optional model/type description\n\
          # department   = \"famiglia\"                 # optional zone / department label\n\
          # notes        = \"compleanno gennaio\"       # optional free text\n\
@@ -1186,7 +1186,7 @@ fn chown(path: &Path) -> anyhow::Result<()> {
 }
 
 fn chown_recursive(path: &Path) -> anyhow::Result<()> {
-    // roundup-01: `-h` (`--no-dereference`) so a symlink encountered during the
+    // `-h` (`--no-dereference`) so a symlink encountered during the
     // recursive walk has ITS OWN ownership changed, never the target's. On a
     // first `init` the tree is freshly created and symlink-free, but a `--force`
     // re-init walks `/var/lib/purge-warden` which already holds daemon-written
@@ -1265,14 +1265,14 @@ mod tests {
         assert_eq!(mode, 0o750);
     }
 
-    // ── cli-h9 defect 1: `--config` was accepted and discarded ──────────
+    // ── `--config` was accepted and discarded ──────────
 
-    /// **The highest-value test in this sprint.** `scripts/install.sh:28`
+    /// A high-value regression test. `scripts/install.sh`
     /// hardcodes `CONFIG_PATH="/var/lib/purge-warden/config.toml"`, runs
-    /// `init --yes` with no `--config` (line 550), and then dies if that
+    /// `init --yes` with no `--config`, and then dies if that
     /// exact file is missing. The installer is not ours to edit, so the
-    /// unflagged layout must stay byte-for-byte what it was before this
-    /// sprint — every field, not just the config path.
+    /// unflagged layout must stay byte-for-byte what it was —
+    /// every field, not just the config path.
     #[test]
     fn unflagged_layout_is_unchanged_from_the_pre_h9_constants() {
         let l = InitLayout::for_config(Path::new(DEFAULT_CONFIG_PATH));
@@ -1292,7 +1292,7 @@ mod tests {
             "the socket the rendered config points at"
         );
 
-        // And the exact directory set, in the pre-h9 creation order.
+        // And the exact directory set, in creation order.
         let dirs: Vec<_> = l.dirs_to_create().into_iter().collect();
         assert_eq!(
             dirs,
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     /// An explicit `--config` under a temp dir must move EVERYTHING. The
-    /// discriminating assertions are the negative ones: pre-h9 the layout
+    /// discriminating assertions are the negative ones: previously the layout
     /// was the constants regardless of what was passed, so a test that
     /// only checked `config_path` would have passed on the bug the moment
     /// the field existed.
@@ -1375,7 +1375,7 @@ mod tests {
             .contains(&PathBuf::from("/etc/purge-warden")));
     }
 
-    /// cli-h9: the rendered `[socket] path` must name a directory init
+    /// The rendered `[socket] path` must name a directory init
     /// actually created. It was a hardcoded `/run/purge-warden/control.sock`
     /// regardless of layout, so an init anywhere else produced a config
     /// describing a socket the daemon could never bind — and every IPC verb
@@ -1416,7 +1416,7 @@ mod tests {
         );
     }
 
-    // ── §5.3: the cluster-secondary scaffold ────────────────────────────
+    // ── the cluster-secondary scaffold ────────────────────────────
     //
     // WHAT IS AND IS NOT COVERED HERE — declared, not implied.
     //
@@ -1440,7 +1440,7 @@ mod tests {
     fn secondary_scaffold(dir: &Path) -> String {
         render_cluster_secondary_config(
             "0.0.0.0:53",
-            &["192.0.2.0/24".to_string()],
+            &["10.10.1.0/24".to_string()],
             &dir.join("control.sock"),
             "https://192.0.2.10:8053",
         )
@@ -1631,10 +1631,10 @@ mod tests {
         );
     }
 
-    /// The end-to-end claim S2 exists to make: the documented path to a
-    /// second node produces a master that `join` ACCEPTS and that LOADS
-    /// once joined. Before S2 the scaffold had to be hand-edited, and the
-    /// hand-edit was itself refused.
+    /// The end-to-end claim this test exists to make: the documented path
+    /// to a second node produces a master that `join` ACCEPTS and that
+    /// LOADS once joined. Previously the scaffold had to be hand-edited,
+    /// and the hand-edit was itself refused.
     #[cfg(feature = "cluster")]
     #[test]
     fn the_cluster_secondary_scaffold_is_joinable_and_loads_after() {
@@ -1661,7 +1661,7 @@ mod tests {
         );
     }
 
-    // ── cli-h9 defect 3: init left the operator without a token ─────────
+    // ── init left the operator without a token ─────────
 
     /// `init` creates no IPC token, and every Mutating/Admin command
     /// refuses without one. The old block listed two steps — edit, start —
@@ -1715,7 +1715,7 @@ mod tests {
         );
     }
 
-    // ── cli-h9 defect 7: the printed start command could not work ───────
+    // ── the printed start command could not work ───────
 
     /// The scaffold binds :53 and the block tells the operator to run as
     /// the unprivileged `purge-warden` user. `sudo -u` confers no
@@ -1781,7 +1781,7 @@ mod tests {
         );
     }
 
-    // ── cli-h9 defect 2: init mutated before checking ───────────────────
+    // ── init mutated before checking ───────────────────
 
     /// An existing config without `--force` is refused, and the refusal is
     /// a *read-only* outcome: `check_preconditions` performs no mutation,
@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn validated_default_profile_rejects_hostile_or_typod_ids() {
-        // roundup-01: a TOML-breaking / injection attempt or any non-charset
+        // A TOML-breaking / injection attempt or any non-charset
         // value must be refused before it reaches `render_default_config`.
         assert!(validated_default_profile("a\"]\nevil = true").is_err());
         assert!(validated_default_profile("Has Spaces").is_err());
@@ -1878,14 +1878,14 @@ mod tests {
         assert!(validated_default_profile("UPPER").is_err());
     }
 
-    /// neutrality-03 — the scaffold must not route a fresh install's
+    /// The scaffold must not route a fresh install's
     /// entire DNS traffic to a provider warden picked.
     ///
     /// `DEFAULT_UPSTREAMS` used to be Cloudflare (`1.1.1.1:53`,
     /// `1.0.0.1:53`), so every `warden init` handed one named company the
     /// household's full query stream by default. There is no neutral
     /// non-empty default — any address favours someone — so the scaffold
-    /// ships none and the operator states one. See project rules §Neutrality.
+    /// ships none and the operator states one.
     #[test]
     fn neutrality03_scaffold_ships_no_vendor_upstream() {
         let body = default_config();
@@ -1904,7 +1904,7 @@ mod tests {
         );
     }
 
-    /// neutrality-03: the dead-end message is the only recovery surface a
+    /// The dead-end message is the only recovery surface a
     /// fresh operator gets, so it has to READ like prose in a terminal.
     /// The first version was an inline multi-line literal whose source
     /// indentation ended up inside the string — on the CT it printed as
@@ -1938,9 +1938,8 @@ mod tests {
         );
     }
 
-    // rev-2606 P0-2 (init-scaffold-silent-no-blocking): replaces the
-    // pre-rework `default_config_sources_match_catalog_defaults`, which
-    // pinned the dual-channel shape (DEFAULT_SOURCES mirrored into
+    // Replaces the old `default_config_sources_match_catalog_defaults`,
+    // which pinned the dual-channel shape (DEFAULT_SOURCES mirrored into
     // `[lists].sources`). The scaffold is single-channel now: slugs
     // become `[[blocklists]]` entities with catalog-resolved URLs, the
     // legacy slug channel stays empty.
@@ -1980,9 +1979,9 @@ mod tests {
         // End-to-end: parse the scaffold, stand up a FilterEngine with
         // a known-bad domain mapped to the bit the profile mask uses,
         // build a v1 ResolvedProfile via the same path start.rs uses,
-        // and confirm the hot-path evaluator blocks. §4.24: the bit map
-        // is the typed [`SourceBitMap`] — the post-§4.24 production
-        // path — so `bit_for_v1_id` is the only consumer lookup.
+        // and confirm the hot-path evaluator blocks. The bit map
+        // is the typed [`SourceBitMap`], so `bit_for_v1_id` is the only
+        // consumer lookup.
         use crate::filter::engine::{FilterEngine, FilterResult};
         use crate::lists::manager::merge_sources_with_blocklists;
         use crate::lists::source_key::SourceBitMap;
@@ -2008,7 +2007,7 @@ mod tests {
             cfg.local_dns.ttl_secs,
         );
 
-        // `plp-s3`: the subscription is no longer a field on the resolved
+        // The subscription is no longer a field on the resolved
         // profile — it is the publish-time projection of the operator's
         // policy onto this generation's bits. Same claim, asked where the
         // answer now lives.
@@ -2066,7 +2065,7 @@ mod tests {
         // for the default profile. Any of the three steps failing means
         // a fresh install would refuse to boot.
         //
-        // rev-2606 P0-2 extension — BIT IDENTITY: a non-zero mask is
+        // BIT IDENTITY: a non-zero mask is
         // not enough (the dual-channel scaffold had a non-zero mask
         // pointing at bits the downloads never populated). The pin is
         // now: merged sources == exactly the catalog URLs of
@@ -2084,7 +2083,7 @@ mod tests {
         let mut cfg: ConfigV1 =
             toml::from_str(&body).expect("rendered template parses as ConfigV1");
 
-        // neutrality-03: the scaffold deliberately ships NO upstream, so it
+        // The scaffold deliberately ships NO upstream, so it
         // must fail validation on exactly that and nothing else. `warden
         // init` refuses without `--upstream` rather than writing this body,
         // so the "a fresh install boots" invariant is preserved by failing
@@ -2162,15 +2161,15 @@ mod tests {
     }
 
     /// The scaffold writes no association key the operator did not ask
-    /// for — not the v1 `[[categories]]` entity, and since `plp-s5c` not
+    /// for — not the v1 `[[categories]]` entity, and not
     /// a `tags` array either.
     ///
     /// **This test was INVERTED, and the previous claim is the record.**
     /// It required `tags = ["uncategorized"]` on every bundled blocklist
     /// and on the default profile, "so a fresh install boots with
     /// filtering ON for every device that inherits the system-reserved
-    /// sentinel". That was the mechanism until `plp-s3`; it has not been
-    /// since. `effective_direction` is `profile.lists[list]` if present,
+    /// sentinel". That was the mechanism until the tag-model cutover; it
+    /// has not been since. `effective_direction` is `profile.lists[list]` if present,
     /// else `list.base`, and `base` defaults to `deny`.
     ///
     /// So the tags were doing nothing, and writing them was warden
@@ -2229,7 +2228,7 @@ mod tests {
         );
     }
 
-    // rev-2606 P0-2: flag-value gates. Typed parses double as the
+    // Flag-value gates. Typed parses double as the
     // TOML-injection guard for everything init interpolates.
     #[test]
     fn flag_gates_accept_valid_and_reject_garbage() {

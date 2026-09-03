@@ -1,15 +1,14 @@
 //! [`Schedule`] — time-window profile override for a device or group.
 //!
-//! Per design doc §8.6 and DM4. Schedules override the underlying
-//! device/group/subnet resolution for the duration of their active
-//! window (resolver level 2).
+//! Schedules override the underlying device/group/subnet resolution for
+//! the duration of their active window (resolver level 2).
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::id::Id;
 
-/// What kind of entity the schedule applies to (DM4).
+/// What kind of entity the schedule applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScheduleTargetType {
@@ -39,8 +38,7 @@ pub enum ScheduleTargetType {
 /// that instant (`ParsedSchedule::is_active` checks expiry first), so an
 /// expired row on disk is inert. The validator WARNs on — never refuses —
 /// an already-expired entry: refusing would brick boot/reload/CLI for a
-/// row that no longer does anything (rev-2606 schema-validator-01).
-/// Expired rows are pruned from disk by the daemon's 60-second schedule
+/// row that no longer does anything. Expired rows are pruned from disk by the daemon's 60-second schedule
 /// tick and by `warden device quiet`'s pre-clean; `warden schedule
 /// remove <id>` drops one on demand.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -89,7 +87,7 @@ hours = "21:00-07:00"
 id = "focus"
 display_name = "Focus mode"
 target_type = "device"
-target_id = "alex-laptop"
+target_id = "edo-laptop"
 profile = "focus-only"
 days = ["weekdays"]
 hours = "09:00-12:00"

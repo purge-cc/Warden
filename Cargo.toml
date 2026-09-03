@@ -1,6 +1,6 @@
 [package]
 name = "purge-warden"
-version = "0.38.0"
+version = "0.40.0"
 edition = "2021"
 # Minimum supported Rust version. cargo enforces this at build time even
 # for a `publish = false` crate, so an outsider on an older toolchain gets a
@@ -101,6 +101,13 @@ tower-http = { version = "0.6", features = ["timeout", "trace"] }
 # Auth / crypto
 sha2 = "0.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Self-signed certificate minting for a cluster primary (`cluster::certgen`).
+# Optional so the default and Raspberry Pi binaries stay byte-for-byte
+# unchanged; turned on by `cluster`. Default features are crypto+pem+ring —
+# `ring` is already the rustls crypto provider here, so this adds NO second
+# crypto backend (same rule as the doq/dnssec decisions). Also present in
+# `[dev-dependencies]`, deliberately: see the note there.
+rcgen = { version = "0.13", optional = true }
 hex = "0.4"
 subtle = "2"
 # base32hex (RFC 4648 extended-hex) for NSEC3 owner-name hashes (§4.10-3c).
@@ -136,7 +143,7 @@ tracing-appender = "0.2"
 # Time (schedule matching)
 libc = "0.2"
 # Time (RFC 3339 / OffsetDateTime — Sprint 23 schedule expires_at).
-# Per project rules "Don't use chrono — use time crate (lighter, no unsafe)".
+# Per CLAUDE.md "Don't use chrono — use time crate (lighter, no unsafe)".
 time = { version = "0.3", features = ["serde", "parsing", "formatting", "macros"] }
 # Human-friendly duration parsing for `warden client quiet --for 15m`.
 # Sprint 23 design decision: usability trumps lean-deps for user input.
@@ -177,10 +184,13 @@ dnssec = ["hickory-proto/dnssec-ring", "dep:data-encoding"]
 # (mirrors the dnssec/doq `--features` contract). Kept gated so the default and
 # Raspberry Pi binaries stay byte-for-byte unchanged.
 #
-# Carries no extra dependencies since S1: the postcard+zstd domain-map codec was
-# deleted with the map transfer (`cluster_sync_policy_only.md` §3). Only policy
-# crosses the wire now, as TOML.
-cluster = []
+# Carries exactly ONE dependency, `rcgen` (S4): the primary mints its own
+# self-signed API certificate so the secondary has something to pin. The
+# postcard+zstd domain-map codec that used to be here went out with the map
+# transfer (`cluster_sync_policy_only.md` §3) — only policy crosses the wire
+# now, as TOML. This comment read "carries no extra dependencies" until S4;
+# it is updated in the commit that made it false rather than left to rot.
+cluster = ["dep:rcgen"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
@@ -192,9 +202,20 @@ tempfile = "3"
 # returns instantly prints the same text, so only elapsed time separates
 # them, and asserting on a real 90s wait would put 90s in the suite.
 tokio = { version = "1", features = ["test-util"] }
-# Self-signed certs for the in-process DoQ test server (feature `doq` tests).
-# Dev-only — never compiled into the release/Pi binary.
+# Self-signed certs for the in-process DoQ test server (feature `doq` tests)
+# and for `cluster::pinned`'s TLS fixtures.
+#
+# KEEP, even though `[dependencies]` now carries an optional `rcgen`: an
+# optional dependency is nameable only when its feature is on, so dropping this
+# line breaks `cargo test --features doq` (and the default `cargo test`) for a
+# crate those builds never enable. Both entries resolve to the same 0.13.x, so
+# this costs no second compile.
 rcgen = "0.13"
+# PEM decoding in `cluster::certgen`'s tests only — the fingerprint test decodes
+# the emitted PEM back to DER *independently* of the mint (which digests
+# `rcgen`'s DER directly) so the two paths cross-check instead of agreeing with
+# themselves. Already in the lock via rcgen; adds no crate to the graph.
+pem = "3"
 # gzip ENCODER for the mock origin in the list-download tests. reqwest gives us
 # the decoder; a test that proves decompression works has to produce genuinely
 # compressed bytes on the wire, and asserting against a hand-embedded blob would

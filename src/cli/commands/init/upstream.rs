@@ -1,6 +1,6 @@
 //! Upstream resolver detection and the `warden init` menu.
 //!
-//! neutrality-09. Everything provider-adjacent lives in this one file so
+//! Everything provider-adjacent lives in this one file so
 //! a reader asking "where could a provider name hide?" has one place to
 //! look. There are none: entry 1 is read from the machine, entries 2..N
 //! are read from an operator-editable data file.
@@ -21,7 +21,7 @@ pub(crate) struct UpstreamChoice {
     pub servers: Vec<String>,
 }
 
-/// rev-detect F7: **`deny_unknown_fields` is what makes this file's
+/// **`deny_unknown_fields` is what makes this file's
 /// promise true.** Without it, `[[upstreams]]` — the plural, the single
 /// likeliest typo for this schema — is simply a different top-level key:
 /// serde discards it, `#[serde(default)]` supplies an empty `upstream`,
@@ -83,7 +83,7 @@ const DETECTED_PORT: u16 = 53;
 /// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4
 /// form, leaving everything else untouched.
 ///
-/// rev-detect F1: without this, `[::ffff:0.0.0.0]:53` — a spelling clap
+/// Without this, `[::ffff:0.0.0.0]:53` — a spelling clap
 /// accepts, `validated_listen` blesses, and the **kernel binds as a
 /// wildcard over every IPv4 address** — is not `is_unspecified()`,
 /// because its octets are not all zero. The self-loop rule therefore
@@ -163,12 +163,11 @@ pub(crate) fn filter_candidates(
 /// Port 0 is ephemeral, so this cannot collide with a listener — and the
 /// socket is dropped immediately.
 ///
-/// Measured on `the lab host` 2026-07-31 across four arms: `192.0.2.10`
-/// (its own address) and `127.0.0.1` bind; `192.0.2.1` (the LAN gateway)
-/// and an off-network address return "Cannot assign requested address".
-/// The standing check is `a_public_address_is_not_local` below, which
-/// uses an RFC 5737 address — this module names no resolver, including
-/// in its comments.
+/// Measured across four arms: a host's own address and loopback bind;
+/// the LAN gateway and an off-network address return "Cannot assign
+/// requested address". The standing check is
+/// `a_public_address_is_not_local` below, which uses an RFC 5737
+/// address — this module names no resolver, including in its comments.
 pub(crate) fn is_local_address(ip: IpAddr) -> bool {
     UdpSocket::bind((ip, 0)).is_ok()
 }
@@ -195,7 +194,7 @@ pub(crate) fn parse_resolv_conf(body: &str) -> Vec<IpAddr> {
 
 /// What detection found, and what survived filtering.
 ///
-/// rev-detect F1: an empty `usable` is **two** states, and collapsing
+/// An empty `usable` is **two** states, and collapsing
 /// them to one produced the worst kind of error message — one that
 /// contradicts what the operator can see in `/etc/resolv.conf`.
 #[derive(Debug, Default, Clone)]
@@ -405,8 +404,7 @@ pub(crate) fn parse_resolvectl(body: &str) -> Vec<IpAddr> {
 /// the file holds nothing but the `systemd-resolved` stub.
 ///
 /// **`resolvectl` being absent is an empty result, never an error** —
-/// it is not installed on `the lab host`, the project's own canonical
-/// environment, and detection must not fail there.
+/// it is not installed on every host, and detection must not fail there.
 pub(crate) fn detect_upstreams(listen: &str) -> Detection {
     let mut candidates = std::fs::read_to_string("/etc/resolv.conf")
         .map(|body| parse_resolv_conf(&body))
@@ -424,7 +422,7 @@ pub(crate) fn detect_upstreams(listen: &str) -> Detection {
 
     // `seen` keeps the pre-filter list so the caller can distinguish
     // "this machine names no resolver" from "every resolver it names is
-    // us" — see `Detection` and rev-detect F1.
+    // us" — see `Detection`.
     Detection {
         usable: filter_candidates(candidates.clone(), listen, &is_local_address),
         seen: candidates,
@@ -435,8 +433,8 @@ pub(crate) fn detect_upstreams(listen: &str) -> Detection {
 mod tests {
     use super::*;
 
-    /// Shaped on the real `/etc/resolv.conf` from `the lab host`
-    /// (2026-07-31), whose FIRST nameserver is warden's own address.
+    /// Shaped on a real `/etc/resolv.conf` whose FIRST nameserver is
+    /// warden's own address.
     #[test]
     fn parses_nameserver_lines_in_order() {
         let body = "domain home.local\nsearch home.local\nnameserver 192.0.2.10\nnameserver 149.112.112.112\n";
@@ -472,9 +470,9 @@ mod tests {
         assert!(parse_resolv_conf("").is_empty());
     }
 
-    /// Verified against `the lab host` 2026-07-31 with the equivalent
-    /// python probe: the host's own address and loopback bind; a public
-    /// resolver and the LAN gateway return EADDRNOTAVAIL.
+    /// Verified with an equivalent python probe: the host's own address
+    /// and loopback bind; a public resolver and the LAN gateway return
+    /// EADDRNOTAVAIL.
     ///
     /// Loopback is the arm that works on every machine, including CI.
     #[test]
@@ -506,7 +504,7 @@ mod tests {
         assert_eq!(got, vec!["192.0.2.1:53".to_string()]);
     }
 
-    /// The rule that matters on the lab host, whose first nameserver is
+    /// The rule that matters when a host's first nameserver is
     /// its own address. `0.0.0.0:53` means warden answers on every local
     /// address, so a candidate on port 53 that IS one of ours self-loops.
     #[test]
@@ -572,7 +570,7 @@ mod tests {
         assert_eq!(got, vec!["192.0.2.1:53".to_string()]);
     }
 
-    /// rev-detect F1, the highest-blast-radius finding. `::ffff:0.0.0.0`
+    /// `::ffff:0.0.0.0`
     /// is the IPv4-mapped spelling of the wildcard: clap accepts it,
     /// `validated_listen` blesses it, and the kernel binds **every IPv4
     /// address** — the reviewer proved that by binding it and then
@@ -637,9 +635,9 @@ mod tests {
         assert!(parse_resolvectl("").is_empty());
     }
 
-    /// `resolvectl` is NOT installed on the lab host. A missing binary
-    /// must read as "no candidates", never as an error — measured
-    /// 2026-07-31: `resolvectl: command not found`.
+    /// `resolvectl` is not installed on every host. A missing binary
+    /// must read as "no candidates", never as an error:
+    /// `resolvectl: command not found`.
     #[test]
     fn detect_never_panics_and_returns_a_vec() {
         let got = detect_upstreams("0.0.0.0:53");
@@ -709,7 +707,7 @@ servers = ["192.0.2.1:53", "192.0.2.2:53"]
         );
     }
 
-    /// rev-detect F7. The test above passes for the WRONG REASON: `nmae`
+    /// The test above passes for the WRONG REASON: `nmae`
     /// errors because the required field `name` is then missing, not
     /// because `nmae` is unknown. It would pass identically against a
     /// deserializer that silently ignores unknown keys — which is what
@@ -862,7 +860,7 @@ servers = ["192.0.2.1:53", "192.0.2.2:53"]
         assert_eq!(err.to_string(), super::super::UPSTREAM_MISSING);
     }
 
-    /// rev-detect F1. "Empty" is TWO states and they were conflated:
+    /// "Empty" is TWO states and they were conflated:
     /// nothing was read from the machine, versus everything read was
     /// dropped as loopback or as us.
     ///

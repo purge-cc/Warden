@@ -1,4 +1,4 @@
-//! Per-list runtime telemetry (Sprint 43 T1, DM3).
+//! Per-list runtime telemetry.
 //!
 //! Every blocklist source tracked by [`super::manager::ListManager`] gets a
 //! [`ListStatus`] handle held behind an [`ArcSwap`]. On each refresh the
@@ -113,7 +113,7 @@ pub struct ParsedCounts {
     /// line — is never charged here. That bound is load-bearing now that
     /// the cap fails closed: a source whose *domains* stay under the cap
     /// must not lose its entire body because its *lines* ran past it.
-    /// Until S2 the spill producer ran a private copy of the parse
+    /// The spill producer used to run a private copy of the parse
     /// skeleton whose check sat ahead of extraction and counted candidate
     /// lines; that copy is gone and this is the one definition.
     ///
@@ -136,7 +136,7 @@ impl ParsedCounts {
 /// Outcome of the most recent refresh attempt for a list.
 ///
 /// `Failed` carries the reason as a String so the operator can read it
-/// directly in `warden blocklist show` (T2) or the TUI Lists tab (T2).
+/// directly in `warden blocklist show` or the TUI Lists tab.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LastOutcome {
@@ -149,17 +149,16 @@ pub enum LastOutcome {
     Failed { reason: String },
 }
 
-/// Per-list runtime telemetry — DM3 in `_docs/features/lists_management.md`.
+/// Per-list runtime telemetry.
 ///
 /// Held behind an `ArcSwap` per source, replaced atomically on every
 /// refresh. The IPC layer takes a `load_full()` snapshot to build the
 /// `BlocklistStatusDto` returned to clients.
 ///
-/// `entries` is the primary metric (D1). `parsed_ok` and `parsed_skipped`
+/// `entries` is the primary metric. `parsed_ok` and `parsed_skipped`
 /// surface why a list might have a lower-than-expected entry count.
 /// `delta_pct_vs_prev` is the supply-chain canary; the retention guard's
-/// accept path now alarms on it via [`BLOCKLIST_DELTA_WARN`] (rev-2606 §06
-/// `status-01` — the doc-promised wiring that S43 T6 never delivered).
+/// accept path alarms on it via [`BLOCKLIST_DELTA_WARN`].
 ///
 /// No `Eq` derive: `delta_pct_vs_prev: Option<f32>` is intentionally a
 /// float for percentage arithmetic; tests use field-by-field comparisons
@@ -171,7 +170,7 @@ pub struct ListStatus {
     /// the `Vacant` arm of the shard build, so a domain an earlier source
     /// already contributed is charged to that source and not to this one:
     /// two sources with identical bodies report the full count and zero,
-    /// in iteration order. Primary D1 metric. Contrast
+    /// in iteration order. Primary metric. Contrast
     /// [`Self::unique_domains`], which ignores every other source.
     pub entries: u64,
     /// Lines successfully parsed (pre-dedup, see [`ParsedCounts::parsed_ok`]).
@@ -217,14 +216,14 @@ pub struct ListStatus {
     /// Entry count from the previous successful refresh. Persisted to
     /// `data/list_stats.json` so the delta survives daemon restart.
     pub prev_entries: Option<u64>,
-    /// §4.7 Phase 2 T2: RFC 3339 timestamp of the most recent
-    /// **successful** refresh — distinct from [`Self::fetched_at`]
+    /// RFC 3339 timestamp of the most recent **successful** refresh —
+    /// distinct from [`Self::fetched_at`]
     /// which records the most recent *attempt* (success or failure).
     /// `None` until the first successful refresh completes;
     /// preserved across subsequent failures so the TUI stale badge
     /// can compare against "last-known-good", not "last tried".
     ///
-    /// `#[serde(default)]` for back-compat: a pre-Phase-2 daemon's
+    /// `#[serde(default)]` for back-compat: an older daemon's
     /// `ListStatus` payload deserialises with this field at `None`,
     /// which makes the TUI suppress the badge (correct degradation).
     #[serde(default, with = "rfc3339_option")]
@@ -300,8 +299,8 @@ impl ListStatus {
             last_outcome: LastOutcome::Ok,
             delta_pct_vs_prev,
             prev_entries,
-            // §4.7 Phase 2 T2: success path stamps "last good" alongside
-            // the attempt timestamp. `from_failure` carries this forward.
+            // Success path stamps "last good" alongside the attempt
+            // timestamp. `from_failure` carries this forward.
             last_refresh_at: Some(fetched_at),
         }
     }
@@ -326,13 +325,9 @@ impl ListStatus {
     }
 }
 
-/// rev-2606 §06 `status-01`: the supply-chain delta canary warning.
+/// The supply-chain delta canary warning.
 ///
-/// The [`ListStatus`] doc-comment long promised "T6 wires the
-/// `BLOCKLIST_DELTA_WARN` frozen string against this", but the symbol was
-/// never created — the canary was computed and surfaced pull-only (in
-/// `warden blocklist show` / the TUI), so no daemon-side alarm ever fired.
-/// This is that string. The retention guard's accept path emits it at
+/// The retention guard's accept path emits it at
 /// `warn!(target: "audit")` whenever a refresh is accepted but the
 /// unique-domain count still swung by more than [`DELTA_WARN_THRESHOLD_PCT`]
 /// versus the prior cycle — loud-but-allowed movement the operator should
@@ -345,18 +340,17 @@ pub const BLOCKLIST_DELTA_WARN: &str = "blocklist size changed sharply versus th
 /// non-catastrophic change, not a refusal.
 pub const DELTA_WARN_THRESHOLD_PCT: f32 = 50.0;
 
-/// rev-2606 §06 `manager-01`: operator-facing `last_outcome` reason
-/// stamped when the retention guard refuses a catastrophic shrink. Frozen
+/// Operator-facing `last_outcome` reason stamped when the retention
+/// guard refuses a catastrophic shrink. Frozen
 /// template — the live string substitutes the measured numbers. Surfaces
 /// in `warden blocklist show` (`failed: …`) and the TUI Lists tab.
 pub const BLOCKLIST_SHRINK_REFUSED: &str =
     "refresh refused: list shrank by {drop}% to {got} domains (was {kept}); \
      keeping the previous list — run `warden lists forget <source>` to accept";
 
-/// Operator-facing `last_outcome` reason stamped when a source is refused
-/// for exceeding its `max_entries` cap (step 3 of
-/// `lists-truncation-silent-19pct`). Frozen template — the live string
-/// substitutes the measured numbers.
+/// Operator-facing `last_outcome` reason stamped when a source is
+/// refused for exceeding its `max_entries` cap. Frozen template — the
+/// live string substitutes the measured numbers.
 ///
 /// Fail-closed is the point. A truncated list passes every sanity check
 /// the daemon has — it fetched, it parsed, its entry count is plausible —
@@ -367,7 +361,7 @@ pub const BLOCKLIST_SHRINK_REFUSED: &str =
 /// not a degraded blocklist, it is a blocklist with a published bypass.
 pub const BLOCKLIST_TRUNCATION_REFUSED: &str =
     "refresh refused: list exceeded max_entries ({cap}) and would have dropped {dropped} \
-     entries; keeping the previous list — raise `max_entries` for this source";
+     entries; keeping the previous list — raise `[lists] max_entries` (the global cap)";
 
 /// Substitute the measured numbers into [`BLOCKLIST_TRUNCATION_REFUSED`].
 pub fn format_blocklist_truncation_refused(cap: usize, dropped: u64) -> String {
@@ -389,7 +383,7 @@ pub fn format_blocklist_shrink_refused(drop_pct: u32, got: u64, kept: u64) -> St
 /// Returns `None` when `prev_entries == 0` to avoid the division-by-zero
 /// trap. The semantic interpretation: "we have nothing to compare
 /// against, don't show a delta" — which is what the TUI / CLI surface
-/// in T2 is going to render as `—`.
+/// renders as `—`.
 pub fn compute_delta_pct(entries: u64, prev_entries: u64) -> Option<f32> {
     if prev_entries == 0 {
         return None;
@@ -436,12 +430,12 @@ pub struct BlocklistStatusDto {
     pub last_outcome: String,
     pub delta_pct_vs_prev: Option<f32>,
     pub prev_entries: Option<u64>,
-    /// §4.7 Phase 2 T2: RFC 3339 timestamp of the most recent
-    /// *successful* refresh. `None` until the first success;
-    /// preserved across subsequent failures (so the TUI stale badge
-    /// reflects last-good, not last-attempted). `#[serde(default)]`
-    /// keeps pre-Phase-2 payloads decodable — old daemons emit no
-    /// field, new readers see `None`, badge suppressed.
+    /// RFC 3339 timestamp of the most recent *successful* refresh.
+    /// `None` until the first success; preserved across subsequent
+    /// failures (so the TUI stale badge reflects last-good, not
+    /// last-attempted). `#[serde(default)]` keeps older payloads
+    /// decodable — old daemons emit no field, new readers see `None`,
+    /// badge suppressed.
     #[serde(default)]
     pub last_refresh_at: Option<String>,
 }
@@ -489,8 +483,8 @@ impl BlocklistStatusDto {
 /// source slot is itself an `ArcSwap` so per-list status updates remain
 /// lock-free even when the outer map is being grown.
 ///
-/// Closes the §14.1 pitfall: pre-S53.2 the registry was a `HashMap`
-/// fixed at boot, so reloads that added a new `[[blocklists]].url`
+/// The registry used to be a `HashMap` fixed at boot, so reloads that
+/// added a new `[[blocklists]].url`
 /// silently failed to surface stats for the new source until daemon
 /// restart. Now `update()` self-heals — first write to an unknown
 /// source materialises the slot.
@@ -519,6 +513,35 @@ pub struct CorpusRefusal {
     /// first. Sound as a diagnostic, and never an input to the refusal
     /// decision itself, which is taken on the order-independent union.
     pub novel_by_source: Vec<(String, u64)>,
+}
+
+/// How long the corpus has been frozen, and across how many cycles.
+///
+/// [`CorpusRefusal`] is rebuilt from scratch by every refused cycle, so
+/// it can only ever say *this refresh was refused* — the operator reading
+/// it cannot tell a refusal that started ten minutes ago from one that
+/// has been standing for a fortnight. Those are different incidents: the
+/// first may clear on its own when a list shrinks, the second is a host
+/// that has silently stopped tracking upstream. proxmox ran the second
+/// for two weeks and nine cycles with every per-source row green.
+///
+/// So the streak lives on the registry instead of in the payload, and
+/// survives the payload being replaced.
+///
+/// The count is honest about its own horizon: the registry is built at
+/// boot, so a restart resets it, and a restart takes the cold-start arm
+/// of the guard anyway. Every surface that renders this says "since this
+/// daemon started" rather than implying an all-time total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusFreeze {
+    /// When the current streak's first refusal landed. `Some` for every
+    /// value this daemon publishes — the `Option` exists so the
+    /// `rfc3339_option` serde helper is reused verbatim rather than
+    /// duplicated for a non-optional timestamp.
+    #[serde(with = "rfc3339_option")]
+    pub since: Option<OffsetDateTime>,
+    /// Refused cycles in the current streak, `1` on the first.
+    pub consecutive: u32,
 }
 
 /// What a completed reload cycle did to the corpus.
@@ -573,11 +596,6 @@ pub enum CycleOutcome {
 /// The sequence number is the part that makes polling sound. A caller reads
 /// it before signalling and waits for it to change; only then is the
 /// outcome the outcome of *their* cycle rather than of whatever ran last.
-/// A completed cycle: what it did, plus a monotonic sequence number.
-///
-/// The sequence number is the part that makes polling sound. A caller reads
-/// it before signalling and waits for it to change; only then is the
-/// outcome the outcome of *their* cycle rather than of whatever ran last.
 ///
 /// **`outcome` is optional and `seq` starts at 0 for a reason.** A caller
 /// has to separate three states that a bare `Option<CycleMark>` collapses
@@ -609,6 +627,14 @@ pub struct ListStatusRegistry {
     /// reaches every reporting surface off one write, with no new
     /// plumbing.
     corpus_refusal: ArcSwap<Option<CorpusRefusal>>,
+    /// How long the standing refusal has stood, cleared by any cycle that
+    /// installs.
+    ///
+    /// Separate from `corpus_refusal` because that field is *replaced*
+    /// wholesale every cycle from values the cycle just measured — there
+    /// is nowhere in it for a fact that outlives the cycle. This is the
+    /// only state in the reload path that deliberately accumulates.
+    corpus_freeze: ArcSwap<Option<CorpusFreeze>>,
     /// The last completed cycle, or `None` before the first one ends.
     ///
     /// Sits beside `corpus_refusal` rather than replacing it: that field
@@ -629,8 +655,8 @@ pub struct ListStatusRegistry {
     /// WRONG cycle's outcome — a wrong verdict, not just a slow one. The
     /// safety comes from the single receiver; keep it there.
     cycle: ArcSwap<CycleMark>,
-    /// §4.24 Phase 2 P2-C: secondary lookup-only index mapping a v1
-    /// canonical [`Id`] to the slot key stored in `inner`. Lets
+    /// Secondary lookup-only index mapping a v1 canonical [`Id`] to
+    /// the slot key stored in `inner`. Lets
     /// future id-keyed consumers (TUI Lists tab v2, audit attribution,
     /// IPC handlers that pre-resolve `Id`) reach the slot without
     /// monkey-patching a reverse lookup through the URL.
@@ -674,7 +700,7 @@ impl ListStatusRegistry {
     /// Build a registry covering every entry in `sources`. Each slot
     /// starts as `ListStatus::default()` (entries=0, NeverFetched).
     ///
-    /// The Phase 2 [`by_v1_id_index`](Self) is seeded with slash-form
+    /// The [`by_v1_id_index`](Self) is seeded with slash-form
     /// translations from `sources` (`"privacy/ads"` →
     /// `Id::new("privacy-ads")`); v1-row aliases get added by a
     /// subsequent [`populate_v1_id_index`](Self::populate_v1_id_index)
@@ -695,6 +721,7 @@ impl ListStatusRegistry {
             inner: ArcSwap::from_pointee(inner),
             by_v1_id_index: ArcSwap::from_pointee(by_v1_id_index),
             corpus_refusal: ArcSwap::from_pointee(None),
+            corpus_freeze: ArcSwap::from_pointee(None),
             cycle: ArcSwap::from_pointee(CycleMark {
                 seq: 0,
                 outcome: None,
@@ -715,6 +742,49 @@ impl ListStatusRegistry {
     /// The last cycle's corpus refusal, if it was refused.
     pub fn corpus_refusal(&self) -> Option<CorpusRefusal> {
         self.corpus_refusal.load().as_ref().clone()
+    }
+
+    /// Extend the freeze streak with one more refused cycle and return
+    /// the updated value, so the caller can log it without re-reading.
+    ///
+    /// `now` is the cycle's own timestamp, not a fresh clock read: the
+    /// refusal, the ERROR line and this stamp must all name the same
+    /// instant, or an operator correlating the log against `warden
+    /// status` sees two times for one event.
+    ///
+    /// Read-modify-write, and sound for the same structural reason
+    /// [`record_cycle`](Self::record_cycle) is: every reload funnels
+    /// through the single `ipc_reload_rx` receiver, so exactly one cycle
+    /// runs at a time. Two concurrent cycles would lose a count.
+    pub fn note_refused_cycle(&self, now: OffsetDateTime) -> CorpusFreeze {
+        let next = match self.corpus_freeze.load().as_ref() {
+            Some(prev) => CorpusFreeze {
+                since: prev.since,
+                consecutive: prev.consecutive.saturating_add(1),
+            },
+            None => CorpusFreeze {
+                since: Some(now),
+                consecutive: 1,
+            },
+        };
+        self.corpus_freeze.store(Arc::new(Some(next.clone())));
+        next
+    }
+
+    /// End the streak: a cycle installed, so nothing is frozen.
+    ///
+    /// Only an install clears it. The other non-installing arms
+    /// (flush failure, degraded shard build, an empty spill) leave the
+    /// previous generation serving too — the corpus is still frozen, and
+    /// zeroing the streak there would report a fresh incident on the next
+    /// refusal of an outage that never ended.
+    pub fn note_installed_cycle(&self) {
+        self.corpus_freeze.store(Arc::new(None));
+    }
+
+    /// The standing freeze, or `None` when the corpus is current.
+    pub fn corpus_freeze(&self) -> Option<CorpusFreeze> {
+        self.corpus_freeze.load().as_ref().clone()
     }
 
     /// Record a completed cycle, advancing the sequence number.
@@ -742,7 +812,7 @@ impl ListStatusRegistry {
     /// Seed-time helper: translate legacy slash-form source strings to
     /// canonical [`Id`]s. Shares the [`is_url_source`](super::source_key::is_url_source) heuristic with
     /// [`super::source_key::SourceBitMap::build`] so the rule cannot
-    /// drift (Phase 1 §11 Pitfall 1).
+    /// drift.
     fn seed_v1_id_index_from_sources(sources: &[String]) -> HashMap<Id, String> {
         let mut out: HashMap<Id, String> = HashMap::new();
         for s in sources {
@@ -756,7 +826,7 @@ impl ListStatusRegistry {
         out
     }
 
-    /// §4.24 Phase 2 P2-C: rebuild the
+    /// Rebuild the
     /// [`by_v1_id_index`](Self) from the current `inner` slot keys
     /// plus the v1 `[[blocklists]]` catalogue. Idempotent — atomically
     /// replaces the whole index, so the post-call state is purely a
@@ -770,8 +840,8 @@ impl ListStatusRegistry {
     ///   legacy `[lists].sources` configs.
     /// - Enabled blocklist rows whose URL matches a slot key alias
     ///   `Id → slot_key`. The blocklist pass runs after the slash-form
-    ///   pass and wins on collision (matches Phase 1 §11.4 overwrite
-    ///   discipline) — a typed lookup test pins this explicitly.
+    ///   pass and wins on collision — a typed lookup test pins this
+    ///   explicitly.
     pub fn populate_v1_id_index(&self, blocklists: &[Blocklist]) {
         let snapshot = self.inner.load();
         let mut next: HashMap<Id, String> = HashMap::new();
@@ -820,14 +890,14 @@ impl ListStatusRegistry {
     /// manager's source string — URL for v1 rows, slash-form for
     /// legacy `[lists].sources`). Materialises the slot if it doesn't
     /// exist yet — first write from a reload-time-added source
-    /// self-heals the registry instead of being silently dropped
-    /// (pre-S53.2 behaviour). The materialised slot starts at
+    /// self-heals the registry instead of being silently dropped.
+    /// The materialised slot starts at
     /// `ListStatus::default()` and is immediately replaced with the
     /// new status, so readers never observe a stale "NeverFetched"
     /// transient between materialise and update.
     ///
-    /// Renamed from `update` in §4.24 Phase 2 P2-C to make the URL-vs-id
-    /// contract explicit at the call line. Future v1-id-keyed
+    /// Named to make the URL-vs-id contract explicit at the call
+    /// line. Future v1-id-keyed
     /// consumers will reach for a parallel `update_for_v1_id` method
     /// — out of scope until a concrete consumer surfaces.
     pub fn update_for_url(&self, source: &str, new_status: ListStatus) {
@@ -857,12 +927,12 @@ impl ListStatusRegistry {
     /// reload pipeline so the registry tracks exactly the current
     /// merged source set.
     ///
-    /// Closes the S53.7 leak: deleting a `[[blocklists]]` entry caused
+    /// Deleting a `[[blocklists]]` entry causes
     /// `merge_sources_with_blocklists` to drop its URL from the next
-    /// reload's source list, but the registry slot lived on forever
-    /// (the post-S53.2 grow path adds slots, never removes them). The
-    /// TUI then rendered a permanent orphan row keyed on the dead URL
-    /// because the IPC `snapshot()` still returned that slot.
+    /// reload's source list, but the registry's grow path only adds
+    /// slots, never removes them — so without this, the slot lives on
+    /// forever and the TUI renders a permanent orphan row keyed on the
+    /// dead URL because the IPC `snapshot()` still returns it.
     pub fn retain_only(&self, keep: &[String]) {
         // Fast-path read: see if anything would actually be removed.
         // Skip the expensive rcu COW when the current map already
@@ -888,8 +958,8 @@ impl ListStatusRegistry {
             next
         });
 
-        // §4.24 Phase 2 P2-C: retire stale `by_v1_id_index` entries
-        // pointing at slots we just dropped. Without this, a typed
+        // Retire stale `by_v1_id_index` entries pointing at slots we
+        // just dropped. Without this, a typed
         // `status_for_v1_id` lookup would return `None` (because the
         // chained inner lookup misses), but the index would still
         // carry the dead id — leaking memory and confusing diagnostics.
@@ -909,14 +979,13 @@ impl ListStatusRegistry {
 
     /// Snapshot the current status for one source (keyed by the
     /// manager's source string — URL for v1 rows, slash-form for
-    /// legacy `[lists].sources` entries). Renamed from `get` in
-    /// §4.24 Phase 2 P2-C — see [`update_for_url`](Self::update_for_url)
-    /// rationale.
+    /// legacy `[lists].sources` entries). See
+    /// [`update_for_url`](Self::update_for_url) for the naming rationale.
     pub fn status_for_url(&self, source: &str) -> Option<Arc<ListStatus>> {
         self.inner.load().get(source).map(|s| s.load_full())
     }
 
-    /// §4.24 Phase 2 P2-C: snapshot the current status by canonical
+    /// Snapshot the current status by canonical
     /// v1 entity [`Id`]. Chains through the
     /// [`by_v1_id_index`](Self) → slot key → slot lookup. Returns
     /// `None` either when the id is unknown to the registry OR when
@@ -950,8 +1019,8 @@ impl ListStatusRegistry {
         self.inner.load().is_empty()
     }
 
-    /// rev-2606 §06 `manager-01`: reset a source's slot to the boot
-    /// default (clearing the retention-guard baseline) **iff the slot
+    /// Reset a source's slot to the boot default (clearing the
+    /// retention-guard baseline) **iff the slot
     /// already exists**. Used by `forget_source` so `warden lists forget`
     /// disarms a guard-refused list — the next fetch is then treated as a
     /// first fetch and accepted. Returns whether a slot was reset. Does
@@ -1029,7 +1098,7 @@ impl ListStatusRegistry {
     /// make any honest refresh look like a catastrophic shrink and brick
     /// the list), and an operator who *lowers* `max_entries` across a
     /// restart keeps a usable — if capped — baseline rather than losing
-    /// it. The §4.28-era `s-review-2605-lists-low` carryover.
+    /// it.
     ///
     /// **Merge-don't-clobber.** Only slots the live daemon has not yet
     /// populated this run are seeded. On a config reload the registry is
@@ -1089,7 +1158,7 @@ impl ListStatusRegistry {
     }
 }
 
-/// §4.31: thin adapter over [`hardened_atomic_write`](crate::config::atomic_write::hardened_atomic_write) so the
+/// Thin adapter over [`hardened_atomic_write`](crate::config::atomic_write::hardened_atomic_write) so the
 /// `list_stats.json` write here gets the same fsync + mode
 /// preservation as every config-mutation path.
 fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -1105,6 +1174,8 @@ fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use time::macros::datetime;
+    use time::Duration;
 
     #[test]
     fn parsed_counts_default_is_zero() {
@@ -1131,7 +1202,7 @@ mod tests {
     fn push_skipped_truncates_long_lines_to_bounded_width() {
         // Hostile input: a list body with no '\n' makes str::lines() yield
         // the whole blob as one multi-megabyte "line". The retained sample
-        // must be byte-bounded, not the full blob (P1 memory amplification).
+        // must be byte-bounded, not the full blob.
         let mut c = ParsedCounts::default();
         let huge = "a".repeat(1024 * 1024); // 1 MiB single line
         c.push_skipped(&huge);
@@ -1401,12 +1472,119 @@ mod tests {
         );
     }
 
+    /// The whole point of the type: one refusal is an incident, nine in a
+    /// row is a host that stopped tracking upstream a fortnight ago. The
+    /// refusal payload cannot tell them apart — it is rebuilt from
+    /// scratch by every cycle — so the streak is pinned here.
+    #[test]
+    fn a_freeze_streak_keeps_its_start_and_counts_its_cycles() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+        assert!(
+            reg.corpus_freeze().is_none(),
+            "a fresh registry is not frozen"
+        );
+
+        let first = datetime!(2026-08-04 03:00:00 UTC);
+        let f1 = reg.note_refused_cycle(first);
+        assert_eq!(f1.since, Some(first));
+        assert_eq!(f1.consecutive, 1);
+        assert_eq!(reg.corpus_freeze(), Some(f1));
+
+        // The mutation this is built to catch is not a missing call — that
+        // leaves `consecutive` at 1 and is caught below. It is a
+        // `note_refused_cycle` that restamps `since` every cycle, which
+        // counts correctly and reports a fortnight-old freeze as minutes
+        // old: the one number an operator would act on.
+        let second = datetime!(2026-08-18 03:00:00 UTC);
+        let f2 = reg.note_refused_cycle(second);
+        assert_eq!(
+            f2.since,
+            Some(first),
+            "the streak must date from its FIRST refusal, not its latest"
+        );
+        assert_eq!(f2.consecutive, 2);
+        assert_eq!(reg.corpus_freeze(), Some(f2));
+
+        // An install is the only thing that ends it.
+        reg.note_installed_cycle();
+        assert!(reg.corpus_freeze().is_none());
+
+        // ...and the next refusal is a new incident, not a resumption.
+        let third = datetime!(2026-08-19 03:00:00 UTC);
+        let f3 = reg.note_refused_cycle(third);
+        assert_eq!(f3.since, Some(third));
+        assert_eq!(f3.consecutive, 1);
+    }
+
+    /// The end-to-end shape the manager drives: refuse, refuse, install.
+    ///
+    /// Lives here rather than beside the manager because the streak is
+    /// registry state and the manager owns only the three call sites; a
+    /// manager-level test would re-measure the download pipeline to assert
+    /// on two integers.
+    #[test]
+    fn two_refusals_then_an_install_leaves_nothing_frozen() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+        let t0 = datetime!(2026-08-04 03:00:00 UTC);
+        reg.note_refused_cycle(t0);
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 15_012_024,
+            ceiling: 14_000_000,
+            novel_by_source: vec![],
+        }));
+        reg.record_cycle(CycleOutcome::Refused);
+
+        reg.note_refused_cycle(t0 + Duration::hours(24));
+        reg.record_cycle(CycleOutcome::Refused);
+        let frozen = reg.corpus_freeze().expect("still frozen");
+        assert_eq!(frozen.since, Some(t0));
+        assert_eq!(frozen.consecutive, 2);
+
+        // The install clears the freeze. The refusal record is not this
+        // method's to clear — the manager republishes it (as `None`) on
+        // every cycle that installs — so only the freeze is asserted here.
+        reg.note_installed_cycle();
+        reg.record_cycle(CycleOutcome::Installed);
+        assert!(reg.corpus_freeze().is_none());
+    }
+
+    /// `since` is an `Option` only so the RFC3339 serde helper is reused.
+    /// Nothing this daemon publishes may leave it `None`, and a renderer
+    /// that has to print "unknown" for a live freeze is a worse line than
+    /// no line — so the invariant is a test, not a sentence.
+    #[test]
+    fn a_published_freeze_always_names_its_start() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+        for i in 0..3 {
+            let f = reg.note_refused_cycle(datetime!(2026-08-04 03:00:00 UTC) + Duration::hours(i));
+            assert!(
+                f.since.is_some(),
+                "cycle {i} published a freeze with no start"
+            );
+        }
+    }
+
+    #[test]
+    fn a_freeze_round_trips_through_json() {
+        let f = CorpusFreeze {
+            since: Some(datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 9,
+        };
+        let json = serde_json::to_string(&f).expect("serialise");
+        assert!(
+            json.contains("2026-08-04T03:00:00Z"),
+            "the timestamp must go over the wire as RFC3339, got: {json}"
+        );
+        let back: CorpusFreeze = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back, f);
+    }
+
     #[test]
     fn registry_update_unknown_source_grows_on_demand() {
-        // S53.2 — pre-S53.2 this was a silent no-op (§14.1 pitfall:
-        // reload-time-added sources never surfaced in IPC stats until
-        // daemon restart). Now `update()` self-heals: writing to an
-        // unknown source materialises a slot for it on the spot.
+        // This used to be a silent no-op: reload-time-added sources
+        // never surfaced in IPC stats until daemon restart. Now
+        // `update()` self-heals: writing to an unknown source
+        // materialises a slot for it on the spot.
         let reg = ListStatusRegistry::new(&["a".into()]);
         let now = OffsetDateTime::now_utc();
         reg.update_for_url(
@@ -1428,7 +1606,7 @@ mod tests {
 
     #[test]
     fn registry_retain_only_drops_stale_slots() {
-        // Pin the S53.7 leak fix: deleting a [[blocklists]] entry drops
+        // Pin the leak fix: deleting a [[blocklists]] entry drops
         // its URL from the next merged_sources, and the reload
         // pipeline calls retain_only(merged_sources) to evict the
         // matching registry slot. Without this the TUI would render a
@@ -1730,13 +1908,13 @@ mod tests {
         );
     }
 
-    /// §4.7 Phase 2 T2: `ListStatus.last_refresh_at` survives the
-    /// round-trip through `BlocklistStatusDto::from_status` (the
-    /// IPC encoder) — set on success via `from_refresh`, carried
-    /// forward across a subsequent `from_failure`, suppressed when
-    /// `None`. Also confirms back-compat: a payload from a pre-T2
-    /// daemon (no `last_refresh_at` field in JSON) decodes with the
-    /// field at `None` thanks to `#[serde(default)]`.
+    /// `ListStatus.last_refresh_at` survives the round-trip through
+    /// `BlocklistStatusDto::from_status` (the IPC encoder) — set on
+    /// success via `from_refresh`, carried forward across a
+    /// subsequent `from_failure`, suppressed when `None`. Also
+    /// confirms back-compat: a payload from an older daemon (no
+    /// `last_refresh_at` field in JSON) decodes with the field at
+    /// `None` thanks to `#[serde(default)]`.
     #[test]
     fn list_status_carries_last_refresh_at() {
         let now = OffsetDateTime::now_utc();
@@ -1803,7 +1981,7 @@ mod tests {
 
     #[test]
     fn status_for_v1_id_resolves_v1_row_via_url_alias() {
-        // §4.24 Phase 2 P2-C: a pure-v1 row in `[[blocklists]]` (URL
+        // A pure-v1 row in `[[blocklists]]` (URL
         // in the source list, id known) — after
         // `populate_v1_id_index`, the typed v1-id lookup must hit the
         // same slot the URL lookup hits.
@@ -1860,7 +2038,7 @@ mod tests {
 
     #[test]
     fn populate_v1_id_index_skips_disabled_blocklists() {
-        // §4.24 Phase 2 P2-C parity with `SourceBitMap::build` —
+        // Parity with `SourceBitMap::build` —
         // disabled rows don't get a `by_v1_id_index` alias because
         // their URL doesn't surface in `merge_sources_with_blocklists`
         // (so the slot wouldn't exist anyway). Pinning this prevents
@@ -1880,7 +2058,7 @@ mod tests {
 
     #[test]
     fn retain_only_retires_v1_id_index_entries_pointing_at_dropped_slots() {
-        // §4.24 Phase 2 P2-C: when a [[blocklists]] entry is removed
+        // When a [[blocklists]] entry is removed
         // at reload time, both the URL slot AND the v1-id alias must
         // be retired. Otherwise `status_for_v1_id` would return
         // `None` (correct outcome via the inner-lookup miss) but the

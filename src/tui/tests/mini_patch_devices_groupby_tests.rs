@@ -17,7 +17,7 @@ fn dummy_poller() -> IpcPoller {
 fn sample_entry(domain: &str) -> QueryLogDto {
     QueryLogDto {
         timestamp: "2026-05-01T00:00:00Z".into(),
-        client_ip: "192.0.2.10".into(),
+        client_ip: "10.10.1.10".into(),
         client_name: None,
         domain: domain.into(),
         query_type: "A".into(),

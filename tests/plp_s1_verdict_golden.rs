@@ -273,7 +273,7 @@ fn config_toml() -> String {
      format = \"domains\"\n\
      base = \"deny\"\n\n\
      # Synthetic. Tagged because `ALLOW_LIST_REQUIRES_TAG`; consent-flagged\n\
-     # because `trust = remote-unsigned` (project rules §Neutrality table row 4).\n\
+     # because `trust = remote-unsigned` (CLAUDE.md §Neutrality table row 4).\n\
      [[blocklists]]\n\
      id = \"social-exempt\"\n\
      display_name = \"Social exemption\"\n\

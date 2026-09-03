@@ -1,10 +1,10 @@
-//! DNSSEC response-path consumer (§4.10-4b) — the `dnssec.mode` wiring.
+//! DNSSEC response-path consumer — the `dnssec.mode` wiring.
 //!
-//! This is the **only client-visible** piece of the §4.10 workstream. It bolts
-//! the frozen validation engine in [`crate::dnssec`] onto the live response path:
-//! for a positive answer about to be served it produces one [`crate::dns::dnssec_validator::DnssecDecision`]
-//! (set the AD bit / SERVFAIL / serve unchanged), behind the `dnssec.mode`
-//! config.
+//! This is the **only client-visible** piece of the DNSSEC validation work. It
+//! bolts the frozen validation engine in [`crate::dnssec`] onto the live
+//! response path: for a positive answer about to be served it produces one
+//! [`crate::dns::dnssec_validator::DnssecDecision`] (set the AD bit / SERVFAIL
+//! / serve unchanged), behind the `dnssec.mode` config.
 //!
 //! ## Where it runs
 //!
@@ -24,7 +24,7 @@
 //! [`crate::dnssec::chain::validate_chain`]. A [`crate::dnssec::cache::VerdictCache`] absorbs repeats so only the first query
 //! for a name pays the walk.
 //!
-//! ## Policy (decided §4.10-4b, see the sprint plan)
+//! ## Policy
 //!
 //! - `Secure` → set AD. `Insecure` (incl. an unsigned answer with no RRSIG) →
 //!   serve, no AD. `Bogus` → SERVFAIL under `validate`.
@@ -36,13 +36,13 @@
 //! - `log-only` **never alters the wire** (no AD, no SERVFAIL): it validates and
 //!   logs only, a true dry-run for staged rollout.
 //! - A client query with the **CD** bit set bypasses validation entirely and
-//!   never gets AD (RFC 4035 §3.2.2). (Distinct from the *upstream*-facing CD bit
-//!   §4.10-4a bakes into the validator's own queries.)
+//!   never gets AD (RFC 4035 §3.2.2). (Distinct from the *upstream*-facing CD
+//!   bit the validator bakes into its own queries.)
 //!
-//! Known limitations recorded as follow-up TODOs: the served bytes come from the
-//! resolution path, not the (separately fetched) validated bytes; a stripped-
-//! signature answer downgrades to unvalidated; negative answers and CNAME-chain
-//! links are not authenticated. See the sprint plan / TODO backlog.
+//! Known limitations: the served bytes come from the resolution path, not the
+//! (separately fetched) validated bytes; a stripped-signature answer degrades
+//! to unvalidated; negative answers and CNAME-chain links are not
+//! authenticated.
 
 use std::sync::Arc;
 
@@ -101,7 +101,7 @@ impl DnssecValidator {
     /// `is_negative` is the cached entry's negativity (NXDOMAIN / NODATA); we do
     /// not authenticate denial of existence yet, so negatives are served as-is.
     ///
-    /// `rewrote` is `true` when a §4.12 / §4.53 rewrite fired on this query.
+    /// `rewrote` is `true` when a response rewrite fired on this query.
     pub async fn decide(
         &self,
         request: &Request,
@@ -115,9 +115,9 @@ impl DnssecValidator {
         }
         // A rewrite fired: skip validation outright, before the fetch.
         //
-        // `dnssec-validator-validates-unserved-name` — this used to walk the
-        // chain and the *handler* discarded the result. Two things were wrong
-        // with that, and only the second is a cost:
+        // An earlier version walked the chain here and let the *handler*
+        // discard the result. Two things were wrong with that, and only the
+        // second is a cost:
         //
         // 1. **The walk was of the wrong name.** The target came from
         //    `request.queries().first()`, i.e. the ORIGINAL pre-rewrite qname,
@@ -148,8 +148,8 @@ impl DnssecValidator {
             );
             return DnssecDecision::Serve;
         }
-        // Negative answers: denial-of-existence authentication is out of §4.10-4b
-        // scope (the engine has no leaf-NXDOMAIN entry point). Serve, no AD.
+        // Negative answers: denial-of-existence authentication is out of scope
+        // (the engine has no leaf-NXDOMAIN entry point). Serve, no AD.
         if is_negative {
             return DnssecDecision::Serve;
         }
@@ -600,8 +600,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "CD must skip the fetch");
     }
 
-    /// `dnssec-validator-validates-unserved-name`: a rewritten answer must skip
-    /// validation entirely — no fetch, no chain walk, no verdict.
+    /// A rewritten answer must skip validation entirely — no fetch, no chain
+    /// walk, no verdict.
     ///
     /// The two arms differ **only** in the `rewrote` flag, and the assertion is
     /// on the fetch counter rather than on the returned decision. That matters:

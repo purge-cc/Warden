@@ -101,11 +101,12 @@ schema_version = 3
 # update_interval_secs = 43200
 
 # Maximum size (bytes) for a single blocklist download. Aborts mid-stream.
-# Default: 200 MB. Lower on constrained hardware (Pi: 50-100 MB).
-# max_body_bytes = 209715200
+# Default: 512 MiB. Lower on constrained hardware (Pi: 50-100 MB).
+# max_body_bytes = 536870912
 
-# Maximum entries per list. Lists exceeding this are truncated with a warning.
-# max_entries = 5000000
+# Maximum entries per list. A list over this cap is refused for the cycle and keeps
+# filtering with its previous body; raise it with `warden lists set max_entries <n>`.
+# max_entries = 20000000
 
 # ── Cache ────────────────────────────────────────────────────────
 [cache]

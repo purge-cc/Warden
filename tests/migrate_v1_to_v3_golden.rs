@@ -34,7 +34,7 @@ const V1_CT_LIVE_FIXTURE: &str = r##"schema_version = 2
 [server]
 listen = "0.0.0.0:53"
 default_profile = "default"
-allow_from = ["192.0.2.0/24", "127.0.0.0/8"]
+allow_from = ["10.10.1.0/24", "127.0.0.0/8"]
 
 [upstream]
 mode = "plain"
@@ -76,9 +76,9 @@ display_name = "Default household profile"
 blocklists = ["mycompany", "privacy-ads", "privacy-tracking", "security-malicious"]
 
 [[devices]]
-id = "alex-iphone"
-display_name = "Alex's phone"
-ip = "192.0.2.107"
+id = "operator-iphone"
+display_name = "iPhone di Operator"
+ip = "10.10.1.107"
 profile = "default"
 
 [cache]
@@ -115,7 +115,7 @@ fn migrate_v1_to_v3_ct_live_config_byte_pinned() {
     // four pairs are kept and none is written `ignore`. This is the
     // measurement that separates the direct route from the v1→v2→v3
     // chain: the chain would have REFUSED this fixture outright (its own
-    // step 4 tags `alex-iphone`, and `tagged_sub_profile_entities`
+    // step 4 tags `operator-iphone`, and `tagged_sub_profile_entities`
     // refuses tagged devices), and with that refusal suppressed it would
     // have written `ignore` for all four — a config that loads, lints
     // clean, and filters nothing.
@@ -209,8 +209,8 @@ fn migrate_v1_to_v3_ct_live_config_byte_pinned() {
         .config
         .devices
         .iter()
-        .find(|d| d.id.as_str() == "alex-iphone")
-        .expect("alex-iphone device must survive");
+        .find(|d| d.id.as_str() == "operator-iphone")
+        .expect("operator-iphone device must survive");
     assert!(!dev.unfiltered);
 }
 
@@ -290,7 +290,7 @@ display_name = "Default"
 [[subnets]]
 id = "lan"
 display_name = "LAN"
-cidrs = ["192.0.2.0/24"]
+cidrs = ["10.10.1.0/24"]
 profile = "default"
 
 [[subnets]]

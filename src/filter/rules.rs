@@ -11,16 +11,15 @@
 //! - `||*.suffix^` — wildcard subdomain match
 //! - `/regex/` — regex pattern match (compiled case-insensitive — lookup
 //!   input is lowercased by invariant, so an as-authored uppercase literal
-//!   could never match; rev-2606 rules-02)
+//!   could never match)
 //! - `$important` / `$noapex` — the only recognized modifiers; anything
-//!   else is a parse error, not a silent no-op (rev-2606 rules-03)
+//!   else is a parse error, not a silent no-op
 //! - Plain `domain` — block exact domain
 //!
 //! Parsing has two entry points: [`parse_rule_checked`] returns a typed
 //! [`RuleParseError`] (consumed by the config validator so `config lint`
-//! rejects exactly what this parser rejects — rev-2606
-//! schema-validator-05), and [`parse_rule`] is its `Option` adapter for
-//! engine-side callers.
+//! rejects exactly what this parser rejects), and [`parse_rule`] is its
+//! `Option` adapter for engine-side callers.
 
 use compact_str::CompactString;
 use regex::{Regex, RegexBuilder};
@@ -122,12 +121,11 @@ impl DnsRule {
 /// "sub.example.com" is a subdomain of "example.com".
 /// "example.com" is NOT a subdomain of "example.com" (it's an exact match).
 ///
-/// L-13 (rev-2026-05-suffix-empty-guard): empty-parent early return.
-/// `parse_rule` rejects empty patterns upstream, so today's call sites
-/// cannot reach this branch — but the helper is reachable from rule
-/// patterns derived elsewhere, and an empty `parent` would otherwise
-/// match every dot-terminated domain via `ends_with("")` returning true.
-/// Pure contract pin.
+/// Empty-parent early return. `parse_rule` rejects empty patterns upstream,
+/// so today's call sites cannot reach this branch — but the helper is
+/// reachable from rule patterns derived elsewhere, and an empty `parent`
+/// would otherwise match every dot-terminated domain via `ends_with("")`
+/// returning true.
 fn is_subdomain_of(domain: &str, parent: &str) -> bool {
     if parent.is_empty() {
         return false;
@@ -141,10 +139,10 @@ fn is_subdomain_of(domain: &str, parent: &str) -> bool {
 /// of [`parse_rule_checked`].
 ///
 /// `Display` strings are operator-facing: the config validator embeds them
-/// in `ValidationFailed` errors (rev-2606 schema-validator-05), so they are
-/// pinned byte-for-byte in `tests/frozen_strings_entity_contracts.rs`.
-/// Payloads are `String` (not `regex::Error`) so the enum stays
-/// `Clone + PartialEq + Eq` like `ConfigError`.
+/// in `ValidationFailed` errors, so they are pinned byte-for-byte in
+/// `tests/frozen_strings_entity_contracts.rs`. Payloads are `String` (not
+/// `regex::Error`) so the enum stays `Clone + PartialEq + Eq` like
+/// `ConfigError`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuleParseError {
     #[error("rule text is empty")]
@@ -202,13 +200,12 @@ impl RuleParseError {
 /// - `domain` → Block, Exact (plain domain shorthand)
 /// - `@@domain` → Allow, Exact (plain domain shorthand)
 ///
-/// Regexes compile case-insensitive (rev-2606 rules-02): engine lookups are
-/// lowercase by invariant, so an as-authored `/DoubleClick/` could never
-/// match; authors can opt back out with an inline `(?-i)`. The pattern is
-/// terminated by the FIRST unescaped-or-not `/` after the opening one —
-/// text after it is an error, not ignored (rev-2606 rules-03), which also
-/// means `$important` on a regex is rejected rather than silently dropped
-/// (May res-10 / rules-01, closed in the reject direction).
+/// Regexes compile case-insensitive: engine lookups are lowercase by
+/// invariant, so an as-authored `/DoubleClick/` could never match; authors
+/// can opt back out with an inline `(?-i)`. The pattern is terminated by
+/// the FIRST unescaped-or-not `/` after the opening one — text after it is
+/// an error, not ignored, which also means `$important` on a regex is
+/// rejected rather than silently dropped.
 ///
 /// This is the single source of truth for rule-text validity: the schema
 /// validator's `check_admin_rules` calls it too, so `config lint` accepts
@@ -245,12 +242,11 @@ pub fn parse_rule_checked(line: &str) -> Result<DnsRule, RuleParseError> {
                 trailing: trailing.to_string(),
             });
         }
-        // L-10 (rev-2026-04-admin-regex-size): cap the compiled regex
-        // size at 1 MiB. Rust's `regex` crate is linear-time so there
-        // is no ReDoS risk, but a huge admin pattern (e.g. a giant
-        // alternation pasted by accident) can still pin a lot of
-        // memory. The cap rejects patterns that would compile larger
-        // than 1 MiB at parse time with a clear error, instead of
+        // Cap the compiled regex size at 1 MiB. Rust's `regex` crate is
+        // linear-time so there is no ReDoS risk, but a huge admin pattern
+        // (e.g. a giant alternation pasted by accident) can still pin a
+        // lot of memory. The cap rejects patterns that would compile
+        // larger than 1 MiB at parse time with a clear error, instead of
         // silently growing process RSS.
         let compiled = RegexBuilder::new(pattern_str)
             .size_limit(1 << 20)
@@ -420,11 +416,9 @@ mod tests {
 
     #[test]
     fn parse_unknown_modifier_rejected() {
-        // rev-2606 rules-03: sanctioned behavior overturn. Until this fix
-        // unsupported modifiers were silently ignored — `$third-party` was
-        // dropped and the rule enforced anyway (this test pinned that
-        // tolerance). Now an unrecognized modifier is a parse error so the
-        // rule can't enforce something broader than authored.
+        // An unrecognized modifier is a parse error, not silently dropped —
+        // otherwise a rule like `$third-party` would enforce something
+        // broader than authored.
         assert_eq!(
             parse_rule_checked("||ads.com^$third-party,important").unwrap_err(),
             RuleParseError::UnknownModifier {
@@ -503,11 +497,10 @@ mod tests {
 
     #[test]
     fn parse_oversized_regex_rejected() {
-        // L-10 (rev-2026-04-admin-regex-size) regression pin: a regex
-        // whose compiled NFA exceeds 1 MiB must be rejected at parse time
-        // rather than silently consuming process memory. A long alternation
-        // with bounded repetition expands to a large compiled size — the
-        // crate's `size_limit` check fires and we return None.
+        // A regex whose compiled NFA exceeds 1 MiB must be rejected at
+        // parse time rather than silently consuming process memory. A long
+        // alternation with bounded repetition expands to a large compiled
+        // size — the crate's `size_limit` check fires and we return None.
         let big = format!("a{{{}}}", 200_000);
         assert!(
             parse_rule(&format!("/{big}/")).is_none(),
@@ -517,17 +510,17 @@ mod tests {
 
     #[test]
     fn parse_normal_regex_within_size_limit_accepted() {
-        // L-10 sibling: realistic admin patterns must still parse cleanly —
-        // the cap is a defense against absurd patterns, not normal use.
+        // Realistic admin patterns must still parse cleanly — the cap is a
+        // defense against absurd patterns, not normal use.
         assert!(parse_rule("/^ad[0-9]+\\.example\\.com$/").is_some());
         assert!(parse_rule("/tracker.*\\.evil/").is_some());
     }
 
     #[test]
     fn parse_regex_case_insensitive() {
-        // rev-2606 rules-02: engine lookups are lowercase by invariant, so
-        // an as-authored uppercase literal could never match. Regexes now
-        // compile case-insensitive (AdGuard parity).
+        // Engine lookups are lowercase by invariant, so an as-authored
+        // uppercase literal could never match. Regexes compile
+        // case-insensitive (AdGuard parity).
         let rule = parse_rule("/DoubleClick/").unwrap();
         assert!(rule.matches("doubleclick.net"));
         let classy = parse_rule("/AD[0-9]+/").unwrap();
@@ -543,10 +536,9 @@ mod tests {
 
     #[test]
     fn parse_regex_trailing_text_rejected() {
-        // rev-2606 rules-03: text after the closing '/' was silently
-        // discarded (`/foo/bar` enforced `/foo/`). Now an error — which
-        // also rejects `$important` on a regex loudly (May res-10 /
-        // rules-01 closed in the reject direction).
+        // Text after the closing '/' is an error, not silently discarded
+        // (`/foo/bar` does not enforce `/foo/`) — which also rejects
+        // `$important` on a regex loudly rather than dropping it.
         assert_eq!(
             parse_rule_checked("/foo/bar").unwrap_err(),
             RuleParseError::TrailingAfterRegex {
@@ -626,7 +618,7 @@ mod tests {
     fn parse_checked_ok_matches_parse_rule_some() {
         // The Option adapter must stay a pure projection of the checked
         // parser — lint validates via parse_rule_checked, the engine
-        // consumes via parse_rule/parse_rules (schema-validator-05).
+        // consumes via parse_rule/parse_rules.
         for input in [
             "||tiktok.com^",
             "@@||wikipedia.org^",
@@ -660,11 +652,11 @@ mod tests {
         assert!(parse_rule("||ads.*.com^").is_none());
     }
 
-    // --- S54: parse_rule rejects malformed admin patterns ---
+    // --- parse_rule rejects malformed admin patterns ---
     //
-    // Before S54 these inputs were silently accepted as Exact rules
-    // that could never match anything, hiding admin-config typos.
-    // S54 routes Exact + Wildcard patterns through is_valid_domain.
+    // Without this check these inputs would be silently accepted as Exact
+    // rules that could never match anything, hiding admin-config typos.
+    // Exact + Wildcard patterns route through is_valid_domain.
 
     #[test]
     fn parse_rule_rejects_script_tags() {
@@ -850,9 +842,9 @@ mod tests {
 
     #[test]
     fn is_subdomain_of_empty_parent_returns_false() {
-        // L-13 (rev-2026-05-suffix-empty-guard) regression pin: an empty
-        // parent must not match every dot-terminated domain. parse_rule
-        // rejects empty patterns upstream, so this is contract pinning.
+        // An empty parent must not match every dot-terminated domain.
+        // parse_rule rejects empty patterns upstream, so this is contract
+        // pinning.
         assert!(!is_subdomain_of("sub.example.com", ""));
         assert!(!is_subdomain_of("a.", ""));
         assert!(!is_subdomain_of("", ""));

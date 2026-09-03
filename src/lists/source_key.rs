@@ -1,40 +1,32 @@
 //! Typed source-key facades for the list manager / profile resolver
-//! contract (§4.24).
+//! contract.
 //!
-//! Phase 1 (CLOSED 2026-05-06) introduced [`SourceBitMap`], replacing the
-//! raw `HashMap<String, u8>` that the list-manager and the profile
-//! resolver shared. The raw map keyed every entry by `String` and relied
-//! on a kebab→slash compatibility shim to bridge URL-keyed producer ↔
-//! id-keyed consumer. The 2026-05-06 silent-no-blocking incident showed
-//! that this contract is too easy to break: a config cleanup that
-//! emptied `[lists].sources = []` left every profile's `list_bitmask`
-//! zeroed because no slash-form keys remained for the shim to translate
-//! to.
+//! [`SourceBitMap`] replaces a raw `HashMap<String, u8>` that keyed every
+//! entry by `String` and relied on a kebab→slash compatibility shim to
+//! bridge URL-keyed producer to id-keyed consumer. That contract was too
+//! easy to break: a config cleanup that emptied `[lists].sources = []`
+//! left every profile's `list_bitmask` zeroed because no slash-form keys
+//! remained for the shim to translate.
 //!
 //! The typed facades expose lookup methods, one per source kind, so call
 //! sites declare their intent at the lookup line:
 //!
 //! - [`SourceBitMap::bit_for_url`] / [`SourceBitMap::bit_for_v1_id`] /
-//!   [`SourceBitMap::bit_for_legacy_catalog_id`] — the bit map (Phase 1).
+//!   [`SourceBitMap::bit_for_legacy_catalog_id`] — the bit map.
 //! - [`SourceTrustMap::trust_for_url`] / [`SourceTrustMap::trust_for_v1_id`]
 //!   — per-source `BlocklistTrust`, fed to the `imported.local` loader
-//!   bridge (Phase 2 §4.24-P2-A).
+//!   bridge.
 //! - [`SourceTokenMap::token_for_url`] / [`SourceTokenMap::token_for_v1_id`]
-//!   — per-source bearer token resolved from `secrets.toml` (Phase 2
-//!   §4.24-P2-B).
+//!   — per-source bearer token resolved from `secrets.toml`.
 //!
 //! Each facade owns its own seeding rules but shares the same
 //! [`is_url_source`] heuristic for distinguishing URL-form vs legacy
 //! slash-form catalog ids — the validator at
 //! `src/config/schema/validator.rs` only accepts the two shapes.
 //!
-//! Phase B of the original kickoff removed the kebab→slash shim from
-//! [`crate::profiles::profile::ResolvedProfile::build_v1`]. Phase 2 of
-//! the workstream closes the sibling maps on the same call-site type
-//! safety contract: `merge_sources_with_blocklists` returns
-//! `(Vec<String>, SourceTrustMap)`, `build_source_tokens` returns
-//! `SourceTokenMap`, and the `ListManager` struct fields carry the
-//! typed shapes.
+//! `merge_sources_with_blocklists` returns `(Vec<String>, SourceTrustMap)`,
+//! `build_source_tokens` returns `SourceTokenMap`, and the `ListManager`
+//! struct fields carry the typed shapes throughout.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -87,14 +79,15 @@ impl SourceBitMap {
     /// (their URL is not in `sources` per
     /// `merge_sources_with_blocklists`, so the alias would dangle).
     ///
-    /// **Why both paths seed `by_v1_id`.** Pre-§4.24, pure-v1 configs
-    /// (empty `[lists].sources`, populated `[[blocklists]]`) zeroed the
-    /// profile resolver's bitmask because the URL-keyed map had no id
-    /// to match. Mixed/legacy configs (`[lists].sources = ["privacy/ads"]`)
-    /// only worked through the kebab→slash shim. With both channels
-    /// seeding `by_v1_id`, the consumer collapses to a single
-    /// `bit_for_v1_id(bid)` call regardless of source kind — closing
-    /// the May 6 contract gap at the type level.
+    /// **Why both paths seed `by_v1_id`.** A pure-v1 config (empty
+    /// `[lists].sources`, populated `[[blocklists]]`) would zero the
+    /// profile resolver's bitmask if only the URL-keyed map were
+    /// consulted, because it has no id to match. A mixed/legacy config
+    /// (`[lists].sources = ["privacy/ads"]`) only worked through the
+    /// kebab→slash shim. With both channels seeding `by_v1_id`, the
+    /// consumer collapses to a single `bit_for_v1_id(bid)` call
+    /// regardless of source kind — closing the contract gap at the type
+    /// level.
     pub fn build(sources: &[String], blocklists: &[Blocklist]) -> Result<Self, BitMapBuildError> {
         if sources.len() > MAX_LIST_SOURCES {
             return Err(BitMapBuildError::TooManySources {
@@ -142,22 +135,21 @@ impl SourceBitMap {
 
     /// Project the operator's list policy onto **this** generation's bits.
     ///
-    /// The one place a stable list id becomes a bit position. That boundary
-    /// is the whole of `_docs/features/profile_list_policy.md` §2.4
-    /// (D-ARCH-1): the config expresses policy per **list id**, which is
-    /// stable, and only this function turns it into a `u64`, which is
-    /// **positional** — `bit = i` over the merged sources vector, so removing
-    /// one list slides every later list down one bit. A mask that crossed the
-    /// config→engine boundary on its own could therefore meet a corpus that
-    /// had re-assigned the bits it names, and under allow-beats-block the
+    /// The one place a stable list id becomes a bit position: the config
+    /// expresses policy per **list id**, which is stable, and only this
+    /// function turns it into a `u64`, which is **positional** — `bit = i`
+    /// over the merged sources vector, so removing one list slides every
+    /// later list down one bit. A mask that crossed the config→engine
+    /// boundary on its own could therefore meet a corpus that had
+    /// re-assigned the bits it names, and under allow-beats-block the
     /// superset error is silent and fails open.
     ///
     /// The returned [`PolicyMasks`] goes straight into
     /// [`crate::filter::engine::ListPolicy::publish`] and travels in the same
     /// `Arc` as the entries it interprets. **Do not stash it anywhere else.**
     ///
-    /// Direction per pair is [`effective_direction`] — one function, N
-    /// callers (P5); this is not the place to re-derive the inheritance rule.
+    /// Direction per pair is [`effective_direction`] — one function, every
+    /// caller; this is not the place to re-derive the inheritance rule.
     ///
     /// **Disabled rows contribute nothing**, and not by an explicit test:
     /// `merge_sources_with_blocklists` never puts their URL in the merged
@@ -178,8 +170,8 @@ impl SourceBitMap {
         // The masks a profile carrying no override of its own gets. Same
         // rule as the per-profile loop below, reached through the same
         // mapping (`BlocklistBase::as_policy`) rather than re-spelled here
-        // — P5, and the reason `Ignore` could not be forgotten at one of
-        // the two sites.
+        // — the reason `Ignore` could not be forgotten at one of the two
+        // sites.
         let mut inherited = ProfileMasks::INERT;
         for b in blocklists {
             let Some(bit) = self.bit_for_list(b) else {
@@ -223,16 +215,14 @@ impl SourceBitMap {
 
     /// The bit this generation gave `b`, or `None` if it holds none.
     ///
-    /// **Goes through [`Self::bit_for_v1_id`], not `by_url`, and the
-    /// difference is the 2026-05-06 silent-no-blocking incident.** A config
-    /// can name a source in two channels: a `[[blocklists]]` row (URL-keyed)
-    /// or a slash-form slug in `[lists].sources` (translated to a v1 id).
-    /// `by_url` only sees the first, so a slug-channel list would get no bit
-    /// here — every profile would come out with an empty mask and the daemon
-    /// would forward everything, which is exactly what happened for ~5h45m on
-    /// the dev CT before §4.24 introduced the typed lookup. `by_v1_id` is
-    /// seeded from **both** channels, which is why the consumer side has
-    /// collapsed to one call since.
+    /// **Goes through [`Self::bit_for_v1_id`], not `by_url`, deliberately.**
+    /// A config can name a source in two channels: a `[[blocklists]]` row
+    /// (URL-keyed) or a slash-form slug in `[lists].sources` (translated to
+    /// a v1 id). `by_url` only sees the first, so a slug-channel list would
+    /// get no bit here — every profile would come out with an empty mask
+    /// and the daemon would forward everything. `by_v1_id` is seeded from
+    /// **both** channels, which is why the consumer side has collapsed to
+    /// one call.
     ///
     /// Caught by `tests/dual_channel_source_dedup.rs`, which builds the
     /// slug-channel shape and asserts bit identity; the first draft of
@@ -257,8 +247,7 @@ impl SourceBitMap {
     /// resolver once per applicable list when it turns the tag
     /// intersection into a subscription mask — `ResolvedProfile::build_v1`
     /// and `specialise_with_effective_tags`, both in
-    /// `src/profiles/profile.rs`. The pre-v2 `profile.blocklists` field
-    /// this comment used to name is gone; the ids now come from
+    /// `src/profiles/profile.rs`. The ids come from
     /// `blocklist.tags ∩ effective_tags`.
     pub fn bit_for_v1_id(&self, id: &Id) -> Option<u8> {
         self.by_v1_id.get(id).copied()
@@ -316,8 +305,8 @@ pub(crate) fn is_url_source(s: &str) -> bool {
 /// equivalence key, so two entries that differ only in ways HTTP
 /// considers meaningless compare equal.
 ///
-/// `tag_model_consolidation` §3.2 — the single point of truth for
-/// "are these two blocklists the same source?". Three callers share it:
+/// The single point of truth for "are these two blocklists the same
+/// source?". Three callers share it:
 /// the `warden blocklist add` gate, the `warden blocklist set <id> url`
 /// gate, and the validator's duplicate check
 /// ([`crate::config::schema::validator::BLOCKLIST_DUPLICATE_URL`]).
@@ -409,17 +398,15 @@ pub fn canonical_url_key(url: &str) -> String {
     out
 }
 
-/// Typed facade over the URL ↔ v1-id source → [`BlocklistTrust`] map
-/// (§4.24 Phase 2).
+/// Typed facade over the URL ↔ v1-id source → [`BlocklistTrust`] map.
 ///
-/// Replaces the raw `HashMap<String, BlocklistTrust>` that
+/// Replaces a raw `HashMap<String, BlocklistTrust>` that
 /// [`merge_sources_with_blocklists`](crate::lists::manager::merge_sources_with_blocklists)
 /// historically returned. The trust is associated with each
 /// `[[blocklists]]` row at the schema level; both `[lists].sources`
 /// entries (legacy slash form, no schema-level trust) and absent rows
 /// resolve to [`BlocklistTrust::RemoteUnsigned`] at the consumer via the
-/// usual `unwrap_or` default — preserving pre-§4.24-P2 behaviour byte
-/// for byte.
+/// usual `unwrap_or` default.
 ///
 /// Two internal submaps share the same trust values:
 ///
@@ -428,9 +415,9 @@ pub fn canonical_url_key(url: &str) -> String {
 ///   (the manager checks trust unconditionally on the fetch path; the
 ///   disabled rows simply never reach that path because the merged
 ///   sources vector omits them).
-/// - `by_v1_id` — new in Phase 2. Lets future consumers (TUI, IPC,
-///   audit) resolve trust by canonical [`Id`] without monkey-patching a
-///   reverse lookup through the URL.
+/// - `by_v1_id` — lets consumers (TUI, IPC, audit) resolve trust by
+///   canonical [`Id`] without monkey-patching a reverse lookup through
+///   the URL.
 ///
 /// Build is infallible — the trust map has no per-list cap (the
 /// 64-source cap is enforced exactly once, by [`SourceBitMap::build`],
@@ -495,10 +482,9 @@ impl SourceTrustMap {
 }
 
 /// Typed facade over the source → bearer-token map used for
-/// `Authorization: Bearer <value>` headers on blocklist fetches
-/// (§4.24 Phase 2 P2-B).
+/// `Authorization: Bearer <value>` headers on blocklist fetches.
 ///
-/// Replaces the raw `HashMap<String, String>` that the start.rs
+/// Replaces a raw `HashMap<String, String>` that the start.rs
 /// helper `build_source_tokens` historically returned. The token is
 /// resolved at build time from each `[[blocklists]].auth_token_ref` →
 /// `Secrets` entry; absence (no ref OR ref missing in `secrets.toml`)
@@ -509,27 +495,25 @@ impl SourceTrustMap {
 /// - `by_url` — keyed by the **legacy slash-form source-key** produced
 ///   by the existing kebab→slash translation (`b.id.replacen('-','/',1)`).
 ///   The manager's [`download_list`](crate::lists::manager::ListManager)
-///   path keys exactly on this string today, so the typed API preserves
-///   pre-§4.24-P2 behaviour byte for byte. **Latent gap**: pure-v1
+///   path keys exactly on this string. **Latent gap**: pure-v1
 ///   configs (`[lists].sources = []`) put URL strings in the manager's
 ///   source vector, which never matches a slash-form key — so a
 ///   blocklist whose ONLY entry is in `[[blocklists]]` with
-///   `auth_token_ref` set currently fetches anonymously. Phase 2 leaves
-///   this gap in place to keep the scope as pure refactor; the new
-///   `token_for_v1_id` lookup positions a future fix (the manager's
-///   `source_to_blocklist` reverse-mapping at line 251 already resolves
-///   source → `Id`, so a follow-up commit can chain `Id → token` via
-///   `token_for_v1_id`).
-/// - `by_v1_id` — new in Phase 2. Lets future consumers resolve the
-///   token by canonical [`Id`] without re-deriving the slash-form.
+///   `auth_token_ref` set currently fetches anonymously. The
+///   `token_for_v1_id` lookup positions a future fix: the manager's
+///   `source_to_blocklist` reverse-mapping already resolves source →
+///   `Id`, so a follow-up commit can chain `Id → token` via
+///   `token_for_v1_id`.
+/// - `by_v1_id` — lets consumers resolve the token by canonical [`Id`]
+///   without re-deriving the slash-form.
 #[derive(Clone, Default)]
 pub struct SourceTokenMap {
     by_url: HashMap<String, String>,
     by_v1_id: HashMap<Id, String>,
 }
 
-/// rev-2606 §06 `source_key-01`: hand-written `Debug` that redacts the
-/// resolved bearer tokens. The derived `Debug` would print every secret
+/// Hand-written `Debug` that redacts the resolved bearer tokens.
+/// The derived `Debug` would print every secret
 /// in cleartext on any accidental `{:?}` — a future `debug!(?token_map)`,
 /// a `#[derive(Debug)]` on a containing struct that then gets logged, or
 /// a test dump. Print only the counts; never the values.
@@ -552,11 +536,10 @@ impl SourceTokenMap {
     /// For each enabled or disabled blocklist row with
     /// `auth_token_ref` set: resolve the named secret, insert the
     /// bearer string twice — once under the slash-form source-key
-    /// (matches manager.rs:1032 lookup byte for byte) and once under
-    /// the canonical [`Id`] (new typed surface). Rows whose
-    /// `auth_token_ref` points at a missing secret emit a
-    /// `tracing::warn!` and are skipped — the download proceeds
-    /// anonymously, identical to pre-§4.24-P2 behaviour.
+    /// (matches the manager's `download_list` lookup byte for byte) and
+    /// once under the canonical [`Id`]. Rows whose `auth_token_ref`
+    /// points at a missing secret emit a `tracing::warn!` and are
+    /// skipped — the download proceeds anonymously.
     pub fn build(
         config: &crate::config::schema::ConfigV1,
         secrets: &crate::config::secrets::Secrets,
@@ -596,11 +579,10 @@ impl SourceTokenMap {
         self.by_url.get(source).map(String::as_str)
     }
 
-    /// Look up the bearer token by canonical v1 entity [`Id`]. New
-    /// surface in §4.24 Phase 2 — closes the URL-vs-id ambiguity at
-    /// the type level and positions future consumers (the manager's
-    /// `source_to_blocklist` reverse-mapping path) to fetch with
-    /// authentication on pure-v1 configs.
+    /// Look up the bearer token by canonical v1 entity [`Id`]. Closes
+    /// the URL-vs-id ambiguity at the type level and positions future
+    /// consumers (the manager's `source_to_blocklist` reverse-mapping
+    /// path) to fetch with authentication on pure-v1 configs.
     pub fn token_for_v1_id(&self, id: &Id) -> Option<&str> {
         self.by_v1_id.get(id).map(String::as_str)
     }
@@ -665,7 +647,7 @@ mod tests {
 
     #[test]
     fn build_pure_v1_config_seeds_v1_id_alias_from_blocklist() {
-        // The May 6 case: empty `[lists].sources`, populated
+        // The pure-v1 case: empty `[lists].sources`, populated
         // `[[blocklists]]`. After `merge_sources_with_blocklists`, the
         // sources vector carries the URL — the v1 id alias must point
         // at the same bit so the profile resolver's `bit_for_v1_id`
@@ -680,14 +662,14 @@ mod tests {
         assert_eq!(
             map.bit_for_v1_id(&Id::new("privacy-ads").unwrap()),
             Some(0),
-            "pure-v1 config must produce a non-zero bit for the v1 id; \
-             the May 6 incident had this silently fall to None",
+            "pure-v1 config must produce a non-zero bit for the v1 id, \
+             not silently fall to None",
         );
         assert_eq!(map.bit_for_url("https://lists.purge.cc/ads.txt"), Some(0));
     }
 
-    /// neutrality-06 — the shard builder needs to know which source bits
-    /// are allow-direction. Direction is a per-source property, so it
+    /// The shard builder needs to know which source bits are
+    /// allow-direction. Direction is a per-source property, so it
     /// collapses to a single `u64` over the same bit space the corpus
     /// already uses.
     #[test]
@@ -712,8 +694,7 @@ mod tests {
         );
     }
 
-    /// A config with no allow-direction list must yield an empty mask —
-    /// the pre-neutrality-06 behaviour, preserved exactly.
+    /// A config with no allow-direction list must yield an empty mask.
     #[test]
     fn allow_bits_is_zero_when_every_list_is_deny() {
         let sources = vec!["https://lists.purge.cc/ads.txt".to_string()];
@@ -793,16 +774,15 @@ mod tests {
 
     #[test]
     fn blocklist_url_alias_overwrites_slash_form_v1_id_alias() {
-        // §11.4 bit-shuffle gotcha pin. When BOTH source channels
-        // alias the same logical list (slash-form `[lists].sources`
-        // entry + matching `[[blocklists]]` row whose URL is a
-        // separate entry in the merged sources vector), the
-        // blocklist-step seeding overwrites the slash-form-translation
-        // step's `by_v1_id` entry because `HashMap::insert` overwrites.
-        // Final value points at the URL-derived bit, not the
-        // slash-form-derived one. Pinning this explicitly prevents an
-        // accidental order swap from breaking downstream test fixtures
-        // (`init.rs:570` took this exact bite during Phase B).
+        // Bit-shuffle gotcha pin. When BOTH source channels alias the
+        // same logical list (slash-form `[lists].sources` entry +
+        // matching `[[blocklists]]` row whose URL is a separate entry
+        // in the merged sources vector), the blocklist-step seeding
+        // overwrites the slash-form-translation step's `by_v1_id` entry
+        // because `HashMap::insert` overwrites. Final value points at
+        // the URL-derived bit, not the slash-form-derived one. Pinning
+        // this explicitly prevents an accidental order swap from
+        // breaking downstream test fixtures.
         let sources = vec![
             "security/malicious".to_string(),
             "https://lists.purge.cc/security/malicious.txt".to_string(),
@@ -886,13 +866,12 @@ mod tests {
 
     #[test]
     fn trust_map_build_seeds_disabled_blocklists_too() {
-        // The pre-§4.24-P2 `merge_sources_with_blocklists` inserted
-        // trust unconditionally (line 1643 of manager.rs at sprint
-        // open). Phase 2 preserves this — a disabled blocklist's URL
-        // still gets a trust lookup because the manager's mutate
-        // helpers (`list_state` transitions, hypothetical `inspect`
-        // verb) may legitimately ask about a list the operator has
-        // toggled off. Disabled rows don't reach the fetch path
+        // `merge_sources_with_blocklists` inserts trust
+        // unconditionally. A disabled blocklist's URL still gets a
+        // trust lookup because the manager's mutate helpers
+        // (`list_state` transitions, hypothetical `inspect` verb) may
+        // legitimately ask about a list the operator has toggled off.
+        // Disabled rows don't reach the fetch path
         // (`merge_sources_with_blocklists` skips them when building
         // `sources`), so the disabled entry's URL is unreachable from
         // the manager's download loop regardless.
@@ -946,7 +925,7 @@ mod tests {
     fn trust_map_url_trusts_accessor_matches_typed_lookup_byte_for_byte() {
         // `url_trusts()` is the legacy accessor for transition
         // consumers that still hold a `&HashMap<String, BlocklistTrust>`.
-        // Phase 2 keeps it `pub` until no caller remains.
+        // Kept `pub` until no caller remains.
         let blocklists = vec![mk_trusted_blocklist(
             "privacy-ads",
             "https://lists.purge.cc/ads.txt",
@@ -1047,10 +1026,9 @@ mod tests {
 
     #[test]
     fn token_map_skips_blocklists_with_missing_secret() {
-        // Phase 2 preserves pre-existing behaviour: a `auth_token_ref`
-        // pointing at a non-existent secret emits `tracing::warn!` and
-        // the row is skipped (downloads anonymously, identical to
-        // build_source_tokens pre-§4.24-P2).
+        // An `auth_token_ref` pointing at a non-existent secret emits
+        // `tracing::warn!` and the row is skipped (downloads
+        // anonymously).
         use crate::config::schema::ConfigV1;
         let mut config = ConfigV1::test_scaffold();
         config.blocklists.push(mk_blocklist_with_token_ref(
@@ -1105,8 +1083,8 @@ mod tests {
 
     #[test]
     fn debug_redacts_bearer_tokens() {
-        // rev-2606 §06 source_key-01: the hand-written Debug must print
-        // counts, never the secret values.
+        // The hand-written Debug must print counts, never the secret
+        // values.
         use crate::config::schema::ConfigV1;
         let mut config = ConfigV1::test_scaffold();
         config.blocklists.push(mk_blocklist_with_token_ref(
@@ -1131,7 +1109,7 @@ mod tests {
         );
     }
 
-    // ── tag_model_consolidation §3.2 — canonical_url_key ─────────────
+    // ── canonical_url_key ─────────────────────────────────────────
 
     #[test]
     fn tmc_canonical_key_lowercases_scheme_and_host_only() {
@@ -1322,9 +1300,9 @@ mod tests {
 
     #[test]
     fn tmc_canonical_key_matches_the_live_ct_duplicate_pair() {
-        // D3 on `.94`: `privacy-ads` and `ads` both point at
-        // lists.purge.cc/ads.txt and were invisible to the byte-exact
-        // gate that let them in.
+        // Two differently-named entries can point at the same URL with
+        // only a trailing slash difference; a byte-exact gate would let
+        // them both in as if they were distinct sources.
         assert_eq!(
             canonical_url_key("https://lists.purge.cc/ads.txt"),
             canonical_url_key("https://lists.purge.cc/ads.txt/"),

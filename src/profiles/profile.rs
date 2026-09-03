@@ -26,7 +26,7 @@ use crate::dns::local_profile::ProfileLocalRecords;
 use crate::dns::rewrite::ProfileRewriteRules;
 use crate::filter::rules::{self, DnsRule, RuleAction};
 
-/// §4.8 §2/2 (D3): the per-resolution ECS knob carried by every
+/// The per-resolution ECS knob carried by every
 /// [`ResolvedProfile`]. Pre-flattened from `Profile.ecs` + the global
 /// `[upstream.ecs]` defaults at resolver-map build time, so the DNS
 /// hot path only reads `Copy` scalars — no Option chains, no dictionary
@@ -34,8 +34,8 @@ use crate::filter::rules::{self, DnsRule, RuleAction};
 ///
 /// Two-mode-plus-off model:
 ///
-/// - `EcsMode::Off` → [`Self::build_option`] returns `None`, the
-///   upstream wire is byte-identical to pre-§4.8 baseline.
+/// - `EcsMode::Off` → [`Self::build_option`] returns `None`; the
+///   upstream wire carries no ECS option at all.
 /// - `EcsMode::Coarse` → fixed `/24` IPv4 or `/56` IPv6 mask (RFC 7871
 ///   §11 privacy-preserving recommendation). [`Self::source_prefix_v4`]
 ///   and [`Self::source_prefix_v6`] are **ignored** under this mode.
@@ -55,9 +55,8 @@ pub struct EcsPolicy {
 
 impl EcsPolicy {
     /// Privacy-preserving default: never emit ECS. Matches the
-    /// behaviour of every pre-§4.8 deploy and of any post-§4.8 config
-    /// that leaves `[upstream.ecs].enabled = false` (the master kill-
-    /// switch).
+    /// behaviour of any config that leaves `[upstream.ecs].enabled =
+    /// false` (the master kill-switch).
     pub const OFF: Self = Self {
         mode: EcsMode::Off,
         source_prefix_v4: 0,
@@ -77,10 +76,10 @@ impl EcsPolicy {
 
     /// Resolve the per-profile policy from a (possibly absent)
     /// `Profile.ecs` sub-table layered onto the global `[upstream.ecs]`
-    /// defaults (D7 inheritance). Inner-`Option` fields on
+    /// defaults. Inner-`Option` fields on
     /// [`ProfileEcsConfig`] inherit per-field.
     ///
-    /// **Master kill-switch (T4):** when
+    /// **Master kill-switch:** when
     /// [`crate::config::settings::EcsConfig::enabled`] is `false`, the
     /// resolved policy short-circuits to [`Self::OFF`] regardless of
     /// any per-profile override. This is the operator's emergency stop
@@ -157,7 +156,7 @@ impl Default for EcsPolicy {
     }
 }
 
-/// `tag_model_consolidation` §3.1 — the groups a device belongs to.
+/// The groups a device belongs to.
 ///
 /// Membership is symmetric and either direction counts: `group.devices`
 /// listing the device, or `device.groups` listing the group. The
@@ -177,17 +176,14 @@ pub fn groups_for_device<'a>(device: &Device, all: &'a [Group]) -> Vec<&'a Group
 /// replaced atomically via `ArcSwap`.
 #[derive(Debug)]
 pub struct ResolvedProfile {
-    /// Profile id (e.g. "default", "kids"). Used by Stats/API sprints.
+    /// Profile id (e.g. "default", "kids").
     pub name: CompactString,
     /// This resolution opts out of **list** filtering entirely
     /// (`[[devices]].unfiltered = true`).
     ///
-    /// # What this replaces, and why it is a bool and not a mask
+    /// # Why this is a bool and not a mask
     ///
-    /// Until `plp-s3` this slot was `list_bitmask: u64` — the profile's
-    /// subscription mask — and `unfiltered` was expressed by zeroing it via
-    /// an empty `effective_tags` set (D14). Both halves of that are gone:
-    /// subscription and direction are now one per-profile pair
+    /// Subscription and direction are one per-profile pair
     /// ([`crate::filter::engine::ProfileMasks`]) held **beside the corpus**,
     /// materialised at publish time against the bit assignment that will
     /// actually serve the query.
@@ -198,8 +194,7 @@ pub struct ResolvedProfile {
     /// so a mask travelling with a profile can meet a corpus that has since
     /// re-assigned the bits it names — and the superset error puts a
     /// deny-list's bit on the allow side, where allow beats block and the
-    /// list silently stops blocking. That is `plp-s1` finding **F10**, closed
-    /// here; `_docs/features/profile_list_policy.md` §2.4 is the argument.
+    /// list silently stops blocking.
     ///
     /// A **boolean** is safe in a way a mask is not: it names no list, so it
     /// cannot point at the wrong one. Stale it can only be by one reload, and
@@ -208,7 +203,7 @@ pub struct ResolvedProfile {
     /// Domains that override blocks (parsed from `@@||domain^` admin rules).
     /// Checked with subdomain walk — allowing "example.com" also allows "sub.example.com".
     ///
-    /// **Shared, not copied** (`s-review-2605-profiles-m3`). This set is
+    /// **Shared, not copied.** This set is
     /// profile-static: [`Self::as_unfiltered`] varies only
     /// [`Self::unfiltered`], so every specialised profile
     /// clones the `Arc` rather than the table. Before the change a config
@@ -233,42 +228,40 @@ pub struct ResolvedProfile {
     /// Shared across specialisations — see [`Self::allow_domains`].
     pub rules: Arc<Vec<DnsRule>>,
     /// Wire-level response when a query is blocked under this profile.
-    /// Pre-resolved with N6 fallback applied at build time (either the
-    /// profile's own `block_response` or the global
+    /// Pre-resolved at build time (either the profile's own
+    /// `block_response` or the global
     /// `ServerGlobals::default_block_response`).
     pub block_response: BlockResponseV1,
     /// TTL (seconds) applied to the canned block response. Pre-resolved
-    /// with N6 fallback at build time.
+    /// at build time.
     pub blocked_ttl_secs: u32,
-    /// S44 DM4: profile-scoped local DNS records (A/AAAA/CNAME). Built
+    /// Profile-scoped local DNS records (A/AAAA/CNAME). Built
     /// once at resolver-map construction from `Profile.local_records`
     /// (already validated) + the global `[local_dns].ttl_secs` fallback.
     /// Hot-path probe is `Arc::clone` (free, the resolver loaded the
     /// `ResolvedProfile` already) + one `HashMap::get` + an optional
     /// bounded suffix walk gated on `has_subdomain_records`. Empty by
-    /// default — every pre-S44 profile pays zero overhead vs the
-    /// pre-S44 baseline.
+    /// default, so a profile with no local records pays zero overhead.
     pub local_records: Arc<ProfileLocalRecords>,
-    /// §4.12: profile-scoped name-to-name rewrite engine. Empty by default —
-    /// every pre-§4.12 profile pays zero overhead. Hot-path probe is
+    /// Profile-scoped name-to-name rewrite engine. Empty by default —
+    /// a profile with no rewrites pays zero overhead. Hot-path probe is
     /// `Arc::clone` (free) + one `HashMap::get` + optional bounded suffix
     /// walk gated on `has_subdomain_rules`. Engine in
     /// [`crate::dns::rewrite::ProfileRewriteRules`].
     pub rewrite_rules: Arc<ProfileRewriteRules>,
-    /// Sprint B of `lists_categories_v2` (T1, §5.1): the union of
-    /// §4.8 §2/2 (D3): per-resolution ECS policy. Pre-flattened from
+    /// Per-resolution ECS policy. Pre-flattened from
     /// the per-profile [`Profile::ecs`] override + the global
     /// `[upstream.ecs]` defaults at resolver-map build time, so the
     /// DNS hot path reads a `Copy` value with zero pointer chasing.
     ///
-    /// **Default-OFF construction** (D7 inheritance, T2): [`Self::build_v1`]
+    /// **Default-OFF construction:** [`Self::build_v1`]
     /// leaves this at [`EcsPolicy::OFF`]. The production resolver-map
     /// builder (`crate::profiles::resolver::build_resolver_map`)
     /// overrides it after construction with
     /// [`EcsPolicy::from_profile_and_upstream`] so tests that hit
-    /// `build_v1` directly stay on the baseline. The Sprint 1
+    /// `build_v1` directly stay on the baseline. The
     /// `[upstream.ecs].enabled` master kill-switch is enforced at the
-    /// T4 call site — when `enabled = false`, the upstream skips the
+    /// call site — when `enabled = false`, the upstream skips the
     /// build_option call regardless of policy value.
     pub ecs_policy: EcsPolicy,
 }
@@ -283,17 +276,14 @@ impl ResolvedProfile {
     /// wildcard) go into the [`Self::allow_domains`] / [`Self::deny_domains`]
     /// fast-path HashSets; everything else goes into [`Self::rules`].
     ///
-    /// **No list state reaches this struct any more (`plp-s3`).** It used to
-    /// carry a subscription bitmask derived here from
-    /// `blocklist.tags ∩ effective_tags`. Which lists a profile subscribes to,
-    /// and in which direction, is now one question with one answer —
-    /// `profiles.<id>.lists` over each list's `base` — projected onto the
-    /// corpus generation's bits by
+    /// **No list state reaches this struct.** Which lists a profile
+    /// subscribes to, and in which direction, is one question with one
+    /// answer — `profiles.<id>.lists` over each list's `base` — projected
+    /// onto the corpus generation's bits by
     /// `lists::source_key::SourceBitMap::project_policy` and published in the
-    /// same `Arc` as the entries it interprets. See
-    /// `_docs/features/profile_list_policy.md` §2.4.
+    /// same `Arc` as the entries it interprets.
     ///
-    /// `server` supplies the N6 fallbacks for `block_response` and
+    /// `server` supplies the fallbacks for `block_response` and
     /// `blocked_ttl_secs`: the profile's own value wins when set, otherwise
     /// the daemon-wide default applies. The fallback is applied here so the
     /// DNS hot path does a single `Arc::load` and reads the final values
@@ -321,7 +311,7 @@ impl ResolvedProfile {
             };
             let parsed = rules::parse_rules(&rule_def.rule);
             if parsed.is_empty() && !rule_def.rule.trim().is_empty() {
-                // Drift guard (rev-2606 schema-validator-05): the validator
+                // Drift guard: the validator
                 // dry-runs the same parser, so this fires only if a config
                 // bypassed validation (or the two paths diverged). Cold
                 // path — the double parse is for the error detail only.
@@ -403,10 +393,19 @@ impl ResolvedProfile {
         }
     }
 
-    /// Build a permissive default profile (forwards everything).
-    /// Used when no profile is resolved at any level of the chain and a
-    /// synthetic placeholder is needed — e.g. tests and the `permissive`
-    /// fallback when the operator has explicitly unset `default_profile`.
+    /// Build a permissive default profile — forwards everything, filters
+    /// nothing.
+    ///
+    /// **Test scaffolding. No resolution path may reach it.** A client the
+    /// chain cannot place gets a
+    /// [`Resolution`](crate::profiles::resolver::Resolution) carrying no
+    /// profile, and the query is refused. Handing that client this profile
+    /// instead would make the *unknown* client the least filtered one on the
+    /// network, which inverts the rule that an unrecognised client gets the
+    /// strictest treatment, not the loosest.
+    ///
+    /// Not `#[cfg(test)]`-gated only because integration tests in `tests/`
+    /// build against the library without that cfg.
     pub fn permissive_default() -> Self {
         Self {
             name: CompactString::new("default"),
@@ -426,21 +425,16 @@ impl ResolvedProfile {
     /// The same profile, with **list** filtering switched off for one
     /// resolution — `[[devices]].unfiltered = true`.
     ///
-    /// # What it replaces
+    /// # Why list policy is not per-device
     ///
-    /// `specialise_with_effective_tags`, which recomputed a subscription
-    /// bitmask **per device** from `device.tags ∪ profile.tags`. That is the
-    /// semantic narrowing `_docs/features/profile_list_policy.md` §4 S3
-    /// names: in v3 policy is a property of the *profile*, so two devices on
-    /// one profile can no longer see different lists. Measured on both live
-    /// hosts 2026-08-24: **zero** devices carry tags, so nothing real is
-    /// lost — and `warden migrate v2-to-v3` refuses a config that does carry
-    /// them rather than flattening it silently.
+    /// Policy is a property of the *profile*: two devices on one profile
+    /// cannot see different lists. `warden migrate v2-to-v3` refuses a
+    /// config that has devices carrying per-device list tags rather than
+    /// flattening it silently.
     ///
-    /// What survives the narrowing is `unfiltered`, which was never a tag
-    /// question wearing tag clothes: it is a device saying "do not filter
-    /// me", and it kept working only because an empty tag set happened to
-    /// zero the mask (D14). It now says so directly.
+    /// `unfiltered` is not a list-policy question: it is a device saying
+    /// "do not filter me", independent of which lists the profile
+    /// subscribes to.
     ///
     /// Every other field is profile-static and shares its `Arc` — see
     /// [`Self::allow_domains`] for the measurement that made that matter.
@@ -465,24 +459,24 @@ impl ResolvedProfile {
     }
 }
 
-/// Sprint 43 T4 (DM2): per-device overlay attached to the resolver state.
+/// Per-device overlay attached to the resolver state.
 ///
 /// Holds two `Arc<HashSet>` carrying the *exact-or-subdomain* allow / deny
 /// domains derived from the device's `allow_rules` / `deny_rules` admin
 /// rule references. Lives next to [`Arc<ResolvedProfile>`] in the
 /// resolver's private `ResolverMap` so a single atomic
 /// `ArcSwap` snapshot delivers both pointers consistently — no torn
-/// reads possible across reload boundaries (R5).
+/// reads possible across reload boundaries.
 ///
 /// Hot-path access: two `HashSet::contains` probes per query, zero
 /// allocation, zero lock. The overlay is computed at config build /
 /// reload time, not at query time, so adding rules to a device costs
 /// at most one rebuild + one ArcSwap store.
 ///
-/// **Qtype invariant (N7):** the sets are keyed on domain only.
+/// **Qtype invariant:** the sets are keyed on domain only.
 /// `apply_overlay` therefore returns the same decision for `A` and
 /// `AAAA` of the same name — preserving the symmetric-block invariant
-/// the rest of the daemon relies on. `T5` input validation rejects any
+/// the rest of the daemon relies on. Input validation rejects any
 /// rule that uses `$dnstype=` modifier so this invariant cannot be
 /// undermined at write time.
 #[derive(Debug, Clone)]
@@ -497,11 +491,10 @@ pub struct DeviceOverlay {
     /// Domains whose admin-rule was a `||domain^`-form deny. Subdomain
     /// walk applies.
     pub deny: Arc<HashSet<CompactString, RandomState>>,
-    /// D3-A-prudente flag: when `true`, an `allow` hit is permitted to
-    /// override a profile-level deny on the same domain (truth table §4
-    /// row 7). When `false`, the CLI / TUI refuses such writes at edit
-    /// time, and the daemon defensively prefers the profile deny on any
-    /// drift it observes (truth table §4 row 6 fallback).
+    /// When `true`, an `allow` hit is permitted to override a
+    /// profile-level deny on the same domain. When `false`, the CLI / TUI
+    /// refuses such writes at edit time, and the daemon defensively
+    /// prefers the profile deny on any drift it observes.
     pub override_profile_deny: bool,
 }
 
@@ -512,18 +505,16 @@ impl DeviceOverlay {
     /// Returns `None` when both `device.allow_rules` and
     /// `device.deny_rules` are empty — there is no overlay state to
     /// carry, and the resolver's `Resolution.overlay = None` triggers
-    /// the byte-identical pre-T4 hot path. Empty-overlay devices pay
-    /// zero overhead vs the pre-T4 baseline (snapshot acceptance).
+    /// the unchanged hot path. Empty-overlay devices pay zero overhead.
     ///
     /// Domain extraction mirrors [`ResolvedProfile::build_v1`]: simple
     /// exact `||domain^` / `@@||domain^` forms land in the HashSets;
     /// wildcard / `$important` / regex rules are dropped silently —
     /// the per-device overlay only models exact-or-subdomain matching
-    /// (D3 wording: "device-allow has effect ONLY if the profile does
-    /// not have an explicit deny on the same domain"). T5's input
-    /// validator rejects non-exact rule shapes at write time so this
-    /// branch should be unreachable on a fresh config; defensive on
-    /// drift.
+    /// ("device-allow has effect ONLY if the profile does not have an
+    /// explicit deny on the same domain"). The input validator rejects
+    /// non-exact rule shapes at write time so this branch should be
+    /// unreachable on a fresh config; defensive on drift.
     ///
     /// Dangling rule references (id not in `admin_rules_by_id`) are
     /// also skipped — the validator catches them earlier with a
@@ -553,10 +544,10 @@ impl DeviceOverlay {
                     }
                 }
             }
-            // res-11: a referenced rule that yields no simple-exact allow
+            // A referenced rule that yields no simple-exact allow
             // domain is silently dropped from the overlay (only exact
             // `||domain^` / `@@||domain^` forms are modelled). Make the
-            // drop observable so hand-edited drift past the T5 validator
+            // drop observable so hand-edited drift past the validator
             // shows up in the log instead of failing open in silence.
             if !contributed {
                 tracing::warn!(
@@ -608,20 +599,18 @@ impl DeviceOverlay {
     }
 }
 
-/// TUI-facing offline accessor (tui-wave1 `profiles-summary`): the blocklist
-/// ids a profile actually filters on, computed the SAME way the daemon does
-/// at publish time.
+/// TUI-facing offline accessor: the blocklist ids a profile actually
+/// filters on, computed the SAME way the daemon does at publish time.
 ///
-/// **`plp-s3` changed what the question means.** It used to be tag
-/// intersection (`blocklist.tags ∩ profile.tags ≠ ∅`); it is now "every
-/// enabled list whose effective direction for this profile is not `ignore`"
-/// — `profiles.<id>.lists` over each list's own `base`, via the one canonical
-/// predicate [`crate::config::schema::effective_direction`].
+/// The question is "every enabled list whose effective direction for
+/// this profile is not `ignore`" — `profiles.<id>.lists` over each
+/// list's own `base`, via the one canonical predicate
+/// [`crate::config::schema::effective_direction`].
 ///
 /// Kept as a single public entry point for the same reason it was created:
 /// the read-only Profiles-tab "What it blocks" summary and
 /// `warden lists …` must ask the *engine's* question, not a second copy of
-/// it. D11 of `tag_model_consolidation` is what two copies cost.
+/// it.
 ///
 /// Disabled lists are excluded: they never reach the merged sources vector,
 /// so they hold no bit and cannot contribute a verdict.
@@ -925,7 +914,7 @@ mod tests {
         assert!(rp.allow_domains.is_empty() && rp.deny_domains.is_empty());
     }
 
-    // ── Sprint 43 T4 — DM2 DeviceOverlay::build_v1 ───────────────────
+    // ── DeviceOverlay::build_v1 ───────────────────────────────────
 
     fn empty_device(id: &str) -> Device {
         Device {
@@ -951,8 +940,8 @@ mod tests {
 
     #[test]
     fn overlay_build_returns_none_when_device_has_no_rules() {
-        // Snapshot acceptance: empty allow_rules + deny_rules → no
-        // overlay attached → byte-identical pre-T4 hot path.
+        // Empty allow_rules + deny_rules → no overlay attached → the
+        // hot path is unchanged.
         let dev = empty_device("phone");
         let overlay = DeviceOverlay::build_v1(&dev, &BTreeMap::new());
         assert!(overlay.is_none());
@@ -984,11 +973,11 @@ mod tests {
 
     #[test]
     fn overlay_build_preserves_override_flag() {
-        // override_profile_deny is the per-device gate enabling truth
-        // table §4 row 7 (allow + profile-deny + override=true → ALLOW
-        // Device [OVERRIDE]). Always carried on the overlay so the
-        // hot path can read it without consulting the original
-        // DeviceConfig (which lives behind a separate ArcSwap snapshot).
+        // override_profile_deny is the per-device gate enabling an
+        // allow to win over a profile-level deny on the same domain.
+        // Always carried on the overlay so the hot path can read it
+        // without consulting the original DeviceConfig (which lives
+        // behind a separate ArcSwap snapshot).
         let rules = vec![mk_rule("allow-bank", "@@||bank.example^")];
         let mut dev = empty_device("phone");
         dev.allow_rules = vec![Id::new("allow-bank").unwrap()];
@@ -1014,7 +1003,7 @@ mod tests {
     #[test]
     fn overlay_build_drops_non_simple_rules() {
         // Wildcards / regex / $important shapes are not modelled by
-        // the per-device overlay (T5 input validator rejects them at
+        // the per-device overlay (the input validator rejects them at
         // write time). Defensive on drift: rule is silently skipped.
         let rules = vec![
             mk_rule("wild-allow", "@@||*.bank.example^"),
@@ -1090,7 +1079,7 @@ mod tests {
         );
     }
 
-    // ── §4.8 §2/2: EcsPolicy ───────────────────────────────────
+    // ── EcsPolicy ──────────────────────────────────────────────
 
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1119,7 +1108,7 @@ mod tests {
     fn ecs_policy_off_emits_none_for_any_ip() {
         let p = EcsPolicy::OFF;
         assert!(p
-            .build_option(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)))
+            .build_option(IpAddr::V4(Ipv4Addr::new(10, 10, 1, 50)))
             .is_none());
         assert!(p
             .build_option(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
@@ -1134,7 +1123,7 @@ mod tests {
             source_prefix_v6: 8,
         };
         let opt = p
-            .build_option(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50)))
+            .build_option(IpAddr::V4(Ipv4Addr::new(10, 10, 1, 50)))
             .expect("coarse v4 emits option");
         assert_eq!(opt.source_prefix(), 24);
     }
@@ -1228,7 +1217,7 @@ mod tests {
     fn ecs_policy_master_kill_switch_off_overrides_profile_subnet() {
         // Operator emergency stop: even an explicit `mode = "subnet"`
         // on the profile must yield OFF when `[upstream.ecs].enabled
-        // = false`. Validates the T4 master kill-switch path.
+        // = false`. Validates the master kill-switch path.
         let upstream_disabled = EcsConfig {
             enabled: false,
             source_prefix_v4: 24,

@@ -38,15 +38,14 @@ fn default_upstream_timeout_ms() -> u64 {
 }
 
 fn default_update_interval_secs() -> u64 {
-    // 12h. After Sprint 24 Phase 1.2 (s24-list-cache-freshness-check)
-    // this value has DUAL purpose: it is the background update period
-    // AND the disk cache freshness threshold. The freshness check in
-    // refresh() skips HTTP entirely when the on-disk cache age is
-    // below this number, so a higher value reduces upstream traffic
-    // for unchanged content. Matched to the purge.cc list update
-    // cadence — server-side lists are not republished more often
-    // than once every 12h, so a tighter interval would just produce
-    // 304s without changing the merged domain map.
+    // 12h. Dual purpose: background update period AND disk cache
+    // freshness threshold. The freshness check in refresh() skips HTTP
+    // entirely when the on-disk cache age is below this number, so a
+    // higher value reduces upstream traffic for unchanged content.
+    // Matched to the purge.cc list update cadence — server-side lists
+    // are not republished more often than once every 12h, so a
+    // tighter interval would just produce 304s without changing the
+    // merged domain map.
     43_200
 }
 
@@ -86,16 +85,7 @@ fn default_cache_cname_max_depth() -> usize {
     16
 }
 
-// ── Sprint §4.4 P1 — prefetch hit-frequency tracker defaults ───
-//
-// Sprint §4.4 P2 (2026-05-06) flipped the master flag to `true` after
-// CT burn-in: 6-min synthetic warm of cnn.com on `the lab host`
-// produced 9/10 cache hits at Query time = 0msec, RSS drift +708 KB
-// over 9 minutes (no leak), regression clean. Operators picking up
-// the new binary now get proactive refresh by default; explicit
-// opt-out via `prefetch_tracker_enabled = false` under [cache] still
-// works. See `_docs/features/cache_prefetching.md` and the
-// `tracking::prefetch::PrefetchTrackerConfig` mirror.
+// ── Prefetch hit-frequency tracker defaults ─────────────────────
 
 fn default_cache_prefetch_tracker_enabled() -> bool {
     true
@@ -113,12 +103,12 @@ fn default_cache_prefetch_tracker_max_pool_size() -> u32 {
     1024
 }
 
-// ── Sprint §4.4 P2 — background refresh worker pacing ─────────────
+// ── Background refresh worker pacing ────────────────────────────
 //
 // `tick_secs` is how often the worker scans the promoted-domain set.
 // `lead_secs` is how far ahead of TTL expiry the worker will refresh
-// an entry. Both are independent of the Sprint 17 `prefetch_threshold`
-// (% of TTL) which still drives Approach A's reactive path.
+// an entry. Both are independent of `prefetch_threshold` (% of TTL),
+// which still drives the reactive prefetch path.
 
 fn default_cache_prefetch_tracker_tick_secs() -> u64 {
     30
@@ -154,12 +144,11 @@ fn default_api_rate_limit() -> u32 {
 
 // ── Security defaults ──────────────────────────────────────────
 
-// rrl-01 (rev-2606): was 5. RRL buckets by /24, and a home LAN is exactly
-// one /24 — at 5 resp/s × 15 s the whole household shared a 75-responses-
-// per-15-s budget across every response class (post-9f60205 hoist), which
-// normal multi-device browsing exceeds. 100 resp/s (= 1500/window) sits
-// ~4-7× above real LAN peaks while reflection floods (thousands/s) still
-// trip it.
+// Was 5. RRL buckets by /24, and a home LAN is exactly one /24 — at 5
+// resp/s × 15 s the whole household shared a 75-responses-per-15-s
+// budget across every response class, which normal multi-device
+// browsing exceeds. 100 resp/s (= 1500/window) sits ~4-7× above real
+// LAN peaks while reflection floods (thousands/s) still trip it.
 fn default_rrl_responses_per_second() -> u32 {
     100
 }
@@ -226,10 +215,8 @@ fn default_tunneling_window_secs() -> u64 {
 
 // Per-section `enabled` defaults. Each section gets its own one-line
 // helper so a future flip of one default does NOT silently retune
-// unrelated features. Pre-T2.5 a single shared `default_tracking_enabled`
-// was wired to six independent toggles (tracking + four security
-// sub-sections + anti-bypass); see review `settings-01` / FIX_PLAN H-10.
-// Today every helper returns `true`, but each can flip independently.
+// unrelated features — every helper returns `true` today, but each
+// can flip independently.
 fn default_tracking_enabled() -> bool {
     true
 }
@@ -282,32 +269,29 @@ fn default_query_log_max_files() -> usize {
     7
 }
 
-/// Sprint 38 QLP3: named default closes the Sprint 37 QL3 gap where a
-/// partial `[tracking]` section with no `query_log_enabled` line
-/// deserialised via the bare `#[serde(default)]` path to `bool::default()`
-/// (i.e. `false`) — disagreeing with the struct-level `impl Default`
-/// which flips to `true` on S37.
+/// Named default closes a gap where a partial `[tracking]` section
+/// with no `query_log_enabled` line deserialised via the bare
+/// `#[serde(default)]` path to `bool::default()` (i.e. `false`) —
+/// disagreeing with the struct-level `impl Default`, which is `true`.
 fn default_query_log_enabled() -> bool {
     true
 }
 
-/// Sprint 38 QLP3: `retention_days` is the primary on-disk retention
-/// knob. `7` matches the S38 design's "weekly window" contract with
-/// operator cron archival — see `_docs/features/query_log_policy_v1.md` D2.
+/// `retention_days` is the primary on-disk retention knob. `7` matches
+/// a "weekly window" contract with operator cron archival.
 fn default_retention_days() -> u32 {
     7
 }
 
 // ── Back-compat deserialisers ────────────────────────────────────
 //
-// T2.5 H-11: pre-T2.5, `ApiConfig` carried `String::new()` sentinels
-// for `token_hash` / `tls_cert` / `tls_key`, and operator configs on
-// disk (including the live CT master and `cli/commands/token.rs`'s
-// regenerate output) literally write `token_hash = ""` when the value
-// is unset. After the migration to `Option<String>` / `Option<PathBuf>`
-// these helpers preserve byte-for-byte back-compat: an empty string in
-// the TOML still parses as `None`, and an absent field still defaults
-// to `None` via `#[serde(default)]`.
+// `ApiConfig` used to carry `String::new()` sentinels for `token_hash`
+// / `tls_cert` / `tls_key`, and operator configs on disk (including
+// `cli/commands/token.rs`'s regenerate output) still write
+// `token_hash = ""` when the value is unset. These helpers preserve
+// byte-for-byte back-compat: an empty string in the TOML still parses
+// as `None`, and an absent field still defaults to `None` via
+// `#[serde(default)]`.
 
 /// Deserialise `Option<String>`, mapping an empty string to `None`.
 fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -327,14 +311,11 @@ where
     Ok(opt.filter(|s| !s.is_empty()).map(PathBuf::from))
 }
 
-// §4.41: the v0 top-level `Settings` aggregate struct was retired here.
 // `ConfigV1` (src/config/schema/mod.rs) is the single config model; it
 // reuses the sub-struct types defined below (`ServerConfig`,
-// `UpstreamConfig`, `ListsConfig`, …) as pass-through sections, and
+// `UpstreamConfig`, `ListsConfig`, …) as pass-through sections.
 // `ClientConfig` / `ScheduleConfig` survive as the IPC `[[devices]]`
-// wire type + migration exchange type. Only the `Settings` envelope,
-// its `from_file*` / `apply_cli_overrides` impl, and `SettingsLoadError`
-// were deleted — see also `config/writer.rs` (v0 `write_config` gone).
+// wire type and migration exchange type respectively.
 
 // ── [server] ────────────────────────────────────────────────────
 
@@ -351,7 +332,7 @@ pub struct ServerConfig {
     #[serde(default = "default_tcp_timeout_secs")]
     pub tcp_timeout_secs: u64,
     /// Verify the device's hardware address (MAC) at query time for
-    /// clients whose `[[clients]]` entry pins a MAC (P0-2).
+    /// clients whose `[[clients]]` entry pins a MAC.
     ///
     /// When `true` (default): if a client config pins a MAC, the daemon
     /// consults the local ARP table at query time. If the ARP table maps
@@ -376,12 +357,12 @@ pub struct ServerConfig {
     ///
     /// Set to `false` only if you need the old behavior (IP-only
     /// matching, no MAC verification) — e.g. for debugging.
-    /// T5 renamed from `enforce_client_mac`; the legacy key is accepted
+    /// Renamed from `enforce_client_mac`; the legacy key is accepted
     /// via the serde alias on direct `ConfigV1` parses — the loader's
     /// WARN branch is the primary retro-compat surface.
     #[serde(default = "default_enforce_device_mac", alias = "enforce_client_mac")]
     pub enforce_device_mac: bool,
-    /// Source-IP allow list (CIDRs) for incoming DNS queries (P0-5).
+    /// Source-IP allow list (CIDRs) for incoming DNS queries.
     ///
     /// When empty and `listen` binds a specific interface (loopback or
     /// private), all sources are accepted — standard behavior. When
@@ -467,13 +448,13 @@ pub struct UpstreamConfig {
     /// - dot: "host:port" (e.g. "192.0.2.1:853")
     /// - doq: "host:port" (e.g. "resolver.example.net:853"); requires the `doq` feature
     ///
-    /// neutrality-10: there is deliberately **no** default. `#[serde(default)]`
-    /// yields an EMPTY vector, which the validator refuses with the frozen
+    /// There is deliberately **no** default. `#[serde(default)]` yields an
+    /// EMPTY vector, which the validator refuses with the frozen
     /// `UPSTREAM_SERVERS_EMPTY`. This used to default to a named provider's
     /// pair, so a config that merely omitted `servers` routed the household's
     /// whole query stream to a company warden — not the operator — chose. No
     /// non-empty value is neutral: any address favours someone. Same reasoning
-    /// as `init`'s `NO_DEFAULT_UPSTREAMS`; see project rules §Neutrality.
+    /// as `init`'s `NO_DEFAULT_UPSTREAMS`; see CLAUDE.md §Neutrality.
     ///
     /// Both default paths must stay empty, and they are reached by different
     /// configs: this attribute fires when `[upstream]` is present but `servers`
@@ -501,8 +482,8 @@ impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             mode: UpstreamMode::default(),
-            // neutrality-10: empty on purpose — see the `servers` field doc.
-            // This is the branch a config that omits `[upstream]` entirely
+            // Empty on purpose — see the `servers` field doc. This is
+            // the branch a config that omits `[upstream]` entirely
             // lands on; the field attribute never runs for it.
             servers: Vec::new(),
             timeout_ms: default_upstream_timeout_ms(),
@@ -513,22 +494,46 @@ impl Default for UpstreamConfig {
     }
 }
 
-/// EDNS Client Subnet (RFC 7871) policy. §4.8 Sprint 1/2 reads only
-/// `enabled` + `source_prefix_v4/v6`; `mode` is reserved for Sprint 2/2's
+impl UpstreamConfig {
+    /// Flatten the configured upstreams into an ordered `(address, mode)`
+    /// list: every primary server tagged with `self.mode`, then (if a
+    /// fallback is configured) every fallback server tagged with the
+    /// fallback's mode.
+    ///
+    /// The daemon precomputes this at boot and stores the stringified form
+    /// on `DaemonState` so `IpcResponse::Status` can surface the literal
+    /// resolver addresses. Order is primary-then-fallback so the System
+    /// card leads with the primary resolvers. A differing fallback mode is
+    /// the only source of a mixed-kind list — the primary `servers` all
+    /// share `self.mode`.
+    pub fn server_list(&self) -> Vec<(String, UpstreamMode)> {
+        let mut out: Vec<(String, UpstreamMode)> = self
+            .servers
+            .iter()
+            .map(|s| (s.clone(), self.mode))
+            .collect();
+        if let Some(fb) = &self.fallback {
+            out.extend(fb.servers.iter().map(|s| (s.clone(), fb.mode)));
+        }
+        out
+    }
+}
+
+/// EDNS Client Subnet (RFC 7871) policy. Only `enabled` +
+/// `source_prefix_v4/v6` are read; `mode` is reserved for a future
 /// per-profile policy and is currently a no-op.
 ///
 /// Default is OFF (`enabled = false`). When omitted from the TOML, the
-/// daemon emits no ECS option on outbound queries — identical wire
-/// behaviour to pre-§4.8 baseline. LAN-only deploys leave this section
-/// off; CDN-routing deploys opt in.
+/// daemon emits no ECS option on outbound queries. LAN-only deploys
+/// leave this section off; CDN-routing deploys opt in.
 ///
 /// ```toml
-/// # Privacy-preserving infra-ready (Sprint 1 default when enabled):
+/// # Privacy-preserving, infra-ready:
 /// [upstream.ecs]
 /// enabled = true
 /// source_prefix_v4 = 0    # zero address bytes on wire (RFC §7.1.2)
 /// source_prefix_v6 = 0
-/// mode = "off"            # Sprint 2 will read this; ignored in Sprint 1
+/// mode = "off"            # reserved; ignored today
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EcsConfig {
@@ -548,9 +553,8 @@ pub struct EcsConfig {
     /// as `source_prefix_v4`.
     #[serde(default = "default_ecs_source_prefix_v6")]
     pub source_prefix_v6: u8,
-    /// Sprint 2/2 reserved field. Currently no-op — Sprint 1 always
-    /// emits the anonymous form when `enabled = true`. Sprint 2 will
-    /// promote this to a per-profile knob.
+    /// Reserved field. Currently no-op — the anonymous form is always
+    /// emitted when `enabled = true`.
     #[serde(default)]
     pub mode: EcsMode,
 }
@@ -572,12 +576,10 @@ impl EcsConfig {
     /// deploys, default), in which case upstreams emit zero EDNS
     /// extensions on the wire.
     ///
-    /// Sprint 1/2 always emits the **anonymous** form (RFC 7871 §7.1.2:
+    /// Always emits the **anonymous** form (RFC 7871 §7.1.2:
     /// `source_prefix = 0`, address all-zero) regardless of the `mode`
     /// or `source_prefix_v{4,6}` fields — those fields are reserved for
-    /// Sprint 2/2's per-profile policy. Sprint 1 stands up the
-    /// wire-format infrastructure with privacy-first defaults; only
-    /// Sprint 2 promotes the prefix to a per-client value.
+    /// a future per-profile policy.
     ///
     /// IPv4 family is chosen unconditionally for the anonymous option:
     /// the address is `0.0.0.0` so the family choice is moot from a
@@ -601,19 +603,19 @@ fn default_ecs_source_prefix_v6() -> u8 {
     0
 }
 
-/// ECS routing policy. Sprint 1/2 reads only `Off` semantically (the
+/// ECS routing policy. Only `Off` is semantically read today (the
 /// codec emits the anonymous zero-bytes form regardless when `enabled`
-/// is true). Sprint 2/2 will activate `Coarse` (truncate to a fixed
-/// privacy-safe prefix) and `Subnet` (forward the per-profile prefix).
+/// is true). `Coarse` (truncate to a fixed privacy-safe prefix) and
+/// `Subnet` (forward the per-profile prefix) are reserved variants.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EcsMode {
     /// No address forwarding — anonymous form only.
     #[default]
     Off,
-    /// Sprint 2 reserved: coarse-grained truncation.
+    /// Reserved: coarse-grained truncation.
     Coarse,
-    /// Sprint 2 reserved: per-profile source-prefix forwarding.
+    /// Reserved: per-profile source-prefix forwarding.
     Subnet,
 }
 
@@ -674,13 +676,15 @@ pub struct ListsConfig {
     /// servers that omit `Content-Length`, and bounds worst-case memory
     /// use during list refresh.
     ///
-    /// **Default:** 200 MB. Chosen because real purge.cc lists have
-    /// grown past 100 MB (e.g. `security/malicious` hit ~114 MB in
-    /// April 2026). Operators on resource-constrained hardware (e.g. a
-    /// Raspberry Pi Zero 2 W with 512 MB RAM) may want to lower this —
-    /// a full list download briefly holds its full size in memory, and
-    /// a 200 MB body on a 512 MB device is a significant spike. For a
-    /// Pi, 50-100 MB and a curated smaller list is safer.
+    /// **Default:** 512 MiB. Sized so [`Self::max_entries`] binds before
+    /// this cap does — 20,000,000 entries at ~23 bytes each is ~460 MB,
+    /// under 512 MiB — while still holding headroom over the largest
+    /// real list. A refresh can briefly hold a downloaded body twice over
+    /// in memory, so this is also a bound on that spike: on
+    /// resource-constrained hardware (e.g. a Raspberry Pi Zero 2 W with
+    /// 512 MB RAM), a body anywhere near this cap is the device's whole
+    /// RAM budget. Lower it, and curate a smaller list, on hardware that
+    /// small.
     ///
     /// Must be non-zero. `0` is treated as a misconfiguration and
     /// rejected at validation time.
@@ -689,14 +693,15 @@ pub struct ListsConfig {
     /// Maximum number of entries (domains) to load from a single list.
     ///
     /// Prevents OOM from adversarial or unexpectedly large list content.
-    /// When a list exceeds this limit, the remainder is silently dropped
-    /// with a warn-level log naming the list. Each list is capped
-    /// independently; the merged domain map may exceed this if multiple
-    /// lists contribute different domains.
+    /// A list that exceeds this limit is **refused for the cycle** — it is
+    /// not truncated. Each list is capped independently; the merged
+    /// domain map may exceed this if multiple lists contribute different
+    /// domains.
     ///
-    /// **Default:** 10,000,000. Was 5,000,000, which sat *below* four of
-    /// the eight live purge.cc lists — the daemon silently discarded 19%
-    /// of its corpus. See `default_max_list_entries`.
+    /// This is the **global** `[lists] max_entries`. A `max_entries` set
+    /// on an individual `[[blocklists]]` entry is validated and stored,
+    /// but not enforced — only this value reaches the parser. See
+    /// `default_max_list_entries`.
     ///
     /// Must be non-zero.
     #[serde(default = "default_max_list_entries")]
@@ -704,11 +709,11 @@ pub struct ListsConfig {
     /// Ceiling on the **merged, deduplicated** domain corpus, in entries.
     ///
     /// [`Self::max_entries`] bounds a single list and therefore bounds
-    /// nothing in aggregate: eight sources at 10,000,000 each is 80,000,000
-    /// on paper. What actually holds the live corpus near 12.3 M is that
-    /// the lists overlap heavily — around 2.4× — and overlap is a property
-    /// of the lists an operator happens to subscribe to, not a guarantee
-    /// the daemon enforces. This is the bound on the merged map.
+    /// nothing in aggregate: eight sources at 20,000,000 each is
+    /// 160,000,000 on paper. What actually holds the live corpus down is
+    /// that the lists overlap heavily, and overlap is a property of the
+    /// lists an operator happens to subscribe to, not a guarantee the
+    /// daemon enforces. This is the bound on the merged map.
     ///
     /// Enforced on the deduplicated union, measured before any part of the
     /// new generation is installed. Three bands:
@@ -724,21 +729,8 @@ pub struct ListsConfig {
     /// status` says so explicitly and names the list contributing the most
     /// domains no other list supplies.
     ///
-    /// **Default:** 14,000,000. This is a memory budget, so it is yours to
-    /// set — a box with tens of GB free has no reason to stop at the
-    /// default. The number **was** chosen to sit just under a step in the
-    /// memory curve: the domain map used to keep 16 shards of power-of-two
-    /// buckets at 7/8 maximum load, so crossing 14,680,064 entries doubled
-    /// every shard's allocation and roughly doubled the map's footprint
-    /// (~690 MB → ~1.37 GB at the then-measured 41 bytes per bucket).
-    ///
-    /// **`mem-t6` removed that step.** Each shard is now an exact-size
-    /// sorted slice — no buckets, no load factor, no allocation cliff — so
-    /// memory grows linearly with the domain count. The value is kept at
-    /// 14,000,000 deliberately, now as a plain memory budget rather than a
-    /// threshold: changing it would move the behaviour of every existing
-    /// installation for a reason that is not a safety one. Raise it freely if
-    /// you have the RAM, and expect the cost to arrive in steps.
+    /// See `default_max_total_domains` for how the default is sized and
+    /// what it costs in memory.
     ///
     /// `0` disables the check entirely, including the extra counting pass
     /// over the refresh spill that measures the union — so disabling it
@@ -755,10 +747,9 @@ pub struct ListsConfig {
     /// directory. **Default:** `"lists"`.
     #[serde(default = "default_cache_dir")]
     pub cache_dir: PathBuf,
-    /// §4.7 Phase 2 T2: threshold (in seconds) past which a list is
-    /// considered "stale" and the TUI Lists tab renders a non-alarm
-    /// `Stale` badge in muted color. Compared against
-    /// `now - ListStatus.last_refresh_at`.
+    /// Threshold (in seconds) past which a list is considered "stale"
+    /// and the TUI Lists tab renders a non-alarm `Stale` badge in
+    /// muted color. Compared against `now - ListStatus.last_refresh_at`.
     ///
     /// **Default:** 86 400 (24 h) — twice the default
     /// `update_interval_secs` of 43 200 (12 h), so a single missed
@@ -767,8 +758,8 @@ pub struct ListsConfig {
     /// to at least 2× their interval to avoid false positives.
     #[serde(default = "default_staleness_threshold_secs")]
     pub staleness_threshold_secs: u64,
-    /// rev-2606 §06 `manager-01`: when `true`, a refresh whose freshly
-    /// downloaded body shrinks a previously-healthy list by more than
+    /// When `true`, a refresh whose freshly downloaded body shrinks a
+    /// previously-healthy list by more than
     /// [`Self::shrink_guard_max_drop_pct`] percent is **refused** — the
     /// prior on-disk cache is kept, the source is marked `Failed` with an
     /// operator-visible reason, and the daemon keeps serving the last-good
@@ -784,12 +775,12 @@ pub struct ListsConfig {
     /// refused with `warden lists forget <source>`.
     #[serde(default = "default_shrink_guard_enabled")]
     pub shrink_guard_enabled: bool,
-    /// rev-2606 §06 `manager-01`: the maximum single-cycle shrink, as a
-    /// percentage of the previous unique-domain count, that the retention
-    /// guard tolerates before refusing the refresh. A drop **strictly
-    /// greater** than this trips the guard; a drop equal to or below it is
-    /// accepted (lists do get pruned upstream, so this must not be a hard
-    /// "never shrink").
+    /// The maximum single-cycle shrink, as a percentage of the
+    /// previous unique-domain count, that the retention guard
+    /// tolerates before refusing the refresh. A drop **strictly
+    /// greater** than this trips the guard; a drop equal to or below it
+    /// is accepted (lists do get pruned upstream, so this must not be
+    /// a hard "never shrink").
     ///
     /// **Default:** 90 — a list losing >90% of its domains in one cycle is
     /// the empty-body / error-page signature, not organic churn. Valid
@@ -816,63 +807,68 @@ impl Default for ListsConfig {
     }
 }
 
-/// rev-2606 §06 `manager-01`: retention guard on by default — a security
-/// product must not silently fail open when an upstream serves garbage.
+/// Retention guard on by default — a security product must not
+/// silently fail open when an upstream serves garbage.
 fn default_shrink_guard_enabled() -> bool {
     true
 }
 
-/// rev-2606 §06 `manager-01`: a >90% single-cycle collapse is the
-/// empty-body / error-page signature. See
-/// [`ListsConfig::shrink_guard_max_drop_pct`].
+/// A >90% single-cycle collapse is the empty-body / error-page
+/// signature. See [`ListsConfig::shrink_guard_max_drop_pct`].
 fn default_shrink_guard_max_drop_pct() -> u8 {
     90
 }
 
-/// §4.7 Phase 2 T2: 24-hour staleness window for the TUI Lists badge.
-/// See [`ListsConfig::staleness_threshold_secs`] for rationale.
+/// 24-hour staleness window for the TUI Lists badge. See
+/// [`ListsConfig::staleness_threshold_secs`] for rationale.
 fn default_staleness_threshold_secs() -> u64 {
     86_400
 }
 
+/// 512 MiB. [`ListsConfig::max_entries`] binds first in practice —
+/// 20,000,000 entries at ~23 bytes/domain is ~460 MB — so this is
+/// headroom over the largest first-party body rather than the binding
+/// constraint. A refresh can hold a downloaded body twice over in memory,
+/// so the worst case this cap allows is roughly twice itself.
 fn default_max_list_body_bytes() -> usize {
-    // 200 MB — fits today's largest purge.cc lists with headroom.
-    // See the `max_body_bytes` doc comment above for rationale.
-    200 * 1024 * 1024
+    512 * 1024 * 1024
 }
 
-/// Global `[lists] max_entries` fallback, inherited by every
-/// `[[blocklists]]` entry that does not set its own. Kept in step with
-/// [`crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES`], which carries the
-/// measured rationale for 10M.
+/// Global `[lists] max_entries` fallback — the only place this cap is
+/// actually enforced. A `max_entries` set on an individual
+/// `[[blocklists]]` entry is validated and stored, but never reaches the
+/// parser. See [`ListsConfig::max_entries`] for the refusal semantics.
 ///
-/// Note for operators upgrading: this default is only inherited by a
-/// `[[blocklists]]` entry that does not pin its own `max_entries`. A
-/// config that still pins the old `5000000` keeps that lower cap — and
-/// exceeding a cap no longer truncates the overflow, it **refuses the
-/// whole source** and keeps the previous generation. So a pinned 5M on a
-/// list that has since grown past it makes that list disappear rather
-/// than shrink. Re-pin or drop the override.
+/// 20,000,000 is roughly 2.2x the largest first-party list, a per-source
+/// sanity bound rather than a memory guarantee. It sits well under the
+/// corpus ceiling's cold-start cap, which admits up to twice
+/// [`default_max_total_domains`] at boot.
 fn default_max_list_entries() -> usize {
-    10_000_000
+    20_000_000
 }
 
-/// Global `[lists] max_total_domains` default — the ceiling on the merged
-/// deduplicated corpus. See [`ListsConfig::max_total_domains`] for the
-/// bands and for why this number and not another.
+/// 24,000,000. The corpus is an exact-size sorted slice of
+/// `(CompactString, u64)` (32 B inline) plus heap for names longer than 24 B
+/// (25 % of the first-party corpus, ~10 B amortised), measured on two live
+/// hosts at 13.1 M and 14.9 M domains as RSS ≈ 25 MB + 47 B × N with a
+/// refresh transient of ~335 MB set by the largest single body, not by N.
+/// At this ceiling that is ≈1.15 GB steady and ≈1.5 GB at refresh peak —
+/// the largest round value whose refresh still fits a 2 GB box, the
+/// smallest class on which the `warden init` default subscription (12.4 M
+/// domains) fits at all. The full first-party catalog sits near 15.0 M,
+/// growing ~18 k/day; `tests/fixtures/catalog_census.json` pins that the
+/// shipped defaults keep ≥ 20 % headroom over the last census. Memory
+/// grows linearly with the count: there is no allocation step to sit
+/// under.
 ///
-/// 14,000,000 was chosen to sit just under the 14,680,064-entry point at
-/// which the old hash representation doubled every shard's bucket
-/// allocation. `mem-t6` replaced that representation with exact-size
-/// sorted slices, so **the point no longer exists** and the value survives
-/// as a memory budget rather than as a cliff-avoidance number. It remains
-/// a conservative default for the low-power positioning, and must never be
-/// compared
-/// against at runtime, which is why enforcement reads only this value.
-/// Revisit the default if the domain map ever moves off power-of-two
-/// bucket tables, since the step it avoids would no longer exist.
+/// Two consequences worth knowing before raising it: the cold-start
+/// admission cap is twice this value (`cold_start_hard_cap`), so a corpus
+/// admitted at boot can reach ~2.3 GB before it is refused; and at this
+/// ceiling the dashboard's default `rss_warn_mb` (half of MemTotal) turns
+/// red on a 2 GB box — the budget reporting that it is spent, not a
+/// contradiction.
 fn default_max_total_domains() -> usize {
-    14_000_000
+    24_000_000
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -914,12 +910,9 @@ pub struct CacheConfig {
     /// against the filter. Default 16 (was hardcoded 8).
     #[serde(default = "default_cache_cname_max_depth")]
     pub cname_max_depth: usize,
-    /// Sprint §4.4 P1 — master toggle for the hit-frequency tracker that
-    /// underlies proactive prefetch. **Default `false`** — Phase 1 ships
-    /// the data plane only; flipping to `true` populates the prefetch set
-    /// for Phase 2/2 to consume. Independent from the existing
-    /// `prefetch` (TTL-triggered Approach A) flag — both can be on
-    /// together once Phase 2/2 ships.
+    /// Master toggle for the hit-frequency tracker that underlies
+    /// proactive prefetch. Independent from `prefetch` (the
+    /// TTL-triggered gate) — both can be enabled together.
     #[serde(default = "default_cache_prefetch_tracker_enabled")]
     pub prefetch_tracker_enabled: bool,
     /// Sliding-window length in seconds for the hit counter.
@@ -932,14 +925,13 @@ pub struct CacheConfig {
     /// at the default; bump on bigger boxes.
     #[serde(default = "default_cache_prefetch_tracker_max_pool_size")]
     pub prefetch_tracker_max_pool_size: u32,
-    /// Sprint §4.4 P2 — interval in seconds at which the background
-    /// refresh worker scans the promoted-domain set. Default 30.
+    /// Interval in seconds at which the background refresh worker
+    /// scans the promoted-domain set. Default 30.
     #[serde(default = "default_cache_prefetch_tracker_tick_secs")]
     pub prefetch_tracker_tick_secs: u64,
-    /// Sprint §4.4 P2 — refresh an entry when its remaining TTL drops
-    /// below this many seconds. Distinct from `prefetch_threshold`
-    /// (Sprint 17 fraction-of-TTL gate); both can be on simultaneously.
-    /// Default 10.
+    /// Refresh an entry when its remaining TTL drops below this many
+    /// seconds. Distinct from `prefetch_threshold` (the fraction-of-TTL
+    /// gate); both can be on simultaneously. Default 10.
     #[serde(default = "default_cache_prefetch_tracker_lead_secs")]
     pub prefetch_tracker_lead_secs: u64,
 }
@@ -966,11 +958,6 @@ impl Default for CacheConfig {
     }
 }
 
-// §4.41: the orphaned v0 `BlockResponse` enum was retired here. The v1
-// block-response type is `config::schema::profile::BlockResponseV1`; the
-// v0 3-variant enum (Zero / Nxdomain / Refused) had no live referents
-// once the resolver moved onto the v1 schema.
-
 // ── [[clients]] ────────────────────────────────────────────────
 
 /// Client configuration — maps a device to a profile.
@@ -988,7 +975,7 @@ pub struct ClientConfig {
     pub name: String,
     /// Client IP address for identification.
     pub ip: IpAddr,
-    /// Optional MAC address for identification (ARP table lookup, Sprint 8).
+    /// Optional MAC address for identification (ARP table lookup).
     #[serde(default)]
     pub mac: Option<String>,
     /// Additional MACs that also belong to this device. Modern OSes
@@ -1003,7 +990,7 @@ pub struct ClientConfig {
     /// the ARP→profile resolver and by the uniqueness check. Format
     /// and uniqueness are validated the same as `mac`.
     ///
-    /// Defaults to an empty list, so pre-Sprint-27 configs keep
+    /// Defaults to an empty list, so configs without this field keep
     /// working unchanged.
     #[serde(default)]
     pub mac_aliases: Vec<String>,
@@ -1014,7 +1001,7 @@ pub struct ClientConfig {
     pub owner: Option<String>,
     /// Optional device type / category (free text, e.g. "iPad", "Smart TV").
     /// The `(owner, device_type)` pair is enforced unique across clients.
-    /// Accepts the legacy `device` alias for v0.x configs (renamed in v0.4.3).
+    /// Accepts the legacy `device` alias for older configs.
     #[serde(default, alias = "device")]
     pub device_type: Option<String>,
     /// Optional department / logical group (free text, e.g. "famiglia").
@@ -1072,10 +1059,10 @@ impl Default for ClientConfig {
 /// days = ["weekdays"]
 /// hours = "21:00-07:00"
 ///
-/// # Sprint 23: optional one-shot expiry. After this RFC 3339 timestamp
-/// # passes the schedule is treated as inactive AND pruned from the file
-/// # by the next handle_schedule_tick (s23-schedule-tick-prune). Used by
-/// # `warden client quiet --for 15m` to time-box block_all overrides.
+/// # Optional one-shot expiry. After this RFC 3339 timestamp passes
+/// # the schedule is treated as inactive AND pruned from the file by
+/// # the next scheduled tick. Used by `warden client quiet --for 15m`
+/// # to time-box block_all overrides.
 /// [[schedules]]
 /// client = "tablet"
 /// profile = "blocked"
@@ -1099,14 +1086,14 @@ pub struct ScheduleConfig {
     /// Optional one-shot expiry — when set, the schedule stops being
     /// active after this UTC timestamp regardless of `days`/`hours`,
     /// AND the next `handle_schedule_tick` prunes it from the TOML
-    /// file. Used by Sprint 23's `warden client quiet --for 15m`
-    /// helper to time-box temporary overrides without leaving stale
-    /// entries around forever.
+    /// file. Used by `warden client quiet --for 15m` to time-box
+    /// temporary overrides without leaving stale entries around
+    /// forever.
     ///
     /// Validator rejects schedules where `expires_at` is in the past
     /// at create time so a typo can't accidentally land a "schedule
     /// that's already expired" entry. Stored as `time::OffsetDateTime`
-    /// (per project rules "use time, not chrono"); the serde feature on
+    /// (per CLAUDE.md "use time, not chrono"); the serde feature on
     /// the `time` crate handles RFC 3339 wire format.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<time::OffsetDateTime>,
@@ -1141,12 +1128,12 @@ impl Default for SocketConfig {
 
 /// Stats tracking configuration — per-client counters, top-N, query log.
 ///
-/// Sprint 37 flipped `query_log_enabled`'s default from `false` to
-/// `true` so a fresh install shows DNS activity in the TUI without an
-/// operator config edit, matching the Pi-hole / AdGuard Home
-/// expectation. Existing configs with an explicit value — either
-/// `true` or `false` — are unaffected; only deployments with no
-/// `[tracking]` section at all pick up the new default on restart.
+/// `query_log_enabled` defaults to `true` so a fresh install shows DNS
+/// activity in the TUI without an operator config edit, matching the
+/// Pi-hole / AdGuard Home expectation. Existing configs with an
+/// explicit value — either `true` or `false` — are unaffected; only
+/// deployments with no `[tracking]` section at all pick up this
+/// default.
 ///
 /// ```toml
 /// [tracking]
@@ -1171,41 +1158,40 @@ pub struct TrackingConfig {
     pub top_n_interval_secs: u64,
     /// Maximum number of devices to track.
     ///
-    /// T5 renamed from `max_clients`; the serde alias plus the loader
+    /// Renamed from `max_clients`; the serde alias plus the loader
     /// WARN branch accept the legacy key for one release cycle.
     #[serde(default = "default_max_devices", alias = "max_clients")]
     pub max_devices: usize,
-    /// Enable query logging to file. Sprint 38 QLP3 promotes the bare
-    /// `#[serde(default)]` to a named default so a partial `[tracking]`
-    /// section without this line still picks up S37's `true` default.
+    /// Enable query logging to file. Uses a named default so a partial
+    /// `[tracking]` section without this line still picks up the
+    /// `true` default.
     #[serde(default = "default_query_log_enabled")]
     pub query_log_enabled: bool,
     /// Path to the query log file.
     #[serde(default = "default_query_log_path")]
     pub query_log_path: PathBuf,
-    /// Max query log file size before rotation (MB). Post-Sprint 38 QLP2
-    /// this is a *per-day* backstop — rotation is primarily calendar-
-    /// based (`retention_days` drives deletion); a single day that
-    /// exceeds the cap is split into numeric-suffix files.
+    /// Max query log file size before rotation (MB). This is a
+    /// *per-day* backstop — rotation is primarily calendar-based
+    /// (`retention_days` drives deletion); a single day that exceeds
+    /// the cap is split into numeric-suffix files.
     #[serde(default = "default_query_log_max_size_mb")]
     pub query_log_max_size_mb: u64,
-    /// Max number of per-day numeric-suffix overflow files (Sprint 38
-    /// QLP2 backstop). Normal operation is one file per day; this cap
-    /// only kicks in when a single day's traffic exceeds
-    /// `query_log_max_size_mb`.
+    /// Max number of per-day numeric-suffix overflow files. Normal
+    /// operation is one file per day; this cap only kicks in when a
+    /// single day's traffic exceeds `query_log_max_size_mb`.
     #[serde(default = "default_query_log_max_files")]
     pub query_log_max_files: usize,
     /// How many days of `query.log.YYYY-MM-DD` files to keep on disk.
-    /// Primary retention knob after Sprint 38 QLP2 — older files are
-    /// pruned by the writer at UTC midnight rotation. Range `[1, 365]`,
-    /// validated at config load.
+    /// Primary retention knob — older files are pruned by the writer
+    /// at UTC midnight rotation. Range `[1, 365]`, validated at config
+    /// load.
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
-    /// How much to log per query. Sprint 38 QLP3. `All` logs everything
-    /// (desktop / server default). `BlockedOnly` logs only queries whose
-    /// result is `BLOCKED` — the Pi-recommended setting. `Sampled`
-    /// always logs blocked queries and a fraction (`allowed_rate`) of
-    /// allowed queries.
+    /// How much to log per query. `All` logs everything (desktop /
+    /// server default). `BlockedOnly` logs only queries whose result
+    /// is `BLOCKED` — the Pi-recommended setting. `Sampled` always
+    /// logs blocked queries and a fraction (`allowed_rate`) of allowed
+    /// queries.
     #[serde(default)]
     pub log_mode: LogMode,
 }
@@ -1228,7 +1214,7 @@ impl Default for TrackingConfig {
     }
 }
 
-/// Per-query logging decision (Sprint 38 QLP3 / design doc D3).
+/// Per-query logging decision.
 ///
 /// The enum drives an early-return branch at the top of
 /// `StatsEngine::log_query_event` so `BlockedOnly` and `Sampled`'s
@@ -1243,8 +1229,8 @@ impl Default for TrackingConfig {
 /// log_mode = { sampled = { allowed_rate = 0.1 } }
 /// ```
 /// The first two are the overwhelming common case; the table form is
-/// only used when operators want the sampling variant (TUI always emits
-/// the hardcoded `0.1` rate per QLP5 §3).
+/// only used when operators want the sampling variant (the TUI always
+/// emits the hardcoded `0.1` rate).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(try_from = "LogModeRepr", into = "LogModeRepr")]
 pub enum LogMode {
@@ -1313,15 +1299,14 @@ impl From<LogMode> for LogModeRepr {
 /// token_hash = "abc123..."
 /// ```
 ///
-/// T2.5 H-11: `token_hash`, `tls_cert`, `tls_key` are `Option`-typed
-/// (was `String::new()` sentinel pre-T2.5). For back-compat the
-/// deserialiser still accepts `key = ""` from on-disk configs and
-/// interprets it as `None`; serialisation skips `None` so the round-
-/// trip output omits the key entirely. Consumers must still check
-/// `.is_some()` (or use `.as_deref()` at the boundary).
+/// `token_hash`, `tls_cert`, `tls_key` are `Option`-typed (previously a
+/// `String::new()` sentinel). For back-compat the deserialiser still
+/// accepts `key = ""` from on-disk configs and interprets it as
+/// `None`; serialisation skips `None` so the round-trip output omits
+/// the key entirely. Consumers must still check `.is_some()` (or use
+/// `.as_deref()` at the boundary).
 ///
-/// Validator rules (`check_api`, rev-2606 `api-auth-07-01`/`07-02`;
-/// all inert when `enabled = false`):
+/// Validator rules (`check_api`; all inert when `enabled = false`):
 /// - `enabled = true` ⇒ `token_hash` must be set and non-blank.
 /// - `enabled = true` + non-loopback `listen` ⇒ both `tls_cert` and
 ///   `tls_key` must be set (no cleartext bearer tokens off-host).
@@ -1453,29 +1438,15 @@ pub struct RrlConfig {
     ///
     /// The bucket is the exact client address for sources inside a
     /// configured `server.allow_from` CIDR, and the /24 (or /48) prefix
-    /// for everyone else — see [`crate::security::rrl::client_key`]. It
-    /// used to be the prefix unconditionally, which made this an aggregate
-    /// ceiling for an entire household rather than a per-device one.
+    /// for everyone else — see [`crate::security::rrl::client_key`].
     ///
-    /// # Sizing note for operators (Part C, `security-rrl-cli-and-prefix-scope`)
+    /// # Sizing note for operators
     ///
     /// The effective budget is `responses_per_second * window_secs`, not a
     /// per-second cap: at the defaults that is 100 × 15 = 1500 responses
-    /// per 15s window.
-    ///
-    /// The live the lab host CT runs `responses_per_second = 5` — 20×
-    /// stricter than this default, with no recorded decision behind it.
-    /// Under the old prefix keying that was 75 responses per 15s for the
-    /// **whole house**, which is what let a 500-query burst from one dev
-    /// box throttle a Philips Hue bridge on 2026-07-28. Per-client keying
-    /// makes 5 far less dangerous, since the budget is now per device —
-    /// but it is still tight for a browser: a single page load can issue
-    /// 30-50 lookups, so two heavy loads inside one window can exhaust 75.
-    ///
-    /// Unresolved deliberately: whether that box should be restored to the
-    /// default or keep a documented low value is an operator decision, and
-    /// changing it is a live-config edit on a resolver serving real
-    /// household DNS. Flagged, not silently "fixed".
+    /// per 15s window. A single page load can issue 30-50 DNS lookups, so
+    /// a value set well below the default can throttle normal browsing
+    /// during heavy multi-tab loads even under per-client keying.
     #[serde(default = "default_rrl_responses_per_second")]
     pub responses_per_second: u32,
     /// Sliding window in seconds for tracking response rates.
@@ -1571,8 +1542,8 @@ pub struct TunnelingConfig {
     #[serde(default = "default_tunneling_entropy_min_len")]
     pub entropy_min_len: usize,
     /// Max cache-missing queries per (client, base domain) per window
-    /// before flagging (tunneling-rate-01: cached repeats don't count,
-    /// and one client's fan-out can't exhaust another's budget).
+    /// before flagging. Cached repeats don't count, and one client's
+    /// fan-out can't exhaust another's budget.
     #[serde(default = "default_tunneling_subdomain_rate")]
     pub subdomain_rate: u32,
     /// Window in seconds for subdomain rate tracking.
@@ -1619,8 +1590,8 @@ impl Default for TunnelingConfig {
 /// extra_domains = ["my-vpn-dns.example.com"]
 /// ```
 ///
-/// **`enabled = true` on its own does nothing.** `neutrality-01` deleted the
-/// built-in resolver list — warden holds no opinion about which resolvers
+/// **`enabled = true` on its own does nothing.** Warden ships no
+/// built-in resolver list — it holds no opinion about which resolvers
 /// exist — so the checker refuses exactly the names below and no others. That
 /// pairing (`enabled` true, `extra_domains` empty) is the *default*, which is
 /// why the validator warns about it on every load rather than staying quiet
@@ -1713,20 +1684,19 @@ pub struct IpBlocklistConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalDnsConfig {
-    /// Fallback TTL (seconds) for local DNS responses. Precedence
-    /// (rev-2606 cfg-validator-01/02): a record's own `ttl_secs` wins
-    /// where set; this value covers every record without an override
-    /// (both global and profile scope), the auto-generated PTR records
-    /// of non-overridden entries, and the NODATA negative TTL. Validator
-    /// enforces `1..=86_400` — the same DR5 bound as the per-record
-    /// override. Default 3600.
+    /// Fallback TTL (seconds) for local DNS responses. Precedence: a
+    /// record's own `ttl_secs` wins where set; this value covers every
+    /// record without an override (both global and profile scope), the
+    /// auto-generated PTR records of non-overridden entries, and the
+    /// NODATA negative TTL. Validator enforces `1..=86_400`, the same
+    /// bound as the per-record override. Default 3600.
     #[serde(default = "default_local_dns_ttl_secs")]
     pub ttl_secs: u32,
     /// TTL (seconds) for `network_name` dynamic-device answers
     /// specifically — deliberately short and distinct from
     /// [`Self::ttl_secs`], since the underlying IP can change between
-    /// resolver refreshes. Validator enforces `1..=86_400`, same DR5
-    /// bound as `ttl_secs`. Default 30.
+    /// resolver refreshes. Validator enforces `1..=86_400`, same bound
+    /// as `ttl_secs`. Default 30.
     #[serde(default = "default_local_dns_dynamic_ttl_secs")]
     pub dynamic_ttl_secs: u32,
     /// When `true` (default), a query for a locally-defined name whose
@@ -1764,18 +1734,17 @@ pub struct LocalDnsRecord {
     pub record_type: LocalDnsRecordType,
     /// Value: IPv4 address, IPv6 address, or target domain name.
     pub value: String,
-    /// S44 DM2: opt-in subdomain matching. When `true` the record matches
-    /// the apex AND every descendant via longest-suffix-match. The validator
-    /// rejects this on public suffixes (DR9) and on the empty domain (DR10).
-    /// Default `false` keeps Sprint 18 exact-match semantics for existing
-    /// configs (R1 additive only).
+    /// Opt-in subdomain matching. When `true` the record matches the
+    /// apex AND every descendant via longest-suffix-match. The
+    /// validator rejects this on public suffixes and on the empty
+    /// domain. Default `false` keeps exact-match semantics for
+    /// existing configs.
     #[serde(default)]
     pub match_subdomains: bool,
-    /// S44 DM3: per-record TTL override. `None` falls back to
+    /// Per-record TTL override. `None` falls back to
     /// `[local_dns].ttl_secs`. Validator enforces `1..=86_400`. Honored
-    /// on BOTH scopes since rev-2606 cfg-validator-02 (the global path
-    /// previously served the fallback regardless); the record's derived
-    /// PTR entries inherit the same effective TTL.
+    /// on both scopes (global and profile) — the record's derived PTR
+    /// entries inherit the same effective TTL.
     #[serde(default)]
     pub ttl_secs: Option<u32>,
 }
@@ -1788,7 +1757,7 @@ pub enum LocalDnsRecordType {
     CNAME,
 }
 
-/// §4.12 — a single domain-rewrite rule.
+/// A single domain-rewrite rule.
 ///
 /// Rewrites a queried qname before resolution begins. Useful for domain
 /// migrations (`api.old.com → api.new.com`) and "fake CNAME" without
@@ -1810,9 +1779,9 @@ pub struct RewriteRule {
     /// `match_subdomains: true` (footgun).
     pub from: String,
     /// Replacement FQDN. Single-pass at runtime — the result is NOT
-    /// re-fed into the rewrite table (DR2 depth=1).
+    /// re-fed into the rewrite table.
     pub to: String,
-    /// Mirrors `LocalDnsRecord.match_subdomains` (S44 DM2). When `true`,
+    /// Mirrors `LocalDnsRecord.match_subdomains`. When `true`,
     /// `from` matches the apex AND any descendant; the descendant's
     /// label prefix is preserved when rewriting onto `to` (e.g.
     /// `api.old.com → api.new.com` for `*.old.com → *.new.com`).
@@ -1820,16 +1789,15 @@ pub struct RewriteRule {
     pub match_subdomains: bool,
 }
 
-// ── DNSSEC validation (§4.10) ─────────────────────────────────────────────
+// ── DNSSEC validation ──────────────────────────────────────────────────
 //
 // Opt-in, OFF by default. The `[dnssec]` section is parsed *unconditionally*
-// (these types are not behind the `dnssec` cargo feature) so that an operator's
-// `mode = "validate"` deserialises on any build; the validation machinery
-// itself lives in the feature-gated `crate::dnssec` module. **§4.10-1 ships
-// this scaffold inert** — nothing reads `mode` or the DoS caps yet; they wire
-// up in §4.10-2..4.
+// (these types are not behind the `dnssec` cargo feature) so that an
+// operator's `mode = "validate"` deserialises on any build; the validation
+// machinery itself lives in the feature-gated `crate::dnssec` module. This
+// scaffold currently ships inert — nothing reads `mode` or the DoS caps yet.
 
-/// DNSSEC validation mode (§4.10). Default [`DnssecMode::Off`] — DNSSEC is
+/// DNSSEC validation mode. Default [`DnssecMode::Off`] — DNSSEC is
 /// opt-in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1838,10 +1806,10 @@ pub enum DnssecMode {
     /// are returned unmodified.
     #[default]
     Off,
-    /// Validate signatures and reject bogus answers with SERVFAIL (§4.10-4).
+    /// Validate signatures and reject bogus answers with SERVFAIL.
     Validate,
-    /// Validate but never block: log/count bogus answers and still return them.
-    /// For staged rollout and debugging (§4.10-4).
+    /// Validate but never block: log/count bogus answers and still
+    /// return them. For staged rollout and debugging.
     LogOnly,
 }
 
@@ -1855,9 +1823,8 @@ impl std::fmt::Display for DnssecMode {
     }
 }
 
-/// `[dnssec]` configuration section (§4.10). The DoS caps and cache TTL carry
-/// the design-doc defaults. **Inert in §4.10-1** — parsed and stored but not
-/// yet consumed; validation and cap enforcement land in later sprints.
+/// `[dnssec]` configuration section. Parsed and stored but not yet
+/// consumed — validation and cap enforcement are not wired up.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DnssecConfig {
@@ -1900,6 +1867,51 @@ impl Default for DnssecConfig {
 mod tests {
     use super::*;
 
+    // `UpstreamConfig::server_list()` feeds the per-server
+    // {address, kind} list the daemon reports on `IpcResponse::Status`.
+    #[test]
+    fn upstream_server_list_primary_only_preserves_order() {
+        let cfg = UpstreamConfig {
+            mode: UpstreamMode::Plain,
+            servers: vec!["192.0.2.1:53".into(), "192.0.2.2:53".into()],
+            fallback: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.server_list(),
+            vec![
+                ("192.0.2.1:53".to_string(), UpstreamMode::Plain),
+                ("192.0.2.2:53".to_string(), UpstreamMode::Plain),
+            ]
+        );
+    }
+
+    #[test]
+    fn upstream_server_list_appends_fallback_with_its_own_kind() {
+        let cfg = UpstreamConfig {
+            mode: UpstreamMode::Plain,
+            servers: vec!["192.0.2.1:53".into(), "192.0.2.2:53".into()],
+            fallback: Some(FallbackConfig {
+                mode: UpstreamMode::Doh,
+                servers: vec!["https://dns.example/dns-query".into()],
+            }),
+            ..Default::default()
+        };
+        // Primary servers (plain) first, fallback server (doh) appended
+        // last — the only source of a mixed-kind list.
+        assert_eq!(
+            cfg.server_list(),
+            vec![
+                ("192.0.2.1:53".to_string(), UpstreamMode::Plain),
+                ("192.0.2.2:53".to_string(), UpstreamMode::Plain),
+                (
+                    "https://dns.example/dns-query".to_string(),
+                    UpstreamMode::Doh
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn upstream_mode_doq_parses_and_displays() {
         // The `doq` variant always deserializes (feature-independent) so a
@@ -1928,12 +1940,10 @@ servers = ["dns.quad9.net:853"]
 
     #[test]
     fn deserialize_client_without_metadata_fields_is_retrocompat() {
-        // §4.41: rewritten off the v0 `Settings` `[[clients]]` envelope
-        // onto a direct `ClientConfig` parse — `ClientConfig` survives as
-        // the IPC `[[devices]]` wire type. A pre-Sprint-22 client block
-        // must still deserialize cleanly: owner/device/department/tags/
-        // notes default to None / empty vec. If anyone removes
-        // `#[serde(default)]` from `tags`, every existing config breaks.
+        // A legacy client block (no owner/device_type/department/notes)
+        // must still deserialize cleanly — those fields default to
+        // None / empty vec. Removing `#[serde(default)]` from any of
+        // them breaks every existing config on disk.
         let toml = r#"
 name = "legacy-laptop"
 ip = "192.168.1.42"
@@ -1949,18 +1959,14 @@ profile = "default"
         assert!(c.notes.is_none(), "notes must default to None");
     }
 
-    // ── ScheduleConfig expires_at (Sprint 23 s23-schedule-expires-at) ──
-    //
-    // §4.41: rewritten off the v0 `Settings` `[[schedules]]` envelope
-    // onto direct `ScheduleConfig` parses — `ScheduleConfig` survives as
-    // the migration exchange type consumed by `profiles::schedule`.
+    // ── ScheduleConfig expires_at ────────────────────────────────────
 
     #[test]
     fn schedule_without_expires_at_is_retrocompat() {
-        // A pre-Sprint-23 schedule block must deserialize with
+        // A schedule block without expires_at must deserialize with
         // expires_at = None. Every existing config on disk relies on
-        // this — without #[serde(default)] the old configs would
-        // hard-fail at parse time after upgrade.
+        // this — without #[serde(default)] old configs would hard-fail
+        // at parse time.
         let toml = r#"
 client = "tablet"
 profile = "night"
@@ -1991,15 +1997,12 @@ expires_at = "2026-04-13T22:30:00Z"
         assert_eq!(sched2.expires_at, Some(exp));
     }
 
-    // ── T2.5 H-10: per-section enabled defaults are decoupled ────
+    // ── Per-section enabled defaults are decoupled ───────────────────
     //
-    // Pre-T2.5 a single `default_tracking_enabled()` was wired to six
-    // unrelated `enabled` toggles via `#[serde(default = ...)]`. These
-    // tests pin the post-fix shape: each section deserialises its own
-    // default from a partial TOML that omits the `enabled` line, so a
-    // future flip of one helper cannot leak into the others. Round-trip
-    // through `toml::from_str(...)` exercises serde's named-default
-    // path — the very call the shared helper used to feed.
+    // Each section deserialises its own default from a partial TOML
+    // that omits the `enabled` line, so a future flip of one helper
+    // cannot leak into the others. Round-trip through
+    // `toml::from_str(...)` exercises serde's named-default path.
 
     #[test]
     fn h10_default_tracking_enabled_isolated_from_security_helpers() {
@@ -2055,22 +2058,19 @@ expires_at = "2026-04-13T22:30:00Z"
         );
     }
 
-    // ── T2.5 / M-02: subsection default-fixpoint discipline ──────
+    // ── Subsection default-fixpoint discipline ───────────────────────
     //
-    // §4.41: the whole-`Settings` round-trip fixpoint test and the v0
-    // `ApiConfig` sentinel→Option migration tests were retired with the
-    // `Settings` envelope. The per-subsection fixpoint check below
-    // survives — it covers every staying pass-through sub-struct
-    // directly, which is the coverage that actually guards
-    // `#[serde(default = "...")]` vs `impl Default` drift.
+    // The fixpoint check below covers every pass-through sub-struct
+    // directly — the coverage that guards `#[serde(default = "...")]`
+    // vs `impl Default` drift.
 
     #[test]
     fn m02_settings_default_subsection_defaults_are_internally_consistent() {
-        // M-02 corollary: each top-level subsection round-trips
-        // independently — a regression that affects only one section
-        // (e.g. someone adds a #[serde(default)] field with no
-        // matching impl Default constructor) is named in the failure
-        // message instead of being lost in a bulk round-trip dump.
+        // Each top-level subsection round-trips independently — a
+        // regression that affects only one section (e.g. someone adds
+        // a #[serde(default)] field with no matching impl Default
+        // constructor) is named in the failure message instead of
+        // being lost in a bulk round-trip dump.
         macro_rules! check {
             ($name:literal, $ty:ty) => {{
                 let v = <$ty as Default>::default();
@@ -2100,13 +2100,12 @@ expires_at = "2026-04-13T22:30:00Z"
         check!("DnssecConfig", DnssecConfig);
     }
 
-    /// §5-review (settings-fixpoint-test-gaps): the `m02` macro covers
-    /// only `Default`-bearing top-level sections, so `LogMode::Sampled`
-    /// (the table form `{ sampled = { allowed_rate = .. } }`, distinct
-    /// from the default `All`) had no round-trip coverage — the riskiest
-    /// uncovered serde path. Exercise it through its `TrackingConfig`
-    /// envelope so a break in the `LogModeRepr` try_from/into shim fails
-    /// loudly.
+    /// The round-trip check above covers only `Default`-bearing
+    /// top-level sections, so `LogMode::Sampled` (the table form
+    /// `{ sampled = { allowed_rate = .. } }`, distinct from the default
+    /// `All`) had no round-trip coverage — the riskiest uncovered serde
+    /// path. Exercise it through its `TrackingConfig` envelope so a
+    /// break in the `LogModeRepr` try_from/into shim fails loudly.
     #[test]
     fn m02b_log_mode_sampled_round_trips() {
         let t = TrackingConfig {
@@ -2130,10 +2129,10 @@ expires_at = "2026-04-13T22:30:00Z"
         );
     }
 
-    /// §4.7 Phase 2 T2: the staleness threshold defaults to 24 h
-    /// (86_400 s) when the operator's TOML omits the field, AND a
-    /// pre-Phase-2 config (no `staleness_threshold_secs` line under
-    /// `[lists]`) deserialises with the same value via
+    /// The staleness threshold defaults to 24 h (86_400 s) when the
+    /// operator's TOML omits the field, and a config with no
+    /// `staleness_threshold_secs` line under `[lists]` deserialises
+    /// with the same value via
     /// `#[serde(default = "default_staleness_threshold_secs")]`.
     #[test]
     fn staleness_threshold_config_field_default_86400() {

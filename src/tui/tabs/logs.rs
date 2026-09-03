@@ -12,7 +12,7 @@
 //!   `PgUp`/`PgDn` by [`NAV_PAGE`], `Home`/`End`, clamped against
 //!   `len - 1` through a saturating `u16` conversion. A second scroll
 //!   idiom in the same product is a bug an operator has to learn.
-//! - the **filter card is N13's** — `theme::render_filter_card`, `/`
+//! - the **filter card is shared** — `theme::render_filter_card`, `/`
 //!   search, an `f`-cycled chip row, `[R] clear`, exactly as
 //!   `tabs::lists` and `tabs::rules` render it.
 //!
@@ -29,11 +29,17 @@
 //! │ 14:02:58  INFO   cli::start       listening on 0.0.0.0:53                │
 //! └──────────────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_logs_key` (the borrowed scroll convention above)
+//! - Form:  none — read-only, no modal
+//! - State: `app::LogsState` (`entries`, `scroll_offset`, `level_filter`, `filter_text`)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::ipc::protocol::DaemonLogDto;
@@ -73,7 +79,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     render_body(f, chunks[1], app);
 }
 
-/// N13 shared filter card: `/` text search plus the `f`-cycled severity
+/// Shared filter card: `/` text search plus the `f`-cycled severity
 /// chip. Mirrors `tabs::lists::render_filters` field for field.
 fn render_filters(f: &mut Frame, area: Rect, app: &App) {
     let content_area = theme::render_filter_card(f, area);
@@ -171,7 +177,7 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
         .map(|e| entry_line(e, content.width))
         .collect();
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+    f.render_widget(Paragraph::new(lines), content);
 }
 
 /// `Log Messages (47 of ≤1000 · 3 dropped)`.
@@ -200,6 +206,11 @@ fn body_title(app: &App) -> String {
 }
 
 /// One rendered row: `HH:MM:SS  LEVEL  target  message`.
+///
+/// The message is truncated to whatever width the fixed columns leave,
+/// never wrapped: `scroll_offset`, [`last_row`] and [`page_step`] all
+/// count *entries*, and a wrapped message would make `PgDn`/`End` skip
+/// whole screens or land mid-message instead of moving one pane.
 fn entry_line(entry: &DaemonLogDto, width: u16) -> Line<'static> {
     let level_style = Style::default()
         .fg(level_color(entry.level))
@@ -208,27 +219,56 @@ fn entry_line(entry: &DaemonLogDto, width: u16) -> Line<'static> {
     // message is what the operator came for, so the module path is the
     // first thing to give up cells.
     let target_w = if width >= 100 { 22 } else { 14 };
+    let clock_str = clock(&entry.timestamp);
+    let level_str = format!("{:<5}", level_label(entry.level));
+    let target_str = format!("{:<w$}", short_target(&entry.target), w = target_w);
+    let fixed_w =
+        clock_str.chars().count() + level_str.chars().count() + target_str.chars().count() + 6; // three 2-space gaps
+    let msg_budget = (width as usize).saturating_sub(fixed_w);
     Line::from(vec![
-        Span::styled(clock(&entry.timestamp), Style::default().fg(T.text_muted)),
+        Span::styled(clock_str, Style::default().fg(T.text_muted)),
         Span::raw("  "),
-        Span::styled(format!("{:<5}", level_label(entry.level)), level_style),
+        Span::styled(level_str, level_style),
+        Span::raw("  "),
+        Span::styled(target_str, Style::default().fg(T.text_secondary)),
         Span::raw("  "),
         Span::styled(
-            format!("{:<w$}", short_target(&entry.target), w = target_w),
-            Style::default().fg(T.text_secondary),
+            truncate_message(&entry.message, msg_budget),
+            Style::default().fg(T.text_primary),
         ),
-        Span::raw("  "),
-        Span::styled(entry.message.clone(), Style::default().fg(T.text_primary)),
     ])
+}
+
+/// Truncates to `max` chars with a trailing ellipsis, char-safe (never
+/// splits a multibyte codepoint) — same shape as `cluster::truncate`,
+/// kept local rather than shared because that helper is private to its
+/// own module.
+fn truncate_message(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// `2026-08-25T14:03:05Z` → `14:03:05`. Falls back to the whole string if
 /// it is not the shape the daemon promised — a timestamp that renders
 /// oddly is better than a row that vanishes.
 pub fn clock(timestamp: &str) -> String {
-    match (timestamp.find('T'), timestamp.len()) {
-        (Some(t), len) if len >= t + 9 => timestamp[t + 1..t + 9].to_string(),
-        _ => timestamp.to_string(),
+    // `.get()` yields None when a slice boundary is not a char boundary,
+    // so a malformed stamp falls back to the raw string instead of
+    // panicking mid-codepoint — same contract as local_dns::trim_audit_ts
+    // and cluster::short_hash.
+    match timestamp
+        .find('T')
+        .and_then(|t| timestamp.get(t + 1..t + 9))
+    {
+        Some(hms) => hms.to_string(),
+        None => timestamp.to_string(),
     }
 }
 
@@ -291,6 +331,19 @@ mod tests {
             let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
             row.contains(needle)
         })
+    }
+
+    /// Count of rows containing `needle` — `buffer_contains` collapsed to
+    /// a bool, which can't tell "one entry, one row" from "one entry
+    /// wrapped onto several".
+    fn rows_containing(buf: &ratatui::buffer::Buffer, needle: &str) -> usize {
+        let area = *buf.area();
+        (0..area.height)
+            .filter(|&y| {
+                let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                row.contains(needle)
+            })
+            .count()
     }
 
     fn draw(app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
@@ -389,6 +442,42 @@ mod tests {
     }
 
     #[test]
+    fn truncate_message_keeps_the_head_and_marks_the_cut() {
+        assert_eq!(truncate_message("short", 20), "short");
+        assert_eq!(truncate_message("0123456789", 5), "0123\u{2026}");
+        assert_eq!(truncate_message("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_message_does_not_panic_on_a_multibyte_boundary() {
+        let s = "\u{1f600}".repeat(5);
+        assert_eq!(truncate_message(&s, 3), "\u{1f600}\u{1f600}\u{2026}");
+    }
+
+    /// `scroll_offset`/`last_row`/`page_step` all count *entries*. A
+    /// message wrapping onto a second row would desync that count from
+    /// what is actually on screen, making `PgDn`/`End` skip whole screens
+    /// or land mid-message.
+    #[test]
+    fn a_long_message_is_truncated_not_wrapped_onto_a_second_row() {
+        let mut app = App::new();
+        let long = "refresh failed source=oisd attempt=3 backoff=30s reason=timeout while=fetching";
+        app.logs.entries = vec![dto(LogLevel::Error, "purge_warden::lists::manager", long)];
+        let term = draw(&app, 60, 10);
+        let buf = term.backend().buffer();
+        assert_eq!(
+            rows_containing(buf, "ERROR"),
+            1,
+            "a long message must stay on the entry's single row, not wrap \
+             onto a second"
+        );
+        assert!(
+            buffer_contains(buf, "\u{2026}"),
+            "a message too wide for the pane must say it was cut"
+        );
+    }
+
+    #[test]
     fn a_stale_scroll_offset_does_not_blank_the_pane() {
         // A poll that returns a SHORTER page (the operator just narrowed
         // the filter) leaves the offset past the end. Without the clamp,
@@ -416,6 +505,15 @@ mod tests {
         // the row or panicking on a slice.
         assert_eq!(clock("whenever"), "whenever");
         assert_eq!(clock("2026-08-25T14"), "2026-08-25T14");
+    }
+
+    #[test]
+    fn clock_does_not_panic_on_a_multibyte_boundary() {
+        // Byte 9 after the `T` falls mid-codepoint here — `find`/`len` are
+        // byte offsets, so a naive range index would panic. Mirrors
+        // cluster::short_hash_does_not_panic_on_multibyte_boundary.
+        let s = "T1234567\u{e9}9";
+        assert_eq!(clock(s), s);
     }
 
     #[test]

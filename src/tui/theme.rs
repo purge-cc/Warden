@@ -1,7 +1,6 @@
 //! Color palette and styled widget helpers for the TUI.
 //!
 //! Design tokens derived from the purge.cc website for brand consistency.
-//! See _docs/rules/TUI_DESIGN.md for the full specification.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -44,7 +43,7 @@ pub struct Theme {
     // because that silently retargets `chart_1`, `gauge_critical`,
     // `bar_gradient` and `border_focus` across 12 tab files. Splitting
     // the *role* now costs nothing and makes the later value split a
-    // one-line change. See _docs/features/tui_modal_palette_spec_v1.md §1.3.
+    // one-line change.
     pub red_glow: Color,
 
     // Warden-only accents (refined purge.cc brand guide) — no Tailwind
@@ -92,9 +91,7 @@ pub struct Theme {
     pub spark_falling: Color,
 
     // Heatmap — 5-stop cold→hot intensity scale (green → yellow →
-    // orange → red). Operator override 2026-05-10 at Sprint C close
-    // (supersedes Sprint A single-hue purple).
-    // Dormant since Sprint D 2026-05-10 (heatmap retired); tokens
+    // orange → red). The heatmap itself is retired; tokens are kept
     // reserved for possible future re-introduction.
     pub heat_0: Color,
     pub heat_1: Color,
@@ -189,10 +186,8 @@ impl Theme {
             //   heat_2 yellow-400 (med-low)
             //   heat_3 orange-400 (med-hi)
             //   heat_4 red-500    (high)
-            // Operator override 2026-05-10 at Sprint C close
-            // (supersedes Sprint A's single-hue Tailwind violet).
-            // Dormant since Sprint D 2026-05-10 (heatmap retired);
-            // RGB stops reserved for possible future re-introduction.
+            // The heatmap itself is retired; RGB stops are kept
+            // reserved for possible future re-introduction.
             heat_0: Color::Rgb(26, 26, 26),
             heat_1: Color::Rgb(74, 222, 128),
             heat_2: Color::Rgb(250, 204, 21),
@@ -244,8 +239,8 @@ impl Theme {
     }
 
     /// Returns the heatmap color for a normalized value (0.0–1.0).
-    /// Dormant since Sprint D 2026-05-10 (heatmap retired); kept for
-    /// possible future re-introduction.
+    /// The heatmap itself is retired; kept for possible future
+    /// re-introduction.
     #[allow(dead_code)]
     pub const fn heat_color(&self, val: f64) -> Color {
         if val <= 0.0 {
@@ -263,15 +258,12 @@ impl Theme {
 
     /// Bar-gradient color for a cell at normalized position
     /// (`cell_index / bar_width`, 0.0–1.0). Use only on "fill = good"
-    /// bars. See _docs/rules/TUI_DESIGN.md §"Bar Gradient" for the policy.
+    /// bars.
     ///
-    /// First stop is hardcoded to the original pre-Sprint-A heat_2
-    /// dark green (`#1D6B4F`) so the Block Rate / Cache Hit Rate
-    /// gauges keep their original cool-start anchor across heatmap
-    /// palette changes. Sprint A inadvertently retargeted this stop
-    /// to violet-700 by changing `heat_2`'s value while leaving
-    /// `bar_gradient` pulling `self.heat_2`; Sprint C operator
-    /// override pinned it back to the original.
+    /// First stop is hardcoded to a fixed dark green (`#1D6B4F`) rather
+    /// than derived from `self.heat_2`, so the Block Rate / Cache Hit
+    /// Rate gauges keep their cool-start anchor even if a future
+    /// heatmap palette change retargets `heat_2`'s value.
     pub const fn bar_gradient(&self, pos: f64) -> Color {
         if pos <= 0.20 {
             Color::Rgb(29, 107, 79)
@@ -334,7 +326,7 @@ pub fn framed_block() -> Block<'static> {
 /// Frame-only block with a category-coloured border. Pair with a
 /// matching first-row title in the same colour for visual coupling
 /// (codeburn pattern: the eye scans by colour and instantly knows
-/// which panel it's looking at). See _docs/rules/TUI_DESIGN.md §"Gauge Anatomy".
+/// which panel it's looking at).
 pub fn framed_block_colored(border: Color) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -342,18 +334,16 @@ pub fn framed_block_colored(border: Color) -> Block<'static> {
         .border_style(Style::default().fg(border))
 }
 
-/// N13 (`_docs/features/tui_nav_and_help_v1.md` §10a): the one filter-card
-/// frame shared by Query Log, Lists, Rules and Tags. Paints
-/// `framed_block_colored(T.text_primary)` at `area` (height 3 — top
-/// border, one content row, bottom border) and returns the **padded**
-/// 1-row inner rect (border + 1-col pad on each side) so every caller's
-/// width-budget arithmetic lines up without hand-rolling the same
-/// `inner.x + 1` / `width - 2` math four times.
+/// The one filter-card frame shared by Query Log, Lists, Rules and Tags.
+/// Paints `framed_block_colored(T.text_primary)` at `area` (height 3 —
+/// top border, one content row, bottom border) and returns the
+/// **padded** 1-row inner rect (border + 1-col pad on each side) so
+/// every caller's width-budget arithmetic lines up without hand-rolling
+/// the same `inner.x + 1` / `width - 2` math four times.
 ///
 /// Deliberately lives here, not in a new `filter_card.rs`: a new module
-/// needs a `mod filter_card;` line in `tui/mod.rs`, which this wave does
-/// not own (see `LANE-REPORT.md`). `_docs/features/tui_nav_and_help_v1.md`
-/// §10a.1 sanctions this file as the fallback site.
+/// needs a `mod filter_card;` line in `tui/mod.rs`, which is an extra
+/// wiring change this shared helper does not need.
 ///
 /// Caller renders one `Line` of fields into the returned rect. Do not
 /// write a title — the fields are the label now.
@@ -517,10 +507,10 @@ mod tests {
     /// `contrast_gate_holds_for_every_text_pair` reads this table in
     /// **both** directions, so it cannot rot into an amnesty:
     ///
-    /// * a pair below the floor with **no** row fails as undeclared. This
-    ///   is the hole the gate had until 2026-08-08: `bg_highlight` was
-    ///   left out of the surfaces entirely, so anything landing on it was
-    ///   admitted by absence rather than by a decision;
+    /// * a pair below the floor with **no** row fails as undeclared. A gate
+    ///   that leaves a surface out of its enumeration entirely admits
+    ///   anything landing on it by absence rather than by a decision, which
+    ///   is why the enumeration below covers every `bg_*` token;
     /// * a row whose pair now **clears** the floor fails as stale, and has
     ///   to be deleted in the commit that lifts it;
     /// * a row naming a pair the gate does not enumerate fails as a typo.
@@ -565,9 +555,9 @@ mod tests {
     ///
     /// Enumerates **every** `bg_*` token in `Theme` — all five — against
     /// every foreground that carries a glyph. Nothing is held back for a
-    /// narrower test: until 2026-08-08 `bg_highlight` was, and the test it
-    /// deferred to (`focus_bar_admits_only_high_contrast_foregrounds`) is a
-    /// *positive* list, so it enumerated nothing and forbade nothing. A
+    /// narrower test: a *positive* list like
+    /// `focus_bar_admits_only_high_contrast_foregrounds` enumerates
+    /// nothing and forbids nothing, which is not the same guarantee. A
     /// `warden_teal` band on `bg_highlight` (3.37:1, against a 4.5:1 prose
     /// bar) was written, reviewed and nearly shipped with both tests green;
     /// it was caught by reading `modal_form`'s colour rule and measuring by
@@ -583,7 +573,7 @@ mod tests {
     /// rendered spans (`modal_form::desc_band2`'s twin tests are the worked
     /// example). Both halves are needed; neither substitutes for the other.
     ///
-    /// ## Two deviations from the spec's §7, both measured rather than assumed
+    /// ## Two deviations from the palette spec, both measured rather than assumed
     ///
     /// 1. It measured everything against a `#0F0F11` page background. The
     ///    modal body is drawn on `bg_elevated` `#262626`
@@ -715,8 +705,7 @@ mod tests {
                 listed.iter().any(|(n, c)| *n == name && *c == color),
                 "background {name} is defined by Theme but not enumerated by \
                  the contrast gate — a surface off the list is a surface where \
-                 any tint passes in silence, which is the defect this gate was \
-                 repaired for on 2026-08-08"
+                 any tint passes in silence"
             );
         }
     }

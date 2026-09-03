@@ -1,11 +1,11 @@
-//! Append-only audit log (Sprint 32, N1).
+//! Append-only audit log.
 //!
 //! Every reload / boot / shutdown event writes one JSON object on a single
 //! line to `/var/lib/purge-warden/audit/audit.log`. The file is never
 //! truncated, only appended, so the log is a permanent integrity record of
 //! every change the daemon saw at runtime.
 //!
-//! # Schema (frozen 2026-04-22)
+//! # Schema
 //!
 //! ```json
 //! {
@@ -40,8 +40,8 @@
 //! `write(2)` per record (trailing newline included). On Linux the kernel
 //! serialises concurrent `O_APPEND` writes so two writers don't interleave
 //! within a line, as long as each record fits in a single `write(2)` of a
-//! practical size. (The earlier doc cited `PIPE_BUF` here — that 4 KB
-//! guarantee governs pipes / FIFOs, not regular files; audit-01.) Records
+//! practical size. (Not a `PIPE_BUF` guarantee — that 4 KB atomicity bound
+//! governs pipes / FIFOs, not regular files.) Records
 //! are kept small on purpose — the per-record `errors` list is capped at
 //! [`MAX_AUDIT_RECORD_ERRORS`] — so a `Rejected` reload over a badly broken
 //! multi-file config can't grow a line large enough to risk a torn write.
@@ -78,7 +78,7 @@ pub const AUDIT_FILE_NAME: &str = "audit.log";
 /// `Rejected` reload over a badly broken multi-file config could otherwise
 /// emit one string per error and grow the record past a safe single-write
 /// size (risking a torn `O_APPEND`) and bloat the log. Beyond this we keep
-/// the first N and append a synthetic "… and M more" marker (audit-01).
+/// the first N and append a synthetic "… and M more" marker.
 pub const MAX_AUDIT_RECORD_ERRORS: usize = 32;
 
 /// Default audit directory name. Paired with the daemon's `/var/lib`
@@ -88,18 +88,14 @@ pub const AUDIT_DIR_NAME: &str = "audit";
 /// Classification of what triggered an audit record. The daemon emits one
 /// per lifecycle transition; `warden audit tail` reads them back verbatim.
 ///
-/// **T6 schema extension (2026-04-25):** added [`AuditEvent::CliMutation`]
-/// for CLI-issued rule writes (`warden {profile,device,group,subnet,
-/// default} {allow,deny}`, `warden rule undo`, `warden device rules
-/// prune`, `warden profile blocklists ...`). Earlier the lifecycle quartet
-/// was the only persisted shape; CLI mutations were emitted via
-/// `tracing::info!(target: "audit", ...)` and lived only on the CLI's
-/// own stderr, so `journalctl -u purge-warden` never saw them. The new
-/// variant lets [`AuditWriter::append_cli_mutation`] write the same JSON
-/// file the daemon writes to, with the optional fields below carrying
-/// the mutation context. Old logs (pre-T6) parse with the new
-/// deserialiser unchanged; new logs require T6+ binary to parse the
-/// new variant.
+/// [`AuditEvent::CliMutation`] covers CLI-issued rule writes (`warden
+/// {profile,device,group,subnet,default} {allow,deny}`, `warden rule
+/// undo`, `warden device rules prune`, `warden profile blocklists ...`).
+/// [`AuditWriter::append_cli_mutation`] writes it to the same JSON file
+/// the daemon writes to, with the optional fields below carrying the
+/// mutation context, so `journalctl -u purge-warden` and `warden audit
+/// tail` both see it. The schema is additive: audit lines written before
+/// this variant existed still deserialise unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEvent {
@@ -114,16 +110,15 @@ pub enum AuditEvent {
     /// Out-of-band config replacement via `warden config restore`. Recorded
     /// from the CLI path, not the daemon runtime — uid = invoker.
     Restore,
-    /// CLI rule/blocklist mutation issued from `warden <verb>`. T6 added
-    /// for R4 audit cabling completeness. `action` carries the verb tag
-    /// (`rule.add` / `rule.remove` / `rule.undo` /
+    /// CLI rule/blocklist mutation issued from `warden <verb>`. `action`
+    /// carries the verb tag (`rule.add` / `rule.remove` / `rule.undo` /
     /// `device.rules.prune`); `scope` / `target_id` / `domain` /
     /// `rule_id` / `rule_action` / `override_used` carry the mutation
     /// detail. `pre_hash` / `post_hash` not used (the row is short-lived
     /// CLI state, not daemon state); `files` may carry the touched
     /// master/entity paths.
     CliMutation,
-    /// §4.5 Sprint 2/2 — runtime CNAME chain block. Emitted when
+    /// Runtime CNAME chain block. Emitted when
     /// `filter::cname::walk_response` returns `Verdict::Block` on a
     /// CNAME chain post-upstream-fetch or on cache-hit re-check. `action`
     /// carries the static `"cname_block"` verb; `domain` carries the
@@ -167,31 +162,14 @@ impl AuditResult {
 /// the top of this module one-to-one; renaming a field here is a breaking
 /// change for parsers.
 ///
-/// **T6 schema extension (2026-04-25):** added optional fields
-/// [`AuditRecord::action`], [`AuditRecord::scope`],
-/// [`AuditRecord::target_id`], [`AuditRecord::rule_id`],
-/// [`AuditRecord::rule_action`], [`AuditRecord::domain`],
-/// [`AuditRecord::override_used`]. They carry the CLI-mutation detail
-/// when [`AuditRecord::event`] is [`AuditEvent::CliMutation`]. Lifecycle
-/// records (Boot/Reload/Shutdown/Restore) leave them all `None` /
-/// `false`. Each new field is `#[serde(skip_serializing_if = ...)]` so
-/// pre-T6 lifecycle records on disk stay byte-identical (no spurious
-/// `null` fields appended).
-///
-/// **S50 T2 schema extension (2026-05-04):** added optional fields
-/// [`AuditRecord::fields_before`] and [`AuditRecord::fields_after`].
-/// They carry the before/after value of the mutated field for
-/// `blocklist.set_kind` / `blocklist.set_trust` CLI mutations introduced
-/// by the lists-and-categories work (`_docs/features/lists_categories_v1.md`
-/// §6 R4). Same `#[serde(default, skip_serializing_if = ...)]` pattern
-/// as T6: pre-S50 lifecycle and CLI-mutation records on disk stay
-/// byte-identical (no spurious `null` fields appended). The R4 spec
-/// also requires `tree_hash_before` / `tree_hash_after` per audit line;
-/// those are carried by the pre-existing
-/// [`AuditRecord::pre_hash`] / [`AuditRecord::post_hash`] fields with
-/// the operator-facing aliases documented at
-/// `src/config/audit.rs:tree_hash` (one and the same hash, two names
-/// for two consumers).
+/// Every field beyond the original lifecycle quartet (`event`, `uid`,
+/// `files`, `pre_hash`/`post_hash`, `result`, `errors`) carries the
+/// CLI-mutation or feature-specific detail below, is
+/// `#[serde(default, skip_serializing_if = ...)]`, and defaults to
+/// `None` on lifecycle records (Boot/Reload/Shutdown/Restore). That
+/// keeps two things true at once: older lines on disk without a given
+/// field still deserialise, and a record that doesn't populate a field
+/// doesn't grow a spurious `null` in the JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub ts: String,
@@ -203,19 +181,14 @@ pub struct AuditRecord {
     pub result: AuditResult,
     pub errors: Vec<String>,
 
-    // T6 — CLI mutation detail. All optional + skip-if-none so the
-    // lifecycle records on disk keep their pre-T6 shape.
+    // CLI mutation detail. All optional + skip-if-none so lifecycle
+    // records on disk keep their original shape.
     /// CLI mutation verb tag, e.g. `rule.add` / `rule.remove` /
     /// `rule.undo` / `device.rules.prune` / `blocklist.tag_add` /
     /// `device.tag_add` / `profile.tag_add` / `tags.rename`.
-    ///
-    /// The previous example, `profile.blocklists.add`, was never
-    /// emitted by anything — `Profile.blocklists` was removed in
-    /// Sprint A of `lists_categories_v2` and list applicability is tag
-    /// intersection now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// SN1 scope tag: `profile` / `device` / `group` / `subnet` /
+    /// Scope tag: `profile` / `device` / `group` / `subnet` /
     /// `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -236,85 +209,79 @@ pub struct AuditRecord {
     pub domain: Option<String>,
     /// `true` when the device-allow path landed because
     /// `override_profile_deny = true` was set on the device entry.
-    /// Cybersec lens guard surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_used: Option<bool>,
 
-    /// S50 T2 — value of the mutated field BEFORE the CLI mutation
-    /// landed. Carried for `blocklist.set_kind` / `blocklist.set_trust`
-    /// (e.g. `"block"` flipping to `"allow"`). Stored as the wire-form
-    /// string the operator typed in TOML so audit-log readers don't
-    /// have to know the Rust enum spelling. `None` for any record
-    /// where the action is not a single-field mutation.
+    /// Value of the mutated field BEFORE the CLI mutation landed.
+    /// Carried for `blocklist.set_kind` / `blocklist.set_trust` (e.g.
+    /// `"block"` flipping to `"allow"`). Stored as the wire-form string
+    /// the operator typed in TOML so audit-log readers don't have to
+    /// know the Rust enum spelling. `None` for any record where the
+    /// action is not a single-field mutation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields_before: Option<String>,
-    /// S50 T2 — value of the mutated field AFTER the CLI mutation
-    /// landed. Symmetric counterpart to [`AuditRecord::fields_before`].
+    /// Value of the mutated field AFTER the CLI mutation landed.
+    /// Symmetric counterpart to [`AuditRecord::fields_before`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields_after: Option<String>,
 
-    /// S44 follow-up (`s44-audit-extra-fields`) — the resolved IP/CNAME
-    /// target stored on a `local_records.add` mutation. Pre-T6 audit
-    /// lines (no such field) deserialise unchanged thanks to
-    /// `#[serde(default)]`. `None` for any non-Local-DNS audit record
-    /// and for `local_records.remove` (the value is implied by the
-    /// matched row, not part of the operator-typed mutation).
+    /// The resolved IP/CNAME target stored on a `local_records.add`
+    /// mutation. `None` for any non-Local-DNS audit record and for
+    /// `local_records.remove` (the value is implied by the matched
+    /// row, not part of the operator-typed mutation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_value: Option<String>,
-    /// S44 follow-up (`s44-audit-extra-fields`) — the
-    /// `match_subdomains` flag on a `local_records.add` mutation.
+    /// The `match_subdomains` flag on a `local_records.add` mutation.
     /// `None` outside Local DNS adds. Lets the audit panel show
     /// "wildcard" mutations distinct from exact-match adds without
     /// having to cross-reference the master TOML.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_subdomains: Option<bool>,
-    /// S44 follow-up (`s44-audit-extra-fields`) — explicit per-record
-    /// TTL on a `local_records.add` mutation. `None` when the operator
-    /// did not override the global default; the daemon falls back to
-    /// `[local_dns].ttl_secs`. `None` outside Local DNS adds.
+    /// Explicit per-record TTL on a `local_records.add` mutation.
+    /// `None` when the operator did not override the global default;
+    /// the daemon falls back to `[local_dns].ttl_secs`. `None` outside
+    /// Local DNS adds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u32>,
 
-    /// §4.5 Sprint 2/2 — offending hop in a CNAME chain block. Set when
+    /// Offending hop in a CNAME chain block. Set when
     /// [`AuditRecord::event`] is [`AuditEvent::CnameBlock`]; carries the
     /// fully-qualified domain that triggered the block in the chain
     /// reached from [`AuditRecord::domain`] (the original qname).
     /// `None` outside CNAME-block records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cname_target: Option<String>,
-    /// §4.5 Sprint 2/2 — block-source classifier. One of `"list"` /
-    /// `"rule"` / `"admin_block"` / `"cname_loop"` /
-    /// `"cname_depth_exceeded"` (frozen via `BlockSource::label()` in
+    /// Block-source classifier. One of `"list"` / `"rule"` /
+    /// `"admin_block"` / `"cname_loop"` / `"cname_depth_exceeded"`
+    /// (frozen via `BlockSource::label()` in
     /// `tests/frozen_strings_s45_p1.rs`). `None` outside CNAME-block
     /// records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cname_source: Option<String>,
 
-    /// §4.12 — `from` side of a `rewrite.add` / `rewrite.remove`
-    /// mutation (the operator-typed source FQDN). `None` outside
-    /// rewrite-rule mutations. Pre-§4.12 audit lines deserialise
-    /// unchanged.
+    /// `from` side of a `rewrite.add` / `rewrite.remove` mutation (the
+    /// operator-typed source FQDN). `None` outside rewrite-rule
+    /// mutations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_from: Option<String>,
-    /// §4.12 — `to` side of a `rewrite.add` / `rewrite.remove`
-    /// mutation (the operator-typed target FQDN). `None` outside
-    /// rewrite-rule mutations.
+    /// `to` side of a `rewrite.add` / `rewrite.remove` mutation (the
+    /// operator-typed target FQDN). `None` outside rewrite-rule
+    /// mutations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite_to: Option<String>,
 
-    /// §4.39 — original (pre-rewrite) qname when a §4.12 per-profile
-    /// domain rewrite fired on the *resolved query* that produced this
-    /// CNAME-block audit record. [`AuditRecord::domain`] carries the
-    /// effective (rewritten) name that was actually filtered; this
-    /// carries what the client typed. `None` when no rewrite fired
-    /// (the common case) and on every non-CNAME-block record.
+    /// Original (pre-rewrite) qname when a per-profile domain rewrite
+    /// fired on the *resolved query* that produced this CNAME-block
+    /// audit record. [`AuditRecord::domain`] carries the effective
+    /// (rewritten) name that was actually filtered; this carries what
+    /// the client typed. `None` when no rewrite fired (the common
+    /// case) and on every non-CNAME-block record.
     ///
     /// Distinct from [`AuditRecord::rewrite_from`] above: that is the
     /// operator-typed `from` side of a `rewrite.add` / `rewrite.remove`
     /// *CLI mutation*; this is the runtime original qname of a query
     /// the resolver rewrote. The tense difference (`rewrite_` vs
-    /// `rewrote_`) is the naming cue. Pre-§4.39 audit lines deserialise
-    /// unchanged thanks to `#[serde(default)]`.
+    /// `rewrote_`) is the naming cue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrote_from: Option<String>,
 }
@@ -393,7 +360,7 @@ impl AuditRecord {
         self
     }
 
-    // ── T6 CLI-mutation builders ─────────────────────────────────────
+    // ── CLI-mutation builders ────────────────────────────────────────
 
     pub fn with_action(mut self, action: impl Into<String>) -> Self {
         self.action = Some(action.into());
@@ -430,7 +397,7 @@ impl AuditRecord {
         self
     }
 
-    // ── S50 T2 single-field-mutation builders ────────────────────────
+    // ── single-field-mutation builders ───────────────────────────────
 
     pub fn with_fields_before(mut self, before: impl Into<String>) -> Self {
         self.fields_before = Some(before.into());
@@ -442,7 +409,7 @@ impl AuditRecord {
         self
     }
 
-    // ── S44 follow-up Local-DNS-mutation builders ────────────────────
+    // ── Local-DNS-mutation builders ──────────────────────────────────
 
     pub fn with_record_value(mut self, value: impl Into<String>) -> Self {
         self.record_value = Some(value.into());
@@ -459,7 +426,7 @@ impl AuditRecord {
         self
     }
 
-    // ── §4.12 Domain Rewrite Rules builders ─────────────────────────
+    // ── domain-rewrite-rule builders ─────────────────────────────────
 
     pub fn with_rewrite_from(mut self, from: impl Into<String>) -> Self {
         self.rewrite_from = Some(from.into());
@@ -471,7 +438,7 @@ impl AuditRecord {
         self
     }
 
-    // ── §4.5 Sprint 2/2 CNAME-chain-block builders ──────────────────
+    // ── CNAME-chain-block builders ───────────────────────────────────
 
     pub fn with_cname_target(mut self, target: impl Into<String>) -> Self {
         self.cname_target = Some(target.into());
@@ -483,10 +450,10 @@ impl AuditRecord {
         self
     }
 
-    /// §4.39 — attach the original (pre-rewrite) qname when a §4.12
-    /// per-profile rewrite fired on the query being audited. `None` is
-    /// a no-op so call sites can pass `decision.rewrote_from` straight
-    /// through without branching.
+    /// Attach the original (pre-rewrite) qname when a per-profile
+    /// rewrite fired on the query being audited. `None` is a no-op so
+    /// call sites can pass `decision.rewrote_from` straight through
+    /// without branching.
     pub fn with_rewrote_from(mut self, original: Option<&str>) -> Self {
         if let Some(orig) = original {
             self.rewrote_from = Some(orig.to_string());
@@ -512,8 +479,8 @@ impl AuditWriter {
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                // §4.40 DISC-3: chmod the parent ONLY when we created it —
-                // the rule `ipc::auth_token::save_token_at` and
+                // Chmod the parent ONLY when we created it — the rule
+                // `ipc::auth_token::save_token_at` and
                 // `ipc::socket_server` both honour. A dir we create would
                 // otherwise land at `0o777 & !umask` (umask-dependent), so
                 // it still needs the explicit mode; a dir that was already
@@ -582,7 +549,7 @@ impl AuditWriter {
     /// `io::Result` rather than panicking — a panic on the append-only
     /// integrity-log path is a strictly worse failure mode.
     pub fn append(&self, record: &AuditRecord) -> std::io::Result<()> {
-        // audit-01: cap the per-record error list so a `Rejected` reload over
+        // Cap the per-record error list so a `Rejected` reload over
         // a badly broken multi-file config can't produce a record large
         // enough to risk a torn O_APPEND write (or bloat the log). Keep the
         // first N + a synthetic marker. Clone only on the rare overflow path.
@@ -610,7 +577,7 @@ impl AuditWriter {
         Ok(())
     }
 
-    /// T6 PRIORITY-1 fix #2: append a CLI-mutation record. Same on-disk
+    /// Append a CLI-mutation record. Same on-disk
     /// shape as [`AuditWriter::append`], but the [`AuditEvent`] is
     /// [`AuditEvent::CliMutation`] and the new optional fields carry
     /// the mutation context. Called by every `warden <verb>` rule
@@ -692,7 +659,7 @@ where
 /// Errors on IO failure; malformed lines are reported as `Err` inside the
 /// parsed side.
 pub fn tail(path: &Path, n: usize) -> std::io::Result<Vec<(String, Result<AuditRecord, String>)>> {
-    // audit-01: bounded back-scan. Read the file's tail in chunks from the
+    // Bounded back-scan. Read the file's tail in chunks from the
     // END until we've seen enough lines (or reached the start), rather than
     // slurping a possibly-large audit.log whole for a small `tail`. Bytes
     // are reassembled before decoding so a UTF-8 char split across a chunk
@@ -805,7 +772,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// §4.40 DISC-3: a parent directory that was ALREADY there belongs to
+    /// A parent directory that was ALREADY there belongs to
     /// the operator, and `open` must leave its mode alone. Only a directory
     /// warden itself creates gets [`AUDIT_DIR_MODE`] — the rule
     /// `ipc::auth_token::save_token_at` and `ipc::socket_server` honour.
@@ -869,7 +836,7 @@ mod tests {
 
     #[test]
     fn cname_block_record_round_trips_via_writer() {
-        // §4.5 Sprint 2/2: a chain block writes one JSON line with
+        // A chain block writes one JSON line with
         // `event=cname_block`, `action=cname_block`, the original qname
         // in `domain`, the offending hop in `cname_target`, and the
         // BlockSource label in `cname_source`.
@@ -899,8 +866,8 @@ mod tests {
 
     #[test]
     fn pre_s4_5_p2_lifecycle_record_deserialises_with_new_fields_none() {
-        // Backward compat: a Reload record on disk before S4.5 P2
-        // shipped has no `cname_target` / `cname_source` fields. The
+        // Backward compat: an older Reload record on disk has no
+        // `cname_target` / `cname_source` fields. The
         // `#[serde(default)]` decorations on the manual Deserialize
         // impl read them back as `None` without erroring.
         let legacy = r#"{
@@ -1004,7 +971,7 @@ mod tests {
 
     #[test]
     fn append_caps_oversized_error_list() {
-        // audit-01: a Rejected reload with a huge validator-error list is
+        // A Rejected reload with a huge validator-error list is
         // capped to N + a marker on disk, bounding the record size.
         let root = tmp_dir("err-cap");
         let path = root.join("audit.log");
@@ -1136,11 +1103,9 @@ mod tests {
     fn lifecycle_record_serialises_without_cli_mutation_fields() {
         let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Ok).with_uid(Some(0));
         let json = serde_json::to_string(&rec).unwrap();
-        // Pre-T6 lifecycle records had no action / scope / etc. — the
-        // skip_serializing_if guard keeps the on-disk shape identical.
-        // S50 T2 added `fields_before` / `fields_after` for kind/trust
-        // mutations; the same skip_if_none guard must keep lifecycle
-        // records byte-identical to the pre-S50 shape.
+        // Lifecycle records have no action / scope / etc, and no
+        // fields_before / fields_after — the skip_serializing_if guard
+        // on every optional field keeps the on-disk shape identical.
         assert!(!json.contains("\"action\""));
         assert!(!json.contains("\"scope\""));
         assert!(!json.contains("\"target_id\""));
@@ -1151,16 +1116,14 @@ mod tests {
         assert!(!json.contains("\"fields_after\""));
     }
 
-    /// Sprint 50 T2 — every CLI mutation that flips a blocklist's
-    /// `kind` field must emit one append-only audit line carrying
-    /// `ts`, `uid`, `action = "blocklist.set_kind"`, `target_id`,
-    /// `fields_before` / `fields_after` (the wire-form values the
-    /// operator typed), and `pre_hash` / `post_hash` (the
-    /// `tree_hash_before` / `tree_hash_after` half of R4 — same hash,
-    /// existing field name retained for backward compatibility).
-    /// Pinning here exercises the audit-emission helper end-to-end
-    /// (build → append → tail → parse) so T3's CLI dispatch only
-    /// needs to wire the call sites; the JSON shape is locked at T2.
+    /// Every CLI mutation that flips a blocklist's `kind` field must
+    /// emit one append-only audit line carrying `ts`, `uid`,
+    /// `action = "blocklist.set_kind"`, `target_id`, `fields_before` /
+    /// `fields_after` (the wire-form values the operator typed), and
+    /// `pre_hash` / `post_hash`. Pinning here exercises the
+    /// audit-emission helper end-to-end (build → append → tail →
+    /// parse) so CLI dispatch call sites can rely on a locked JSON
+    /// shape.
     #[test]
     fn s50_t2_blocklist_set_kind_round_trips_via_writer() {
         let root = tmp_dir("s50-t2-set-kind");
@@ -1194,11 +1157,8 @@ mod tests {
         assert_eq!(parsed.post_hash.as_deref(), Some("bbb"));
         assert!(!parsed.ts.is_empty(), "ts must be populated");
 
-        // Cybersec-side guard: the on-disk JSON must spell out every R4
-        // field for downstream tooling, even fields that happen to be
-        // empty strings. (`pre_hash` / `post_hash` carry the
-        // `tree_hash_before` / `tree_hash_after` half of R4 under the
-        // pre-existing field names.)
+        // The on-disk JSON must spell out every field for downstream
+        // tooling, even fields that happen to be empty strings.
         let raw = &got[0].0;
         for needle in [
             "\"action\":\"blocklist.set_kind\"",
@@ -1218,12 +1178,12 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Sprint 50 T2 — symmetric to the kind test, but for the
-    /// `blocklist.set_trust` action. Pins the per-action tag so T3's
-    /// CLI dispatch can copy this pattern verbatim. The test also
-    /// covers a `Rejected` outcome (e.g. operator tries to set
-    /// `trust = signed`) so the audit row records the refusal — R4
-    /// requires every mutation, successful or not, to leave a trail.
+    /// Symmetric to the kind test, but for the `blocklist.set_trust`
+    /// action. Pins the per-action tag so CLI dispatch can copy this
+    /// pattern verbatim. The test also covers a `Rejected` outcome
+    /// (e.g. operator tries to set `trust = signed`) so the audit row
+    /// records the refusal — every mutation, successful or not, must
+    /// leave a trail.
     #[test]
     fn s50_t2_blocklist_set_trust_records_rejection_with_errors() {
         let root = tmp_dir("s50-t2-set-trust");
@@ -1260,9 +1220,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Sprint 50 T2 — pre-S50 audit lines on disk must still
-    /// deserialise even though the new fields don't exist there.
-    /// Companion to `pre_t6_lifecycle_lines_still_deserialise`.
+    /// Older audit lines on disk must still deserialise even though
+    /// these fields don't exist there. Companion to
+    /// `pre_t6_lifecycle_lines_still_deserialise`.
     #[test]
     fn pre_s50_t2_cli_mutation_lines_still_deserialise() {
         let raw = r#"{"ts":"2026-04-25T12:00:00Z","event":"cli_mutation","uid":1000,"files":[],"pre_hash":null,"post_hash":null,"result":"ok","errors":[],"action":"rule.add","scope":"device","target_id":"pc-gioele","rule_id":"r1","rule_action":"allow","domain":"example.com","override_used":false}"#;
@@ -1272,10 +1232,9 @@ mod tests {
         assert_eq!(parsed.fields_after, None);
     }
 
-    /// S44 follow-up — pre-`s44-audit-extra-fields` audit lines (no
-    /// `record_value` / `match_subdomains` / `ttl_secs` columns) must
-    /// continue to deserialise. The new fields default to `None`,
-    /// matching the on-disk shape from the S44 T3 release.
+    /// Older audit lines (no `record_value` / `match_subdomains` /
+    /// `ttl_secs` columns) must continue to deserialise. The new
+    /// fields default to `None`.
     #[test]
     fn pre_s44_followup_local_dns_audit_lines_still_deserialise() {
         let raw = r#"{"ts":"2026-05-01T10:11:00Z","event":"cli_mutation","uid":1000,"files":[],"pre_hash":null,"post_hash":null,"result":"ok","errors":[],"action":"local_records.add","scope":"global","target_id":"global","rule_action":"A","domain":"nas.home"}"#;
@@ -1289,10 +1248,9 @@ mod tests {
         assert_eq!(parsed.ttl_secs, None);
     }
 
-    /// S44 follow-up — a post-followup audit line carrying the three
-    /// new fields must round-trip through the writer + tail + parse
-    /// pipeline byte-stable, including the wire-form spelling of every
-    /// new column.
+    /// An audit line carrying the three Local-DNS fields must
+    /// round-trip through the writer + tail + parse pipeline
+    /// byte-stable, including the wire-form spelling of every column.
     #[test]
     fn s44_followup_local_dns_audit_line_round_trips_through_writer() {
         let root = tmp_dir("s44-roundtrip");
@@ -1332,11 +1290,11 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// S44 follow-up — a post-followup audit line that omits the new
-    /// fields (e.g. a `local_records.remove` against multiple matching
-    /// rows) keeps the on-disk shape compact. `skip_serializing_if`
-    /// must drop the `null`s so legacy log readers don't see new
-    /// columns until they actually carry data.
+    /// An audit line that omits the Local-DNS fields (e.g. a
+    /// `local_records.remove` against multiple matching rows) keeps
+    /// the on-disk shape compact. `skip_serializing_if` must drop the
+    /// `null`s so log readers don't see columns until they actually
+    /// carry data.
     #[test]
     fn s44_followup_audit_line_without_new_fields_serialises_compactly() {
         let rec = AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
@@ -1352,8 +1310,8 @@ mod tests {
 
     #[test]
     fn pre_t6_lifecycle_lines_still_deserialise() {
-        // Hand-crafted JSON in the original (pre-T6) shape: no
-        // action/scope/etc fields. The new deserialiser must accept it.
+        // Hand-crafted JSON in the original lifecycle shape: no
+        // action/scope/etc fields. The deserialiser must accept it.
         let raw = r#"{"ts":"2026-04-22T16:09:55Z","event":"reload","uid":1000,"files":["/etc/purge-warden/config.toml"],"pre_hash":"aaa","post_hash":"bbb","result":"ok","errors":[]}"#;
         let parsed: AuditRecord = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.event, AuditEvent::Reload);

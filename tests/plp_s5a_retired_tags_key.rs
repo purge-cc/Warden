@@ -233,9 +233,9 @@ default_profile = "default"
 display_name = "Default"
 
 [[labels]]
-id = "alex"
+id = "operator"
 kind = "owner"
-display_name = "Alex"
+display_name = "Operator"
 
 [[labels]]
 id = "ads"
@@ -264,7 +264,7 @@ servers = ["192.0.2.1:53"]
             .iter()
             .map(|l| l.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["alex", "famiglia"],
+        vec!["operator", "famiglia"],
         "the retired row goes and its neighbours stay"
     );
     assert!(

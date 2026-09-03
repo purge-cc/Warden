@@ -44,20 +44,19 @@ pub struct CircuitBreaker {
     failures: AtomicU32,
     /// Monotonic origin for [`Self::opened_at`].
     ///
-    /// **M5** This used to be absent and `opened_at` held epoch seconds read
-    /// from `SystemTime::now()` — a wall clock. `should_probe` subtracts the
-    /// two readings, so any *backward* wall-clock movement between them (NTP
-    /// slew, `date -s`, a DST jump on a box that keeps local time in the RTC)
-    /// made the difference negative, `saturating_sub` clamped it to `0`, and
-    /// the breaker stayed **stuck open** until real time caught back up.
-    /// A *forward* jump fired the probe early. `Instant` is monotonic by
-    /// contract, so neither is expressible.
+    /// Must be a monotonic clock, not `SystemTime::now()` (wall clock).
+    /// `should_probe` subtracts two readings; a *backward* wall-clock jump
+    /// between them (NTP slew, `date -s`, a DST jump on a box that keeps
+    /// local time in the RTC) would make the difference negative,
+    /// `saturating_sub` would clamp it to `0`, and the breaker would stay
+    /// stuck open until real time caught back up. A *forward* jump would
+    /// fire the probe early. `Instant` is monotonic by contract, so neither
+    /// is expressible.
     ///
-    /// Not an `AtomicU64` of its own: `Instant` is not atomic-storable and a
-    /// `Mutex<Instant>` here would add a fourteenth shard-scoped lock site to
-    /// project rules's enumerated table on a per-cache-miss path. The anchor is
-    /// immutable after construction, so it needs no synchronisation at all and
-    /// the struct stays lock-free.
+    /// Not an `AtomicU64` of its own: `Instant` is not atomic-storable, and a
+    /// `Mutex<Instant>` here would add a lock to a per-cache-miss path. The
+    /// anchor is immutable after construction, so it needs no
+    /// synchronisation at all and the struct stays lock-free.
     anchor: Instant,
     /// Whole seconds since [`Self::anchor`] at which the circuit opened.
     opened_at: AtomicU64,
@@ -111,9 +110,9 @@ impl CircuitBreaker {
         self.anchor.elapsed().as_secs()
     }
 
-    // roundup-01 (rev-2606): `failures` and `state` are two independent atomics,
-    // so a concurrent success+failure can momentarily observe them inconsistent
-    // (e.g. `failures = 0` while `state = Open`). This self-heals on the next
+    // `failures` and `state` are two independent atomics, so a concurrent
+    // success+failure can momentarily observe them inconsistent (e.g.
+    // `failures = 0` while `state = Open`). This self-heals on the next
     // probe / Closed transition and is per-query benign — the breaker is an
     // availability optimisation, not a correctness gate — so the multi-field
     // state is left as separate atomics rather than a lock or packed word.
@@ -145,9 +144,9 @@ impl CircuitBreaker {
         let opened = self.opened_at.load(Ordering::Acquire);
         // `saturating_sub` is now belt-and-braces rather than load-bearing:
         // both operands come from `elapsed_secs()`, which is monotonic
-        // non-decreasing, so the subtraction cannot underflow. [M5] — under the
-        // old wall clock it *was* load-bearing, and clamping to 0 is precisely
-        // how a backward jump wedged the breaker open.
+        // non-decreasing, so the subtraction cannot underflow. Under the old
+        // wall clock it *was* load-bearing — clamping to 0 is precisely how a
+        // backward jump wedged the breaker open.
         self.elapsed_secs().saturating_sub(opened) >= PROBE_INTERVAL_SECS
     }
 }
@@ -292,7 +291,7 @@ mod tests {
         assert!(matches!(err, DnsError::CircuitBreakerOpen));
     }
 
-    /// M5 The probe window must be timed on the process-monotonic clock, not
+    /// The probe window must be timed on the process-monotonic clock, not
     /// on the wall clock.
     ///
     /// The needle discriminates by *magnitude*, which is what makes it a real
@@ -328,7 +327,7 @@ mod tests {
         );
     }
 
-    /// M5 The probe window opens purely as a function of monotonic elapsed
+    /// The probe window opens purely as a function of monotonic elapsed
     /// time since the anchor — the two arms differ *only* in how far back the
     /// anchor is dated.
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! [`RetiredEntry`] — N8: id retirement policy.
+//! [`RetiredEntry`] — id retirement policy.
 //!
 //! When an entity is deleted, its id enters a 90-day quarantine list in
 //! the config. Attempting to create a new entity with a retired id inside
@@ -8,10 +8,9 @@
 //! entity.
 //!
 //! After 90 days the id can be reused. Nothing prunes the ledger
-//! automatically — no writer touches `[[retired]]` — so it grows until an
-//! operator removes expired entries by hand. (rev-2606 retired-01: the
-//! prior doc wrongly claimed the validator drops expired entries during
-//! the check pass; it does not.)
+//! automatically — no writer touches `[[retired]]`, and the validator does
+//! not drop expired entries during the check pass — so it grows until an
+//! operator removes expired entries by hand.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;

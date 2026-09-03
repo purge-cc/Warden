@@ -1,4 +1,4 @@
-//! Memory-bounded concurrent map with approximate-LRU eviction (P0-4).
+//! Memory-bounded concurrent map with approximate-LRU eviction.
 //!
 //! Wraps a `DashMap<K, V>` with a soft cap. When an insert would exceed the
 //! cap, the map samples up to `SAMPLE` existing entries and evicts the one
@@ -98,9 +98,10 @@ where
     /// guarded ref to the existing value. Otherwise computes a value via `f`
     /// and inserts it (evicting the approximately-oldest entry if the map is
     /// at capacity). The lookup-and-insert is a single atomic shard
-    /// operation, closing get-then-insert races — see L-1 in
-    /// `_docs/reviews/code_review_2026_04.md` for the rate-limiter call site
-    /// that motivated this addition.
+    /// operation, closing the get-then-insert race a naive
+    /// check-then-insert would have — this is what the rate limiter and
+    /// RRL call sites rely on for exactly-one-bucket-per-fresh-key
+    /// semantics under concurrent first requests.
     ///
     /// The caller holds a `RefMut` (shard write guard) for the duration of
     /// the returned reference; drop it as soon as practical to release the
@@ -123,6 +124,19 @@ where
         self.inner.entry(key).or_insert_with(f)
     }
 
+    /// Remove the entry for `key`, returning its value if one was present.
+    ///
+    /// The soft cap is re-derived from `len()` on every insert and nowhere
+    /// else, so a removal needs no eviction bookkeeping: the freed slot is
+    /// simply there for the next insert to use.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.remove(key).map(|(_, v)| v)
+    }
+
     /// Current entry count. Exposed so call sites can publish it as a stat.
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -141,10 +155,10 @@ where
     }
 
     /// Count entries whose value satisfies `f`. Iterates under shard
-    /// read locks; callers should keep `f` cheap. Sprint §4.4 P1
-    /// `HitTracker::pool_size` reads the in-pool flag this way to avoid
-    /// maintaining a parallel `HashSet` that could drift out of sync
-    /// with `BoundedMap`'s approximate-LRU eviction.
+    /// read locks; callers should keep `f` cheap. `HitTracker::pool_size`
+    /// reads the in-pool flag this way to avoid maintaining a parallel
+    /// `HashSet` that could drift out of sync with `BoundedMap`'s
+    /// approximate-LRU eviction.
     pub fn count_where<F: FnMut(&V) -> bool>(&self, mut f: F) -> usize {
         self.inner.iter().filter(|entry| f(entry.value())).count()
     }
@@ -152,13 +166,14 @@ where
     /// Snapshot the keys of entries whose value satisfies `f`. Iterates
     /// under shard read locks and clones each matching key into a fresh
     /// `Vec`, so the cost is `O(tracked_entries)` plus one `K::clone`
-    /// per match. Intended for low-cadence consumers (Sprint §4.4 P2's
-    /// background prefetch worker reads the promoted-domain set every
-    /// `tick_secs`); not suitable for the hot path.
+    /// per match. Intended for low-cadence consumers (the background
+    /// prefetch worker reads the promoted-domain set every `tick_secs`);
+    /// not suitable for the hot path.
     ///
     /// Result ordering is unspecified — DashMap iterates by shard hash
-    /// order. Soft-cap semantics (§ module docs) mean a briefly-evicted
-    /// entry may or may not appear; callers must tolerate ghost keys.
+    /// order. Soft-cap semantics (see module docs above) mean a
+    /// briefly-evicted entry may or may not appear; callers must
+    /// tolerate ghost keys.
     pub fn snapshot_keys_where<F: FnMut(&V) -> bool>(&self, mut f: F) -> Vec<K> {
         self.inner
             .iter()
@@ -300,6 +315,44 @@ mod tests {
         let has_1 = m.get(&1).is_some();
         let has_2 = m.get(&2).is_some();
         assert!(has_1 ^ has_2, "exactly one entry should remain");
+    }
+
+    #[test]
+    fn remove_returns_the_value_and_drops_the_entry() {
+        let m: BoundedMap<u32, Aged> = BoundedMap::new(10, age_of);
+        m.insert(1, Aged(AtomicU64::new(7)));
+        m.insert(2, Aged(AtomicU64::new(9)));
+
+        let gone = m.remove(&1).expect("a present key yields its value");
+        assert_eq!(gone.0.load(Ordering::Relaxed), 7);
+        assert!(m.get(&1).is_none());
+        assert_eq!(m.len(), 1);
+
+        assert!(m.remove(&1).is_none(), "removing twice is not an error");
+        assert!(m.remove(&404).is_none(), "an absent key yields None");
+        assert!(m.get(&2).is_some(), "the untouched key must survive");
+    }
+
+    #[test]
+    fn remove_frees_a_slot_so_the_next_insert_does_not_evict() {
+        // At cap, an insert evicts. After a remove it must not — otherwise
+        // a caller that removes before inserting silently loses a second
+        // entry it never asked to drop.
+        let m: BoundedMap<u32, Aged> = BoundedMap::new(4, age_of);
+        for i in 0..4 {
+            m.insert(i, Aged(AtomicU64::new(i as u64)));
+        }
+        m.remove(&0);
+        m.insert(100, Aged(AtomicU64::new(100)));
+
+        for i in 1..4 {
+            assert!(
+                m.get(&i).is_some(),
+                "key {i} must survive an under-cap insert"
+            );
+        }
+        assert!(m.get(&100).is_some());
+        assert_eq!(m.len(), 4);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! `data/list_state.toml` — refresh-state persistence for blocklists.
 //!
-//! Sprint A of `lists_categories_v2` (decision D10): the retry state
-//! machine introduced in Sprint B (Pending → Active → Failed) needs a
+//! The retry state machine (Pending → Active → Failed) needs a
 //! durable side-channel so a daemon restart does not reset every
 //! list's `consecutive_failures` counter or its `last_success`
 //! timestamp. The state lives in `data/list_state.toml` (alongside
@@ -11,17 +10,15 @@
 //! This module supplies:
 //!
 //! - The struct surface ([`ListState`], [`ListStatusEntry`],
-//!   [`ListStatus`]) that the resolver and the refresh task will
-//!   read/write in Sprint B.
+//!   [`ListStatus`]) that the resolver and the refresh task read/write.
 //! - [`ListState::read_or_default`] — load from disk, return
 //!   `ListState::default()` when the file is missing.
 //! - [`ListState::write_atomic`] — write through
 //!   [`crate::config::atomic_write::atomic_write_and_validate`] so a
 //!   crash mid-write leaves the previous state intact.
-//!
-//! The actual state-machine logic (transition rules, retry counters,
-//! stale-cache fallback) lives in Sprint B per the
-//! `_docs/features/lists_categories_v2.md` §11 sprint breakdown.
+//! - The state-machine transitions themselves
+//!   ([`ListStatusEntry::record_success`],
+//!   [`ListStatusEntry::record_failure`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,7 +41,7 @@ pub enum ListStatus {
     /// Cache is fresh and the filter engine is using it.
     Active,
     /// `max_consecutive_failures` exhausted. A list with a prior
-    /// success keeps its stale cache (D9); a list that never
+    /// success keeps its stale cache; a list that never
     /// succeeded has `cache_path = None` and contributes nothing.
     Failed,
 }
@@ -58,23 +55,23 @@ pub struct ListStatusEntry {
     #[serde(default)]
     pub status: ListStatus,
     /// Wall-clock at the most recent successful refresh, RFC 3339.
-    /// Sprint B's stale-badge logic reads this.
+    /// The stale-badge logic reads this.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_success: Option<OffsetDateTime>,
     /// Wall-clock at the most recent refresh attempt (success or
-    /// failure). Used by Sprint B to decide when to schedule the
+    /// failure). Used to decide when to schedule the
     /// next attempt.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_attempt: Option<OffsetDateTime>,
     /// Number of refresh attempts that have failed in a row since
-    /// the last success. Reset to 0 on success. Sprint B uses this
+    /// the last success. Reset to 0 on success. Checked
     /// against `Blocklist.max_consecutive_failures` (default 5,
-    /// configurable per list per D8).
+    /// configurable per list).
     #[serde(default)]
     pub consecutive_failures: u32,
     /// On-disk path of the cached list bytes, when one exists. The
-    /// file may be stale — Sprint B's resolver applies it anyway as
-    /// long as `status != Failed without prior success` (D9).
+    /// file may be stale — the resolver applies it anyway as
+    /// long as `status != Failed without prior success`.
     #[serde(default)]
     pub cache_path: Option<PathBuf>,
 }
@@ -120,13 +117,13 @@ pub enum ListStateError {
 }
 
 impl ListStatusEntry {
-    /// Sprint B of `lists_categories_v2` (T5): record a successful
+    /// Record a successful
     /// refresh. Resets [`Self::consecutive_failures`] to 0, transitions
     /// any prior `Pending` / `Failed` status back to `Active`, and
     /// stamps the success / attempt timestamps.
     ///
     /// `cache_path` is the path the manager just wrote the cached
-    /// bytes to. Always `Some(_)` after a success — D9 stale-cache
+    /// bytes to. Always `Some(_)` after a success — the stale-cache
     /// fallback depends on it.
     pub fn record_success(&mut self, now: OffsetDateTime, cache_path: PathBuf) {
         self.status = ListStatus::Active;
@@ -136,12 +133,12 @@ impl ListStatusEntry {
         self.cache_path = Some(cache_path);
     }
 
-    /// Sprint B of `lists_categories_v2` (T5): record a failed refresh.
+    /// Record a failed refresh.
     /// Increments [`Self::consecutive_failures`]; when the new count
     /// reaches `max_consecutive_failures`, transitions the entry to
     /// [`ListStatus::Failed`].
     ///
-    /// **D9 stale-cache fallback.** If the entry has succeeded at least
+    /// **Stale-cache fallback.** If the entry has succeeded at least
     /// once before (`last_success.is_some()`), [`Self::cache_path`] is
     /// preserved across the transition — the resolver continues to
     /// apply the stale bytes (badge red but filtering active). For an
@@ -150,8 +147,7 @@ impl ListStatusEntry {
     ///
     /// Returns `true` when the call flipped the status to `Failed`
     /// (i.e. the threshold was crossed in this call). Useful for the
-    /// caller's audit log — Sprint C surfaces these transitions on
-    /// the TUI and `warden status`.
+    /// caller's audit log.
     pub fn record_failure(&mut self, now: OffsetDateTime, max_consecutive_failures: u32) -> bool {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_attempt = Some(now);
@@ -159,8 +155,8 @@ impl ListStatusEntry {
             && self.status != ListStatus::Failed;
         if should_fail {
             self.status = ListStatus::Failed;
-            // cache_path stays as-is: if a prior success populated it
-            // (D9 stale-cache), the resolver keeps using it; otherwise
+            // cache_path stays as-is: if a prior success populated it,
+            // the resolver keeps using it; otherwise
             // it remains None and the list is inactive.
         }
         should_fail
@@ -372,9 +368,9 @@ consecutive_failures = 3
         assert!(s.contains("status = \"active\""), "got: {s}");
     }
 
-    // ── Sprint B T5 — state-machine transitions ────────────────────
+    // ── state-machine transitions ────────────────────
 
-    /// T5 row 1 — Pending → Active on first success.
+    /// Pending → Active on first success.
     #[test]
     fn pending_to_active_on_first_success() {
         let mut e = ListStatusEntry::default();
@@ -389,9 +385,9 @@ consecutive_failures = 3
         assert!(e.cache_path.is_some());
     }
 
-    /// T5 row 2 — Active → Failed once consecutive_failures hits the
+    /// Active → Failed once consecutive_failures hits the
     /// max threshold. cache_path is preserved across the transition
-    /// (D9 stale-cache fallback) when a prior success populated it.
+    /// (stale-cache fallback) when a prior success populated it.
     #[test]
     fn active_to_failed_after_max_consecutive_failures() {
         let mut e = ListStatusEntry::default();
@@ -411,14 +407,14 @@ consecutive_failures = 3
         assert!(e.record_failure(datetime!(2026-05-08 12:00:00 UTC), 5));
         assert_eq!(e.status, ListStatus::Failed);
         assert_eq!(e.consecutive_failures, 5);
-        // D9 stale-cache fallback — cache_path preserved.
+        // Stale-cache fallback — cache_path preserved.
         assert_eq!(
             e.cache_path.as_deref().unwrap().to_str().unwrap(),
             "lists/x.cache"
         );
     }
 
-    /// T5 row 3 — Failed → Active on recovery, counter resets.
+    /// Failed → Active on recovery, counter resets.
     #[test]
     fn failed_to_active_on_recovery_resets_counter() {
         let mut e = ListStatusEntry {
@@ -446,7 +442,7 @@ consecutive_failures = 3
         );
     }
 
-    /// T5 row 4 — Pending → Failed without prior success. cache_path
+    /// Pending → Failed without prior success. cache_path
     /// stays `None`; the resolver excludes the list entirely.
     #[test]
     fn pending_to_failed_no_cache_after_max_failures() {
@@ -463,7 +459,7 @@ consecutive_failures = 3
         assert!(e.last_success.is_none());
     }
 
-    /// T5 row 5 — once Failed, additional failures keep the status
+    /// Once Failed, additional failures keep the status
     /// pinned (does not flip to Failed twice). Counter still ticks
     /// up so the operator can see how long the list has been broken.
     #[test]

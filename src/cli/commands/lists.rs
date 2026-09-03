@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
+use super::format_config_errors;
 use super::target::{read_or_empty, remove_id_keyed, write_value_validated, EntityClass};
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
 use crate::config::loader::load_config;
@@ -34,7 +35,7 @@ use crate::lists::source_key::{canonical_url_key, is_url_source};
 /// subscribe to, and the old behaviour of recording the slug anyway
 /// produced an entry that could never download or filter.
 ///
-/// **The cost of that choice, recorded (N1).** `warden lists catalog`
+/// **The cost of that choice, recorded.** `warden lists catalog`
 /// renders the *live* index, so the two verbs consult different sources
 /// and the built-in table can fall behind — it did, by
 /// `services/resolvers`, and the operator's report was "the catalog
@@ -140,6 +141,90 @@ fn sanitize_id(raw: &str) -> Option<String> {
     }
 }
 
+/// What `warden lists add` says about the corpus ceiling before it
+/// writes, or `None` when there is nothing worth saying.
+///
+/// Three inputs, each of which can be missing, and the reason has to
+/// reach the operator because they imply different next steps: the
+/// config carries the ceiling, the daemon carries what is installed
+/// (config cannot know it — the corpus is the deduplicated union), and
+/// the on-disk catalog carries the list's own size.
+///
+/// The catalog read is the *persisted* one rather than a fetch: `add`
+/// mutates the config, and letting a purge.cc outage change what it
+/// prints would make the verb's output depend on the network. A cache
+/// miss is `Unknown`, which is honest and costs one line.
+async fn projection_note(
+    config_path: &Path,
+    socket_path: &Path,
+    loaded: Option<&crate::config::loader::LoadedConfig>,
+    url: &str,
+) -> Option<String> {
+    use super::lists_knobs::{corpus_projection, fetch_live_corpus, Projection};
+
+    let Some(loaded) = loaded else {
+        return Some(unknown_note("config not readable"));
+    };
+    let ceiling = loaded.config.lists.max_total_domains as u64;
+    // Mirrors `corpus_projection`'s own precedence: with the guard off
+    // there is no question to answer, so neither the daemon nor the
+    // catalog is worth consulting — and neither is worth reporting.
+    if ceiling == 0 {
+        return None;
+    }
+    // Bounded like the banner's probe: a daemon that accepts and then
+    // says nothing must not hold `add` for the full IPC timeout.
+    let Ok(Ok(live)) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fetch_live_corpus(socket_path),
+    )
+    .await
+    else {
+        return Some(unknown_note("daemon not reachable"));
+    };
+    let installed = live.unique_installed;
+
+    // Matched the way every other URL comparison in this file matches:
+    // the persisted catalog and the operator's argument may differ in
+    // scheme case or an explicit port and still name one list.
+    let wanted = canonical_url_key(url);
+    let entries =
+        Catalog::load_from_disk(&super::start::lists_cache_dir(config_path, &loaded.config))
+            .and_then(|c| {
+                c.entries()
+                    .iter()
+                    .find(|e| canonical_url_key(&e.url) == wanted)
+                    .map(|e| e.entries)
+            });
+
+    match corpus_projection(installed, ceiling, entries) {
+        // `MayCross` is only reachable with a known size, so the addend is
+        // the list's own count; `upper_bound` saturates on overflow and
+        // would otherwise print the difference as 0 exactly there.
+        Projection::MayCross { upper_bound } => Some(format!(
+            "note: this list may push the corpus past max_total_domains: {installed} \
+             installed + up to {} = up to {upper_bound} > {ceiling}. If it does, the next \
+             refresh is refused and filtering FREEZES at today's corpus. Raise the ceiling \
+             first: warden lists set max_total_domains <n>",
+            entries.unwrap_or(0),
+        )),
+        Projection::Unknown { reason } => Some(unknown_note(reason)),
+        // A list that fits, or a ceiling nobody enforces: the operator
+        // asked to add a list, not to read about one.
+        Projection::Fits | Projection::Disabled => None,
+    }
+}
+
+/// The unprojectable case. One renderer for all three causes so the
+/// remedy stays attached to every one of them — the operator's next step
+/// is the same measurement whichever input was missing.
+fn unknown_note(reason: &str) -> String {
+    format!(
+        "note: cannot project this list's size ({reason}); the first refresh after adding \
+         it measures the corpus — check: warden lists show"
+    )
+}
+
 /// Subscribe to a list.
 ///
 /// The entry written is a `[[blocklists]]` one, because that is the only
@@ -148,12 +233,10 @@ fn sanitize_id(raw: &str) -> Option<String> {
 /// nothing it contains can ever reach a profile — a list added that way
 /// filtered nothing, quietly, forever.
 ///
-/// **The clause removed from that sentence said a profile picks up a
-/// list "when their tags intersect".** False since the `plp-s3` cutover:
-/// what a profile does with a list is
+/// What a profile does with a list is
 /// [`effective_direction`](crate::config::schema::effective_direction) —
 /// the profile's `profiles.<id>.lists` entry for that list if it has
-/// one, else the list's own `base`.
+/// one, else the list's own `base`. Tags play no part in it.
 ///
 /// The entry itself is built by [`super::blocklists::run_add_silent`]
 /// rather than by a second writer here, so a list added with `lists add`
@@ -161,12 +244,7 @@ fn sanitize_id(raw: &str) -> Option<String> {
 /// validation, the same duplicate-URL rule, and the same audit record.
 /// The common case starts filtering with no further steps, and the
 /// reason is `base`: it defaults to `deny`, and a profile with no
-/// override inherits that. **This paragraph used to credit the tags** —
-/// "promoted to `uncategorized` … which is the tag `warden init` puts on
-/// the default profile". Both halves are dead: the promotion decides
-/// nothing since `plp-s3`, and `plp-s5c` stopped `warden init` writing
-/// that tag at all. The behaviour it described is unchanged; only the
-/// mechanism it named was wrong.
+/// override inherits that.
 ///
 /// The reachability probe `blocklist add` runs is deliberately skipped:
 /// that verb offers `--skip-head-check` for a list whose server happens
@@ -174,13 +252,21 @@ fn sanitize_id(raw: &str) -> Option<String> {
 /// here would make a transient outage block the subscription outright.
 pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> anyhow::Result<()> {
     let (id, url) = derive_subscription(source)?;
+    // First, before the duplicate checks: an idempotent provisioning script
+    // re-adds every list it already has, and that is the run on which an
+    // operator must still be told the corpus is frozen.
+    super::lists_knobs::warn_if_frozen(socket_path).await;
 
     // Adding a list twice is not an error — it is a script being re-run.
     // Both channels are checked: an entry may predate this verb writing
     // entities, and a legacy leftover still downloads, so re-adding it
     // would put the same body behind two sources.
+    // Held past the duplicate checks: the ceiling this list is projected
+    // against comes from the same load, so the projection cannot answer
+    // from a different config than the checks just used.
     let now = time::OffsetDateTime::now_utc();
-    if let Ok(loaded) = load_config(config_path, now) {
+    let loaded = load_config(config_path, now).ok();
+    if let Some(loaded) = &loaded {
         let canonical = canonical_url_key(&url);
         if let Some(existing) = loaded
             .config
@@ -225,6 +311,15 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
             );
             return Ok(());
         }
+    }
+
+    // Before the write, not after. Past this point the list is
+    // subscribed and the next refresh either installs it or refuses the
+    // whole cycle; an operator told afterwards has already paid for the
+    // answer. The banner is separate because a corpus that is ALREADY
+    // frozen makes the projection moot — nothing installs either way.
+    if let Some(note) = projection_note(config_path, socket_path, loaded.as_ref(), &url).await {
+        println!("{note}");
     }
 
     // A slug is a name worth keeping — it is what the operator typed and
@@ -272,7 +367,13 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
 ///
 /// Removing something that is not there is not an error — re-running a
 /// teardown script should be quiet, not fatal.
-pub fn run_remove(config_path: &Path, source: &str) -> anyhow::Result<()> {
+pub async fn run_remove(
+    config_path: &Path,
+    socket_path: &Path,
+    source: &str,
+) -> anyhow::Result<()> {
+    super::lists_knobs::warn_if_frozen(socket_path).await;
+
     // The id `run_add` would have chosen for this argument, so removing
     // by URL finds the entry that URL created. Unresolvable arguments
     // (an id typed directly, a slug not in the catalog) are not an error
@@ -399,7 +500,7 @@ pub fn run_remove(config_path: &Path, source: &str) -> anyhow::Result<()> {
     }
 
     if removed_from.is_empty() {
-        // verbs-02: remove of an absent source is idempotent (exit 0).
+        // Remove of an absent source is idempotent (exit 0).
         println!("source not found: {source} — nothing to remove");
         return Ok(());
     }
@@ -415,9 +516,11 @@ pub fn run_remove(config_path: &Path, source: &str) -> anyhow::Result<()> {
 /// way on purpose. Entries under `[lists].sources` download on schedule
 /// and filter nothing — that is not visible from the entry itself, so
 /// the output says it.
-pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
+pub async fn run_list(config_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    super::lists_knobs::warn_if_frozen(socket_path).await;
+
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_errs)?;
+    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
     let lists = &loaded.config.lists;
     let blocklists = &loaded.config.blocklists;
 
@@ -519,7 +622,13 @@ impl ActiveSources {
 }
 
 /// Browse available purge.cc lists, grouped by scope.
-pub async fn run_catalog(config_path: &Path, scope_filter: Option<&str>) -> anyhow::Result<()> {
+pub async fn run_catalog(
+    config_path: &Path,
+    socket_path: &Path,
+    scope_filter: Option<&str>,
+) -> anyhow::Result<()> {
+    super::lists_knobs::warn_if_frozen(socket_path).await;
+
     // Best-effort: catalog browsing must keep working when the config is
     // absent or not yet a valid v1 master, so every load error collapses
     // to "nothing configured" rather than aborting.
@@ -569,7 +678,7 @@ pub async fn run_catalog(config_path: &Path, scope_filter: Option<&str>) -> anyh
         println!("purge.cc list catalog ({} lists)\n", filtered.len());
     }
 
-    // N1 — this display renders the LIVE catalog while `warden lists
+    // This display renders the LIVE catalog while `warden lists
     // add <slug>` resolves against the built-in one (see
     // `derive_subscription`). A list published after this binary was
     // built therefore shows up here and is refused there, with a
@@ -681,21 +790,7 @@ fn format_count(n: u64) -> String {
     }
 }
 
-/// Collapse a v1 loader error list into a single `anyhow::Error`.
-///
-/// `Vec<ConfigError>` does not implement `std::error::Error`, so the
-/// `?` operator cannot convert it directly — the read paths route
-/// through this helper. Mirrors `blocklists::format_errs`.
-fn format_errs(errs: Vec<crate::config::error::ConfigError>) -> anyhow::Error {
-    let mut msg = format!("cannot load config ({} error(s)):", errs.len());
-    for e in &errs {
-        msg.push_str("\n  - ");
-        msg.push_str(&e.to_string());
-    }
-    anyhow::anyhow!(msg)
-}
-
-/// §4.7 Phase 2 T1: forget a list source's cached data via IPC.
+/// Forget a list source's cached data via IPC.
 ///
 /// Sends [`IpcCommand::ForgetList`] over the authenticated socket;
 /// the daemon's list manager drops the in-memory cache entry and
@@ -707,6 +802,8 @@ fn format_errs(errs: Vec<crate::config::error::ConfigError>) -> anyhow::Error {
 /// source stays subscribed; only its cached body is dropped. Use
 /// `warden lists remove` to also unsubscribe.
 pub async fn run_forget(socket_path: &Path, source: &str) -> anyhow::Result<()> {
+    super::lists_knobs::warn_if_frozen(socket_path).await;
+
     // Token is auto-attached by `socket_client::send_command` from
     // `~/.config/purge-warden/token`. ForgetList is `Mutating`, so a
     // missing or stale token surfaces as a daemon-side rejection.
@@ -746,7 +843,7 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // ── N1 — a displayed slug must be an addable slug ────────────────
+    // ── a displayed slug must be an addable slug ────────────────
 
     /// The operator-visible half of the catalog gap: this is the exact
     /// call `warden lists add services/resolvers` makes, and it returned
@@ -959,10 +1056,10 @@ mod tests {
     }
 
     /// Minimal valid v1 master — the proven-good shape from the
-    /// `blocklists` test module. §4.41: `run_add` / `run_remove` now end
-    /// in `validate_or_revert` (the full v1 loader), and `run_list`
-    /// reads via `load_config`, so every config-touching test fixture
-    /// must carry `schema_version` + a resolvable `default_profile`.
+    /// `blocklists` test module. `run_add` / `run_remove` end in
+    /// `validate_or_revert` (the full v1 loader), and `run_list` reads
+    /// via `load_config`, so every config-touching test fixture must
+    /// carry `schema_version` + a resolvable `default_profile`.
     const MINIMAL_V1: &str = r#"schema_version = 3
 
 [server]
@@ -1063,19 +1160,16 @@ servers = ["192.0.2.1:53"]
         );
         // The LOADER still auto-promotes an untagged deny-list to
         // `uncategorized`, so this assertion holds — but it is a fact
-        // about storage, not about reach. The comment here used to add
-        // "which is the tag `warden init` puts on the default profile —
-        // so a fresh subscription filters with no extra steps", and both
-        // halves are dead: the tag decides nothing since `plp-s3`, and
-        // `plp-s5c` stopped `init` writing it. What makes a fresh
-        // subscription filter is `base = deny`, proven by
-        // `a_freshly_added_list_is_reached_by_the_default_profile` below.
+        // about storage, not about reach. Tags decide nothing about
+        // reach; what makes a fresh subscription filter is `base = deny`,
+        // proven by `a_freshly_added_list_is_reached_by_the_default_profile`
+        // below.
         std::fs::remove_file(&path).ok();
     }
 
-    /// The assertion the whole sprint is about, one level below the
-    /// `dig`: the default profile must actually resolve to the list that
-    /// was just added. This calls the same predicate the daemon uses to
+    /// One level below the `dig`: the default profile must actually
+    /// resolve to the list that was just added. This calls the same
+    /// predicate the daemon uses to
     /// build a profile's subscription mask, so a list it does not return
     /// is a list that cannot filter — which is exactly what the previous
     /// implementation produced, silently, every time.
@@ -1084,10 +1178,9 @@ servers = ["192.0.2.1:53"]
         use crate::profiles::profile::resolve_profile_blocklist_ids;
 
         // A default profile shaped the way `warden init` writes it —
-        // which since `plp-s5c` means NO `tags` key. The fixture carried
-        // `tags = ["uncategorized"]` and called itself init's output; it
-        // was init's output until this sprint stopped the scaffold
-        // writing a value that decides nothing.
+        // no `tags` key. The scaffold used to write
+        // `tags = ["uncategorized"]`; it stopped, since that value
+        // decides nothing.
         //
         // Removing it strengthens the test rather than weakening it: the
         // predicate below, `resolve_profile_blocklist_ids`, filters on
@@ -1240,7 +1333,9 @@ servers = ["192.0.2.1:53"]
             .unwrap();
 
         // Removing by the same argument used to add it.
-        run_remove(&path, "privacy/ads").unwrap();
+        run_remove(&path, &no_socket(), "privacy/ads")
+            .await
+            .unwrap();
 
         let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let ids: Vec<&str> = loaded
@@ -1253,15 +1348,17 @@ servers = ["192.0.2.1:53"]
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn remove_clears_a_legacy_entry_left_by_an_older_release() {
+    #[tokio::test]
+    async fn remove_clears_a_legacy_entry_left_by_an_older_release() {
         // Configs written before subscriptions became list entries still
         // hold these, and they are exactly the entries an operator needs
         // to be able to clear.
         let path = temp_config(&format!(
             "{MINIMAL_V1}\n[lists]\nsources = [\"privacy/ads\", \"security/malicious\"]\n"
         ));
-        run_remove(&path, "privacy/ads").unwrap();
+        run_remove(&path, &no_socket(), "privacy/ads")
+            .await
+            .unwrap();
 
         let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.lists.sources, vec!["security/malicious"]);
@@ -1297,7 +1394,9 @@ servers = ["192.0.2.1:53"]
         assert_eq!(before.config.blocklists.len(), 1, "fixture: entry present");
         assert_eq!(before.config.lists.sources.len(), 1, "fixture: legacy too");
 
-        run_remove(&path, "privacy/ads").unwrap();
+        run_remove(&path, &no_socket(), "privacy/ads")
+            .await
+            .unwrap();
 
         let after = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert!(
@@ -1341,12 +1440,14 @@ servers = ["192.0.2.1:53"]
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn remove_of_something_absent_is_not_an_error() {
+    #[tokio::test]
+    async fn remove_of_something_absent_is_not_an_error() {
         let path = temp_config(&format!(
             "{MINIMAL_V1}\n[lists]\nsources = [\"privacy/ads\"]\n"
         ));
-        assert!(run_remove(&path, "nonexistent/list").is_ok());
+        assert!(run_remove(&path, &no_socket(), "nonexistent/list")
+            .await
+            .is_ok());
         std::fs::remove_file(&path).ok();
     }
 

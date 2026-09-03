@@ -153,7 +153,7 @@ display_name = "Default"
 
 [profiles.kids]
 display_name = "Kids"
-local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
+local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
 
 [[local_dns.records]]
 domain = "nas.home"
@@ -265,14 +265,14 @@ default_profile = "default"
 display_name = "Default"
 
 [[labels]]
-id = "alex"
+id = "operator"
 kind = "owner"
-display_name = "Alex"
+display_name = "Operator"
 
 [[labels]]
-id = "emanuela"
+id = "member"
 kind = "owner"
-display_name = "Emanuela"
+display_name = "Member"
 
 [[labels]]
 id = "laptop"
@@ -438,7 +438,7 @@ async fn ux8_down_walks_the_entries_while_they_have_focus() {
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("emanuela"),
+        Some("member"),
         "with the entries focused the vertical key walks rows"
     );
     assert_eq!(
@@ -460,7 +460,7 @@ async fn ux8_j_and_k_are_no_longer_bound_on_labels() {
     handle_key(&mut app, key(KeyCode::Char('j')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("alex"),
+        Some("operator"),
         "`j` is unbound \u{2014} the cursor stays on row 0. (It is not `None`: \
              `handle_labels_key` seeds the anchor before the match, for ANY \
              key \u{2014} see `ux8_the_row_anchor_is_seeded_on_the_first_keystroke`. \
@@ -470,13 +470,13 @@ async fn ux8_j_and_k_are_no_longer_bound_on_labels() {
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("emanuela"),
+        Some("member"),
         "the real binding still walks rows"
     );
     handle_key(&mut app, key(KeyCode::Char('k')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("emanuela"),
+        Some("member"),
         "`k` is unbound \u{2014} the cursor stays put"
     );
 }
@@ -497,7 +497,7 @@ async fn ux8_the_row_anchor_is_seeded_on_the_first_keystroke() {
     handle_key(&mut app, key(KeyCode::Char('z')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("alex"),
+        Some("operator"),
         "the anchor agrees with the row the renderer already paints"
     );
 }
@@ -590,14 +590,14 @@ async fn ux8_a_failed_load_does_not_wipe_the_anchor() {
     let mut app = labels_app(&master);
     handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
-    assert_eq!(app.labels.selected_id.as_deref(), Some("emanuela"));
+    assert_eq!(app.labels.selected_id.as_deref(), Some("member"));
 
     // What a parse failure leaves behind.
     app.loaded_config = None;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("emanuela"),
+        Some("member"),
         "the anchor must survive a failed load, not be reset by it"
     );
 
@@ -608,7 +608,7 @@ async fn ux8_a_failed_load_does_not_wipe_the_anchor() {
     reconcile_active_leaf_selection(&mut app);
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("emanuela"),
+        Some("member"),
         "the render-time reconcile must not reset it either"
     );
 }
@@ -805,7 +805,7 @@ async fn l7_edit_acts_on_the_row_the_table_highlights() {
     // painted and the only `▸ ` in the buffer is the table's own
     // highlight symbol.
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    term.draw(|f| tabs::labels::render(f, f.area(), &app))
+    term.draw(|f| tabs::labels::render(f, f.area(), &mut app))
         .unwrap();
     let dump = term.backend().to_string();
     let highlighted = dump
@@ -841,23 +841,23 @@ async fn l7_add_writes_the_row_to_disk_and_the_leaf_sees_it() {
     let mut app = labels_app(&master);
 
     handle_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
-    for c in "alex".chars() {
+    for c in "operator".chars() {
         handle_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
     }
     // Tab past the read-only kind row onto display name, and type the
     // value the devices actually carry — the half that makes
     // `DEVICE_METADATA_UNKNOWN_LABEL` stop firing.
     handle_key(&mut app, key(KeyCode::Tab), &poller, &master).await;
-    for c in "Alex".chars() {
+    for c in "Operator".chars() {
         handle_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
 
     let on_disk = labels_of(&master);
     assert_eq!(on_disk.len(), 1, "one row on disk; got {on_disk:?}");
-    assert_eq!(on_disk[0].id.as_str(), "alex");
+    assert_eq!(on_disk[0].id.as_str(), "operator");
     assert_eq!(on_disk[0].kind, LabelKind::Owner);
-    assert_eq!(on_disk[0].display_name, "Alex");
+    assert_eq!(on_disk[0].display_name, "Operator");
     assert_eq!(
         app.loaded_config.as_ref().unwrap().config.labels.len(),
         1,
@@ -917,7 +917,7 @@ async fn l7_removing_a_row_that_is_already_gone_reports_it() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
     app.labels.focus = app::LabelsFocus::Entries;
-    app.labels.selected_id = Some("alex".to_string());
+    app.labels.selected_id = Some("operator".to_string());
 
     handle_key(&mut app, key(KeyCode::Char('d')), &poller, &master).await;
     assert!(app.labels.modal.is_some(), "`d` opens the confirm");
@@ -926,7 +926,7 @@ async fn l7_removing_a_row_that_is_already_gone_reports_it() {
     // CLI. The captured snapshot still names it.
     let text = std::fs::read_to_string(&master).unwrap();
     let without = text.replace(
-        "[[labels]]\nid = \"alex\"\nkind = \"owner\"\ndisplay_name = \"Alex\"\n",
+        "[[labels]]\nid = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n",
         "",
     );
     assert_ne!(
@@ -948,31 +948,46 @@ async fn l7_removing_a_row_that_is_already_gone_reports_it() {
     }
 }
 
-/// A Labels edit is **two writes** when two fields change, because
-/// `labels::set_inner` takes one field at a time. When the second one
-/// is refused, the message must name what already landed — a message
-/// implying atomicity sends the operator back to retype a change that
-/// is already on disk.
+/// **`tui-mod-05` (2026-08-28 review) retired `set_inner`-per-field for
+/// `submit_label_edit`** — the last surviving instance of the
+/// partial-apply trap `subnet_modal-01` already closed for Subnets — in
+/// favour of `labels::set_fields_inner`, which lands every changed field
+/// in one validated write.
 ///
-/// The forced failure is a description past `FREE_TEXT_MAX_BYTES`,
-/// which the validator refuses **after** the display-name write has
-/// been promoted.
+/// This replaces `l7_a_half_applied_edit_names_what_landed`, which
+/// asserted the OLD defect as if it were correct: a validator refusal on
+/// `description` left an already-landed `display_name` write on disk,
+/// so Discard implied nothing was saved when something was. With one
+/// write, a refusal on either field must leave BOTH exactly as they
+/// were — there is no longer a "what already landed" to name.
+///
+/// The forced failure is unchanged: a description past
+/// `FREE_TEXT_MAX_BYTES`, which the validator refuses. Under the old
+/// per-field loop that refusal fired only on the second call, after
+/// `display_name` had already been promoted; under one write it must
+/// refuse before either field reaches disk.
 #[tokio::test]
-async fn l7_a_half_applied_edit_names_what_landed() {
+async fn l7_a_refused_edit_leaves_the_label_byte_identical_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_labels_master(&dir);
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
-    app.labels.modal = Some(label_modal::LabelModal::open_edit(
-        labels_of(&master)
-            .iter()
-            .find(|l| l.id.as_str() == "alex")
-            .unwrap(),
-    ));
+    let before_labels = labels_of(&master);
+    let before = before_labels
+        .iter()
+        .find(|l| l.id.as_str() == "operator")
+        .unwrap();
+    let before_display_name = before.display_name.clone();
+    let before_description = before.description.clone();
+
+    app.labels.modal = Some(label_modal::LabelModal::open_edit(before));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Alex P".to_string();
+        // `display_name` alone would succeed — the OLD loop's proof that
+        // it lands is exactly the bug. One atomic write means it must
+        // NOT land either, refused alongside the oversized description.
+        form.display_name = "Operator P".to_string();
         form.description = "x".repeat(2000);
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -984,22 +999,25 @@ async fn l7_a_half_applied_edit_names_what_landed() {
         .expect("a form failure keeps the modal open")
         .form()
         .expect("and keeps it on the form stage");
-    let msg = form
-        .error_message
-        .as_deref()
-        .expect("the failure lands on the inline validation line");
     assert!(
-        msg.contains("display_name") && msg.contains("already saved"),
-        "the message must name the write that landed; got: {msg}"
+        form.error_message.is_some(),
+        "the refusal must land on the inline validation line"
+    );
+
+    let after_labels = labels_of(&master);
+    let after = after_labels
+        .iter()
+        .find(|l| l.id.as_str() == "operator")
+        .unwrap();
+    assert_eq!(
+        after.display_name, before_display_name,
+        "a refusal on ANY field must leave every field as it was — \
+         display_name is individually valid and would have landed under \
+         the old per-field loop"
     );
     assert_eq!(
-        labels_of(&master)
-            .iter()
-            .find(|l| l.id.as_str() == "alex")
-            .unwrap()
-            .display_name,
-        "Alex P",
-        "the first write really did land — that is why saying so matters"
+        after.description, before_description,
+        "the field that actually failed must also be unchanged"
     );
 }
 
@@ -1023,12 +1041,12 @@ async fn l7_the_success_message_fits_the_modal_body() {
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "alex")
+            .find(|l| l.id.as_str() == "operator")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Alex P".to_string();
+        form.display_name = "Operator P".to_string();
         form.description = "studio".to_string();
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -1039,7 +1057,7 @@ async fn l7_the_success_message_fits_the_modal_body() {
         .unwrap();
     let dump = term.backend().to_string();
     assert!(
-        dump.contains("updated owner alex (display_name, description)"),
+        dump.contains("updated owner operator (display_name, description)"),
         "the whole message must reach the screen; got:\n{dump}"
     );
     assert!(
@@ -1069,7 +1087,7 @@ async fn l7_each_opener_opens_its_own_stage() {
         (KeyCode::Delete, false, true),
     ] {
         let mut app = labels_app(&master);
-        app.labels.selected_id = Some("alex".to_string());
+        app.labels.selected_id = Some("operator".to_string());
         handle_key(&mut app, key(k), &poller, &master).await;
         let modal = app
             .labels
@@ -1182,9 +1200,9 @@ async fn l7b_edit_and_delete_follow_the_cursor_to_the_second_row() {
     for k in [KeyCode::Char('e'), KeyCode::Char('d')] {
         let mut app = labels_app(&master);
         app.labels.focus = app::LabelsFocus::Entries;
-        // Walk down one row: alex -> emanuela.
+        // Walk down one row: operator -> member.
         handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
-        assert_eq!(app.labels.selected_id.as_deref(), Some("emanuela"));
+        assert_eq!(app.labels.selected_id.as_deref(), Some("member"));
 
         handle_key(&mut app, key(k), &poller, &master).await;
         let modal = app.labels.modal.as_ref().expect("modal opens");
@@ -1193,7 +1211,7 @@ async fn l7b_edit_and_delete_follow_the_cursor_to_the_second_row() {
             _ => modal.remove().unwrap().id.clone(),
         };
         assert_eq!(
-            acted_on, "emanuela",
+            acted_on, "member",
             "{k:?} acted on the wrong row — it must follow the cursor"
         );
     }
@@ -1218,13 +1236,13 @@ async fn l7b_a_confirmed_delete_removes_that_row_and_only_that_row() {
     assert!(
         !on_disk
             .iter()
-            .any(|l| l.id.as_str() == "emanuela" && l.kind == LabelKind::Owner),
+            .any(|l| l.id.as_str() == "member" && l.kind == LabelKind::Owner),
         "the confirmed row must be gone; got {on_disk:?}"
     );
     assert!(
         on_disk
             .iter()
-            .any(|l| l.id.as_str() == "alex" && l.kind == LabelKind::Owner),
+            .any(|l| l.id.as_str() == "operator" && l.kind == LabelKind::Owner),
         "and its neighbour must survive; got {on_disk:?}"
     );
     assert!(
@@ -1248,31 +1266,37 @@ async fn l7b_a_clean_edit_writes_both_fields_to_disk() {
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "alex")
+            .find(|l| l.id.as_str() == "operator")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Alex P".to_string();
+        form.display_name = "Operator P".to_string();
         form.description = "studio".to_string();
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
 
     let row = labels_of(&master)
         .into_iter()
-        .find(|l| l.id.as_str() == "alex")
+        .find(|l| l.id.as_str() == "operator")
         .expect("the row survives an edit");
-    assert_eq!(row.display_name, "Alex P");
+    assert_eq!(row.display_name, "Operator P");
     assert_eq!(row.description.as_deref(), Some("studio"));
     assert_eq!(row.kind, LabelKind::Owner, "the kind is not touched");
 }
 
-/// **A partial write still changed the file, so the table must be told.**
-/// Keying the refresh on `was_ok` left the row rendering its old name
-/// while the disk held the new one — and the operator who trusts the
-/// table reopens Edit onto a snapshot the file no longer matches.
+/// **`tui-mod-05` retired the partial-apply trap this test used to name.**
+/// Before the atomic-write fix, a validator refusal on `description`
+/// still left the already-landed `display_name` write on disk, and this
+/// test pinned the consequence: the cached config had to be told about
+/// that partial write, or the table would render a name the file no
+/// longer had. One atomic write means there is no longer a partial
+/// write to be told about, so this replaces
+/// `l7b_a_half_applied_edit_still_refreshes_the_cached_config` with the
+/// inverse claim — a refusal changes neither the file nor the cache nor
+/// the form's re-anchor snapshot.
 #[tokio::test]
-async fn l7b_a_half_applied_edit_still_refreshes_the_cached_config() {
+async fn l7b_a_refused_edit_leaves_the_cached_config_and_the_form_snapshot_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_labels_master(&dir);
     let poller = dummy_poller(dir.path());
@@ -1281,12 +1305,12 @@ async fn l7b_a_half_applied_edit_still_refreshes_the_cached_config() {
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "alex")
+            .find(|l| l.id.as_str() == "operator")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Alex P".to_string();
+        form.display_name = "Operator P".to_string();
         form.description = "x".repeat(2000);
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -1298,17 +1322,16 @@ async fn l7b_a_half_applied_edit_still_refreshes_the_cached_config() {
         .config
         .labels
         .iter()
-        .find(|l| l.id.as_str() == "alex")
+        .find(|l| l.id.as_str() == "operator")
         .expect("the row is still there")
         .display_name
         .clone();
     assert_eq!(
-        cached, "Alex P",
-        "the cached config must match the file after a partial write"
+        cached, "Operator",
+        "the cached config must not drift ahead of a file nothing was written to"
     );
 
-    // And the form re-anchors, so a retry does not re-write a field
-    // that already landed.
+    // Nothing landed, so the snapshot has nothing to re-anchor to.
     let original = app
         .labels
         .modal
@@ -1319,10 +1342,7 @@ async fn l7b_a_half_applied_edit_still_refreshes_the_cached_config() {
         .original
         .as_ref()
         .unwrap();
-    assert_eq!(
-        original.display_name, "Alex P",
-        "the snapshot must move to what landed"
-    );
+    assert_eq!(original.display_name, "Operator");
 }
 
 /// The footer advertises `Ctrl+s` while this form is open. It does not

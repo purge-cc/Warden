@@ -42,13 +42,13 @@ pub const ADD_RULE_MODAL_TITLE: &str = " Add rule ";
 pub const LABEL_DOMAIN: &str = "Domain";
 pub const LABEL_ACTION: &str = "Action";
 pub const LABEL_SCOPE: &str = "Scope";
-// N14: the save/cancel clause is gone. Neither action on this row is a
+// The save/cancel clause is gone. Neither action on this row is a
 // Tab target (see `form_body`'s comment on `actions`), so each button
 // bakes its own key into its label instead — `keys_legend()` no longer
 // needs to carry either key, and a second, dead `ADD_RULE_HINT_2` const
-// that once carried "Esc cancel" (word `cancel`, which §3.1 now
-// forbids) was deleted rather than repointed: it had no render call
-// site, only this file's frozen-strings test kept it alive.
+// that once carried "Esc cancel" was deleted rather than repointed: it
+// had no render call site, only this file's frozen-strings test kept
+// it alive.
 pub const ADD_RULE_HINT_1: &str =
     "  Tab/\u{2191}\u{2193} move  \u{2022}  \u{2190}/\u{2192} change action/scope";
 /// Placeholder shown in the Domain field before the operator types
@@ -100,8 +100,6 @@ pub struct RuleAddModal {
     pub scope_options: Vec<ScopeChoice>,
     pub focus: AddFocus,
     pub error_message: Option<String>,
-    pub status_message: Option<String>,
-    pub submitting: bool,
 }
 
 impl RuleAddModal {
@@ -123,8 +121,6 @@ impl RuleAddModal {
             scope_options,
             focus: AddFocus::Domain,
             error_message: None,
-            status_message: None,
-            submitting: false,
         }
     }
 
@@ -197,10 +193,6 @@ pub async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
     let Some(mut modal) = app.rules.add_modal.take() else {
         return;
     };
-    if modal.submitting && !matches!(key.code, KeyCode::Esc) {
-        app.rules.add_modal = Some(modal);
-        return;
-    }
 
     // Ctrl+S submits regardless of focus — mirrors the edit modal's
     // Ctrl+S-from-anywhere convention (`handle_rule_edit_form_key`).
@@ -211,7 +203,7 @@ pub async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
         return;
     }
 
-    // N14: Enter submits too. Neither action on this row is a Tab
+    // Enter submits too. Neither action on this row is a Tab
     // target (see `form_body`), so the button bakes in its own key
     // (`[Enter] Save`) rather than relying on focus + the field-default
     // Enter meaning — the key must therefore actually save, or the
@@ -228,10 +220,10 @@ pub async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
             // Modal simply closes — nothing has been written yet.
             return;
         }
-        // §4.63 nav-grammar: Up/Down MOVE FOCUS, Left/Right cycle the
-        // focused field's value — the grammar every other form modal was
-        // converted to in s3b. This handler was the third outlier and the
-        // last one where Up/Down did not move focus.
+        // Up/Down MOVE FOCUS, Left/Right cycle the
+        // focused field's value — the grammar every other form modal
+        // uses. This handler was the last outlier where Up/Down did not
+        // move focus.
         //
         // An addition, not a swap: Tab and BackTab keep working. The
         // operator who learned Tab here loses nothing; the one who
@@ -296,10 +288,13 @@ async fn submit(app: &mut App, mut modal: RuleAddModal, poller: &IpcPoller, conf
         ScopeChoice::Device(_) => Scope::Device(scope_id.as_str()),
     };
 
-    modal.submitting = true;
-    modal.status_message = Some("adding\u{2026}".into());
-    app.rules.add_modal = Some(modal.clone());
-
+    // `add_inner` is synchronous and there is no yield point before it, so a
+    // progress flag set here could never be drawn — the event loop cannot
+    // deliver a key or paint a frame during a bare synchronous call.
+    // Kept inline deliberately: this is a config-sized write plus a
+    // validator pass, not the seconds a tar.gz of the config tree costs —
+    // the two surfaces that DID need the blocking pool are the
+    // backup/restore flows.
     let outcome = add_inner(config_path, scope, cli_action, &domain, None, None);
 
     match outcome {
@@ -340,21 +335,18 @@ async fn submit(app: &mut App, mut modal: RuleAddModal, poller: &IpcPoller, conf
             ));
         }
         Err(e) => {
-            if let Some(m) = app.rules.add_modal.as_mut() {
-                m.submitting = false;
-                m.status_message = None;
-                m.error_message = Some(format!("add failed: {e}"));
-            }
+            modal.error_message = Some(format!("add failed: {e}"));
+            app.rules.add_modal = Some(modal);
         }
     }
 }
 
-// ── render (§4.61 Wave 3b — Archetype F) ──────────────────────────────
+// ── render (Archetype F) ────────────────────────────────────────────────
 //
 // Every colour below comes from `modal_form`. A locally-built foreground
 // style, a full-border block or a direct reach into the theme's brand red
-// is R1 — the twelve-surfaces-each-re-deriving-the-colour-rule drift the
-// workstream exists to end. Pinned by
+// is exactly the surfaces-each-re-deriving-the-colour-rule drift this
+// module exists to avoid. Pinned by
 // `no_hand_rolled_colour_in_this_module`, which greps this file's own
 // source; the needles are spelled out there, deliberately not here, so
 // the guard cannot match the comment that describes it.
@@ -365,9 +357,9 @@ const MODAL_W: u16 = 64;
 
 /// Nav-key legend: [`ADD_RULE_HINT_1`] minus its own two-cell indent,
 /// which [`modal_form::nav_keys_line`] re-adds — so the migrated legend
-/// row renders byte-identical to the pre-migration hint row. §4.61 D7′
-/// changes chrome, layout and colour and leaves the keying — and the
-/// copy that advertises it — alone.
+/// row renders byte-identical to the pre-migration hint row. The
+/// migration changes chrome, layout and colour and leaves the keying —
+/// and the copy that advertises it — alone.
 fn keys_legend() -> &'static str {
     ADD_RULE_HINT_1.trim_start()
 }
@@ -386,25 +378,6 @@ fn field_hint(f: AddFocus) -> &'static str {
     }
 }
 
-/// The transient "we are talking to the config right now" message, if any.
-///
-/// It goes to [`modal_form::form_tail_with_status`]'s own slot — its own
-/// row, in the theme's neutral status colour — and the focused field keeps
-/// its guidance underneath. Before §4.63 S1 Archetype F's tail offered
-/// only `error` and `hint`, so this was handed to *every* row in place of
-/// its hint: the status wore the hint's muted italic and the guidance for
-/// the field the operator was standing on disappeared for the duration of
-/// the submit. An error still wins over both.
-fn transient_status(modal: &RuleAddModal) -> Option<&str> {
-    modal.status_message.as_deref().or({
-        if modal.submitting {
-            Some("adding\u{2026}")
-        } else {
-            None
-        }
-    })
-}
-
 /// The scope picker's display value.
 fn scope_text(modal: &RuleAddModal) -> String {
     if modal.scope_options.is_empty() {
@@ -415,7 +388,7 @@ fn scope_text(modal: &RuleAddModal) -> String {
 }
 
 /// The two description rows for the add form, on their own `bg_main`
-/// strip under the title band ([`modal_form::desc_band2`], 2026-08-07).
+/// strip under the title band ([`modal_form::desc_band2`]).
 ///
 /// Not the title's `bg_highlight` — teal on it is 3.37:1 against a 4.5:1
 /// prose bar, and no contrast gate covers the pair. See `desc_band2`.
@@ -442,8 +415,9 @@ const ADD_DESC: [&str; 2] = [
 /// field when it holds focus.
 ///
 /// The head is **4** rows ([`ADD_DESC`] is two of them). `scroll_layout`
-/// serves the tail first and the head second, so at the D18 floor's 12
-/// interior rows that comes out of the field viewport: with this modal's
+/// serves the tail first and the head second, so at the minimum-terminal
+/// floor's 12 interior rows that comes out of the field viewport: with
+/// this modal's
 /// default 5-row tail (spacer + 2 note + keys + actions) the viewport went
 /// 4 rows → **3**.
 ///
@@ -452,7 +426,6 @@ const ADD_DESC: [&str; 2] = [
 /// narrower, so a width-dependent *row count* would silently mis-size
 /// the modal. Width may only change a row's content.
 fn form_body(modal: &RuleAddModal, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
-    let status = transient_status(modal);
     let hint = field_hint;
 
     let mut rows = modal_form::FormRows::new_desc2(ADD_RULE_MODAL_TITLE.trim(), ADD_DESC, width);
@@ -501,13 +474,13 @@ fn form_body(modal: &RuleAddModal, width: u16) -> (modal_form::ScrollBody, Optio
     );
 
     // Neither action is a Tab target: this modal's focus ring is the
-    // three fields, and Esc / Enter (N14) discard and save from
+    // three fields, and Esc / Enter discard and save from
     // anywhere. Both therefore carry their key IN the label, the same
     // way `subnet_modal::remove_notice` does — an unkeyed button that
     // focus never reaches tells the operator nothing about how to press
     // it. Ctrl+S still works (`handle_key`) but is no longer advertised
-    // here: N14 keeps it to one mention on the modal surface, and Enter
-    // is that mention now.
+    // here: the modal keeps its save key to one mention on the surface,
+    // and Enter is that mention now.
     //
     // This is load-bearing for `Esc`, not decoration. Archetype F's tail
     // has one legend row, the legend is `ADD_RULE_HINT_1` verbatim, and
@@ -519,9 +492,8 @@ fn form_body(modal: &RuleAddModal, width: u16) -> (modal_form::ScrollBody, Optio
         Action::new("  [Enter] Save  ", false, ActionKind::Primary, ""),
     ];
 
-    let tail = modal_form::form_tail_with_status(
+    let tail = modal_form::form_tail(
         &rows,
-        status,
         modal.error_message.as_deref(),
         "",
         keys_legend(),
@@ -532,7 +504,7 @@ fn form_body(modal: &RuleAddModal, width: u16) -> (modal_form::ScrollBody, Optio
 
 /// Draw the add-rule modal anchored on the tab content rect.
 ///
-/// `anchor` is the Rules tab's content area (§4.61 D18), never
+/// `anchor` is the Rules tab's content area, never
 /// `f.area()`: the header, the menu card and the footer legend stay
 /// visible behind it. That leaves a 12-row interior at the declared
 /// 80×24 floor against a body of 16, which is why this is a
@@ -559,19 +531,17 @@ mod tests {
             scope_options: vec![ScopeChoice::Default],
             focus: AddFocus::Domain,
             error_message: None,
-            status_message: None,
-            submitting: false,
         }
     }
 
-    // ── §4.63 nav grammar, driven through the production handler ───────
+    // ── Nav grammar, driven through the production handler ─────────────
     //
     // The existing tests below exercise `AddFocus::next`/`prev` directly.
     // Those pass whether or not any key is WIRED to them — which is
     // exactly the state this modal was in: `focus.next()` was correct and
-    // reachable only from Tab, and Up/Down cycled values instead. The DoD
-    // therefore asks for real `KeyCode`s through `handle_key`, so these
-    // drive the handler.
+    // reachable only from Tab, and Up/Down cycled values instead. The
+    // tests below drive real `KeyCode`s through `handle_key` instead, so
+    // they exercise the handler rather than the model alone.
 
     /// A poller pointed at a socket that does not exist.
     ///
@@ -800,10 +770,10 @@ mod tests {
         assert!(content.contains("ads.example.com"), "typed domain missing");
     }
 
-    // ── §4.61 Wave 3b: the 80×24 floor ───────────────────────────────
+    // ── The 80×24 floor ──────────────────────────────────────────────
     //
     // `ui.rs` declares MIN_WIDTH 80 × MIN_HEIGHT 24. At that size the tab
-    // content rect this overlay anchors on (D18) is
+    // content rect this overlay anchors on is
     // `24 − 4 header − 5 menu card − 1 footer = 14` rows, leaving a
     // 12-row interior. `overlay::centered_rect` CLAMPS rather than
     // scrolls, so a body taller than that is cut at the bottom while
@@ -848,7 +818,7 @@ mod tests {
         );
     }
 
-    /// §4.68 DoD, **at the floor**: the two description rows are on screen,
+    /// **At the floor**: the two description rows are on screen,
     /// they fill the modal interior with `bg_main` `Rgb(15,15,15)` in teal
     /// `Rgb(13,148,136)`, they are NOT on the title's `Rgb(51,51,51)`, and
     /// the action row survived the head growing.
@@ -902,7 +872,7 @@ mod tests {
 
     #[test]
     fn overlay_is_confined_to_the_anchor_rect() {
-        // D18: the anchor is the tab content rect, so the header, the
+        // The anchor is the tab content rect, so the header, the
         // menu card and the footer legend stay visible behind the modal.
         // Anchoring on `f.area()` instead paints over all three.
         use ratatui::backend::TestBackend;
@@ -1018,105 +988,38 @@ mod tests {
         // so neither can advertise its key by being focused. If the
         // labels lose their keys, the only way to save or close this
         // modal appears nowhere on screen — which is precisely the
-        // class of silent operator-facing loss this wave exists to
+        // class of silent operator-facing loss this test exists to
         // prevent.
         //
-        // Was `esc_and_ctrl_s_are_discoverable_without_focus`: N14 moved
-        // the advertised save key from Ctrl+s to Enter (still on the
+        // Was `esc_and_ctrl_s_are_discoverable_without_focus`: the
+        // advertised save key moved from Ctrl+s to Enter (still on the
         // button, since focus still never reaches it) and Ctrl+s itself
-        // dropped off this surface — it still works, but §3.1 keeps it
-        // to one mention on the modal and the global footer owns that
+        // dropped off this surface — it still works, but is kept to one
+        // mention on the modal, and the global footer owns that
         // mention now, not this overlay.
         let dump = render_overlay_in(&blank_modal(), 80, 24);
         assert!(dump.contains("Esc"), "no way to discard is shown:\n{dump}");
         assert!(dump.contains("Enter"), "no way to save is shown:\n{dump}");
     }
 
-    #[test]
-    fn transient_status_survives_without_a_status_message_of_its_own() {
-        // `submitting` alone, with no `status_message`, is a real state:
-        // `submit` sets both but a caller need not. The synthesised
-        // "adding…" must still reach its slot.
-        //
-        // Was `transient_status_takes_the_hint_row_while_submitting`,
-        // which asserted the status REPLACED the focused row's hint.
-        // That was pinning the workaround, not a requirement — see
-        // `transient_status_has_its_own_slot_and_leaves_the_field_hint_alone`.
-        let mut m = blank_modal();
-        m.domain = "ads.example.com".into();
-        m.submitting = true;
-        let dump = render_overlay_in(&m, 80, 24);
-
-        assert!(
-            dump.contains("adding\u{2026}"),
-            "the in-flight status must reach the operator:\n{dump}"
-        );
-    }
-
-    /// Pins `s4-63-form-transient-status-slot` (add half).
-    ///
-    /// Before the fix the in-flight message had no home: Archetype F's
-    /// tail offered `error` (⚠ + error colour) and `hint` (muted italic)
-    /// and nothing else, so `form_body` passed the status in place of
-    /// EVERY row's hint. Two losses, both silent — the status wore the
-    /// hint's muted italic instead of the colour the pre-migration status
-    /// row had, and the guidance for the field the operator is actually
-    /// standing on disappeared for the duration of the submit.
-    #[test]
-    fn transient_status_has_its_own_slot_and_leaves_the_field_hint_alone() {
-        use crate::tui::theme::T;
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut m = blank_modal();
-        m.domain = "ads.example.com".into();
-        m.submitting = true;
-        m.status_message = Some("adding\u{2026}".into());
-
-        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| render_overlay(f, f.area(), &m)).unwrap();
-        let buf = term.backend().buffer().clone();
-        let dump = dump_buffer(&buf);
-
-        assert!(
-            dump.contains("adding\u{2026}"),
-            "the in-flight status must reach the operator:\n{dump}"
-        );
-        assert!(
-            dump.contains("the domain this rule matches"),
-            "the focused field's guidance must survive the submit — the \
-             status has its own row:\n{dump}"
-        );
-
-        // Its own slot means its own colour. Read off the buffer: the
-        // style is the half of this defect a substring assertion cannot
-        // see, and the half that made the pre-migration row legible.
-        let row = dump
-            .lines()
-            .position(|l| l.contains("adding\u{2026}"))
-            .expect("just asserted it is on screen") as u16;
-        let styled = (0..buf.area.width)
-            .map(|x| buf[(x, row)].clone())
-            .find(|c| c.symbol() == "a")
-            .expect("the status text is painted");
-        assert_eq!(
-            styled.fg, T.info,
-            "the status wears the hint's colour — it is still riding the \
-             hint slot:\n{dump}"
-        );
-        assert!(
-            !styled.modifier.contains(ratatui::style::Modifier::ITALIC),
-            "italic is the hint's affordance, not the status's:\n{dump}"
-        );
-    }
+    // `submitting`/`status_message` and
+    // the `transient_status` slot they fed were dropped from `RuleAddModal`
+    // — `add_inner` is a synchronous call with no yield point before it, so
+    // a progress flag set ahead of it could never reach a frame. Three
+    // tests retired with the state rather than left pinning it:
+    //   - transient_status_survives_without_a_status_message_of_its_own
+    //   - transient_status_has_its_own_slot_and_leaves_the_field_hint_alone
+    //     (pinned this modal's half of the shared transient-status-slot
+    //     coverage; the slot itself, `modal_form::form_tail_with_status`,
+    //     is still exercised by the modals that keep a real in-flight
+    //     state, e.g. backup/restore)
+    // `error_message_wins_over_the_status_and_carries_the_warning_glyph`
+    // is kept below as `error_message_carries_the_warning_glyph`, minus
+    // the now-impossible stale-status half of its claim.
 
     #[test]
-    fn error_message_wins_over_the_status_and_carries_the_warning_glyph() {
-        // `hint_or_error_rows` checks the error slot first, so an error
-        // must beat a stale status. The real failure copy comes from
-        // `submit`'s `format!("add failed: {e}")`.
+    fn error_message_carries_the_warning_glyph() {
         let mut m = blank_modal();
-        m.status_message = Some("adding\u{2026}".into());
         m.error_message = Some("add failed: domain is required".into());
         let dump = render_overlay_in(&m, 80, 24);
 
@@ -1128,18 +1031,14 @@ mod tests {
             dump.contains("add failed: domain is required"),
             "the error text is missing:\n{dump}"
         );
-        assert!(
-            !dump.contains("adding\u{2026}"),
-            "a stale status must not outrank an error:\n{dump}"
-        );
     }
 
     #[test]
     fn no_hand_rolled_colour_in_this_module() {
-        // §4.61 Wave 3b's acceptance criterion as a test rather than a
+        // The no-hand-rolled-colour rule as a test rather than a
         // claim in a commit message. A surface that reaches for the
-        // theme directly is a surface that will drift from the other
-        // eleven — R1 is that every wave re-derives the colour rule
+        // theme directly is a surface that will drift from every other
+        // migrated modal if each one re-derives the colour rule
         // locally. Needles are split so this assertion cannot match
         // itself.
         let src = include_str!("rule_add_modal.rs");

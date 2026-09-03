@@ -8,7 +8,7 @@
 //! [`populate`] injected them into every profile carrying
 //! [`crate::config::schema::profile::Profile::safe_search`]`= true`.
 //!
-//! That is the project rules §Neutrality test failed in every clause at
+//! That is the CLAUDE.md §Neutrality test failed in every clause at
 //! once. It changed what warden did to **named** domains; the operator
 //! never asked for those particular names; the rows were invisible in
 //! their TOML (`profile show`, `rewrite list` and the TUI all read the
@@ -87,7 +87,7 @@ mod tests {
     /// binary, paired with the CNAME target it used to send them to.
     ///
     /// Naming them **here** is the point, and it is the one place where
-    /// naming them is correct: project rules §Neutrality says a vendor name
+    /// naming them is correct: CLAUDE.md §Neutrality says a vendor name
     /// in `#[cfg(test)]` is desirable when it proves *absence* of
     /// behaviour. If anyone reintroduces the table — in any shape, under
     /// any name — `populate` starts producing these rows again and every

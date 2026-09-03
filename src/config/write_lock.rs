@@ -43,10 +43,10 @@
 //!
 //! That failure mode is silent and it passes a naive test (one process locks,
 //! a second blocks) because the second process only stops blocking once a
-//! rename has happened. `rr-concurrent-edit-locking` warns that "wrong locking
-//! is worse than the rare lost update" — this is the specific way it goes
-//! wrong here. The lock therefore lives on a **side file that is never
-//! renamed, never promoted and never part of the config**.
+//! rename has happened. Wrong locking is worse than the rare lost update —
+//! this is the specific way it goes wrong here. The lock therefore lives on
+//! a **side file that is never renamed, never promoted and never part of
+//! the config**.
 //!
 //! # Why `flock` and not the marker file `config/backup.rs` uses
 //!
@@ -178,10 +178,9 @@ fn flock_until(file: &File, wait: std::time::Duration) -> i32 {
 /// every other task scheduled on it. Uncontended the cost is one syscall and
 /// this is all moot; contention is the entire reason the lock exists.
 ///
-/// `_docs/features/config_edit_locking.md` §3.2.3 called this out before the
-/// code existed: *"`flock` … must not be held across an await point on a
-/// blocking-thread model"*. This is the containment for it that does not
-/// require restructuring seven async handlers.
+/// `flock` must not be held across an await point on a blocking-thread
+/// model. This is the containment for that constraint, without
+/// restructuring seven async handlers.
 ///
 /// **The flavour check is not defensive padding.** `block_in_place` **panics**
 /// on a `current_thread` runtime, and this crate has `current_thread` tests
@@ -280,7 +279,7 @@ fn acquire_with_deadline(
 //   A loads → B loads → A promotes → B promotes (from its pre-A view)
 //
 // B's file is valid and B's own key is right; A's key is gone. That is the
-// "rare lost update" the task names, and it is strictly less severe than the
+// "rare lost update", and it is strictly less severe than the
 // rollback above: no committed-and-then-erased state, no silent revert of a
 // third party, and the operator can see it by re-reading.
 //

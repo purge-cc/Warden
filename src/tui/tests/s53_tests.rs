@@ -680,6 +680,227 @@ fn the_edit_builder_writes_every_blocklist_field() {
     );
 }
 
+fn mk_master_with_blocklist(dir: &tempfile::TempDir, blocklist_block: &str) -> PathBuf {
+    let master = mk_master(dir);
+    let mut content = std::fs::read_to_string(&master).unwrap();
+    content.push_str(blocklist_block);
+    std::fs::write(&master, content).unwrap();
+    master
+}
+
+fn catalog_row(
+    canonical_id: &str,
+    url: &str,
+    base: BlocklistBase,
+    staged_enabled: bool,
+    original: crate::tui::app::CatalogRowState,
+) -> crate::tui::app::CatalogPickerRow {
+    crate::tui::app::CatalogPickerRow {
+        catalog_id: canonical_id.replace('-', "/"),
+        canonical_id: canonical_id.to_string(),
+        url: url.to_string(),
+        display_name: "irrelevant — `existing` wins whenever it is Some".to_string(),
+        scope: String::new(),
+        topic: String::new(),
+        entry_count: 0,
+        updated_at: String::new(),
+        original,
+        staged_enabled,
+        staged_kind: base,
+        format: BlocklistFormat::Domains,
+    }
+}
+
+/// Twin of `the_edit_builder_writes_every_blocklist_field`, for the
+/// catalog picker's row builder (`tui-mod-02` / `struct-04`). A SEPARATE
+/// test rather than an extension of the sibling: the two builders carry
+/// `accept_unsigned_allow` under different rules (`original ||
+/// consent_declared` there; unconditionally from `existing` here, since
+/// this picker has no session-level consent flag to OR against), so one
+/// destructure asserting both would average two different contracts
+/// into a weaker one. What the two tests share is the mechanism — an
+/// exhaustive `let Blocklist { .. }` that fails the build the day a
+/// 13th field is added and neither builder has been taught about it.
+#[test]
+fn the_catalog_builder_carries_every_field_from_an_existing_entry() {
+    const CARRIED_UNCONDITIONALLY: &[&str] = &[
+        "id",
+        "display_name",
+        "url",
+        "format",
+        "enabled",
+        "base",
+        "trust",
+        "update_interval_hours",
+        "max_entries",
+        "max_consecutive_failures",
+        "accept_unsigned_allow",
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Privacy: ads"
+url = "https://example.com/ads.txt"
+format = "domains"
+enabled = true
+base = "allow"
+trust = "remote-unsigned"
+accept_unsigned_allow = true
+update_interval_hours = 12
+max_entries = 5000000
+max_consecutive_failures = 5
+auth_token_ref = "some-secret-ref"
+"#,
+    );
+    let on_disk = crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc())
+        .expect(
+            "fixture must be schema-valid: base=allow + trust=remote-unsigned + \
+             accept_unsigned_allow=true loads with a WARN, not an error — the old \
+             categorical ALLOW_LIST_REQUIRES_LOCAL_TRUST rule was retired 2026-08-01",
+        );
+    let existing = on_disk
+        .config
+        .blocklists
+        .iter()
+        .find(|b| b.id.as_str() == "privacy-ads")
+        .expect("fixture wrote this row");
+
+    // Exhaustive on purpose, mirroring the sibling test: a 13th field on
+    // `Blocklist` fails THIS build too, not only the edit builder's.
+    let crate::config::schema::Blocklist {
+        id: _,
+        display_name: _,
+        url: _,
+        format: _,
+        update_interval_hours: _,
+        max_entries: _,
+        enabled: _,
+        auth_token_ref: _,
+        base: _,
+        trust: _,
+        accept_unsigned_allow: _,
+        max_consecutive_failures: _,
+    } = existing;
+
+    let row = catalog_row(
+        "privacy-ads",
+        "https://example.com/ads.txt",
+        BlocklistBase::Allow,
+        true,
+        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+    );
+    let value = build_catalog_blocklist_value(&row, Some(&on_disk));
+    let tbl = value.as_table().expect("a row is a table");
+
+    let missing: Vec<&str> = CARRIED_UNCONDITIONALLY
+        .iter()
+        .copied()
+        .filter(|f| !tbl.contains_key(*f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "build_catalog_blocklist_value drops {missing:?} when `existing` is \
+             Some — upsert_id_keyed replaces the whole row, so every dropped \
+             field is silently reset to its serde default on the next save \
+             from the catalog picker: {tbl:?}"
+    );
+    assert_eq!(
+        tbl.get("accept_unsigned_allow"),
+        Some(&toml::Value::Boolean(true)),
+        "a declared consent must survive an unrelated save (e.g. toggling \
+             `enabled`) through the catalog picker: {tbl:?}"
+    );
+    assert!(
+        !tbl.contains_key("tags"),
+        "tags was removed from Blocklist in plp-s5d/plp-s5a; a surviving \
+             key here would fail to load under deny_unknown_fields: {tbl:?}"
+    );
+
+    // Not merely shaped right — the validator that required the consent
+    // in the first place must accept the row back, same as the picker's
+    // own save path does.
+    use crate::cli::commands::target::{
+        read_or_empty, resolve_target_file, upsert_id_keyed, write_value_validated, EntityClass,
+    };
+    let target_path = resolve_target_file(&master, EntityClass::Blocklists, None).unwrap();
+    let (mut doc, _) = read_or_empty(&target_path).unwrap();
+    upsert_id_keyed(
+        &mut doc,
+        EntityClass::Blocklists.toml_key(),
+        "privacy-ads",
+        value,
+    )
+    .unwrap();
+    write_value_validated(&master, &target_path, &doc).expect(
+        "a row carrying its own already-accepted consent must not be \
+             refused by the validator that required it",
+    );
+}
+
+/// `accept_unsigned_allow` is never synthesised — carried forward when
+/// `existing` says `false`, and omitted (not defaulted to any value) when
+/// there is no `existing` row at all. Two angles on one claim: this
+/// builder must not invent consent either way.
+#[test]
+fn the_catalog_builder_does_not_synthesise_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-tracking"
+display_name = "Privacy: tracking"
+url = "https://example.com/tracking.txt"
+format = "domains"
+enabled = true
+base = "deny"
+trust = "remote-unsigned"
+accept_unsigned_allow = false
+update_interval_hours = 12
+max_entries = 5000000
+max_consecutive_failures = 5
+"#,
+    );
+    let on_disk =
+        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+
+    let row = catalog_row(
+        "privacy-tracking",
+        "https://example.com/tracking.txt",
+        BlocklistBase::Deny,
+        true,
+        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+    );
+    let value = build_catalog_blocklist_value(&row, Some(&on_disk));
+    let tbl = value.as_table().unwrap();
+    assert_eq!(
+        tbl.get("accept_unsigned_allow"),
+        Some(&toml::Value::Boolean(false)),
+        "an existing `false` must stay `false`, not flip to `true` on an \
+             unrelated save: {tbl:?}"
+    );
+
+    let new_row = catalog_row(
+        "brand-new",
+        "https://example.com/new.txt",
+        BlocklistBase::Deny,
+        false,
+        crate::tui::app::CatalogRowState::NotSubscribed,
+    );
+    let new_value = build_catalog_blocklist_value(&new_row, None);
+    let new_tbl = new_value.as_table().unwrap();
+    assert!(
+        !new_tbl.contains_key("accept_unsigned_allow"),
+        "a first-time add through the picker (no `existing` row) must get \
+             the schema default via omission, not a value this builder \
+             invented: {new_tbl:?}"
+    );
+}
+
 // Sprint A.5 (lc2_v2 foundation) dropped two save-flow tests:
 //   - s53_1_ctrl_s_preserves_max_entries_from_snapshot
 //   - s53_ctrl_s_with_valid_buffers_writes_through_and_closes

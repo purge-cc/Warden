@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "measured_at": "2026-09-02T13:48:53Z",
+  "index_generated_at": "2026-09-02T10:04:07Z",
+  "method": "curl --compressed per list; lines trimmed, ASCII-lowercased, lines starting with # or ! and blank lines dropped, trailing dot stripped; union = LC_ALL=C sort -u | wc -l over all lists; union_default_sources = same over DEFAULT_SOURCES only",
+  "lists": [
+    {
+      "id": "content/adult",
+      "url": "https://lists.purge.cc/adult.txt",
+      "entries": 3199256,
+      "body_bytes": 73979091
+    },
+    {
+      "id": "content/dating",
+      "url": "https://lists.purge.cc/dating.txt",
+      "entries": 22939,
+      "body_bytes": 521774
+    },
+    {
+      "id": "content/gambling",
+      "url": "https://lists.purge.cc/gambling.txt",
+      "entries": 755545,
+      "body_bytes": 13355654
+    },
+    {
+      "id": "content/hate",
+      "url": "https://lists.purge.cc/hate.txt",
+      "entries": 385755,
+      "body_bytes": 7817488
+    },
+    {
+      "id": "content/piracy",
+      "url": "https://lists.purge.cc/piracy.txt",
+      "entries": 52955,
+      "body_bytes": 1005882
+    },
+    {
+      "id": "privacy/ads",
+      "url": "https://lists.purge.cc/ads.txt",
+      "entries": 6957082,
+      "body_bytes": 152158968
+    },
+    {
+      "id": "privacy/devices",
+      "url": "https://lists.purge.cc/devices.txt",
+      "entries": 4028,
+      "body_bytes": 103788
+    },
+    {
+      "id": "privacy/general",
+      "url": "https://lists.purge.cc/general.txt",
+      "entries": 403467,
+      "body_bytes": 8070003
+    },
+    {
+      "id": "privacy/mobile",
+      "url": "https://lists.purge.cc/mobile.txt",
+      "entries": 7367,
+      "body_bytes": 160889
+    },
+    {
+      "id": "privacy/tracking",
+      "url": "https://lists.purge.cc/tracking.txt",
+      "entries": 8308058,
+      "body_bytes": 181899728
+    },
+    {
+      "id": "security/malicious",
+      "url": "https://lists.purge.cc/malicious.txt",
+      "entries": 9031604,
+      "body_bytes": 179255557
+    },
+    {
+      "id": "security/suspicious",
+      "url": "https://lists.purge.cc/suspicious.txt",
+      "entries": 5192113,
+      "body_bytes": 107877733
+    },
+    {
+      "id": "services/apple",
+      "url": "https://lists.purge.cc/apple.txt",
+      "entries": 58,
+      "body_bytes": 2489
+    },
+    {
+      "id": "services/meta",
+      "url": "https://lists.purge.cc/meta.txt",
+      "entries": 12606,
+      "body_bytes": 422466
+    },
+    {
+      "id": "services/microsoft",
+      "url": "https://lists.purge.cc/microsoft.txt",
+      "entries": 645,
+      "body_bytes": 20953
+    },
+    {
+      "id": "services/resolvers",
+      "url": "https://lists.purge.cc/resolvers.txt",
+      "entries": 65,
+      "body_bytes": 2038
+    },
+    {
+      "id": "services/tiktok",
+      "url": "https://lists.purge.cc/tiktok.txt",
+      "entries": 7953,
+      "body_bytes": 229370
+    },
+    {
+      "id": "services/youtube",
+      "url": "https://lists.purge.cc/youtube.txt",
+      "entries": 9230,
+      "body_bytes": 300643
+    }
+  ],
+  "union_all": 15012024,
+  "union_default_sources": 12413016
+}

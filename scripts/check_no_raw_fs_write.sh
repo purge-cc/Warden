@@ -119,6 +119,67 @@ else
             || true)
 fi
 
+# True if $1 is ENTIRELY a relocated test module. `in_test_module()` below
+# only recognizes a marker and its block INSIDE THE SAME FILE — a file that
+# consists entirely of a moved-out test module has no such marker in itself
+# at all, so without this check every line reads as ordinary production
+# code. Three extraction shapes exist; two carry a filename/path signal
+# that needs no parent lookup, one does not:
+#
+#   1. native module resolution — `<owner>/tests.rs`, or a non-"tests"-named
+#      sibling ending in `_tests.rs` (`window_tests.rs`,
+#      `retired_tags_reporting_tests.rs`)
+#   2. `#[path]`-into-shared-dir — anything under a `tests/` directory
+#      component (`src/tui/tests/dashboard.rs` has no "_tests" suffix at all)
+#   3. a directory module (`mod.rs`) that cfg(test)-gates a plainly-named
+#      sibling file — e.g. `src/cli/commands/mod.rs`'s
+#      `#[cfg(test)] pub(crate) mod hr2_test_support;`, body at
+#      `src/cli/commands/hr2_test_support.rs`. No filename signal at all —
+#      only the parent-lookup fallback below can catch this shape.
+#
+# Measured: shape 1 fired on `src/cli/commands/start/tests.rs` the first
+# time that file existed, flagging two legitimate temp-fixture
+# `fs::write(&config_path, ...)` calls the file's own tests always had.
+# Shapes 2 and 3 are latent (0 hits) as of this writing — this function
+# still has to recognize them, or the first hit inside either shape reads
+# as a real violation.
+file_is_relocated_test_module() {
+    local file="$1" dir mod_name parent result
+
+    case "$file" in
+    */tests.rs | *_tests.rs | */tests/*) return 0 ;;
+    esac
+
+    # Fallback for shape 3 (no filename signal): try both candidate
+    # parents — the native-resolution sibling (`<dir>.rs`) and a
+    # same-directory `mod.rs`.
+    dir="$(dirname "$file")"
+    mod_name="$(basename "$file" .rs)"
+    for parent in "${dir}.rs" "${dir}/mod.rs"; do
+        [ -f "$parent" ] || continue
+        # Word-boundary-ish substring match rather than a fully-anchored
+        # pattern with an optional `pub(...)` capture group: a dynamically
+        # built awk regex with a nested `(...)` group is fragile across awk
+        # dialects (a literal /pattern/ tolerates it; a string handed to `~`
+        # does not — confirmed failing here with "invalid regexp: unbalanced
+        # (" under this repo's awk). A bare declaration line has nothing else
+        # on it, so "contains `mod <name>;`, optionally with stuff before it"
+        # is unambiguous without anchoring the visibility prefix at all.
+        result=$(awk -v mod_name="$mod_name" '
+            /^#\[cfg\([^)]*test/ { pending = 1; next }
+            /^#\[/ { next }
+            {
+                if (pending && index($0, "mod " mod_name ";") > 0 && $0 ~ /;[[:space:]]*$/) {
+                    print "yes"; exit
+                }
+                pending = 0
+            }
+        ' "$parent" 2>/dev/null)
+        [ "$result" = "yes" ] && return 0
+    done
+    return 1
+}
+
 # True if $2 (a line number in file $1) falls inside a top-level
 # `#[cfg(test)] mod ... {` block. Single pass, no AST: tracks the
 # most recent column-0 `}` (closes whatever top-level item preceded)
@@ -153,6 +214,9 @@ while IFS= read -r rawline; do
     file=${rawline%%:*}
     rest=${rawline#*:}
     lineno=${rest%%:*}
+    if file_is_relocated_test_module "$file"; then
+        continue
+    fi
     if in_test_module "$file" "$lineno"; then
         continue
     fi

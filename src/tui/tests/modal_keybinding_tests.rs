@@ -15,7 +15,7 @@ fn mk_mapped(name: &str, ip: &str) -> MappedDeviceDto {
         mac: Some("AA:BB:CC:DD:EE:FF".into()),
         mac_aliases: Vec::new(),
         profile: "default".into(),
-        owner: Some("Alex".into()),
+        owner: Some("Operator".into()),
         device_type: Some("ThinkPad".into()),
         department: Some("home".into()),
         queries: 0,
@@ -59,7 +59,7 @@ fn seam_poller() -> IpcPoller {
 /// `filter_subnet` — the lane shipped the read side only.
 #[tokio::test]
 async fn slash_commits_the_subnet_filter_and_capital_r_clears_it() {
-    let mut app = app_with_view(vec![mk_mapped("alex-laptop", "192.0.2.14")], Vec::new());
+    let mut app = app_with_view(vec![mk_mapped("edo-laptop", "10.10.1.14")], Vec::new());
     let poller = seam_poller();
 
     handle_key(
@@ -73,7 +73,7 @@ async fn slash_commits_the_subnet_filter_and_capital_r_clears_it() {
         matches!(app.input_mode, InputMode::FilterDevicesSubnet(_)),
         "`/` on Devices must focus the subnet buffer"
     );
-    for c in "192.0.2.0/24".chars() {
+    for c in "10.10.1.0/24".chars() {
         handle_key(&mut app, seam_key_char(c), &poller, Path::new("/dev/null")).await;
     }
     handle_key(
@@ -83,7 +83,7 @@ async fn slash_commits_the_subnet_filter_and_capital_r_clears_it() {
         Path::new("/dev/null"),
     )
     .await;
-    assert_eq!(app.devices.filter_subnet.as_deref(), Some("192.0.2.0/24"));
+    assert_eq!(app.devices.filter_subnet.as_deref(), Some("10.10.1.0/24"));
     assert!(matches!(app.input_mode, InputMode::Normal));
 
     handle_key(
@@ -116,7 +116,7 @@ async fn row_actions_resolve_against_the_filtered_rows_not_the_full_list() {
     let mut app = app_with_view(
         vec![
             mk_mapped("aaa-other-subnet", "10.99.0.5"),
-            mk_mapped("alex-laptop", "192.0.2.14"),
+            mk_mapped("edo-laptop", "10.10.1.14"),
         ],
         Vec::new(),
     );
@@ -129,10 +129,10 @@ async fn row_actions_resolve_against_the_filtered_rows_not_the_full_list() {
         other => panic!("expected the 10.99 device unfiltered, got {other:?}"),
     }
 
-    app.devices.filter_subnet = Some("192.0.2.0/24".into());
+    app.devices.filter_subnet = Some("10.10.1.0/24".into());
     match selected_device_row(&app) {
         Some(tabs::devices::DeviceRow::Mapped(m)) => assert_eq!(
-            m.name, "alex-laptop",
+            m.name, "edo-laptop",
             "row actions must resolve against the visible rows; resolving to \
                  aaa-other-subnet means a delete confirm can name a device that \
                  is not on screen"
@@ -144,8 +144,8 @@ async fn row_actions_resolve_against_the_filtered_rows_not_the_full_list() {
 fn mk_mapped_with_groups(groups: Vec<&str>) -> MappedDeviceDto {
     MappedDeviceDto {
         groups: groups.into_iter().map(String::from).collect(),
-        id: Some("alex-laptop".into()),
-        ..mk_mapped("alex-laptop", "192.168.1.42")
+        id: Some("edo-laptop".into()),
+        ..mk_mapped("edo-laptop", "192.168.1.42")
     }
 }
 
@@ -207,7 +207,7 @@ fn build_edit_form_pulls_focused_mapped_row_fields() {
     assert_eq!(form.ip, "192.168.1.42");
     assert_eq!(form.mac, "AA:BB:CC:DD:EE:FF");
     assert_eq!(form.profile, "default");
-    assert_eq!(form.owner, "Alex");
+    assert_eq!(form.owner, "Operator");
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn l3_metadata_fields_are_select_only_once_a_vocabulary_exists() {
     // only where a vocabulary was actually declared. The empty case is
     // the sibling test `l3_empty_vocabulary_leaves_the_field_TYPEABLE`.
     let form = DeviceFormState::new_add().with_label_vocab(
-        vec!["Alex".into()],
+        vec!["Operator".into()],
         vec!["Laptop".into()],
         vec!["Studio".into()],
     );
@@ -325,7 +325,7 @@ fn l3_metadata_fields_are_select_only_once_a_vocabulary_exists() {
 #[test]
 fn l3_picker_offers_display_names_not_ids() {
     // The constraint that decides this sprint: `Device.owner` is free
-    // text ("Alex") while `Label.id` is an `Id` ("alex"), so the
+    // text ("Operator") while `Label.id` is an `Id` ("operator"), so the
     // two sets never intersect. `matches_value` accepts either, and the
     // display name is the one that also reads correctly in the table.
     use crate::config::loader::LoadedConfig;
@@ -333,9 +333,9 @@ fn l3_picker_offers_display_names_not_ids() {
 
     let cfg = ConfigV1 {
         labels: vec![Label {
-            id: Id::new("alex").unwrap(),
+            id: Id::new("operator").unwrap(),
             kind: LabelKind::Owner,
-            display_name: "Alex".to_string(),
+            display_name: "Operator".to_string(),
             description: None,
         }],
         ..Default::default()
@@ -351,7 +351,7 @@ fn l3_picker_offers_display_names_not_ids() {
     });
 
     let (owners, types, depts) = device_form_label_vocab(&app);
-    assert_eq!(owners, vec!["Alex".to_string()]);
+    assert_eq!(owners, vec!["Operator".to_string()]);
     assert!(types.is_empty(), "a kind with no vocabulary stays empty");
     assert!(depts.is_empty());
 }
@@ -399,12 +399,12 @@ fn l3_the_metadata_picker_offers_a_way_to_clear() {
     // emptying the field. Without this the operator can set an owner and
     // never unset it.
     let mut form = DeviceFormState::new_add().with_label_vocab(
-        vec!["Alex".into(), "Emanuela".into()],
+        vec!["Operator".into(), "Member".into()],
         Vec::new(),
         Vec::new(),
     );
     form.focused = DeviceFormFocus::Field(DeviceFormField::Owner);
-    form.owner = "Alex".into();
+    form.owner = "Operator".into();
     open_field_picker(&mut form);
     let picker = form.picker.as_ref().expect("vocabulary is non-empty");
     assert_eq!(
@@ -415,7 +415,7 @@ fn l3_the_metadata_picker_offers_a_way_to_clear() {
     assert_eq!(picker.options.len(), 3, "clear + the two declared owners");
     // The cursor must land on the CURRENT value, not on the clear row —
     // otherwise Enter-without-thinking wipes the field.
-    assert_eq!(picker.options[picker.cursor], "Alex");
+    assert_eq!(picker.options[picker.cursor], "Operator");
 }
 
 #[test]
@@ -431,7 +431,7 @@ fn l3_a_declared_vocabulary_flips_the_field_to_picker_driven() {
     // select-only so the operator picks instead of retyping. Per-kind,
     // not all-or-nothing — declaring owners must not freeze departments.
     let form =
-        DeviceFormState::new_add().with_label_vocab(vec!["Alex".into()], Vec::new(), Vec::new());
+        DeviceFormState::new_add().with_label_vocab(vec!["Operator".into()], Vec::new(), Vec::new());
     assert!(is_select_only_field(&form, DeviceFormField::Owner));
     assert!(
         !is_select_only_field(&form, DeviceFormField::Department),
@@ -633,7 +633,7 @@ fn g4_promote_form_cannot_offer_a_group_the_wire_will_not_carry() {
 #[test]
 fn g4_edit_patch_carries_the_whole_membership_list() {
     let mut form = edit_form_from(&mk_mapped_with_groups(vec!["phones", "kids"]));
-    form.name = "sam-thinkpad".into();
+    form.name = "work-thinkpad".into();
     let patch = device_update_patch(&form).expect("form parses");
     assert_eq!(
         patch.groups,
@@ -734,16 +734,16 @@ fn focused_mapped_name_returns_none_when_view_missing() {
 #[test]
 fn parse_form_happy_path_returns_typed_values() {
     let mut form = DeviceFormState::new_add();
-    form.name = "alex-laptop".into();
+    form.name = "edo-laptop".into();
     form.ip = "192.168.1.42".into();
     form.profile = "default".into();
     form.mac_aliases = "AA:BB:CC:DD:EE:01,AA:BB:CC:DD:EE:02".into();
-    form.owner = "Alex".into();
+    form.owner = "Operator".into();
     let p = parse_form(&form).unwrap();
-    assert_eq!(p.name, "alex-laptop");
+    assert_eq!(p.name, "edo-laptop");
     assert_eq!(p.ip.to_string(), "192.168.1.42");
     assert_eq!(p.mac_aliases.len(), 2);
-    assert_eq!(p.owner.as_deref(), Some("Alex"));
+    assert_eq!(p.owner.as_deref(), Some("Operator"));
 }
 
 #[test]
@@ -821,7 +821,7 @@ fn edit_form_prefills_both_network_name_fields_from_the_dto() {
     let dto = MappedDeviceDto {
         network_name: Some("desktop-1".into()),
         network_name_wildcard: true,
-        ..mk_mapped("alex-laptop", "192.168.1.42")
+        ..mk_mapped("edo-laptop", "192.168.1.42")
     };
     let form = edit_form_from(&dto);
     assert_eq!(form.network_name, "desktop-1");
@@ -830,14 +830,14 @@ fn edit_form_prefills_both_network_name_fields_from_the_dto() {
         "the wildcard buffer must be concrete, never blank"
     );
 
-    let unset = edit_form_from(&mk_mapped("alex-laptop", "192.168.1.42"));
+    let unset = edit_form_from(&mk_mapped("edo-laptop", "192.168.1.42"));
     assert_eq!(unset.network_name, "");
     assert_eq!(unset.network_name_wildcard, "false");
 }
 
 #[test]
 fn parse_form_carries_network_name_and_wildcard() {
-    let mut form = edit_form_from(&mk_mapped("desktop-1", "192.0.2.50"));
+    let mut form = edit_form_from(&mk_mapped("desktop-1", "10.10.1.50"));
     form.network_name = "desktop-1".into();
     form.network_name_wildcard = "TRUE".into(); // case-insensitive
     let parsed = parse_form(&form).unwrap();
@@ -847,7 +847,7 @@ fn parse_form_carries_network_name_and_wildcard() {
 
 #[test]
 fn parse_form_rejects_bad_wildcard_text() {
-    let mut form = edit_form_from(&mk_mapped("desktop-1", "192.0.2.50"));
+    let mut form = edit_form_from(&mk_mapped("desktop-1", "10.10.1.50"));
     form.network_name_wildcard = "sideways".into();
     let err = parse_form(&form).unwrap_err();
     assert!(
@@ -866,7 +866,7 @@ fn edit_patch_clears_the_network_name_when_the_field_is_emptied() {
     let dto = MappedDeviceDto {
         network_name: Some("desktop-1".into()),
         network_name_wildcard: false,
-        ..mk_mapped("alex-laptop", "192.168.1.42")
+        ..mk_mapped("edo-laptop", "192.168.1.42")
     };
     let mut form = edit_form_from(&dto);
     form.network_name.clear();
@@ -894,7 +894,7 @@ fn edit_patch_carries_wildcard_without_name_for_the_daemon_to_refuse() {
     let dto = MappedDeviceDto {
         network_name: Some("desktop-1".into()),
         network_name_wildcard: true,
-        ..mk_mapped("alex-laptop", "192.168.1.42")
+        ..mk_mapped("edo-laptop", "192.168.1.42")
     };
     let mut form = edit_form_from(&dto);
     form.network_name.clear(); // wildcard buffer still "true"
@@ -918,7 +918,7 @@ fn parse_form_refuses_an_emptied_wildcard_on_an_edit_form() {
     let dto = MappedDeviceDto {
         network_name: Some("desktop-1".into()),
         network_name_wildcard: true,
-        ..mk_mapped("alex-laptop", "192.168.1.42")
+        ..mk_mapped("edo-laptop", "192.168.1.42")
     };
     let mut form = edit_form_from(&dto);
     form.network_name_wildcard.clear();
@@ -937,7 +937,7 @@ fn parse_form_refuses_an_emptied_wildcard_on_an_edit_form() {
 fn parse_form_refuses_a_network_name_the_add_wire_cannot_carry() {
     let mut form = DeviceFormState::new_add();
     form.name = "desktop-1".into();
-    form.ip = "192.0.2.50".into();
+    form.ip = "10.10.1.50".into();
     form.profile = "default".into();
 
     // Untouched: both buffers empty, nothing to complain about.

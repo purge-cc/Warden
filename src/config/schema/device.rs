@@ -1,8 +1,8 @@
 //! [`Device`] — a single client endpoint in the LAN, identified by IP or
 //! one-or-more MAC addresses (primary + aliases for randomising phones).
 //!
-//! Per design doc §8.3. Devices are the leaf entities of the resolver
-//! chain: their optional `profile` wins over group / subnet (DM1).
+//! Devices are the leaf entities of the resolver chain: their optional
+//! `profile` wins over group / subnet.
 
 use std::net::IpAddr;
 
@@ -12,15 +12,15 @@ use super::id::Id;
 
 /// ```toml
 /// [[devices]]
-/// id = "alex-iphone-01"
-/// display_name = "Alex's phone"
-/// ip = "192.0.2.107"
+/// id = "operator-iphone-01"
+/// display_name = "iPhone di Operator"
+/// ip = "10.10.1.107"
 /// mac = "AA:BB:CC:DD:EE:FF"
 /// mac_aliases = ["22:33:44:55:66:77"]
 /// profile = "default"
 /// groups = ["famiglia"]
-/// allow_rules = ["alex-allow-bank"]
-/// deny_rules = ["alex-deny-tiktok"]
+/// allow_rules = ["operator-allow-bank"]
+/// deny_rules = ["operator-deny-tiktok"]
 /// override_profile_deny = false
 /// ```
 ///
@@ -40,16 +40,16 @@ pub struct Device {
     #[serde(default)]
     pub mac: Option<String>,
     /// Additional MACs for randomising clients (iOS private-wifi, Android
-    /// rotating MAC). Any match identifies this device (DM6).
+    /// rotating MAC). Any match identifies this device.
     #[serde(default)]
     pub mac_aliases: Vec<String>,
-    /// Direct profile assignment. Wins over groups and subnets (DM1). If
+    /// Direct profile assignment. Wins over groups and subnets. If
     /// `None`, resolution falls through to groups → subnet → default.
     #[serde(default)]
     pub profile: Option<Id>,
     /// Groups this device is a member of. A group can impose its profile
     /// only if the device has no direct [`Self::profile`] and the group's
-    /// priority is the highest among memberships (DM2).
+    /// priority is the highest among memberships.
     #[serde(default)]
     pub groups: Vec<Id>,
     #[serde(default)]
@@ -67,45 +67,33 @@ pub struct Device {
     pub department: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
-    /// Sprint 43 T4 (DM1): per-device allow overlay — references to
-    /// `[[admin_rules]]` ids whose parsed `||domain^` form the device's
-    /// allow set. Wired into the resolver chain as a
-    /// [`DeviceOverlay`](crate::profiles::DeviceOverlay)
-    /// (DM2) — the hot path checks the overlay BEFORE the profile's
-    /// allow/deny tables (R5: two `HashSet::contains` probes per query).
+    /// Per-device allow overlay — references to `[[admin_rules]]` ids
+    /// whose parsed `||domain^` form the device's allow set. Wired into
+    /// the resolver chain as a
+    /// [`DeviceOverlay`](crate::profiles::DeviceOverlay) — the hot path
+    /// checks the overlay BEFORE the profile's allow/deny tables (two
+    /// `HashSet::contains` probes per query).
     ///
     /// Combined cap (allow_rules + deny_rules) is 64 (soft, emits
     /// `LIST_PRUNE_WARN` at validator pass) / 128 (hard, refused).
     #[serde(default)]
     pub allow_rules: Vec<Id>,
-    /// Sprint 43 T4 (DM1): per-device deny overlay. Same shape as
-    /// [`Self::allow_rules`]. Truth table §4 row 5 — additive deny
-    /// over a profile-level allow.
+    /// Per-device deny overlay. Same shape as [`Self::allow_rules`] —
+    /// additive deny over a profile-level allow.
     #[serde(default)]
     pub deny_rules: Vec<Id>,
-    /// Sprint 43 T4 (DM1, D3): when `true`, an entry on
-    /// [`Self::allow_rules`] is allowed to override a profile-level
-    /// `||domain^` deny on the same domain (truth table §4 row 7).
+    /// When `true`, an entry on [`Self::allow_rules`] is allowed to
+    /// override a profile-level `||domain^` deny on the same domain.
     /// When `false` (default), the CLI / TUI refuses to add an
     /// `allow_rules` entry that would conflict with an existing
-    /// profile-level deny — emitting `RULE_REFUSED_OVERRIDE` (SN3).
-    /// Audited; surfaced in red on the TUI Resolver tab.
+    /// profile-level deny — emitting `RULE_REFUSED_OVERRIDE`. Audited;
+    /// surfaced in red on the TUI Resolver tab.
     #[serde(default)]
     pub override_profile_deny: bool,
-    /// Sprint A of `lists_categories_v2` (D3, D14): explicit opt-out
-    /// from filtering. When `true`, the filter step is skipped entirely.
-    /// DNS resolution, caching, query log, and stats remain active (the
-    /// operator monitors IoT traffic without filtering).
-    ///
-    /// **The mutual exclusion it used to carry is gone with its other
-    /// half.** The rule was "must NOT be paired with non-empty `tags`",
-    /// enforced by the validator with `DEVICE_UNFILTERED_WITH_TAGS`,
-    /// because the mechanism was "`effective_tags(d) = ∅` regardless of
-    /// inheritance" and a tag alongside it was dead weight. `plp-s3`
-    /// moved the mechanism onto `ResolvedProfile::unfiltered` and
-    /// `plp-s5a` removed the field, so there is no longer a second field
-    /// for this one to contradict. The meaning of `unfiltered` itself is
-    /// unchanged.
+    /// Explicit opt-out from filtering. When `true`, the filter step is
+    /// skipped entirely. DNS resolution, caching, query log, and stats
+    /// remain active (the operator monitors IoT traffic without
+    /// filtering).
     #[serde(default)]
     pub unfiltered: bool,
     /// Bare DNS name this device answers to. No suffix is enforced —
@@ -134,11 +122,11 @@ mod tests {
         let toml_src = r#"
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
         assert_eq!(d.id.as_str(), "iphone");
-        assert_eq!(d.ip, Some("192.0.2.107".parse().unwrap()));
+        assert_eq!(d.ip, Some("10.10.1.107".parse().unwrap()));
         assert!(d.mac.is_none());
         assert!(d.profile.is_none());
         assert!(d.groups.is_empty());
@@ -147,14 +135,14 @@ ip = "192.0.2.107"
     #[test]
     fn full_device_deserialises() {
         let toml_src = r#"
-id = "alex-iphone-01"
-display_name = "Alex's phone"
-ip = "192.0.2.107"
+id = "operator-iphone-01"
+display_name = "iPhone di Operator"
+ip = "10.10.1.107"
 mac = "AA:BB:CC:DD:EE:FF"
 mac_aliases = ["22:33:44:55:66:77", "33:44:55:66:77:88"]
 profile = "default"
 groups = ["famiglia", "iot-lite"]
-owner = "Alex"
+owner = "Operator"
 device_type = "iPhone personale"
 department = "famiglia"
 notes = "compleanno gennaio"
@@ -162,7 +150,7 @@ notes = "compleanno gennaio"
         let d: Device = toml::from_str(toml_src).unwrap();
         assert_eq!(d.mac_aliases.len(), 2);
         assert_eq!(d.groups.len(), 2);
-        assert_eq!(d.owner.as_deref(), Some("Alex"));
+        assert_eq!(d.owner.as_deref(), Some("Operator"));
         assert_eq!(d.device_type.as_deref(), Some("iPhone personale"));
         assert_eq!(d.profile.as_ref().unwrap().as_str(), "default");
     }
@@ -172,7 +160,7 @@ notes = "compleanno gennaio"
         let toml_src = r#"
 id = "desktop-1"
 display_name = "Desktop-1"
-ip = "192.0.2.50"
+ip = "10.10.1.50"
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
         assert!(d.network_name.is_none());
@@ -201,7 +189,7 @@ network_name_wildcard = true
         let toml_src = r#"
 id = "legacy"
 display_name = "legacy"
-ip = "192.0.2.1"
+ip = "10.10.1.1"
 device = "iPad personale"
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
@@ -214,7 +202,7 @@ device = "iPad personale"
             r#"
 id = "iphone"
 display_name = "x"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 made_up = 7
 "#,
         )
@@ -248,18 +236,18 @@ ip = "not-an-ip"
         assert!(err.to_string().contains("invalid"));
     }
 
-    // ── Sprint 43 T4 — DM1: per-device overlay schema ─────────────
+    // ── per-device overlay schema ──────────────────────────────────
 
-    /// Old configs that pre-date T4 must continue to deserialise. R1
-    /// `#[serde(default)]` on every new field — `allow_rules`,
-    /// `deny_rules`, `override_profile_deny` — keeps a v0.4.5 TOML
-    /// loadable as `Vec::new()` / `false`.
+    /// Old configs that pre-date the overlay fields must continue to
+    /// deserialise. `#[serde(default)]` on every new field —
+    /// `allow_rules`, `deny_rules`, `override_profile_deny` — keeps a
+    /// v0.4.5 TOML loadable as `Vec::new()` / `false`.
     #[test]
     fn pre_t4_device_loads_with_default_overlay_fields() {
         let toml_src = r#"
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
         assert!(d.allow_rules.is_empty());
@@ -271,19 +259,19 @@ ip = "192.0.2.107"
     #[test]
     fn t4_device_overlay_fields_roundtrip() {
         let toml_src = r#"
-id = "alex-iphone"
-display_name = "Alex's phone"
-ip = "192.0.2.107"
-allow_rules = ["alex-allow-bank", "alex-allow-airbnb"]
-deny_rules = ["alex-deny-tiktok"]
+id = "operator-iphone"
+display_name = "iPhone di Operator"
+ip = "10.10.1.107"
+allow_rules = ["operator-allow-bank", "operator-allow-airbnb"]
+deny_rules = ["operator-deny-tiktok"]
 override_profile_deny = true
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
         assert_eq!(d.allow_rules.len(), 2);
-        assert_eq!(d.allow_rules[0].as_str(), "alex-allow-bank");
-        assert_eq!(d.allow_rules[1].as_str(), "alex-allow-airbnb");
+        assert_eq!(d.allow_rules[0].as_str(), "operator-allow-bank");
+        assert_eq!(d.allow_rules[1].as_str(), "operator-allow-airbnb");
         assert_eq!(d.deny_rules.len(), 1);
-        assert_eq!(d.deny_rules[0].as_str(), "alex-deny-tiktok");
+        assert_eq!(d.deny_rules[0].as_str(), "operator-deny-tiktok");
         assert!(d.override_profile_deny);
     }
 
@@ -294,7 +282,7 @@ override_profile_deny = true
         let toml_src = r#"
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 allow_rules = []
 deny_rules = []
 override_profile_deny = false
@@ -304,7 +292,7 @@ override_profile_deny = false
             r#"
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 "#,
         )
         .unwrap();
@@ -313,9 +301,9 @@ ip = "192.0.2.107"
         assert_eq!(d.override_profile_deny, default_d.override_profile_deny);
     }
 
-    // ── Sprint A of lists_categories_v2 (D1, D3, D14, D15) ──
+    // ── unfiltered opt-out ──────────────────────────────────────────
 
-    /// `unfiltered` defaults to `false` — every pre-v2 device
+    /// `unfiltered` defaults to `false` — every pre-existing device
     /// deserialises unchanged.
     #[test]
     fn lc2_unfiltered_default_false() {
@@ -323,7 +311,7 @@ ip = "192.0.2.107"
             r#"
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 "#,
         )
         .unwrap();

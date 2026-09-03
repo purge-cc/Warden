@@ -8,8 +8,7 @@ pub mod circuit;
 pub mod doh;
 /// DNS-over-QUIC upstream (RFC 9250). Feature-gated (`doq`, default OFF) — the
 /// quinn QUIC stack adds binary size, so the default + Raspberry Pi builds
-/// exclude it. §4.9-1 ships the transport + handshake; the `Upstream` impl
-/// (message framing) lands in §4.9-2.
+/// exclude it.
 #[cfg(feature = "doq")]
 pub mod doq;
 pub mod dot;
@@ -18,8 +17,8 @@ pub mod plain;
 pub mod plain_raw;
 pub mod resolver;
 /// Pure, I/O-free shape validation for upstream server strings, shared by the
-/// transport constructors (boot) and `config lint` (rev-2606). See the module
-/// doc for the offline syntax-vs-resolvability boundary.
+/// transport constructors (boot) and `config lint`. See the module doc for
+/// the offline syntax-vs-resolvability boundary.
 pub mod shape;
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
@@ -36,13 +35,12 @@ pub use resolver::UpstreamResolver;
 
 /// Common interface for all upstream DNS resolvers.
 ///
-/// **§4.8 §2/2 (T4):** the `ecs` parameter carries the per-query EDNS
-/// Client Subnet option derived from the resolved profile's
+/// The `ecs` parameter carries the per-query EDNS Client Subnet option
+/// derived from the resolved profile's
 /// [`crate::profiles::profile::EcsPolicy`] and the client IP. `None`
-/// emits zero EDNS extensions (pre-§4.8 baseline). Sprint 1's
-/// "construct-time ECS" knob is gone — `self.ecs` no longer exists on
-/// any concrete upstream; the handler builds the option once per query
-/// and threads it through.
+/// emits zero EDNS extensions. There is no construct-time ECS knob —
+/// `self.ecs` does not exist on any concrete upstream; the handler builds
+/// the option once per query and threads it through.
 #[async_trait::async_trait]
 pub trait Upstream: Send + Sync {
     /// Resolve a DNS name. Returns records and response code.
@@ -84,7 +82,7 @@ pub struct UpstreamResponse {
     /// The response's authority (name-server) section, verbatim and
     /// heterogeneous (NSEC/NSEC3 + their RRSIGs + SOA, as on the wire). Retained
     /// only under the `dnssec` feature, where the DNSSEC [`ChainFetcher`] adapter
-    /// consumes it for NSEC/NSEC3 no-DS denial-of-existence proofs (§4.10). The
+    /// consumes it for NSEC/NSEC3 no-DS denial-of-existence proofs. The
     /// default and Raspberry Pi builds never allocate it — the field does not
     /// exist there, so `parse_response_bytes` stays byte-identical to baseline.
     ///
@@ -101,7 +99,7 @@ pub struct UpstreamResponse {
 /// source-port randomisation they are the entropy that resists off-path answer
 /// forgery / cache poisoning on the plain-UDP path (`PlainRawClient`). A
 /// sequential counter is fully predictable, so we draw from `OsRng` — the
-/// project's mandated CSPRNG (project rules "Common Pitfalls"; same source as
+/// project's mandated CSPRNG (CLAUDE.md "Common Pitfalls"; same source as
 /// `auth::token`). Over reliable transports (DoT/DoH) the ID is cosmetic, and
 /// DoQ overrides it to 0 (RFC 9250 §4.2.1); the cost is one draw per upstream
 /// query, all off the cached hot path.
@@ -109,17 +107,30 @@ fn next_query_id() -> u16 {
     rand_core::OsRng.next_u32() as u16
 }
 
-/// Build a DNS query message in wire format.
+/// Build a DNS query message in wire format, discarding the question.
+///
+/// Identical construction to [`build_query`] — see it for the EDNS, DO and CD
+/// rules — for callers with no use for the echoed-question check.
+pub fn build_query_bytes(
+    name: &Name,
+    record_type: RecordType,
+    ecs: Option<EdnsClientSubnet>,
+    dnssec_ok: bool,
+) -> Result<Vec<u8>, DnsError> {
+    build_query(name, record_type, ecs, dnssec_ok).map(|(bytes, _)| bytes)
+}
+
+/// Build a DNS query message in wire format, with the question it carries.
 ///
 /// The query contains QNAME + QTYPE with RD (Recursion Desired) set. An EDNS
 /// OPT record is emitted only when there is something to put in it: the EDNS
 /// Client Subnet option (RFC 7871, when `ecs` is `Some`) and/or the DNSSEC OK
 /// (DO) bit (RFC 3225, when `dnssec_ok`). When **neither** is requested no EDNS
-/// extension is emitted at all — byte-identical to the pre-§4.8 / non-DNSSEC
-/// baseline.
+/// extension is emitted at all — byte-identical to the baseline with neither
+/// feature enabled.
 ///
-/// `dnssec_ok` is a global construction-time policy on the validator's upstream
-/// (§4.10); the client-facing upstream always passes `false`. When set it also
+/// `dnssec_ok` is a global construction-time policy on the validator's
+/// upstream; the client-facing upstream always passes `false`. When set it also
 /// turns on the **CD (Checking Disabled)** header bit and advertises a 1232-byte
 /// EDNS buffer, because the validator does its own validation:
 /// - **CD (RFC 4035 §3.2.2):** without it a *validating* upstream resolver
@@ -129,12 +140,19 @@ fn next_query_id() -> u16 {
 /// - **1232-byte buffer (RFC 6891 / DNS flag-day 2020):** DNSKEY/RRSIG sets
 ///   routinely exceed the 512-byte default; advertising 1232 keeps them on UDP
 ///   instead of forcing a TCP fallback for every chain fetch.
-pub fn build_query_bytes(
+///
+/// The returned question comes back out of the encoded message rather than
+/// being rebuilt, so the two can never describe different queries — which is
+/// what lets [`parse_response_bytes`] treat it as the authority on what was
+/// asked. It is fully qualified: a name decoded from a response always is, and
+/// [`Name`] equality treats the relative and absolute forms as different names,
+/// so an unqualified caller name would make every response look forged.
+pub fn build_query(
     name: &Name,
     record_type: RecordType,
     ecs: Option<EdnsClientSubnet>,
     dnssec_ok: bool,
-) -> Result<Vec<u8>, DnsError> {
+) -> Result<(Vec<u8>, Query), DnsError> {
     // 0.26: Message::new() gained (id, message_type, op_code) params; the flag
     // setters were removed in favour of public Metadata fields.
     let mut msg = Message::new(next_query_id(), MessageType::Query, OpCode::Query);
@@ -156,13 +174,43 @@ pub fn build_query_bytes(
         }
         msg.set_edns(edns);
     }
-    msg.to_vec()
-        .map_err(|e| DnsError::WireFormatError(e.to_string()))
+    let bytes = msg
+        .to_vec()
+        .map_err(|e| DnsError::WireFormatError(e.to_string()))?;
+    let mut question = msg.queries.pop().expect("the query added above");
+    question.name.set_fqdn(true);
+    Ok((bytes, question))
 }
 
 /// Parse a DNS response from wire format bytes into an UpstreamResponse.
-pub fn parse_response_bytes(data: &[u8]) -> Result<UpstreamResponse, DnsError> {
+///
+/// `expected` is the question that was sent (see [`build_query`]); a
+/// response that does not echo it is rejected instead of parsed, per RFC 5452
+/// §9.1. Warden filters the name it *queried*, so records delivered under some
+/// other question would reach the cache and the client without the filter
+/// engine ever having evaluated their name.
+///
+/// Name comparison is case-insensitive (RFC 4343), which is what upstreams
+/// applying 0x20 randomisation to the echoed QNAME depend on. A response with
+/// no question section is rejected: there is nothing to match against, and
+/// failing closed costs nothing against conforming upstreams. Only the first
+/// question is examined — a second one carries no records, so it can smuggle
+/// nothing past the check.
+pub fn parse_response_bytes(data: &[u8], expected: &Query) -> Result<UpstreamResponse, DnsError> {
     let msg = Message::from_vec(data).map_err(|e| DnsError::WireFormatError(e.to_string()))?;
+    match msg.queries.first() {
+        Some(echoed) if question_echoes(echoed, expected) => {}
+        Some(echoed) => {
+            return Err(DnsError::WireFormatError(format!(
+                "response question [{echoed}] does not match the query sent [{expected}]"
+            )))
+        }
+        None => {
+            return Err(DnsError::WireFormatError(format!(
+                "response carries no question section (sent [{expected}])"
+            )))
+        }
+    }
     Ok(UpstreamResponse {
         records: msg.answers.to_vec(),
         response_code: msg.metadata.response_code,
@@ -170,6 +218,16 @@ pub fn parse_response_bytes(data: &[u8]) -> Result<UpstreamResponse, DnsError> {
         #[cfg(feature = "dnssec")]
         authority: msg.authorities.to_vec(),
     })
+}
+
+/// Whether `echoed` is the question in `expected`.
+///
+/// All three fields must match: an upstream that returns the right name under
+/// a different QTYPE or QCLASS is answering a question we did not ask.
+fn question_echoes(echoed: &Query, expected: &Query) -> bool {
+    echoed.name() == expected.name()
+        && echoed.query_type() == expected.query_type()
+        && echoed.query_class() == expected.query_class()
 }
 
 /// Extract the SOA-derived negative-cache TTL hint from an authority section.
@@ -202,10 +260,9 @@ fn extract_soa_minimum_ttl(authorities: &[Record]) -> Option<u32> {
 /// `ClientConfig::builder()` call. reqwest installs one for DoH, but a
 /// standalone DoT/DoQ upstream needs it too.
 ///
-/// L-11 (rev-2026-04-tls-provider-check): check global state first — if a
-/// provider is already installed we no-op (matches reqwest-installed-first or a
-/// repeat init); only the genuinely unexpected install race after a None-check
-/// is logged at warn.
+/// Checks global state first — if a provider is already installed this
+/// no-ops (matches reqwest-installed-first or a repeat init); only the
+/// genuinely unexpected install race after a None-check is logged at warn.
 pub(crate) fn install_ring_crypto_provider_once() {
     match rustls::crypto::CryptoProvider::get_default() {
         None => {
@@ -238,7 +295,7 @@ pub(crate) fn webpki_root_store() -> rustls::RootCertStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::rr::rdata::SOA;
+    use hickory_proto::rr::rdata::{A, SOA};
     use hickory_proto::rr::{DNSClass, RData, Record};
 
     fn make_soa_record(ttl: u32, minimum: u32) -> Record {
@@ -280,7 +337,8 @@ mod tests {
         msg.add_authority(make_soa_record(900, 600));
         let bytes = msg.to_vec().unwrap();
 
-        let parsed = parse_response_bytes(&bytes).unwrap();
+        let expected = question_sent("nonexistent.example.com.", RecordType::A);
+        let parsed = parse_response_bytes(&bytes, &expected).unwrap();
         assert_eq!(parsed.response_code, ResponseCode::NXDomain);
         assert!(parsed.records.is_empty());
         // min(900, 600) = 600
@@ -291,14 +349,14 @@ mod tests {
     fn parse_response_bytes_no_soa_gives_none() {
         let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
         msg.add_query(Query::query("example.com.".parse().unwrap(), RecordType::A));
-        let _ = DNSClass::IN;
         let bytes = msg.to_vec().unwrap();
 
-        let parsed = parse_response_bytes(&bytes).unwrap();
+        let expected = question_sent("example.com.", RecordType::A);
+        let parsed = parse_response_bytes(&bytes, &expected).unwrap();
         assert_eq!(parsed.soa_minimum_ttl, None);
     }
 
-    /// §4.10: under the `dnssec` feature the authority (name-server) section is
+    /// Under the `dnssec` feature the authority (name-server) section is
     /// retained verbatim — the seam the DNSSEC `ChainFetcher` reads for NSEC/
     /// NSEC3 no-DS proofs. (Default builds drop the field entirely; that the
     /// non-dnssec parse stays byte-identical is covered by the SOA-TTL tests.)
@@ -314,7 +372,8 @@ mod tests {
         msg.add_authority(make_soa_record(900, 600));
         let bytes = msg.to_vec().unwrap();
 
-        let parsed = parse_response_bytes(&bytes).unwrap();
+        let expected = question_sent("absent.example.com.", RecordType::A);
+        let parsed = parse_response_bytes(&bytes, &expected).unwrap();
         assert_eq!(parsed.authority.len(), 1, "authority section retained");
         assert!(
             matches!(parsed.authority[0].data, RData::SOA(_)),
@@ -322,11 +381,125 @@ mod tests {
         );
     }
 
-    /// Sanity check on the §4.8 ECS / §4.10 DO injection hooks: passing
-    /// `None` + `dnssec_ok=false` produces a wire packet with no EDNS / OPT
-    /// record at all (additional count = 0). This is the LAN-only deploy
-    /// path, the client-facing upstream, and the pre-§4.8 / non-DNSSEC
-    /// baseline we MUST NOT regress on.
+    // ── RFC 5452 §9.1 question-section echo ────────────────────
+
+    /// The question `build_query` would hand back for this name and type.
+    fn question_sent(name: &str, record_type: RecordType) -> Query {
+        let name: Name = name.parse().unwrap();
+        build_query(&name, record_type, None, false).unwrap().1
+    }
+
+    fn response_with_question(question: Query, answer: Option<Record>) -> Vec<u8> {
+        let mut msg = Message::new(9, MessageType::Response, OpCode::Query);
+        msg.add_query(question);
+        if let Some(rec) = answer {
+            msg.add_answer(rec);
+        }
+        msg.to_vec().unwrap()
+    }
+
+    fn a_record(owner: &str) -> Record {
+        Record::from_rdata(
+            owner.parse().unwrap(),
+            300,
+            RData::A(A::new(203, 0, 113, 7)),
+        )
+    }
+
+    /// The forgery this check exists to stop: a response carrying an A record
+    /// for a name warden never asked about. It is refused outright, so the
+    /// caller gets an `Err` and has no `UpstreamResponse` to cache or serve.
+    #[test]
+    fn parse_response_bytes_rejects_answer_under_unrelated_question() {
+        let bytes = response_with_question(
+            Query::query("attacker.example.net.".parse().unwrap(), RecordType::A),
+            Some(a_record("attacker.example.net.")),
+        );
+
+        let expected = question_sent("example.com.", RecordType::A);
+        let err = parse_response_bytes(&bytes, &expected).unwrap_err();
+        assert!(
+            matches!(&err, DnsError::WireFormatError(m) if m.contains("does not match")),
+            "expected a question-mismatch rejection, got {err:?}"
+        );
+    }
+
+    /// The right name under a question we did not ask is still a question we
+    /// did not ask — all three fields are compared, not just the name.
+    #[test]
+    fn parse_response_bytes_rejects_mismatched_qtype() {
+        let bytes = response_with_question(
+            Query::query("example.com.".parse().unwrap(), RecordType::AAAA),
+            None,
+        );
+
+        let expected = question_sent("example.com.", RecordType::A);
+        assert!(parse_response_bytes(&bytes, &expected).is_err());
+    }
+
+    #[test]
+    fn parse_response_bytes_rejects_mismatched_qclass() {
+        let mut question = Query::query("example.com.".parse().unwrap(), RecordType::A);
+        question.query_class = DNSClass::CH;
+        let bytes = response_with_question(question, None);
+
+        let expected = question_sent("example.com.", RecordType::A);
+        assert!(parse_response_bytes(&bytes, &expected).is_err());
+    }
+
+    /// No question section means nothing to match against — fail closed.
+    #[test]
+    fn parse_response_bytes_rejects_missing_question() {
+        let mut msg = Message::new(9, MessageType::Response, OpCode::Query);
+        msg.add_answer(a_record("example.com."));
+        let bytes = msg.to_vec().unwrap();
+
+        let expected = question_sent("example.com.", RecordType::A);
+        let err = parse_response_bytes(&bytes, &expected).unwrap_err();
+        assert!(
+            matches!(&err, DnsError::WireFormatError(m) if m.contains("no question section")),
+            "expected a missing-question rejection, got {err:?}"
+        );
+    }
+
+    /// Upstreams applying 0x20 randomisation echo the QNAME in mixed case.
+    /// Rejecting those would break resolution outright, so the comparison is
+    /// case-insensitive per RFC 4343.
+    #[test]
+    fn parse_response_bytes_accepts_case_differing_question() {
+        let bytes = response_with_question(
+            Query::query("ExAmPlE.CoM.".parse().unwrap(), RecordType::A),
+            Some(a_record("ExAmPlE.CoM.")),
+        );
+
+        let expected = question_sent("example.com.", RecordType::A);
+        let parsed = parse_response_bytes(&bytes, &expected).expect("0x20 echo accepted");
+        assert_eq!(parsed.records.len(), 1);
+    }
+
+    /// The returned question must describe the bytes that went out, or every
+    /// conforming response would be refused. The name without a trailing dot
+    /// is the case that needs the fully-qualifying step: `Name` equality
+    /// separates the relative and absolute forms.
+    #[test]
+    fn build_query_returns_the_question_it_serialised() {
+        for name in ["example.com.", "example.com"] {
+            let name: Name = name.parse().unwrap();
+            let (bytes, question) = build_query(&name, RecordType::A, None, false).unwrap();
+            let sent = Message::from_vec(&bytes).unwrap();
+            let echoed = sent.queries.first().expect("query carries a question");
+
+            assert!(
+                question_echoes(echoed, &question),
+                "returned question must match the wire bytes for {name}"
+            );
+        }
+    }
+
+    /// Sanity check on the ECS / DO injection hooks: passing `None` +
+    /// `dnssec_ok=false` produces a wire packet with no EDNS / OPT record at
+    /// all (additional count = 0). This is the LAN-only deploy path, the
+    /// client-facing upstream, and the baseline we MUST NOT regress on.
     #[test]
     fn build_query_bytes_without_ecs_or_do_emits_no_opt_record() {
         let name: Name = "example.com.".parse().unwrap();
@@ -341,7 +514,7 @@ mod tests {
         );
     }
 
-    /// §4.10: `dnssec_ok=true` is the validator's upstream query — it sets the
+    /// `dnssec_ok=true` is the validator's upstream query — it sets the
     /// DO bit (RFC 3225) so signed zones return RRSIG/NSEC/NSEC3 material, the
     /// CD bit (RFC 4035 §3.2.2) so a *validating* upstream returns raw bogus
     /// data for us to judge rather than pre-empting with SERVFAIL, and a

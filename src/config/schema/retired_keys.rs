@@ -14,14 +14,14 @@
 //! the minute the field goes, `unknown field `tags`` refuses the whole
 //! load and the daemon does not start.
 //!
-//! `plp-s5a` removed `tags` from all five. The remedy is the
+//! Removing `tags` from all five needs a remedy: the same
 //! `ip_denylists` shape already used by
 //! `config::loader::normalise_deprecated_keys`: strip the retired key from
 //! the raw [`toml::Table`] **before serde sees it**, and tell the operator.
 //! The alternative shape in that same function — the `kind` arm, which
-//! *refuses* rather than rewrites — is the wrong one here: `tags` decided
-//! nothing after the `plp-s3` cutover, so dropping it changes no verdict,
-//! and a refusal would be exactly the outage this module exists to prevent.
+//! *refuses* rather than rewrites — is the wrong one here: `tags` no longer
+//! decides anything, so dropping it changes no verdict, and a refusal
+//! would be exactly the outage this module exists to prevent.
 //!
 //! # Both loader exits, or neither
 //!
@@ -40,7 +40,7 @@
 
 /// Entity sections whose entries are TOML **arrays of tables**.
 ///
-/// `clients` is the pre-S42 spelling of `devices`. It is listed because
+/// `clients` is the legacy spelling of `devices`. It is listed because
 /// `ConfigV1` still accepts it via `#[serde(alias = "clients")]`, so a
 /// config reaching serde through the single-file path can carry
 /// `[[clients]]` with a `tags` key on it and never pass through the
@@ -58,8 +58,8 @@ const RETIRED_TAGS_KEY: &str = "tags";
 /// makes it an unknown *variant*, and serde refuses the load for it
 /// whether or not the struct denies unknown fields.
 ///
-/// `kind = "tag"` shipped on 2026-08-08 and was retired on 2026-08-26, so
-/// the window in which an operator could have declared one is short but
+/// `kind = "tag"` shipped and was retired a short time later, so the
+/// window in which an operator could have declared one is small but
 /// real — and a config that does not load is the same outage regardless of
 /// how few rows caused it.
 ///
@@ -240,7 +240,7 @@ tags = ["ads", "tracking"]
         assert_eq!(t["profiles"]["kids"]["display_name"].as_str(), Some("Kids"));
     }
 
-    /// All five entity shapes, plus the pre-S42 `[[clients]]` spelling
+    /// All five entity shapes, plus the legacy `[[clients]]` spelling
     /// that `ConfigV1` still accepts via serde alias.
     #[test]
     fn every_entity_shape_including_the_clients_alias_is_covered() {
@@ -348,9 +348,9 @@ lists = { social = "allow" }
         let mut t = table_of(
             r#"
 [[labels]]
-id = "alex"
+id = "operator"
 kind = "owner"
-display_name = "Alex"
+display_name = "Operator"
 
 [[labels]]
 id = "ads"
@@ -370,7 +370,7 @@ display_name = "Famiglia"
             rows.iter()
                 .map(|r| r["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["alex", "famiglia"],
+            vec!["operator", "famiglia"],
             "the surrounding vocabulary must survive intact"
         );
     }

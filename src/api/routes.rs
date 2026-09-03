@@ -38,11 +38,10 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
         .route("/api/devices", get(handlers::get_devices))
         .route("/api/logs", get(handlers::get_logs))
         .route("/api/lists", get(handlers::get_lists))
-        // Sprint 43 T2: per-blocklist runtime telemetry — entries,
-        // last fetch outcome, parsed counters, delta-pct vs prev cycle.
-        // Always token-gated by the same `auth_middleware` already
-        // wrapping every `/api/` route below (Cybersec lens — IPC's
-        // ReadOnly-no-token rule does NOT extend to HTTP).
+        // Per-blocklist runtime telemetry — entries, last fetch outcome,
+        // parsed counters, delta-pct vs prev cycle. Token-gated by the
+        // same `auth_middleware` wrapping every `/api/` route below —
+        // the IPC ReadOnly-no-token rule does not extend to HTTP.
         .route(
             "/api/blocklists/{id}/stats",
             get(handlers::get_blocklist_stats),
@@ -59,12 +58,12 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
         // Two layers on all /api/ routes. Axum runs the LAST-added layer
         // first, so the request order is: auth_middleware (outer) →
         // rate_limit_middleware (inner) → handler. Rate limiting AFTER
-        // auth is deliberate (rev-2606 api-auth-07-03): the knob caps
-        // *valid-token* clients, unauthenticated callers cannot probe the
-        // window or burn a legit client's budget, a locked-out IP keeps
-        // getting the lockout 429 (Retry-After: 300) rather than a softer
-        // rate-limit 429, and §4.48 lockout accounting is fully settled
-        // before the limiter ever runs. `/healthz` + `/metrics` (public,
+        // auth is deliberate: the knob caps *valid-token* clients,
+        // unauthenticated callers cannot probe the window or burn a
+        // legit client's budget, a locked-out IP keeps getting the
+        // lockout 429 (Retry-After: 300) rather than a softer rate-limit
+        // 429, and lockout accounting is fully settled before the
+        // limiter ever runs. `/healthz` + `/metrics` (public,
         // below) and `/api/cluster/*` (own cluster-token + CIDR gate,
         // machine-to-machine cadence) are exempt by construction — these
         // layers attach to `api_routes` only.
@@ -88,7 +87,7 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
 
     let app = api_routes.merge(public_routes);
 
-    // §4.11-2 — cluster serve endpoints mount on THIS server, under their own
+    // Cluster serve endpoints mount on THIS server, under their own
     // cluster-token auth layer, only when the primary built a `ClusterState`
     // (`cluster.enabled && role == primary && api.enabled`). Absent otherwise,
     // so `/api/cluster/*` 404s exactly like `/metrics` when disabled — no
@@ -185,15 +184,15 @@ mod tests {
             body.contains("purge_warden_uptime_seconds"),
             "expected uptime metric in body, got: {body}"
         );
-        // engine-03 (rev-2606): frozen pin on the new security-refusal
-        // series — scrapers depend on the exact metric name.
+        // Frozen pin on the security-refusal metric series — scrapers
+        // depend on the exact metric name.
         assert!(
             body.contains("purge_warden_refused_security_total"),
             "expected security-refusal metric in body, got: {body}"
         );
     }
 
-    // ── per-IP request rate limit (rev-2606 api-auth-07-03) ──────────
+    // ── per-IP request rate limit ──────────
 
     use axum::extract::connect_info::MockConnectInfo;
     use std::net::SocketAddr;
@@ -268,8 +267,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A rate-limited request must leave §4.48 auth-lockout state clean:
-    /// the 429 comes from the limiter, not from failure accounting.
+    /// A rate-limited request must leave auth-lockout state clean: the
+    /// 429 comes from the limiter, not from failure accounting.
     #[tokio::test]
     async fn rate_limited_request_leaves_auth_state_clean() {
         let (state, token) = test_state_with_rate_limit(1);

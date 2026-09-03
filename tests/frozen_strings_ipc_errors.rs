@@ -544,7 +544,7 @@ fn list_policy_unknown_list_names_profile_and_list() {
 ///
 /// It must name the **verb** that declares the ack, not merely the field:
 /// the old TUI consent gate earned its reputation by telling operators to
-/// set a TOML key the interface gave them no way to set (project rules
+/// set a TOML key the interface gave them no way to set (CLAUDE.md
 /// §Neutrality). It must also name the profile as well as the list — the
 /// ack lives on the list's row, the offence lives in the profile.
 #[test]

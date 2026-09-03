@@ -73,7 +73,7 @@ fn load_ok(master: &Path) -> purge_warden::config::schema::ConfigV1 {
 /// cascade, not the resolution of the target path.
 ///
 /// The upstream address is RFC 5737 TEST-NET-1 — warden ships no provider
-/// defaults (project rules §Neutrality) and a fixture is not a place to
+/// defaults (CLAUDE.md §Neutrality) and a fixture is not a place to
 /// reintroduce one by habit.
 fn write_master(dir: &tempfile::TempDir, body: &str) -> PathBuf {
     let master = dir.path().join("config.toml");

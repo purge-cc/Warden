@@ -271,14 +271,31 @@ impl RuleField {
     }
 }
 
-/// Add one rule to a pack.
+/// What the rule form does to the pack on Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleFormMode {
+    /// Append a line at the end of the file.
+    Add,
+    /// Replace the rule on one file line with what the form holds.
+    ///
+    /// **The rule as it was rendered is carried, not only its line
+    /// number.** The pane's numbers come from the last read, so a write it
+    /// did not see makes line N a different rule; the writer takes these
+    /// as the expectation and refuses on a mismatch rather than editing
+    /// whatever now sits there.
+    Edit {
+        line: usize,
+        was_domain: String,
+        was_allow: bool,
+    },
+}
+
+/// One rule, added or edited.
 ///
-/// **There is no edit-in-place counterpart, and the reason is the writer.**
-/// `add_rule` appends, so changing a rule's domain would have to be a
-/// remove followed by an add — which tears the rule out of the section its
-/// comment heading describes and drops it at the end of the file under an
-/// unrelated one. That is the same argument that keeps a direction-invert
-/// key out, and it holds until a writer exists that substitutes in place.
+/// **One form for both, and the direction flip is the case where only the
+/// selector moves.** A second key that inverted the direction on the spot
+/// would be a write with no preview and no confirm, on the surface where
+/// an accidental `@@` is an exemption for every device on the profile.
 #[derive(Debug, Clone)]
 pub struct RuleForm {
     pub list_id: String,
@@ -287,6 +304,7 @@ pub struct RuleForm {
     pub allow: bool,
     pub focused: RuleField,
     pub error_message: Option<String>,
+    pub mode: RuleFormMode,
 }
 
 impl RuleForm {
@@ -300,6 +318,61 @@ impl RuleForm {
             allow: false,
             focused: RuleField::Domain,
             error_message: None,
+            mode: RuleFormMode::Add,
+        }
+    }
+
+    /// Seeded from the row under the cursor.
+    ///
+    /// The seed is kept twice on purpose: `domain`/`allow` are what the
+    /// operator now edits, the mode holds what they were shown. Reading
+    /// the expectation back out of the editable fields would make it
+    /// agree with any change they typed, which is the whole thing the
+    /// writer checks.
+    pub fn edit(list_id: String, line: usize, domain: String, allow: bool) -> Self {
+        Self {
+            list_id,
+            domain: domain.clone(),
+            allow,
+            focused: RuleField::Domain,
+            error_message: None,
+            mode: RuleFormMode::Edit {
+                line,
+                was_domain: domain,
+                was_allow: allow,
+            },
+        }
+    }
+
+    /// The file line and the rule this form replaces, or `None` on an add.
+    pub fn replacing(&self) -> Option<(usize, &str, bool)> {
+        match &self.mode {
+            RuleFormMode::Add => None,
+            RuleFormMode::Edit {
+                line,
+                was_domain,
+                was_allow,
+            } => Some((*line, was_domain.as_str(), *was_allow)),
+        }
+    }
+
+    /// Whether the form still holds exactly the rule it opened on.
+    ///
+    /// Compared as composed lines rather than as typed text: the domain is
+    /// lowercased on the way to the file, so retyping it in capitals is
+    /// the same rule and must not churn the file's mtime — which the leaf
+    /// reports — or cost a daemon reload. A domain the grammar refuses is
+    /// never "unchanged": the operator has to see the refusal.
+    pub fn is_unchanged(&self) -> bool {
+        let Some((_, was_domain, was_allow)) = self.replacing() else {
+            return false;
+        };
+        match (
+            crate::config::custom_list::compose_line(self.domain.trim(), self.allow),
+            crate::config::custom_list::compose_line(was_domain, was_allow),
+        ) {
+            (Ok(now), Ok(before)) => now == before,
+            _ => false,
         }
     }
 
@@ -311,7 +384,7 @@ impl RuleForm {
         }
     }
 
-    /// The line this form would append, for the preview row.
+    /// The line this form would write, for the preview row.
     ///
     /// Rendered from the same two components `compose_line` uses, so the
     /// operator sees the exact syntax before committing to it.
@@ -454,6 +527,12 @@ impl CustomListModal {
     pub fn open_add_rule(list_id: String) -> Self {
         Self {
             stage: Stage::AddingRule(RuleForm::new(list_id)),
+        }
+    }
+
+    pub fn open_edit_rule(list_id: String, line: usize, domain: String, allow: bool) -> Self {
+        Self {
+            stage: Stage::AddingRule(RuleForm::edit(list_id, line, domain, allow)),
         }
     }
 
@@ -650,7 +729,9 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
 
 fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
     let focus = form.focused;
-    let title = format!("Add rule \u{00b7} {}", form.list_id);
+    let replacing = form.replacing();
+    let verb = if replacing.is_some() { "Edit" } else { "Add" };
+    let title = format!("{verb} rule \u{00b7} {}", form.list_id);
     let mut rows = modal_form::FormRows::new(&title, "one domain, one direction", width);
 
     rows.section("Rule");
@@ -665,7 +746,7 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
             width,
         ),
         d,
-        rule_hint(RuleField::Domain),
+        rule_hint(RuleField::Domain, replacing.is_some()),
         form.domain.chars().count() as u16,
     );
     rows.line(modal_form::value_row(
@@ -683,7 +764,13 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
     // **The exact line, before it is written.** The grammar admits two
     // forms and the operator hand-edits these files, so showing the syntax
     // is what stops `@@` and `||` being guessed at from the direction word.
-    rows.section("Appends");
+    //
+    // On an edit the heading names the file line, which is the number the
+    // pane shows and the one the operator would type into their editor.
+    match replacing {
+        Some((line, _, _)) => rows.section(&format!("Replaces line {line}")),
+        None => rows.section("Appends"),
+    }
     rows.line(modal_form::state_row(
         "line",
         &form.line_preview(),
@@ -692,34 +779,44 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
         width,
     ));
 
+    let edit = replacing.is_some();
     let actions = [
         Action::new(
             "  [Esc] Discard  ",
             focus == RuleField::Cancel,
             ActionKind::Neutral,
-            rule_hint(RuleField::Cancel),
+            rule_hint(RuleField::Cancel, edit),
         ),
         Action::new(
-            "  [Enter] Add  ",
+            if edit {
+                "  [Enter] Save  "
+            } else {
+                "  [Enter] Add  "
+            },
             focus == RuleField::Submit,
             ActionKind::Primary,
-            rule_hint(RuleField::Submit),
+            rule_hint(RuleField::Submit, edit),
         ),
     ];
     let tail = modal_form::form_tail(
         &rows,
         form.error_message.as_deref(),
-        rule_hint(focus),
+        rule_hint(focus, edit),
         KEYS,
         &actions,
     );
     rows.finish(tail)
 }
 
-fn rule_hint(f: RuleField) -> &'static str {
+/// The hint band, which is where the two modes differ in what they promise.
+///
+/// A form that said "appends to the end of the file" while replacing a line
+/// would be describing the writer this one exists to avoid.
+fn rule_hint(f: RuleField, edit: bool) -> &'static str {
     match f {
         RuleField::Domain => "a bare domain — no wildcard, no regex, no path",
         RuleField::Direction => "deny blocks it; allow exempts it from every list",
+        RuleField::Submit if edit => "Enter replaces that line and nothing else",
         RuleField::Submit => "Enter appends the line to the end of the file",
         RuleField::Cancel => "discard and close (also Esc)",
     }
@@ -1163,5 +1260,142 @@ mod tests {
         let spec = mount_spec(&p);
         assert_eq!(spec.choices[0].detail, None, "unchanged row says nothing");
         assert_eq!(spec.choices[1].detail.as_deref(), Some("will mount"));
+    }
+
+    fn dump(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render(modal: &CustomListModal, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_overlay(f, f.area(), modal)).unwrap();
+        dump(term.backend().buffer())
+    }
+
+    fn edit_form(domain: &str, allow: bool) -> RuleForm {
+        RuleForm::edit("videogames".to_string(), 7, domain.to_string(), allow)
+    }
+
+    /// The form opens on the rule under the cursor, and keeps what it was
+    /// shown separately from what the operator now edits.
+    #[test]
+    fn an_edit_seeds_the_form_and_remembers_the_rule_it_opened_on() {
+        let mut f = edit_form("tracking.example.com", false);
+        assert_eq!(f.domain, "tracking.example.com");
+        assert!(!f.allow);
+        assert_eq!(f.replacing(), Some((7, "tracking.example.com", false)));
+
+        // Editing the fields must not move the expectation: it is what the
+        // writer checks the file against.
+        f.domain = "other.example.com".to_string();
+        f.allow = true;
+        assert_eq!(f.replacing(), Some((7, "tracking.example.com", false)));
+    }
+
+    #[test]
+    fn an_add_replaces_nothing_and_is_never_unchanged() {
+        let f = RuleForm::new("videogames".to_string());
+        assert_eq!(f.replacing(), None);
+        assert!(
+            !f.is_unchanged(),
+            "an add has nothing to be unchanged against"
+        );
+    }
+
+    /// A no-op save must not rewrite the file: it would churn the mtime the
+    /// leaf reports and cost a daemon reload for nothing. Case is not a
+    /// change — the domain is lowercased on the way to the file.
+    #[test]
+    fn only_a_real_change_counts_as_changed() {
+        assert!(edit_form("d.example.com", false).is_unchanged());
+
+        let mut same_case = edit_form("d.example.com", false);
+        same_case.domain = "D.Example.COM".to_string();
+        assert!(
+            same_case.is_unchanged(),
+            "case alone is not a change; the file stores it lowercased"
+        );
+
+        let mut flipped = edit_form("d.example.com", false);
+        flipped.allow = true;
+        assert!(!flipped.is_unchanged(), "a direction flip is a change");
+
+        let mut renamed = edit_form("d.example.com", false);
+        renamed.domain = "e.example.com".to_string();
+        assert!(!renamed.is_unchanged());
+
+        // A domain the grammar refuses is not "unchanged" — that would
+        // swallow the refusal the operator has to see.
+        let mut bad = edit_form("d.example.com", false);
+        bad.domain = "*.d.example.com".to_string();
+        assert!(!bad.is_unchanged());
+    }
+
+    /// **The body has to carry the seed, not only the state.** A form
+    /// seeded correctly and rendered from the wrong half is invisible to
+    /// every handler test.
+    #[test]
+    fn the_edit_body_shows_the_seeded_rule_and_the_line_it_replaces() {
+        let modal = CustomListModal::open_edit_rule(
+            "videogames".to_string(),
+            7,
+            "d.example.com".into(),
+            true,
+        );
+        let out = render(&modal, 80, 30);
+
+        assert!(out.contains("Edit rule"), "title must say edit:\n{out}");
+        assert!(
+            !out.contains("Add rule"),
+            "the add title must be gone:\n{out}"
+        );
+        assert!(out.contains("videogames"), "the list must be named:\n{out}");
+        assert!(
+            out.contains("d.example.com"),
+            "the domain must be seeded:\n{out}"
+        );
+        assert!(
+            out.contains("allow"),
+            "the direction must be seeded:\n{out}"
+        );
+        assert!(
+            out.contains("@@||d.example.com^"),
+            "the exact line must be previewed:\n{out}"
+        );
+        // The band upper-cases its label, so the assertion reads the
+        // rendered form: a state-level check would pass on a body that
+        // never drew it.
+        assert!(
+            out.contains("REPLACES LINE 7"),
+            "the file line being replaced must be stated:\n{out}"
+        );
+        assert!(
+            out.contains("[Enter] Save"),
+            "the action must not read Add:\n{out}"
+        );
+        assert!(
+            !out.contains("APPENDS"),
+            "an edit must not promise an append:\n{out}"
+        );
+    }
+
+    /// The add body is the same form, and must keep saying what IT does.
+    #[test]
+    fn the_add_body_still_promises_an_append() {
+        let modal = CustomListModal::open_add_rule("videogames".to_string());
+        let out = render(&modal, 80, 30);
+        assert!(out.contains("Add rule"), "{out}");
+        assert!(out.contains("APPENDS"), "{out}");
+        assert!(out.contains("[Enter] Add"), "{out}");
+        assert!(!out.contains("REPLACES LINE"), "{out}");
     }
 }

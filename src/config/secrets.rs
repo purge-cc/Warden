@@ -1,4 +1,4 @@
-//! Secrets file loader (Sprint 32, N9).
+//! Secrets file loader.
 //!
 //! Holds API tokens, DoH credentials and any other value that must not be
 //! merged into the main config output. The file is loaded separately from
@@ -13,7 +13,7 @@
 //! doh-creds       = "user:pass"
 //! ```
 //!
-//! Loader guarantees (design doc §10 + §13-Sprint-32 step 2):
+//! Loader guarantees:
 //!
 //! - **Permissions enforced at load time.** Anything wider than `0600` is a
 //!   hard error; the operator must `chmod 0600` before the daemon will boot.
@@ -41,16 +41,16 @@ use super::error::{ConfigError, ErrorContext};
 pub const REQUIRED_MODE: u32 = 0o600;
 
 /// Canonical filename for the secrets file when living next to the master
-/// config. Pre-S34 the whole tree is monolithic in `/var/lib/purge-warden/`;
-/// post-S34 it lives under `/etc/purge-warden/`. The loader accepts either
-/// via [`secrets_path_for`].
+/// config. One layout keeps the whole tree monolithic in
+/// `/var/lib/purge-warden/`; another keeps it under `/etc/purge-warden/`.
+/// The loader accepts either via [`secrets_path_for`].
 pub const SECRETS_FILENAME: &str = "secrets.toml";
 
 /// Resolved secrets table. Opaque to callers: lookup by name, never
 /// enumerated outside the module that loaded it.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Secrets {
-    /// rev-2606 secrets-03: values are [`Zeroizing<String>`], so the token
+    /// Values are [`Zeroizing<String>`], so the token
     /// bytes are overwritten when the map drops instead of being left in
     /// freed heap where a core dump or a later allocation can expose them.
     /// `Zeroizing` derefs to `String`, so every reader below is unchanged.
@@ -62,7 +62,7 @@ pub struct Secrets {
     loaded: bool,
 }
 
-/// secrets-01 (rev-2606 §05): redact values in `Debug`. The derived impl
+/// Redact values in `Debug`. The derived impl
 /// printed every `entries` value verbatim, so a stray `{:?}` — a
 /// containing struct's derive, an error context, a
 /// `tracing::debug!(?secrets)` — would dump every token, contradicting
@@ -122,8 +122,8 @@ impl Secrets {
 }
 
 /// Build the canonical secrets path from a master config path. On the
-/// pre-S34 monolithic CT layout (`/var/lib/purge-warden/config.toml`) this
-/// returns `/var/lib/purge-warden/secrets.toml`; post-S34
+/// monolithic layout (`/var/lib/purge-warden/config.toml`) this
+/// returns `/var/lib/purge-warden/secrets.toml`; on the split layout
 /// (`/etc/purge-warden/config.toml`) it returns
 /// `/etc/purge-warden/secrets.toml`.
 pub fn secrets_path_for(master: &Path) -> PathBuf {
@@ -139,7 +139,7 @@ pub fn secrets_path_for(master: &Path) -> PathBuf {
 /// [`ConfigError::ValidationFailed`] with file context so the operator
 /// sees the exact next step.
 pub fn load_secrets(path: &Path) -> Result<Secrets, ConfigError> {
-    // secrets-02 (rev-2606 §05): open ONCE with `O_NOFOLLOW`, then fstat +
+    // Open ONCE with `O_NOFOLLOW`, then fstat +
     // read the SAME fd. The previous `metadata(path)` → `read_to_string(path)`
     // pair followed symlinks on both calls and left a TOCTOU window between
     // the 0600 mode gate and the read (the path could be swapped in between).
@@ -207,7 +207,7 @@ pub fn load_secrets(path: &Path) -> Result<Secrets, ConfigError> {
         ));
     }
 
-    // secrets-03: the raw buffer holds EVERY secret in cleartext, so it is
+    // The raw buffer holds EVERY secret in cleartext, so it is
     // zeroized on drop just like the parsed values. Wrapping only the map
     // would leave the whole file's material in freed heap — the larger of
     // the two exposures, and the easier one to overlook.
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(s, Secrets::default());
     }
 
-    // secrets-01: the hand-written Debug must surface the shape, never a
+    // The hand-written Debug must surface the shape, never a
     // value (or even a key name).
     #[test]
     fn debug_redacts_secret_values() {
@@ -485,7 +485,7 @@ mod tests {
         );
     }
 
-    // secrets-02: O_NOFOLLOW refuses a symlinked secrets path.
+    // O_NOFOLLOW refuses a symlinked secrets path.
     #[test]
     fn refuses_symlinked_secrets() {
         let target = tmp_path("real-secrets.toml");

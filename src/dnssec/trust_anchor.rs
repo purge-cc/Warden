@@ -13,10 +13,10 @@
 //! As of this writing two KSKs are simultaneously published and valid:
 //! KSK-2017 (key tag 20326) and KSK-2024 (key tag 38696). Both are embedded.
 //! The set shape, the [`RootTrustAnchors::push`] mutator, and the per-anchor
-//! `valid_from` / `valid_until` metadata are what make future automated
-//! rollover representable. **Sprint 1 implements the *representation* only** —
-//! there is no add / hold-down / revoke timing logic yet (that is a later
-//! sprint), and `valid_from` / `valid_until` are informational.
+//! `valid_from` / `valid_until` metadata make future automated rollover
+//! representable. Today only the representation exists: there is no add /
+//! hold-down / revoke timing logic, so `valid_from` / `valid_until` are
+//! informational only.
 
 use hickory_proto::dnssec::rdata::DS;
 use hickory_proto::dnssec::{Algorithm, DigestType};
@@ -32,17 +32,16 @@ pub struct RootTrustAnchor {
     pub digest_type: DigestType,
     /// The DS digest bytes (32 bytes for SHA-256).
     pub digest: Vec<u8>,
-    /// IANA `validFrom` (ISO-8601). Informational in Sprint 1 — rollover timing
-    /// is a later sprint.
+    /// IANA `validFrom` (ISO-8601). Informational only — not enforced by any
+    /// rollover timing logic.
     pub valid_from: &'static str,
-    /// IANA `validUntil`; `None` = no scheduled retirement. Informational in
-    /// Sprint 1.
+    /// IANA `validUntil`; `None` = no scheduled retirement. Informational only.
     pub valid_until: Option<&'static str>,
 }
 
 impl RootTrustAnchor {
-    /// This anchor as a hickory [`DS`] record, for DNSKEY matching in a later
-    /// validation sprint (`DS::covers(name, &dnskey)`).
+    /// This anchor as a hickory [`DS`] record, for DNSKEY matching
+    /// (`DS::covers(name, &dnskey)`).
     pub fn to_ds(&self) -> DS {
         DS::new(
             self.key_tag,
@@ -109,8 +108,7 @@ impl RootTrustAnchors {
         self.0.iter().find(|a| a.key_tag == key_tag)
     }
 
-    /// Add an anchor (e.g. a future rollover successor). The rollover *timing*
-    /// logic is a later sprint; this is the set-mutation primitive it builds on.
+    /// Add an anchor (e.g. a future rollover successor).
     pub fn push(&mut self, anchor: RootTrustAnchor) {
         self.0.push(anchor);
     }

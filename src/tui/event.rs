@@ -241,8 +241,8 @@ mod tests {
     /// outcomes.
     ///
     /// Two environment hazards, both measured rather than assumed. Neither is a
-    /// defect in `poll_hangup`; the rev-2607 pty smoke proved the watchdog
-    /// itself sound against a real closed pty.
+    /// defect in `poll_hangup`; a pty smoke test proved the watchdog itself
+    /// sound against a real closed pty.
     ///
     /// 1. A `libc::pipe` fd carries no `O_CLOEXEC`, so any `fork`+`exec`
     ///    elsewhere in this test binary — `tar` in the config backup/restore

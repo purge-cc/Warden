@@ -1,9 +1,9 @@
-//! Sprint 38 QLP8 — `warden reload` standalone subcommand.
+//! `warden reload` standalone subcommand.
 //!
-//! Shares the Sprint 36 HR1 *classifier* ([`super::ipc_reload::attempt_reload`])
-//! but **not** its reporter. Makes the forward-referenced S37 §3 D4 frozen
-//! message ("run `warden reload`") honest — operators can drive an IPC
-//! reload without a dummy mutating command.
+//! Shares the *classifier* ([`super::ipc_reload::attempt_reload`]) but
+//! **not** its reporter. Makes the frozen message ("run `warden reload`")
+//! honest — operators can drive an IPC reload without a dummy mutating
+//! command.
 //!
 //! The command auto-discovers the current token via the shared helper, so
 //! an operator whose IPC auth gate is correctly set up only ever types
@@ -12,7 +12,7 @@
 //! # Why this command does not use `report_reload_outcome`
 //!
 //! [`super::ipc_reload::report_reload_outcome`] is the **post-write tail**:
-//! roughly forty mutating verbs (`warden device set …`, every S34 entity
+//! roughly forty mutating verbs (`warden device set …`, every entity
 //! editor) call it *after* an atomic write has already landed on disk. For
 //! those, the reload is a courtesy — so `DaemonUnreachable` is a legitimate
 //! success ("change will take effect on next start", exit 0) and all four
@@ -20,7 +20,7 @@
 //!
 //! For `warden reload` the reload **is** the operation. No change landed on
 //! disk; there is no next-start consolation. Every one of the four shared
-//! strings is factually wrong here — before this sprint, `warden reload`
+//! strings is factually wrong here — previously, `warden reload`
 //! with no token printed *"change landed on disk but no admin token is
 //! available"*, describing a write that never happened.
 //!
@@ -28,7 +28,7 @@
 //! shared because "did the daemon accept the reload?" is one question with
 //! one answer; the reporting and the exit code are local because the same
 //! answer means opposite things to the two callers. The shared strings are
-//! frozen and untouched — see `_docs/features/config_safety_v12.md` §2 HR1.
+//! frozen and untouched.
 //!
 //! Exit codes: [`SUCCESS`] when the daemon reloaded, [`FAILURE`] otherwise
 //! (unreachable, no token, or refused) — a reload that did not happen is a
@@ -109,10 +109,10 @@ mod tests {
 
     /// The headline fix: a reload that did not happen must not exit 0.
     ///
-    /// The socket is absent, so the S36 classifier yields
+    /// The socket is absent, so the classifier yields
     /// `DaemonUnreachable` (or `NoToken`, if the running user has no
     /// token file — either way the reload did not happen). Both map to
-    /// [`FAILURE`]. Before this sprint the wrapper returned `Ok(())`
+    /// [`FAILURE`]. Previously the wrapper returned `Ok(())`
     /// unconditionally and a systemd `ExecReload=` or a deploy script
     /// read "reloaded" from a daemon that was not running.
     #[tokio::test]
@@ -128,8 +128,8 @@ mod tests {
         );
     }
 
-    /// Sprint 38 QLP8: the wrapper dispatches through the same
-    /// `attempt_reload` classifier every S36 editor uses. Pinning this
+    /// The wrapper dispatches through the same
+    /// `attempt_reload` classifier every editor uses. Pinning this
     /// keeps the *detection* of the daemon state in one place even
     /// though the reporting has deliberately diverged.
     #[tokio::test]
@@ -163,7 +163,7 @@ mod tests {
         );
     }
 
-    /// The separation this sprint had to protect. `warden reload` must
+    /// The separation this module protects. `warden reload` must
     /// NOT speak the post-write family's vocabulary: for those forty
     /// callers a write already landed, so "change will take effect on
     /// next start" is a legitimate success. Here nothing was written,

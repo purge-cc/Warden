@@ -15,6 +15,7 @@
 //! §5 sync model).
 
 pub mod apply;
+pub mod certgen;
 pub mod dto;
 pub mod observe;
 pub mod pinned;

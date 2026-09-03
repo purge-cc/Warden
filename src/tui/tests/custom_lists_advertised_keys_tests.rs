@@ -159,3 +159,39 @@ fn every_key_the_custom_lists_footer_advertises_is_bound() {
              the footer"
     );
 }
+
+/// **The rule pane's legend has to FIT.**
+///
+/// Advertising a key is only half the promise: a token clipped by the
+/// right edge is a key the operator cannot read, and 80 columns is the
+/// narrowest terminal this TUI supports. The rule pane's cluster runs
+/// closest to that edge, and it grew by one key.
+#[test]
+fn the_rule_pane_legend_fits_eighty_columns() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    app.active_leaf = Leaf::CustomLists;
+    app.custom_lists.focus = CustomListsFocus::Rules;
+    let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+    term.draw(|f| crate::tui::ui::render_footer_for_test(f, f.area(), &app))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut line = String::new();
+    for x in 0..buf.area.width {
+        line.push_str(buf[(x, 0)].symbol());
+    }
+
+    for token in [
+        "[a] add rule",
+        "[e] edit rule",
+        "[d] remove rule",
+        "[Esc] lists",
+    ] {
+        assert!(
+            line.contains(token),
+            "{token} is clipped or missing at 80 columns:\n{line}"
+        );
+    }
+}

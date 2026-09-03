@@ -203,9 +203,9 @@ mod tests {
 
     #[test]
     fn days_to_date_matches_time_crate_across_boundaries() {
-        // stats-01: validate the hand-rolled Hinnant civil-calendar algorithm
-        // against the `time` crate oracle across epoch, leap days, a div-400
-        // leap century (2000), and a non-leap century (2100).
+        // Validate the hand-rolled Hinnant civil-calendar algorithm against
+        // the `time` crate oracle across epoch, leap days, a div-400 leap
+        // century (2000), and a non-leap century (2100).
         let cases: [i64; 6] = [
             0,             // 1970-01-01 (epoch)
             946_684_800,   // 2000-01-01

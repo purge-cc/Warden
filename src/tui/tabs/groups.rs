@@ -1,34 +1,25 @@
-//! Groups tab — read-only view of `[[groups]]` (§4.64 G1).
+//! Groups tab — read-only view of `[[groups]]`.
 //!
-//! `[[groups]]` has been a first-class config entity with a full CLI
-//! surface since S33 and had **zero** TUI surface until this leaf. The
-//! only contact point was `DeviceFormField::Group`, a picker seeded from
-//! the loaded config — and `open_field_picker` no-ops on an empty option
-//! list, so on a config with no groups that field was dead by
-//! construction and no TUI path could create the first group.
+//! `[[groups]]` is a first-class config entity with a full CLI surface;
+//! this leaf is its TUI surface. The only other contact point is
+//! `DeviceFormField::Group`, a picker seeded from the loaded config —
+//! and `open_field_picker` no-ops on an empty option list, so on a
+//! config with no groups that field is dead by construction and no
+//! TUI path could create the first group without this leaf.
 //!
-//! **G1 made groups visible; G2 made them writable.** *This module* still
-//! holds no write path and issues no IPC — it renders. The `a`/`e`/`d`
-//! modal, its submit path and the two writers behind it all live in
-//! `tui/mod.rs` and `tui/group_modal.rs`. The source here is
-//! `app.loaded_config`, read from disk: the same offline cohort the
-//! Subnets/Profiles/Rules leaves belong to, and G2 did not change that —
-//! it re-reads that field after a successful write rather than adding a
-//! poller.
+//! *This module* still holds no write path and issues no IPC — it
+//! renders. The `a`/`e`/`d` modal, its submit path and the two writers
+//! behind it all live in `tui/mod.rs` and `tui/group_modal.rs`. The
+//! source here is `app.loaded_config`, read from disk: the same
+//! offline cohort the Subnets/Profiles/Rules leaves belong to. A
+//! successful write re-reads that field rather than adding a poller.
 //!
 //! ## The distinction this view exists to make legible
 //!
-//! A group is **policy**, not vocabulary. Two of its six fields carry
-//! semantics an operator routinely conflates, so the detail card names
-//! both:
-//!
-//! - `profile` + `priority` — **selection**. A device in several groups
-//!   resolves ONE profile: the highest-priority group wins (DM2). A tie
-//!   between different profiles is a validator error, not a coin flip.
-//! - `tags` — **union**. The same device collects the tags of *every*
-//!   group it belongs to. `priority` is deliberately not consulted:
-//!   restricting the contribution to the winning group would make
-//!   re-ordering two groups silently drop a blocklist.
+//! A group carries exactly one `profile`, and `priority` is the tiebreak
+//! when a device is in several. Nothing about a group is merged across
+//! memberships — the highest-priority group wins outright, and a tie
+//! between different profiles is a validator error, not a coin flip.
 //!
 //! ## Membership is bidirectional — and this view used to read one side
 //!
@@ -36,17 +27,18 @@
 //! device **or** `[[devices]].groups` names the group. Neither side is
 //! canonical and symmetry is not required: the resolver unions both
 //! ([`groups_for_device`](crate::profiles::profile::groups_for_device))
-//! and so does the validator's DM2 conflict check
+//! and so does the validator's conflict check
 //! (`check_group_priority_conflicts`).
 //!
-//! Until §4.64 G5 this view read `g.devices` literally. That is the side
-//! the TUI does **not** write: the Devices form writes `[[devices]].groups`,
-//! so once G4 made multi-group membership editable there, every membership
-//! an operator created read back as `Members 0 device(s)`. Measured on the
-//! CT by pty-smoke 2026-08-06 — a device in three groups, all three
-//! reporting zero. No unit test could have caught it: a fixture that builds
-//! a `Group` by hand never crosses the device side and so cannot express
-//! the relation, let alone fail on it.
+//! This view must not read `g.devices` alone: that is the side the TUI
+//! does **not** write, since the Devices form writes
+//! `[[devices]].groups`. Reading only `g.devices` makes every
+//! membership an operator creates from the Devices form read back as
+//! `Members 0 device(s)` — a device in several groups, all reporting
+//! zero. No unit test can catch that by accident: a fixture that
+//! builds a `Group` by hand never crosses the device side and so
+//! cannot express the relation, let alone fail on it — hence the union
+//! read above, and a live pty-smoke test rather than a unit fixture.
 //!
 //! The two sides are **not** interchangeable to the operator, because they
 //! are edited in different places — so the member list marks each one.
@@ -58,13 +50,18 @@
 //!   ID          DISPLAY NAME        PROFILE     PRI  DEVICES │ iot-strict
 //!   iot-strict  IoT devices         iot-strict   10    7     │ Profile   iot-strict  (priority 10)
 //!   kids        Kids' phones        kids-safe     0    3     │ Members   7 device(s)
-//!                                                            │ Tags      iot, no-telemetry
 //!                                                            │
 //!                                                            │ Members
 //!                                                            │   hue-bulb-1  (group-side)
-//!                                                            │   alex-laptop  (device-side)
+//!                                                            │   edo-laptop  (device-side)
 //!                                                            │   living-tv   (both sides)
 //! ```
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_groups_key` (the `a`/`e`/`d` modal named above)
+//! - Form:  `tui::group_modal` (named above)
+//! - State: `app::GroupsState` (cursor, the modal, table viewport)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -84,16 +81,14 @@ const NARROW_THRESHOLD: u16 = 100;
 
 /// Shown when the config parsed but declares no groups.
 ///
-/// G1 pointed at `warden group add` because the leaf was read-only and no
-/// TUI path could create the first group. §4.64 G2 built that path, and
 /// `handle_groups_key` runs `a` **above** its empty-list guard precisely
-/// so it works here — so the hint names the key. The CLI still works;
-/// what changed is that it is no longer the only route, and copy that
-/// sends an operator to a terminal they already left is copy that has
-/// gone stale.
+/// so it works here — so the hint names the key rather than pointing at
+/// `warden group add`. The CLI still works, but copy that sends an
+/// operator to a terminal they already left is copy that has gone
+/// stale.
 pub const EMPTY_HINT: &str = "  press a to add the first group";
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         render_no_config(f, area);
         return;
@@ -115,7 +110,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if outer.width < NARROW_THRESHOLD {
         // Single-column fallback: the operator still sees every group;
         // the detail card returns when they widen the terminal.
-        render_master(f, outer, app, groups, devices);
+        render_master(
+            f,
+            outer,
+            groups,
+            devices,
+            app.groups.selected_id.as_deref(),
+            &mut app.groups.table_state,
+        );
         return;
     }
 
@@ -126,7 +128,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(outer);
 
-    render_master(f, cols[0], app, groups, devices);
+    render_master(
+        f,
+        cols[0],
+        groups,
+        devices,
+        app.groups.selected_id.as_deref(),
+        &mut app.groups.table_state,
+    );
     render_detail(f, cols[2], app, groups, devices);
     draw_v_divider(f, cols[1]);
 }
@@ -206,7 +215,14 @@ fn member_count(g: &Group, devices: &[Device]) -> usize {
 
 // ── Master pane ──────────────────────────────────────────────────────
 
-fn render_master(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices: &[Device]) {
+fn render_master(
+    f: &mut Frame,
+    area: Rect,
+    groups: &[Group],
+    devices: &[Device],
+    selected_id: Option<&str>,
+    table_state: &mut TableState,
+) {
     let header = Row::new(vec![
         Cell::from("ID"),
         Cell::from("DISPLAY NAME"),
@@ -234,17 +250,12 @@ fn render_master(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices
         .collect();
 
     // Resolve the selection back to an index every frame rather than
-    // carrying one across frames: an index survives a config reload that
-    // reorders or removes rows and then points at the wrong group.
-    // Mirrors Profiles (`prof-03`) and Subnets (`sub-01`); the scroll
-    // offset is left to ratatui to derive from `select()` for the same
-    // reason.
-    let mut table_state = TableState::default();
-    if let Some(idx) = resolve_selected_index(groups, app.groups.selected_id.as_deref()) {
-        table_state.select(Some(idx));
-    } else if !rows.is_empty() {
-        table_state.select(Some(0));
-    }
+    // trusting one carried over: a config reload can reorder or remove
+    // rows, and a stale index then points at the wrong group. The scroll
+    // offset persists regardless (see `tabs::subnets::render_master` for
+    // why that is safe across a row-count change).
+    let selected =
+        resolve_selected_index(groups, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
 
     let table = Table::new(
         rows,
@@ -259,7 +270,7 @@ fn render_master(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices
     .header(header)
     .row_highlight_style(theme::highlight_style());
 
-    f.render_stateful_widget(table, area, &mut table_state);
+    super::render_table(f, area, table, table_state, selected);
 }
 
 /// Index of `selected_id` in the current group list, or `None` when the
@@ -493,9 +504,9 @@ mod tests {
     /// passes even when the text is clipped off screen, which is exactly
     /// the failure an empty-state is supposed to prevent.
     ///
-    /// §4.64 G2 moved the answer from the CLI verb to the `a` key, and
-    /// the assertion moved with it. The pairing matters: `handle_groups_key`
-    /// runs `a` above its empty-list guard so the key genuinely works from
+    /// The hint names the `a` key, not the CLI verb, and the assertion
+    /// below checks that claim directly. The pairing matters:
+    /// `handle_groups_key` runs `a` above its empty-list guard so the key genuinely works from
     /// this exact state. If that guard is ever reordered, this copy
     /// becomes a lie that no compiler catches — see
     /// `groups_add_opens_on_an_empty_config` in `tui/mod.rs`, which pins
@@ -544,7 +555,7 @@ mod tests {
         );
     }
 
-    // ── §4.64 G5 — the bidirectional membership union ────────────────
+    // ── The bidirectional membership union ────────────────────────────
     //
     // Every fixture below declares the membership on the DEVICE side and
     // leaves `Group::devices` EMPTY. That asymmetry is the test: a
@@ -555,7 +566,7 @@ mod tests {
     #[test]
     fn a_device_side_only_membership_is_counted() {
         let g = group("phones", "p", 0, &[]);
-        let devices = vec![device("alex-laptop", &["phones"])];
+        let devices = vec![device("edo-laptop", &["phones"])];
         assert_eq!(
             member_count(&g, &devices),
             1,
@@ -567,8 +578,8 @@ mod tests {
 
     #[test]
     fn a_symmetric_membership_is_counted_once() {
-        let g = group("phones", "p", 0, &["alex-laptop"]);
-        let devices = vec![device("alex-laptop", &["phones"])];
+        let g = group("phones", "p", 0, &["edo-laptop"]);
+        let devices = vec![device("edo-laptop", &["phones"])];
         assert_eq!(
             member_count(&g, &devices),
             1,
@@ -640,14 +651,20 @@ mod tests {
         use ratatui::Terminal;
 
         let groups = vec![group("phones", "p", 0, &[])];
-        let devices = vec![
-            device("alex-laptop", &["phones"]),
-            device("tv", &["phones"]),
-        ];
-        let app = App::default();
+        let devices = vec![device("edo-laptop", &["phones"]), device("tv", &["phones"])];
+        let mut app = App::default();
         let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
-        term.draw(|f| render_master(f, f.area(), &app, &groups, &devices))
-            .unwrap();
+        term.draw(|f| {
+            render_master(
+                f,
+                f.area(),
+                &groups,
+                &devices,
+                app.groups.selected_id.as_deref(),
+                &mut app.groups.table_state,
+            )
+        })
+        .unwrap();
         let dump = term.backend().to_string();
         // Read the cell by the header's column offset. A substring probe
         // is not usable here: `PRI` is 0 in this fixture, so `" 0 "`
@@ -685,7 +702,7 @@ mod tests {
         use ratatui::Terminal;
 
         let groups = vec![group("phones", "p", 0, &[])];
-        let devices = vec![device("alex-laptop", &["phones"])];
+        let devices = vec![device("edo-laptop", &["phones"])];
         let app = App::default();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render_detail(f, f.area(), &app, &groups, &devices))
@@ -696,7 +713,7 @@ mod tests {
             "the Members row must count the device side; got:\n{dump}"
         );
         assert!(
-            dump.contains("alex-laptop"),
+            dump.contains("edo-laptop"),
             "a counted member missing from the list is worse than a \
              wrong count; got:\n{dump}"
         );
@@ -720,8 +737,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let groups = vec![group("phones", "p", 0, &["alex-laptop"])];
-        let devices = vec![device("alex-laptop", &["phones"])];
+        let groups = vec![group("phones", "p", 0, &["edo-laptop"])];
+        let devices = vec![device("edo-laptop", &["phones"])];
         let app = App::default();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render_detail(f, f.area(), &app, &groups, &devices))
@@ -745,8 +762,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let groups = vec![group("phones", "p", 0, &["alex-laptop"])];
-        let devices = vec![device("alex-laptop", &[])];
+        let groups = vec![group("phones", "p", 0, &["edo-laptop"])];
+        let devices = vec![device("edo-laptop", &[])];
         let app = App::default();
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render_detail(f, f.area(), &app, &groups, &devices))

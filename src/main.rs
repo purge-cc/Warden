@@ -26,9 +26,10 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
             | cli::Commands::Init { .. }
             | cli::Commands::Resolve { .. }
             // `lists refresh` (ex-`warden update`) drives the daemon over
-            // SIGHUP, not IPC — it never reads `socket_path`. The rest of
-            // the `lists` family does (`forget`), so the skip is scoped to
-            // this one action rather than the whole subcommand.
+            // SIGHUP, not IPC — it never reads `socket_path`. Every other
+            // `lists` action does: `forget` over IPC, and the rest to ask
+            // whether the corpus is frozen. So the skip is scoped to this
+            // one action rather than the whole subcommand.
             | cli::Commands::Lists {
                 action: cli::ListsAction::Refresh
             }
@@ -52,6 +53,7 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
                 action: cli::ClusterAction::Token
                     | cli::ClusterAction::Join { .. }
                     | cli::ClusterAction::Leave { .. }
+                    | cli::ClusterAction::Enable { .. }
             }
     )
 }
@@ -132,9 +134,8 @@ async fn main() -> anyhow::Result<()> {
             safe_mode,
         } => {
             // Safe mode bypasses every on-disk config file and runs a
-            // hardcoded minimum-risk configuration — see design doc §11.5
-            // and `cli::commands::start::safe_mode_config` for the exact
-            // shape.
+            // hardcoded minimum-risk configuration — see
+            // `cli::commands::start::safe_mode_config` for the exact shape.
             let (config, custom_lists) = if safe_mode {
                 print_safe_mode_banner();
                 (
@@ -156,13 +157,13 @@ async fn main() -> anyhow::Result<()> {
                         for err in &errs {
                             eprintln!("  - {err}");
                         }
-                        // rev2606 target-01: CLI/IPC mutations are now
-                        // validated against the merged tree BEFORE the rename
-                        // (target::write_value_validated), so a killed mutation
-                        // can no longer leave a cross-reference-invalid tree.
-                        // A start-time load failure here therefore means a
-                        // hand-edited or externally-corrupted config — point
-                        // the operator at the recovery tooling regardless.
+                        // CLI/IPC mutations are validated against the merged
+                        // tree before the rename (target::write_value_validated),
+                        // so a killed mutation can no longer leave a
+                        // cross-reference-invalid tree. A start-time load
+                        // failure here therefore means a hand-edited or
+                        // externally-corrupted config — point the operator at
+                        // the recovery tooling regardless.
                         eprintln!(
                             "\nrun `warden config lint` to see the actionable fixes, then \
                              restart. To bring the daemon up on a known-good fallback while \
@@ -185,11 +186,11 @@ async fn main() -> anyhow::Result<()> {
                     lists,
                     update_interval,
                 )?;
-                // rev-2606 init-01: `--listen` lands AFTER the load-time
-                // validator ran, so the open-resolver refusal (unspecified
-                // bind + empty allow_from) must be re-asserted on the flag
-                // path — otherwise `warden start --listen 0.0.0.0:53` on a
-                // loopback-shaped config silently answers the world.
+                // `--listen` lands after the load-time validator ran, so the
+                // open-resolver refusal (unspecified bind + empty allow_from)
+                // must be re-asserted on the flag path — otherwise
+                // `warden start --listen 0.0.0.0:53` on a loopback-shaped
+                // config silently answers the world.
                 // `binds_every_interface`, not `is_unspecified`: the
                 // IPv4-mapped wildcard `[::ffff:0.0.0.0]` binds every
                 // interface but is not "unspecified", so the plain check
@@ -293,10 +294,10 @@ async fn main() -> anyhow::Result<()> {
                 cli::commands::lists::run_add(&config_path, &socket_path, &source).await?;
             }
             cli::ListsAction::Remove { source } => {
-                cli::commands::lists::run_remove(&config_path, &source)?;
+                cli::commands::lists::run_remove(&config_path, &socket_path, &source).await?;
             }
             cli::ListsAction::List => {
-                cli::commands::lists::run_list(&config_path)?;
+                cli::commands::lists::run_list(&config_path, &socket_path).await?;
             }
             cli::ListsAction::Show => {
                 cli::commands::lists_knobs::run_show(&config_path, &socket_path).await?;
@@ -312,7 +313,8 @@ async fn main() -> anyhow::Result<()> {
                 cli::exit_codes::exit_with(code);
             }
             cli::ListsAction::Catalog { scope } => {
-                cli::commands::lists::run_catalog(&config_path, scope.as_deref()).await?;
+                cli::commands::lists::run_catalog(&config_path, &socket_path, scope.as_deref())
+                    .await?;
             }
             cli::ListsAction::Forget { source } => {
                 cli::commands::lists::run_forget(&socket_path, &source).await?;
@@ -1087,11 +1089,9 @@ async fn main() -> anyhow::Result<()> {
         },
 
         cli::Commands::FirewallRules => {
-            // §4.41: v1 loader replaces the v0 `Settings::from_file`.
-            // `ConfigV1` derives `Default`, so a missing or broken
-            // config still falls back to the default listen address —
-            // preserving the lenient behaviour the v0
-            // `.unwrap_or_default()` had here.
+            // `ConfigV1` derives `Default`, so a missing or broken config
+            // still falls back to the default listen address rather than
+            // failing this command outright.
             let listen = config::loader::load_config(&config_path, time::OffsetDateTime::now_utc())
                 .map(|loaded| loaded.config)
                 .unwrap_or_default()
@@ -1101,9 +1101,9 @@ async fn main() -> anyhow::Result<()> {
         }
 
         cli::Commands::Token { action } => {
-            // Sprint 35 CS3: token commands operate on the v1 master
-            // and optionally trigger a hot IPC reload. We need both a
-            // plaintext location and the daemon socket.
+            // Token commands operate on the v1 master and optionally
+            // trigger a hot IPC reload, so we need both a plaintext
+            // location and the daemon socket.
             let token_path =
                 purge_warden::ipc::auth_token::default_token_path().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1138,6 +1138,20 @@ async fn main() -> anyhow::Result<()> {
                     token.as_deref(),
                     token_file.as_deref(),
                     peer_cert.as_deref(),
+                )?;
+            }
+            cli::ClusterAction::Enable {
+                role,
+                sans,
+                api_listen,
+                validity_days,
+            } => {
+                cli::commands::cluster::run_enable(
+                    &config_path,
+                    role,
+                    &sans,
+                    api_listen,
+                    validity_days,
                 )?;
             }
             cli::ClusterAction::Leave { upstream } => {
@@ -1370,14 +1384,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print the safe-mode banner. A single call point shared between the
-/// CLI dispatch and the daemon boot so the warning is impossible to miss
-/// even when someone eventually pipes stderr into a log aggregator.
-/// Sprint 43 T5 — typed-`DEFAULT` confirm for the CLI. Mirrors SN2
-/// tier 3 behaviour from the TUI scope modal. Returns `true` when the
-/// operator typed `DEFAULT` exactly (case-sensitive). Returns `false`
-/// (with a friendly hint) on any other input including EOF / non-TTY
-/// callers — those should pass `--yes` to skip the prompt.
+/// Typed-`DEFAULT` confirm for the CLI, mirroring the TUI scope modal's
+/// tier-3 behaviour. Returns `true` when the operator typed `DEFAULT`
+/// exactly (case-sensitive). Returns `false` (with a friendly hint) on
+/// any other input including EOF / non-TTY callers — those should pass
+/// `--yes` to skip the prompt.
 fn confirm_default_phrase() -> anyhow::Result<bool> {
     use std::io::{BufRead, Write};
     print!("{}", cli::commands::rules::RULES_BATCH_DEFAULT_CONFIRM_CLI);
@@ -1406,6 +1417,9 @@ fn refuse_retired_tags_verb() -> anyhow::Result<()> {
     anyhow::bail!("{}", cli::commands::entity_tags::TAGS_RETIRED)
 }
 
+/// Print the safe-mode banner. A single call point shared between the
+/// CLI dispatch and the daemon boot so the warning is impossible to miss
+/// even when someone eventually pipes stderr into a log aggregator.
 fn print_safe_mode_banner() {
     eprintln!("╔══════════════════════════════════════════════════════════════════╗");
     eprintln!("║                                                                  ║");
@@ -1487,24 +1501,20 @@ fn init_tracing(log_level: &str) {
 /// every other invocation the env var is absent and we fall back to the
 /// foreground path.
 ///
-/// That path writes to **stdout**, not stderr — this line said stderr from
-/// 2026-04-14 (`75caa1e8`) until 2026-08-25, and the log-ring rewire made
-/// the error consequential rather than merely wrong: `init_tracing_with_mode`
-/// now passes the writer explicitly, so a reader checking that call against
-/// this sentence would conclude the wrong stream had been chosen. It had
-/// not; `tracing_subscriber::fmt()` defaults to `io::stdout`, and the
-/// explicit argument preserves it.
+/// That path writes to **stdout**, not stderr: `init_tracing_with_mode`
+/// passes the writer explicitly, and `tracing_subscriber::fmt()` defaults
+/// to `io::stdout` — the explicit argument preserves that default rather
+/// than overriding it, so don't "correct" this to stderr without checking
+/// the call site.
 ///
-/// **Both live boxes take the `Foreground` arm, and always have.** Measured
-/// 2026-08-25 on the lab host: the unit is `Type=simple` with no
-/// `EnvironmentFile`, `PURGE_WARDEN_DAEMON_LOGS_DIR` is absent from the
-/// running process's environ, and `/var/lib/purge-warden/logs/` does not
-/// exist. Only `fork_daemon` sets that variable, and systemd does not use
-/// it. So the `Daemon` arm below — the `tracing_appender` writer and the
-/// dir-creation-failure fallback alike — has never been exercised by a
-/// runtime smoke; `current_log_mode`'s *selection* is tested, the `install`
-/// call inside that arm is not. Tracked as
-/// `log-ring-daemon-arm-never-exercised`.
+/// **Every systemd-run instance takes the `Foreground` arm.** `Type=simple`
+/// units have no `EnvironmentFile`, so `PURGE_WARDEN_DAEMON_LOGS_DIR` is
+/// absent from the running process's environment — only `fork_daemon` sets
+/// that variable, and systemd does not use it. So the `Daemon` arm below —
+/// the `tracing_appender` writer and the dir-creation-failure fallback
+/// alike — is exercised only by `fork_daemon`, never by a systemd-managed
+/// process; `current_log_mode`'s *selection* is tested, the `install` call
+/// inside that arm is not.
 fn current_log_mode() -> LogMode {
     match std::env::var_os(DAEMON_LOGS_DIR_ENV) {
         Some(dir) if !dir.is_empty() => LogMode::Daemon {
@@ -1514,14 +1524,78 @@ fn current_log_mode() -> LogMode {
     }
 }
 
-fn init_tracing_with_mode(log_level: &str, mode: LogMode) {
-    use std::io::IsTerminal;
+/// The directive that keeps per-query resolver logging out of the
+/// journal, or `None` when the operator has asked to see it.
+///
+/// `hickory_server` emits one INFO line per query. At household volume
+/// that is tens of thousands of lines a day, and warden's own WARN and
+/// ERROR lines — a refused refresh, a list that failed to download —
+/// land between them at a ratio that makes them unfindable by reading.
+/// Damping that one target is what makes the journal legible.
+///
+/// Three ways to turn it off, all explicit. Raising the level to `debug`
+/// or `trace` says the operator is debugging queries. Lowering it to
+/// `warn` or `error` already silences the per-query INFO stream — and a
+/// target-bearing directive outranks a bare level, so adding
+/// `hickory_server=warn` under `error` would *admit* resolver warnings
+/// the operator had silenced. Naming `hickory_server` in `RUST_LOG` says
+/// they have already decided what they want for that target — and since
+/// a later directive on the SAME target replaces an earlier one, damping
+/// anyway would not compete with their choice, it would silently
+/// overwrite it. Only `info` (and an unparseable level, which the
+/// subscriber treats as `info`) is damped.
+pub(crate) fn per_query_noise_directive(
+    log_level: &str,
+    rust_log: Option<&str>,
+) -> Option<&'static str> {
+    // Parsed rather than compared, so the spellings `Level` accepts are
+    // the spellings this accepts — including the upper-case ones.
+    if matches!(
+        log_level.trim().parse::<tracing::Level>(),
+        Ok(tracing::Level::DEBUG
+            | tracing::Level::TRACE
+            | tracing::Level::WARN
+            | tracing::Level::ERROR)
+    ) {
+        return None;
+    }
+    if rust_log.is_some_and(|s| s.contains("hickory_server")) {
+        return None;
+    }
+    Some("hickory_server=warn")
+}
 
-    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
+/// Build the subscriber's filter: `RUST_LOG` directives, then the level,
+/// then the per-query damper.
+///
+/// `rust_log` is a parameter rather than a read so the composition can be
+/// tested; the caller reads the variable once. Passing
+/// `env::var("RUST_LOG").ok()` reproduces `EnvFilter::from_default_env()`
+/// exactly — the same lossy parse of the same variable, and the same
+/// empty string when it is unset or not UTF-8.
+///
+/// Order is load-bearing. `EnvFilter` resolves an event against the most
+/// specific matching directive, so the damper — which names a target —
+/// wins over the bare level added before it.
+fn build_log_filter(log_level: &str, rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let filter = tracing_subscriber::EnvFilter::new(rust_log.unwrap_or_default()).add_directive(
         log_level
             .parse()
             .unwrap_or_else(|_| tracing::Level::INFO.into()),
     );
+    match per_query_noise_directive(log_level, rust_log) {
+        // Parsed, not constructed: a literal that stopped parsing would
+        // otherwise disappear into a filter that logs everything again,
+        // which is the failure this whole function exists to prevent.
+        Some(d) => filter.add_directive(d.parse().expect("static directive literal must parse")),
+        None => filter,
+    }
+}
+
+fn init_tracing_with_mode(log_level: &str, mode: LogMode) {
+    use std::io::IsTerminal;
+
+    let filter = build_log_filter(log_level, std::env::var("RUST_LOG").ok().as_deref());
 
     match mode {
         LogMode::Foreground => {
@@ -1656,6 +1730,15 @@ mod tests {
                 peer_cert: None,
             },
             cli::ClusterAction::Leave { upstream: None },
+            // S4. The array is not exhaustive over `ClusterAction`, so
+            // nothing but this line makes a new config-editing verb assert
+            // it does not force a socket.
+            cli::ClusterAction::Enable {
+                role: cli::EnableRole::Primary,
+                sans: vec!["192.0.2.10".into()],
+                api_listen: None,
+                validity_days: 3650,
+            },
         ] {
             assert!(
                 !command_needs_socket(&cli::Commands::Cluster { action }),
@@ -1843,6 +1926,158 @@ mod tests {
             Some(v) => unsafe { std::env::set_var(DAEMON_LOGS_DIR_ENV, v) },
             None => unsafe { std::env::remove_var(DAEMON_LOGS_DIR_ENV) },
         }
+    }
+
+    // ── Per-query journal noise. The damper is applied at the default
+    // level and stood down whenever the operator has asked for the
+    // per-query stream, either by level or by target. ───────────────
+
+    #[test]
+    fn the_default_level_damps_per_query_logging() {
+        assert_eq!(
+            per_query_noise_directive("info", None),
+            Some("hickory_server=warn")
+        );
+        // An explicit RUST_LOG that says nothing about the resolver is
+        // not a decision about the resolver.
+        assert_eq!(
+            per_query_noise_directive("info", Some("warn")),
+            Some("hickory_server=warn")
+        );
+    }
+
+    /// Asking for `debug` or `trace` IS asking for the per-query stream —
+    /// it is the only place a single query's path is visible — so the
+    /// damper must not survive the request that needs it gone.
+    #[test]
+    fn debugging_turns_the_damper_off() {
+        assert_eq!(per_query_noise_directive("debug", None), None);
+        assert_eq!(per_query_noise_directive("trace", None), None);
+        // The level is parsed, so case is not a way to lose the opt-out.
+        assert_eq!(per_query_noise_directive("DEBUG", None), None);
+        assert_eq!(per_query_noise_directive("  trace  ", None), None);
+    }
+
+    /// A quieter level needs no damper, and must not get one: a directive
+    /// that names a target outranks a bare level, so `hickory_server=warn`
+    /// under `error` would let resolver warnings through that the level
+    /// had silenced. An unparseable level falls back to `info` in the
+    /// subscriber and stays damped.
+    #[test]
+    fn a_quieter_level_turns_the_damper_off_too() {
+        assert_eq!(per_query_noise_directive("warn", None), None);
+        assert_eq!(per_query_noise_directive("error", None), None);
+        assert_eq!(per_query_noise_directive("ERROR", None), None);
+        assert_eq!(
+            per_query_noise_directive("info", None),
+            Some("hickory_server=warn")
+        );
+        assert_eq!(
+            per_query_noise_directive("bogus", None),
+            Some("hickory_server=warn")
+        );
+    }
+
+    /// An operator who has named the target in `RUST_LOG` has already
+    /// decided. The damper names the same target, so adding it would
+    /// replace their directive rather than lose to it — silently
+    /// inverting an explicit instruction.
+    #[test]
+    fn a_rust_log_directive_for_the_resolver_wins_outright() {
+        assert_eq!(
+            per_query_noise_directive("info", Some("hickory_server=info")),
+            None
+        );
+        assert_eq!(
+            per_query_noise_directive("info", Some("warn,hickory_server=trace")),
+            None
+        );
+    }
+
+    /// The damper is a string literal that is parsed at startup. If it
+    /// ever stops parsing, `build_log_filter` panics — so the parse is
+    /// pinned here rather than left to the `expect`.
+    #[test]
+    fn the_damper_directive_parses() {
+        let d = per_query_noise_directive("info", None).expect("damper at the default level");
+        assert!(
+            d.parse::<tracing_subscriber::filter::Directive>().is_ok(),
+            "{d} must parse as a directive"
+        );
+    }
+
+    /// Records every event the filter admits, so both the absence of one
+    /// event and the presence of another are measurable.
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<(String, tracing::Level)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let m = event.metadata();
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((m.target().to_string(), *m.level()));
+        }
+    }
+
+    fn captured_under(
+        filter: tracing_subscriber::EnvFilter,
+        emit: impl FnOnce(),
+    ) -> Vec<(String, tracing::Level)> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(Captured(std::sync::Arc::clone(&seen)));
+        tracing::subscriber::with_default(subscriber, emit);
+        let out = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        out
+    }
+
+    /// The composed filter, not just the directive string: at the
+    /// default level a resolver INFO event must be dropped while
+    /// warden's own WARN still arrives.
+    ///
+    /// The `purge_warden` assertion is the positive control and is
+    /// load-bearing — without it, "no `hickory_server` event" would also
+    /// hold if the capture layer had received nothing at all.
+    #[test]
+    fn at_info_the_filter_drops_resolver_noise_and_keeps_warden_warnings() {
+        // Emitted from this test's own source lines: callsite interest is
+        // cached per invocation site, so sharing them with the `debug`
+        // test below could carry one filter's verdict into the other.
+        let seen = captured_under(build_log_filter("info", None), || {
+            tracing::info!(target: "hickory_server", "query received");
+            tracing::warn!(target: "purge_warden", "refresh refused");
+        });
+        assert!(
+            seen.iter()
+                .any(|(t, l)| t == "purge_warden" && *l == tracing::Level::WARN),
+            "warden's own warning must survive the damper: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(t, _)| t == "hickory_server"),
+            "per-query logging must not reach the journal at the default level: {seen:?}"
+        );
+    }
+
+    /// At `debug` the damper stands down and both arrive — the operator
+    /// asked for the per-query stream and must get it.
+    #[test]
+    fn at_debug_the_filter_keeps_both() {
+        let seen = captured_under(build_log_filter("debug", None), || {
+            tracing::info!(target: "hickory_server", "query received");
+            tracing::warn!(target: "purge_warden", "refresh refused");
+        });
+        assert!(
+            seen.iter().any(|(t, _)| t == "hickory_server"),
+            "debug must not suppress the per-query stream: {seen:?}"
+        );
+        assert!(seen.iter().any(|(t, _)| t == "purge_warden"), "{seen:?}");
     }
 
     // ── Interval flags: only the canonical spelling parses. The

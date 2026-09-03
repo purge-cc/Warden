@@ -17,7 +17,7 @@
 //! happen, and that an operator who *wants* those rewrites gets exactly
 //! them by writing them.
 //!
-//! Vendor names below sit in a test file on purpose. Per project rules
+//! Vendor names below sit in a test file on purpose. Per CLAUDE.md
 //! §Neutrality that is the right home for one — proving the absence of
 //! a behaviour.
 //!

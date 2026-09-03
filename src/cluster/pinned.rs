@@ -1,4 +1,4 @@
-//! §6 — the secondary's pinned poll client.
+//! The secondary's pinned poll client.
 //!
 //! The cluster sync channel runs between two household boxes over a link the
 //! design assumes may be hostile. Neither has a publicly-issued certificate,
@@ -64,8 +64,8 @@ use crate::config::schema::cluster::CLUSTER_SECONDARY_REQUIRES_PEER_CERT;
 /// `peer_cert` is `None` when the operator has not run
 /// `warden cluster join --peer-cert <pem>`. Against a **non-loopback** peer
 /// that **fails closed**: a secondary with no pin has the authenticity of the
-/// whole replicated channel resting on the bearer token alone, on a link §6
-/// assumes may be hostile. Returning an unpinned client instead would be the
+/// whole replicated channel resting on the bearer token alone, on a link that
+/// may be hostile. Returning an unpinned client instead would be the
 /// one outcome worse than an error — a sync that silently works, against
 /// anyone holding a publicly-issued certificate for the peer's name.
 ///
@@ -130,7 +130,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+    };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -162,11 +164,11 @@ mod tests {
     ///
     /// The SAN is load-bearing: rustls validates SAN, not CN.
     ///
-    /// **`CA:FALSE` is load-bearing too, and it is the opposite of what the
-    /// design doc says.** §6 asserts the pinned self-signed certificate "must
+    /// **`CA:FALSE` is load-bearing too, and it is counter-intuitive.** The
+    /// instinct is that the pinned self-signed certificate must
     /// carry `basicConstraints: CA:TRUE`, because `add_root_certificate`
     /// builds a chain to a trust anchor (openssl `-x509` does this by
-    /// default)". Measured here, that produces a certificate the primary
+    /// default). Measured here, that produces a certificate the primary
     /// cannot serve: rustls rejects it with
     /// `InvalidCertificate(Other(CaUsedAsEndEntity))` before trust is even
     /// considered, because the same certificate is both the anchor and the
@@ -178,9 +180,16 @@ mod tests {
     /// `CA:FALSE` rather than omitting basicConstraints, which is what an
     /// operator-facing recipe should produce.
     fn generate_self_signed(ip: &str) -> Fixture {
+        generate_with_ca(ip, IsCa::ExplicitNoCa)
+    }
+
+    /// [`generate_self_signed`] with the `basicConstraints` shape as a
+    /// parameter, so the CA:TRUE claim above can be **executed** rather than
+    /// asserted in prose.
+    fn generate_with_ca(ip: &str, is_ca: IsCa) -> Fixture {
         let key_pair = KeyPair::generate().expect("generate key");
         let mut params = CertificateParams::default();
-        params.is_ca = IsCa::ExplicitNoCa;
+        params.is_ca = is_ca;
         params.use_authority_key_identifier_extension = false;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.subject_alt_names = vec![SanType::IpAddress(ip.parse().expect("parse ip"))];
@@ -304,6 +313,120 @@ mod tests {
         assert!(resp.status().is_success());
     }
 
+    /// **The joint property neither lane could test: a certificate minted by
+    /// [`crate::cluster::certgen`] is served by the loader the daemon actually
+    /// uses, and accepted by the client the secondary actually uses.**
+    ///
+    /// Every other test in this module mints its fixture with a *local* rcgen
+    /// call, and every test in `certgen` inspects the DER it just produced.
+    /// Both halves can be green while the pair fails in production: the
+    /// certificate is minted by `certgen`, loaded by
+    /// `axum_server`'s `RustlsConfig::from_pem_file` (`api/server.rs:25`), and
+    /// validated by [`build_pinned_client`] — three components, no test
+    /// spanning them. This is the seam, and it is where the `CA:TRUE` defect
+    /// lived: `certgen` would have emitted it happily, the DER assertion would
+    /// have passed, and only the handshake would have failed.
+    ///
+    /// Loopback is used as the SAN because the test has to bind a real socket;
+    /// the pin logic itself is exercised against a non-loopback peer by the
+    /// neighbouring tests.
+    #[tokio::test]
+    async fn a_certgen_minted_certificate_survives_the_real_loader_and_the_real_client() {
+        use crate::cluster::certgen;
+
+        install_ring_crypto_provider_once();
+
+        let minted = certgen::generate_self_signed(
+            &[certgen::San::Ip("127.0.0.1".parse().unwrap())],
+            3650,
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("mint");
+
+        // Written exactly as `cluster enable` writes them, and read back by the
+        // same call `spawn_api_server` makes. A key that does not match its
+        // certificate, or an encoding rustls will not take, dies here rather
+        // than at the operator's first poll.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("api.crt");
+        let key_path = dir.path().join("api.key");
+        std::fs::write(&cert_path, minted.cert_pem.as_bytes()).expect("write cert");
+        std::fs::write(&key_path, minted.key_pem.as_bytes()).expect("write key");
+
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .expect("the minted pair must load through the daemon's own TLS loader");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        // tokio refuses to register a blocking socket and panics inside
+        // axum_server; bind on port 0 first so the test can learn the port,
+        // then hand over a non-blocking fd.
+        listener.set_nonblocking(true).expect("non-blocking");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, tls)
+                .expect("adopt the bound listener")
+                .serve(app.into_make_service())
+                .await;
+        });
+
+        let client = build_pinned_client(
+            &format!("https://{addr}"),
+            Some(cert_path.to_str().unwrap()),
+            TIMEOUT,
+        )
+        .expect("builds");
+
+        let resp = client
+            .get(format!("https://{addr}/probe"))
+            .send()
+            .await
+            .expect("a certgen-minted certificate must validate against its own pin");
+        assert!(resp.status().is_success());
+    }
+
+    /// The `CA:TRUE` shape the design doc prescribed is REJECTED on the wire.
+    ///
+    /// This closes a re-confirmation the S3 pin lane explicitly deferred to
+    /// integration (`87368535`: *"generate both shapes and assert the CA:TRUE
+    /// one is rejected. Until the orchestrator has reproduced it this is a
+    /// lane's measurement, not a verified fact"*). S3 shipped without it, so
+    /// until now the claim rested on a doc comment — and a comment that makes a
+    /// prediction with nothing executing it is exactly the defence that fails
+    /// silently. Someone "restoring" `IsCa::Ca` from the design doc would have
+    /// kept every test green and produced a channel that dies on the wire with
+    /// an error naming neither the recipe nor the fix.
+    ///
+    /// The assertion is deliberately on the **handshake**, not on a string:
+    /// rustls's error text is not ours to freeze.
+    #[tokio::test]
+    async fn the_ca_true_shape_from_the_design_doc_is_rejected_on_the_wire() {
+        let ca_true = generate_with_ca("127.0.0.1", IsCa::Ca(BasicConstraints::Unconstrained));
+        let addr = spawn_tls_server(&ca_true).await;
+        let client = build_pinned_client(PEER, Some(ca_true.pem_path.to_str().unwrap()), TIMEOUT)
+            .expect(
+                "the client still BUILDS — the certificate parses fine, it is the \
+                     handshake that must fail, and a build-time refusal would prove the \
+                     wrong thing",
+            );
+
+        let err = client
+            .get(format!("https://{addr}/api/cluster/policy"))
+            .send()
+            .await
+            .expect_err(
+                "a self-signed certificate carrying CA:TRUE is both the pinned anchor and \
+                 the leaf, which rustls refuses as CaUsedAsEndEntity — if this now SUCCEEDS, \
+                 the design doc's original recipe has become valid and `87368535` plus the \
+                 comment on `generate_self_signed` must be revisited, not this test deleted",
+            );
+        assert!(
+            err.is_connect() || err.is_request(),
+            "expected a transport-level failure, got {err:?}"
+        );
+    }
+
     /// A PEM with no certificate in it must REFUSE, not build a client with an
     /// empty root store.
     ///
@@ -395,9 +518,8 @@ mod tests {
     /// makes a supported configuration unpollable rather than more secure —
     /// and nothing failed, because no test starts the poll loop.
     ///
-    /// This is the `feedback_green_today_tests_catch_the_overreach` shape: with
-    /// an exemption in play, the discriminating test is the one that is green
-    /// **today**, not the one the new rule suggests.
+    /// With an exemption in play, the discriminating test is the one that is
+    /// green **today**, not the one a stricter rule would suggest.
     #[test]
     fn a_loopback_peer_needs_no_pin() {
         for peer in [

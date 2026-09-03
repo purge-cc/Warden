@@ -2,9 +2,9 @@
 //! per-profile, with non-selectable group headers, plus in-tab Add /
 //! Edit / Delete modals and an audit-history side-card.
 //!
-//! N6 (2026-08-24) replaced a master/detail pair of stacked tables. The
-//! old shape put every profile record two keys away from being seen: `o`
-//! to move focus to the lower panel, then `n`/`N` to cycle to the right
+//! This replaces a master/detail pair of stacked tables. That shape put
+//! every profile record two keys away from being seen: `o` to move
+//! focus to the lower panel, then `n`/`N` to cycle to the right
 //! profile, with `Tab` unavailable for either because it is the global
 //! leaf cycle (`ldns_04_tab_still_cycles_leaf`). One list with headers is
 //! the shape Devices already uses, and `↑`/`↓` now walk the lot.
@@ -14,8 +14,8 @@
 //! Profiles. The daemon is NOT consulted for the records list; that
 //! avoids a stale view when the operator is staging edits that haven't
 //! been hot-reloaded yet. The Add / Remove modals submit through
-//! `cli::commands::local_dns::add_inner` / `remove_inner` (R7
-//! single-seat — same code path the CLI verbs use).
+//! `cli::commands::local_dns::add_inner` / `remove_inner` — the same
+//! single-seat code path the CLI verbs use.
 //!
 //! Hits column: reads the per-record
 //! [`LocalRecordsHits`](crate::tracking::LocalRecordsHits) counter
@@ -28,13 +28,13 @@
 //! Keybindings (handled in `tui/mod.rs`):
 //!   ↑/↓             walk every record, skipping group headers
 //!   Home/End        first / last record
-//!   PgUp/PgDn       page, clamped at both ends (N4)
+//!   PgUp/PgDn       page, clamped at both ends
 //!   a / e / d       open the Add / Edit / Remove modal on the focused row
 //!   Enter / Esc     open / close the audit side-card on the focused row
 //!
-//! `o`, `n` and `N` are **unbound** — N6 retired them with the panels.
-//! `Tab` is untouched and still cycles leaves; that was never negotiable
-//! (`ldns_04_tab_still_cycles_leaf`, reaffirmed by N1).
+//! `o`, `n` and `N` are **unbound** — retired with the stacked panels.
+//! `Tab` is untouched and still cycles leaves; that is never negotiable
+//! (`ldns_04_tab_still_cycles_leaf`).
 //!
 //! Empty groups are omitted, headers included: a profile with no records
 //! contributes no rows. When the whole list is empty the tab shows
@@ -42,6 +42,12 @@
 //! `format_local_records_tab_empty_profile` no longer has a TUI caller —
 //! there is no per-profile panel left to be empty. The constant is
 //! untouched and the CLI still prints it.
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_local_dns_key` (bindings listed above)
+//! - Form:  `tui::local_dns_modal` (the Add/Edit/Remove modal named above)
+//! - State: `app::LocalDnsState` (`selected_id`, `modal`, `hits_snapshot`)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -49,11 +55,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-// N6: `format_local_records_tab_empty_profile` is no longer imported
-// here — with empty profile groups omitted there is no per-profile panel
-// left to be empty, so the TUI has no caller for it. The constant itself
-// is untouched (CONTRACT §4: byte-identical), the CLI still prints it,
-// and the in-file test below still pins it through its full path.
+// `format_local_records_tab_empty_profile` is not imported here — with
+// empty profile groups omitted there is no per-profile panel left to be
+// empty, so the TUI has no caller for it. The constant itself stays
+// byte-identical, the CLI still prints it, and the in-file test below
+// still pins it through its full path.
 use crate::cli::commands::local_dns::LocalRecordScope;
 use crate::cli::commands::local_dns::LOCAL_RECORDS_TAB_EMPTY_GLOBAL;
 use crate::config::audit::AuditRecord;
@@ -72,7 +78,7 @@ pub const LOCAL_RECORDS_SIDE_CARD_AUDIT_EMPTY: &str = "no audit history for this
 /// truncation).
 const SIDE_CARD_WIDTH: u16 = 38;
 
-// ── The unified row model (N6) ──────────────────────────────────────────
+// ── The unified row model ─────────────────────────────────────────────
 
 /// One row of the Local DNS table.
 ///
@@ -100,7 +106,7 @@ impl LocalDnsRow<'_> {
 ///
 /// One vocabulary for the cursor key, the hits lookup and the side-card,
 /// so a record cannot be addressed one way here and another way there —
-/// which is exactly how the pre-ldns-05 hits column disagreed with the
+/// a mismatch here is exactly how the hits column can disagree with the
 /// side-card about the same row.
 pub fn scope_key(scope: &LocalRecordScope) -> String {
     match scope {
@@ -160,10 +166,9 @@ pub fn build_rows(loaded: &LoadedConfig) -> Vec<LocalDnsRow<'_>> {
 
 /// Step the cursor to the next selectable row, skipping headers.
 ///
-/// **Clamps** — N4. Written here rather than reused from
-/// `devices::next_selectable_index` because that one still wraps (its
-/// clamp belongs to a sibling lane this wave) and a new list shipping
-/// with a wrap would be a regression on arrival.
+/// **Clamps**, does not wrap. Written here rather than reused from
+/// `devices::next_selectable_index` because that one still wraps, and
+/// a new list shipping with a wrap would be a regression on arrival.
 pub fn next_selectable_index(
     rows: &[LocalDnsRow],
     current: Option<usize>,
@@ -206,16 +211,16 @@ pub fn index_of_key(rows: &[LocalDnsRow], want: Option<&(String, String)>) -> Op
     rows.iter().position(|r| row_key(r).as_ref() == Some(want))
 }
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         render_no_config(f, area);
         return;
     };
 
-    // Side-card split is unchanged (N6 keeps it): when the audit view is
-    // open and the terminal is wide enough, the list takes the left
-    // column and the card the right. What changed is the left column —
-    // it is one table now, not a 50/50 vertical stack of two.
+    // Side-card split: when the audit view is open and the terminal is
+    // wide enough, the list takes the left column and the card the
+    // right. The left column is one table, not a 50/50 vertical stack
+    // of two.
     let (list_area, side_card) = match app.local_dns.audit_view.as_ref() {
         Some(view) if area.width >= 60 + SIDE_CARD_WIDTH => {
             let cols = Layout::horizontal([
@@ -235,7 +240,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let content = render_section_chrome(f, list_area, &title, T.text_secondary);
 
     if rows.is_empty() {
-        // Byte-identical to the pre-N6 empty state, and to the CLI's.
+        // Byte-identical to the CLI's empty state.
         render_empty_state(f, content, LOCAL_RECORDS_TAB_EMPTY_GLOBAL);
     } else {
         // Resolve the anchor here rather than trusting `table_state`: a
@@ -245,13 +250,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         // with nothing highlighted while records exist.
         let selected = index_of_key(&rows, app.local_dns.selected_id.as_ref())
             .or_else(|| rows.iter().position(LocalDnsRow::is_selectable));
-        let mut state = app.local_dns.table_state.clone();
         render_records_table(
             f,
             content,
             &rows,
             selected,
-            &mut state,
+            &mut app.local_dns.table_state,
             app.local_dns.hits_snapshot.as_deref(),
         );
     }
@@ -314,8 +318,7 @@ fn render_records_table(
     .header(header)
     .row_highlight_style(theme::highlight_style());
 
-    state.select(selected);
-    f.render_stateful_widget(table, area, state);
+    super::render_table(f, area, table, state, selected);
 }
 
 /// A group divider, styled like the Devices one: em-dash rule, muted,
@@ -355,14 +358,14 @@ fn render_record_row<'a>(
         Some(n) => Cell::from(n.to_string()),
         None => Cell::from(Span::styled("default", Style::default().fg(T.text_muted))),
     };
-    // S44 follow-up (`s44-hits-ipc-verb`): hits reads through the daemon
-    // snapshot. `None` snapshot (boot-fresh TUI, IPC not yet polled)
-    // renders `—`; a populated snapshot resolves `(scope_tag, domain)`
-    // and renders 0 for a record that exists but has never been hit.
-    // ldns-05: resolution is shared with the side-card via `hits_for` so
-    // both match case-insensitively.
+    // Hits reads through the daemon snapshot. `None` snapshot
+    // (boot-fresh TUI, IPC not yet polled) renders `—`; a populated
+    // snapshot resolves `(scope_tag, domain)` and renders 0 for a
+    // record that exists but has never been hit. Resolution is shared
+    // with the side-card via `hits_for` so both match
+    // case-insensitively.
     //
-    // N6: `scope_tag` now comes from `scope_key`, the same function that
+    // `scope_tag` comes from `scope_key`, the same function that
     // builds the cursor key — one spelling for all three consumers.
     let hits = match hits_for(hits_snapshot, scope_tag, r.domain.as_str()) {
         None => Cell::from(Span::styled("\u{2014}", Style::default().fg(T.text_muted))),
@@ -494,7 +497,7 @@ fn focused_record_matching<'a>(
     loaded: &'a LoadedConfig,
     view: &LocalDnsAuditView,
 ) -> Option<&'a LocalDnsRecord> {
-    // N6: one lookup instead of a per-panel branch. The view's
+    // One lookup instead of a per-panel branch. The view's
     // `(scope_tag, target_id)` pair is the audit-log spelling, which
     // `scope_key` also produces — so the comparison is one string
     // equality rather than two shapes that have to be kept agreeing.
@@ -524,14 +527,14 @@ fn scope_label(view: &LocalDnsAuditView) -> String {
 }
 
 /// Hit count for `(scope_tag, domain)` in the daemon snapshot, matched
-/// **case-insensitively** (ldns-05). Single source of truth for both the
-/// records table and the audit side-card: before, the table used an
-/// exact `==` while the side-card used `eq_ignore_ascii_case`, so a
-/// record whose snapshot casing differed from its TOML casing showed
-/// HITS `0` in the table but the real count in the side-card. Domains
-/// are lowercased at ingestion + lookup (design rule #3), but the
-/// snapshot and the on-disk record can still disagree on case, so the
-/// insensitive compare is the robust one. `None` snapshot → `None`
+/// **case-insensitively**. Single source of truth for both the
+/// records table and the audit side-card: an exact `==` in one and
+/// `eq_ignore_ascii_case` in the other lets a record whose snapshot
+/// casing differs from its TOML casing show HITS `0` in the table but
+/// the real count in the side-card. Domains are lowercased at
+/// ingestion and lookup elsewhere, but the snapshot and the on-disk
+/// record can still disagree on case, so the insensitive compare here
+/// is the robust one. `None` snapshot → `None`
 /// (boot-fresh, render `—`); present snapshot with no match → `Some(0)`.
 fn hits_for(
     snapshot: Option<&[(String, String, u64)]>,
@@ -671,9 +674,9 @@ mod tests {
         }
     }
 
-    /// N6 replaced `focused_panel` / `focused_profile_idx` with one
-    /// cursor. A fresh tab has no anchor until the first keystroke seeds
-    /// it — same contract as Subnets / Profiles.
+    /// One cursor, not `focused_panel` / `focused_profile_idx`. A fresh
+    /// tab has no anchor until the first keystroke seeds it — same
+    /// contract as Subnets / Profiles.
     #[test]
     fn n6_fresh_local_dns_state_has_no_selection() {
         let app = App::new();
@@ -682,11 +685,10 @@ mod tests {
         assert!(app.local_dns.hits_snapshot.is_none());
     }
 
-    // ldns-05 (rev-2606 §11): the hits lookup must match the daemon
-    // snapshot case-insensitively — the records table previously used an
-    // exact `==` and silently reported 0 when the snapshot casing
-    // differed from the TOML record, while the side-card (correct) found
-    // the count. Now both go through `hits_for`.
+    // The hits lookup must match the daemon snapshot case-insensitively
+    // — an exact `==` silently reports 0 when the snapshot casing
+    // differs from the TOML record, while `eq_ignore_ascii_case` finds
+    // the count. Both go through `hits_for`.
     #[test]
     fn hits_for_matches_case_insensitively() {
         let snap = vec![("profile:Kids".to_string(), "Example.COM".to_string(), 7u64)];
@@ -704,7 +706,7 @@ mod tests {
         assert_eq!(hits_for(None, "profile:kids", "example.com"), None);
     }
 
-    // N6: `t3_local_dns_panel_next_cycles_global_to_profile_to_global`
+    // `t3_local_dns_panel_next_cycles_global_to_profile_to_global`
     // and `t3_focus_marker_returns_visible_indicator_when_focused` are
     // GONE, not retargeted. Both tested a member of the panel model
     // itself — `LocalDnsPanel::next` and the `[focus]` marker that said
@@ -765,10 +767,10 @@ mod tests {
         use ratatui::Terminal;
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();
-        let app = App::new();
+        let mut app = App::new();
         term.draw(|f| {
             let area = Rect::new(0, 0, 80, 20);
-            render(f, area, &app);
+            render(f, area, &mut app);
         })
         .unwrap();
         // Without a loaded config we hit the no-config branch.
@@ -791,10 +793,10 @@ mod tests {
         assert!(LOCAL_RECORDS_TAB_EMPTY_GLOBAL.contains("warden local-dns add"));
     }
 
-    /// Kept after N6 even though the TUI no longer calls this — the
-    /// constant is frozen (CONTRACT §4) and the CLI still prints it, so
-    /// the pin has to survive the caller. Full path, since the module
-    /// no longer imports it.
+    /// Kept even though the TUI no longer calls this — the constant is
+    /// byte-frozen and the CLI still prints it, so the pin has to
+    /// survive the caller. Full path, since the module no longer
+    /// imports it.
     #[test]
     fn t3_profile_empty_state_substitutes_profile_id() {
         let s = crate::cli::commands::local_dns::format_local_records_tab_empty_profile("kids");
@@ -814,7 +816,7 @@ mod tests {
             LocalDnsRecord {
                 domain: "example.test".into(),
                 record_type: LocalDnsRecordType::A,
-                value: "192.0.2.50".into(),
+                value: "10.10.1.50".into(),
                 match_subdomains: true,
                 ttl_secs: Some(7200),
             },
@@ -838,7 +840,7 @@ mod tests {
         assert!(content.contains("nas.home"));
         assert!(content.contains("example.test"));
         assert!(content.contains("192.168.1.50"));
-        assert!(content.contains("192.0.2.50"));
+        assert!(content.contains("10.10.1.50"));
         assert!(content.contains("true")); // match_subdomains badge
         assert!(content.contains("7200")); // explicit TTL
         assert!(content.contains("default")); // ttl_secs=None fallback label
@@ -893,13 +895,9 @@ mod tests {
         use ratatui::Terminal;
         let backend = TestBackend::new(120, 6);
         let mut term = Terminal::new(backend).unwrap();
-        let records = vec![rec("example.test", "192.0.2.50")];
+        let records = vec![rec("example.test", "10.10.1.50")];
         let rows = rows_of(&records, None);
-        let snap = vec![(
-            "profile:kids".to_string(),
-            "example.test".to_string(),
-            99_u64,
-        )];
+        let snap = vec![("profile:kids".to_string(), "example.test".to_string(), 99_u64)];
         let mut state = ratatui::widgets::TableState::default();
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 6);
@@ -959,7 +957,7 @@ value = "192.168.1.50"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // N6: one cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain) rather than by a
         // per-panel index.
         app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
@@ -984,7 +982,7 @@ value = "192.168.1.50"
 
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 30);
-            render(f, area, &app);
+            render(f, area, &mut app);
         })
         .unwrap();
 
@@ -1034,7 +1032,7 @@ value = "192.168.1.51"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // N6: one cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain) rather than by a
         // per-panel index.
         app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
@@ -1046,7 +1044,7 @@ value = "192.168.1.51"
 
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 40);
-            render(f, area, &app);
+            render(f, area, &mut app);
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -1098,7 +1096,7 @@ value = "192.168.1.50"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // N6: one cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain) rather than by a
         // per-panel index.
         app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
@@ -1110,7 +1108,7 @@ value = "192.168.1.50"
 
         term.draw(|f| {
             let area = Rect::new(0, 0, 50, 20);
-            render(f, area, &app);
+            render(f, area, &mut app);
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -1153,7 +1151,7 @@ value = "192.168.1.50"
         assert_eq!(scope_label(&g), "global");
     }
 
-    // ── N6: the unified row model ───────────────────────────────────
+    // ── The unified row model ─────────────────────────────────────────
 
     fn loaded_from(toml_src: &str) -> crate::config::loader::LoadedConfig {
         let cfg = toml::from_str::<crate::config::schema::ConfigV1>(toml_src).unwrap();
@@ -1188,10 +1186,10 @@ display_name = "Empty"
 
 [profiles.kids]
 display_name = "Kids"
-local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
+local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
 "#;
 
-    /// The shape N6 is for: both scopes in one vector, headers between
+    /// The unified row model: both scopes in one vector, headers between
     /// them, and **the empty profile contributes nothing** — not even a
     /// header. A header with no rows under it claims something is there.
     #[test]
@@ -1236,8 +1234,8 @@ local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
         );
     }
 
-    /// N4 applies from the start here: this list ships clamping, it does
-    /// not inherit a wrap to be fixed later.
+    /// This list ships clamping from the start; it does not inherit a
+    /// wrap to be fixed later.
     #[test]
     fn n6_the_cursor_clamps_at_both_ends() {
         let loaded = loaded_from(MIXED);
@@ -1290,7 +1288,7 @@ value = "192.168.1.60"
 
 [profiles.kids]
 display_name = "Kids"
-local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
+local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
 "#,
         );
         let rows2 = build_rows(&shrunk);
@@ -1337,7 +1335,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
         assert!(build_rows(app.loaded_config.as_ref().unwrap()).is_empty());
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 12), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 12), &mut app))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let mut content = String::new();
@@ -1364,7 +1362,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
         app.loaded_config = Some(loaded_from(MIXED));
 
         let mut term = Terminal::new(TestBackend::new(120, 16)).unwrap();
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 16), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 16), &mut app))
             .unwrap();
         let buffer = term.backend().buffer().clone();
         let mut content = String::new();
@@ -1376,8 +1374,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
         assert!(content.contains("nas.home"), "global record missing");
         assert!(
             content.contains("youtube.local"),
-            "profile record must be visible WITHOUT a panel switch — that \
-             is what N6 is for"
+            "profile record must be visible WITHOUT a panel switch"
         );
         assert!(content.contains("Global"), "global header missing");
         assert!(content.contains("Profile: kids"), "profile header missing");

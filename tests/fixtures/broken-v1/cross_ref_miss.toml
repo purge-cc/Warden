@@ -8,5 +8,5 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "ghost"

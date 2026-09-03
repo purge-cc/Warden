@@ -25,9 +25,9 @@ pub struct ApiState {
     /// Auth failure rate limiter.
     pub rate_limiter: AuthRateLimiter,
     /// Per-IP request-rate limiter for authed `/api/*` routes (wires
-    /// `api.rate_limit_per_minute`, rev-2606 `api-auth-07-03`). Disjoint
-    /// from `rate_limiter` (auth-failure lockout, §4.48) by design —
-    /// separate map, separate concern, zero shared state.
+    /// `api.rate_limit_per_minute`). Disjoint from `rate_limiter`
+    /// (auth-failure lockout) by design — separate map, separate
+    /// concern, zero shared state.
     pub api_rate_limiter: crate::api::rate_limit::ApiRateLimiter,
     /// Channel to trigger config+list reload (shared with signal loop).
     /// Payload is the invoker uid from `SO_PEERCRED`; API callers have no
@@ -44,15 +44,15 @@ pub struct ApiState {
     pub upstream_mode: String,
     pub upstream_count: usize,
     pub list_count: usize,
-    /// Sprint 43 T2: shared handle to per-source `ListStatus`. `None`
-    /// when the daemon was started with no `[lists].sources` (filter
-    /// disabled). The `GET /api/blocklists/:id/stats` handler reads
-    /// through this Arc; the list manager updates it atomically on
-    /// each refresh cycle. Mirrors the `DaemonState.list_statuses`
-    /// field T1 added — same registry, two readers (IPC + HTTP).
+    /// Shared handle to per-source `ListStatus`. `None` when the daemon
+    /// was started with no `[lists].sources` (filter disabled). The
+    /// `GET /api/blocklists/:id/stats` handler reads through this Arc;
+    /// the list manager updates it atomically on each refresh cycle.
+    /// Mirrors the `DaemonState.list_statuses` field — same registry,
+    /// two readers (IPC + HTTP).
     pub list_statuses: Option<Arc<ListStatusRegistry>>,
-    /// §4.2 G1a — bit → blocklist-label snapshot, cloned from the same
-    /// `Arc` as `DaemonState.list_labels`. Lets `GET /api/query/{domain}`
+    /// Bit → blocklist-label snapshot, cloned from the same `Arc` as
+    /// `DaemonState.list_labels`. Lets `GET /api/query/{domain}`
     /// render block attribution (`BlockSource::List(bit)` → `list:<name>`)
     /// without re-reading the catalog. Same data, two readers (IPC +
     /// HTTP) — mirrors `list_statuses` above.
@@ -65,7 +65,7 @@ pub struct ApiState {
     /// [`ApiState::mutate_config`] — see there for why the guard never
     /// reaches a handler.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
-    /// §4.11-2 — cluster serve-state (CS4): generations, content hashes, and the
+    /// Cluster serve-state: generations, content hashes, and the
     /// pre-serialised policy / domain-map artifacts the `/api/cluster/*`
     /// handlers return, plus the cluster bearer token + `allow_peer` gate. `Some`
     /// only when `cluster.enabled && role == primary && api.enabled` at boot —
@@ -73,7 +73,7 @@ pub struct ApiState {
     /// Behind the `cluster` feature so the default build is byte-identical.
     #[cfg(feature = "cluster")]
     pub cluster: Option<Arc<crate::cluster::ClusterState>>,
-    /// §4.11-4 — shared cluster observability handle (CS9). The heartbeat
+    /// Shared cluster observability handle. The heartbeat
     /// handler WRITES the per-peer roster through this; the IPC `ClusterStatus`
     /// reader (on `DaemonState`) reads the same `Arc`. `Some` only on an
     /// enabled primary (mirrors `cluster` above). Same handle, two readers —

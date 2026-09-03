@@ -1,17 +1,18 @@
-//! Hit-frequency tracker for popular domains (Sprint §4.4 Phase 1/2).
+//! Hit-frequency tracker for popular domains.
 //!
 //! Tracks per-domain cache-hit counts in a sliding window with
-//! decay-on-write CAS — there is no background task in Phase 1.
-//! When a domain crosses `min_hits` within a window, its `is_in_pool`
-//! flag flips to `true`; on the next window-boundary crossing with too
-//! few accumulated hits, the flag flips back to `false`.
+//! decay-on-write CAS — this module itself runs no background task; the
+//! proactive refresh worker (`prefetch_worker.rs`) polls the pool
+//! snapshot instead. When a domain crosses `min_hits` within a window,
+//! its `is_in_pool` flag flips to `true`; on the next window-boundary
+//! crossing with too few accumulated hits, the flag flips back to
+//! `false`.
 //!
-//! # Scope (Phase 1/2)
+//! # Scope
 //!
 //! Data plane only. The pool is exported via the existing `TrackingStats`
-//! IPC surface but **no DNS-side behaviour reads it yet** — Phase 2/2
-//! will add the proactive refresh worker that consumes the pool snapshot
-//! and the TUI Pulse row.
+//! IPC surface, and the proactive refresh worker consumes the pool
+//! snapshot to keep hot entries warm.
 //!
 //! # Why no parallel `HashSet`
 //!
@@ -27,9 +28,8 @@
 //! # Hot-path discipline
 //!
 //! `record_hit` is the only DNS-side caller. When the tracker is
-//! disabled (the default in Phase 1) it short-circuits before any state
-//! mutation, costing one branch on a `bool` field. When enabled it
-//! performs:
+//! disabled (the default) it short-circuits before any state mutation,
+//! costing one branch on a `bool` field. When enabled it performs:
 //!
 //! - one `BoundedMap::entry_or_insert_with` (atomic shard insert),
 //! - two-to-three relaxed atomic ops on `HitState`,
@@ -45,9 +45,7 @@ use crate::security::bounded_map::BoundedMap;
 /// `cache.prefetch_tracker_*` keys in `[cache]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefetchTrackerConfig {
-    /// Master enable flag. Default `false` in Phase 1 — operators opt in
-    /// per-deploy and Phase 2/2 may flip the default once the refresh
-    /// worker has burned in.
+    /// Master enable flag. Default `false` — operators opt in per-deploy.
     pub enabled: bool,
     /// Sliding-window length in seconds. The counter resets at
     /// `now / window_secs * window_secs` boundaries.
@@ -102,8 +100,8 @@ fn hit_state_age(s: &HitState) -> u64 {
 }
 
 /// How many idle windows a promoted domain may go without a client hit
-/// before the refresh worker time-demotes it (rev-2606 prefetch-01).
-/// Demotion otherwise only fires on a window-boundary client hit, so a
+/// before the refresh worker time-demotes it. Demotion otherwise only
+/// fires on a window-boundary client hit, so a
 /// domain nobody queries again would stay warm upstream forever. Three
 /// windows gives a re-query grace period before the worker lets it cool.
 const PROMOTION_IDLE_WINDOWS: u64 = 3;
@@ -228,9 +226,8 @@ impl HitTracker {
         self.demotions_total.load(Ordering::Relaxed)
     }
 
-    /// Membership query — Phase 2/2 will use this to decide which
-    /// domains the proactive refresh worker should exercise. Empty
-    /// domain returns `false` (L-13 guard).
+    /// Membership query for a single domain. Empty domain returns
+    /// `false` (L-13 guard).
     pub fn is_promoted(&self, domain: &str) -> bool {
         if domain.is_empty() {
             return false;
@@ -242,8 +239,8 @@ impl HitTracker {
         }
     }
 
-    /// Bulk snapshot of every domain currently in the pool. Sprint §4.4
-    /// P2's background refresh worker calls this once per `tick_secs`
+    /// Bulk snapshot of every domain currently in the pool. The
+    /// background refresh worker calls this once per `tick_secs`
     /// (default 30s) to enumerate the hot set. Cost is one
     /// `BoundedMap::snapshot_keys_where` iteration plus one
     /// `CompactString::clone` per match — measured in microseconds at
@@ -268,8 +265,8 @@ impl HitTracker {
     /// `PROMOTION_IDLE_WINDOWS` windows is demoted (`is_in_pool` → false)
     /// and excluded from the returned set.
     ///
-    /// prefetch-01 (rev-2606): demotion otherwise only fires on a
-    /// window-boundary *client* hit (`record_hit`). A domain nobody
+    /// Demotion otherwise only fires on a window-boundary *client* hit
+    /// (`record_hit`). A domain nobody
     /// queries again never gets a `record_hit`, so it stayed promoted
     /// indefinitely and the refresh worker kept it warm upstream — a
     /// self-sustaining query loop for a dead domain, bounded only by cap
@@ -306,8 +303,8 @@ impl HitTracker {
     /// itself is **not** restored — it rebuilds from live query
     /// traffic, which keeps the on-disk format simple and avoids
     /// resurrecting domains that have gone cold across the daemon
-    /// downtime. Sprint §4.4 P1 — only the running totals are stitched
-    /// across restarts so the TUI / IPC counters stay monotonic.
+    /// downtime. Only the running totals are stitched across restarts
+    /// so the TUI / IPC counters stay monotonic.
     pub fn restore_counters(&self, promotions: u64, demotions: u64) {
         self.promotions_total.store(promotions, Ordering::Relaxed);
         self.demotions_total.store(demotions, Ordering::Relaxed);
@@ -563,7 +560,7 @@ mod tests {
         assert!(t.pool_size() <= 4);
     }
 
-    // Sprint §4.4 P2 — snapshot_promoted surface for the background worker.
+    // snapshot_promoted surface for the background worker.
 
     #[test]
     fn snapshot_promoted_returns_all_in_pool() {
@@ -597,8 +594,8 @@ mod tests {
         assert!(t.snapshot_promoted().is_empty());
     }
 
-    /// prefetch-01 (rev-2606): a domain that goes cold (no further
-    /// client hits) must be time-demoted by the worker's snapshot, not
+    /// A domain that goes cold (no further client hits) must be
+    /// time-demoted by the worker's snapshot, not
     /// kept warm forever. Within the idle horizon it stays promoted;
     /// past it, the snapshot demotes it and drops it from the refresh set.
     #[test]

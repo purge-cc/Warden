@@ -2,15 +2,14 @@
 //!
 //! Loads the v1 config from disk, builds a fresh [`ProfileResolver`],
 //! evaluates the source IP, and prints the match level + device +
-//! profile in a human-friendly format that matches the design doc §9.2.
+//! profile in a human-friendly format.
 //!
 //! **Offline mode only for now.** The command does NOT consult the
 //! running daemon via IPC — it simply re-runs the resolver against the
 //! on-disk config. That means the output reflects the config as it
 //! would be loaded on the next SIGHUP, not necessarily what the daemon
 //! has active right now (if the operator edited the file without
-//! reloading). S31+ can add an IPC path if the divergence becomes a
-//! real operator pain point.
+//! reloading).
 //!
 //! # Exit codes
 //!
@@ -124,24 +123,14 @@ pub fn run_resolve(config_path: &Path, ip: IpAddr) -> anyhow::Result<i32> {
 
 /// Print the list policy this resolution actually filters under.
 ///
-/// # What this used to print, and why it changed (`plp-s3`)
-///
-/// It printed every *effective tag* with the entity that contributed it,
-/// then the blocklists that tag set resolved to. The reason was sound and is
-/// worth keeping in view: group tags widened what a device blocked, and a
-/// block the operator could not trace to its cause was indistinguishable
-/// from a bug — the only symptom being "why doesn't this site open?".
-///
-/// `_docs/features/profile_list_policy.md` removes the indirection instead
-/// of tracing it. Direction is now a property of the `(profile, list)` pair,
-/// so there is nothing to attribute: the profile the resolver landed on IS
-/// the answer, and each list's direction under it is one lookup. The
-/// traceability the tag-origin block bought is now free.
+/// Direction is a property of the `(profile, list)` pair, so there is
+/// nothing to trace back through tag origins: the profile the resolver
+/// landed on IS the answer, and each list's direction under it is one
+/// lookup.
 ///
 /// Uses [`effective_direction`](crate::config::schema::effective_direction) —
 /// the same predicate the publish-time projection and `blocklist show`'s
-/// enforcement report call. Never a re-derivation; that is the mistake D11
-/// recorded and P5 forbids.
+/// enforcement report call. Never re-derive it here.
 ///
 /// `unfiltered` is printed on its own line because it is the one thing that
 /// still varies per *device* rather than per profile, and a reader who sees
@@ -245,7 +234,7 @@ mod tests {
 
     #[test]
     fn resolve_exit_config_on_unloadable_config() {
-        // stats-01: a config that fails to load → CONFIG.
+        // A config that fails to load → CONFIG.
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(&dir, "this = is = not = valid = toml\n");
         let code = run_resolve(&p, "10.0.0.1".parse().unwrap()).unwrap();
@@ -341,10 +330,9 @@ mod tests {
         );
 
         let lines = print_tag_provenance(&config, &resolution);
-        // `plp-s3`: `unrelated` used to be excluded because its tag did not
-        // intersect the device's. Tags decide nothing now, so every enabled
-        // list this profile does not `ignore` resolves — sorted by id, which
-        // is what this test actually pins.
+        // Tags decide nothing here, so every enabled list this profile
+        // does not `ignore` resolves — sorted by id, which is what this
+        // test actually pins.
         assert!(
             lines.contains(
                 &"Resolved blocklists (3): ads-block [deny], unrelated [deny], zzz-list [deny]"
@@ -392,8 +380,8 @@ mod tests {
     /// Each resolved id is annotated with its direction so an
     /// allow-direction list never reads as "this blocks you" — it does
     /// the opposite. `base = "allow"` here pairs with `trust = "local"`
-    /// so the config needs no `accept_unsigned_allow` consent (project rules
-    /// §Neutrality's consent table: allow + local trust needs none).
+    /// so the config needs no `accept_unsigned_allow` consent (a local
+    /// trust allow-list needs none).
     #[test]
     fn resolve_annotates_resolved_blocklists_with_kind() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,12 +416,10 @@ mod tests {
 
     /// `Resolved blocklists: none` — a real line, not a blank one.
     ///
-    /// **`plp-s3` changed how a profile gets there.** It used to be tag
-    /// disjunction (device tagged `ads`, the only list tagged `tracking`).
-    /// Tags reach nothing now, so the only way a profile resolves to no list
-    /// is by overriding every one of them to `ignore` — which is what the
-    /// fixture says, and which is the same state the validator's
-    /// `PROFILE_FILTERS_NO_LISTS` WARN names.
+    /// Tags reach nothing here, so the only way a profile resolves to no
+    /// list is by overriding every one of them to `ignore` — which is
+    /// what the fixture says, and which is the same state the
+    /// validator's `PROFILE_FILTERS_NO_LISTS` WARN names.
     #[test]
     fn resolve_reports_no_resolved_blocklists_when_every_list_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -462,9 +448,8 @@ mod tests {
         );
     }
 
-    /// An unfiltered device has no effective tags at all (D14
-    /// short-circuit) — must still print an explicit
-    /// `Resolved blocklists: none`, not skip the line.
+    /// An unfiltered device has no effective tags at all — must still
+    /// print an explicit `Resolved blocklists: none`, not skip the line.
     #[test]
     fn resolve_reports_no_resolved_blocklists_when_device_unfiltered() {
         let dir = tempfile::tempdir().unwrap();

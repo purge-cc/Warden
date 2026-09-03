@@ -151,3 +151,211 @@ fn paste_is_inert_in_subnet_remove_confirm() {
     handle_paste(&mut app, "yyyy".to_string());
     assert!(app.subnets.modal.is_some());
 }
+
+// ── modals-01: the three arms `focused_text_buffer` was missing ────────
+
+#[test]
+fn paste_reaches_rule_add_modal_domain_field() {
+    let mut app = App::new();
+    app.active_leaf = Leaf::Rules;
+    app.rules.add_modal = Some(rule_add_modal::RuleAddModal::open(&app));
+    // `RuleAddModal::open` defaults focus to Domain.
+    handle_paste(&mut app, "ads.example.com".to_string());
+    assert_eq!(
+        app.rules.add_modal.as_ref().unwrap().domain,
+        "ads.example.com"
+    );
+}
+
+#[test]
+fn paste_is_inert_in_rule_edit_modal() {
+    use crate::filter::rules::RuleAction;
+    use crate::tui::app::{RuleEditFocus, RuleEditModal, RuleEditMode, RuleScope, ScopeChoice};
+
+    let mut app = App::new();
+    app.active_leaf = Leaf::Rules;
+    app.rules.edit_modal = Some(RuleEditModal {
+        rule_id: "r-1".into(),
+        raw_rule: "||ads.example.com^".into(),
+        original_action: RuleAction::Block,
+        original_scope: RuleScope::Default,
+        original_references: Vec::new(),
+        current_action: RuleAction::Block,
+        current_scope_choice: ScopeChoice::Default,
+        scope_options: vec![ScopeChoice::Default],
+        focus: RuleEditFocus::Action,
+        mode: RuleEditMode::Edit,
+        error_message: None,
+        status_message: None,
+        submitting: false,
+    });
+    assert!(
+        focused_text_buffer(&mut app).is_none(),
+        "picker/confirm only — paste must not fall through past this gate"
+    );
+}
+
+#[test]
+fn paste_reaches_custom_list_add_form_id_field() {
+    let mut app = App::new();
+    app.active_leaf = Leaf::CustomLists;
+    app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_add("packs".into()));
+    // `Form::new_add` focuses Id first, and Id is pasteable on Add.
+    handle_paste(&mut app, "videogames".to_string());
+    match &app.custom_lists.modal.as_ref().unwrap().stage {
+        custom_list_modal::Stage::EditingForm(form) => assert_eq!(form.id, "videogames"),
+        other => panic!("expected EditingForm, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_reaches_custom_list_form_display_name_and_description() {
+    let mut app = App::new();
+    app.active_leaf = Leaf::CustomLists;
+    app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_add("packs".into()));
+
+    if let Some(custom_list_modal::Stage::EditingForm(form)) =
+        app.custom_lists.modal.as_mut().map(|m| &mut m.stage)
+    {
+        form.focused = custom_list_modal::FormField::DisplayName;
+    }
+    handle_paste(&mut app, "Video games".to_string());
+
+    if let Some(custom_list_modal::Stage::EditingForm(form)) =
+        app.custom_lists.modal.as_mut().map(|m| &mut m.stage)
+    {
+        assert_eq!(form.display_name, "Video games");
+        form.focused = custom_list_modal::FormField::Description;
+    }
+    handle_paste(&mut app, "the kids' allowances".to_string());
+
+    match &app.custom_lists.modal.as_ref().unwrap().stage {
+        custom_list_modal::Stage::EditingForm(form) => {
+            assert_eq!(form.description, "the kids' allowances");
+        }
+        other => panic!("expected EditingForm, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_reaches_custom_list_add_rule_domain_field() {
+    let mut app = App::new();
+    app.active_leaf = Leaf::CustomLists;
+    app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_add_rule(
+        "videogames".into(),
+    ));
+    // `RuleForm::new` focuses Domain first.
+    handle_paste(&mut app, "roblox.example.com".to_string());
+    match &app.custom_lists.modal.as_ref().unwrap().stage {
+        custom_list_modal::Stage::AddingRule(form) => {
+            assert_eq!(form.domain, "roblox.example.com");
+        }
+        other => panic!("expected AddingRule, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_is_inert_in_custom_list_remove_confirm() {
+    use crate::config::schema::{CustomList, Id};
+
+    let entity = CustomList {
+        id: Id::new("videogames").unwrap(),
+        display_name: "Video games".into(),
+        description: "the kids' allowances".into(),
+    };
+    let mut app = App::new();
+    app.active_leaf = Leaf::CustomLists;
+    app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_remove(
+        &entity,
+        Vec::new(),
+        0,
+    ));
+
+    // Same rule as the Lists / Subnets typed gates: buys deliberation,
+    // not transcription.
+    assert!(focused_text_buffer(&mut app).is_none());
+    handle_paste(&mut app, "videogames".to_string());
+    match &app.custom_lists.modal.as_ref().unwrap().stage {
+        custom_list_modal::Stage::ConfirmingRemove(rc) => {
+            assert!(
+                rc.typed.is_empty(),
+                "paste must not land in the typed buffer"
+            );
+        }
+        other => panic!("expected ConfirmingRemove, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_reaches_query_log_filter_name_ip_subnet_fields() {
+    use crate::ipc::protocol::AdvancedClientFilterDto;
+    use query_log_filter_modal::{Field, QueryLogFilterModal};
+
+    let mut app = App::new();
+    app.query_log.advanced_modal = Some(QueryLogFilterModal::open(
+        &AdvancedClientFilterDto::default(),
+    ));
+
+    // `QueryLogFilterModal::open` defaults focus to NamePattern.
+    handle_paste(&mut app, "kids-*".to_string());
+    assert_eq!(
+        app.query_log
+            .advanced_modal
+            .as_ref()
+            .unwrap()
+            .draft
+            .name
+            .as_deref(),
+        Some("kids-*")
+    );
+
+    app.query_log.advanced_modal.as_mut().unwrap().focus = Field::IpPattern;
+    handle_paste(&mut app, "10.0.0.*".to_string());
+    assert_eq!(
+        app.query_log
+            .advanced_modal
+            .as_ref()
+            .unwrap()
+            .draft
+            .ip
+            .as_deref(),
+        Some("10.0.0.*")
+    );
+
+    app.query_log.advanced_modal.as_mut().unwrap().focus = Field::SubnetPattern;
+    handle_paste(&mut app, "10.10.1.0/24".to_string());
+    assert_eq!(
+        app.query_log
+            .advanced_modal
+            .as_ref()
+            .unwrap()
+            .draft
+            .subnet
+            .as_deref(),
+        Some("10.10.1.0/24")
+    );
+}
+
+#[test]
+fn paste_is_inert_on_query_log_filter_polarity_and_action_rows() {
+    use crate::ipc::protocol::AdvancedClientFilterDto;
+    use query_log_filter_modal::{Field, QueryLogFilterModal};
+
+    let mut app = App::new();
+    app.query_log.advanced_modal = Some(QueryLogFilterModal::open(
+        &AdvancedClientFilterDto::default(),
+    ));
+    for focus in [
+        Field::NamePolarity,
+        Field::IpPolarity,
+        Field::SubnetPolarity,
+        Field::Cancel,
+        Field::Apply,
+    ] {
+        app.query_log.advanced_modal.as_mut().unwrap().focus = focus;
+        assert!(
+            focused_text_buffer(&mut app).is_none(),
+            "{focus:?} has no text buffer to paste into"
+        );
+    }
+}

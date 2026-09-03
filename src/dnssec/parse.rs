@@ -2,7 +2,7 @@
 //!
 //! Thin wrappers over hickory-proto's public [`RData::read`] so the rest of the
 //! crate has one stable DNSSEC-parsing entry point — and one place to add
-//! length / sanity caps in a later sprint. Parsing decodes the RDATA into typed
+//! length / sanity caps if needed. Parsing decodes the RDATA into typed
 //! records only; signature *verification* lives in [`crate::dnssec::verify`].
 
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
@@ -123,8 +123,8 @@ mod tests {
     #[test]
     fn parses_ecdsa_p256_dnskey_algorithm() {
         // flags=256 (0x0100, ZSK), protocol=3, algorithm=13 (ECDSAP256SHA256),
-        // then a 64-byte P-256 public key. Sprint 1 only identifies the
-        // algorithm; it does not verify the key, so dummy key bytes suffice.
+        // then a 64-byte P-256 public key. This only identifies the algorithm;
+        // it does not verify the key, so dummy key bytes suffice.
         let mut bytes = vec![0x01u8, 0x00, 0x03, 0x0d];
         bytes.extend_from_slice(&[0xABu8; 64]);
         let key = decode_dnskey_rdata(&bytes).expect("alg-13 DNSKEY parses");

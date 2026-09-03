@@ -1,11 +1,11 @@
 //! `warden migrate v0-to-v1` — one-shot translation from the pre-v1
 //! single-file layout to the FHS-compliant `/etc/purge-warden/` multi-file
-//! tree, per design doc §12.
+//! tree.
 //!
 //! # Input shape
 //!
 //! Any TOML file in the pre-v1 single-file layout — or one already in
-//! the v1 [`ConfigV1`] shape — is accepted. Mixed files (post-S28 scaffolds
+//! the v1 [`ConfigV1`] shape — is accepted. Mixed files (scaffolds
 //! that already carry `[[blocklists]]` / v1 `[profiles.*]` next to legacy
 //! `[[clients]]`) are handled by extracting each section individually
 //! rather than piping the whole thing through one deserialiser. This keeps
@@ -87,7 +87,7 @@ fn migration_atomic_write(path: &Path, content: &str) -> anyhow::Result<()> {
 /// default. Migrated `*.d/` slice dirs must not be world-listable — the
 /// filenames leak device/profile ids even when the file contents stay `0o640`.
 /// Mirrors `backup.rs` / `init.rs`; `recursive` makes it a no-op on an existing
-/// dir (the mode applies only to dirs we actually create). cli §9 migrate-01.
+/// dir (the mode applies only to dirs we actually create).
 fn create_dir_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -128,7 +128,7 @@ pub fn run(
 }
 
 /// CLI entry point for `warden migrate v1-to-v2` — **deprecated alias for
-/// `v1-to-v3`** since plp-s3b.
+/// `v1-to-v3`**.
 ///
 /// The verb cannot do what its name says any more. `migrate_v1_to_v2`
 /// writes [`SCHEMA_VERSION_V1`] into its output, which is now `3`, so it
@@ -165,14 +165,13 @@ pub struct V1ToV2Summary {
     pub notes: Vec<String>,
 }
 
-/// Translate a pre-`lists_categories_v2` config (schema_version = 2 wire,
-/// pre-Sprint-A semantic) into the tag-based v2 association model. Per
-/// `_docs/features/lists_categories_v2.md` §7:
+/// Translate a pre-`lists_categories_v2` config (schema_version = 2 wire)
+/// into the tag-based v2 association model:
 ///
 /// - Every `kind = "deny"` blocklist (including the implicit default)
 ///   gains `tags = ["uncategorized"]` so it stays applied to every
 ///   device that inherits the `uncategorized` sentinel post-migration.
-/// - Every `kind = "allow"` blocklist keeps `tags = []` (D2 — auto-allow
+/// - Every `kind = "allow"` blocklist keeps `tags = []` (auto-allow
 ///   for everyone is a security risk; the operator tags allow-lists
 ///   explicitly).
 /// - `Profile.blocklists` and `Profile.categories` arrays are dropped;
@@ -195,13 +194,13 @@ pub fn migrate_v1_to_v2(
         bail!("v1 config not found: {}", from_config.display());
     }
 
-    // §4.35 DISC-2 (2026-05-13): refuse to clobber an existing target
-    // unless --force. Pre-fix the single-file output was overwritten
+    // Refuse to clobber an existing target
+    // unless --force. Previously the single-file output was overwritten
     // silently, costing operator post-edits on a re-run.
     if target.exists() && !force {
         bail!(
             "target {} already exists. Pass --force to overwrite (will replace the file). \
-             Re-running on an already-migrated input is idempotent (cli-h2) so the new \
+             Re-running on an already-migrated input is idempotent so the new \
              output should match the existing one byte-for-byte, but operator post-edits \
              would be lost.",
             target.display()
@@ -218,7 +217,7 @@ pub fn migrate_v1_to_v2(
     apply_v1_to_v2_transformations(&mut root, &mut summary)?;
 
     // Pin schema_version to the current value so a downgrade-input
-    // (legacy schema_version = 1) lands on the post-Sprint-A v2 wire.
+    // (legacy schema_version = 1) lands on the current v2 wire.
     if let Value::Table(t) = &mut root {
         t.insert(
             "schema_version".into(),
@@ -254,7 +253,7 @@ pub fn migrate_v1_to_v2(
     // in-place case the migrate-transactionality lens forbids). The v0→v1
     // multi-file path keeps the TOML-parse-only validator because its staged
     // slices can be mid-schema; this v1→v2 path produces a single complete
-    // file, so the full loader can and must gate the rename. cli §9 #2.
+    // file, so the full loader can and must gate the rename.
     let now = OffsetDateTime::now_utc();
     atomic_write_and_validate(target, &output, |staged: &Path| {
         crate::config::loader::load_config(staged, now)
@@ -283,7 +282,7 @@ pub fn migrate_v1_to_v2(
 
     if summary.blocklists_kept_empty_tags > 0 {
         summary.notes.push(format!(
-            "{} allow-list(s) kept `tags = []` (D2). Sprint B's reload \
+            "{} allow-list(s) kept `tags = []`. The reload \
              validator will emit a WARN for each — tag the allow-list(s) \
              explicitly to silence the warning.",
             summary.blocklists_kept_empty_tags
@@ -312,10 +311,10 @@ fn apply_v1_to_v2_transformations(
         _ => bail!("v1 config root must be a TOML table"),
     };
 
-    // §4.28 b9 cli-h2 idempotency short-circuit (2026-05-13): if the
+    // Idempotency short-circuit: if the
     // input already carries v2 shape (every blocklist has `tags` and
     // no `[[categories]]` block survives), the transformation is a
-    // no-op. Pre-fix a re-run would clobber operator-set tags via
+    // no-op. Previously a re-run would clobber operator-set tags via
     // unconditional `t.insert("tags", …)`.
     if is_already_v2(table) {
         tracing::info!(
@@ -325,14 +324,13 @@ fn apply_v1_to_v2_transformations(
         return Ok(());
     }
 
-    // 1) Drop top-level `[[categories]]` block (entity removed in
-    //    Sprint A of lists_categories_v2).
+    // 1) Drop top-level `[[categories]]` block (entity removed).
     if let Some(Value::Array(arr)) = table.remove("categories") {
         summary.categories_blocks_dropped = arr.len();
     }
 
     // 2) Walk `[[blocklists]]`: drop legacy `category`, set `tags`
-    //    based on `kind`. cli-h2: skip entries that already carry
+    //    based on `kind`. Skip entries that already carry
     //    `tags` so an operator-customised value survives a re-run.
     if let Some(Value::Array(blocklists)) = table.get_mut("blocklists") {
         for entry in blocklists.iter_mut() {
@@ -357,7 +355,7 @@ fn apply_v1_to_v2_transformations(
     }
 
     // 3) Walk `[profiles.<id>]` table: drop `blocklists` + `categories`
-    //    arrays, set `tags = []` ONLY when absent (cli-h2).
+    //    arrays, set `tags = []` ONLY when absent.
     if let Some(Value::Table(profiles)) = table.get_mut("profiles") {
         for (_, profile_val) in profiles.iter_mut() {
             if let Value::Table(t) = profile_val {
@@ -374,7 +372,7 @@ fn apply_v1_to_v2_transformations(
     }
 
     // 4) Walk `[[devices]]`: set `tags = ["uncategorized"]` +
-    //    `unfiltered = false`. cli-h2: gate both inserts on
+    //    `unfiltered = false`. Gate both inserts on
     //    `contains_key` so an operator who has already moved a device
     //    to e.g. `tags = ["family"]` keeps that on re-run.
     if let Some(Value::Array(devices)) = table.get_mut("devices") {
@@ -394,7 +392,7 @@ fn apply_v1_to_v2_transformations(
         }
     }
 
-    // 5) Walk `[[subnets]]`: set `tags = []` only when absent (cli-h2).
+    // 5) Walk `[[subnets]]`: set `tags = []` only when absent.
     if let Some(Value::Array(subnets)) = table.get_mut("subnets") {
         for entry in subnets.iter_mut() {
             if let Value::Table(t) = entry {
@@ -409,9 +407,9 @@ fn apply_v1_to_v2_transformations(
     Ok(())
 }
 
-/// Already-v2 detector for the cli-h2 idempotency short-circuit. The
+/// Already-v2 detector for the idempotency short-circuit. The
 /// loose signal is "no `[[categories]]` block AND every blocklist
-/// carries a `tags` field" — a pre-Sprint-A v1 config has neither,
+/// carries a `tags` field" — a legacy v1 config has neither,
 /// so the absence of categories alone is not enough.
 fn is_already_v2(table: &toml::value::Table) -> bool {
     let no_categories = table.get("categories").is_none();
@@ -437,8 +435,8 @@ pub struct V2ToV3Summary {
     /// change behaviour: in v3 a list with no override is inherited by every
     /// profile.
     pub pairs_ignored: usize,
-    /// `[[blocklists]]` rows whose `kind` key was renamed to `base`
-    /// (plp-s3b). Counted separately from the policy work because it is the
+    /// `[[blocklists]]` rows whose `kind` key was renamed to `base`.
+    /// Counted separately from the policy work because it is the
     /// half that makes the output *loadable* at all: `Blocklist` carries
     /// `deny_unknown_fields`, so a surviving `kind` is a hard refusal.
     pub lists_renamed_kind_to_base: usize,
@@ -471,7 +469,7 @@ pub struct V2ToV3Summary {
 /// next save).
 /// The v2 sentinel the loader used to stamp on every untagged deny-list.
 ///
-/// A local copy on purpose. `plp-s5a` deleted `config::schema::tag`, so the
+/// A local copy on purpose. A prior refactor deleted `config::schema::tag`, so the
 /// shared const is gone — but this module reads **v2** files, where the tag
 /// model was live, and it needs the same value the v2 loader would have
 /// synthesised in order to derive the right `profiles.<id>.lists` table.
@@ -507,9 +505,9 @@ fn raw_string_array(t: &toml::value::Table, key: &str) -> Option<Vec<String>> {
 /// axis — `profiles.<id>.lists` is the whole model — so flattening them would
 /// be a silent verdict change for whichever client loses a list.
 ///
-/// `_docs/features/profile_list_policy.md` §4 S3 names devices; groups and
+/// The design intent names devices; groups and
 /// subnets are the same defect through a different door, and refusing all
-/// three costs nothing on the two live hosts (measured 2026-08-24: zero
+/// three costs nothing on the two live hosts (measured: zero
 /// tagged entities of any kind).
 fn tagged_sub_profile_entities(table: &toml::value::Table) -> Vec<String> {
     let mut out = Vec::new();
@@ -530,10 +528,10 @@ fn tagged_sub_profile_entities(table: &toml::value::Table) -> Vec<String> {
 
 /// Snapshot the association v2 resolved, as explicit per-profile overrides.
 ///
-/// Per `_docs/features/profile_list_policy.md` §4 S3: *"snapshot meccanico
-/// della risoluzione odierna in override espliciti"*. Nothing is repaired.
+/// The intent: a mechanical snapshot of today's resolution into explicit
+/// overrides. Nothing is repaired.
 /// If two profiles filtered identically because every list carried
-/// `uncategorized` (§1.1 E1), the migrated config says so out loud — that
+/// `uncategorized`, the migrated config says so out loud — that
 /// defect is the operator's to fix once they can see it, and a migration that
 /// quietly improved it would be changing verdicts.
 ///
@@ -552,9 +550,9 @@ fn tagged_sub_profile_entities(table: &toml::value::Table) -> Vec<String> {
 /// then claim.
 ///
 /// **This paragraph used to say `tags` stay exactly as the file had them,
-/// "S5 removes the field", and that was right when written.** S5 has since
-/// landed: the field is gone from the data model and the loader strips the
-/// key at load, so leaving it here no longer defers work to a later sprint —
+/// deferring their removal to later.** That has since landed:
+/// the field is gone from the data model and the loader strips the
+/// key at load, so leaving it here no longer defers the work —
 /// it hands the operator a config that NOTES once per entity at every load,
 /// forever, with no CLI able to clear it. The key is now removed here, which
 /// is the only place the operator's forward path passes through.
@@ -569,10 +567,10 @@ fn tagged_sub_profile_entities(table: &toml::value::Table) -> Vec<String> {
 /// written for every (profile, list) pair** — a config that loads, lints
 /// clean, and filters nothing.
 ///
-/// Not hypothetical: it shipped in this function for one commit, and was
-/// caught by migrating the two live household configs rather than by any
-/// test. `the lab host` came out the far side with all fourteen of its lists
-/// ignored by both profiles. It lints clean because a `base = "deny"` list
+/// Not hypothetical: it shipped in this function briefly, and was
+/// caught by migrating a real household config rather than by any
+/// test — every one of its lists came out ignored by both profiles.
+/// It lints clean because a `base = "deny"` list
 /// that every profile overrides to `ignore` has no detector — see
 /// `plp-all-profiles-ignore-is-silently-inert`.
 ///
@@ -619,7 +617,7 @@ fn apply_v2_to_v3_inner(root: &mut Value, summary: &mut V2ToV3Summary) -> anyhow
         _ => bail!("v2 config root must be a TOML table"),
     };
 
-    // plp-s3b — `kind` → `base` on every `[[blocklists]]` row.
+    // `kind` → `base` on every `[[blocklists]]` row.
     //
     // ABOVE the `is_already_v3` short-circuit on purpose. That gate keys on
     // the *profiles* carrying `lists` tables, so a half-migrated file — one
@@ -676,7 +674,7 @@ fn apply_v2_to_v3_inner(root: &mut Value, summary: &mut V2ToV3Summary) -> anyhow
              {verb} onto the profile would silently change what those clients \
              filter.\n  {}\n\nMove the intent onto a profile first: give the affected \
              clients a profile of their own with the same list set, clear the `tags`, \
-             and re-run. See `_docs/features/profile_list_policy.md` §4 S3.",
+             and re-run.",
             refused.len(),
             refused.join("\n  "),
         );
@@ -700,8 +698,8 @@ fn apply_v2_to_v3_inner(root: &mut Value, summary: &mut V2ToV3Summary) -> anyhow
                 let effective_tags = match declared {
                     Some(tags) => tags,
                     // `auto_promote_blocklists`: untagged DENY lists become
-                    // `uncategorized`; allow-lists deliberately do not (D2 —
-                    // auto-allowing for every device is a security risk).
+                    // `uncategorized`; allow-lists deliberately do not
+                    // (auto-allowing for every device is a security risk).
                     None if kind == "allow" => Vec::new(),
                     None => vec![V2_UNCATEGORIZED.to_string()],
                 };
@@ -759,7 +757,7 @@ fn apply_v2_to_v3_inner(root: &mut Value, summary: &mut V2ToV3Summary) -> anyhow
 ///
 /// The signal is "there is at least one profile and every one of them carries
 /// a `lists` table". Deliberately not `schema_version`: the wire version and
-/// the association model are bumped by different sprints, so keying on it
+/// the association model are bumped at different points, so keying on it
 /// would make this a no-op on a config that has the new number and none of
 /// the new content.
 fn is_already_v3(table: &toml::value::Table) -> bool {
@@ -772,7 +770,7 @@ fn is_already_v3(table: &toml::value::Table) -> bool {
 }
 
 /// Translate a tag-associated v2 config into the per-profile list policy of
-/// v3, per `_docs/features/profile_list_policy.md` §4 S3.
+/// v3.
 ///
 /// Mirrors [`migrate_v1_to_v2`] exactly — same refusal-to-clobber rule, same
 /// backup, same validate-before-rename write — because the properties that
@@ -967,7 +965,7 @@ fn v1_profile_association(
 ///   every profile at `tags = []`, so the tag intersection in
 ///   [`apply_v2_to_v3_transformations`] is empty for every pair and every
 ///   `(profile, list)` lands on `ignore`. The output loads, lints clean, and
-///   filters **nothing** — the 2026-05-07 shape, frozen into explicit
+///   filters **nothing** — that shape, frozen into explicit
 ///   config.
 ///
 /// The direct route is also *lossless*, which the chain could never be: v1
@@ -984,7 +982,7 @@ fn v1_profile_association(
 ///    (drop `[[categories]]`, drop `Blocklist.category`, seed `tags`,
 ///    default `unfiltered`) is the same work and is already covered by
 ///    `tests/migrate_v1_to_v2_golden.rs`. The tags it seeds decide nothing
-///    under v3 and are removed by S5; reproducing that pass by hand to omit
+///    under v3 and are removed later; reproducing that pass by hand to omit
 ///    them would fork a tested transformation to save a field.
 /// 3. Rename `kind` → `base` on every `[[blocklists]]` row.
 /// 4. Write `profiles.<id>.lists` from the captured association.
@@ -999,7 +997,7 @@ pub fn migrate_v1_to_v3(
     if target.exists() && !force && target != from_config {
         bail!(
             "target {} already exists. Pass --force to overwrite (will replace the file). \
-             Re-running on an already-migrated input is idempotent (cli-h2) so the new \
+             Re-running on an already-migrated input is idempotent so the new \
              output should match the existing one byte-for-byte, but operator post-edits \
              would be lost.",
             target.display()
@@ -1121,7 +1119,7 @@ fn apply_v1_to_v3_policy(
         _ => bail!("v1 config root must be a TOML table"),
     };
 
-    // `plp-s5a` retired the `tags` key from the data model. The loader
+    // A prior refactor retired the `tags` key from the data model. The loader
     // strips it at load and NOTES it, once per entity, on every load and
     // every reload — so a migrated config that still carries the key warns
     // forever, and the only way to silence it is hand-editing the file, in a
@@ -1292,7 +1290,7 @@ fn print_v1_to_v2_summary(s: &V1ToV2Summary) {
 
 /// Core migration routine, public for tests + programmatic callers.
 ///
-/// §4.35 cli-m2 + cli-m3 (2026-05-13): the write sequence is now
+/// The write sequence is
 /// transactional via a `<target>/.staging/` directory:
 ///
 /// 1. Pre-flight: refuse to clobber existing migration artifacts
@@ -1330,7 +1328,7 @@ pub fn migrate(
 
     let (mut config_v1, mut notes) = translate(&root)?;
 
-    // Pre-flight: target shape + overwrite policy (cli-m3).
+    // Pre-flight: target shape + overwrite policy.
     if target.exists() {
         if !target.is_dir() {
             bail!("{} exists and is not a directory", target.display());
@@ -1354,11 +1352,11 @@ pub fn migrate(
         create_dir_mode(target, 0o750)?;
     }
 
-    // §4.35 cli-m2: backup BEFORE any writes hit disk so a partial
+    // Backup BEFORE any writes hit disk so a partial
     // crash leaves the operator with a recoverable state.
     let backup_path = backup_legacy(legacy_config)?;
 
-    // cli §9 migrate-02: stage into a CSPRNG-named 0o700 dir under the target
+    // Stage into a CSPRNG-named 0o700 dir under the target
     // (same filesystem, so the promote rename(2) stays atomic) instead of a
     // predictable, EEXIST-tolerant `<target>/.staging` an attacker could
     // pre-create or symlink. The StagingDir guard wipes the staging tree on
@@ -1403,7 +1401,7 @@ pub fn migrate(
     // tree is internally consistent, so a partial-promote (e.g. a
     // crash between renames) leaves the target with a valid prefix
     // and the operator can re-run with --force to finish.
-    // cli §9 #6: `<target>/` may hold a partial set of already-renamed files on
+    // `<target>/` may hold a partial set of already-renamed files on
     // a promote failure; the legacy config is never deleted, so a `--force`
     // re-run completes the promote. StagingDir::drop wipes the staging
     // remainder on either outcome.
@@ -1448,7 +1446,7 @@ pub fn migrate(
 /// True when `target` already holds migration output: either
 /// `<target>/config.toml` exists, or any of the known entity
 /// subdirectories carry at least one file. Used by `migrate()` and
-/// gated on `--force` (§4.35 cli-m3).
+/// gated on `--force`.
 fn target_has_existing_artifacts(target: &Path) -> anyhow::Result<bool> {
     if target.join("config.toml").exists() {
         return Ok(true);
@@ -1604,7 +1602,7 @@ pub fn translate(root_raw: &Value) -> anyhow::Result<(ConfigV1, Vec<String>)> {
         if let Some(Value::Table(server)) = root_table.get_mut("server") {
             if let Some(v) = server.remove("blocked_ttl_secs") {
                 // v0 blocked_ttl_secs is a per-server TTL; in v1 the
-                // equivalent is server.default_blocked_ttl_secs (the N6
+                // equivalent is server.default_blocked_ttl_secs (the
                 // per-profile fallback). Forward only when the v1 field is
                 // not already present, so a mixed config that already sets
                 // `default_blocked_ttl_secs = 120` wins.
@@ -1614,8 +1612,8 @@ pub fn translate(root_raw: &Value) -> anyhow::Result<(ConfigV1, Vec<String>)> {
             }
             if let Some(Value::Boolean(true)) = server.remove("block_unmapped_clients") {
                 notes.push(
-                    "server.block_unmapped_clients = true detected. SN3 removed \
-                     this flag — the equivalent v1 behaviour is leaving \
+                    "server.block_unmapped_clients = true detected. This flag was removed — \
+                     the equivalent v1 behaviour is leaving \
                      `server.default_profile` unset (→ REFUSED for unmapped \
                      sources). Review the produced config and, if appropriate, \
                      set `default_profile` explicitly."
@@ -1727,13 +1725,12 @@ fn apply_v0_profile_extras(
                     continue;
                 }
             };
-            // Sprint A of `lists_categories_v2` removed
-            // `Profile.blocklists` (D1, D5). The legacy v0 path no
-            // longer attaches lists to profiles directly — Sprint B's
-            // tag intersection takes over. The list itself is still
+            // `Profile.blocklists` was removed. The legacy v0 path no
+            // longer attaches lists to profiles directly — tag
+            // intersection takes over. The list itself is still
             // emitted into `[[blocklists]]` so the bitmask stays
             // populated; auto-promotion to `tags=["uncategorized"]`
-            // happens at validator pass (T3).
+            // happens at validator pass.
             let _ = profile_entry;
             if !config.blocklists.iter().any(|b| b.id == id) {
                 config.blocklists.push(Blocklist {
@@ -1857,18 +1854,18 @@ fn translate_v0_clients(
             mac_aliases: client.mac_aliases.clone(),
             profile,
             groups: Vec::new(),
-            // Sprint A of `lists_categories_v2`: device.tags is now
+            // `device.tags` is now
             // Vec<TagSlug>. Legacy v0 free-form tags are dropped during
-            // migration — Sprint A's auto-promote logic in T3 +
-            // migrate v1→v2 will populate `["uncategorized"]` on the
+            // migration — auto-promote logic plus
+            // `migrate v1→v2` will populate `["uncategorized"]` on the
             // device after this step.
             owner: client.owner.clone(),
             device_type: client.device_type.clone(),
             department: client.department.clone(),
             notes: client.notes.clone(),
-            // S43 T4: per-device overlay fields default-empty during the
+            // Per-device overlay fields default-empty during the
             // legacy v0→v1 migration. Operators add them post-migration
-            // via `warden device {allow,deny}` (T5). R1: schema additive.
+            // via `warden device {allow,deny}`. Schema additive.
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
             override_profile_deny: false,
@@ -2073,7 +2070,7 @@ fn backup_legacy(legacy_config: &Path) -> anyhow::Result<PathBuf> {
         .unwrap_or_else(|_| "unknown-time".to_string())
         .replace(':', "-");
     // Bump the name on a same-second collision so a rapid re-run can't
-    // silently overwrite the pre-migration rollback copy (cli §9 #8).
+    // silently overwrite the pre-migration rollback copy.
     let path =
         crate::cli::commands::make_unique_path(backup_dir.join(format!("pre-migration-{ts}.toml")));
     std::fs::copy(legacy_config, &path).with_context(|| {
@@ -2318,7 +2315,7 @@ tags = ["general", "kids-only"]
         assert_eq!(sanitize_id("__weird__"), "weird");
         // Accented chars are dropped entirely (charset is ASCII lowercase).
         assert_eq!(sanitize_id("caffè"), "caff");
-        assert_eq!(sanitize_id("Alex iPhone"), "alex-iphone");
+        assert_eq!(sanitize_id("Operator iPhone"), "operator-iphone");
     }
 
     #[test]
@@ -2351,7 +2348,7 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 
 [upstream]
@@ -2380,14 +2377,14 @@ lists = ["privacy/ads"]
 
 [[clients]]
 name = "iphone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 "#;
         let root: Value = src.parse().unwrap();
         let (cfg, _notes) = translate(&root).unwrap();
         assert_eq!(cfg.devices.len(), 1);
         assert_eq!(cfg.devices[0].id.as_str(), "iphone");
-        assert_eq!(cfg.devices[0].ip, Some("192.0.2.107".parse().unwrap()));
+        assert_eq!(cfg.devices[0].ip, Some("10.10.1.107".parse().unwrap()));
         // v0 profile.lists -> blocklists + [[blocklists]] entry
         assert_eq!(cfg.blocklists.len(), 1);
         assert_eq!(cfg.blocklists[0].id.as_str(), "privacy-ads");
@@ -2402,9 +2399,9 @@ profile = "default"
             "migrated blocklist must inherit the shared default max_entries"
         );
         let _default_prof = cfg.profiles.get("default").unwrap();
-        // Sprint A of `lists_categories_v2`: `Profile.blocklists` is
-        // gone (D1, D5). The list is still emitted into `[[blocklists]]`
-        // (asserted above); Sprint B's tag intersection takes over for
+        // `Profile.blocklists` is
+        // gone. The list is still emitted into `[[blocklists]]`
+        // (asserted above); tag intersection takes over for
         // the per-profile applicability check.
     }
 
@@ -2443,7 +2440,7 @@ block_all = true
 
 [[clients]]
 name = "tablet"
-ip = "192.0.2.50"
+ip = "10.10.1.50"
 profile = "default"
 
 [[schedules]]
@@ -2501,7 +2498,7 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 
 [upstream]
@@ -2533,7 +2530,7 @@ servers = ["192.0.2.1:53"]
             .expect("migrated config should lint clean");
     }
 
-    /// cli §9 migrate-01: every migrated `*.d/` dir (and the fresh target
+    /// Every migrated `*.d/` dir (and the fresh target
     /// root) lands `0o750`, not the umask-default `0o755` — the slice
     /// filenames leak device/profile ids and must not be world-listable.
     #[test]
@@ -2562,7 +2559,7 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 
 [upstream]
@@ -2618,10 +2615,10 @@ servers = ["192.0.2.1:53"]
         assert!(!target.join("blocklists.d").exists());
     }
 
-    // ── Sprint 37 QL5: preserve explicit `query_log_enabled` ──────────
-    // The 2026-04-23 incident had the v0→v1 migrator silently overwrite
+    // ── preserve explicit `query_log_enabled` ──────────
+    // A past incident had the v0→v1 migrator silently overwrite
     // an operator's explicit `query_log_enabled = true` with the struct
-    // default (which was `false` pre-Sprint-37). These three tests pin
+    // default (which used to be `false`). These three tests pin
     // the invariants so any future refactor of `translate()` or the
     // `TrackingConfig` serde wiring that regresses them fails loudly.
 
@@ -2661,9 +2658,9 @@ query_log_enabled = true
 
     #[test]
     fn migrator_uses_new_default_when_v0_has_no_tracking_section() {
-        // The 2026-04-23 scenario: pre-S34 backup had no `[tracking]`
+        // The scenario: an old backup had no `[tracking]`
         // at all; the old migrator emitted `query_log_enabled = false`
-        // via the struct default. Post-Sprint-37 the struct default is
+        // via the struct default. The struct default is now
         // `true`, so an absent section now yields logging on.
         let src = r#"
 [server]
@@ -2688,7 +2685,7 @@ lists = ["privacy/ads"]
 
 [[clients]]
 name = "Alice's iPad"
-ip = "192.0.2.108"
+ip = "10.10.1.108"
 profile = "default"
 "#;
         let root: Value = src.parse().unwrap();
@@ -2705,10 +2702,9 @@ profile = "default"
         assert!(!notes.iter().any(|n| n.contains("auto-generated")));
     }
 
-    // ── §4.35 cli-h2 idempotency + cli-m2 transactional + cli-m3
-    //    no-overwrite + DISC-2 v1→v2 no-overwrite (2026-05-13) ─────────
+    // ── idempotency + transactional + no-overwrite ─────────
 
-    /// cli-h2: a second run of `apply_v1_to_v2_transformations` on an
+    /// A second run of `apply_v1_to_v2_transformations` on an
     /// already-transformed document is a no-op. Operator-set tags
     /// survive byte-identical.
     #[test]
@@ -2734,7 +2730,7 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 
 [upstream]
@@ -2759,7 +2755,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// cli-h2: operator-set tags on devices survive a re-run. Pre-fix
+    /// Operator-set tags on devices survive a re-run. Previously
     /// the unconditional `t.insert("tags", ["uncategorized"])` would
     /// clobber a `tags = ["family"]` the operator added by hand.
     #[test]
@@ -2787,7 +2783,7 @@ tags = ["family"]
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 tags = ["family"]
 unfiltered = false
@@ -2840,7 +2836,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// cli-h2: the `is_already_v2` short-circuit. A document where
+    /// The `is_already_v2` short-circuit. A document where
     /// every blocklist already carries `tags` and there's no
     /// [[categories]] block is detected as already-migrated; the
     /// transformation logs and returns Ok without mutating summary.
@@ -2865,7 +2861,7 @@ tags = ["family"]
         assert_eq!(summary.devices_tagged_uncategorized, 0);
     }
 
-    /// cli-m3: a re-run of `migrate()` against a populated target
+    /// A re-run of `migrate()` against a populated target
     /// refuses without `--force`.
     #[test]
     fn migrate_v0_v1_refuses_populated_target_without_force() {
@@ -2902,7 +2898,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// cli-m3 happy-path: --force unlocks the overwrite. Pre-condition
+    /// Happy-path: --force unlocks the overwrite. Pre-condition
     /// is the same as the refuse test — `migrate()` ran once and
     /// produced a tree. The second run with force succeeds and the
     /// master is replaced.
@@ -2940,7 +2936,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// cli-m2 transactional invariant: when the staged tree fails
+    /// Transactional invariant: when the staged tree fails
     /// validation, target/ remains untouched and the staging dir is
     /// cleaned up. Force a validation failure by handing the migrator
     /// a translatable-but-impossible config — a `default_profile`
@@ -2980,7 +2976,7 @@ servers = ["192.0.2.1:53"]
             !target.join("config.toml").exists(),
             "target master must not exist after validation failure"
         );
-        // The CSPRNG-named staging dir (cli §9 migrate-02) is wiped by the
+        // The CSPRNG-named staging dir is wiped by the
         // StagingDir guard on the validation-failure return — no leftover
         // `purge-warden-stage-*` dir under target.
         let leftover = std::fs::read_dir(&target).unwrap().any(|e| {
@@ -2995,7 +2991,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// DISC-2: `migrate_v1_to_v2()` refuses to overwrite an existing
+    /// `migrate_v1_to_v2()` refuses to overwrite an existing
     /// target without `--force`.
     #[test]
     fn migrate_v1_to_v2_refuses_populated_target_without_force() {
@@ -3031,7 +3027,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// DISC-2 happy-path: --force unlocks the v1→v2 overwrite.
+    /// Happy-path: --force unlocks the v1→v2 overwrite.
     #[test]
     fn migrate_v1_to_v2_force_unlocks_overwrite() {
         let tmp = tmpdir();

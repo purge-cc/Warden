@@ -332,7 +332,7 @@ fn subnets_dangling_selection_is_repaired_so_master_and_detail_agree() {
         Subnet {
             id: Id::new(id).unwrap(),
             display_name: id.to_string(),
-            cidrs: vec!["192.0.2.0/24".to_string()],
+            cidrs: vec!["10.10.1.0/24".to_string()],
             profile: Id::new("default").unwrap(),
             priority: 0,
         }

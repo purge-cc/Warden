@@ -1,4 +1,4 @@
-//! §4.12 — per-profile domain rewrite engine.
+//! Per-profile domain rewrite engine.
 //!
 //! Rewrites a queried qname before resolution. Useful for domain migrations
 //! (`api.old.com → api.new.com`) and "fake CNAME" without committing a
@@ -7,12 +7,12 @@
 //! Built once at resolver-map construction time from the profile's
 //! `rewrite_rules` slice (already validated by
 //! [`crate::config::validator::validate_rewrite_rules`]). Lives behind the
-//! existing `ArcSwap<ResolverMap>` — R5 (zero-alloc, zero-lock hot path).
+//! existing `ArcSwap<ResolverMap>` (zero-alloc, zero-lock hot path).
 //!
 //! ## Hot-path semantics
 //!
 //! [`ProfileRewriteRules::apply`] is **single-pass**: the rewritten output is
-//! never re-fed into the table. This is the DR2 runtime depth=1 guard —
+//! never re-fed into the table. This is the runtime depth=1 guard —
 //! belt-and-braces for the validator's config-time cycle detection. Even if
 //! the validator misses a cycle (unlikely; it runs three-colour DFS), the
 //! runtime cannot loop.
@@ -35,7 +35,7 @@ use compact_str::CompactString;
 
 use crate::config::settings::RewriteRule;
 
-/// Per-profile rewrite table (DM-equivalent, §4.12).
+/// Per-profile rewrite table.
 ///
 /// `forward` carries exact-match rules keyed on the lowercased `from`.
 /// `suffix_rules` carries `match_subdomains: true` rules, **sorted by label
@@ -46,7 +46,7 @@ use crate::config::settings::RewriteRule;
 ///
 /// `has_subdomain_rules` is the fast-path bool. When `false`, [`Self::apply`]
 /// short-circuits the suffix walk completely — profiles without rewrites pay
-/// one `HashMap::get` per query, indistinguishable from pre-§4.12 baseline.
+/// one `HashMap::get` per query and are otherwise unaffected.
 #[derive(Debug, Default, Clone)]
 pub struct ProfileRewriteRules {
     forward: HashMap<CompactString, CompactString, ahash::RandomState>,
@@ -67,11 +67,11 @@ impl ProfileRewriteRules {
             HashMap::with_hasher(ahash::RandomState::new());
         let mut suffix_rules: Vec<(CompactString, CompactString)> = Vec::new();
 
-        // Shared canonical spelling (cfg-validator-03): the validator's
-        // duplicate/identity/shadow checks and this table must key on the
-        // same string, and the key must match the handler's lowercase
-        // dot-less query domain ("Ads.Example.Com." in TOML must fire on
-        // a query for ads.example.com).
+        // Shared canonical spelling: the validator's duplicate/identity/
+        // shadow checks and this table must key on the same string, and
+        // the key must match the handler's lowercase dot-less query
+        // domain ("Ads.Example.Com." in TOML must fire on a query for
+        // ads.example.com).
         let canonical: Vec<(CompactString, CompactString, bool)> = rules
             .iter()
             .filter_map(|rule| {
@@ -88,13 +88,13 @@ impl ProfileRewriteRules {
             })
             .collect();
 
-        // Two-pass insert (rev-2606 cfg-validator-08): exact rules claim
-        // apexes first; a subdomain rule's apex shortcut only fills vacant
-        // slots. An exact + wildcard pair for the same apex is therefore
-        // deterministic — exact wins the apex, descendants route through
-        // the wildcard — regardless of TOML order (previously first-write-
-        // wins on insertion order). Mirrors `ProfileLocalRecords`'s
-        // "exact-match wins, apex includes self" semantics.
+        // Two-pass insert: exact rules claim apexes first; a subdomain
+        // rule's apex shortcut only fills vacant slots. An exact +
+        // wildcard pair for the same apex is therefore deterministic —
+        // exact wins the apex, descendants route through the wildcard —
+        // regardless of TOML order (previously first-write-wins on
+        // insertion order). Mirrors `ProfileLocalRecords`'s "exact-match
+        // wins, apex includes self" semantics.
         for (from, to, match_subdomains) in &canonical {
             if !match_subdomains {
                 forward.entry(from.clone()).or_insert_with(|| to.clone());
@@ -122,7 +122,7 @@ impl ProfileRewriteRules {
 
     /// Returns `Some(rewritten_domain)` on hit, `None` otherwise.
     ///
-    /// Single-pass (DR2): the returned domain is NOT re-fed into the table.
+    /// Single-pass: the returned domain is NOT re-fed into the table.
     /// The caller continues resolution against the rewritten name.
     ///
     /// Case-insensitive: `domain` is expected lowercased by the handler
@@ -161,8 +161,9 @@ impl ProfileRewriteRules {
                 out.push_str(target.as_str());
                 return Some(out);
             }
-            // Stop at the TLD label — DR8 prevents subdomain rules on
-            // public suffixes anyway, but the lookup is defensive.
+            // Stop at the TLD label — the validator prevents subdomain
+            // rules on public suffixes anyway, but the lookup is
+            // defensive.
             if !current.contains('.') {
                 break;
             }
@@ -353,8 +354,7 @@ mod tests {
     #[test]
     fn s412_apex_exact_wins_over_apex_subdomain_when_both_present() {
         // Same `from`, one exact, one subdomain. The exact-rule entry
-        // wins for the apex (two-pass build — order-independent since
-        // rev-2606 cfg-validator-08).
+        // wins for the apex (two-pass build — order-independent).
         let rules = vec![
             rule("foo.example-int", "exact-target.example-int"),
             rule_sub("foo.example-int", "wild-target.example-int"),
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn rev2606_apex_exact_wins_even_when_wildcard_listed_first() {
-        // cfg-validator-08: pre-fix the apex winner was TOML insertion
+        // Before the two-pass build, the apex winner was TOML insertion
         // order (or_insert first-write-wins) — wildcard-first configs
         // served the wildcard target on the apex. Two-pass build makes
         // the exact rule win regardless of order.

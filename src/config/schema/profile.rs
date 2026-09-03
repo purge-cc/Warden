@@ -1,7 +1,7 @@
 //! [`Profile`] — a named bundle of filter rules (blocklists, admin_rules,
 //! response behaviour) referenced by devices / groups / subnets / schedules.
 //!
-//! Profiles are flat in v1 (no `extends`, DM3). Per design doc §8.2.
+//! Profiles are flat in v1 (no `extends`).
 
 use std::collections::BTreeMap;
 
@@ -13,12 +13,10 @@ use crate::config::settings::{EcsMode, LocalDnsRecord, RewriteRule};
 
 /// Wire-level response shape for blocked queries.
 ///
-/// This is the v1 schema enum, scoped to `config::schema`. §4.41 retired
-/// the legacy v0 `config::settings::BlockResponse` (a 3-variant enum that
-/// became orphaned once the resolver moved onto the v1 schema), so this
-/// is now the sole block-response type in the codebase.
+/// This is the v1 schema enum, scoped to `config::schema` — the sole
+/// block-response type in the codebase.
 ///
-/// Four variants per design doc §8.2:
+/// Four variants:
 ///
 /// - `zero` — canned `0.0.0.0 / ::0`. Fast client giveup, default.
 /// - `nxdomain` — `RCODE=NXDOMAIN`. Client treats as a missing record.
@@ -45,35 +43,32 @@ pub enum BlockResponseV1 {
 /// ```
 ///
 /// `block_response` and `blocked_ttl_secs` are `Option` so that absence
-/// means "fall back to the `[server]` globals" (N6). The profile's *id* is
+/// means "fall back to the `[server]` globals". The profile's *id* is
 /// the map key in the parent `BTreeMap<String, Profile>` — the key string
 /// is validated as an [`Id`](super::id::Id) by `collect_profile_ids` at
-/// load, not enforced by the serde map type (schema-01); it does not live
-/// on this struct.
+/// load, not enforced by the serde map type; it does not live on this
+/// struct.
 ///
-/// **Sprint A of `lists_categories_v2` (D1, D5, Q2):** the v1 fields
-/// `blocklists: Vec<Id>` and `categories: Vec<Id>` are removed. Profile
-/// keeps its behavioural role (schedule, response, admin rules,
-/// local_records) and gains a `tags: Vec<TagSlug>` field that
-/// contributes to the device's effective tag set. List applicability is
-/// derived from tag intersection; profiles no longer enumerate lists
-/// directly.
+/// The v1 schema has no `blocklists: Vec<Id>` or `categories: Vec<Id>`
+/// fields. Profile keeps its behavioural role (schedule, response, admin
+/// rules, local_records); list applicability is derived from tag
+/// intersection instead — profiles do not enumerate lists directly.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
     pub display_name: String,
-    /// N6: per-profile wire-level block response. `None` → inherit from
+    /// Per-profile wire-level block response. `None` → inherit from
     /// `[server].default_block_response`.
     #[serde(default)]
     pub block_response: Option<BlockResponseV1>,
-    /// N6: per-profile TTL applied to block responses, in seconds. `None`
+    /// Per-profile TTL applied to block responses, in seconds. `None`
     /// → inherit from `[server].default_blocked_ttl_secs`.
     #[serde(default)]
     pub blocked_ttl_secs: Option<u32>,
     /// Admin-rule ids applied to this profile. Only admin rules can use
     /// AdGuard `@@` overrides and `$important`; external blocklists are
-    /// sandboxed (project rules rule 4).
+    /// sandboxed (CLAUDE.md rule 4).
     #[serde(default)]
     pub admin_rules: Vec<Id>,
     /// Block every query unless an admin-rule allow (`@@||domain^`) matches.
@@ -82,16 +77,15 @@ pub struct Profile {
     /// legacy v0 profile model.
     #[serde(default)]
     pub block_all: bool,
-    /// S44 DM1: profile-scoped local DNS records. Empty by default — every
-    /// pre-S44 config deserialises byte-identical (R1 additive only). When
-    /// non-empty, queries from clients resolving to this profile consult
-    /// these records BEFORE the global `[local_dns]` table (precedence
-    /// per `_docs/features/local_dns_scoping.md` §4 truth table). Validation
-    /// runs through `crate::config::validator::validate_local_records_v2`
+    /// Profile-scoped local DNS records. Empty by default, so every
+    /// pre-existing config deserialises byte-identical. When non-empty,
+    /// queries from clients resolving to this profile consult these
+    /// records BEFORE the global `[local_dns]` table. Validation runs
+    /// through `crate::config::validator::validate_local_records_v2`
     /// scoped per-profile.
     #[serde(default)]
     pub local_records: Vec<LocalDnsRecord>,
-    /// §4.8 §2/2 (D1): per-profile EDNS Client Subnet policy. `None` →
+    /// Per-profile EDNS Client Subnet policy. `None` →
     /// inherit `[upstream.ecs]` defaults. `Some(...)` → per-profile
     /// override (and per-field inheritance via inner `Option`s; see
     /// [`ProfileEcsConfig`]). The master kill-switch
@@ -99,8 +93,8 @@ pub struct Profile {
     /// when it is `false`, this field is ignored regardless of value.
     #[serde(default)]
     pub ecs: Option<ProfileEcsConfig>,
-    /// §4.12: profile-scoped name-to-name rewrites. Empty by default — every
-    /// pre-§4.12 config deserialises byte-identical (R1 additive only).
+    /// Profile-scoped name-to-name rewrites. Empty by default, so every
+    /// pre-existing config deserialises byte-identical.
     /// Engine in `crate::dns::rewrite::ProfileRewriteRules`. Hot-path hook
     /// runs AFTER filter+blocked check + BEFORE upstream forward, so a
     /// rewrite cannot bypass blocklist enforcement on the original qname.
@@ -108,12 +102,12 @@ pub struct Profile {
     /// `crate::config::validator::validate_rewrite_rules` per-profile.
     #[serde(default)]
     pub rewrite_rules: Vec<RewriteRule>,
-    /// §4.53: opt-in per-profile SafeSearch enforcement. When `true`, the
+    /// Opt-in per-profile SafeSearch enforcement. When `true`, the
     /// resolver injects a fixed set of search-engine rewrite rules at
     /// resolve-time (inside [`crate::profiles::profile::ResolvedProfile::build_v1`]),
     /// after validation and before the rewrite engine is built. Default
-    /// `false` — every pre-§4.53 config deserialises byte-identical
-    /// (R1 additive only). Operator-authored `[[rewrites]]` entries with
+    /// `false`, so every pre-existing config deserialises byte-identical.
+    /// Operator-authored `[[rewrites]]` entries with
     /// the same `from` take precedence — see `crate::profiles::safesearch`.
     #[serde(default)]
     pub safe_search: bool,
@@ -133,7 +127,6 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_lists: Vec<Id>,
     /// Per-list direction override, scoped to this profile.
-    /// `_docs/features/profile_list_policy.md` §2.
     ///
     /// Keyed by [`Blocklist::id`](super::blocklist::Blocklist::id). An id
     /// present here overrides that list's own
@@ -145,16 +138,11 @@ pub struct Profile {
     ///                          = list.base                otherwise
     /// ```
     ///
-    /// Empty by default, so every pre-S2 config deserialises byte-identical
-    /// (R1 additive only). **Absence and `lists = {}` are the same state** —
+    /// Empty by default, so every pre-existing config deserialises
+    /// byte-identical. **Absence and `lists = {}` are the same state** —
     /// both mean "inherit everything" — which is why this is the one field
     /// on `Profile` carrying `skip_serializing_if`; see the note on that
     /// attribute below.
-    ///
-    /// **Nothing reads this field yet.** S2 lands the schema and the
-    /// cross-reference validation only; the resolver and filter engine still
-    /// derive direction from the list's global `kind` (S3 does the cutover).
-    /// A reader added before S3 would be consuming a half-built model.
     ///
     /// Validated by `check_profiles` in
     /// [`crate::config::schema::validator`]: every id named here must exist
@@ -162,7 +150,7 @@ pub struct Profile {
     /// [`ConfigError::CrossRefMiss`](crate::config::error::ConfigError::CrossRefMiss).
     /// That refusal is the point — the model this replaces accepted a
     /// profile naming a tag no list carried, kept no record of it, and
-    /// filtered nothing (defect E2 in the design doc §1.1).
+    /// filtered nothing.
     ///
     /// ```toml
     /// [profiles.finance]
@@ -192,7 +180,7 @@ pub struct Profile {
     pub lists: BTreeMap<Id, ListPolicy>,
 }
 
-/// §4.8 §2/2: per-profile EDNS Client Subnet override.
+/// Per-profile EDNS Client Subnet override.
 ///
 /// Three knobs in this sub-table; each is `Option<...>` so an operator
 /// can override one without enumerating the others (the omitted fields
@@ -289,11 +277,10 @@ made_up = true
         assert!(err.to_string().contains("unknown field"));
     }
 
-    /// Sprint A of lists_categories_v2 (D1, D15, Q2): the v1 fields
-    /// `blocklists` and `categories` are gone. `deny_unknown_fields`
-    /// rejects them so a config carried over from v1 fails loudly
-    /// instead of silently dropping its blocklist references.
-    /// migrate.rs (T5) handles the rename for the live CT config.
+    /// The v1 fields `blocklists` and `categories` are gone.
+    /// `deny_unknown_fields` rejects them so a config carried over from
+    /// v1 fails loudly instead of silently dropping its blocklist
+    /// references.
     #[test]
     fn lc2_legacy_blocklists_field_rejected() {
         let err = toml::from_str::<Profile>(
@@ -345,8 +332,6 @@ block_response = "panic"
         // serde uses "unknown variant" not "invalid value" here.
         assert!(err.to_string().contains("unknown variant"));
     }
-
-    // ── §4.8 §2/2: ProfileEcsConfig ────────────────────────────
 
     #[test]
     fn ecs_subtable_absent_defaults_to_none() {

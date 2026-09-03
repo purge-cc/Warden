@@ -20,7 +20,7 @@ fn dummy_poller() -> IpcPoller {
 fn entry_with_result(result: &str, domain: &str) -> QueryLogDto {
     QueryLogDto {
         timestamp: "2026-05-02T10:00:00Z".into(),
-        client_ip: "192.0.2.50".into(),
+        client_ip: "10.10.1.50".into(),
         client_name: Some("iphone".into()),
         domain: domain.into(),
         query_type: "A".into(),
@@ -53,9 +53,9 @@ async fn enter_on_blocked_row_opens_allow_modal() {
     )
     .await;
     let modal = app
-        .scope_modal
+        .query_log_rule_modal
         .as_ref()
-        .expect("Enter on BLOCKED must open the scope modal");
+        .expect("Enter on BLOCKED must open the rule picker");
     assert_eq!(
         modal.action,
         Action::Allow,
@@ -76,9 +76,9 @@ async fn enter_on_allowed_row_opens_deny_modal() {
     )
     .await;
     let modal = app
-        .scope_modal
+        .query_log_rule_modal
         .as_ref()
-        .expect("Enter on ALLOWED must open the scope modal");
+        .expect("Enter on ALLOWED must open the rule picker");
     assert_eq!(
         modal.action,
         Action::Deny,
@@ -99,7 +99,7 @@ async fn enter_on_local_row_surfaces_last_error_no_modal() {
     )
     .await;
     assert!(
-        app.scope_modal.is_none(),
+        app.query_log_rule_modal.is_none(),
         "LOCAL is not actionable — modal must stay closed"
     );
     assert_eq!(
@@ -120,7 +120,7 @@ async fn enter_on_refused_row_surfaces_specific_message() {
         Path::new("/dev/null"),
     )
     .await;
-    assert!(app.scope_modal.is_none());
+    assert!(app.query_log_rule_modal.is_none());
     assert_eq!(
         app.status_text(),
         Some(QUERY_NOT_ACTIONABLE_REFUSED),
@@ -133,7 +133,7 @@ async fn enter_with_no_selection_is_safe_noop() {
     let mut app = App::new();
     app.active_leaf = Leaf::QueryLog;
     // Empty entries + no selection — the early-returns in
-    // `build_scope_modal_for_query_row` and the `_UNKNOWN` fallback
+    // `build_query_log_rule_modal` and the `_UNKNOWN` fallback
     // in `footer_message_for_neutral_row` must keep this safe.
     let poller = dummy_poller();
     handle_key(
@@ -144,7 +144,7 @@ async fn enter_with_no_selection_is_safe_noop() {
     )
     .await;
     assert!(
-        app.scope_modal.is_none(),
+        app.query_log_rule_modal.is_none(),
         "no selection → no modal, no panic"
     );
     assert_eq!(
@@ -166,8 +166,8 @@ async fn a_key_no_longer_opens_modal_regression() {
     )
     .await;
     assert!(
-        app.scope_modal.is_none(),
-        "Sprint 47 T2 retired `a` outright — must not open the modal"
+        app.query_log_rule_modal.is_none(),
+        "`a` is not bound on this tab — it must not open the modal"
     );
 }
 
@@ -183,7 +183,7 @@ async fn d_key_no_longer_opens_modal_regression() {
     )
     .await;
     assert!(
-        app.scope_modal.is_none(),
-        "Sprint 47 T2 retired `d` outright — must not open the modal"
+        app.query_log_rule_modal.is_none(),
+        "`d` is not bound on this tab — it must not open the modal"
     );
 }

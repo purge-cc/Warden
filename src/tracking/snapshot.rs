@@ -24,32 +24,34 @@ pub struct StatsSnapshot {
     pub total_blocked: u64,
     pub total_cache_hits: u64,
     /// Subset of `total_cache_hits` served from negative entries (NXDOMAIN/NODATA).
-    /// Defaults to 0 for snapshots written by pre-Sprint-25 binaries.
+    /// Defaults to 0 for snapshots written before this field existed.
     #[serde(default)]
     pub total_cache_negative_hits: u64,
     /// Per-`TypeBucket` query counters in canonical bucket order
-    /// (`TypeBucket::ALL`). Defaults to all-zero for snapshots written
-    /// by pre-§4.6 binaries — operators upgrading mid-day see the
-    /// per-type widget light up from zero rather than disappearing.
+    /// (`TypeBucket::ALL`). Defaults to all-zero for older snapshots —
+    /// operators upgrading mid-day see the per-type widget light up
+    /// from zero rather than disappearing.
     #[serde(default = "zero_per_type")]
     pub per_type: [u64; TYPE_BUCKET_COUNT],
     /// Per-`TypeBucket` BLOCKED query counters. Parallel to `per_type`,
     /// only incremented when the query was blocked. Defaults to all-zero
-    /// for pre-Sprint-E snapshots so the QTYPE chart card lights up
-    /// from zero on upgrade rather than failing the load.
+    /// for older snapshots so the QTYPE chart card lights up from zero
+    /// on upgrade rather than failing the load.
     #[serde(default = "zero_per_type")]
     pub per_type_blocked: [u64; TYPE_BUCKET_COUNT],
     /// Cumulative count of prefetch-set promotions since the tracker
-    /// was last reset. Defaults to 0 for pre-§4.4 snapshots.
+    /// was last reset. Defaults to 0 for snapshots written before this
+    /// field existed.
     #[serde(default)]
     pub prefetch_promotions_total: u64,
     /// Cumulative count of prefetch-set demotions since the tracker
-    /// was last reset. Defaults to 0 for pre-§4.4 snapshots.
+    /// was last reset. Defaults to 0 for snapshots written before this
+    /// field existed.
     #[serde(default)]
     pub prefetch_demotions_total: u64,
-    /// Per-device entries. Serialized as `devices` (T5 canonical); old
-    /// snapshots with `clients` key still deserialize via the alias for
-    /// one release cycle (§3 R1 decode-compat).
+    /// Per-device entries. Serialized as `devices` (the canonical name);
+    /// old snapshots with the legacy `clients` key still deserialize via
+    /// the alias.
     #[serde(alias = "clients")]
     pub devices: Vec<DeviceSnapshot>,
     pub top_n: TopNSnapshot,
@@ -67,28 +69,29 @@ pub struct DeviceSnapshot {
     pub blocked: u64,
     pub cache_hits: u64,
     pub last_seen: u64,
-    /// Per-bucket query counters. Defaults to all-zero for pre-§4.6
+    /// Per-bucket query counters. Defaults to all-zero for older
     /// snapshots so the device row still loads — the per-device pie
     /// will be empty until the device makes its next query.
     #[serde(default = "zero_per_type")]
     pub per_type: [u64; TYPE_BUCKET_COUNT],
     /// Per-bucket BLOCKED query counters for this device. Parallel to
-    /// `per_type`, defaults to all-zero for pre-Sprint-E snapshots.
+    /// `per_type`, defaults to all-zero for older snapshots.
     #[serde(default = "zero_per_type")]
     pub per_type_blocked: [u64; TYPE_BUCKET_COUNT],
     /// Snapshot of `DeviceStats::queries_today_baseline` — the cumulative
     /// query count at the start of `today_day_index`'s day. Persisted so
     /// "queries today" survives a daemon restart instead of re-seeding to
     /// the current total (a mid-day restart otherwise collapsed every
-    /// device's today count to ~0). Defaults to 0 for pre-2026-07
-    /// snapshots.
+    /// device's today count to ~0). Defaults to 0 for snapshots written
+    /// before this field existed.
     #[serde(default)]
     pub queries_today_baseline: u64,
     /// Snapshot of `DeviceStats::today_day_index` (UTC `unix_secs /
     /// 86400`) the baseline above belongs to. On restore a stale index
     /// (snapshot from a previous day) is rolled forward on the first
     /// snapshot-task tick; a matching index preserves an intra-day count
-    /// across the restart. Defaults to 0 for pre-2026-07 snapshots.
+    /// across the restart. Defaults to 0 for snapshots written before
+    /// this field existed.
     #[serde(default)]
     pub today_day_index: u64,
 }
@@ -145,12 +148,11 @@ impl StatsSnapshot {
         }
     }
 
-    /// Write snapshot to a file atomically via the §4.31 hardened
-    /// helper (fsync on temp + parent dir, preserve target mode/owner
-    /// if any). Replaces a raw `fs::write` + `rename` pair that
-    /// previously matched the legacy `lists/{manager,status}.rs`
-    /// pattern — those siblings now route through the same primitive,
-    /// closing the bug class consistently across modules.
+    /// Write snapshot to a file atomically via the hardened helper
+    /// (fsync on temp + parent dir, preserve target mode/owner if any),
+    /// rather than a raw `fs::write` + `rename` pair — the same
+    /// primitive `lists/{manager,status}.rs` route through, so the
+    /// atomicity guarantee is consistent across modules.
     pub fn write_to_file(&self, path: &Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         crate::config::atomic_write::hardened_atomic_write(
@@ -211,8 +213,8 @@ impl StatsSnapshot {
         let mut devices = self.devices;
         devices.sort_unstable_by_key(|b| std::cmp::Reverse(b.last_seen));
         for ds in devices {
-            // Gate on the engine's O(1) size counter (TRK-03), the same
-            // source of truth the hot path uses. Fresh engine → starts at 0.
+            // Gate on the engine's O(1) size counter, the same source of
+            // truth the hot path uses. Fresh engine → starts at 0.
             if engine.devices_len.load(Ordering::Relaxed) >= engine.max_devices {
                 break;
             }
@@ -264,8 +266,8 @@ pub fn spawn_snapshot_task(
         // `tokio::time::interval` panics on a zero period — under the release
         // profile's `panic = "abort"` that kills the daemon. The validator
         // rejects `tracking.snapshot_interval_secs = 0`; this floor is the
-        // backstop for construction paths that bypass it (settings-02,
-        // mirrors prefetch_worker).
+        // backstop for construction paths that bypass it (mirrors
+        // prefetch_worker).
         let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
         ticker.tick().await; // skip first immediate tick
         loop {
@@ -325,12 +327,12 @@ mod tests {
     use hickory_proto::rr::RecordType;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// settings-02 (rev-2606): a zero interval reaching the spawn site must
-    /// not panic the task — `tokio::time::interval(0)` panics and the release
-    /// profile aborts on panic. The `.max(1 s)` floor is the backstop for
-    /// construction paths that bypass the validator gate. The bogus path is
-    /// never written: the first (immediate) tick is skipped and the test ends
-    /// before the floored 1 s period elapses.
+    /// A zero interval reaching the spawn site must not panic the task —
+    /// `tokio::time::interval(0)` panics and the release profile aborts on
+    /// panic. The `.max(1 s)` floor is the backstop for construction paths
+    /// that bypass the validator gate. The bogus path is never written:
+    /// the first (immediate) tick is skipped and the test ends before the
+    /// floored 1 s period elapses.
     #[tokio::test]
     async fn zero_interval_does_not_panic_task() {
         let config = TrackingConfig::default();
@@ -397,13 +399,13 @@ mod tests {
         assert_eq!(loaded.total_blocked, 1);
         assert_eq!(loaded.total_cache_hits, 1);
         assert_eq!(loaded.total_cache_negative_hits, 2);
-        // §4.6 — per-type counters round-trip in both global and per-device fields.
+        // Per-type counters round-trip in both global and per-device fields.
         assert_eq!(loaded.per_type[0], 1, "global A bucket");
         assert_eq!(loaded.per_type[1], 1, "global AAAA bucket");
         assert_eq!(loaded.per_type[2], 1, "global TXT bucket");
         assert_eq!(loaded.per_type.iter().sum::<u64>(), 3);
-        // Sprint E — only the AAAA query (`ads.com`) was blocked, so
-        // exactly one bucket of `per_type_blocked` should be set.
+        // Only the AAAA query (`ads.com`) was blocked, so exactly one
+        // bucket of `per_type_blocked` should be set.
         assert_eq!(loaded.per_type_blocked[0], 0, "global A blocked");
         assert_eq!(loaded.per_type_blocked[1], 1, "global AAAA blocked");
         assert_eq!(loaded.per_type_blocked[2], 0, "global TXT blocked");
@@ -458,8 +460,8 @@ mod tests {
         assert_eq!(dev.queries_today(now), 120);
     }
 
-    /// §4.6 — a snapshot written by a pre-§4.6 binary (no `per_type`
-    /// keys at all) must still deserialize, defaulting both global and
+    /// A snapshot written before `per_type` existed (no `per_type` keys
+    /// at all) must still deserialize, defaulting both global and
     /// per-device per-type arrays to all-zero.
     #[test]
     fn snapshot_legacy_without_per_type_deserializes_to_zero() {
@@ -487,16 +489,17 @@ mod tests {
         assert_eq!(parsed.per_type_blocked, [0u64; 10]);
         assert_eq!(parsed.devices[0].per_type, [0u64; 10]);
         assert_eq!(parsed.devices[0].per_type_blocked, [0u64; 10]);
-        // Pre-2026-07 snapshots carry no "today" anchor — both fields
-        // must default to 0 so the row still loads (the first snapshot
-        // sweep re-seeds them on the next tick).
+        // Older snapshots carry no "today" anchor — both fields must
+        // default to 0 so the row still loads (the first snapshot sweep
+        // re-seeds them on the next tick).
         assert_eq!(parsed.devices[0].queries_today_baseline, 0);
         assert_eq!(parsed.devices[0].today_day_index, 0);
     }
 
-    /// Sprint E — a snapshot written by a §4.6-but-pre-Sprint-E binary
-    /// (has `per_type` but no `per_type_blocked`) must still deserialize,
-    /// defaulting both global and per-device blocked arrays to zero.
+    /// A snapshot written after `per_type` existed but before
+    /// `per_type_blocked` (has `per_type` but no `per_type_blocked`)
+    /// must still deserialize, defaulting both global and per-device
+    /// blocked arrays to zero.
     #[test]
     fn snapshot_legacy_without_per_type_blocked_deserializes_to_zero() {
         let legacy_json = serde_json::json!({
@@ -526,9 +529,9 @@ mod tests {
         assert_eq!(parsed.devices[0].per_type_blocked, [0u64; 10]);
     }
 
-    /// Legacy migration: a pre-Sprint-25 snapshot without `total_cache_negative_hits`
-    /// must still deserialize, defaulting the missing field to zero. The legacy
-    /// `clients` key doubles as the T5 alias path for `devices`.
+    /// Legacy migration: a snapshot written before `total_cache_negative_hits`
+    /// existed must still deserialize, defaulting the missing field to zero.
+    /// The legacy `clients` key doubles as the alias path for `devices`.
     #[test]
     fn snapshot_legacy_without_negative_hits_deserializes() {
         let legacy_json = serde_json::json!({
@@ -548,10 +551,9 @@ mod tests {
         assert_eq!(parsed.total_cache_negative_hits, 0);
     }
 
-    /// T5 decode-compat: a pre-T5 snapshot with the legacy `clients` JSON key
-    /// must still deserialize into the renamed `devices` field via the serde
-    /// alias. Pairs with the §3 R1 "accept old + new on decode for 1 release"
-    /// requirement for persisted state.
+    /// Decode-compat: a snapshot with the legacy `clients` JSON key must
+    /// still deserialize into the renamed `devices` field via the serde
+    /// alias.
     #[test]
     fn snapshot_legacy_clients_key_deserializes_into_devices() {
         let legacy_json = serde_json::json!({
@@ -577,7 +579,7 @@ mod tests {
         assert_eq!(parsed.devices[0].name, "legacy-laptop");
     }
 
-    /// T5 canonical path: a snapshot with the `devices` JSON key deserializes
+    /// Canonical path: a snapshot with the `devices` JSON key deserializes
     /// into the `devices` field directly (no alias involvement).
     #[test]
     fn snapshot_canonical_devices_key_deserializes() {
@@ -636,10 +638,10 @@ mod tests {
         assert_eq!(entry.name.as_str(), "pc");
     }
 
-    /// trk-snapshot-restore-no-device-cap: a snapshot carrying more
-    /// device rows than `max_devices` (e.g. a cap lowered between runs)
-    /// must not repopulate the map above the bound the hot path upholds;
-    /// the freshest devices by `last_seen` survive.
+    /// A snapshot carrying more device rows than `max_devices` (e.g. a
+    /// cap lowered between runs) must not repopulate the map above the
+    /// bound the hot path upholds; the freshest devices by `last_seen`
+    /// survive.
     #[test]
     fn merge_into_enforces_max_devices_cap() {
         let json = serde_json::json!({
@@ -694,10 +696,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Sprint §4.4 P1 — capture must read the prefetch tracker counters
-    /// and round-trip them via merge_into. The tracker itself is built
-    /// disabled by default in `StatsEngine::new`, so we install a live
-    /// one via `with_prefetch_config` to exercise the wiring.
+    /// Capture must read the prefetch tracker counters and round-trip
+    /// them via merge_into. The tracker itself is built disabled by
+    /// default in `StatsEngine::new`, so we install a live one via
+    /// `with_prefetch_config` to exercise the wiring.
     #[test]
     fn snapshot_captures_prefetch_promotions_demotions() {
         use crate::tracking::PrefetchTrackerConfig;
@@ -727,11 +729,11 @@ mod tests {
         assert_eq!(engine2.prefetch_tracker.demotions_total(), 1);
     }
 
-    /// Sprint F — pre-Sprint-F snapshots embed `TimeBucket` entries
-    /// without `per_type` / `blocked_per_type` keys. Both must default
-    /// to all-zero so a daemon upgrading mid-day picks up the existing
-    /// hourly ring without an error; live traffic backfills the
-    /// per-type counters as buckets roll over.
+    /// Older snapshots embed `TimeBucket` entries without `per_type` /
+    /// `blocked_per_type` keys. Both must default to all-zero so a
+    /// daemon upgrading mid-day picks up the existing hourly ring
+    /// without an error; live traffic backfills the per-type counters
+    /// as buckets roll over.
     #[test]
     fn snapshot_legacy_time_bucket_without_per_type_deserializes_to_zero() {
         let legacy_json = serde_json::json!({
@@ -764,10 +766,10 @@ mod tests {
         assert_eq!(parsed.daily[0].blocked_per_type, [0u64; TYPE_BUCKET_COUNT]);
     }
 
-    /// Sprint §4.4 P1 — pre-§4.4 snapshots have neither
-    /// `prefetch_promotions_total` nor `prefetch_demotions_total`. Both
-    /// must default to zero so a daemon upgrading mid-day picks up the
-    /// existing on-disk state without an error.
+    /// Older snapshots have neither `prefetch_promotions_total` nor
+    /// `prefetch_demotions_total`. Both must default to zero so a
+    /// daemon upgrading mid-day picks up the existing on-disk state
+    /// without an error.
     #[test]
     fn snapshot_legacy_without_prefetch_fields_deserializes_to_zero() {
         let legacy_json = serde_json::json!({

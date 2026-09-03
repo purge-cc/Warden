@@ -7,6 +7,27 @@
 //! spacers carry the breathing room. Block heights are computed from
 //! the wrapped row count so the popup grows with its content rather
 //! than guessing a fixed height.
+//!
+//! **Height vs the 80×24 floor.** The full block list needs 37-49 rows
+//! depending on the active leaf; `ui::render` refuses to draw at all
+//! below a 24-row terminal, a 22-row interior after the border. Content
+//! that size cannot fit that floor by any layout choice — the fix needs
+//! either scrolling or losing rows, and [`fit_blocks`] is the honest
+//! half of that choice reachable from this file: it keeps only whole
+//! blocks from the front (`build_blocks` puts the per-leaf section
+//! first for exactly this reason) and the border title reports the cut
+//! in numbers rather than letting `Layout::vertical` silently squeeze
+//! whichever block loses the constraint solver's tie.
+//!
+//! **What this does not do.** A real fix scrolls: a stored offset,
+//! `↑`/`↓`/`PgUp`/`PgDn` bound while the overlay is open, and a
+//! `Scrollbar` drawn against it. That needs an arm in `mod.rs`'s
+//! `dispatched_from_help` match (`mod.rs:908-925`) — today any key but
+//! `?`/`Esc`/`q`/`Ctrl+C` closes the overlay and falls through to the
+//! leaf underneath, by design (`mod.rs:888-891`: "deliberately NO
+//! second dispatch table"). This module cannot add that arm, so the
+//! shared sections below the per-leaf one stay unreachable at the floor
+//! until whoever owns `mod.rs` next wires the scroll.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -30,21 +51,39 @@ pub fn render(f: &mut Frame, active_leaf: Leaf) {
     let area = f.area();
     let blocks = build_blocks(active_leaf);
 
-    // Popup height grows with the content. centered_rect clamps to the
-    // parent rect, so on a tiny terminal the layout below shrinks
-    // gracefully rather than panicking.
-    let total_height = blocks.iter().map(HelpBlock::height).sum::<u16>() + 2;
-    let popup = centered_rect(area, POPUP_W, total_height);
+    // Popup height grows with the content, clamped to the real frame by
+    // `centered_rect`. `fit_blocks` is what keeps that clamp honest: it
+    // decides, in whole blocks, how much of `blocks` the clamped popup
+    // can actually hold — instead of handing every block's full height
+    // to `Layout::vertical` and letting the constraint solver silently
+    // squeeze whichever ones lose the tie.
+    let content_h = blocks.iter().map(HelpBlock::height).sum::<u16>();
+    let popup = centered_rect(area, POPUP_W, content_h + 2);
+    let inner_budget = popup.height.saturating_sub(2);
+    let fit = fit_blocks(&blocks, inner_budget);
 
     f.render_widget(Clear, popup);
 
-    // N15: `?` rejoins the modal ecosystem — rounded, neutral accent,
-    // raised surface — instead of the square red-bordered reference card
-    // it used to be. The ecosystem colour rule (v0.24.2, `7d3cd33`) bans
+    // `?` uses the modal ecosystem's chrome — rounded, neutral accent,
+    // raised surface — instead of a square red-bordered reference card.
+    // The ecosystem colour rule bans
     // the brand's red tone on a border outright ("reads as an error
     // state") and reserves it for the brand tick + destructive actions,
     // neither of which this overlay has. Mirrors
     // `modal_form::render_chrome_in`.
+    //
+    // The title doubles as the overflow tell. Below the terminal-size
+    // floor `fit.hidden` is never zero, and this count — not a scroll,
+    // see the module doc — is the honest half of that hazard reachable
+    // from this file alone.
+    let title = if fit.hidden > 0 {
+        format!(
+            " Help — showing {}/{content_h} rows, resize to see the rest ",
+            fit.used
+        )
+    } else {
+        " Help — press ? or Esc to close ".to_string()
+    };
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -55,32 +94,66 @@ pub fn render(f: &mut Frame, active_leaf: Leaf) {
                 .fg(T.text_primary)
                 .add_modifier(Modifier::BOLD),
         )
-        .title(" Help — press ? or Esc to close ");
+        .title(title);
     let inner = outer.inner(popup);
     f.render_widget(outer, popup);
 
-    let constraints: Vec<Constraint> = blocks
+    let shown = &blocks[..fit.shown];
+    let constraints: Vec<Constraint> = shown
         .iter()
         .map(|b| Constraint::Length(b.height()))
         .collect();
     let chunks = Layout::vertical(constraints).split(inner);
 
-    for (rect, blk) in chunks.iter().zip(blocks.iter()) {
+    for (rect, blk) in chunks.iter().zip(shown.iter()) {
         blk.render(f, *rect);
+    }
+}
+
+/// How much of `blocks` fits in `budget` rows.
+#[derive(Debug, Clone, Copy)]
+struct HelpFit {
+    /// Number of leading blocks that fit whole.
+    shown: usize,
+    /// Rows those blocks occupy.
+    used: u16,
+    /// Rows left out — the ones a cut fell on.
+    hidden: u16,
+}
+
+/// Walk `blocks` front to back, keeping whole blocks only, until the next
+/// one would exceed `budget`. Never a partial row: a cut always lands on
+/// a section boundary, not mid-table.
+fn fit_blocks(blocks: &[HelpBlock], budget: u16) -> HelpFit {
+    let mut used = 0u16;
+    let mut shown = 0usize;
+    for b in blocks {
+        let h = b.height();
+        if used + h > budget {
+            break;
+        }
+        used += h;
+        shown += 1;
+    }
+    let total: u16 = blocks.iter().map(HelpBlock::height).sum();
+    HelpFit {
+        shown,
+        used,
+        hidden: total.saturating_sub(used),
     }
 }
 
 /// One row of the help table.
 ///
 /// `pub(crate)` so the copy is reachable from a test rather than only
-/// from a renderer: §4.65 UX10 found the `?` overlay still offering to
-/// make a new tag three sprints after the verb was renamed, because
+/// from a renderer: the `?` overlay once kept offering to
+/// make a new tag long after the verb was renamed, because
 /// every guard on that wording tested the *modal* and none could see
 /// this table. Operator-facing copy that no test can read is copy that
 /// drifts.
 ///
 /// The removed sentence is deliberately not quoted verbatim anywhere in
-/// `src/` — UX10's acceptance check is a literal grep for it, and a
+/// `src/` — the acceptance check for it is a literal grep, and a
 /// detector that reports its own post-mortem is one nobody reads twice.
 /// `tabs::tags::tests::tags_help_never_promises_tag_creation` is the
 /// durable guard; the grep is only its proxy.
@@ -111,7 +184,7 @@ impl HelpBlock {
     fn render(&self, f: &mut Frame, area: Rect) {
         match self {
             HelpBlock::Title(text) => {
-                // N15 rule 2: `warden_teal` marks static info — section
+                // `warden_teal` marks static info — section
                 // headers, read-only values. These are section headers.
                 let para = Paragraph::new(Line::from(Span::styled(
                     *text,
@@ -172,7 +245,7 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
                 key: "[ / ]",
                 desc: "Cycle leaves within the active section",
             },
-            // §4.11-4b — the linear cycle count tracks `Leaf::ALL.len()`,
+            // The linear cycle count tracks `Leaf::ALL.len()`,
             // which the `cluster` build grows by one. Pinned by
             // `navigation_block_leaf_count_matches_leaf_all_len`, which is
             // why a leaf coming or going shows up here as a number change
@@ -195,7 +268,7 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
             },
         ]),
         HelpBlock::Spacer,
-        // §4.63-s3b: one navigation grammar for every modal form, stated
+        // One navigation grammar for every modal form, stated
         // once here instead of per-modal. Before this the arrows meant
         // "move focus" in four forms and "change the value" in three, and
         // neither reading was advertised anywhere the operator could find
@@ -208,7 +281,7 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
                 key: "Up/Down or Tab",
                 desc: "Move between fields (any modal form)",
             },
-            // §4.65 UX2: the desc, not a fourth row. The block is
+            // The desc, not a fourth row. The block is
             // deliberately three rows (the overlay already crowds 80×24)
             // and a row's height is `word_wrap(desc, DESC_COL_W)`, so the
             // copy has to stay inside 47 cells or it costs the row a
@@ -236,10 +309,10 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
                 key: "g d / g q",
                 desc: "Dashboard / Query Log",
             },
-            // 2026-07-24 (IA Option B): grouped by owning section so the
+            // Grouped by owning section so the
             // help mirrors the menu card. Network lost Profiles; Filters
             // leads with it and lists its leaves in strip order.
-            // §4.67-a: the Configuration row regroups with its section; the
+            // The Configuration row regroups with its section; the
             // sub-tab strip underlines each letter inside its own label.
             //
             // **Two rows per section, and the width is the reason.** The key
@@ -311,14 +384,21 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
                 desc: "Quit",
             },
         ]),
-        HelpBlock::Spacer,
     ];
 
-    blocks.push(HelpBlock::Title(per_leaf_header(active_leaf)));
-    blocks.push(HelpBlock::Spacer);
-    blocks.push(HelpBlock::Rows(per_leaf_rows(active_leaf)));
-
-    blocks
+    // The per-leaf section leads rather than trails: it is the one block
+    // that changes with the active leaf, and the one the operator opened
+    // `?` to find. `render` cuts from the back when the popup does not
+    // fit the terminal (`fit_blocks`), so a cut lands on one of the four
+    // shared sections above, never on this one.
+    let mut leading = vec![
+        HelpBlock::Title(per_leaf_header(active_leaf)),
+        HelpBlock::Spacer,
+        HelpBlock::Rows(per_leaf_rows(active_leaf)),
+        HelpBlock::Spacer,
+    ];
+    leading.append(&mut blocks);
+    leading
 }
 
 fn per_leaf_header(leaf: Leaf) -> &'static str {
@@ -344,8 +424,8 @@ fn per_leaf_header(leaf: Leaf) -> &'static str {
 
 /// The per-leaf keybinding table the `?` overlay renders.
 ///
-/// `pub(crate)` for the same reason as [`HelpRow`] — see §4.65 UX10
-/// there. `tabs::tags::tests::tags_help_never_promises_tag_creation`
+/// `pub(crate)` for the same reason as [`HelpRow`].
+/// `tabs::tags::tests::tags_help_never_promises_tag_creation`
 /// reads it directly, which is stronger than an `include_str!` grep:
 /// it asserts on the *data* this leaf actually renders, so it neither
 /// false-positives on another leaf's legitimate "Create" nor survives
@@ -361,17 +441,16 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 key: "Up/Down",
                 desc: "Scroll table",
             },
-            // N3 (operator decision, 2026-08-24): jump-to-bottom is
+            // Jump-to-bottom is
             // `End`, not the vim-style `G`.
             HelpRow {
                 key: "End",
                 desc: "Jump to bottom",
             },
-            // `qlog-paging-cursor`. §15.7 is explicit that bound-and-
-            // undocumented is the one state wrong in both directions —
-            // it fires and nothing names it — and this wave deleted 44
-            // aliases for exactly that. A binding that exists only in the
-            // code is not a feature; it is a landmine.
+            // Bound-and-undocumented is the one state wrong in both
+            // directions — it fires and nothing names it. A binding that
+            // exists only in the code is not a feature; it is a
+            // landmine.
             HelpRow {
                 key: "PgUp/PgDn",
                 desc: "Scroll; at the table edge, page newer / older",
@@ -565,9 +644,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 key: "K",
                 desc: "Toggle list kind (BLOCK ↔ ALLOW)",
             },
-            // rev-2606 §10 help-01: the live filter-card keys (`/`, `f`,
-            // `R`) were missing; the dead `c`/`m`/`p`/`Space-x` category
-            // + assignment rows were removed with the modals (mod-06).
+            // Live filter-card keys.
             HelpRow {
                 key: "/",
                 desc: "Search lists by id / name / URL",
@@ -598,7 +675,6 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 key: "d / Delete",
                 desc: "Delete the focused rule (typed-id confirm)",
             },
-            // rev-2606 §10 help-01: `/` search + `R` clear were missing.
             HelpRow {
                 key: "/",
                 desc: "Search rules by text",
@@ -612,12 +688,12 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Clear the search text + filter",
             },
         ],
-        // §4.68 UX8: two panes, navigated on the axis they are drawn.
+        // Two panes, navigated on the axis they are drawn.
         // The vocabulary list stops at `department` — `tag` is declared
         // from the CLI and lives on the Tags tab, which is the derived
         // view of what entities actually carry.
         //
-        // §4.66 L7: `a` works on an empty vocabulary too — it is the only
+        // `a` works on an empty vocabulary too — it is the only
         // TUI path that declares the first value, and empty is the state
         // both live boxes are actually in.
         Leaf::Labels => vec![
@@ -629,9 +705,9 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 key: "Up/Down",
                 desc: "Move inside the focused pane (kind, or entry)",
             },
-            // N3 (amended 2026-08-24): the `h`/`l` alias for Left/Right
-            // is deleted outright this wave, not just unadvertised — so
-            // there is no alias row left to list.
+            // There is no `h`/`l` alias for Left/Right — it is deleted
+            // outright, not just unadvertised, so there is no alias row
+            // left to list.
             HelpRow {
                 key: "a",
                 desc: "Declare a value in the selected kind",
@@ -645,7 +721,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Remove the selected entry (refused while devices use it)",
             },
         ],
-        // §4.64 G2: `a` works on an empty list too — it is the only TUI
+        // `a` works on an empty list too — it is the only TUI
         // path that creates the first group.
         Leaf::Groups => vec![
             HelpRow {
@@ -665,7 +741,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Remove the selected group",
             },
         ],
-        // §4.67-b MN3: the document's keys moved to Leaf::File with the
+        // The document's keys moved to Leaf::File with the
         // viewer. What is left is what Settings administers.
         Leaf::File => vec![
             HelpRow {
@@ -822,7 +898,7 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|r| r.key == "End" && r.desc == "Jump to bottom"),
-            "End jump-to-bottom must remain (N3: not the vim-style G); got:\n{blob}"
+            "End jump-to-bottom must remain (not the vim-style G); got:\n{blob}"
         );
         assert!(
             blob.contains("Filter by domain"),
@@ -834,7 +910,7 @@ mod tests {
         );
     }
 
-    /// §4.63-s3b — the `?` overlay is where an operator looks for a key
+    /// The `?` overlay is where an operator looks for a key
     /// they cannot see. The one modal navigation grammar has to be named
     /// there, on every leaf, or the change is invisible: the keys work
     /// and nothing on screen says so.
@@ -915,10 +991,10 @@ mod tests {
 
     #[test]
     fn every_leaf_has_a_per_leaf_header_and_at_least_one_row() {
-        // §4.38 DISC-1: iterate Leaf::ALL so any future leaf addition
+        // Iterate Leaf::ALL so any future leaf addition
         // automatically requires both a per-leaf header and at least one
-        // row. Pre-fix this loop hardcoded 8 leaves and silently missed
-        // Leaf::Tags (added in Sprint C of lists_categories_v2).
+        // row. A loop that hardcodes the leaf list can silently miss a
+        // newly-added leaf.
         for leaf in Leaf::ALL {
             let header = per_leaf_header(leaf);
             assert!(
@@ -1034,19 +1110,19 @@ mod tests {
         );
     }
 
-    /// §4.38 — Lists help_rows must advertise the full Sprint 50/53
-    /// binding set. Pre-fix the Lists rows still described the
-    /// pre-S53 "Toggle drill-down detail" Enter behaviour and missed
-    /// the five S50 T4 mutation hotkeys (a/B/c/m/K). The footer hint
+    /// Lists help_rows must advertise the full current
+    /// binding set. This once drifted: the Lists rows still described a
+    /// stale "Toggle drill-down detail" Enter behaviour and missed
+    /// the five mutation hotkeys (a/B/c/m/K). The footer hint
     /// cluster in `ui::tab_hints_for` already advertised them but the
-    /// `?` overlay drifted.
+    /// `?` overlay had not caught up.
     #[test]
     fn lists_help_advertises_current_binding_set() {
         let blob = flatten_rows(&per_leaf_rows(Leaf::Lists));
         // Each binding row in flatten_rows is `{key} {desc}`, joined by
         // `\n`. So a single-letter key like `a` appears as `\na ` or at
         // blob start; multi-char keys like `Enter` survive a contains-
-        // check directly. rev-2606 §10 help-01: the live filter-card keys
+        // check directly. The live filter-card keys
         // (`/`, `f`, `R`) must be present.
         for needle in ["Enter", "\na ", "\nB ", "\nK ", "\n/ ", "\nf ", "\nR "] {
             assert!(
@@ -1055,8 +1131,8 @@ mod tests {
                 needle.trim()
             );
         }
-        // mod-06: the unmounted category/assignment keys must NOT be
-        // advertised any more (they dead-ended in v2 refusal stubs).
+        // The unmounted category/assignment keys must NOT be
+        // advertised any more (they dead-ended in refusal stubs).
         for gone in ["\nc ", "\nm ", "\np ", "Space / x"] {
             assert!(
                 !blob.contains(gone),
@@ -1064,15 +1140,15 @@ mod tests {
                 gone.trim()
             );
         }
-        // Pre-§4.38 wording must NOT reappear.
+        // Stale wording must NOT reappear.
         assert!(
             !blob.contains("Toggle drill-down detail"),
-            "regression: pre-S53 'Toggle drill-down detail' Enter wording must not reappear; got:\n{blob}"
+            "regression: stale 'Toggle drill-down detail' Enter wording must not reappear; got:\n{blob}"
         );
     }
 
-    /// §4.38 — Rules help_rows must advertise the S53.5 interactive
-    /// bindings. Pre-fix it listed only the scroll binding + [f].
+    /// Rules help_rows must advertise the interactive
+    /// bindings, not just the scroll binding + [f].
     #[test]
     fn rules_help_advertises_enter_and_delete() {
         let blob = flatten_rows(&per_leaf_rows(Leaf::Rules));
@@ -1091,15 +1167,15 @@ mod tests {
         );
     }
 
-    /// rev-2606 §10 help-01 coverage backstop: the `?` overlay is the
-    /// authoritative key reference, and it had drifted — the Lists/Rules
-    /// filter-card keys (`/` search, `f` chip, `R` clear) were bound in
+    /// Coverage backstop: the `?` overlay is the
+    /// authoritative key reference, and it can drift — the Lists/Rules
+    /// filter-card keys (`/` search, `f` chip, `R` clear) can be bound in
     /// `handle_lists_key` / `handle_rules_key` but never advertised. Pin
     /// all three on BOTH leaves so a future filter-key change that
     /// forgets the help overlay trips here instead of shipping a `?`
     /// reference that lies by omission. (Paired with the negative
     /// assertions in `lists_help_advertises_current_binding_set`, which
-    /// guard the advertised-but-dead direction for mod-06's removed keys.)
+    /// guard the advertised-but-dead direction for removed keys.)
     #[test]
     fn lists_and_rules_help_advertise_live_filter_keys() {
         for leaf in [Leaf::Lists, Leaf::Rules] {
@@ -1114,8 +1190,8 @@ mod tests {
         }
     }
 
-    /// §4.38 — Subnets help_rows must advertise the interactive S51
-    /// bindings. Pre-fix it listed only the scroll binding.
+    /// Subnets help_rows must advertise the interactive
+    /// bindings, not just the scroll binding.
     #[test]
     fn subnets_help_advertises_add_edit_delete_promote() {
         let blob = flatten_rows(&per_leaf_rows(Leaf::Subnets));
@@ -1142,16 +1218,15 @@ mod tests {
         );
     }
 
-    /// §4.38 — Settings help_rows must advertise the Sprint 39
-    /// Tracking-form opener `[t]`. Pre-fix Settings listed only the
+    /// Settings help_rows must advertise the
+    /// Tracking-form opener `[t]`, not just the
     /// scroll binding + [e] + [Ctrl+r].
     #[test]
     fn settings_help_advertises_tracking_form_opener() {
         let blob = flatten_rows(&per_leaf_rows(Leaf::Settings));
         let lower = blob.to_lowercase();
         // Single-letter `t` row appears as `\nt ` after flatten join (or
-        // at blob start, defensively). The Tracking form opener is the
-        // Sprint 39 binding that drifted before §4.38.
+        // at blob start, defensively).
         assert!(
             blob.contains("\nt ") || blob.starts_with("t "),
             "Settings help must advertise [t] binding; got:\n{blob}"
@@ -1162,9 +1237,9 @@ mod tests {
         );
     }
 
-    /// §4.38 navigation-block leaf count must match `Leaf::ALL.len()`.
-    /// Pre-fix the navigation block hardcoded "Cycle ALL 8 leaves"
-    /// after Tags shipped as the 9th leaf.
+    /// The navigation-block leaf count must match `Leaf::ALL.len()`.
+    /// A hardcoded count in the navigation block can drift silently the
+    /// moment a leaf is added.
     #[test]
     fn navigation_block_leaf_count_matches_leaf_all_len() {
         let blocks = build_blocks(Leaf::Dashboard);
@@ -1195,7 +1270,7 @@ mod tests {
         );
     }
 
-    /// N15 — a render-level guard, not just the source-grep the DoD names.
+    /// A render-level guard, not just a source-grep.
     /// The grep can see the red border and the brand-red titles come back;
     /// it cannot see the rounded border type or the raised surface simply
     /// failing to be added, since neither has a banned token to catch.
@@ -1214,8 +1289,8 @@ mod tests {
         // A rounded top-left corner ('\u{256d}') only exists if
         // `BorderType::Rounded` was actually set — the default `Plain`
         // border draws '\u{250c}' there instead, so this cell's mere
-        // presence proves the border type, and its colours prove N15's
-        // other two properties in the same read.
+        // presence proves the border type, and its colours prove the
+        // chrome rule's other two properties in the same read.
         let (cx, cy) = (0..area.width)
             .flat_map(|x| (0..area.height).map(move |y| (x, y)))
             .find(|&(x, y)| buf[(x, y)].symbol() == "\u{256d}")
@@ -1240,5 +1315,85 @@ mod tests {
             has_teal_title,
             "section titles (e.g. ` Navigation`) must render in warden_teal"
         );
+    }
+
+    /// tui-infra-01, achievable half: at the declared 80×24 floor every
+    /// leaf's content overflows (37-49 rows needed against a 22-row
+    /// interior — this repo's own measured numbers), so every leaf must
+    /// hit the truncation branch, and what IS shown must actually be on
+    /// screen rather than merely claimed. A revert to the old
+    /// full-height `Layout::vertical` (no `fit_blocks`, no title count)
+    /// fails this on the last assertion: the fallback title never
+    /// contains "showing N/".
+    #[test]
+    fn every_leaf_declares_its_truncation_honestly_at_the_80x24_floor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        const FLOOR_INNER: u16 = 22; // 24-row terminal minus the 2-row border
+
+        for leaf in Leaf::ALL {
+            let blocks = build_blocks(leaf);
+            let fit = fit_blocks(&blocks, FLOOR_INNER);
+            assert!(
+                fit.hidden > 0,
+                "{leaf:?}: this leaf's content now fits the 80x24 floor — \
+                 update this test's premise instead of leaving it green by accident"
+            );
+
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| render(f, leaf)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let mut screen = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    screen.push_str(buf[(x, y)].symbol());
+                }
+                screen.push('\n');
+            }
+
+            // Every row inside the fitted budget must actually be on
+            // screen — a byte count claiming "shown" is not evidence,
+            // the pixels are.
+            for b in &blocks[..fit.shown] {
+                if let HelpBlock::Rows(rows) = b {
+                    for r in rows {
+                        assert!(
+                            screen.contains(r.key),
+                            "{leaf:?}: {:?} is inside the fitted budget but not on screen:\n{screen}",
+                            r.key
+                        );
+                    }
+                }
+            }
+
+            // The row-content loop above is a no-op if `fit.shown` lands
+            // on Title+Spacer alone — this closes that gap so a budget
+            // too small for any keybindings fails loudly instead of
+            // reading as "every shown row is on screen" (vacuously true
+            // of zero rows).
+            assert!(
+                blocks[..fit.shown]
+                    .iter()
+                    .any(|b| matches!(b, HelpBlock::Rows(_))),
+                "{leaf:?}: fitted budget holds no keybinding rows — the \
+                 overlay would paint a header and blank space"
+            );
+
+            // The per-leaf section leads, so it must always survive the cut.
+            let header = per_leaf_header(leaf).trim();
+            assert!(
+                screen.contains(header),
+                "{leaf:?}: per-leaf header must survive the cut; got:\n{screen}"
+            );
+
+            // The cut must be declared, with numbers that add up — not a
+            // silent clip with nothing on screen to say so.
+            let expect_used = format!("showing {}/", fit.used);
+            assert!(
+                screen.contains(&expect_used),
+                "{leaf:?}: overlay must report its own truncation ({expect_used}); got:\n{screen}"
+            );
+        }
     }
 }

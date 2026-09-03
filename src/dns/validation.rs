@@ -13,7 +13,7 @@ const MAX_LABEL_LEN: usize = 63;
 const MAX_NAME_LEN: usize = 253;
 /// Project-specific depth limit. 15 real labels (excludes the root label).
 pub(crate) const MAX_LABEL_COUNT: usize = 15;
-/// Depth limit for names under `.arpa` (query-validator-01, rev-2606).
+/// Depth limit for names under `.arpa`.
 ///
 /// A full IPv6 reverse name (`ip6.arpa`) is 32 nibble labels + 2 suffix
 /// labels = 34 — RFC-mandated shape and the deepest legitimate name family
@@ -146,9 +146,9 @@ mod tests {
         assert!(validate_query(&name).is_ok());
     }
 
-    /// query-validator-01 (rev-2606) regression: a full IPv6 reverse name
-    /// is 34 labels (32 nibbles + ip6 + arpa) — the 15-label cap SERVFAILed
-    /// every IPv6 PTR query before anything else saw it.
+    /// Regression: a full IPv6 reverse name is 34 labels (32 nibbles +
+    /// ip6 + arpa) — the 15-label cap SERVFAILed every IPv6 PTR query
+    /// before anything else saw it.
     #[test]
     fn full_ip6_arpa_reverse_name_passes() {
         // 2001:4860:4860::8888 reversed, nibble-expanded: 32 one-char labels.

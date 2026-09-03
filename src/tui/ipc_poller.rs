@@ -22,7 +22,7 @@ use crate::tui::app::{DaemonStatus, TrackingData};
 
 pub struct IpcPoller {
     socket_path: PathBuf,
-    /// Sprint §4.4 P2 — previous `prefetch_promotions_total` plus the
+    /// Previous `prefetch_promotions_total` plus the
     /// instant of the previous fetch. Used to derive a per-minute rate
     /// for the Dashboard Pulse row. `None` on first poll; the rate
     /// stays `0.0` until a second poll establishes a baseline.
@@ -30,7 +30,7 @@ pub struct IpcPoller {
 }
 
 /// Bundled result of `fetch_query_logs`. Carries the three fields the
-/// TUI needs to render the Sprint 37 empty-state messages without
+/// TUI needs to render its empty-state messages without
 /// inferring: the DTO list, the live `query_log_enabled` flag as the
 /// daemon sees it, and the file-read outcome.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct QueryLogPollResult {
     pub cursor_stale: bool,
 }
 
-/// `logs-tab`: bundled result of [`IpcPoller::fetch_daemon_logs`].
+/// Bundled result of [`IpcPoller::fetch_daemon_logs`].
 ///
 /// `dropped` and `capacity` travel with the entries rather than being
 /// fetched separately: they describe THIS page's honesty — how much the
@@ -94,7 +94,7 @@ impl IpcPoller {
         rate
     }
 
-    /// Sprint 43 T3: borrow the socket path so callers (e.g. the Lists
+    /// Borrow the socket path so callers (e.g. the Lists
     /// assignment modal commit handler) can chain a manual
     /// `ipc_reload::attempt_reload` after a batch of inline writes,
     /// keeping the modal flow async-friendly without re-creating the
@@ -103,39 +103,51 @@ impl IpcPoller {
         &self.socket_path
     }
 
+    /// Shared tail for every `fetch_*`/`send_*` match below: an
+    /// `IpcResponse::Error` carries the daemon's own message, and
+    /// anything else is a protocol mismatch worth naming — `verb` plus
+    /// the `Debug` of the variant actually received, not a bare
+    /// "unexpected response" that discards the one diagnostic available.
+    fn bail_unexpected<T>(verb: &str, response: IpcResponse) -> Result<T> {
+        match response {
+            IpcResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("{verb}: unexpected response {other:?}"),
+        }
+    }
+
     pub async fn fetch_status(&self) -> Result<DaemonStatus> {
         Self::status_from_response(send_command(&self.socket_path, &IpcCommand::Status).await?)
     }
 
     /// Project an `IpcResponse` onto the TUI's [`DaemonStatus`].
     ///
-    /// Split out of [`IpcPoller::fetch_status`] rather than left inline,
-    /// because inline is where `tui-blind-to-corpus-refusal` was able to
-    /// hide: the projection sat inside an `async fn` that needs a live Unix
-    /// socket to call, so nothing exercised it, and a field vanishing into
-    /// the `..` cost nothing at gate time. As a pure function over a value
-    /// the test can build, the mapping is finally checkable.
+    /// Split out of [`IpcPoller::fetch_status`] rather than left inline:
+    /// inline, the projection sat inside an `async fn` that needs a live
+    /// Unix socket to call, so nothing exercised it, and a field
+    /// vanishing into the `..` cost nothing at gate time. As a pure
+    /// function over a value the test can build, the mapping is
+    /// checkable.
     fn status_from_response(response: IpcResponse) -> Result<DaemonStatus> {
         match response {
-            // T2.9 / H-20: `query_log_drops` skipped via `..` — the TUI's
-            // own status panel doesn't surface drop counters yet (out of
-            // scope for the surgical fix), and a fresh field would
-            // otherwise break this exhaustive destructure.
+            // `query_log_drops` is skipped via `..` — the TUI's own status
+            // panel doesn't surface drop counters yet, and a fresh field
+            // would otherwise break this exhaustive destructure.
             //
-            // §4.19: `version` / `cache_cap` / `lists_active` /
-            // `lists_total` flow through to `DaemonStatus` so the
-            // dashboard can replace its `cache_capacity` extrapolation
-            // and surface real list / version counters.
+            // `version` / `cache_cap` / `lists_active` / `lists_total`
+            // flow through to `DaemonStatus` so the dashboard can replace
+            // its `cache_capacity` extrapolation and surface real list /
+            // version counters.
             //
-            // `tui-blind-to-corpus-refusal`: `lists_corpus_refusal` and
-            // `lists_truncated` were BOTH swallowed by the `..` below, and
-            // that is the one class of field where doing so is not merely
-            // "not surfaced yet" — both describe an outcome that the
-            // counters beside them actively contradict. A refused or
-            // truncated cycle still reports `lists_active == lists_total`,
-            // because every source really did fetch. Anything added here
-            // that qualifies an existing counter must be destructured, not
-            // defaulted away.
+            // `lists_corpus_refusal`, `lists_corpus_freeze` and
+            // `lists_truncated` must NOT be swallowed by the `..` below:
+            // each describes an outcome that the counters beside them
+            // actively contradict. A refused or truncated cycle still
+            // reports `lists_active == lists_total`, because every source
+            // really did fetch. Anything added here that qualifies an
+            // existing counter must be destructured, not defaulted away.
+            //
+            // `upstream_servers` flows through so the System card can
+            // render the literal resolver addresses.
             IpcResponse::Status {
                 pid,
                 listen,
@@ -151,7 +163,9 @@ impl IpcPoller {
                 lists_total,
                 resource_budget,
                 lists_corpus_refusal,
+                lists_corpus_freeze,
                 lists_truncated,
+                upstream_servers,
                 ..
             } => Ok(DaemonStatus {
                 pid,
@@ -168,14 +182,15 @@ impl IpcPoller {
                 lists_total,
                 resource_budget,
                 lists_corpus_refusal,
+                lists_corpus_freeze,
                 lists_truncated,
+                upstream_servers,
             }),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("Status", other),
         }
     }
 
-    /// §4.11-4b (CS9): live cluster view for the dashboard dot + Cluster
+    /// Live cluster view for the dashboard dot + Cluster
     /// tab. Mirrors `fetch_status` — `ClusterStatus` is a ReadOnly,
     /// token-less command (no `token: None` plumbing needed). Returns the
     /// whole `ClusterStatusDto` verbatim; the dot/tab renderers project it.
@@ -183,8 +198,7 @@ impl IpcPoller {
     pub async fn fetch_cluster_status(&self) -> Result<ClusterStatusDto> {
         match send_command(&self.socket_path, &IpcCommand::ClusterStatus).await? {
             IpcResponse::ClusterStatus { status } => Ok(status),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("ClusterStatus", other),
         }
     }
 
@@ -214,30 +228,29 @@ impl IpcPoller {
                 cache_hit_rate_delta_1h,
                 blocked_pct_delta_1h,
                 qtype_distribution,
-                // Sprint E — second bar of the Dashboard QTYPE chart
+                // Second bar of the Dashboard QTYPE chart
                 // card. Same shape + canonical order as
                 // `qtype_distribution`; only the daemon-side counter
                 // semantics differ (blocked-only).
                 qtype_blocked_distribution,
-                // Sprint F — 24h rolling window variants of the two
+                // 24h rolling window variants of the two
                 // qtype distributions above. The chart card reads these
                 // directly; the cumulative pair stays on TrackingData
                 // for future surfacing.
                 qtype_distribution_24h,
                 qtype_blocked_distribution_24h,
-                // Sprint §4.4 P2 — wired into the Dashboard Pulse row.
+                // Wired into the Dashboard Pulse row.
                 prefetch_pool_size,
                 prefetch_promotions_total,
                 prefetch_demotions_total,
-                // Sprint C Dashboard v2 — daemon-resolved scope/topic
-                // labels for the Top Lists card on row 4. Already
-                // sorted desc + capped at 5 by Sprint B's
+                // Daemon-resolved scope/topic labels for the Top Lists
+                // card. Already sorted desc + capped at 5 by
                 // `extract_top_n_u8`; renderer truncates defensively.
                 top_blocked_lists,
                 // 24h-rolling siblings of the lifetime Top-N vectors
-                // above. Drive the retitled row-4 cards. Empty on
-                // pre-Sprint-N daemons, in which case the row-4 cards
-                // render `collecting…` placeholder.
+                // above. Drive the retitled row-4 cards. Empty on older
+                // daemon builds that predate this field, in which case
+                // the row-4 cards render `collecting…` placeholder.
                 top_blocked_24h,
                 top_queried_24h,
                 top_blocked_lists_24h,
@@ -276,12 +289,11 @@ impl IpcPoller {
                     top_blocked_lists_24h,
                 })
             }
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("TrackingStats", other),
         }
     }
 
-    /// Sprint 43 T2: snapshot all per-blocklist runtime telemetry for
+    /// Snapshot all per-blocklist runtime telemetry for
     /// the Lists tab. ReadOnly tier — no token attached. Returns the
     /// `Vec<BlocklistStatusDto>` in the same order as `[lists].sources`
     /// (the manager preserves insertion order in the registry).
@@ -289,12 +301,11 @@ impl IpcPoller {
         let cmd = IpcCommand::BlocklistStats { source_id: None };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::BlocklistStatsList { stats } => Ok(stats),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("BlocklistStats", other),
         }
     }
 
-    /// Sprint 44 follow-up (`s44-hits-ipc-verb`): snapshot the per-record
+    /// Snapshot the per-record
     /// `LocalRecordsHits` counter for the `Leaf::LocalDns` hits column.
     /// ReadOnly tier — no token attached. Daemon-side iteration order is
     /// unspecified; the TUI builds its own `(scope, domain) → count`
@@ -303,12 +314,11 @@ impl IpcPoller {
         let cmd = IpcCommand::LocalRecordsHits;
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::LocalRecordsHitsList { entries } => Ok(entries),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("LocalRecordsHits", other),
         }
     }
 
-    /// `logs-tab`: a filtered page of the daemon's own `tracing` events.
+    /// A filtered page of the daemon's own `tracing` events.
     ///
     /// Admin tier — the daemon's log text carries client IPs and query
     /// names. `send_command` attaches the auto-discovered token, the same
@@ -339,20 +349,18 @@ impl IpcPoller {
                 dropped,
                 capacity,
             }),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("DaemonLogs", other),
         }
     }
 
     /// Fetch the full device view (mapped + unmapped + block flag).
-    /// Uses the Sprint 22 `GetAllDevices` endpoint, which is ReadOnly
+    /// Uses the `GetAllDevices` endpoint, which is ReadOnly
     /// (no token needed) so the Dashboard widget works on a fresh
     /// install and on locked-out networks.
     pub async fn fetch_device_view(&self) -> Result<DeviceViewDto> {
         match send_command(&self.socket_path, &IpcCommand::GetAllDevices).await? {
             IpcResponse::DeviceView(view) => Ok(view),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("GetAllDevices", other),
         }
     }
 
@@ -392,20 +400,18 @@ impl IpcPoller {
                 next_cursor,
                 cursor_stale,
             }),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("QueryLogs", other),
         }
     }
 
     pub async fn send_reload(&self) -> Result<String> {
         match send_command(&self.socket_path, &IpcCommand::Reload { token: None }).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("Reload", other),
         }
     }
 
-    /// Sprint 39: submit the TUI Settings → Tracking panel patch as
+    /// Submit the TUI Settings → Tracking panel patch as
     /// an `IpcCommand::TrackingConfigUpdate`. Success returns the
     /// daemon's "tracking config updated" message; any daemon-side
     /// rejection (e.g. retention out of range) is bubbled up as the
@@ -414,8 +420,7 @@ impl IpcPoller {
         let cmd = IpcCommand::TrackingConfigUpdate { patch, token: None };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("TrackingConfigUpdate", other),
         }
     }
 
@@ -423,7 +428,7 @@ impl IpcPoller {
     /// message on Ok or bubbles the daemon error verbatim. Used by the
     /// TUI device form modal on submit. The parameter is a
     /// `ClientConfig` — the v0 legacy struct kept as the `[[devices]]`
-    /// pass-through type per §14.4 judgment call.
+    /// pass-through type.
     pub async fn send_device_add(&self, device: ClientConfig) -> Result<String> {
         let cmd = IpcCommand::DeviceAdd {
             client: device,
@@ -431,14 +436,13 @@ impl IpcPoller {
         };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("DeviceAdd", other),
         }
     }
 
     /// Submit a `DeviceUpdate` IPC mutation with a partial patch. `id` is the
-    /// device's stable id (mod-10.1) — the IPC `name` field is keyed by id,
-    /// not display name; reconciling the wire field name is §07's call.
+    /// device's stable id — the IPC `name` field is keyed by id, not
+    /// display name; the wire field name is not renamed to match.
     pub async fn send_device_update(&self, id: String, patch: DevicePatch) -> Result<String> {
         let cmd = IpcCommand::DeviceUpdate {
             name: id,
@@ -447,8 +451,7 @@ impl IpcPoller {
         };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("DeviceUpdate", other),
         }
     }
 
@@ -458,8 +461,7 @@ impl IpcPoller {
         let cmd = IpcCommand::DeviceRemove { name, token: None };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("DeviceRemove", other),
         }
     }
 
@@ -479,12 +481,11 @@ impl IpcPoller {
         };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("DevicePromote", other),
         }
     }
 
-    /// §4.26 Phase 2: submit a `ProfileCreate` IPC mutation. Used by the
+    /// Submit a `ProfileCreate` IPC mutation. Used by the
     /// Profiles tab Add modal on submit. The daemon handler validates the
     /// id, refuses duplicates, writes + validates the TOML, and
     /// self-reloads via `notify_reload` — the TUI only needs to refresh
@@ -498,12 +499,11 @@ impl IpcPoller {
         };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("ProfileCreate", other),
         }
     }
 
-    /// §4.26 Phase 2: submit a `ProfileUpdate` IPC mutation. The `patch`
+    /// Submit a `ProfileUpdate` IPC mutation. The `patch`
     /// carries every changed MUTATE field — the daemon applies them in a
     /// single atomic TOML rewrite. Used by the Profiles tab Edit modal.
     pub async fn send_profile_update(
@@ -518,12 +518,11 @@ impl IpcPoller {
         };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("ProfileUpdate", other),
         }
     }
 
-    /// §4.26 Phase 2: submit a `ProfileDelete` IPC mutation. The daemon
+    /// Submit a `ProfileDelete` IPC mutation. The daemon
     /// validator refuses the delete if any device / group / subnet /
     /// schedule still references the id; that rejection bubbles up here
     /// as the error body for the modal to render. Used by the Profiles
@@ -532,8 +531,7 @@ impl IpcPoller {
         let cmd = IpcCommand::ProfileDelete { id, token: None };
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::Ok { message } => Ok(message),
-            IpcResponse::Error { message } => anyhow::bail!("{message}"),
-            _ => anyhow::bail!("unexpected response"),
+            other => Self::bail_unexpected("ProfileDelete", other),
         }
     }
 }
@@ -554,18 +552,20 @@ pub struct PromoteFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lists::status::CorpusRefusal;
+    use crate::lists::status::{CorpusFreeze, CorpusRefusal};
+    use time::macros::datetime;
 
     /// Build a `Status` response with every field named explicitly.
     ///
-    /// Deliberately NOT `..Default::default()`: `tui-blind-to-corpus-refusal`
-    /// existed because a field could join the wire and be defaulted away
-    /// without anything going red, and a fixture that spreads a default
-    /// reproduces exactly that blindness inside the test meant to catch it.
+    /// Deliberately NOT `..Default::default()`: a field can join the wire
+    /// and be defaulted away without anything going red, and a fixture
+    /// that spreads a default reproduces exactly that blindness inside
+    /// the test meant to catch it.
     /// Naming all of them costs one compile error when the wire grows — which
     /// is the notification this projection never had.
     fn status_response(
         lists_corpus_refusal: Option<CorpusRefusal>,
+        lists_corpus_freeze: Option<CorpusFreeze>,
         lists_truncated: u32,
     ) -> IpcResponse {
         IpcResponse::Status {
@@ -573,6 +573,7 @@ mod tests {
             listen: "127.0.0.1:15353".into(),
             upstream_mode: "plain".into(),
             upstream_count: 2,
+            upstream_servers: Vec::new(),
             domain_count: 500_000,
             cache_entries: 1234,
             list_count: 3,
@@ -585,6 +586,7 @@ mod tests {
             lists_truncated,
             lists_corpus_refusal,
             lists_cycle: None,
+            lists_corpus_freeze,
             lc2_list_diagnostics: Default::default(),
             resource_budget: None,
             cache_weighted_size: 0,
@@ -599,6 +601,13 @@ mod tests {
         }
     }
 
+    fn freeze() -> CorpusFreeze {
+        CorpusFreeze {
+            since: Some(datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 9,
+        }
+    }
+
     /// The projection must CARRY the refusal, not merely compile.
     ///
     /// The mutation this is built to catch is not deletion — dropping the
@@ -608,7 +617,9 @@ mod tests {
     /// dashboard, and is precisely the defect that shipped.
     #[test]
     fn corpus_refusal_survives_the_poller_projection() {
-        let status = IpcPoller::status_from_response(status_response(Some(refusal()), 0)).unwrap();
+        let status =
+            IpcPoller::status_from_response(status_response(Some(refusal()), Some(freeze()), 0))
+                .unwrap();
         let carried = status
             .lists_corpus_refusal
             .expect("the refusal must survive the projection, not vanish into the `..`");
@@ -622,11 +633,10 @@ mod tests {
         );
     }
 
-    /// The second blind spot of the same shape, found by the check
-    /// `tui-blind-to-corpus-refusal` step 5 asked for.
+    /// The second blind spot of the same shape.
     #[test]
     fn truncation_count_survives_the_poller_projection() {
-        let status = IpcPoller::status_from_response(status_response(None, 3)).unwrap();
+        let status = IpcPoller::status_from_response(status_response(None, None, 3)).unwrap();
         assert_eq!(
             status.lists_truncated, 3,
             "a truncated source is also `active`, so this counter is the only \
@@ -634,13 +644,29 @@ mod tests {
         );
     }
 
+    /// The third field of the same shape, and the one whose loss is
+    /// hardest to notice: without it the TUI can show a refusal and still
+    /// not distinguish this morning's from a fortnight-old one.
+    #[test]
+    fn freeze_duration_survives_the_poller_projection() {
+        let status =
+            IpcPoller::status_from_response(status_response(Some(refusal()), Some(freeze()), 0))
+                .unwrap();
+        let carried = status
+            .lists_corpus_freeze
+            .expect("the freeze must survive the projection, not vanish into the `..`");
+        assert_eq!(carried.consecutive, 9);
+        assert_eq!(carried.since, Some(datetime!(2026-08-04 03:00:00 UTC)));
+    }
+
     /// The control arm. Without it, a projection that hardcoded
     /// `Some(refusal)` would pass the two tests above and alarm on every
     /// healthy daemon.
     #[test]
     fn a_healthy_cycle_projects_no_refusal_and_no_truncation() {
-        let status = IpcPoller::status_from_response(status_response(None, 0)).unwrap();
+        let status = IpcPoller::status_from_response(status_response(None, None, 0)).unwrap();
         assert!(status.lists_corpus_refusal.is_none());
+        assert!(status.lists_corpus_freeze.is_none());
         assert_eq!(status.lists_truncated, 0);
     }
 }

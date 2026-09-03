@@ -122,15 +122,15 @@ impl EdnsClientSubnet {
         self.0
     }
 
-    /// §4.8 §2/2 (T3): project to a [`EcsPrefix`] suitable for cache
-    /// keying. Returns `None` for the anonymous form (`source_prefix =
+    /// Projects to a [`EcsPrefix`] suitable for cache keying. Returns
+    /// `None` for the anonymous form (`source_prefix =
     /// 0`) so anonymous queries share the same cache slot regardless
     /// of client address family — they emit byte-identical wire data,
     /// so they yield byte-identical upstream answers.
     ///
     /// For non-anonymous forms the masked address + prefix together
     /// define the cache-bucket dimension. Two clients on the same
-    /// `/24` (`192.0.2.50` and `192.0.2.99` under Coarse mode) collapse
+    /// `/24` (`10.10.1.50` and `192.0.2.99` under Coarse mode) collapse
     /// to the same `EcsPrefix` and share the upstream's answer; clients
     /// on different `/24`s get distinct slots so a CDN's
     /// geo-specialised response for `/24=10.10.1` does not poison the
@@ -147,12 +147,12 @@ impl EdnsClientSubnet {
     }
 }
 
-/// §4.8 §2/2 (T3): cache-key dimension for ECS-routed queries.
+/// Cache-key dimension for ECS-routed queries.
 ///
 /// Embedded into [`crate::dns::cache::DnsCache`]'s key tuple as
 /// `Option<EcsPrefix>`. `None` marks queries that emit no ECS option
 /// (or the anonymous zero-bytes form) — they share the same bucket and
-/// the cache stays byte-identical to pre-§4.8 baseline when no profile
+/// the cache stays byte-identical to the baseline when no profile
 /// activates ECS. `Some(p)` partitions the cache by `(masked address,
 /// prefix length)` so two clients on different `/24`s receive their
 /// own CDN-tailored answers.
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(bytes, vec![0x00, 0x01, 0x00, 0x00]);
     }
 
-    // ── §4.8 §2/2 T3: cache-key projection ─────────────────────
+    // ── cache-key projection ─────────────────────
 
     #[test]
     fn as_cache_prefix_zero_prefix_is_none() {
@@ -367,10 +367,10 @@ mod tests {
 
     #[test]
     fn as_cache_prefix_v4_carries_masked_address_and_prefix() {
-        let ecs = EdnsClientSubnet::new("192.0.2.50".parse().unwrap(), 24).unwrap();
+        let ecs = EdnsClientSubnet::new("10.10.1.50".parse().unwrap(), 24).unwrap();
         let pre = ecs.as_cache_prefix().expect("non-zero prefix → Some");
         assert_eq!(pre.prefix, 24);
-        assert_eq!(pre.addr, "192.0.2.0".parse::<IpAddr>().unwrap());
+        assert_eq!(pre.addr, "10.10.1.0".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn ecs_prefix_two_different_subnets_are_not_equal() {
-        let a = EdnsClientSubnet::new("192.0.2.50".parse().unwrap(), 24)
+        let a = EdnsClientSubnet::new("10.10.1.50".parse().unwrap(), 24)
             .unwrap()
             .as_cache_prefix()
             .unwrap();
@@ -398,7 +398,7 @@ mod tests {
     fn ecs_prefix_same_subnet_different_clients_collapse_to_equal() {
         // Two clients on the same /24 must project to the same EcsPrefix
         // — they share the same upstream-tailored cache slot.
-        let a = EdnsClientSubnet::new("192.0.2.50".parse().unwrap(), 24)
+        let a = EdnsClientSubnet::new("10.10.1.50".parse().unwrap(), 24)
             .unwrap()
             .as_cache_prefix()
             .unwrap();
@@ -413,7 +413,7 @@ mod tests {
     fn ecs_prefix_implements_hash_and_eq() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        let a = EdnsClientSubnet::new("192.0.2.50".parse().unwrap(), 24)
+        let a = EdnsClientSubnet::new("10.10.1.50".parse().unwrap(), 24)
             .unwrap()
             .as_cache_prefix()
             .unwrap();

@@ -1,4 +1,4 @@
-//! [`ResourceBudgetConfig`] — `[resource_budget]` knobs for the §4.13
+//! [`ResourceBudgetConfig`] — `[resource_budget]` knobs for the resource
 //! sampler.
 //!
 //! Holds two operator-tunables:
@@ -40,17 +40,15 @@ fn default_rss_warn_mb() -> u64 {
 
 /// 50% of `/proc/meminfo:MemTotal` in megabytes, falling back to 256 MB
 /// if the file is unreadable or malformed. The 50% factor is the
-/// conservative, Pi-class friendly default — design doc proposed 70%
-/// but operator preference for early warning won out for Sprint 1.
+/// conservative, Pi-class friendly default, favouring early warning over
+/// headroom.
 ///
-/// Floored at 1 MB (resource-budget-02, rev-2606): a host reporting
-/// `MemTotal < 2048 kB` would otherwise compute 0, which the validator
-/// itself rejects — the DEFAULT config unloadable through no operator
-/// fault.
+/// Floored at 1 MB: a host reporting `MemTotal < 2048 kB` would otherwise
+/// compute 0, which the validator itself rejects — the DEFAULT config
+/// unloadable through no operator fault.
 ///
 /// Reads `/proc/meminfo` on every call. On the boot path that's once
-/// per daemon start, so caching would buy nothing. (See follow-up
-/// `s-4.13-meminfo-cache`.)
+/// per daemon start, so caching would buy nothing.
 fn meminfo_50pct_or_256() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -95,10 +93,9 @@ mod tests {
 
     #[test]
     fn default_rss_warn_mb_is_nonzero() {
-        // Structural since resource-budget-02 (rev-2606): the derivation
-        // floors at 1 MB, so even a MemTotal < 2048 kB host cannot compute
-        // a 0 the validator would then reject. The 256 MB fallback is
-        // nonzero by construction.
+        // Structural: the derivation floors at 1 MB, so even a
+        // MemTotal < 2048 kB host cannot compute a 0 the validator would
+        // then reject. The 256 MB fallback is nonzero by construction.
         assert!(ResourceBudgetConfig::default().rss_warn_mb > 0);
     }
 

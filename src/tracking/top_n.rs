@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize};
 pub struct TopNSnapshot {
     pub top_queried: Vec<(CompactString, u64)>,
     pub top_blocked: Vec<(CompactString, u64)>,
-    /// Sprint B Dashboard v2 — top-5 Tier 1 blocklists by recent block
-    /// count, keyed by `source_bits` bit (0..=63). Bit → label
-    /// resolution is daemon-side (`socket_server::handle_tracking_stats`)
-    /// using the `list_labels` snapshot on `DaemonState`. Hard-capped
-    /// at 5 entries per `spawn_top_n_task`. `#[serde(default)]` so
-    /// pre-Sprint-B `data/stats.json` snapshots still deserialise.
+    /// Top-5 Tier 1 blocklists by recent block count, keyed by
+    /// `source_bits` bit (0..=63). Bit → label resolution is daemon-side
+    /// (`socket_server::handle_tracking_stats`) using the `list_labels`
+    /// snapshot on `DaemonState`. Hard-capped at 5 entries per
+    /// `spawn_top_n_task`. `#[serde(default)]` so older `data/stats.json`
+    /// snapshots (written before this field existed) still deserialise.
     #[serde(default)]
     pub top_blocked_lists: Vec<(u8, u64)>,
     /// 24h-rolling Top-N by per-domain query count. Each tuple is
@@ -69,8 +69,8 @@ pub fn extract_top_n(
     entries
 }
 
-/// Sprint B Dashboard v2 — u8-keyed sibling of [`extract_top_n`] for the
-/// per-bit blocklist counters on [`super::engine::StatsEngine::list_blocked`].
+/// u8-keyed sibling of [`extract_top_n`] for the per-bit blocklist
+/// counters on [`super::engine::StatsEngine::list_blocked`].
 ///
 /// Zero-count entries are filtered out so pre-seeded bits with no
 /// traffic do not pollute the snapshot. Otherwise mirrors the partial
@@ -117,9 +117,9 @@ pub fn extract_top_n_u8(
 /// Cost: O(N × 24) atomic loads on the ring map + O(N) lifetime
 /// lookups. At MAX_DOMAIN_FREQ_ENTRIES = 10_000, that's ~240k relaxed
 /// loads per tick — trivial. Do not refactor into "skip
-/// `sum_last_24h` when count is already known" cleverness: §4.39 made
-/// the ring slots generation-tagged, so `sum_last_24h` is what
-/// excludes stale (out-of-window) slots when entities go idle.
+/// `sum_last_24h` when count is already known" cleverness: the ring
+/// slots are generation-tagged, so `sum_last_24h` is what excludes
+/// stale (out-of-window) slots when entities go idle.
 pub fn extract_top_n_hourly(
     map: &DashMap<CompactString, super::engine::HourlyRing>,
     lifetime: &DashMap<CompactString, std::sync::atomic::AtomicU64>,
@@ -200,8 +200,8 @@ pub fn spawn_top_n_task(
         // `tokio::time::interval` panics on a zero period — under the release
         // profile's `panic = "abort"` that kills the daemon. The validator
         // rejects `tracking.top_n_interval_secs = 0`; this floor is the
-        // backstop for construction paths that bypass it (settings-02,
-        // mirrors prefetch_worker).
+        // backstop for construction paths that bypass it (mirrors
+        // prefetch_worker).
         let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
         ticker.tick().await; // skip first immediate tick
         loop {
@@ -209,16 +209,14 @@ pub fn spawn_top_n_task(
 
             let top_queried = extract_top_n(&engine.domain_queries, limit);
             let top_blocked = extract_top_n(&engine.domain_blocked, limit);
-            // Sprint B Dashboard v2 — top-5 Tier 1 blocklists by block
-            // count. Hard-cap of 5 per design (D8 in
-            // `_docs/features/dashboard_v2.md`), independent of the
-            // domain-top-N `limit`.
+            // Top-5 Tier 1 blocklists by block count. Hard-cap of 5 by
+            // design, independent of the domain-top-N `limit`.
             let top_blocked_lists = extract_top_n_u8(&engine.list_blocked, 5);
 
             // Snapshot `now_secs` once so prune + extract see a
             // consistent window boundary. `sum_last_24h` is a pure read
-            // since §4.39 (generation-tagged slots — no mutation, no
-            // advance step); ring hygiene is owned by `prune_hourly_map`.
+            // (generation-tagged slots — no mutation, no advance step);
+            // ring hygiene is owned by `prune_hourly_map`.
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -298,10 +296,10 @@ mod tests {
         assert!(top.is_empty());
     }
 
-    /// settings-02 (rev-2606): a zero interval reaching the spawn site must
-    /// not panic the task — `tokio::time::interval(0)` panics and the release
-    /// profile aborts on panic. The `.max(1 s)` floor is the backstop for
-    /// construction paths that bypass the validator gate.
+    /// A zero interval reaching the spawn site must not panic the task —
+    /// `tokio::time::interval(0)` panics and the release profile aborts on
+    /// panic. The `.max(1 s)` floor is the backstop for construction paths
+    /// that bypass the validator gate.
     #[tokio::test]
     async fn zero_interval_does_not_panic_task() {
         let config = crate::config::settings::TrackingConfig::default();
@@ -315,9 +313,9 @@ mod tests {
         handle.abort();
     }
 
-    /// trk-top-n-limit-zero-panic regression: `limit == 0` (an
-    /// unvalidated `top_n_limit`) over a non-empty map must return empty
-    /// rather than underflow `limit - 1` and panic the background task.
+    /// `limit == 0` (an unvalidated `top_n_limit`) over a non-empty map
+    /// must return empty rather than underflow `limit - 1` and panic the
+    /// background task.
     #[test]
     fn extract_top_n_zero_limit_no_panic() {
         let map: DashMap<CompactString, AtomicU64> = DashMap::new();
@@ -343,10 +341,9 @@ mod tests {
         assert!(extract_top_n_u8_hourly(&u8_ring, &u8_map, 3600, 0).is_empty());
     }
 
-    /// Sprint B Dashboard v2 — `extract_top_n_u8` produces a
-    /// descending-by-count list, caps at the requested limit, and
-    /// filters out zero-count entries (pre-seeded but cold bits must
-    /// not pollute the snapshot).
+    /// `extract_top_n_u8` produces a descending-by-count list, caps at
+    /// the requested limit, and filters out zero-count entries
+    /// (pre-seeded but cold bits must not pollute the snapshot).
     #[test]
     fn top_n_extracts_blocked_lists_sorted_capped() {
         let map: DashMap<u8, AtomicU64> = DashMap::new();

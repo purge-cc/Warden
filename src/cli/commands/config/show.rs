@@ -8,7 +8,7 @@
 //! - **`--annotate`** — precede the output with a block listing every
 //!   entity's source file:line from the loader's provenance sidecar.
 //! - **`--resolved`** — report every configured device and subnet with
-//!   the profile the 5-level resolver would pick (design doc §9.2).
+//!   the profile the 5-level resolver would pick.
 //!
 //! `--section` composes with `--resolved`, but over a narrower vocabulary:
 //! the resolved view is a report rather than a serialisation, so it only
@@ -29,9 +29,9 @@ use crate::profiles::resolver::ResolveLevel;
 use crate::profiles::ProfileResolver;
 
 /// Mask shown in `warden config show` in place of any value resolved
-/// from `secrets.toml`. Sprint 32 N9 — the secrets file is never merged
-/// into the show output, so the ref name passes through unchanged while
-/// the resolved value is replaced by this constant.
+/// from `secrets.toml`. The secrets file is never merged into the show
+/// output, so the ref name passes through unchanged while the resolved
+/// value is replaced by this constant.
 const SECRET_MASK: &str = "****";
 
 /// Print the current configuration with the requested flags applied.
@@ -100,7 +100,7 @@ pub fn run_show(
         }
     }
 
-    // Sprint 32 N9: print a masked summary of every secret that a
+    // Print a masked summary of every secret that a
     // blocklist's `auth_token_ref` resolves to. The ref name is already
     // present in the config serialisation above — this footer confirms
     // to the operator which refs are currently bound to a real secret
@@ -484,7 +484,7 @@ mod tests {
         assert!(err.is_err(), "invalid config should not silently pass");
     }
 
-    /// Sprint 32 N9: a blocklist with `auth_token_ref` must surface in the
+    /// A blocklist with `auth_token_ref` must surface in the
     /// `warden config show` output as a masked line. The ref name is
     /// visible (it's metadata, not a secret), but the resolved value is
     /// `****` regardless of what `secrets.toml` actually contains.

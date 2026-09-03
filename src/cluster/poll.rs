@@ -1,10 +1,10 @@
-//! §4.11-3 — the secondary's convergence poll loop (CS1/CS6).
+//! The secondary's convergence poll loop.
 //!
 //! A NEW background tokio task (NOT bolted onto `signal_loop`), spawned only
 //! when `cluster.enabled && role == secondary`. Every `poll_interval_secs`:
 //!
 //! 1. `POST /api/cluster/heartbeat` with this node's stats + the plaintext
-//!    cluster token (CS2 verifies plaintext vs the primary's stored hash) and
+//!    cluster token (verified against the primary's stored hash) and
 //!    reads back the primary's `config_hash`;
 //! 2. if `config_hash` differs from last-applied, `GET /bundle` and apply it
 //!    ([`crate::cluster::apply::apply_bundle`], stage→validate→install→reload).
@@ -15,15 +15,15 @@
 //! meaningful only inside the process that built it — publishing it produced a
 //! fixed size ceiling, a bit↔policy misalignment window, and the silent loss of
 //! list direction. The secondary now downloads and builds its own lists from
-//! the replicated policy, and derives identical bits by construction. See
-//! `_docs/features/cluster_sync_policy_only.md` §3.
+//! the replicated policy, and derives identical bits by construction.
 //!
 //! Convergence is conditioned on the **content hash**, not the generation
 //! counter (the hash survives a primary restart; the counter resets). A failed
 //! poll = log + keep last-good + retry next tick: NO self-promotion, NO
-//! takeover (failover is Phase 2; `failover_after_secs` stays parsed-unused).
+//! takeover (failover is not yet implemented; `failover_after_secs` stays
+//! parsed-unused).
 //!
-//! The last-applied hash lives in-memory (D-F): the first poll after a restart
+//! The last-applied hash lives in-memory: the first poll after a restart
 //! re-pulls the bundle. The bundle itself is on disk in `cluster.d/`, so a
 //! secondary that boots with the primary down still loads its last-good policy.
 
@@ -46,16 +46,13 @@ use super::observe::{ClusterObserve, SyncStatus};
 /// never stalls the loop past a tick or two.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hard ceiling on the policy-bundle body the secondary will buffer (`poll-01`).
+/// Hard ceiling on the policy-bundle body the secondary will buffer.
 /// The bundle is policy-only TOML (KB–low-MB); 16 MB is a safe upper bound.
-///
-/// Lived in `domainmap.rs` until that module was deleted with the map transfer.
-/// It caps the BUNDLE, not the map, so it outlived its old home.
 const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Run the secondary poll loop forever. Captures clones of the daemon's
 /// shared handles; returns only if the reload channel closes (daemon
-/// shutdown). All identity (`peer`, `token`, `interval`) is boot-time (D5).
+/// shutdown). All identity (`peer`, `token`, `interval`) is fixed at boot.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config_path: PathBuf,
@@ -78,9 +75,9 @@ pub async fn run(
              --token …`); polls will fail authentication until one is present"
         );
     }
-    // §6: the poll client trusts the primary's pinned certificate and NO
+    // The poll client trusts the primary's pinned certificate and NO
     // public CA. Neither household box has a publicly-issued certificate, so
-    // this is what makes the channel exist at all — the previous bare builder
+    // this is what makes the channel exist at all — a bare builder
     // (webpki roots only) could not complete a single poll against a
     // non-loopback peer.
     //
@@ -103,12 +100,12 @@ pub async fn run(
 
     tracing::info!(%peer, interval_secs = interval.as_secs(), "cluster secondary: poll loop started");
 
-    // In-memory last-applied content hash (D-F). `None` ⇒ pull on the first
+    // In-memory last-applied content hash. `None` ⇒ pull on the first
     // poll (and again after any restart). The bundle itself is on disk in
     // `cluster.d/`, so a re-pull re-confirms rather than re-enables filtering.
     let mut last_config_hash: Option<String> = None;
 
-    // §4.11-4 observe-only telemetry locals (NOT convergence state): the time
+    // Observe-only telemetry locals (NOT convergence state): the time
     // of the last *successful* poll and whether we've ever synced. Mirrored
     // into `observe` at the end of every tick for the IPC reader; they never
     // feed a convergence decision.
@@ -152,7 +149,7 @@ pub async fn run(
 
         // Write-through the lifted poll state for the IPC `ClusterStatus`
         // reader. The convergence locals above are unchanged — this only
-        // mirrors them out for observation (CS9).
+        // mirrors them out for observation.
         observe.store_sync(SyncStatus {
             last_config_hash: last_config_hash.clone(),
             last_sync,
@@ -171,9 +168,9 @@ pub async fn run(
 ///
 /// **Through the loader, not off the master.** An earlier version parsed the
 /// master's raw TOML on the reasoning that `[cluster]` is node-local and never
-/// replicated (CS3), so the master must be authoritative. That conflates two
-/// different things: CS3 says the section is never *replicated*, not that it
-/// always *lives in the master*. `cluster` is a known singleton top-level key
+/// replicated, so the master must be authoritative. That conflates two
+/// different things: the section is never *replicated* to a secondary, not
+/// that it always *lives in the master*. `cluster` is a known singleton top-level key
 /// (`config::loader`), so an operator may legitimately put `[cluster]` in an
 /// `includes` drop-in — and the raw read would then return `None` on a node
 /// that is correctly configured, refusing to poll. The merged view is also
@@ -210,10 +207,10 @@ async fn poll_once(
     // ── 1. heartbeat ────────────────────────────────────────────────
     let hb_req = HeartbeatRequest {
         // We track content hashes, not generations; the primary parses but
-        // drops these (§16.2), so 0 is correct for the MVP contract.
+        // drops this field, so 0 is correct.
         config_generation: 0,
         stats: current_stats(stats),
-        // §4.11-4: advertise our label so the primary's roster shows a name.
+        // Advertise our label so the primary's roster shows a name.
         node_name: node_name.map(str::to_owned),
     };
     let resp = client
@@ -229,7 +226,7 @@ async fn poll_once(
 
     // ── 2. policy ───────────────────────────────────────────────────
     // The fetched bundle's content hash is verified against `hb.config_hash`
-    // and its policy-only shape fenced inside `apply_bundle` (apply-01/03).
+    // and its policy-only shape fenced inside `apply_bundle`.
     // A 304 (None) means already current — fall through to advance the hash.
     if last_config_hash.as_deref() != Some(hb.config_hash.as_str()) {
         if let Some(bundle_toml) =
@@ -243,7 +240,7 @@ async fn poll_once(
     Ok(())
 }
 
-/// Buffer an HTTP response body with a hard ceiling (`poll-01`). reqwest applies
+/// Buffer an HTTP response body with a hard ceiling. reqwest applies
 /// no default size limit, so a malicious/compromised/MITM'd primary could stream
 /// an unbounded (chunked, no `Content-Length`) body and exhaust memory before the
 /// payload is even decoded. We accumulate `chunk()`s and abort the instant the
@@ -344,8 +341,8 @@ servers = ["192.0.2.1:53"]
     /// `cluster` is a known singleton top-level key, so an operator may put
     /// `[cluster]` in an `includes` drop-in. Reading the master's own TOML
     /// returns `None` there and the poll loop refuses on a node that is
-    /// correctly configured. CS3 says the section is never REPLICATED — not
-    /// that it always lives in the master.
+    /// correctly configured. The section is never REPLICATED to a secondary —
+    /// that does not mean it always lives in the master.
     #[test]
     fn peer_cert_is_found_when_the_cluster_section_lives_in_an_include() {
         let dir = tempfile::tempdir().expect("tempdir");

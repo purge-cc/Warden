@@ -6,9 +6,8 @@
 //! `<config-parent>/backups` (the historical `warden config backup`
 //! default, so existing archives stay where operators expect them).
 //!
-//! Sprint 4 (`v0.20.0-auto-backup-cli`) extends this with five optional
-//! scheduler fields driven by the `purge-warden-backup.timer` systemd
-//! unit. Spec: `_docs/features/backup_restore_post_v1.md` §5 Q1-Q7.
+//! Five optional scheduler fields are driven by the
+//! `purge-warden-backup.timer` systemd unit.
 
 use std::path::{Path, PathBuf};
 
@@ -29,29 +28,29 @@ pub struct BackupConfig {
     #[serde(default)]
     pub dir: Option<PathBuf>,
 
-    /// Q1+Q2: auto-backup interval. Format `[0-9]+(h|d)`, range
-    /// 1h..=720h (30d). Absent ⇒ auto-backup off (the systemd `.timer`
-    /// still wakes up hourly, but `--auto` exits 0 without running).
+    /// Auto-backup interval. Format `[0-9]+(h|d)`, range 1h..=720h (30d).
+    /// Absent ⇒ auto-backup off (the systemd `.timer` still wakes up
+    /// hourly, but `--auto` exits 0 without running).
     #[serde(default)]
     pub auto_interval: Option<String>,
 
-    /// Q2 secondary toggle: when true (and a Sprint 6 `.path` unit is
-    /// installed) a backup is triggered on every config mutation.
-    /// Sprint 4 only parses this; the action wiring lands later.
+    /// Secondary toggle: when true (and a `.path` unit is installed) a
+    /// backup is triggered on every config mutation. Currently parsed
+    /// only — the action wiring is not yet implemented.
     #[serde(default)]
     pub on_change: Option<bool>,
 
-    /// Q3: keep at most N timestamped archives. `None` or `Some(0)`
-    /// ⇒ unbounded. OR'd with [`Self::retention_days`].
+    /// Keep at most N timestamped archives. `None` or `Some(0)` ⇒
+    /// unbounded. OR'd with [`Self::retention_days`].
     #[serde(default)]
     pub retention_count: Option<u32>,
 
-    /// Q3: drop archives older than D days. `None` or `Some(0)`
-    /// ⇒ unbounded. OR'd with [`Self::retention_count`].
+    /// Drop archives older than D days. `None` or `Some(0)` ⇒ unbounded.
+    /// OR'd with [`Self::retention_count`].
     #[serde(default)]
     pub retention_days: Option<u32>,
 
-    /// Q5: auto-disable the scheduler after N consecutive auto-backup
+    /// Auto-disable the scheduler after N consecutive auto-backup
     /// failures. `None` ⇒ default 3. `Some(0)` ⇒ never auto-disable.
     #[serde(default)]
     pub disable_after_failures: Option<u32>,
@@ -291,9 +290,8 @@ mod tests {
 
     #[test]
     fn parses_full_locked_block() {
-        // The exact Q7 TOML from the design doc, minus the `dir` field
-        // (no environment context here — just verifies the new fields
-        // all parse to the documented defaults).
+        // Verifies the full set of scheduler fields parses to the
+        // documented defaults (no `dir` — no environment context here).
         let src = r#"
 auto_interval          = "24h"
 on_change              = false

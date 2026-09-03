@@ -1,15 +1,14 @@
 //! Version-1 configuration schema — the in-memory data model that drives
-//! the purge-warden daemon from Sprint 30 onwards.
+//! the purge-warden daemon.
 //!
-//! This module is the **implementation** of `_docs/features/config_architecture.md`
-//! §8. It owns every entity struct (Blocklist, Profile, Device, Group,
+//! This module owns every entity struct (Blocklist, Profile, Device, Group,
 //! Subnet, Schedule, AdminRule) and the top-level [`ConfigV1`]
 //! aggregate. Every struct applies `#[serde(deny_unknown_fields)]` so that
 //! typos surface at load time, and every id field uses the [`id::Id`]
 //! newtype so that charset / length invariants are enforced at
 //! construction (parse-don't-validate).
 //!
-//! From Sprint 30, `ConfigV1` is the **single source of truth** for the
+//! `ConfigV1` is the **single source of truth** for the
 //! daemon: the master `config.toml` carries both entity-model sections
 //! (`[[devices]]`, `[[groups]]`, `[[subnets]]`, `[[schedules]]`,
 //! `[[blocklists]]`, `[[admin_rules]]`, `[profiles.*]`, `[[retired]]`)
@@ -17,8 +16,7 @@
 //! `[security]`, `[socket]`, `[api]`, `[forwarding]`, `[local_dns]`,
 //! `[ip_blocklists]`, `[anti_bypass]`, `[lists]`). The latter are held as
 //! pass-through fields that reuse the legacy [`crate::config::settings`]
-//! types unchanged — S31-33 will port individual sections to fresh v1
-//! shapes as needed, but S30 focuses on the resolver + subnet logic.
+//! types unchanged.
 
 pub mod admin_rule;
 pub mod backup;
@@ -69,28 +67,21 @@ use crate::config::settings::{
 /// Fixed schema discriminant. Declared as a `u32` rather than a phantom
 /// enum variant so the TOML representation is a plain integer:
 /// `schema_version = 3`. The validator (or manual check) rejects any
-/// value other than [`SCHEMA_VERSION_V1`].
+/// value other than [`SCHEMA_VERSION_V1`]. The legacy name
+/// `SCHEMA_VERSION_V1` is kept to minimise churn on call sites; treat the
+/// constant as "the schema version this binary supports", whatever the
+/// numeric value is.
 ///
-/// **plp-s3b:** bumped from `2` to `3` — the `kind` → `base` wire rename
-/// plus `profiles.<id>.lists`. The legacy name `SCHEMA_VERSION_V1` is
-/// kept to minimise churn on call sites; treat the constant as "the
-/// schema version this binary supports", whatever the numeric value is.
-///
-/// **The bump is an OUTAGE risk, not a code risk, and the remedy is an
-/// ORDER** — `profile_list_policy.md` §6.1 (R7). `check_schema_version`
-/// demands equality, not `>=`, so a `2` on disk under a `3` binary is
-/// *refused*, not degraded: the daemon does not start. Every upgrade path
-/// that installs this binary must therefore migrate and lint **before**
-/// it restarts anything, and abort while the old daemon is still serving
-/// if either step fails. That sequence lives in
+/// **A bump is an OUTAGE risk, not a code risk, and the remedy is an
+/// ORDER.** `check_schema_version`
+/// demands equality, not `>=`, so an older version on disk under a newer
+/// binary is *refused*, not degraded: the daemon does not start. Every
+/// upgrade path that installs this binary must therefore migrate and lint
+/// **before** it restarts anything, and abort while the old daemon is
+/// still serving if either step fails. That sequence lives in
 /// `scripts/upgrade_config_gate.sh`, is called by `make upgrade` and by
 /// `scripts/install.sh` Phase 3.5, and is fenced by
 /// `scripts/check_upgrade_config_gate.sh`.
-///
-/// Precedent for the previous bump: Sprint A of `lists_categories_v2`
-/// (D15, Q4) took it from `1` to `2`, and shipped without that ordering
-/// — which was survivable only because `migrate v1-to-v2` was run by
-/// hand on the two hosts that existed.
 pub const SCHEMA_VERSION_V1: u32 = 3;
 
 fn default_blocked_ttl_secs() -> u32 {
@@ -113,7 +104,7 @@ fn default_tcp_timeout_secs() -> u64 {
 /// serde default at the SAME function rather than re-declaring the value. It
 /// carried a bare `#[serde(default)]` — `bool::default()` = `false` — so a
 /// bundle with a present-but-partial `[server]` table silently disabled MAC
-/// enforcement (cluster sync S2, spec §10).
+/// enforcement.
 ///
 /// **Named in a code span, deliberately not linked.** `src/cluster/` is behind
 /// `#[cfg(feature = "cluster")]` and that feature is OFF by default, so an
@@ -129,18 +120,18 @@ pub(crate) fn default_enforce_device_mac() -> bool {
 ///
 /// Carries two groups of fields:
 ///
-/// - **Resolver defaults** used by the 5-level resolver chain (§9):
+/// - **Resolver defaults** used by the 5-level resolver chain:
 ///   [`Self::default_profile`] is the level-5 fallback, and the
 ///   [`Self::default_block_response`] / [`Self::default_blocked_ttl_secs`]
-///   fields are the N6 per-profile fallbacks.
+///   fields are the per-profile fallbacks.
 /// - **Daemon-startup** fields ported 1:1 from the legacy
 ///   [`crate::config::settings::ServerConfig`]:
 ///   [`Self::listen`] / [`Self::log_level`] / [`Self::tcp_timeout_secs`]
 ///   / [`Self::enforce_device_mac`] / [`Self::allow_from`]. These live
-///   here so the daemon can boot directly from a `ConfigV1` without
-///   the second parse pass S29 did against legacy `Settings`.
+///   here so the daemon can boot directly from a `ConfigV1` without a
+///   second parse pass against legacy `Settings`.
 ///
-/// SN3 — the `block_unmapped_clients` flag is **gone** in v1. Its effect
+/// The `block_unmapped_clients` flag is **gone** in v1. Its effect
 /// is now expressed by leaving [`Self::default_profile`] unset (`None`)
 /// → level-5 resolves to REFUSED.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -156,26 +147,26 @@ pub struct ServerGlobals {
     #[serde(default = "default_tcp_timeout_secs")]
     pub tcp_timeout_secs: u64,
     /// Verify the device's MAC at query time for devices that pin one.
-    /// Legacy P0-2 ergonomic safeguard — carried forward into v1 unchanged.
+    /// Ergonomic safeguard — carried forward into v1 unchanged.
     ///
-    /// T5 renamed from `enforce_client_mac`; the serde alias plus the
+    /// Renamed from `enforce_client_mac`; the serde alias plus the
     /// loader WARN branch accept the legacy key for one release cycle.
     #[serde(default = "default_enforce_device_mac", alias = "enforce_client_mac")]
     pub enforce_device_mac: bool,
-    /// Source-IP allow list (CIDRs) for incoming DNS queries (P0-5). Empty
+    /// Source-IP allow list (CIDRs) for incoming DNS queries. Empty
     /// means "no ACL, accept every source the bind address reaches".
     #[serde(default)]
     pub allow_from: Vec<String>,
-    /// SN2: profile used by level 5 of the resolver chain when no
+    /// Profile used by level 5 of the resolver chain when no
     /// device / group / subnet matches. `None` → REFUSED.
     #[serde(default)]
     pub default_profile: Option<Id>,
     /// Fallback block response when a profile's
-    /// [`profile::Profile::block_response`] is `None` (N6).
+    /// [`profile::Profile::block_response`] is `None`.
     #[serde(default)]
     pub default_block_response: BlockResponseV1,
     /// Fallback TTL (seconds) when a profile's
-    /// [`profile::Profile::blocked_ttl_secs`] is `None` (N6).
+    /// [`profile::Profile::blocked_ttl_secs`] is `None`.
     #[serde(default = "default_blocked_ttl_secs")]
     pub default_blocked_ttl_secs: u32,
 }
@@ -211,10 +202,9 @@ impl Default for ServerGlobals {
 /// pass-through tables ([`Self::upstream`], [`Self::cache`],
 /// [`Self::tracking`], …) that still reuse the legacy
 /// [`crate::config::settings`] types. The pass-through fields land here
-/// so the daemon can boot from a single `load_config` call — S31-33 will
-/// reshape them to fresh v1 types where warranted.
+/// so the daemon can boot from a single `load_config` call.
 ///
-/// Per design doc §7.3, `profiles` is a named-map (`[profiles.<id>]`)
+/// `profiles` is a named-map (`[profiles.<id>]`)
 /// while every other entity collection is an array-of-tables. The map
 /// key is the profile id — the validator ensures every key parses as a
 /// valid [`Id`].
@@ -230,7 +220,7 @@ pub struct ConfigV1 {
     /// [`validator::validate`].
     pub schema_version: u32,
 
-    /// Glob patterns for include resolution (§7). Empty in a single-file
+    /// Glob patterns for include resolution. Empty in a single-file
     /// deployment.
     #[serde(default)]
     pub includes: Vec<String>,
@@ -251,10 +241,10 @@ pub struct ConfigV1 {
     pub profiles: BTreeMap<String, Profile>,
 
     /// Accepts the legacy `[[clients]]` section name via serde alias
-    /// so masters written before S42 T5 continue to parse. Pairs with
+    /// so older masters continue to parse. Pairs with
     /// the loader's `normalise_deprecated_keys` branch which also
-    /// emits the deprecation WARN at load time (§3 R1 belt-and-braces:
-    /// serde alias covers direct `toml::from_str::<ConfigV1>` paths
+    /// emits the deprecation WARN at load time (belt-and-braces:
+    /// the serde alias covers direct `toml::from_str::<ConfigV1>` paths
     /// that bypass the loader).
     #[serde(default, alias = "clients")]
     pub devices: Vec<Device>,
@@ -282,7 +272,7 @@ pub struct ConfigV1 {
     #[serde(default)]
     pub custom_list_limits: CustomListLimits,
 
-    /// §4.66 L1 — the controlled vocabulary for the device metadata
+    /// The controlled vocabulary for the device metadata
     /// fields and for tag slugs. Advisory only: nothing in the resolver
     /// chain consults it, and a device value outside the vocabulary
     /// loads with a WARN rather than an error.
@@ -296,20 +286,18 @@ pub struct ConfigV1 {
     // ── pass-through sections ─────────────────────────────────────
     //
     // These carry the daemon-wide config that has not yet been ported
-    // to a fresh v1 shape. Reuse the legacy structs 1:1 so the S30
-    // rewire is surgical — S31-33 will port individual sections as
-    // needed. `deny_unknown_fields` on `ConfigV1` still catches any
+    // to a fresh v1 shape. Reuse the legacy structs 1:1.
+    // `deny_unknown_fields` on `ConfigV1` still catches any
     // typo at the top level; typos inside these sections fall through
     // to the legacy deserialiser (no `deny_unknown_fields` on most
     // legacy types, same as on v0).
     #[serde(default)]
     pub upstream: UpstreamConfig,
 
-    /// §4.10 — DNSSEC validation of upstream answers. Opt-in, OFF by default;
+    /// DNSSEC validation of upstream answers. Opt-in, OFF by default;
     /// the whole `[dnssec]` section may be omitted. Parsed unconditionally so a
-    /// `mode = "validate"` config deserialises on any build, but **inert in
-    /// §4.10-1** (parsed, not yet consumed). The validation machinery is behind
-    /// the default-OFF `dnssec` cargo feature.
+    /// `mode = "validate"` config deserialises on any build. The validation
+    /// machinery is behind the default-OFF `dnssec` cargo feature.
     #[serde(default)]
     pub dnssec: DnssecConfig,
 
@@ -341,13 +329,12 @@ pub struct ConfigV1 {
     pub ip_blocklists: IpBlocklistConfig,
 
     /// Legacy `[lists]` section — retained as the driver for the blocklist
-    /// download pipeline until S31/S32 migrate the downloader to consume
-    /// the [`Self::blocklists`] entities directly. For S30 every list id
+    /// download pipeline. Every list id
     /// referenced by a profile must match a `lists.sources` entry.
     #[serde(default)]
     pub lists: ListsConfig,
 
-    /// §4.13 — sampler cadence + RSS warn threshold. Omit the whole
+    /// Sampler cadence + RSS warn threshold. Omit the whole
     /// `[resource_budget]` section to inherit the defaults
     /// (`tick_secs = 5`, `rss_warn_mb = 50% of /proc/meminfo MemTotal`
     /// or `256` MB if meminfo is unreadable).
@@ -360,31 +347,28 @@ pub struct ConfigV1 {
     #[serde(default)]
     pub backup: BackupConfig,
 
-    /// §4.11 — primary/secondary cluster replication. Opt-in, OFF by
+    /// Primary/secondary cluster replication. Opt-in, OFF by
     /// default; the whole `[cluster]` section may be omitted. Parsed +
-    /// validated unconditionally, but **inert** in §4.11-1 (no poll loop,
-    /// no endpoints, no failover — those land in later sprints). Node-local
-    /// identity per CS3: never replicated to a peer.
+    /// validated unconditionally. Node-local
+    /// identity: never replicated to a peer.
     #[serde(default)]
     pub cluster: ClusterConfig,
 }
 
 /// Manual `Default` so a Rust-side `ConfigV1::default()` carries a real
-/// `schema_version` (schema-02, rev-2606). `#[derive(Default)]` gave
+/// `schema_version`. `#[derive(Default)]` gave
 /// `schema_version = 0`, which [`validator::validate`] unconditionally
 /// rejects — the exact trap the [`ServerGlobals`] manual impl above
 /// documents, reintroduced one struct down. `schema_version` has no
 /// `#[serde(default)]`, so the parse path is unaffected: a TOML missing
 /// the key still fails to deserialize.
 ///
-/// **This is deliberately NOT a config that validates**, and that changed
-/// with neutrality-10 — the paragraph above used to promise a VALID config.
-/// `upstream.servers` now has no default (see
+/// **This is deliberately NOT a config that validates.**
+/// `upstream.servers` has no default (see
 /// [`crate::config::settings::UpstreamConfig::servers`]), so the default
 /// names no resolver and [`validator::validate`] refuses it with
 /// `UPSTREAM_SERVERS_EMPTY`. That refusal is the whole point: warden will
-/// not pick a resolver on the operator's behalf, and a default that
-/// silently validated is exactly how it used to. Test fixtures that need a
+/// not pick a resolver on the operator's behalf. Test fixtures that need a
 /// config which *does* validate use `ConfigV1::test_scaffold` (test-only,
 /// defined at the foot of this file).
 impl Default for ConfigV1 {
@@ -424,13 +408,13 @@ impl Default for ConfigV1 {
 }
 
 /// Placeholder secret-bearing fields are replaced with on display
-/// surfaces (rev-2606 §07 A2).
+/// surfaces.
 pub const REDACTION_PLACEHOLDER: &str = "***";
 
 impl ConfigV1 {
     /// Replace every credential-bearing value for export over a display
-    /// surface (`GET /api/config`). Shape contract (observable behaviour,
-    /// preserved from T2.5 H-11): field set → `Some("***")` so operators
+    /// surface (`GET /api/config`). Shape contract (observable behaviour):
+    /// field set → `Some("***")` so operators
     /// see it exists; field unset → `None` (`api.token_hash` then omits
     /// via `skip_serializing_if`; `cluster.token_hash` serialises as JSON
     /// `null` — both unchanged).
@@ -450,7 +434,7 @@ impl ConfigV1 {
     }
 }
 
-// ── §4.11 cluster replication: the section classification, as DATA ──
+// ── cluster replication: the section classification, as DATA ──
 //
 // The exhaustive `let ConfigV1 { … }` destructuring in
 // `every_config_section_is_classified_replicated_or_node_local` is the
@@ -493,7 +477,7 @@ pub const REPLICATED_SECTIONS: &[&str] = &[
     "lists",
 ];
 
-/// The CS3 fence: sections that never cross the wire. Replicating any of
+/// Sections that never cross the wire. Replicating any of
 /// these would overwrite the secondary's own identity with the primary's.
 pub const NODE_LOCAL_SECTIONS: &[&str] = &[
     // A `[[custom_lists]]` row is a pointer to a file on THIS node's disk.
@@ -522,7 +506,7 @@ pub const SECTIONS_EXCLUDED_FROM_REPLICATION: &[&str] = &["includes"];
 /// carry, so a guard built from [`REPLICATED_SECTIONS`] must subtract them.
 /// Both entries are load-bearing:
 ///
-/// - `schema_version` is on §5.3's keep-list — *every* master carries it, and
+/// - `schema_version` is on the keep-list — *every* master carries it, and
 ///   the bundle's copy is a compatibility check, not policy to install.
 ///   Forbidding it would refuse every secondary that exists.
 /// - `server` is the one split-merge singleton (`loader.rs`
@@ -553,14 +537,6 @@ schema_version = 3
         assert_eq!(c.server.listen.port(), 15353);
         assert_eq!(c.server.default_blocked_ttl_secs, 60);
         assert!(c.server.enforce_device_mac);
-        // neutrality-10: this line used to be
-        //   assert!(c.upstream.servers.iter().any(|s| s.starts_with("1.1.1.1")))
-        // — a test PINNING the defect. It asserted that a config naming no
-        // resolver still deserialises to a named provider's address, and
-        // called that "sensible daemon config". It is the reason the
-        // violation would have survived a careless fix: repairing the
-        // default without reading this test turns it red and invites
-        // reverting the repair. The invariant is now the opposite one.
         assert!(
             c.upstream.servers.is_empty(),
             "a config naming no upstream must deserialise to none — warden picks nobody"
@@ -672,7 +648,7 @@ log_mode = "blocked_only"
 
     #[test]
     fn server_block_unmapped_clients_rejected_as_unknown_field() {
-        // SN3: the legacy `block_unmapped_clients` flag does not exist
+        // The legacy `block_unmapped_clients` flag does not exist
         // in v1. An operator migrating a legacy config must delete it
         // and set `default_profile` instead. The deny_unknown_fields
         // guard on ServerGlobals makes this fail loudly at parse time.
@@ -713,7 +689,7 @@ display_name = "Default"
 [[devices]]
 id = "iphone"
 display_name = "iPhone"
-ip = "192.0.2.107"
+ip = "10.10.1.107"
 profile = "default"
 
 [[groups]]
@@ -725,7 +701,7 @@ devices = ["iphone"]
 [[subnets]]
 id = "lan"
 display_name = "LAN"
-cidrs = ["192.0.2.0/24"]
+cidrs = ["10.10.1.0/24"]
 profile = "default"
 
 [[schedules]]
@@ -770,7 +746,7 @@ servers = ["192.0.2.1:53"]
         assert!(err.to_string().contains("schema_version"));
     }
 
-    // ── secret redaction (rev-2606 §07 A2) ───────────────────────────
+    // ── secret redaction ───────────────────────────
 
     /// Maximal secret-bearing fixture. When adding any config field that
     /// carries a credential, populate it here — this fixture feeds the
@@ -930,12 +906,11 @@ servers = ["192.0.2.1:53"]
     /// unit-test fixtures whose subject is devices / labels / rules /
     /// anything but upstream policy.
     ///
-    /// neutrality-10 removed the default upstream, so `ConfigV1::default()`
-    /// is refused by the validator. Those fixtures were never asserting
-    /// anything about upstreams; they just needed *a* loadable config, and
-    /// before the change they silently inherited a named provider's address
-    /// pair. This gives them RFC 5737 TEST-NET-1 instead: reserved for
-    /// documentation, unroutable, and naming nobody.
+    /// `ConfigV1::default()` has no default upstream, so it
+    /// is refused by the validator. Fixtures that don't care about upstream
+    /// policy just need *a* loadable config, so this gives them RFC 5737
+    /// TEST-NET-1: reserved for documentation, unroutable, and naming
+    /// nobody.
     ///
     /// Test-only on purpose. Production code must keep hitting
     /// [`ConfigV1::default`] so that a real config which names no resolver
@@ -944,9 +919,10 @@ servers = ["192.0.2.1:53"]
     /// Lives INSIDE `mod tests` rather than beside it, and that placement is
     /// forced from both sides: below the test module clippy refuses it
     /// (`items_after_test_module`), and above it the file would gain a second
-    /// `#[cfg(test)]` ahead of production code — the very blind spot that let
-    /// neutrality-10 survive. An inherent impl is crate-visible from wherever
-    /// it is written, so `pub(crate)` here reaches every other test module.
+    /// `#[cfg(test)]` ahead of production code — exactly the kind of blind
+    /// spot a stray provider default could hide in. An inherent impl is
+    /// crate-visible from wherever it is written, so `pub(crate)` here
+    /// reaches every other test module.
     impl ConfigV1 {
         pub(crate) fn test_scaffold() -> Self {
             Self {
@@ -960,7 +936,7 @@ servers = ["192.0.2.1:53"]
     }
 
     /// Every top-level [`ConfigV1`] section is classified: **replicated** to a
-    /// cluster secondary, **node-local** (never crosses the wire, CS3), or
+    /// cluster secondary, **node-local** (never crosses the wire), or
     /// **excluded with a reason**. The destructuring below is exhaustive — no
     /// `..` rest pattern — so adding a field to `ConfigV1` breaks THIS BUILD
     /// until someone decides which set it belongs to.
@@ -975,7 +951,7 @@ servers = ["192.0.2.1:53"]
     /// `src/cluster/` is behind `#[cfg(feature = "cluster")]` and that feature is
     /// OFF by default, so a copy of this test next to the bundle would never fire
     /// for a contributor running a plain `cargo test` — precisely the
-    /// invisible-to-the-default-build hazard recorded in S1's retained test. The
+    /// invisible-to-the-default-build hazard this test exists to catch. The
     /// half that needs the feature (the bundle round-trip) stays in
     /// `cluster::policy::tests::the_bundle_replicates_the_label_vocabulary`; this
     /// half names only `ConfigV1`, so it runs for everyone.
@@ -1008,7 +984,7 @@ servers = ["192.0.2.1:53"]
             ip_blocklists: _,
             lists: _,
 
-            // ── node-local: the CS3 fence. Replicating any of these would
+            // ── node-local. Replicating any of these would
             // overwrite the secondary's own identity with the primary's.
             custom_lists: _,
             custom_list_limits: _,

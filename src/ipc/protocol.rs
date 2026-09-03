@@ -4,7 +4,7 @@
 //! by `\n`. The client sends one command, the server sends one response, then
 //! the connection closes.
 //!
-//! # Authorization (P0-3)
+//! # Authorization
 //!
 //! Commands are classified into three tiers via [`CommandTier`]:
 //!
@@ -17,14 +17,14 @@
 //! - `Admin` — token required. Shut down the daemon or expose the query
 //!   log, tracking stats, or per-device stats (all of which are PII).
 //!
-//! # T5 backward-decode compatibility (Sprint 42)
+//! # Backward-decode compatibility
 //!
-//! Variants renamed in T5 (Client* → Device*) carry `#[serde(alias = ...)]`
-//! pointing at their legacy wire name, so a pre-T5 CLI can still send
-//! `"client_stats"` / `"client_add"` / `"get_all_clients"` / etc and the
-//! T5 daemon decodes them correctly. The CLI↔daemon pair is still shipped
-//! in lockstep (see the note on `IpcResponse::QueryLogs`), but aliases
-//! cover any in-flight message boundary crossing a partial upgrade.
+//! Variants renamed from the legacy `Client*` naming to `Device*` carry
+//! `#[serde(alias = ...)]` pointing at their legacy wire name, so an older
+//! CLI can still send `"client_stats"` / `"client_add"` / `"get_all_clients"`
+//! / etc and the daemon decodes them correctly. The CLI↔daemon pair is still
+//! shipped in lockstep (see the note on `IpcResponse::QueryLogs`), but
+//! aliases cover any in-flight message boundary crossing a partial upgrade.
 //!
 //! Mutating and Admin commands carry an optional `token` field. The CLI
 //! auto-discovers the plaintext token from a standard file path and
@@ -73,12 +73,11 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// §4.7 Phase 2 T1: drop the in-memory cache entry for a list
-    /// source AND unlink its `<stem>.cache` + `<stem>.meta` sidecars
-    /// from disk. `id` is the source string as configured in
-    /// `lists.sources` (legacy slash slug or raw URL). Forces a
-    /// re-download on the next refresh cycle. Tier `Mutating` —
-    /// affects daemon state, no PII exposed.
+    /// Drops the in-memory cache entry for a list source AND unlinks its
+    /// `<stem>.cache` + `<stem>.meta` sidecars from disk. `id` is the
+    /// source string as configured in `lists.sources` (legacy slash slug
+    /// or raw URL). Forces a re-download on the next refresh cycle. Tier
+    /// `Mutating` — affects daemon state, no PII exposed.
     ForgetList {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,10 +125,10 @@ pub enum IpcCommand {
     GetAllDevices,
     /// Get recent query log entries with optional filters.
     ///
-    /// The `client` filter field is retained (not renamed to `device`)
-    /// per §14.4 punto 3 R4 — it refers to the query-log filter's
-    /// operator-typed target name, which is an API surface with
-    /// semantics stable beyond T5. Renaming would break muscle memory
+    /// The `client` filter field is retained (not renamed to `device`) —
+    /// it refers to the query-log filter's operator-typed target name, an
+    /// API surface whose semantics are stable independent of the
+    /// internal Client→Device rename. Renaming would break muscle memory
     /// for operators running ad-hoc log queries.
     QueryLogs {
         limit: usize,
@@ -139,21 +138,21 @@ pub enum IpcCommand {
         blocked_only: bool,
         #[serde(default)]
         domain: Option<String>,
-        /// Sprint 41: only entries within the last `since_secs` seconds.
-        /// `None` means no time cutoff. `#[serde(default)]` makes older
-        /// callers (that don't carry the field at all) still parse.
+        /// Only entries within the last `since_secs` seconds. `None`
+        /// means no time cutoff. `#[serde(default)]` makes older callers
+        /// (that don't carry the field at all) still parse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_secs: Option<u64>,
-        /// `qlog-paging-cursor`: resume point handed back by a previous
-        /// response's `next_cursor`. `None` reads the live tail — which is
-        /// what every pre-paging caller sends, and what
-        /// `#[serde(default)]` keeps them able to send.
+        /// Resume point handed back by a previous response's
+        /// `next_cursor`. `None` reads the live tail — which is what
+        /// every pre-paging caller sends, and what `#[serde(default)]`
+        /// keeps them able to send.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<crate::tracking::query_log::QueryLogCursor>,
-        /// `qlog-advanced-filter-form`: Tier-1 client predicates, ANDed
-        /// with each other and with `client` / `domain` / `blocked_only`.
-        /// `None` means the operator never opened the form — the field is
-        /// purely additive and the four existing controls are untouched.
+        /// Tier-1 client predicates, ANDed with each other and with
+        /// `client` / `domain` / `blocked_only`. `None` means the
+        /// operator never opened the form — the field is purely additive
+        /// and the four existing controls are untouched.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advanced: Option<AdvancedClientFilterDto>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,10 +165,9 @@ pub enum IpcCommand {
     /// for tags), atomically rewrites `config.toml`, and triggers a
     /// hot reload. Same wire format as a `[[devices]]` TOML block —
     /// a `ClientConfig` (the v0 legacy struct kept as the `[[devices]]`
-    /// pass-through type per §14.4 judgment call) value serialized
-    /// through the existing serde derive on that struct. The `client`
-    /// field name on the wire is retained for decode-compat with
-    /// pre-T5 CLI senders.
+    /// pass-through type) value serialized through the existing serde
+    /// derive on that struct. The `client` field name on the wire is
+    /// retained for decode-compat with older CLI senders.
     #[serde(alias = "client_add")]
     DeviceAdd {
         client: ClientConfig,
@@ -210,10 +208,9 @@ pub enum IpcCommand {
     /// **Strictly requires a MAC pin from the live ARP table** for
     /// the given IP. If the resolver's ARP snapshot has no entry,
     /// the call is rejected with a "wait for ARP, then retry" hint.
-    /// The MAC requirement is load-bearing per project rules "MAC + IP
-    /// for client identification — IP-only is bypassable in 30
-    /// seconds": a DHCP collision could re-bind the IP to a
-    /// different physical device after promotion, silently moving
+    /// The MAC requirement is load-bearing: IP-only identification is
+    /// bypassable in seconds, and a DHCP collision could re-bind the IP
+    /// to a different physical device after promotion, silently moving
     /// the wrong device into the configured device's profile slot.
     ///
     /// On success, builds a `ClientConfig` with the ARP-resolved MAC
@@ -242,24 +239,22 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// Sprint 38 QLP5: apply a partial update to the `[tracking]`
-    /// section of the v1 master. Tier: `Admin` — the query log
-    /// contains PII so mutations of its settings share the tier of
-    /// the reads that expose it.
+    /// Applies a partial update to the `[tracking]` section of the v1
+    /// master. Tier: `Admin` — the query log contains PII so mutations
+    /// of its settings share the tier of the reads that expose it.
     ///
-    /// The handler runs under the same write lock as the entity
-    /// editors, re-reads the master as a `toml::Value`, applies the
-    /// patch field-by-field (partial semantics — absent fields leave
-    /// the master alone), runs the CS2 `atomic_write_and_validate`
-    /// helper against the v1 loader, and triggers the shared S36
-    /// `attempt_reload` so the daemon picks up the change without a
-    /// restart.
+    /// The handler runs under the same write lock as the entity editors,
+    /// re-reads the master as a `toml::Value`, applies the patch
+    /// field-by-field (partial semantics — absent fields leave the
+    /// master alone), runs `atomic_write_and_validate` against the v1
+    /// loader, and triggers the shared `attempt_reload` so the daemon
+    /// picks up the change without a restart.
     TrackingConfigUpdate {
         patch: TrackingPatch,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// Sprint 43 T1: read per-source runtime telemetry.
+    /// Reads per-source runtime telemetry.
     ///
     /// `source_id = None` returns a snapshot of every configured
     /// `[lists].sources` entry. `source_id = Some("ads")` (or any
@@ -276,19 +271,18 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<String>,
     },
-    /// Sprint 44 follow-up (`s44-hits-ipc-verb`): snapshot the per-record
-    /// `LocalRecordsHits` counter for the TUI's `Leaf::LocalDns` `hits`
-    /// column. The counter itself is wired hot-path-side since T3; this
-    /// verb exposes the read surface so the TUI no longer renders `—`.
+    /// Snapshot of the per-record `LocalRecordsHits` counter for the
+    /// TUI's `Leaf::LocalDns` `hits` column. This verb exposes the read
+    /// surface so the TUI no longer renders `—`.
     ///
     /// **Tier: `ReadOnly`.** No token gate, mirroring `BlocklistStats`:
     /// the payload reveals only counts + the operator's own record names
     /// (already in their config), and the TUI polls it on a slow cadence.
     LocalRecordsHits,
-    /// `logs-tab`: a page of the daemon's own recent `tracing` events —
-    /// the source behind the TUI's `Leaf::Logs`. Reads the in-process
-    /// ring buffer (`tracking::log_ring`); nothing is read from disk and
-    /// no journald permission is involved.
+    /// A page of the daemon's own recent `tracing` events — the source
+    /// behind the TUI's `Leaf::Logs`. Reads the in-process ring buffer
+    /// (`tracking::log_ring`); nothing is read from disk and no
+    /// journald permission is involved.
     ///
     /// **Tier: `Admin`.** Log lines routinely carry client IPs and query
     /// names (`dns/handler.rs` formats both into its `warn!`/`error!`
@@ -311,9 +305,9 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// §4.26 Phase 1: create a v1 `[profiles.<id>]` entry with the given
-    /// `display_name`. All other fields default; subsequent mutations go
-    /// through `ProfileUpdate`. Refuses if `id` already exists.
+    /// Creates a v1 `[profiles.<id>]` entry with the given `display_name`.
+    /// All other fields default; subsequent mutations go through
+    /// `ProfileUpdate`. Refuses if `id` already exists.
     /// **Tier: `Mutating`.**
     ProfileCreate {
         id: String,
@@ -321,8 +315,8 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// §4.26 Phase 1: patch fields on an existing v1 profile. `patch`
-    /// uses double-Option semantics for nullable fields (block_response,
+    /// Patches fields on an existing v1 profile. `patch` uses
+    /// double-Option semantics for nullable fields (block_response,
     /// blocked_ttl_secs) so the wire format distinguishes "omitted, no
     /// change" from "set to None (inherit from `[server]` defaults)".
     /// Multi-field mutates (e.g. the `ecs` subtree) land atomically in
@@ -333,18 +327,18 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// §4.26 Phase 1: remove a v1 profile entry. Refuses if any device,
-    /// subnet, or schedule still references the id. **Tier: `Mutating`.**
+    /// Removes a v1 profile entry. Refuses if any device, subnet, or
+    /// schedule still references the id. **Tier: `Mutating`.**
     ProfileDelete {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
-    /// §4.11-4 (CS9): this node's live cluster state — role, peer, generations
-    /// and content hashes, the secondary's last-sync age / poll status, and (on
-    /// a primary) the connected-secondary roster with contribution weights.
-    /// Tier `ReadOnly` (no token — mirrors `Status`); `cluster`-feature only, so
-    /// it is absent from the default build.
+    /// This node's live cluster state — role, peer, generations and
+    /// content hashes, the secondary's last-sync age / poll status, and
+    /// (on a primary) the connected-secondary roster with contribution
+    /// weights. Tier `ReadOnly` (no token — mirrors `Status`);
+    /// `cluster`-feature only, so it is absent from the default build.
     #[cfg(feature = "cluster")]
     ClusterStatus,
 }
@@ -410,9 +404,9 @@ pub struct DevicePatch {
     /// clear every membership. `Some(vec!["foo"])` = replace with
     /// exactly that list.
     ///
-    /// **Full-list, so a short list DELETES.** §4.64 G4: the TUI form
-    /// was single-select and emitted `Some(vec![first])`, which turned
-    /// every Save — including a bare rename — into a silent purge of the
+    /// **Full-list, so a short list DELETES.** An earlier TUI form was
+    /// single-select and emitted `Some(vec![first])`, which turned every
+    /// Save — including a bare rename — into a silent purge of the
     /// device's other memberships. The form is a multi-select now and
     /// sends the whole list; anything else writing this field must too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -423,27 +417,27 @@ pub struct DevicePatch {
     pub notes: Option<Option<String>>,
     /// **RETIRED — captured only so it can be REPORTED, never applied.**
     ///
-    /// `tags` was removed from the product by the profile-list-policy
-    /// workstream. This field exists because removing it outright is not
-    /// neutral: `DevicePatch` carries no `deny_unknown_fields`, so serde
-    /// drops an unknown `tags` key in silence, applies the rest of the
-    /// patch, and answers OK. The operator's rename lands and their tag
-    /// vanishes with no diagnostic — which is the exact failure the tag
-    /// model died of, reintroduced at a different layer.
+    /// `tags` was removed from the product. This field exists because
+    /// removing it outright is not neutral: `DevicePatch` carries no
+    /// `deny_unknown_fields`, so serde drops an unknown `tags` key in
+    /// silence, applies the rest of the patch, and answers OK. The
+    /// operator's rename lands and their tag vanishes with no
+    /// diagnostic — which is the exact failure the tag model died of,
+    /// reintroduced at a different layer.
     ///
-    /// **The skew is reachable, not theoretical.** Measured on
-    /// `the lab host` 2026-08-26: `/usr/local/bin/warden` is a raw ELF,
-    /// there is no libexec copy, and `make upgrade` writes libexec only —
-    /// so after an upgrade the daemon is new and the CLI on `PATH` is
-    /// old, permanently (`upgrade-leaves-stale-cli-on-path`). That old
-    /// CLI still sends `tags`, and `device update` is the one path where
-    /// it otherwise *succeeds*: the request never touches the config file
-    /// it would write a rejected `schema_version` into.
+    /// **The skew is reachable, not theoretical.** An upgraded daemon
+    /// can end up running alongside a stale `warden` CLI still on
+    /// `PATH` (the installed binary has no libexec copy, so an upgrade
+    /// that misses `PATH` leaves the old CLI in place indefinitely).
+    /// That old CLI still sends `tags`, and `device update` is the one
+    /// path where it otherwise *succeeds*: the request never touches
+    /// the config file it would write a rejected `schema_version` into.
     ///
-    /// Strip-and-report rather than refuse, matching
-    /// `normalise_deprecated_keys`' `ip_denylists` precedent
-    /// (`config/loader.rs:1458`) — the operator's other edits still apply,
-    /// and both entry points into the product now behave the same way.
+    /// Strip-and-report rather than refuse, matching the
+    /// `normalise_deprecated_keys` deprecated-key precedent used
+    /// elsewhere in the config loader — the operator's other edits
+    /// still apply, and both entry points into the product now behave
+    /// the same way.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "tags")]
     pub retired_tags: Option<Vec<String>>,
 }
@@ -474,31 +468,9 @@ pub fn retired_tags_worth_reporting(tags: Option<&Vec<String>>) -> bool {
 }
 
 #[cfg(test)]
-mod retired_tags_reporting_tests {
-    use super::retired_tags_worth_reporting;
+mod retired_tags_reporting_tests;
 
-    /// Pins all three states. A mutation to `is_some()` turns the middle row
-    /// red; a mutation to `false` turns the last row red. Without the middle
-    /// row the predicate could be `is_some()` and still pass.
-    #[test]
-    fn only_a_non_empty_retired_tags_key_is_reported() {
-        assert!(
-            !retired_tags_worth_reporting(None),
-            "absent key: the client never sent it"
-        );
-        assert!(
-            !retired_tags_worth_reporting(Some(&vec![])),
-            "empty list: an older client round-tripping a device that has no \
-             tags — presence is not intent, and warning here is noise"
-        );
-        assert!(
-            retired_tags_worth_reporting(Some(&vec!["kids".to_string()])),
-            "non-empty: the closest reachable approximation of intent"
-        );
-    }
-}
-
-/// §4.26 Phase 1: partial update for a v1 `[profiles.<id>]` entry.
+/// Partial update for a v1 `[profiles.<id>]` entry.
 ///
 /// Field shape mirrors `DevicePatch`:
 /// - `Option<T>` for non-nullable fields → outer `None` means "no change".
@@ -528,43 +500,69 @@ pub struct ProfileUpdatePatch {
     pub ecs: Option<EcsPatch>,
     /// **RETIRED — captured only so it can be REFUSED, never applied.**
     ///
-    /// `plp-s5a` removed `Profile.tags`, the field this delta wrote.
-    /// Deleting the wire field with it would not be neutral:
-    /// `ProfileUpdatePatch` carries no `deny_unknown_fields`, so serde
-    /// would drop an unknown `tags` key in silence, apply the rest of the
-    /// patch and answer OK — the operator's tag edit vanishing with no
-    /// diagnostic, which is precisely the failure the tag model died of.
+    /// `Profile.tags` was removed from the product, and this field is
+    /// the delta that used to write it. Deleting the wire field with it
+    /// would not be neutral: `ProfileUpdatePatch` carries no
+    /// `deny_unknown_fields`, so serde would drop an unknown `tags` key
+    /// in silence, apply the rest of the patch and answer OK — the
+    /// operator's tag edit vanishing with no diagnostic, which is
+    /// precisely the failure the tag model died of.
     ///
-    /// The skew that reaches it is measured, not hypothetical: after
-    /// `make upgrade` the daemon is new and the `warden` on `PATH` is old
-    /// (`upgrade-leaves-stale-cli-on-path`), and an old TUI's profile
-    /// modal submits its whole patch on every save.
+    /// The skew that reaches it is measured, not hypothetical: after an
+    /// upgrade the daemon can be new while the `warden` CLI on `PATH` is
+    /// still old, and an old TUI's profile modal submits its whole patch
+    /// on every save.
     ///
     /// **Refused, not stripped — deliberately different from
     /// [`DevicePatch::retired_tags`].** That one strips and reports so the
     /// operator's other device edits still land. Here the refusal already
-    /// existed before the field was retired (`plp-s3`), and downgrading a
-    /// loud rejection to a silent strip in the sprint that removes the
-    /// field would be a behaviour change smuggled inside a deletion.
+    /// existed before the field was retired, and downgrading a loud
+    /// rejection to a silent strip would be a behaviour change smuggled
+    /// inside what looks like pure cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "tags")]
     pub retired_tags: Option<TagsPatch>,
-    /// `profile_list_policy` §4 S4: delta over `Profile.lists`, the
-    /// per-profile direction override map.
+    /// Delta over `Profile.lists`, the per-profile direction override
+    /// map.
     ///
     /// **This is the only write path for a per-profile override.** Both
     /// the CLI (`cli::commands::profiles_v1`) and the TUI
     /// (`tui::ipc_poller`) reach `[profiles.<id>]` through
     /// [`IpcCommand::ProfileUpdate`] and nothing else, so the consent gate
-    /// that a `Allow` override has to pay lives in the handler rather than
-    /// once per surface. Callers expose the daemon's refusal; they do not
-    /// re-implement it.
+    /// that an `Allow` override has to pay lives in the handler rather
+    /// than once per surface. Callers expose the daemon's refusal; they
+    /// do not re-implement it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lists: Option<ListPolicyPatch>,
+    /// Delta over `Profile.custom_lists`, the ids of operator-authored
+    /// rule files this profile mounts.
+    ///
+    /// **Unlike [`Self::lists`], this is NOT the only write path for the
+    /// field it edits, and the asymmetry is deliberate.** This seat serves
+    /// the profile-shaped gesture — *one profile, N lists* — where a mount
+    /// rides the same atomic patch as the display name and the per-list
+    /// overrides. The list-shaped gesture — *one list, N profiles* — edits
+    /// the config files directly instead, because the profiles it touches
+    /// can be declared in different include files: a per-profile
+    /// round-trip would run one full validation and one rename each, so a
+    /// refusal half-way would leave the operator's intent partly applied
+    /// with nothing saying which half landed.
+    ///
+    /// The two cannot disagree about the file. Both end at
+    /// `[profiles.<id>].custom_lists` as a plain array of ids, and both
+    /// read the current value before writing it back. What they do not
+    /// share is atomicity across profiles — the axis each one is shaped
+    /// around.
+    ///
+    /// `skip_serializing_if` is not cosmetic here — a client that emits
+    /// `"custom_lists": null` on every save changes the bytes of every
+    /// `ProfileUpdate` on the wire, including the ones that carry no mount
+    /// at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_lists: Option<CustomListMountPatch>,
 }
 
-/// `profile_list_policy` §4 S4: delta over a profile's
-/// `lists: BTreeMap<Id, ListPolicy>` field — the per-`(profile, list)`
-/// direction override.
+/// Delta over a profile's `lists: BTreeMap<Id, ListPolicy>` field — the
+/// per-`(profile, list)` direction override.
 ///
 /// **Why this is NOT shaped like [`AdminRulesPatch`] / [`TagsPatch`].**
 /// Those are deltas over a *set*, and a set cannot express three states.
@@ -600,10 +598,9 @@ pub struct ProfileUpdatePatch {
 /// consent field here would have to rewrite the `[[blocklists]]` row,
 /// widening the declaration to **every other profile** that overrides that
 /// list: a side effect at a different radius than the edit. Consent stays
-/// what project rules §Neutrality says it is — a per-list property, declared
-/// once, applying at every refresh — and `warden blocklist set-trust
-/// <id> remote-unsigned --accept-unsigned-allow` remains the one place to
-/// declare it.
+/// a per-list property, declared once, applying at every refresh — and
+/// `warden blocklist set-trust <id> remote-unsigned
+/// --accept-unsigned-allow` remains the one place to declare it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ListPolicyPatch {
     /// `(list-id → policy)` pairs to write into `profiles.<id>.lists`.
@@ -616,9 +613,46 @@ pub struct ListPolicyPatch {
     pub clear: Vec<String>,
 }
 
-/// §4.26 Phase 1: delta over a profile's `admin_rules: Vec<Id>` field.
-/// Ids are kept as `String` on the wire — the daemon validates them
-/// through `Id::new` before applying.
+/// Delta over a profile's `custom_lists: Vec<Id>` field — which
+/// operator-authored rule files the profile mounts.
+///
+/// **Why this is a two-list SET delta and not a map like
+/// [`ListPolicyPatch`].** That one needs a map because a blocklist has a
+/// `base` every profile inherits, so "absent" already means *inherit*, and
+/// a third token is needed to say *off*. A custom list inherits nothing:
+/// `Profile.custom_lists` is presence-or-absence, and there is no
+/// direction to declare at the list level because each rule inside the
+/// pack carries its own. Two states, so a set delta says everything.
+///
+/// Semantics, frozen, deliberately mirroring [`ListPolicyPatch`] so a
+/// reader who knows one knows both:
+/// - `mount` of an id already mounted is idempotent, not an error;
+/// - `unmount` of an id not mounted is a no-op;
+/// - `mount` is applied **before** `unmount`, so an id in both ends
+///   unmounted;
+/// - an all-empty patch is a legal no-op that writes nothing at all, not
+///   even an empty `custom_lists = []` (see the handler).
+///
+/// Ids are `String` on the wire, validated through
+/// [`Id::new`](crate::config::schema::Id) before anything is applied — the
+/// same "String on the wire, validated on apply" rule the sibling patches
+/// follow. Whether the id *names a declared list* is not checked here: the
+/// config validator refuses a profile mounting an undeclared list, and it
+/// runs over the whole staged tree, which a per-field check cannot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CustomListMountPatch {
+    /// Ids to ADD to `profiles.<id>.custom_lists`.
+    #[serde(default)]
+    pub mount: Vec<String>,
+    /// Ids to REMOVE from it. The list stops filtering this profile and
+    /// keeps filtering every other profile that still mounts it.
+    #[serde(default)]
+    pub unmount: Vec<String>,
+}
+
+/// Delta over a profile's `admin_rules: Vec<Id>` field. Ids are kept as
+/// `String` on the wire — the daemon validates them through `Id::new`
+/// before applying.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AdminRulesPatch {
     #[serde(default)]
@@ -630,10 +664,10 @@ pub struct AdminRulesPatch {
 /// The wire shape of a tag delta an **old** client may still send.
 ///
 /// It was the add/remove delta over any entity's `tags: Vec<TagSlug>`
-/// field. `plp-s5a` removed that field everywhere, so nothing applies one
-/// any more: the type survives only so
-/// [`ProfileUpdatePatch::retired_tags`] can deserialise such a request and
-/// refuse it by name instead of letting serde discard it in silence.
+/// field. That field was removed everywhere, so nothing applies one any
+/// more: the type survives only so
+/// [`ProfileUpdatePatch::retired_tags`] can deserialise such a request
+/// and refuse it by name instead of letting serde discard it in silence.
 ///
 /// The one semantic still load-bearing is that an **all-empty** patch is
 /// not a tag write. Every edit modal resends its whole buffer, so a save
@@ -648,7 +682,7 @@ pub struct TagsPatch {
     pub remove: Vec<String>,
 }
 
-/// §4.26 Phase 1: patch the per-profile `[profile.X.ecs]` subtree.
+/// Patch the per-profile `[profile.X.ecs]` subtree.
 ///
 /// `clear = true` sets `Profile.ecs = None` (inherit upstream defaults)
 /// and the `mode` / `source_prefix_*` fields are ignored. Otherwise
@@ -666,7 +700,7 @@ pub struct EcsPatch {
     pub clear: bool,
 }
 
-/// Partial update for `[tracking]` config. Sprint 38 QLP5.
+/// Partial update for `[tracking]` config.
 ///
 /// Every field is an `Option<T>` — absent on the wire means "leave
 /// this key in the master alone"; present means "overwrite to the
@@ -676,15 +710,15 @@ pub struct EcsPatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TrackingPatch {
     /// Toggle query logging. Flipping this drives attach/detach of
-    /// the writer on reload (S38 QLP1).
+    /// the writer on reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_log_enabled: Option<bool>,
     /// Days of history to keep. Validator rejects `0` and values
-    /// above `365` per QLP3.
+    /// above `365`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
-    /// What to log per query. QLP3 enum — the type handles its own
-    /// wire shape (string for All/BlockedOnly, table for Sampled).
+    /// What to log per query — the type handles its own wire shape
+    /// (string for All/BlockedOnly, table for Sampled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_mode: Option<crate::config::settings::LogMode>,
 }
@@ -723,10 +757,10 @@ impl IpcCommand {
     /// Canonical audit-action name for this command, e.g.
     /// `"profile.delete"`. Emitted by the IPC auth path so a
     /// token-rejection audit line names the *verb* that was attempted,
-    /// not just its privilege tier (s-4.32-disc-8). Dot-form, no
-    /// version suffix — matches the existing audit `action` convention
-    /// (`rule.add`, `cname_block`, `local_records.add`). Pinned
-    /// byte-for-byte by `tests/frozen_strings_ipc_actions.rs`.
+    /// not just its privilege tier. Dot-form, no version suffix —
+    /// matches the existing audit `action` convention (`rule.add`,
+    /// `cname_block`, `local_records.add`). Pinned byte-for-byte by
+    /// `tests/frozen_strings_ipc_actions.rs`.
     pub fn action_name(&self) -> &'static str {
         match self {
             Self::Status => "status",
@@ -806,7 +840,7 @@ impl IpcCommand {
             // unit test, because tests build `IpcCommand` directly. A `..`
             // here silently resets any field it swallows to the value written
             // on the construct side, which is the `build_blocklist_value` /
-            // `upsert_id_keyed` class project rules documents. With the wildcard
+            // `upsert_id_keyed` class CLAUDE.md documents. With the wildcard
             // gone, the next field added to the variant fails the build here
             // instead of vanishing on the wire.
             Self::QueryLogs {
@@ -895,41 +929,60 @@ impl IpcCommand {
     }
 }
 
-/// Sprint C T3 of `lists_categories_v2` (§5.4 / §8.5): per-list-state
-/// counts the daemon reports back on every `warden status` call so the
-/// operator can spot blocklist health at a glance — `Active` is healthy,
-/// `Pending` is "never refreshed yet", `Failed` is "max consecutive
-/// retries hit", and `stale_over_7d` flags Active lists whose
-/// `last_success` predates a 7-day cutoff.
+/// Per-list-state counts the daemon reports back on every `warden
+/// status` call so the operator can spot blocklist health at a glance —
+/// `Active` is healthy, `Pending` is "never refreshed yet", `Failed` is
+/// "max consecutive retries hit", and `stale_over_7d` flags Active
+/// lists whose `last_success` predates a 7-day cutoff.
 ///
 /// Counts are computed at status-handler time (cheap walk over
-/// `list_state.lists`) — no per-tick caching, so a `warden reload` or
-/// a refresh tick that flips a status surfaces immediately on the next
+/// `list_state.lists`) — no per-tick caching, so a `warden reload` or a
+/// refresh tick that flips a status surfaces immediately on the next
 /// status query. Defaults to `Default::default()` (all zeros) when
-/// decoded from a pre-Sprint-C daemon, so the CLI keeps rendering an
-/// empty section without erroring.
+/// decoded from an older daemon, so the CLI keeps rendering an empty
+/// section without erroring.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListDiagnostics {
     /// Lists whose latest refresh succeeded — currently contributing
-    /// to the filter (D9 stale-cache fallback aside).
+    /// to the filter (the stale-cache fallback aside).
     pub active: u32,
     /// Lists that have never completed a successful refresh — fresh
     /// install or refresh task hasn't run yet.
     pub pending: u32,
     /// Lists that have hit `max_consecutive_failures` and flipped to
-    /// `Failed`. With a stale `cache_path` (D9) they continue to
-    /// protect; without it they contribute nothing.
+    /// `Failed`. With a stale `cache_path` they continue to protect;
+    /// without it they contribute nothing.
     pub failed: u32,
     /// Active lists whose `last_success` is older than 7 days — useful
     /// drift signal even when the state machine is happy.
     pub stale_over_7d: u32,
 }
 
-/// §4.45 (Hermes T1.8): appended to [`IpcResponse::Ok`]`::message` by
-/// device / tracking / profile mutation handlers when their best-effort
-/// reload signal was dropped because the capacity-1 reload channel was
-/// already full. The on-disk write succeeded; the next reload pass
-/// (coalescer drain or schedule tick, ≤ 60s) will pick the change up.
+/// One configured upstream resolver: its literal address and encryption
+/// kind. The daemon precomputes a `Vec<UpstreamServerInfo>` at boot
+/// (primary servers, then fallback) and reports it on
+/// [`IpcResponse::Status`] so the System card and `warden status` can
+/// render the real resolver addresses (e.g. `plain · 192.0.2.1, 192.0.2.2`)
+/// instead of the collapsed `mode (count)`.
+///
+/// `kind` is the stringified [`crate::config::settings::UpstreamMode`]
+/// (`"plain"` / `"doh"` / `"dot"`) — kept as a `String` on the wire so the
+/// protocol stays decoupled from the config enum. Addresses are the
+/// operator's own resolver IPs/URLs, not secrets — no redaction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamServerInfo {
+    /// Resolver address as configured: `"192.0.2.1:53"` (plain/dot) or a
+    /// URL like `"https://dns.example/dns-query"` (doh).
+    pub address: String,
+    /// Encryption kind: `"plain"`, `"doh"`, or `"dot"`.
+    pub kind: String,
+}
+
+/// Appended to [`IpcResponse::Ok`]`::message` by device / tracking /
+/// profile mutation handlers when their best-effort reload signal was
+/// dropped because the capacity-1 reload channel was already full. The
+/// on-disk write succeeded; the next reload pass (coalescer drain or
+/// schedule tick, ≤ 60s) will pick the change up.
 ///
 /// Exported as a `pub const` so operators, downstream tooling, and
 /// integration tests can string-match this exact substring to
@@ -939,12 +992,12 @@ pub const RELOAD_PENDING_SUFFIX: &str = "; reload already pending, takes effect 
 
 /// Response sent from daemon to CLI via Unix socket.
 ///
-/// Sprint F bumped the `TrackingStats` variant past clippy's
-/// `large_enum_variant` heuristic by adding two more `[u64; 10]` arrays
-/// for the 24h-rolling QTYPE distributions. The enum is allocated once
-/// per IPC reply (not stored in collections), so the stack-size concern
-/// the lint guards against doesn't apply here. Boxing the new arrays
-/// would force a heap alloc per reply for no real win.
+/// The `TrackingStats` variant trips clippy's `large_enum_variant`
+/// heuristic — it carries several `[u64; 10]` arrays for the
+/// 24h-rolling QTYPE distributions. The enum is allocated once per IPC
+/// reply (not stored in collections), so the stack-size concern the
+/// lint guards against doesn't apply here. Boxing the arrays would
+/// force a heap alloc per reply for no real win.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -967,43 +1020,43 @@ pub enum IpcResponse {
         list_count: usize,
         /// Daemon uptime in seconds.
         uptime_secs: u64,
-        /// T2.9 / H-20: silent-drop counters for the query-log write
-        /// path. `None` when no writer is attached (`query_log_enabled
-        /// = false`); `Some(_)` carries the three per-surface
-        /// `AtomicU64` snapshots. `#[serde(default)]` so pre-T2.9 CLI
-        /// readers decoding a new daemon's response just see `None`,
-        /// and a new CLI reading a pre-T2.9 daemon's response sees the
-        /// same.
+        /// Silent-drop counters for the query-log write path. `None`
+        /// when no writer is attached (`query_log_enabled = false`);
+        /// `Some(_)` carries the three per-surface `AtomicU64`
+        /// snapshots. `#[serde(default)]` so an older CLI reading a
+        /// new daemon's response just sees `None`, and a new CLI
+        /// reading an older daemon's response sees the same.
         #[serde(default)]
         query_log_drops: Option<crate::tracking::query_log::QueryLogDropSnapshot>,
-        /// §4.19 — daemon binary version (`CARGO_PKG_VERSION` at build
-        /// time). Empty string when decoded from a pre-§4.19 daemon.
+        /// Daemon binary version (`CARGO_PKG_VERSION` at build time).
+        /// Empty string when decoded from an older daemon that doesn't
+        /// send it.
         #[serde(default)]
         version: String,
-        /// §4.19 — configured weighted cache capacity
-        /// (`cache.max_entries`). 0 when decoded from a pre-§4.19
-        /// daemon — the dashboard's existing `cache_capacity`
-        /// extrapolation is the legacy fallback.
+        /// Configured weighted cache capacity (`cache.max_entries`). 0
+        /// when decoded from an older daemon — the dashboard's
+        /// existing `cache_capacity` extrapolation is the legacy
+        /// fallback.
         #[serde(default)]
         cache_cap: u64,
-        /// mem2608-s3 — flushed weighted cache occupancy
+        /// Flushed weighted cache occupancy
         /// (`DnsCache::flushed_usage().weighted_size`), directly
         /// comparable to `cache_cap` — both are moka weight units, not
         /// entry counts (`dns::cache::DnsCache::new`: positive entries
         /// cost 10 units, negative cost 1). `cache_entries` stays a raw
         /// count and is NOT comparable to `cache_cap`; this field is.
-        /// 0 when decoded from a pre-mem2608-s3 daemon, same fallback
-        /// convention as `cache_cap` above.
+        /// 0 when decoded from an older daemon that predates the
+        /// field, same fallback convention as `cache_cap` above.
         #[serde(default)]
         cache_weighted_size: u64,
-        /// §4.19 — number of blocklist sources that completed their
-        /// most recent refresh successfully (`LastOutcome::Ok`). 0 when
-        /// decoded from a pre-§4.19 daemon.
+        /// Number of blocklist sources that completed their most
+        /// recent refresh successfully (`LastOutcome::Ok`). 0 when
+        /// decoded from an older daemon.
         #[serde(default)]
         lists_active: u32,
-        /// §4.19 — total number of configured blocklist sources
-        /// (registry slot count). 0 when decoded from a pre-§4.19
-        /// daemon — `list_count` is the legacy fallback.
+        /// Total number of configured blocklist sources (registry slot
+        /// count). 0 when decoded from an older daemon — `list_count`
+        /// is the legacy fallback.
         #[serde(default)]
         lists_total: u32,
         /// Number of blocklist sources whose most recent refresh hit the
@@ -1050,35 +1103,57 @@ pub enum IpcResponse {
         /// answer" from "has not answered yet" and fall back cleanly.
         #[serde(default)]
         lists_cycle: Option<crate::lists::status::CycleMark>,
-        /// Sprint C T3 of `lists_categories_v2` (§5.4 / §8.5): per-
-        /// state counts (Active / Pending / Failed / Stale > 7d)
+        /// How long a standing corpus refusal has stood, and across how
+        /// many cycles. `None` when the corpus is current — or when
+        /// decoded from a daemon that predates the field, the same
+        /// unavoidable conflation `lists_corpus_refusal` already makes.
+        ///
+        /// Its own channel rather than two more members on
+        /// [`crate::lists::status::CorpusRefusal`], because that payload is
+        /// rebuilt from scratch by every refused cycle and has nowhere to
+        /// keep a fact that outlives one. Without it a caller cannot tell a
+        /// refusal that started this morning from one that has been
+        /// standing a fortnight, which is the difference between a blip
+        /// and a host that stopped tracking upstream.
+        #[serde(default)]
+        lists_corpus_freeze: Option<crate::lists::status::CorpusFreeze>,
+        /// Per-state counts (Active / Pending / Failed / Stale > 7d)
         /// derived from `data/list_state.toml`. Default-empty when
-        /// decoded from a pre-Sprint-C daemon — the CLI's "Lists:"
-        /// section in `warden status` still renders cleanly with the
-        /// zero counts, just no health signal.
+        /// decoded from an older daemon — the CLI's "Lists:" section
+        /// in `warden status` still renders cleanly with the zero
+        /// counts, just no health signal.
         #[serde(default)]
         lc2_list_diagnostics: ListDiagnostics,
-        /// §4.13 — sampled daemon resource footprint (RSS / VSZ / fd
-        /// count / user-mode CPU%) plus the configured `rss_warn_mb`
-        /// threshold so the TUI can colourise without re-reading
-        /// config. `None` when the sampler hasn't produced a first
-        /// sample yet OR when decoded from a pre-§4.13 daemon (the
-        /// `#[serde(default)]` collapses both cases to `None`).
+        /// Sampled daemon resource footprint (RSS / VSZ / fd count /
+        /// user-mode CPU%) plus the configured `rss_warn_mb` threshold
+        /// so the TUI can colourise without re-reading config. `None`
+        /// when the sampler hasn't produced a first sample yet OR when
+        /// decoded from an older daemon (the `#[serde(default)]`
+        /// collapses both cases to `None`).
         #[serde(default)]
         resource_budget: Option<crate::resource_budget::ResourceBudgetSnapshot>,
+        /// Per-server upstream list (primary servers then
+        /// fallback), each carrying its literal address + encryption
+        /// kind. Lets the TUI System card / `warden status` render the
+        /// real resolver addresses instead of the collapsed `mode
+        /// (count)`. Empty when decoded from a older daemon — readers
+        /// fall back to the legacy `upstream_mode (upstream_count)`
+        /// rendering (the two scalars stay on the wire for that purpose).
+        #[serde(default)]
+        upstream_servers: Vec<UpstreamServerInfo>,
     },
     /// Result of a domain query check.
     QueryResult {
         domain: String,
         blocked: bool,
-        /// §4.2 G1a — block attribution: what caused the block, as a
-        /// stable `kind:value` string (`list:<name>`, `rule:<pattern>`)
-        /// or a bare kind (`admin_block`, `cname_loop`,
+        /// Block attribution: what caused the block, as a stable
+        /// `kind:value` string (`list:<name>`, `rule:<pattern>`) or a
+        /// bare kind (`admin_block`, `cname_loop`,
         /// `cname_depth_exceeded`) built from
         /// [`crate::filter::cname::BlockSource::describe`]. `None` for
         /// allowed domains and for blocks with no profile context.
-        /// `#[serde(default)]` keeps pre-G1a CLI/TUI clients parsing a
-        /// new daemon's reply, and a new client reading a pre-G1a
+        /// `#[serde(default)]` keeps older CLI/TUI clients parsing a
+        /// new daemon's reply, and a new client reading an older
         /// daemon sees `None`; `skip_serializing_if` omits it on the
         /// allowed path so the wire stays minimal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1086,10 +1161,9 @@ pub enum IpcResponse {
     },
     /// Generic success response.
     Ok { message: String },
-    /// §4.7 Phase 2 T1: ack for `IpcCommand::ForgetList`. `was_cached`
-    /// echoes whether the source had any in-memory or on-disk state
-    /// before the call — `false` is the idempotent / no-op case, not
-    /// an error.
+    /// Ack for `IpcCommand::ForgetList`. `was_cached` echoes whether
+    /// the source had any in-memory or on-disk state before the call —
+    /// `false` is the idempotent / no-op case, not an error.
     ListForgotten { id: String, was_cached: bool },
     /// Domain count response.
     DomainCount { count: usize },
@@ -1100,7 +1174,7 @@ pub enum IpcResponse {
         blocked_pct: f64,
         cache_hit_rate: f64,
         /// Subset of cache hits served from negative entries (NXDOMAIN/NODATA).
-        /// Defaults to 0 when deserializing responses from pre-Sprint-25 daemons.
+        /// Defaults to 0 when deserializing responses from older daemons.
         #[serde(default)]
         cache_negative_hits: u64,
         uptime_secs: u64,
@@ -1110,7 +1184,7 @@ pub enum IpcResponse {
         daily: Vec<TimeBucketDto>,
         /// Rolling 24-hour averages computed from the hourly buckets.
         /// Match the same units as `cache_hit_rate` / `blocked_pct` (0–100).
-        /// Default to 0.0 for pre-Sprint-27 daemons.
+        /// Default to 0.0 for older daemons.
         #[serde(default)]
         cache_hit_rate_24h: f64,
         #[serde(default)]
@@ -1118,69 +1192,67 @@ pub enum IpcResponse {
         /// Delta between the most recent hour and the previous hour,
         /// expressed in the same percentage-point units. Positive means
         /// the most recent hour was higher than the one before. Default
-        /// to 0.0 for pre-Sprint-27 daemons.
+        /// to 0.0 for older daemons.
         #[serde(default)]
         cache_hit_rate_delta_1h: f64,
         #[serde(default)]
         blocked_pct_delta_1h: f64,
-        /// §4.6 per-`TypeBucket` query distribution in canonical bucket
-        /// order (`A, AAAA, TXT, PTR, NS, SOA, SRV, SVCB, HTTPS, Other`).
-        /// Defaults to all-zero on pre-§4.6 daemons so a freshly-upgraded
+        /// Per-`TypeBucket` query distribution in canonical bucket order
+        /// (`A, AAAA, TXT, PTR, NS, SOA, SRV, SVCB, HTTPS, Other`).
+        /// Defaults to all-zero on older daemons so a freshly-upgraded
         /// CLI/TUI can still parse responses from an older `warden`.
         #[serde(default = "zero_qtype_distribution")]
         qtype_distribution: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-        /// Sprint E per-`TypeBucket` BLOCKED query distribution. Same
-        /// canonical bucket order as `qtype_distribution`. Defaults to
-        /// all-zero on pre-Sprint-E daemons so the QTYPE chart card
-        /// shows only the Total bar (Blocked bar muted) until both ends
-        /// of the wire are upgraded.
+        /// Per-`TypeBucket` BLOCKED query distribution. Same canonical
+        /// bucket order as `qtype_distribution`. Defaults to all-zero on
+        /// older daemons so the QTYPE chart card shows only the Total
+        /// bar (Blocked bar muted) until both ends of the wire are
+        /// upgraded.
         #[serde(default = "zero_qtype_distribution")]
         qtype_blocked_distribution: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-        /// Sprint F — same shape as `qtype_distribution` but summed over
-        /// the trailing 24 hourly buckets (rolling window) rather than
+        /// Same shape as `qtype_distribution` but summed over the
+        /// trailing 24 hourly buckets (rolling window) rather than
         /// cumulative-since-daemon-start. Drives the Dashboard QTYPE
         /// chart card so the bars stay proportional to live activity
         /// even on long-running daemons. Defaults to all-zero on
-        /// pre-Sprint-F daemons; the chart falls back to its cold-start
+        /// older daemons; the chart falls back to its cold-start
         /// `collecting…` placeholder until both ends of the wire are
         /// upgraded.
         #[serde(default = "zero_qtype_distribution")]
         qtype_distribution_24h: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-        /// Sprint F — same shape as `qtype_blocked_distribution` but
-        /// summed over the trailing 24 hourly buckets. Drives the
-        /// Blocked bar of the QTYPE chart card. Defaults to all-zero
-        /// on pre-Sprint-F daemons.
+        /// Same shape as `qtype_blocked_distribution` but summed over
+        /// the trailing 24 hourly buckets. Drives the Blocked bar of
+        /// the QTYPE chart card. Defaults to all-zero on older
+        /// daemons.
         #[serde(default = "zero_qtype_distribution")]
         qtype_blocked_distribution_24h: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-        /// Sprint §4.4 P1 — domains currently in the prefetch hit-tracker
-        /// pool. Defaults to 0 on pre-§4.4 daemons. Phase 1/2 surfaces
-        /// this purely for visibility; the Phase 2/2 background refresh
-        /// worker will be the first DNS-side consumer.
+        /// Domains currently in the prefetch hit-tracker pool.
+        /// Defaults to 0 on older daemons. Surfaced purely for
+        /// visibility.
         #[serde(default)]
         prefetch_pool_size: u32,
         /// Cumulative prefetch promotions since the tracker was last
-        /// reset. Defaults to 0 on pre-§4.4 daemons.
+        /// reset. Defaults to 0 on older daemons.
         #[serde(default)]
         prefetch_promotions_total: u64,
         /// Cumulative prefetch demotions since the tracker was last
-        /// reset. Defaults to 0 on pre-§4.4 daemons.
+        /// reset. Defaults to 0 on older daemons.
         #[serde(default)]
         prefetch_demotions_total: u64,
-        /// Sprint B Dashboard v2 — top-5 Tier 1 blocklists by recent
-        /// block count. The label is resolved daemon-side via the
-        /// `bit → "scope/topic"` snapshot built at start.rs from
-        /// `source_bits.iter_urls()` × `Catalog::entries()`. Empty on
-        /// pre-Sprint-B daemons (`#[serde(default)]`), so a TUI
-        /// without this field renders the placeholder "collecting…"
-        /// instead of breaking.
+        /// Top-5 Tier 1 blocklists by recent block count. The label is
+        /// resolved daemon-side via the `bit → "scope/topic"` snapshot
+        /// built at start.rs from `source_bits.iter_urls()` ×
+        /// `Catalog::entries()`. Empty on older daemons
+        /// (`#[serde(default)]`), so a TUI without this field renders
+        /// the placeholder "collecting…" instead of breaking.
         #[serde(default)]
         top_blocked_lists: Vec<ListBlockCount>,
         /// 24h-rolling Top-N by per-domain block count. Each
         /// `DomainCount` carries both lifetime `count` and
         /// `count_24h`; the rank order is by `count_24h`. Empty on
-        /// pre-Sprint-N daemons (`#[serde(default)]`), so the TUI
-        /// renders the row-4 `Top Blocked Domains (24h)` card as
-        /// `collecting…` until the daemon ships.
+        /// older daemons (`#[serde(default)]`), so the TUI renders the
+        /// row-4 `Top Blocked Domains (24h)` card as `collecting…`
+        /// until the daemon ships.
         #[serde(default)]
         top_blocked_24h: Vec<DomainCount>,
         /// 24h-rolling Top-N by per-domain query count. Mirror of
@@ -1188,33 +1260,32 @@ pub enum IpcResponse {
         #[serde(default)]
         top_queried_24h: Vec<DomainCount>,
         /// 24h-rolling Top-5 lists by block count. Same labelling
-        /// discipline as `top_blocked_lists`. Empty on pre-Sprint-N
-        /// daemons.
+        /// discipline as `top_blocked_lists`. Empty on older daemons.
         #[serde(default)]
         top_blocked_lists_24h: Vec<ListBlockCount>,
     },
     /// Per-device stats table. The `clients` field name on the wire is
-    /// retained for T5 decode-compat with pre-T5 CLI readers.
+    /// retained for decode-compat with older CLI readers.
     #[serde(alias = "client_list")]
     DeviceList { clients: Vec<DeviceStatEntry> },
-    /// Mapped + unmapped device view (Sprint 22 `GetAllDevices`).
+    /// Mapped + unmapped device view (`GetAllDevices`).
     #[serde(alias = "client_view")]
     DeviceView(DeviceViewDto),
     /// Query log entries plus the state the TUI needs to render a
     /// useful empty-state message. `logging_enabled` mirrors
     /// `tracking.query_log_enabled`; `file_state` records the outcome of
     /// the on-disk read so the TUI can distinguish "disabled" from
-    /// "empty" from "file unreadable". Sprint 37 wire break: CLI and
-    /// daemon must be released in lockstep — no `PROTOCOL_VERSION`
-    /// constant exists yet in this codebase. T5 adds `#[serde(alias)]`
-    /// on renamed variants to give one release cycle of decode-compat
-    /// per §3 R1.
+    /// "empty" from "file unreadable". CLI and daemon must be released
+    /// in lockstep — no `PROTOCOL_VERSION` constant exists yet in this
+    /// codebase. `#[serde(alias)]` on renamed variants gives one
+    /// release cycle of decode-compat for a CLI/daemon pair crossing an
+    /// upgrade boundary.
     QueryLogs {
         entries: Vec<QueryLogDto>,
         logging_enabled: bool,
         file_state: QueryLogFileState,
-        /// `qlog-paging-cursor`: resume point for the next (older) page.
-        /// `None` means the walk reached the end of the retained window.
+        /// Resume point for the next (older) page. `None` means the
+        /// walk reached the end of the retained window.
         /// `#[serde(default)]` lets a pre-paging daemon's response decode.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<crate::tracking::query_log::QueryLogCursor>,
@@ -1224,8 +1295,7 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cursor_stale: bool,
     },
-    /// `logs-tab`: reply to [`IpcCommand::DaemonLogs`]. Newest entry
-    /// first.
+    /// Reply to [`IpcCommand::DaemonLogs`]. Newest entry first.
     DaemonLogs {
         entries: Vec<DaemonLogDto>,
         /// Events discarded because a producer found the ring's lock
@@ -1239,21 +1309,20 @@ pub enum IpcResponse {
         #[serde(default)]
         capacity: usize,
     },
-    /// Sprint 43 T1: per-blocklist runtime telemetry. List length is
-    /// `1` when `source_id = Some(_)` resolved a match; the full source
-    /// list otherwise. Order matches `[lists].sources` for the all-
-    /// sources case (so the operator's TUI table renders top-to-bottom
-    /// in the same order as their config file).
+    /// Per-blocklist runtime telemetry. List length is `1` when
+    /// `source_id = Some(_)` resolved a match; the full source list
+    /// otherwise. Order matches `[lists].sources` for the all-sources
+    /// case (so the operator's TUI table renders top-to-bottom in the
+    /// same order as their config file).
     BlocklistStatsList {
         stats: Vec<crate::lists::status::BlocklistStatusDto>,
     },
-    /// Sprint 44 follow-up (`s44-hits-ipc-verb`): per-record local-DNS
-    /// hit-count snapshot. Order matches the daemon-side DashMap
-    /// iteration which is unspecified — the TUI builds its own
-    /// `(scope, domain) → count` lookup at render time.
+    /// Per-record local-DNS hit-count snapshot. Order matches the
+    /// daemon-side DashMap iteration which is unspecified — the TUI
+    /// builds its own `(scope, domain) → count` lookup at render time.
     LocalRecordsHitsList { entries: Vec<LocalRecordsHitEntry> },
-    /// §4.11-4 (CS9): reply to [`IpcCommand::ClusterStatus`]. Carries the whole
-    /// view as one DTO (reused by the 4b dashboard dot + Cluster tab).
+    /// Reply to [`IpcCommand::ClusterStatus`]. Carries the whole view
+    /// as one DTO (reused by the dashboard status dot + Cluster tab).
     /// `cluster`-feature only.
     #[cfg(feature = "cluster")]
     ClusterStatus { status: ClusterStatusDto },
@@ -1261,10 +1330,11 @@ pub enum IpcResponse {
     Error { message: String },
 }
 
-/// §4.11-4 (CS9): this node's cluster view, as returned over IPC. On a
-/// secondary the `roster` is empty and the `last_*` / `converged` fields carry
-/// the poll telemetry; on a primary the secondary-only fields are inert and
-/// `roster` holds the self-row + every connected peer. `cluster`-feature only.
+/// This node's cluster view, as returned over IPC. On a secondary the
+/// `roster` is empty and the `last_*` / `converged` fields carry the
+/// poll telemetry; on a primary the secondary-only fields are inert and
+/// `roster` holds the self-row + every connected peer. `cluster`-feature
+/// only.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClusterStatusDto {
@@ -1293,8 +1363,8 @@ pub struct ClusterStatusDto {
     pub roster: Vec<RosterEntryDto>,
 }
 
-/// §4.11-4 (CS9): one roster row — a node's identity + workload + contribution
-/// weight, as computed by [`crate::cluster::observe`]. `cluster`-feature only.
+/// One roster row — a node's identity + workload + contribution weight,
+/// as computed by [`crate::cluster::observe`]. `cluster`-feature only.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RosterEntryDto {
@@ -1317,8 +1387,7 @@ pub struct RosterEntryDto {
     pub share_pct: f64,
 }
 
-/// Sprint 44 follow-up (`s44-hits-ipc-verb`): one row of the local-DNS
-/// hit-count snapshot.
+/// One row of the local-DNS hit-count snapshot.
 ///
 /// `scope` is the operator-facing tag — `"global"` for the
 /// `[[local_dns.records]]` table, or `"profile:<id>"` for a single
@@ -1333,9 +1402,9 @@ pub struct LocalRecordsHitEntry {
     pub count: u64,
 }
 
-/// `#[serde(default)]` helper for the §4.6 `qtype_distribution` field —
-/// returns the canonical 10-bucket all-zero array. Standalone fn because
-/// serde cannot derive `Default` for arbitrary array lengths.
+/// `#[serde(default)]` helper for the `qtype_distribution` field —
+/// returns the canonical 10-bucket all-zero array. Standalone fn
+/// because serde cannot derive `Default` for arbitrary array lengths.
 fn zero_qtype_distribution() -> [u64; crate::tracking::TYPE_BUCKET_COUNT] {
     [0; crate::tracking::TYPE_BUCKET_COUNT]
 }
@@ -1344,18 +1413,15 @@ fn zero_qtype_distribution() -> [u64; crate::tracking::TYPE_BUCKET_COUNT] {
 /// subscribers. Distinct from [`IpcResponse`] — notifications are
 /// fire-and-forget; the publisher does not await an ack.
 ///
-/// Sprint 43 T2 introduces the enum + the publishing channel
-/// ([`tokio::sync::broadcast`]). The subscriber transport (a long-poll
-/// IPC verb that streams notifications back over the same socket
-/// protocol) is deferred to T3 once a real consumer drives the
-/// concrete shape — the existing request/response socket model would
-/// otherwise constrain the design prematurely. Until then, TUI and
-/// CLI consumers fall back to the 30 s lazy poll on
-/// [`IpcCommand::BlocklistStats`] (acceptance §6).
+/// The publishing channel is a [`tokio::sync::broadcast`]. There is no
+/// subscriber transport yet — a long-poll IPC verb that streams
+/// notifications back over the same socket protocol — so TUI and CLI
+/// consumers fall back to a lazy poll on [`IpcCommand::BlocklistStats`]
+/// instead of subscribing to this channel directly.
 ///
-/// New variants must remain serde-stable across releases — once a
-/// subscriber endpoint exists in T3+, every payload shape becomes a
-/// wire contract.
+/// New variants must remain serde-stable across releases: once a
+/// subscriber endpoint exists, every payload shape becomes a wire
+/// contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcNotification {
@@ -1383,19 +1449,18 @@ pub struct DomainCount {
     pub count: u64,
     /// 24h-rolling block (or query) count for this domain. Drives the
     /// Dashboard row-4 cards retitled to `(24h)`. Defaults to 0 on
-    /// pre-Sprint-N daemons so the TUI sees an empty list and renders
-    /// the `collecting…` placeholder instead of misleading zeros.
+    /// older daemons so the TUI sees an empty list and renders the
+    /// `collecting…` placeholder instead of misleading zeros.
     #[serde(default)]
     pub count_24h: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
 }
 
-/// Sprint B Dashboard v2 — one entry of `top_blocked_lists`. The label
-/// is resolved daemon-side via the `bit → "scope/topic"` snapshot built
-/// at start.rs from `source_bits.iter_urls()` × `Catalog::entries()`.
-/// The TUI receives ready-to-render strings; bit numbers stay
-/// daemon-internal (D8 in `_docs/features/dashboard_v2.md`).
+/// One entry of `top_blocked_lists`. The label is resolved daemon-side
+/// via the `bit → "scope/topic"` snapshot built at start.rs from
+/// `source_bits.iter_urls()` × `Catalog::entries()`. The TUI receives
+/// ready-to-render strings; bit numbers stay daemon-internal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListBlockCount {
     pub label: String,
@@ -1430,10 +1495,10 @@ pub struct DeviceStatEntry {
 
 /// Full device view response body — mapped devices come from v1
 /// `[[devices]]` joined with live stats, unmapped devices come from
-/// observed IPs that never appeared in config. SN3 removed the legacy
-/// `block_unmapped` flag; the TUI now reads the effective "unmapped →
-/// REFUSED" behaviour by checking whether `server.default_profile` is
-/// unset.
+/// observed IPs that never appeared in config. The legacy
+/// `block_unmapped` flag was removed; the TUI now reads the effective
+/// "unmapped → REFUSED" behaviour by checking whether
+/// `server.default_profile` is unset.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceViewDto {
     pub mapped: Vec<MappedDeviceDto>,
@@ -1453,7 +1518,7 @@ pub struct MappedDeviceDto {
     /// randomisation can rotate the active MAC over weeks. Uppercase
     /// normalized. Empty when the device has only a primary MAC or
     /// no MAC at all. `#[serde(default)]` keeps the wire format
-    /// backward-compatible with pre-Sprint-27 daemons.
+    /// backward-compatible with older daemons.
     #[serde(default)]
     pub mac_aliases: Vec<String>,
     pub profile: String,
@@ -1464,15 +1529,15 @@ pub struct MappedDeviceDto {
     pub queries: u64,
     /// Queries since the start of the current calendar day (UTC). Used
     /// by the Dashboard's Top Devices card. Defaults to 0 so older
-    /// daemons (pre-2026-04-29) deserialize cleanly into newer DTOs.
+    /// daemons deserialize cleanly into newer DTOs.
     #[serde(default)]
     pub queries_today: u64,
     pub blocked: u64,
     /// Sum of the last 24h of BLOCKED queries for this device. Drives
     /// the Dashboard Top Devices (24h) card. `#[serde(default)]` keeps
-    /// pre-Sprint-N daemons forward-compatible — older payloads default
-    /// to 0, which the TUI treats as "no 24h data" and falls back to
-    /// the `collecting…` placeholder on the card.
+    /// older daemons forward-compatible — older payloads default to 0,
+    /// which the TUI treats as "no 24h data" and falls back to the
+    /// `collecting…` placeholder on the card.
     #[serde(default)]
     pub blocked_24h: u64,
     pub cache_hits: u64,
@@ -1494,16 +1559,16 @@ pub struct MappedDeviceDto {
     /// strings), in the file's order — `DeviceIndex.groups` is
     /// `dev.groups.clone()` and nothing sorts it. The TUI Edit form
     /// seeds its multi-select from this list and sends it back whole.
-    /// `#[serde(default)]` for back-compat with pre-S44 daemons.
+    /// `#[serde(default)]` for back-compat with older daemons.
     #[serde(default)]
     pub groups: Vec<String>,
     /// Free-form operator memo (v1 `Device.notes`). The daemon never
     /// reads this — pure metadata. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub notes: Option<String>,
-    /// Bare DNS name this device answers to, if any (2026-08-10 device-
-    /// network-name design spec). `#[serde(default)]` keeps the wire
-    /// format compatible with pre-this-feature daemons.
+    /// Bare DNS name this device answers to, if any. `#[serde(default)]`
+    /// keeps the wire format compatible with daemons that predate this
+    /// field.
     #[serde(default)]
     pub network_name: Option<String>,
     #[serde(default)]
@@ -1512,25 +1577,24 @@ pub struct MappedDeviceDto {
     /// IPC key for Update / Remove instead of the operator-typed
     /// `name` (which is `display_name`) — display names can be edited
     /// freely and may diverge from `slug(name)`, so identifying by
-    /// derived slug is wrong. `#[serde(default)]` keeps pre-S44
-    /// daemons forward-compatible (older payloads omit the field; the
-    /// TUI then falls back to the slug-derived id, matching the
-    /// previous behaviour).
+    /// derived slug is wrong. `#[serde(default)]` keeps older daemons
+    /// forward-compatible (older payloads omit the field; the TUI then
+    /// falls back to the slug-derived id, matching the previous
+    /// behaviour).
     #[serde(default)]
     pub id: Option<String>,
     /// Per-hour query counts for the last 24 hours, oldest-first
     /// (`hourly_queries[0]` = "23 hours ago", `[23]` = current hour).
     /// Drives the Devices tab side-card sparkline. Empty when the
-    /// daemon doesn't expose the ring (pre-S44) or when no queries
-    /// have been recorded for this device. `#[serde(default)]` keeps
-    /// older daemons forward-compatible.
+    /// daemon doesn't expose the ring or when no queries have been
+    /// recorded for this device. `#[serde(default)]` keeps older
+    /// daemons forward-compatible.
     #[serde(default)]
     pub hourly_queries: Vec<u64>,
-    /// Sprint C T4 of `lists_categories_v2` (D14, §8.1): D14 opt-out
-    /// flag. When `true`, the resolver short-circuits filtering for
-    /// this device but keeps monitoring active. Surfaced as the
+    /// Opt-out flag. When `true`, the resolver short-circuits filtering
+    /// for this device but keeps monitoring active. Surfaced as the
     /// `[⚠ UNFILTERED]` badge on the Devices tab card. Defaults to
-    /// `false` for back-compat with pre-Sprint-C daemons.
+    /// `false` for back-compat with older daemons.
     #[serde(default)]
     pub unfiltered: bool,
 }
@@ -1568,7 +1632,7 @@ pub struct UnmappedDeviceDto {
 
 /// Outcome of the daemon's attempt to read the query-log file. Paired
 /// with `logging_enabled` on `IpcResponse::QueryLogs`, it drives the
-/// TUI's four-way empty-state picker (see Sprint 37 §3 D4).
+/// TUI's four-way empty-state picker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryLogFileState {
     /// File exists and was read successfully.
@@ -1698,10 +1762,10 @@ pub struct QueryLogDto {
     pub query_type: String,
     pub result: String,
     pub response_time_us: u64,
-    /// §4.5 Sprint 2/2 — mirrors `QueryLogEntry::cname_chain_via`. `Some(hop)`
-    /// when the row is a CNAME chain block; the TUI renders the row as
-    /// `domain → hop` plus a `[CNAME]` badge. `None` otherwise. Back-compat
-    /// via `#[serde(default)]` so older daemons / older tail JSONLs read
+    /// Mirrors `QueryLogEntry::cname_chain_via`. `Some(hop)` when the
+    /// row is a CNAME chain block; the TUI renders the row as `domain →
+    /// hop` plus a `[CNAME]` badge. `None` otherwise. Back-compat via
+    /// `#[serde(default)]` so older daemons / older tail JSONLs read
     /// back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cname_chain_via: Option<String>,
@@ -1725,1225 +1789,4 @@ pub struct DaemonLogDto {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_status_roundtrip() {
-        let cmd = IpcCommand::Status;
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"type":"status"}"#);
-        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
-    fn command_query_roundtrip() {
-        let cmd = IpcCommand::Query {
-            domain: "google.com".into(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"domain\":\"google.com\""));
-        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
-    fn command_cache_flush_all_roundtrip() {
-        let cmd = IpcCommand::CacheFlush {
-            domain: None,
-            token: None,
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
-    fn command_cache_flush_domain_roundtrip() {
-        let cmd = IpcCommand::CacheFlush {
-            domain: Some("example.com".into()),
-            token: None,
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-    }
-
-    #[test]
-    fn response_status_roundtrip() {
-        let resp = IpcResponse::Status {
-            pid: 1234,
-            listen: "127.0.0.1:15353".into(),
-            upstream_mode: "plain".into(),
-            upstream_count: 2,
-            domain_count: 500_000,
-            cache_entries: 1234,
-            list_count: 3,
-            uptime_secs: 3600,
-            query_log_drops: None,
-            version: String::new(),
-            cache_cap: 0,
-            lists_active: 0,
-            lists_total: 0,
-            lists_truncated: 0,
-            lists_corpus_refusal: None,
-            lists_cycle: None,
-            lc2_list_diagnostics: ListDiagnostics::default(),
-            resource_budget: None,
-            cache_weighted_size: 0,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// T2.9 / H-20: a pre-T2.9 daemon's `Status` payload (without
-    /// `query_log_drops`) must still decode into the new struct shape
-    /// thanks to `#[serde(default)]`. Pins the wire-back-compat
-    /// guarantee for the freeze period before CLI/daemon are released
-    /// in lockstep.
-    #[test]
-    fn response_status_legacy_without_drop_counters_deserializes() {
-        let legacy = r#"{"type":"status","pid":1,"listen":"127.0.0.1:53","upstream_mode":"plain","upstream_count":1,"domain_count":0,"cache_entries":0,"list_count":0,"uptime_secs":0}"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy).unwrap();
-        match parsed {
-            IpcResponse::Status {
-                query_log_drops, ..
-            } => assert!(query_log_drops.is_none()),
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    /// T2.9 / H-20: a fresh-daemon `Status` payload carries the new
-    /// `query_log_drops: Some(_)` field intact through round-trip.
-    #[test]
-    fn response_status_with_drop_counters_roundtrip() {
-        use crate::tracking::query_log::QueryLogDropSnapshot;
-        let resp = IpcResponse::Status {
-            pid: 1234,
-            listen: "127.0.0.1:15353".into(),
-            upstream_mode: "plain".into(),
-            upstream_count: 2,
-            domain_count: 500_000,
-            cache_entries: 1234,
-            list_count: 3,
-            uptime_secs: 3600,
-            query_log_drops: Some(QueryLogDropSnapshot {
-                channel_full: 7,
-                flush_open_errors: 1,
-                flush_write_errors: 42,
-            }),
-            version: String::new(),
-            cache_cap: 0,
-            lists_active: 0,
-            lists_total: 0,
-            lists_truncated: 0,
-            lists_corpus_refusal: None,
-            lists_cycle: None,
-            lc2_list_diagnostics: ListDiagnostics::default(),
-            resource_budget: None,
-            cache_weighted_size: 0,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"channel_full\":7"));
-        assert!(json.contains("\"flush_write_errors\":42"));
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// §4.19 — a pre-§4.19 daemon's Status payload (without `version`,
-    /// `cache_cap`, `lists_active`, `lists_total`) must still decode
-    /// thanks to `#[serde(default)]`. Pins back-compat for the freeze
-    /// period before CLI/daemon are released in lockstep.
-    #[test]
-    fn response_status_legacy_without_s419_fields_deserializes() {
-        let legacy = r#"{"type":"status","pid":1,"listen":"127.0.0.1:53","upstream_mode":"plain","upstream_count":1,"domain_count":0,"cache_entries":0,"list_count":0,"uptime_secs":0}"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy).unwrap();
-        match parsed {
-            IpcResponse::Status {
-                version,
-                cache_cap,
-                lists_active,
-                lists_total,
-                lists_truncated,
-                ..
-            } => {
-                assert_eq!(version, "");
-                assert_eq!(cache_cap, 0);
-                assert_eq!(lists_active, 0);
-                assert_eq!(lists_total, 0);
-                // The truncation counter joins the same back-compat
-                // contract: a CLI built with it must not fail to read a
-                // daemon built without it.
-                assert_eq!(lists_truncated, 0);
-            }
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    /// §4.19 — a fresh-daemon Status payload carries the new fields
-    /// intact through round-trip with realistic values.
-    #[test]
-    fn response_status_s419_fields_roundtrip() {
-        let resp = IpcResponse::Status {
-            pid: 1234,
-            listen: "127.0.0.1:15353".into(),
-            upstream_mode: "plain".into(),
-            upstream_count: 2,
-            domain_count: 500_000,
-            cache_entries: 1234,
-            list_count: 8,
-            uptime_secs: 3600,
-            query_log_drops: None,
-            version: "0.7.4".into(),
-            cache_cap: 10_000,
-            lists_active: 7,
-            lists_total: 8,
-            lists_truncated: 0,
-            lists_corpus_refusal: None,
-            lists_cycle: None,
-            lc2_list_diagnostics: ListDiagnostics::default(),
-            resource_budget: None,
-            cache_weighted_size: 4_120,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"version\":\"0.7.4\""));
-        assert!(json.contains("\"cache_cap\":10000"));
-        assert!(json.contains("\"lists_active\":7"));
-        assert!(json.contains("\"lists_total\":8"));
-        assert!(json.contains("\"cache_weighted_size\":4120"));
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// mem2608-s3 — a pre-mem2608-s3 daemon's Status payload (without
-    /// `cache_weighted_size`) must still decode thanks to
-    /// `#[serde(default)]`. Same back-compat contract as `cache_cap`
-    /// itself: a CLI built with this field must not fail to read a
-    /// daemon built without it.
-    #[test]
-    fn response_status_legacy_without_cache_weighted_size_deserializes() {
-        let legacy = r#"{"type":"status","pid":1,"listen":"127.0.0.1:53","upstream_mode":"plain","upstream_count":1,"domain_count":0,"cache_entries":0,"list_count":0,"uptime_secs":0}"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy).unwrap();
-        match parsed {
-            IpcResponse::Status {
-                cache_weighted_size,
-                ..
-            } => assert_eq!(cache_weighted_size, 0),
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    /// §4.13 — pre-§4.13 daemon payload (no `resource_budget`) decodes
-    /// cleanly thanks to `#[serde(default)]`; the field is `None`.
-    #[test]
-    fn response_status_legacy_without_resource_budget_deserializes() {
-        let legacy = r#"{"type":"status","pid":1,"listen":"127.0.0.1:53","upstream_mode":"plain","upstream_count":1,"domain_count":0,"cache_entries":0,"list_count":0,"uptime_secs":0}"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy).unwrap();
-        match parsed {
-            IpcResponse::Status {
-                resource_budget, ..
-            } => assert!(resource_budget.is_none()),
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    /// §4.13 — a fresh daemon Status payload carries a non-empty
-    /// resource_budget through round-trip.
-    #[test]
-    fn response_status_with_resource_budget_roundtrip() {
-        use crate::resource_budget::ResourceBudgetSnapshot;
-        let resp = IpcResponse::Status {
-            pid: 1234,
-            listen: "127.0.0.1:15353".into(),
-            upstream_mode: "plain".into(),
-            upstream_count: 1,
-            domain_count: 1_000,
-            cache_entries: 10,
-            list_count: 1,
-            uptime_secs: 60,
-            query_log_drops: None,
-            version: "0.13.0".into(),
-            cache_cap: 5_000,
-            lists_active: 1,
-            lists_total: 1,
-            lists_truncated: 0,
-            lists_corpus_refusal: None,
-            lists_cycle: None,
-            lc2_list_diagnostics: ListDiagnostics::default(),
-            cache_weighted_size: 300,
-            resource_budget: Some(ResourceBudgetSnapshot {
-                rss_mb: 42,
-                vsz_mb: 280,
-                fd_count: 18,
-                cpu_user_pct: 3,
-                rss_warn_mb: 256,
-            }),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"rss_mb\":42"));
-        assert!(json.contains("\"rss_warn_mb\":256"));
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn response_query_result_roundtrip() {
-        let resp = IpcResponse::QueryResult {
-            domain: "ads.example.com".into(),
-            blocked: true,
-            blocked_by: Some("list:ads".into()),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn response_ok_roundtrip() {
-        let resp = IpcResponse::Ok {
-            message: "cache flushed".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn response_error_roundtrip() {
-        let resp = IpcResponse::Error {
-            message: "unknown command".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// §4.7 Phase 2 T1: `IpcCommand::ForgetList` and the matching
-    /// `IpcResponse::ListForgotten` round-trip cleanly across serde
-    /// AND `ForgetList` is classified `Mutating` so the auth gate
-    /// requires a token. Also covers `with_token` adding the token
-    /// after construction (the CLI client's flow).
-    #[test]
-    fn forget_list_command_and_response_serde_round_trip() {
-        let cmd = IpcCommand::ForgetList {
-            id: "privacy/ads".into(),
-            token: Some("plaintext-token".into()),
-        };
-        assert_eq!(cmd.tier(), CommandTier::Mutating);
-        assert_eq!(cmd.token(), Some("plaintext-token"));
-
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, cmd);
-
-        let cmd_no_token = IpcCommand::ForgetList {
-            id: "privacy/ads".into(),
-            token: None,
-        };
-        let with_t = cmd_no_token.with_token(Some("tok".into()));
-        assert_eq!(with_t.token(), Some("tok"));
-
-        let resp = IpcResponse::ListForgotten {
-            id: "privacy/ads".into(),
-            was_cached: true,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn response_domain_count_roundtrip() {
-        let resp = IpcResponse::DomainCount { count: 123456 };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn all_command_variants_deserialize() {
-        let cases = [
-            r#"{"type":"status"}"#,
-            r#"{"type":"query","domain":"test.com"}"#,
-            r#"{"type":"cache_flush","domain":null}"#,
-            r#"{"type":"reload"}"#,
-            r#"{"type":"shutdown"}"#,
-            r#"{"type":"domain_count"}"#,
-            r#"{"type":"tracking_stats"}"#,
-            r#"{"type":"client_stats"}"#,
-            r#"{"type":"query_logs","limit":20}"#,
-            r#"{"type":"query_logs","limit":10,"client":"laptop","blocked_only":true}"#,
-            // Sprint 41: since_secs added with `#[serde(default)]` so
-            // older callers (no field at all) still parse; newer callers
-            // can set it to apply a rolling time cutoff.
-            r#"{"type":"query_logs","limit":10,"since_secs":3600}"#,
-        ];
-        for json in cases {
-            let _: IpcCommand = serde_json::from_str(json).unwrap();
-        }
-    }
-
-    #[test]
-    fn tracking_stats_response_roundtrip() {
-        let resp = IpcResponse::TrackingStats {
-            queries_total: 1000,
-            blocked_total: 200,
-            blocked_pct: 20.0,
-            cache_hit_rate: 85.5,
-            cache_negative_hits: 42,
-            uptime_secs: 3600,
-            top_blocked: vec![DomainCount {
-                domain: "ads.com".into(),
-                count: 50,
-                count_24h: 0,
-                scope: Some("privacy".into()),
-            }],
-            top_queried: vec![DomainCount {
-                domain: "google.com".into(),
-                count: 200,
-                count_24h: 0,
-                scope: None,
-            }],
-            hourly: vec![TimeBucketDto {
-                timestamp: 1000,
-                queries: 100,
-                blocked: 20,
-                cache_hits: 80,
-            }],
-            daily: vec![],
-            cache_hit_rate_24h: 80.0,
-            blocked_pct_24h: 20.0,
-            cache_hit_rate_delta_1h: 2.5,
-            blocked_pct_delta_1h: -1.0,
-            qtype_distribution: [700, 200, 5, 1, 0, 0, 0, 0, 80, 14],
-            qtype_blocked_distribution: [50, 30, 1, 0, 0, 0, 0, 0, 4, 2],
-            qtype_distribution_24h: [80, 22, 0, 0, 0, 0, 0, 0, 8, 1],
-            qtype_blocked_distribution_24h: [5, 3, 0, 0, 0, 0, 0, 0, 0, 0],
-            prefetch_pool_size: 7,
-            prefetch_promotions_total: 12,
-            prefetch_demotions_total: 5,
-            top_blocked_lists: Vec::new(),
-            top_blocked_24h: Vec::new(),
-            top_queried_24h: Vec::new(),
-            top_blocked_lists_24h: Vec::new(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// Sprint §4.4 P1 — pre-§4.4 daemon emits TrackingStats without the
-    /// three `prefetch_*` fields. The post-upgrade CLI/TUI must still
-    /// deserialize that payload, defaulting all three to zero.
-    #[test]
-    fn tracking_stats_response_legacy_missing_prefetch_fields() {
-        let legacy_json = serde_json::json!({
-            "type": "tracking_stats",
-            "queries_total": 500,
-            "blocked_total": 50,
-            "blocked_pct": 10.0,
-            "cache_hit_rate": 60.0,
-            "cache_negative_hits": 3,
-            "uptime_secs": 120,
-            "top_blocked": [],
-            "top_queried": [],
-            "hourly": [],
-            "daily": [],
-            "qtype_distribution": [400, 90, 0, 0, 0, 0, 0, 0, 0, 10]
-        });
-        let parsed: IpcResponse = serde_json::from_value(legacy_json).unwrap();
-        match parsed {
-            IpcResponse::TrackingStats {
-                prefetch_pool_size,
-                prefetch_promotions_total,
-                prefetch_demotions_total,
-                qtype_blocked_distribution,
-                ..
-            } => {
-                assert_eq!(prefetch_pool_size, 0);
-                assert_eq!(prefetch_promotions_total, 0);
-                assert_eq!(prefetch_demotions_total, 0);
-                // Sprint E — pre-Sprint-E daemons emit no
-                // `qtype_blocked_distribution`; serde default fills in
-                // the canonical 10-bucket all-zero array.
-                assert_eq!(qtype_blocked_distribution, [0u64; 10]);
-            }
-            other => panic!("expected TrackingStats, got {other:?}"),
-        }
-    }
-
-    /// Legacy migration: a pre-Sprint-25 daemon emits TrackingStats
-    /// without the new `cache_negative_hits` field. The TUI (post-upgrade)
-    /// must still deserialize that payload, defaulting the counter to 0.
-    #[test]
-    fn tracking_stats_response_legacy_missing_negative_hits() {
-        let legacy_json = serde_json::json!({
-            "type": "tracking_stats",
-            "queries_total": 500,
-            "blocked_total": 50,
-            "blocked_pct": 10.0,
-            "cache_hit_rate": 60.0,
-            "uptime_secs": 120,
-            "top_blocked": [],
-            "top_queried": [],
-            "hourly": [],
-            "daily": []
-        });
-        let parsed: IpcResponse = serde_json::from_value(legacy_json).unwrap();
-        match parsed {
-            IpcResponse::TrackingStats {
-                cache_negative_hits,
-                ..
-            } => assert_eq!(cache_negative_hits, 0),
-            other => panic!("expected TrackingStats, got {other:?}"),
-        }
-    }
-
-    /// Legacy migration (Sprint 27): a pre-scope daemon emits DomainCount
-    /// entries without the `scope` field. The TUI must default them to
-    /// `None` so the wire format is forward-compatible.
-    #[test]
-    fn domain_count_accepts_missing_scope_as_none() {
-        let legacy = serde_json::json!({
-            "domain": "ads.example",
-            "count": 100,
-        });
-        let parsed: DomainCount = serde_json::from_value(legacy).unwrap();
-        assert_eq!(parsed.scope, None);
-        assert_eq!(parsed.domain, "ads.example");
-        assert_eq!(parsed.count, 100);
-    }
-
-    /// And the new field round-trips when populated.
-    #[test]
-    fn domain_count_roundtrips_populated_scope() {
-        let dc = DomainCount {
-            domain: "tracker.example".into(),
-            count: 42,
-            count_24h: 0,
-            scope: Some("privacy".into()),
-        };
-        let json = serde_json::to_string(&dc).unwrap();
-        let parsed: DomainCount = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, dc);
-    }
-
-    #[test]
-    fn device_list_response_roundtrip() {
-        let resp = IpcResponse::DeviceList {
-            clients: vec![DeviceStatEntry {
-                name: "laptop".into(),
-                ip: "192.168.1.42".into(),
-                queries: 500,
-                blocked: 50,
-                blocked_pct: 10.0,
-                cache_hits: 400,
-                profile: "default".into(),
-                last_seen: 1704110000,
-            }],
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    /// T5 decode-compat: a pre-T5 daemon (or CLI playback) sending the
-    /// legacy `client_list` variant tag must still decode into the T5
-    /// `DeviceList` variant. Pairs with the serde aliases on the
-    /// `IpcResponse` enum and satisfies §3 R1's IPC decode-compat
-    /// requirement for one release cycle.
-    #[test]
-    fn legacy_client_list_variant_decodes_into_device_list() {
-        let legacy_json = r#"{"type":"client_list","clients":[{"name":"laptop","ip":"192.168.1.42","queries":1,"blocked":0,"blocked_pct":0.0,"cache_hits":0,"profile":"default","last_seen":1700000000}]}"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy_json).unwrap();
-        match parsed {
-            IpcResponse::DeviceList { clients } => {
-                assert_eq!(clients.len(), 1);
-                assert_eq!(clients[0].name, "laptop");
-            }
-            other => panic!("expected DeviceList, got {other:?}"),
-        }
-    }
-
-    /// T5 decode-compat (command side): legacy `"client_stats"` tag must
-    /// deserialize into the renamed `DeviceStats` variant.
-    #[test]
-    fn legacy_client_stats_command_decodes_into_device_stats() {
-        let legacy_json = r#"{"type":"client_stats"}"#;
-        let parsed: IpcCommand = serde_json::from_str(legacy_json).unwrap();
-        assert!(matches!(parsed, IpcCommand::DeviceStats { token: None }));
-    }
-
-    /// T5 decode-compat: legacy `"get_all_clients"` tag must deserialize
-    /// into the renamed `GetAllDevices` variant.
-    #[test]
-    fn legacy_get_all_clients_command_decodes_into_get_all_devices() {
-        let legacy_json = r#"{"type":"get_all_clients"}"#;
-        let parsed: IpcCommand = serde_json::from_str(legacy_json).unwrap();
-        assert!(matches!(parsed, IpcCommand::GetAllDevices));
-    }
-
-    // --- P0-3: command tier classification ---
-
-    #[test]
-    fn readonly_commands_have_readonly_tier() {
-        assert_eq!(IpcCommand::Status.tier(), CommandTier::ReadOnly);
-        assert_eq!(IpcCommand::DomainCount.tier(), CommandTier::ReadOnly);
-        assert_eq!(
-            IpcCommand::Query {
-                domain: "google.com".into()
-            }
-            .tier(),
-            CommandTier::ReadOnly
-        );
-    }
-
-    #[test]
-    fn mutating_commands_have_mutating_tier() {
-        assert_eq!(
-            IpcCommand::CacheFlush {
-                domain: None,
-                token: None
-            }
-            .tier(),
-            CommandTier::Mutating
-        );
-        assert_eq!(
-            IpcCommand::Reload { token: None }.tier(),
-            CommandTier::Mutating
-        );
-    }
-
-    #[test]
-    fn admin_commands_have_admin_tier() {
-        assert_eq!(
-            IpcCommand::Shutdown { token: None }.tier(),
-            CommandTier::Admin
-        );
-        assert_eq!(
-            IpcCommand::TrackingStats { token: None }.tier(),
-            CommandTier::Admin
-        );
-        assert_eq!(
-            IpcCommand::DeviceStats { token: None }.tier(),
-            CommandTier::Admin
-        );
-        assert_eq!(
-            IpcCommand::QueryLogs {
-                limit: 10,
-                client: None,
-                blocked_only: false,
-                domain: None,
-                since_secs: None,
-                cursor: None,
-                advanced: None,
-                token: None
-            }
-            .tier(),
-            CommandTier::Admin
-        );
-    }
-
-    #[test]
-    fn with_token_attaches_to_gated_commands() {
-        let tok = Some("ps_abc123".to_string());
-        let attached = IpcCommand::Reload { token: None }.with_token(tok.clone());
-        assert_eq!(attached.token(), Some("ps_abc123"));
-
-        let shutdown = IpcCommand::Shutdown { token: None }.with_token(tok.clone());
-        assert_eq!(shutdown.token(), Some("ps_abc123"));
-
-        let logs = IpcCommand::QueryLogs {
-            limit: 10,
-            client: None,
-            blocked_only: false,
-            domain: None,
-            since_secs: None,
-            cursor: None,
-            advanced: None,
-            token: None,
-        }
-        .with_token(tok.clone());
-        assert_eq!(logs.token(), Some("ps_abc123"));
-    }
-
-    #[test]
-    fn with_token_is_noop_on_readonly() {
-        let tok = Some("ps_abc123".to_string());
-        let status = IpcCommand::Status.with_token(tok.clone());
-        // ReadOnly commands have no token slot, so token() returns None.
-        assert_eq!(status.token(), None);
-        assert_eq!(status, IpcCommand::Status);
-    }
-
-    #[test]
-    fn old_clients_without_token_field_still_parse() {
-        // Mutating commands with no `token` field in JSON must deserialize
-        // (the field defaults to None). This covers CLI clients that pre-date
-        // the P0-3 change, and the round-trip of an un-tokened command.
-        let cases = [
-            r#"{"type":"cache_flush","domain":null}"#,
-            r#"{"type":"reload"}"#,
-            r#"{"type":"shutdown"}"#,
-            r#"{"type":"tracking_stats"}"#,
-            r#"{"type":"device_stats"}"#,
-        ];
-        for json in cases {
-            let cmd: IpcCommand = serde_json::from_str(json).unwrap();
-            assert_eq!(cmd.token(), None);
-        }
-    }
-
-    #[test]
-    fn token_serializes_only_when_set() {
-        let no_tok = IpcCommand::Reload { token: None };
-        let with_tok = IpcCommand::Reload {
-            token: Some("ps_abc".into()),
-        };
-        let no_json = serde_json::to_string(&no_tok).unwrap();
-        let with_json = serde_json::to_string(&with_tok).unwrap();
-        // `skip_serializing_if = Option::is_none` should keep the wire format
-        // minimal when no token is attached.
-        assert!(!no_json.contains("token"), "got {no_json}");
-        assert!(with_json.contains("\"token\":\"ps_abc\""));
-    }
-
-    /// **The trip-wire for the field-drop class.**
-    ///
-    /// `socket_client::send_command` runs every token-bearing request
-    /// through `with_token` — so that arm is on the path of every real
-    /// `QueryLogs` request and on the path of no other test, because
-    /// tests build `IpcCommand` directly. When the arm destructured with
-    /// `..`, a field added to the variant was silently reset to whatever
-    /// the construct side wrote: paging would have been dead in
-    /// production with the whole suite green.
-    ///
-    /// The `let … else` below destructures EXHAUSTIVELY. That is the
-    /// point: the next field added to `QueryLogs` fails to compile here
-    /// rather than vanishing on the wire. Do not replace it with `..`.
-    #[test]
-    fn with_token_preserves_every_query_logs_field() {
-        let cursor = crate::tracking::query_log::QueryLogCursor {
-            file: "/var/lib/purge-warden/query.log".into(),
-            offset: 8192,
-            inode: 4242,
-        };
-        let advanced = AdvancedClientFilterDto {
-            name: Some("*ioel*".into()),
-            name_exclude: true,
-            subnet: Some("192.0.2.0/24".into()),
-            ..Default::default()
-        };
-        let cmd = IpcCommand::QueryLogs {
-            limit: 40,
-            client: Some("laptop".into()),
-            blocked_only: true,
-            domain: Some("ads.example".into()),
-            since_secs: Some(3600),
-            cursor: Some(cursor.clone()),
-            advanced: Some(advanced.clone()),
-            token: None,
-        };
-        let IpcCommand::QueryLogs {
-            limit,
-            client,
-            blocked_only,
-            domain,
-            since_secs,
-            cursor: carried,
-            advanced: carried_advanced,
-            token,
-        } = cmd.with_token(Some("tok".into()))
-        else {
-            panic!("with_token must not change the variant");
-        };
-        assert_eq!(limit, 40);
-        assert_eq!(client.as_deref(), Some("laptop"));
-        assert!(blocked_only);
-        assert_eq!(domain.as_deref(), Some("ads.example"));
-        assert_eq!(since_secs, Some(3600));
-        assert_eq!(
-            carried,
-            Some(cursor),
-            "the resume cursor must survive token attachment — without this \
-             every paged request silently reads the live tail"
-        );
-        // Bound to a NAME, not matched against a literal. A pattern like
-        // `advanced: None` would compile, satisfy the exhaustiveness the
-        // doc comment above is asking for, and assert nothing about the
-        // field — a trip-wire that fires on the build and then tests
-        // nothing is the failure mode this test is guarding against.
-        assert_eq!(
-            carried_advanced,
-            Some(advanced),
-            "the advanced filter must survive token attachment — without \
-             this every advanced search silently reads the whole log"
-        );
-        assert_eq!(token.as_deref(), Some("tok"));
-    }
-
-    /// A pre-paging caller sends no `cursor`; a pre-paging daemon sends
-    /// no `next_cursor` / `cursor_stale`. Both must still decode.
-    #[test]
-    fn query_logs_wire_is_compatible_in_both_directions() {
-        let cmd: IpcCommand = serde_json::from_str(r#"{"type":"query_logs","limit":20}"#).unwrap();
-        let IpcCommand::QueryLogs { cursor, .. } = cmd else {
-            panic!("expected query_logs");
-        };
-        assert!(cursor.is_none(), "absent cursor decodes as live tail");
-
-        let resp: IpcResponse = serde_json::from_str(
-            r#"{"type":"query_logs","entries":[],"logging_enabled":true,"file_state":"Ok"}"#,
-        )
-        .unwrap();
-        let IpcResponse::QueryLogs {
-            next_cursor,
-            cursor_stale,
-            ..
-        } = resp
-        else {
-            panic!("expected query_logs");
-        };
-        assert!(next_cursor.is_none());
-        assert!(!cursor_stale);
-
-        // And a cursor-bearing command survives the round trip.
-        let with_cursor = IpcCommand::QueryLogs {
-            limit: 40,
-            client: None,
-            blocked_only: false,
-            domain: None,
-            since_secs: None,
-            cursor: Some(crate::tracking::query_log::QueryLogCursor {
-                file: "/var/lib/purge-warden/query.log.2026-04-07".into(),
-                offset: 123,
-                inode: 9,
-            }),
-            advanced: Some(AdvancedClientFilterDto {
-                ip: Some("192.0.2.*".into()),
-                ip_exclude: true,
-                ..Default::default()
-            }),
-            token: None,
-        };
-        let json = serde_json::to_string(&with_cursor).unwrap();
-        let back: IpcCommand = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, with_cursor);
-    }
-
-    #[test]
-    fn query_logs_response_roundtrip() {
-        let resp = IpcResponse::QueryLogs {
-            entries: vec![QueryLogDto {
-                timestamp: "2026-04-08T15:00:00Z".into(),
-                client_ip: "192.168.1.1".into(),
-                client_name: Some("laptop".into()),
-                domain: "google.com".into(),
-                query_type: "A".into(),
-                result: "ALLOWED".into(),
-                response_time_us: 500,
-                cname_chain_via: None,
-            }],
-            logging_enabled: true,
-            file_state: QueryLogFileState::Ok,
-            next_cursor: None,
-            cursor_stale: false,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, resp);
-    }
-
-    #[test]
-    fn query_log_dto_with_cname_chain_via_round_trips() {
-        // §4.5 Sprint 2/2: the IPC DTO mirrors `QueryLogEntry`'s new
-        // `cname_chain_via` field so the TUI receives the offending hop
-        // for the `[CNAME]` badge + `qname → offending` rendering.
-        let dto = QueryLogDto {
-            timestamp: "2026-05-08T12:00:00Z".into(),
-            client_ip: "10.0.0.42".into(),
-            client_name: Some("phone".into()),
-            domain: "apex.example.com".into(),
-            query_type: "A".into(),
-            result: "BLOCKED".into(),
-            response_time_us: 999,
-            cname_chain_via: Some("offending.tracker.example".into()),
-        };
-        let json = serde_json::to_string(&dto).unwrap();
-        assert!(json.contains("\"cname_chain_via\":\"offending.tracker.example\""));
-        let parsed: QueryLogDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, dto);
-    }
-
-    #[test]
-    fn query_log_dto_without_cname_chain_via_skips_field() {
-        // Non-CNAME outcomes must not surface a spurious
-        // `cname_chain_via: null` on the IPC wire — keeps the byte
-        // shape identical for older TUIs / tail consumers.
-        let dto = QueryLogDto {
-            timestamp: "2026-05-08T12:00:00Z".into(),
-            client_ip: "10.0.0.1".into(),
-            client_name: None,
-            domain: "google.com".into(),
-            query_type: "A".into(),
-            result: "ALLOWED".into(),
-            response_time_us: 100,
-            cname_chain_via: None,
-        };
-        let json = serde_json::to_string(&dto).unwrap();
-        assert!(!json.contains("cname_chain_via"));
-    }
-
-    #[test]
-    fn query_log_dto_legacy_payload_parses_with_cname_chain_via_none() {
-        // Pre-S4.5-P2 daemons emit DTOs without the field. The
-        // `#[serde(default)]` decoration lets a newer TUI parse them
-        // back as `cname_chain_via: None` without erroring.
-        let legacy_json = r#"{
-            "timestamp":"2026-04-08T15:00:00Z",
-            "client_ip":"10.0.0.1",
-            "client_name":"laptop",
-            "domain":"google.com",
-            "query_type":"A",
-            "result":"ALLOWED",
-            "response_time_us":500
-        }"#;
-        let parsed: QueryLogDto = serde_json::from_str(legacy_json).unwrap();
-        assert!(parsed.cname_chain_via.is_none());
-    }
-
-    // ── s23-mapped-dto-dedup wire-format pin ─────────────────────────
-    // Guards against accidental nesting or field renames from the
-    // MappedDeviceSnapshot/MappedDeviceDto collapse. The DTO is the
-    // single source of truth for mapped-device metadata shape, and the
-    // resolver's snapshot wraps it rather than duplicating fields — so
-    // if anyone (re)introduces `#[serde(flatten)] meta:` or moves a
-    // field out of the DTO, this test fails loudly. The TUI + every
-    // downstream consumer parses this exact flat shape.
-
-    #[test]
-    fn mapped_device_dto_roundtrip() {
-        let dto = MappedDeviceDto {
-            ip: "192.168.1.42".into(),
-            name: "alex-laptop".into(),
-            mac: Some("AA:BB:CC:DD:EE:FF".into()),
-            mac_aliases: Vec::new(),
-            profile: "default".into(),
-            owner: Some("Alex".into()),
-            device_type: Some("ThinkPad".into()),
-            department: Some("home".into()),
-            queries: 42,
-            queries_today: 9,
-            blocked: 7,
-            blocked_24h: 0,
-            cache_hits: 13,
-            last_seen: 1_700_000_000,
-            online: true,
-            vendor: Some("Lenovo".into()),
-            groups: Vec::new(),
-            notes: None,
-            network_name: None,
-            network_name_wildcard: false,
-            id: None,
-            hourly_queries: Vec::new(),
-            unfiltered: false,
-        };
-        let json = serde_json::to_string(&dto).unwrap();
-        let parsed: MappedDeviceDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, dto);
-    }
-
-    /// The device view really does put operator-private metadata on the
-    /// wire, for a command that needs no token.
-    ///
-    /// This exists because the variant's own rustdoc used to claim the
-    /// opposite — that the response "excludes `notes` and any field the
-    /// operator might treat as confidential" — while `notes`, `owner`
-    /// and `department` were all being serialized. A tier justified on
-    /// a false description of its own payload is worse than an
-    /// unjustified one, so the description is now pinned.
-    #[test]
-    fn device_view_carries_operator_private_fields() {
-        let dto = MappedDeviceDto {
-            ip: "192.168.1.42".into(),
-            name: "alex-laptop".into(),
-            mac: Some("AA:BB:CC:DD:EE:FF".into()),
-            mac_aliases: vec!["11:22:33:44:55:66".into()],
-            profile: "default".into(),
-            owner: Some("Alex".into()),
-            device_type: Some("ThinkPad".into()),
-            department: Some("home".into()),
-            queries: 0,
-            queries_today: 0,
-            blocked: 0,
-            blocked_24h: 0,
-            cache_hits: 0,
-            last_seen: 0,
-            online: false,
-            vendor: None,
-            groups: Vec::new(),
-            notes: Some("spare key under the mat".into()),
-            network_name: None,
-            network_name_wildcard: false,
-            id: None,
-            hourly_queries: Vec::new(),
-            unfiltered: false,
-        };
-        let json = serde_json::to_string(&dto).unwrap();
-        for field in ["notes", "owner", "department", "mac", "mac_aliases"] {
-            assert!(
-                json.contains(&format!("\"{field}\"")),
-                "{field} reaches the wire; any tier rationale has to account for it"
-            );
-        }
-        assert!(json.contains("spare key under the mat"));
-        assert_eq!(IpcCommand::GetAllDevices.tier(), CommandTier::ReadOnly);
-    }
-
-    #[test]
-    fn mapped_device_dto_wire_shape_is_flat() {
-        // Every field is a top-level JSON key — NO nesting under
-        // "meta" / "counters" / etc. If the test grows a nested object
-        // after this comment, the dedup refactor has regressed and a
-        // silently-shipping TUI breakage is one commit away.
-        let dto = MappedDeviceDto {
-            ip: "192.168.1.42".into(),
-            name: "alex-laptop".into(),
-            mac: None,
-            mac_aliases: Vec::new(),
-            profile: "default".into(),
-            owner: None,
-            device_type: None,
-            department: None,
-            queries: 0,
-            queries_today: 0,
-            blocked: 0,
-            blocked_24h: 0,
-            cache_hits: 0,
-            last_seen: 0,
-            online: false,
-            vendor: Some("Lenovo".into()),
-            groups: Vec::new(),
-            notes: None,
-            network_name: None,
-            network_name_wildcard: false,
-            id: None,
-            hourly_queries: Vec::new(),
-            unfiltered: false,
-        };
-        let json = serde_json::to_string(&dto).unwrap();
-
-        for key in [
-            "\"ip\":",
-            "\"name\":",
-            "\"mac\":",
-            "\"profile\":",
-            "\"owner\":",
-            "\"device_type\":",
-            "\"department\":",
-            "\"queries\":",
-            "\"queries_today\":",
-            "\"blocked\":",
-            "\"cache_hits\":",
-            "\"last_seen\":",
-            "\"online\":",
-            "\"vendor\":",
-        ] {
-            assert!(json.contains(key), "missing top-level key {key} in {json}");
-        }
-        // Nothing nested — the wire format must stay flat for the TUI
-        // and any third-party operator tooling that parses the JSON.
-        assert!(!json.contains("\"meta\":"), "unexpected nesting: {json}");
-        assert!(
-            !json.contains("\"counters\":"),
-            "unexpected nesting: {json}"
-        );
-    }
-
-    // ── S43 T2: IpcNotification serde stability ─────────────────
-    // The publishing channel is wired in T2; the subscriber endpoint
-    // lands in T3. These tests pin the wire shape now so a future
-    // refactor cannot silently rename or restructure variants once
-    // subscribers exist.
-
-    #[test]
-    fn ipc_notification_list_stats_updated_roundtrip() {
-        let n = IpcNotification::ListStatsUpdated {
-            id: "privacy/ads".into(),
-        };
-        let json = serde_json::to_string(&n).unwrap();
-        // Tag style matches IpcCommand / IpcResponse for consistency.
-        assert_eq!(
-            json, r#"{"type":"list_stats_updated","id":"privacy/ads"}"#,
-            "wire shape must stay stable across releases — subscribers parse this verbatim"
-        );
-        let parsed: IpcNotification = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, n);
-    }
-
-    #[test]
-    fn ipc_notification_list_stats_updated_carries_raw_url_id() {
-        // Source ids in `[lists].sources` may be raw URLs (not slugs).
-        // The notification id field passes them through verbatim — no
-        // canonicalisation, since the registry is keyed on the same
-        // raw string.
-        let n = IpcNotification::ListStatsUpdated {
-            id: "https://example.com/blocklist.txt".into(),
-        };
-        let json = serde_json::to_string(&n).unwrap();
-        let parsed: IpcNotification = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, n);
-    }
-
-    #[test]
-    fn device_view_dto_roundtrip_after_sn3_flag_removal() {
-        // Post-SN3 the envelope carries only `mapped` + `unmapped`. This
-        // test pins the wire shape against accidental field creep (e.g. a
-        // future refactor re-adding `block_unmapped` would fail the
-        // serialise→deserialise equality check and the absence-in-JSON
-        // guard below).
-        let view = DeviceViewDto {
-            mapped: vec![MappedDeviceDto {
-                ip: "10.0.0.5".into(),
-                name: "kids-tablet".into(),
-                mac: None,
-                mac_aliases: Vec::new(),
-                profile: "kids".into(),
-                owner: None,
-                device_type: None,
-                department: None,
-                queries: 1,
-                queries_today: 1,
-                blocked: 0,
-                blocked_24h: 0,
-                cache_hits: 0,
-                last_seen: 0,
-                online: false,
-                vendor: None,
-                groups: Vec::new(),
-                notes: None,
-                network_name: None,
-                network_name_wildcard: false,
-                id: None,
-                hourly_queries: Vec::new(),
-                unfiltered: false,
-            }],
-            unmapped: vec![UnmappedDeviceDto {
-                ip: "10.0.0.99".into(),
-                mac: None,
-                queries: 3,
-                queries_today: 2,
-                blocked: 1,
-                blocked_24h: 0,
-                last_seen: 0,
-                online: false,
-                vendor: None,
-                hourly_queries: Vec::new(),
-            }],
-        };
-        let json = serde_json::to_string(&view).unwrap();
-        let parsed: DeviceViewDto = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, view);
-        assert!(
-            !json.contains("block_unmapped"),
-            "wire format must not carry legacy block_unmapped: {json}",
-        );
-    }
-
-    /// Sprint B Dashboard v2 — `top_blocked_lists` round-trips intact
-    /// through serde_json. Pinning the wire shape so a future field
-    /// rename surfaces as a test failure rather than a silent break of
-    /// the TUI poller.
-    #[test]
-    fn tracking_stats_roundtrip_includes_top_blocked_lists() {
-        use crate::tracking::TYPE_BUCKET_COUNT;
-        let resp = IpcResponse::TrackingStats {
-            queries_total: 100,
-            blocked_total: 12,
-            blocked_pct: 12.0,
-            cache_hit_rate: 50.0,
-            cache_negative_hits: 2,
-            uptime_secs: 600,
-            top_blocked: Vec::new(),
-            top_queried: Vec::new(),
-            hourly: Vec::new(),
-            daily: Vec::new(),
-            cache_hit_rate_24h: 50.0,
-            blocked_pct_24h: 12.0,
-            cache_hit_rate_delta_1h: 0.0,
-            blocked_pct_delta_1h: 0.0,
-            qtype_distribution: [0; TYPE_BUCKET_COUNT],
-            qtype_blocked_distribution: [0; TYPE_BUCKET_COUNT],
-            qtype_distribution_24h: [0; TYPE_BUCKET_COUNT],
-            qtype_blocked_distribution_24h: [0; TYPE_BUCKET_COUNT],
-            prefetch_pool_size: 0,
-            prefetch_promotions_total: 0,
-            prefetch_demotions_total: 0,
-            top_blocked_lists: vec![
-                ListBlockCount {
-                    label: "privacy/ads".into(),
-                    count: 42,
-                    count_24h: 0,
-                },
-                ListBlockCount {
-                    label: "security/malicious".into(),
-                    count: 7,
-                    count_24h: 0,
-                },
-            ],
-            top_blocked_24h: Vec::new(),
-            top_queried_24h: Vec::new(),
-            top_blocked_lists_24h: Vec::new(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"top_blocked_lists\""));
-        assert!(json.contains("\"label\":\"privacy/ads\""));
-        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
-        match parsed {
-            IpcResponse::TrackingStats {
-                top_blocked_lists, ..
-            } => {
-                assert_eq!(top_blocked_lists.len(), 2);
-                assert_eq!(top_blocked_lists[0].label, "privacy/ads");
-                assert_eq!(top_blocked_lists[0].count, 42);
-                assert_eq!(top_blocked_lists[1].label, "security/malicious");
-                assert_eq!(top_blocked_lists[1].count, 7);
-            }
-            other => panic!("expected TrackingStats, got {other:?}"),
-        }
-    }
-
-    /// Sprint B Dashboard v2 — JSON emitted by a pre-Sprint-B daemon
-    /// (no `top_blocked_lists` field) decodes into the new variant
-    /// with an empty vec, so a Sprint-B-aware CLI/TUI talking to an
-    /// older daemon degrades gracefully to the "collecting…"
-    /// placeholder rather than a parse error.
-    #[test]
-    fn tracking_stats_legacy_decodes_with_empty_top_blocked_lists() {
-        // Hand-crafted JSON without `top_blocked_lists`. Mirrors the
-        // shape of a pre-Sprint-B `IpcResponse::TrackingStats`.
-        let legacy = r#"{
-            "type": "tracking_stats",
-            "queries_total": 1,
-            "blocked_total": 0,
-            "blocked_pct": 0.0,
-            "cache_hit_rate": 0.0,
-            "uptime_secs": 1,
-            "top_blocked": [],
-            "top_queried": [],
-            "hourly": [],
-            "daily": []
-        }"#;
-        let parsed: IpcResponse = serde_json::from_str(legacy).unwrap();
-        match parsed {
-            IpcResponse::TrackingStats {
-                top_blocked_lists, ..
-            } => {
-                assert!(top_blocked_lists.is_empty());
-            }
-            other => panic!("expected TrackingStats, got {other:?}"),
-        }
-    }
-}
+mod tests;

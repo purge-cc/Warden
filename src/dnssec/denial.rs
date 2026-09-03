@@ -1,4 +1,4 @@
-//! Authenticated denial of existence — proving a name/type is *absent* (§4.10-3b).
+//! Authenticated denial of existence — proving a name/type is *absent*.
 //!
 //! When the chain walk ([`crate::dnssec::chain`]) reaches a delegation with no DS
 //! RRset, it cannot tell a legitimately *unsigned* delegation from a stripped-DS
@@ -17,7 +17,7 @@
 //! records it has *already authenticated*; this module hashes the delegation name
 //! (the only crypto-adjacent step — a name digest, not a signature) and decides
 //! matching vs opt-out covering. The `max_nsec3_iterations` cap is enforced here,
-//! before any hash, as the third DoS cap (§4.10-3c).
+//! before any hash, as the third DoS cap.
 
 use data_encoding::BASE32_DNSSEC;
 use hickory_proto::dnssec::rdata::{NSEC, NSEC3};
@@ -73,7 +73,7 @@ pub fn nsec3_matching_proves_unsigned_delegation(nsec3: &NSEC3) -> bool {
 }
 
 /// Outcome of scanning *already-authenticated* NSEC3 records for a no-DS proof at a
-/// delegation `child` — the [`crate::dnssec::chain`] no-DS hook (§4.10-3c).
+/// delegation `child` — the [`crate::dnssec::chain`] no-DS hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Nsec3NoDsProof {
     /// A matching NSEC3 (NS∧!DS∧!SOA) or an opt-out NSEC3 covering `child`'s hash —
@@ -99,7 +99,7 @@ pub(crate) enum Nsec3NoDsProof {
 /// closest-encloser-free single-hop case the no-DS hook needs: a *matching* NSEC3
 /// at the delegation hash, or an *opt-out covering* NSEC3 (delegation == next-closer
 /// — the dominant deployment); the full closest-encloser proof for deep next-closers
-/// is general negative-validation, deferred to §4.10-4 (see the §4.10-3c handoff).
+/// is general negative-validation and is out of scope here.
 ///
 /// `max_iterations` is enforced **before any hash**. Matching wins over opt-out
 /// covering (RFC 5155 §8.6: consult a covering NSEC3 only when none matches).
@@ -232,7 +232,7 @@ mod tests {
         assert!(!nsec_proves_unsigned_delegation(&n));
     }
 
-    // ---- NSEC3 (§4.10-3c) --------------------------------------------------
+    // ---- NSEC3 ---------------------------------------------------------------
     //
     // These exercise the *pure* logic over already-authenticated NSEC3 rdata (no
     // signing — `nsec3_proves_no_ds` does not authenticate). The auth dimension

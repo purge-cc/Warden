@@ -1,8 +1,10 @@
 //! Extended query validation — security-focused checks beyond RFC limits.
 //!
-//! Sprint 1's `dns/validation.rs` enforces RFC 1035 structural limits
-//! (label length, name length, depth). This module adds character validation
-//! and malicious pattern detection.
+//! `dns/validation.rs` enforces RFC 1035 structural limits (label length,
+//! name length, depth). This module adds character validation and
+//! malicious pattern detection.
+
+use super::MAX_LABELS;
 
 /// Validate domain characters. Returns an error string if invalid.
 ///
@@ -44,21 +46,20 @@ pub fn validate_domain_chars(domain: &str) -> Result<(), &'static str> {
 ///
 /// Pattern: labels that look like IP addresses (e.g. "192.168.1.1.evil.com").
 ///
-/// L-12 (rev-2026-05-rebinding-stack-array): zero-allocation. Pre-fix the
-/// labels were collected into a `Vec<&str>` on every query — small, but
-/// runs on every pre-cache request. The stack array sized at MAX_LABELS=16
-/// matches the `dns::validation::MAX_LABEL_COUNT = 15` ceiling (validation
-/// runs upstream of this check) plus one slack slot, so a pathological
-/// over-cap input (validation was bypassed) returns false without panicking.
-/// Mirrors the pattern at `security::tunneling::check`.
+/// Labels live in a stack array sized at `MAX_LABELS` rather than a `Vec`,
+/// because this runs on every pre-cache query. That bound is *derived* from
+/// the deepest name `dns::validation` admits, so a name that reached here
+/// after validation always fits — a literal would drift the moment either
+/// validation ceiling moved, and a heuristic reading a truncated prefix of
+/// the name fails open. Mirrors the pattern at `security::tunneling::check`.
 pub fn has_rebinding_pattern(domain: &str) -> bool {
-    const MAX_LABELS: usize = 16;
     let mut labels: [&str; MAX_LABELS] = [""; MAX_LABELS];
     let mut n = 0usize;
     for label in domain.split('.').filter(|l| !l.is_empty()) {
         if n >= MAX_LABELS {
-            // Over-cap input: bail out fail-open. Defensive only — real
-            // production traffic is filtered by validate_query (≤15 labels).
+            // Unreachable for a name that passed validation, which admits
+            // fewer labels than this buffer holds. Bail rather than scan a
+            // truncated prefix: a prefix is not the name that was asked for.
             return false;
         }
         labels[n] = label;
@@ -176,16 +177,32 @@ mod tests {
 
     #[test]
     fn has_rebinding_pattern_pathological_label_count_does_not_panic() {
-        // L-12 (rev-2026-05-rebinding-stack-array) regression pin: a
-        // domain crafted with > MAX_LABELS labels must fail open
-        // (return false) rather than panic on the stack-array index.
-        // Real production traffic is filtered by validate_query (≤15
-        // labels) so this is purely a defensive guard mirroring
-        // L-9 in tunneling.rs.
-        let huge = (0..30)
+        // A domain with more labels than the buffer holds must fail open
+        // rather than panic on the stack-array index. Sized off MAX_LABELS
+        // so raising the buffer cannot quietly move this name back under
+        // the cap and leave the bail arm untested.
+        let huge = (0..MAX_LABELS + 5)
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join(".");
         assert!(!has_rebinding_pattern(&huge));
+    }
+
+    /// The other half of the bound: a name as deep as validation admits
+    /// must still be *analysed*, not skipped. The quad sits at the front,
+    /// so a buffer that fits the name answers `true` where one that
+    /// overflows answers `false` — the two are distinguishable, which the
+    /// over-cap test on its own is not.
+    ///
+    /// At a fixed buffer of 16 this name was never looked at, so padding a
+    /// rebinding name past 15 labels walked straight through the check.
+    #[test]
+    fn rebinding_quad_at_the_deepest_admitted_name_is_still_detected() {
+        use crate::dns::validation::MAX_LABEL_COUNT_ARPA;
+        let quad = ["192", "168", "1", "1"].map(str::to_string);
+        let filler = (0..MAX_LABEL_COUNT_ARPA - 4).map(|i| format!("l{i}"));
+        let name = quad.into_iter().chain(filler).collect::<Vec<_>>().join(".");
+        assert_eq!(name.split('.').count(), MAX_LABEL_COUNT_ARPA);
+        assert!(has_rebinding_pattern(&name));
     }
 }

@@ -1,6 +1,6 @@
-//! §4.11-4a — observability lift for cluster sync (CS9).
+//! Observability lift for cluster sync.
 //!
-//! Sprints 1-3 made a secondary CONVERGE on its primary, but the live state
+//! A secondary CONVERGES on its primary, but without this the live state
 //! was invisible: the poll loop's last-applied hashes / sync time / last error
 //! lived only in [`super::poll::run`]'s task locals, and the primary DROPPED
 //! every secondary's heartbeat stats. This module lifts both into ONE shared
@@ -39,7 +39,7 @@ use crate::config::schema::ClusterRole;
 use super::dto::ClusterStats;
 use super::state::ClusterState;
 
-/// Max stored length (in characters) of a peer-advertised node name (roundup-01).
+/// Max stored length (in characters) of a peer-advertised node name.
 /// The label is display-only (roster / status views); clamping stops a peer from
 /// pinning an arbitrarily long string in the bounded roster.
 const MAX_NODE_NAME_LEN: usize = 64;
@@ -53,7 +53,7 @@ fn clamp_node_name(name: String) -> String {
     name.chars().take(MAX_NODE_NAME_LEN).collect()
 }
 
-/// The secondary's lifted poll telemetry (D-F). Stored whole in an [`ArcSwap`]
+/// The secondary's lifted poll telemetry. Stored whole in an [`ArcSwap`]
 /// and replaced at the end of every poll tick — readers always see a
 /// self-consistent snapshot. Role + peer are boot identity and live on
 /// [`ClusterObserve`], not here, so this is pure per-tick telemetry.
@@ -74,7 +74,7 @@ pub struct SyncStatus {
     pub synced_at_least_once: bool,
 }
 
-/// A secondary's policy-sync health, in the three states §9 requires a node to
+/// A secondary's policy-sync health, in the three states a node must
 /// be able to tell apart. **Two states are not enough**: with an age alone,
 /// "never synced" and "synced a very long time ago" read identically, and the
 /// remedy for them is different (the first needs a join/token, the second needs
@@ -102,14 +102,14 @@ pub struct SyncStatus {
 pub enum SyncHealth {
     /// No poll has succeeded **since this process booted**. Note what this does
     /// *not* say: a secondary that joined earlier still loads its last-good
-    /// bundle from `cluster.d/` at startup and filters with it (§9, row 1), so
+    /// bundle from `cluster.d/` at startup and filters with it, so
     /// this is "unconfirmed policy", not "no policy".
     NeverSynced,
     /// Synced at least once and the most recent tick succeeded.
     Current,
     /// Synced at least once, and the most recent tick failed — the applied
-    /// policy stands but is no longer being confirmed. Filtering continues
-    /// (§9: degrade audibly, never refuse).
+    /// policy stands but is no longer being confirmed. Filtering continues:
+    /// degrade audibly, never refuse.
     Stale,
 }
 
@@ -145,7 +145,7 @@ impl SyncHealth {
     }
 }
 
-/// What a renderer needs to answer §9's question — *"which policy am I
+/// What a renderer needs to answer the question — *"which policy am I
 /// applying, and how old is that answer?"* — without reaching into
 /// [`ClusterObserve`] itself.
 ///
@@ -403,7 +403,7 @@ impl Roster {
         config_generation: u64,
         now: Instant,
     ) {
-        // roundup-01: the name is peer-supplied (untrusted) — clamp its length
+        // The name is peer-supplied (untrusted) — clamp its length
         // before it enters the bounded roster so a peer cannot pin an oversized
         // display label. `record_self` (trusted local config) is not clamped.
         let node_name = node_name.map(clamp_node_name);
@@ -570,7 +570,7 @@ impl ClusterObserve {
         self.sync.load_full()
     }
 
-    /// The §9 staleness view: *"which policy am I applying, and how old is that
+    /// The staleness view: *"which policy am I applying, and how old is that
     /// answer?"* — `None` on a primary, which has no sync of its own to report
     /// (its `SyncStatus` is never written, so classifying it would report a
     /// meaningless `NeverSynced`; the role check lives here because this is
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn peer_node_name_is_clamped() {
-        // roundup-01: a peer advertising a huge label cannot pin it in the roster.
+        // A peer advertising a huge label cannot pin it in the roster.
         let mut r = Roster::new(8);
         let t0 = Instant::now();
         r.record_peer(ip(1), Some("x".repeat(500)), stats(1, 0), 0, t0);

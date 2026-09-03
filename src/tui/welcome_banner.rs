@@ -35,10 +35,10 @@
 //! traffic* — and for each one names the leaf and the key that satisfies
 //! it. Every `g <letter>` in it is **generated from
 //! [`crate::tui::app::Leaf::mnemonic`]**, so a remapped mnemonic moves the
-//! copy with it instead of leaving a hint that points at the wrong tab.
-//! That is the structural fix for welcome_banner-01, where a frozen const
-//! pinned "0.4.7" / "\[5\]" while the tree moved to v0.21 and `5` was
-//! rebound to Settings. The build version is no longer in the body at all:
+//! copy with it instead of leaving a hint that points at the wrong tab —
+//! a frozen const naming a literal key survives the rebinding it once
+//! described, and a mnemonic can be rebound. The build version is no
+//! longer in the body at all:
 //! [`notice_spec`] puts it in the title band, where it costs no row of the
 //! tightest budget in the TUI, and
 //! `welcome_shows_the_running_build_version_on_screen` pins it at the
@@ -49,9 +49,9 @@
 //! This section used to say the opposite — *"the overlay is now built by
 //! [`modal_form::render_modal`], which derives its height from the row
 //! count, so length is no longer a hazard and copy no longer has to be
-//! rationed. Write what the operator needs."* **Measured 2026-08-25: that
-//! is false, and it is the more dangerous of the two claims this module
-//! carried.** `render_modal` does derive the height from the row count,
+//! rationed. Write what the operator needs."* **That claim is false, and
+//! it is the more dangerous of the two this module carried.**
+//! `render_modal` does derive the height from the row count,
 //! but `overlay::centered_rect` then clamps that height to the anchor —
 //! and [`notice_spec`] passes no choices, so
 //! [`modal_form::notice_body`] returns `scrollable: false` and
@@ -92,18 +92,11 @@ use crate::tui::modal_form;
 /// per-release "what's new". Versioned the suffix so a future content
 /// revision can intentionally re-surface by bumping it.
 ///
-/// Bumped `…localdns-v1` → `…setup-v2` on 2026-08-08. That is not
-/// housekeeping: the overlay changed from an unconditional Local DNS advert
-/// to a state-aware surface, and an operator who dismissed v1 would
-/// otherwise never see the revision. The suffix exists exactly so a content
-/// change can re-surface, and this is the first change that earns it.
-///
-/// Bumped `…setup-v2` → `…setup-v3` on 2026-08-25, on the same test and for
-/// the same reason: v2's body was still an advert for one *feature* (local
-/// DNS records), and v3 is a setup checklist — upstreams, lists, pointing
-/// the clients here. What the box is FOR changed, not merely how it words
-/// itself, so an operator who dismissed v2 has never been shown the thing
-/// this surface now exists to say.
+/// A bump earns its cost when what the box is FOR changes — e.g. moving
+/// from advertising one feature to a setup checklist covering upstreams,
+/// lists and client pointing — not when only the wording changes. An
+/// operator who dismissed the earlier body would otherwise never see the
+/// content that replaced it.
 ///
 /// **The cost is real and is the reason this is not free to do:** every
 /// operator who has already dismissed the banner sees it once more. Priced
@@ -153,14 +146,13 @@ pub const WELCOME_DESC: &str = "First launch — three things to set up";
 /// fresh install and a filtered network, each naming the leaf and key that
 /// satisfies it.
 ///
-/// **What this replaced, and why the replacement is not a reword.** Until
-/// 2026-08-25 the body advertised per-profile local DNS records — a feature
+/// **Why this is not per-profile local DNS records.** That is a feature
 /// with no bearing on minute one. Two of the three things below are load
 /// bearing on a fresh install and one of them is a *product decision*:
-/// `neutrality-03` deleted warden's baked-in default resolver, so warden
-/// names no provider for the operator and `warden init` refuses without
-/// `--upstream`. A first screen that pointed at local DNS records in that
-/// state pointed away from the only thing that could be blocking the box.
+/// warden carries no baked-in default resolver, so it names no provider
+/// for the operator and `warden init` refuses without `--upstream`. A
+/// first screen that pointed at local DNS records instead would point
+/// away from the only thing that could be blocking the box.
 ///
 /// **Every `g <letter>` is derived from [`Leaf::mnemonic`], never typed.**
 /// A hint typed by hand is a hint that survives the binding it describes —
@@ -534,9 +526,9 @@ mod tests {
         }
     }
 
-    /// welcome_banner-01, restated structurally. The `g <letter>` hints are
-    /// **derived** from [`Leaf::mnemonic`], so this asserts the derivation
-    /// actually happened rather than that some letter is present: it
+    /// The `g <letter>` hints are **derived** from [`Leaf::mnemonic`], so
+    /// this asserts the derivation actually happened rather than that
+    /// some letter is present: it
     /// rebuilds each hint from the live table and requires it in the copy.
     /// A hand-typed `g i` would pass today and rot the day `i` moves; a
     /// derived one cannot.
@@ -826,9 +818,9 @@ mod tests {
         );
     }
 
-    /// welcome_banner-01 pinned at the render rather than at the string.
-    /// The version left the body (it costs a row of the 19 the floor
-    /// allows) and rides the title band instead, so the invariant that
+    /// Pinned at the render rather than at the string. The version left
+    /// the body (it costs a row of the 19 the floor allows) and rides
+    /// the title band instead, so the invariant that
     /// matters — the operator sees the version they are running — has to be
     /// asserted against the buffer.
     #[test]

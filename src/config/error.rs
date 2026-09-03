@@ -1,4 +1,4 @@
-//! Structured error type for the v1 configuration pipeline (Sprint 28+).
+//! Structured error type for the v1 configuration pipeline.
 //!
 //! Every failure mode of the schema / loader / validator produces a
 //! [`ConfigError`] that carries enough context for the operator to fix the
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 /// Common context attached to every [`ConfigError`] variant.
 ///
-/// Per design doc §13-Sprint-28 step 6, every config failure carries the
+/// Every config failure carries the
 /// tuple `(file, line, entity, reason, suggestion)`. Sharing the payload
 /// across variants keeps the variants themselves categorical (Parse vs
 /// DuplicateId vs CrossRefMiss …) without duplicating five fields per
@@ -28,7 +28,7 @@ pub struct ErrorContext {
     /// underlying error source (e.g. toml crate) did not surface a span.
     pub line: Option<usize>,
     /// The entity `id` (or section name) whose definition triggered the
-    /// error, e.g. `"devices.alex-iphone-01"` or `"profiles.default"`.
+    /// error, e.g. `"devices.operator-iphone-01"` or `"profiles.default"`.
     pub entity: Option<String>,
     /// Human-readable description of what is wrong. Required.
     pub reason: String,
@@ -95,25 +95,20 @@ impl fmt::Display for ErrorContext {
 
 /// All failure modes of the v1 configuration pipeline.
 ///
-/// Variants cover the categories enumerated in design doc §13-Sprint-28
-/// step 6, plus three additions carved out during implementation:
+/// Variant rationale not obvious from the name alone:
 ///
 /// - [`ConfigError::InvalidId`] — an id string failed the [`super::schema::id::Id`]
-///   character / length invariants (design doc §8 "id is the stable cross-
-///   reference key; lowercase-ascii-dashes-only"). Separated from
+///   character / length invariants ("id is the stable cross-reference key;
+///   lowercase-ascii-dashes-only"). Separated from
 ///   `UnknownField` because the repair is different (fix the id string, not
 ///   the schema).
-/// - [`ConfigError::IdRecentlyRetired`] — N8 enforcement: an id in the
+/// - [`ConfigError::IdRecentlyRetired`] — an id in the
 ///   retired-ids window (<90 days) cannot be reused. Separated from
 ///   `DuplicateId` because the conflict is temporal, not spatial.
 /// - [`ConfigError::ValidationFailed`] — catch-all for semantic violations
 ///   that are not cross-reference misses (e.g. an empty `cidrs` array on a
 ///   subnet, a schedule with `target_type` but no `target_id`).
-///
-/// S49 T2 (`_docs/features/lists_categories_v1.md` §7 T2) introduces two
-/// further variants for the lists-and-categories work:
-///
-/// - [`ConfigError::UnsignedAllowListRequiresAck`] — W2.1, now a consent
+/// - [`ConfigError::UnsignedAllowListRequiresAck`] — a consent
 ///   gate rather than a categorical one: `base = allow` on a list that is
 ///   not `trust = local` is refused **unless** the operator declared
 ///   `accept_unsigned_allow = true` on that list. The bypass risk is
@@ -121,14 +116,11 @@ impl fmt::Display for ErrorContext {
 ///   blocked — but it is now accepted explicitly and visibly instead of
 ///   being forbidden outright.
 /// - [`ConfigError::TrustSignedNotYetSupported`] — `trust = signed` is
-///   parked for a future signed-feed sprint (S51+); the validator refuses
+///   parked for a future signed-feed release; the validator refuses
 ///   it now so an operator does not deploy a config that the daemon will
 ///   silently downgrade.
-///
-/// Sprint A of `lists_categories_v2` (this workstream) introduces:
-///
 /// - [`ConfigError::InvalidTagSlug`] — a tag slug failed the
-///   the retired `TagSlug` regex `^[a-z][a-z0-9-]{0,31}$` or
+///   `TagSlug` regex `^[a-z][a-z0-9-]{0,31}$` or
 ///   length bound. Separated from `InvalidId` because the charset is
 ///   stricter (must start with `[a-z]`) and the length budget is shorter
 ///   (32 vs 64).
@@ -187,28 +179,26 @@ pub enum ConfigError {
     #[error("invalid id: {0}")]
     InvalidId(ErrorContext),
 
-    /// N8: an id that was retired less than 90 days ago cannot be reused.
+    /// An id that was retired less than 90 days ago cannot be reused.
     /// `ErrorContext::entity` carries the id; `reason` carries the
     /// `retired_at` timestamp.
     #[error("id retired recently: {0}")]
     IdRecentlyRetired(ErrorContext),
 
-    /// W2.1: a blocklist with `base = allow` whose `trust` is not
+    /// A blocklist with `base = allow` whose `trust` is not
     /// `local` has not declared `accept_unsigned_allow = true`.
     /// `ErrorContext::entity` carries the offending blocklist id;
     /// `reason` includes the actual trust level seen.
     #[error("unsigned allow-list needs accept_unsigned_allow: {0}")]
     UnsignedAllowListRequiresAck(ErrorContext),
 
-    /// S49 T2: a blocklist declares `trust = signed`, which is parked for
-    /// a future signed-feed sprint (S51+). Frozen string for the message
-    /// is coined in S50 (§9 column "Sprint" = S50); T2 emits a free-form
-    /// reason placeholder until then.
+    /// A blocklist declares `trust = signed`, which is parked for
+    /// a future signed-feed release.
     #[error("trust=signed not yet supported: {0}")]
     TrustSignedNotYetSupported(ErrorContext),
 
-    /// Sprint A of `lists_categories_v2`: a tag slug failed the
-    /// the retired `TagSlug` regex `^[a-z][a-z0-9-]{{0,31}}$`
+    /// A tag slug failed the
+    /// `TagSlug` regex `^[a-z][a-z0-9-]{{0,31}}$`
     /// or length bound. Carries the offending string in
     /// `ErrorContext::reason`. Separated from
     /// [`ConfigError::InvalidId`] because the regex is stricter (must
@@ -286,7 +276,7 @@ impl ConfigError {
 }
 
 /// Truncate an operator-supplied string for safe embedding in an error
-/// message (error-01). An over-long id, or a toml Display excerpt of a
+/// message. An over-long id, or a toml Display excerpt of a
 /// multi-MB single-line config, would otherwise put an unbounded amount of
 /// user input into [`ErrorContext::reason`], which then flows into logs /
 /// IPC / the TUI. Cuts on a char boundary at ~256 bytes and appends a
@@ -326,7 +316,7 @@ fn unquoted_skeleton(msg: &str) -> String {
     out
 }
 
-/// Shared classifier (loader-12): map a toml / deserialise error `msg` to
+/// Shared classifier: map a toml / deserialise error `msg` to
 /// the most specific [`ConfigError`] variant, applying `ctx`. Both the
 /// single-file (`schema::load`) and merged (`loader`) paths route here so
 /// the substring ladder can't drift between them.
@@ -373,7 +363,6 @@ mod tests {
 
     #[test]
     fn truncate_for_error_bounds_long_input() {
-        // error-01
         assert_eq!(truncate_for_error("abc").as_ref(), "abc");
         let long = "x".repeat(10_000);
         let t = truncate_for_error(&long);
@@ -383,7 +372,7 @@ mod tests {
 
     #[test]
     fn classify_masks_quoted_user_content() {
-        // loader-12: a higher-priority keyword inside a QUOTED user value must
+        // A higher-priority keyword inside a QUOTED user value must
         // not flip the classification — only the unquoted skeleton matches.
         assert_eq!(
             classify_config_error(
@@ -413,7 +402,7 @@ mod tests {
         );
     }
 
-    /// `s-tui-lists-edit-save-rejected`: a bad *value* on a good field must
+    /// A bad *value* on a good field must
     /// never be reported as a bad *field*. Both arms used to fold into
     /// `UnknownField`, so the Lists modal told the operator it had written
     /// an unknown field when the field was `kind` (now `base`) — perfectly
@@ -508,14 +497,13 @@ mod tests {
 
     #[test]
     fn s49_t2_new_variant_kinds_are_distinct_and_stable() {
-        // S49 T2 introduces two surviving variants (DanglingCategoryRef was
-        // retired with `[[categories]]` in the v2-tags migration — rev-2606
-        // loader-01). Pin their `kind()` tags so a future rename surfaces in
-        // code review (the kind is what JSON / lint output keys on; renaming
-        // silently would break tooling).
+        // DanglingCategoryRef was retired with `[[categories]]` in the
+        // v2-tags migration. Pin the remaining `kind()` tags so a future
+        // rename surfaces in code review (the kind is what JSON / lint
+        // output keys on; renaming silently would break tooling).
         assert_eq!(
             ConfigError::UnsignedAllowListRequiresAck(ErrorContext::new("x")).kind(),
-            // Renamed with the variant when the categorical W2.1 gate
+            // Renamed with the variant when the categorical gate
             // became a consent gate. `kind()` is what JSON / lint output
             // keys on, so this is a BREAKING change for any tooling that
             // matched the old `allow_list_requires_local_trust` tag —
@@ -531,8 +519,7 @@ mod tests {
 
     #[test]
     fn lc2_foundation_invalid_tag_slug_kind_is_distinct_and_stable() {
-        // Sprint A of lists_categories_v2 introduces InvalidTagSlug.
-        // Pin its `kind()` tag for the same reason as the S49 variants.
+        // Pin its `kind()` tag for the same reason as the variants above.
         assert_eq!(
             ConfigError::InvalidTagSlug(ErrorContext::new("x")).kind(),
             "invalid_tag_slug"

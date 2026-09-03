@@ -33,14 +33,13 @@ const DEFAULT_CATALOG_URL: &str = "https://lists.purge.cc/index.json";
 /// default timeout. 2s gives a healthy CDN ample headroom while keeping
 /// the worst-case picker open at ~2s + render.
 ///
-/// §4.34 (post-§4.28 b8): now ALSO applied per-call inside
-/// [`Catalog::fetch_from`] so the daemon-boot path (`Catalog::fetch`,
-/// which does NOT route through `fetch_unified`) is similarly bounded.
-/// A DNS-poisoned upstream that slow-streams cannot stall boot
-/// beyond `FETCH_TIMEOUT_SECS`.
+/// Also applied per-call inside [`Catalog::fetch_from`] so the daemon-boot
+/// path (`Catalog::fetch`, which does NOT route through `fetch_unified`)
+/// is similarly bounded. A DNS-poisoned upstream that slow-streams cannot
+/// stall boot beyond `FETCH_TIMEOUT_SECS`.
 const FETCH_TIMEOUT_SECS: u64 = 2;
 
-/// §4.34: hard cap on the index.json body. The legitimate envelope
+/// Hard cap on the index.json body. The legitimate envelope
 /// today is a few KiB (~5 KB); picking 1 MiB gives roughly a 200×
 /// headroom while keeping a hostile / DNS-poisoned `lists.purge.cc`
 /// from streaming gigabytes into RAM at boot. The catalog is the
@@ -106,7 +105,7 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub updated_at: String,
     /// Declared wire format for this list. `Adguard`/`Hosts` **force** the
-    /// daemon's parser when downloading this URL (rev-2606 §06 parser-02);
+    /// daemon's parser when downloading this URL;
     /// `Domains` — the default when absent (plain-domain lists.purge.cc) —
     /// defers to content auto-detection, which falls back to domain-per-line.
     /// An index.json with a top-level `"format"` discriminator (see the
@@ -157,7 +156,7 @@ impl Catalog {
 
     /// Fetch from a specific URL (for testing or custom catalogs).
     ///
-    /// §4.34: the body is streamed through the bounded
+    /// The body is streamed through the bounded
     /// [`crate::lists::manager::read_bounded_body_bytes`] reader with
     /// [`CATALOG_BODY_MAX_BYTES`] as the cap, then parsed via
     /// `serde_json::from_slice` on the bounded buffer. The whole
@@ -410,13 +409,12 @@ const FALLBACK_ENTRIES: &[(&str, &str)] = &[
     ("services/apple", "https://lists.purge.cc/apple.txt"),
     ("services/meta", "https://lists.purge.cc/meta.txt"),
     ("services/microsoft", "https://lists.purge.cc/microsoft.txt"),
-    // Published upstream, missing here until N1 — the gap `warden lists
-    // catalog` showed and `warden lists add services/resolvers` refused.
     // Deliberately NOT in DEFAULT_SOURCES: subscribing every fresh
-    // install to it by fiat is the non-neutral default `neutrality-03`
-    // removed. The operator opts in.
+    // install to a resolver-hostnames list by fiat would be a non-neutral
+    // default. The operator opts in.
     ("services/resolvers", "https://lists.purge.cc/resolvers.txt"),
     ("services/tiktok", "https://lists.purge.cc/tiktok.txt"),
+    ("services/youtube", "https://lists.purge.cc/youtube.txt"),
 ];
 
 /// Errors from catalog fetch/parse operations.
@@ -431,6 +429,32 @@ pub enum CatalogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One list's row in `tests/fixtures/catalog_census.json` — see
+    /// `scripts/catalog_census.sh` for how the fixture is produced.
+    #[derive(serde::Deserialize)]
+    struct CensusList {
+        id: String,
+        entries: u64,
+        body_bytes: u64,
+    }
+
+    /// Deserialised shape of `tests/fixtures/catalog_census.json`. Shared by
+    /// [`shipped_defaults_keep_headroom_over_the_last_census`] and the live
+    /// drift check in [`fallback_entries_track_the_live_catalog`].
+    #[derive(serde::Deserialize)]
+    struct Census {
+        schema: u32,
+        lists: Vec<CensusList>,
+        union_all: u64,
+        union_default_sources: u64,
+    }
+
+    fn load_census() -> Census {
+        serde_json::from_str(include_str!("../../tests/fixtures/catalog_census.json")).expect(
+            "tests/fixtures/catalog_census.json must parse — re-run scripts/catalog_census.sh",
+        )
+    }
 
     #[test]
     fn fallback_catalog_resolves_known_ids() {
@@ -451,13 +475,13 @@ mod tests {
         assert_eq!(catalog.resolve("nonexistent/list"), None);
     }
 
-    /// N1 — `services/resolvers` was published without landing here.
-    ///
-    /// This is not "offline operators miss an entry". `warden lists
-    /// catalog` renders [`Catalog::fetch`] (live, 17 entries) while
+    /// Guards against a published entry silently missing from the
+    /// fallback table. This is not "offline operators miss an entry":
+    /// `warden lists catalog` renders [`Catalog::fetch`] (live) while
     /// `derive_subscription` resolves against [`Catalog::fallback`]
-    /// (built-in, then 16) — so **every** operator, online or not, was
-    /// shown a list and refused when they typed its slug.
+    /// (built-in) — a gap between the two means **every** operator,
+    /// online or not, sees a list and is refused when they type its
+    /// slug.
     #[test]
     fn fallback_carries_the_services_resolvers_list() {
         assert_eq!(
@@ -532,14 +556,12 @@ mod tests {
 
     #[test]
     fn fallback_has_expected_count() {
-        // 16 → 17 at N1: `services/resolvers` was published upstream and
-        // never landed here. Moving this number is the *intended* cost of
-        // adding an entry — but move it only alongside a real addition,
-        // never to quiet a red: this count and the published index are
-        // supposed to agree (see
-        // `fallback_entries_track_the_live_catalog`).
+        // Moving this number is the *intended* cost of adding an entry —
+        // but move it only alongside a real addition, never to quiet a
+        // red: this count and the published index are supposed to agree
+        // (see `fallback_entries_track_the_live_catalog`).
         let catalog = Catalog::fallback();
-        assert_eq!(catalog.entries().len(), 17);
+        assert_eq!(catalog.entries().len(), 18);
     }
 
     #[test]
@@ -570,11 +592,99 @@ mod tests {
         }
     }
 
+    /// Pins the shipped corpus/per-list defaults against the last real
+    /// census (`tests/fixtures/catalog_census.json`, produced by
+    /// `scripts/catalog_census.sh`) instead of trusting a number written
+    /// into a doc comment once and never re-checked.
+    ///
+    /// Every size comparison here is against the fixture's **union**
+    /// fields, never against a sum of per-list `entries`: the sum
+    /// double-counts every domain that appears on more than one list — on
+    /// the shipped catalog it runs over 2x the union — so comparing it to
+    /// a ceiling accepts a corpus that does not actually fit. That is the
+    /// failure mode `refresh_accepts_a_corpus_whose_pre_dedup_sum_exceeds_the_budget`
+    /// pins on the manager side; this test is the catalog-side half of the
+    /// same invariant.
+    #[test]
+    fn shipped_defaults_keep_headroom_over_the_last_census() {
+        let census = load_census();
+        let defaults = crate::config::settings::ListsConfig::default();
+
+        assert_eq!(
+            census.schema, 1,
+            "unexpected catalog_census.json schema — re-run scripts/catalog_census.sh"
+        );
+        assert!(
+            !census.lists.is_empty(),
+            "catalog_census.json has no lists — re-run scripts/catalog_census.sh"
+        );
+
+        let fallback = Catalog::fallback();
+        let mut violations = Vec::new();
+
+        for l in &census.lists {
+            if fallback.resolve(&l.id).is_none() {
+                violations.push(format!(
+                    "census list '{}' does not resolve in Catalog::fallback() — \
+                     add it to FALLBACK_ENTRIES, or re-run scripts/catalog_census.sh \
+                     if it was retired upstream",
+                    l.id
+                ));
+            }
+        }
+
+        if census.union_all * 100 > defaults.max_total_domains as u64 * 80 {
+            violations.push(format!(
+                "union_all {} leaves less than 20% headroom under max_total_domains {} — \
+                 re-run scripts/catalog_census.sh and raise the ceiling",
+                census.union_all, defaults.max_total_domains
+            ));
+        }
+        if census.union_default_sources * 100 > defaults.max_total_domains as u64 * 80 {
+            violations.push(format!(
+                "union_default_sources {} leaves less than 20% headroom under \
+                 max_total_domains {} — re-run scripts/catalog_census.sh and raise the ceiling",
+                census.union_default_sources, defaults.max_total_domains
+            ));
+        }
+
+        let max_entries_seen = census.lists.iter().map(|l| l.entries).max().unwrap_or(0);
+        if max_entries_seen * 100 > defaults.max_entries as u64 * 80 {
+            violations.push(format!(
+                "the largest census list ({max_entries_seen} entries) leaves less than 20% \
+                 headroom under max_entries {} — re-run scripts/catalog_census.sh and raise \
+                 the per-list cap",
+                defaults.max_entries
+            ));
+        }
+
+        let max_body_seen = census.lists.iter().map(|l| l.body_bytes).max().unwrap_or(0);
+        if max_body_seen * 100 > defaults.max_body_bytes as u64 * 80 {
+            violations.push(format!(
+                "the largest census list body ({max_body_seen} bytes) leaves less than 20% \
+                 headroom under max_body_bytes {} — re-run scripts/catalog_census.sh and \
+                 raise the per-list cap",
+                defaults.max_body_bytes
+            ));
+        }
+
+        let sum_entries: u64 = census.lists.iter().map(|l| l.entries).sum();
+        if !(max_entries_seen <= census.union_all && census.union_all <= sum_entries) {
+            violations.push(format!(
+                "union_all {} is not between the largest single list ({max_entries_seen}) and \
+                 the raw sum of entries ({sum_entries}) — the fixture does not look like a \
+                 real census; re-run scripts/catalog_census.sh",
+                census.union_all
+            ));
+        }
+
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
     /// Hits the real `https://lists.purge.cc/index.json` — needs egress and
     /// a live CDN. Excluded from the default `cargo test` leg so the merge
-    /// gate never depends on a third party (`tests-depend-on-live-cdn-gate-
-    /// hostage`, P2: the 2026-07-23 `lists.purge.cc` proxy fault took this
-    /// test red on both the dev box and the CT with zero code changes).
+    /// gate never depends on a third party (a purge.cc proxy fault would
+    /// take this test red on every box with zero code changes).
     /// Run explicitly, with egress, via:
     /// `cargo test --lib -- --ignored lists::catalog::tests::fetch_live_catalog`
     /// This is the one test that would notice the live catalog schema
@@ -592,23 +702,21 @@ mod tests {
         assert!(catalog.resolve("privacy/ads").is_some());
     }
 
-    /// N1 — the drift detector for [`FALLBACK_ENTRIES`].
+    /// The drift detector for [`FALLBACK_ENTRIES`].
     ///
     /// `derive_subscription` resolves an operator's slug against the
     /// built-in catalog only, deliberately: `warden lists add` mutates
     /// the config, and making that depend on a live fetch would let a
     /// purge.cc outage change what the operator can do, and a poisoned
     /// index write a URL into their config. That choice is sound — but
-    /// it makes [`FALLBACK_ENTRIES`] a **published API surface**, and
-    /// until now nothing checked that it tracked the index. It fell one
-    /// entry behind and the gap surfaced as an operator being refused a
-    /// list the very same binary had just listed.
+    /// it makes [`FALLBACK_ENTRIES`] a **published API surface** that
+    /// nothing else checks against the live index: a gap here surfaces
+    /// as an operator being refused a list the same binary just listed.
     ///
     /// Ignored by default and never wired into the tri-gate: a network
     /// test that gates commits is a purge.cc outage away from blocking
-    /// all work (see [`fetch_live_catalog`], red on two boxes during the
-    /// 2026-07-23 proxy fault). Run it when touching the catalog, and
-    /// when the publisher ships a list:
+    /// all work (see [`fetch_live_catalog`]). Run it when touching the
+    /// catalog, and when the publisher ships a list:
     /// `cargo test --lib -- --ignored lists::catalog::tests::fallback_entries_track`
     ///
     /// Asserts fallback ⊇ live. The converse is deliberately allowed: an
@@ -639,13 +747,49 @@ mod tests {
              Add each to FALLBACK_ENTRIES.",
             missing.len()
         );
+
+        // The headroom test (`shipped_defaults_keep_headroom_over_the_last_census`)
+        // only re-checks offline, against whatever the fixture says — it cannot
+        // tell a stale fixture from a fresh one. This closes that gap: fail loudly
+        // when the live catalog has moved more than the fixture admits.
+        let census = load_census();
+        let drifted: Vec<String> = live
+            .entries()
+            .iter()
+            .filter_map(|e| {
+                let id = e.id();
+                match census.lists.iter().find(|c| c.id == id) {
+                    None => Some(format!("{id}: absent from the census fixture")),
+                    Some(c) => {
+                        let diff = e.entries.abs_diff(c.entries);
+                        let drifted = if c.entries == 0 {
+                            e.entries != 0
+                        } else {
+                            diff * 10 > c.entries
+                        };
+                        drifted.then(|| {
+                            format!(
+                                "{id}: live entries {} vs census {} (> 10% drift)",
+                                e.entries, c.entries
+                            )
+                        })
+                    }
+                }
+            })
+            .collect();
+
+        assert!(
+            drifted.is_empty(),
+            "the live catalog has drifted from the last census: {drifted:?} — \
+             re-run scripts/catalog_census.sh and commit the fixture"
+        );
     }
 
-    // --- §4.34 hostile-upstream regression tests --------------------
+    // --- hostile-upstream regression tests ---------------------------
 
     /// Spawn a one-shot HTTP server that streams `total_bytes` of `0x61`
     /// after writing `headers`. Connection closes on EOF. Same pattern
-    /// as the analogous helper at `lists/manager.rs:2028`; duplicated
+    /// as the analogous helper in `lists/manager.rs`; duplicated
     /// here to keep the catalog test independent of the manager test
     /// scaffolding.
     async fn spawn_one_shot_server(
@@ -681,14 +825,14 @@ mod tests {
         addr
     }
 
-    /// §4.34: a hostile / DNS-poisoned upstream that streams a multi-MiB
+    /// A hostile / DNS-poisoned upstream that streams a multi-MiB
     /// body must be aborted by the projected-size guard inside
     /// `read_bounded_body_bytes`, surfaced as `CatalogError::Fetch`. The
     /// daemon must NOT buffer the entire body before noticing.
     #[tokio::test]
     async fn fetch_from_aborts_on_oversized_body() {
         // 4 MiB body, no Content-Length, connection closes at EOF —
-        // exactly the OOM vector before §4.34. CATALOG_BODY_MAX_BYTES
+        // the OOM vector this guard exists for. CATALOG_BODY_MAX_BYTES
         // is 1 MiB, so we expect a TooLarge / Fetch error within a few
         // chunks past the cap.
         let addr = spawn_one_shot_server(
@@ -721,7 +865,7 @@ mod tests {
         }
     }
 
-    /// §4.34 DISC-1: a slow-streaming upstream must be aborted by the
+    /// A slow-streaming upstream must be aborted by the
     /// per-call timeout, NOT by stalling the boot path indefinitely.
     #[tokio::test]
     async fn fetch_from_aborts_on_slow_stream_timeout() {
@@ -780,7 +924,7 @@ mod tests {
         );
     }
 
-    // --- catalog disk persistence (boot_list_persistence §3.0) ------
+    // --- catalog disk persistence ------------------------------------
 
     /// A persisted catalog round-trips and needs no network.
     #[test]

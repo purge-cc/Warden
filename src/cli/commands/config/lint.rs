@@ -6,8 +6,6 @@
 //! summary with the entity counts. On failure, prints every error on a
 //! separate line with file + line + entity + suggestion attached.
 //!
-//! Design doc §11.2.
-//!
 //! # Exit codes
 //!
 //! - [`SUCCESS`] — the configuration is valid. Warnings may have been
@@ -67,8 +65,8 @@
 //!
 //! **Read-only.** Lint never writes — it loads a path (or a copy) and reports.
 //!
-//! **Warnings (rev-2606 `rev2606-lint-warn-channel`).** The validator emits
-//! its operator WARNs (zero-intersection tags, §5.4 rows, expired schedules)
+//! **Warnings.** The validator emits
+//! its operator WARNs (zero-intersection tags, expired schedules)
 //! via `tracing::warn!(target = "audit", …)`. The daemon's global subscriber
 //! routes those to journald at hot-reload, but the lint CLI installs no
 //! global subscriber, so they would vanish here — defeating lint's
@@ -78,7 +76,7 @@
 //! boot/reload paths are untouched, so their journald output and exit
 //! behaviour are byte-for-byte unchanged.
 //!
-//! **De-raced (`s-rev2606-lint-warn-fixture-flaky-parallel`).** This used to
+//! **De-raced.** This used to
 //! capture the WARNs by installing a thread-scoped `tracing` subscriber
 //! around the load and reading the events back out — using the
 //! process-global tracing dispatcher as a data channel. Under `cargo test`
@@ -232,10 +230,10 @@ mod tests {
     #[test]
     fn lint_returns_zero_for_minimal_valid_fixture() {
         // tests/fixtures/minimal-v1/config.toml is the canonical
-        // one-of-every-entity reference — S28 pinned it as the
-        // happy-path integration shape. Its tag wiring is clean (every
-        // device/profile tag set intersects an enabled list); since N1
-        // it does raise one warning — it omits `[anti_bypass]`, whose
+        // one-of-every-entity reference — the happy-path integration
+        // shape. Its tag wiring is clean (every
+        // device/profile tag set intersects an enabled list); it does
+        // raise one warning — it omits `[anti_bypass]`, whose
         // defaults claim a protection that builds no checker. That is a
         // warning, so the code stays SUCCESS. See
         // `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture`.
@@ -275,9 +273,9 @@ mod tests {
     #[test]
     fn lint_returns_success_for_warnings_only_fixture() {
         // tests/fixtures/warns-v1/config.toml = minimal-v1 plus one
-        // `base = "ignore"` blocklist — the P6 inert WARN, no errors.
-        // (rev-2606 rev2606-lint-warn-channel; the row was a tag orphan
-        // until the plp cutover retired that diagnostic.)
+        // `base = "ignore"` blocklist — the inert WARN, no errors.
+        // (The row was a tag orphan until the tag-model cutover retired
+        // that diagnostic.)
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/warns-v1/config.toml");
         let rc = run_lint(&path, false).unwrap();
@@ -309,8 +307,8 @@ mod tests {
         assert_eq!(
             strict, CONFIG,
             "with --strict the same config must exit 2 — otherwise the flag \
-             parses and does nothing, which is the defect class cli-h5 \
-             deleted four other flags for"
+             parses and does nothing, which is the same defect class other \
+             dead flags get deleted for"
         );
         assert_ne!(
             lenient, strict,
@@ -324,7 +322,7 @@ mod tests {
     ///
     /// The config is minimal-v1 **plus an explicit `[anti_bypass]`
     /// opt-out**, derived into a tempdir rather than checked in. It used
-    /// to point straight at the fixture, and since N1 that fixture raises
+    /// to point straight at the fixture, and that fixture now raises
     /// one warning by design — see
     /// `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture`.
     /// The two requirements are genuinely incompatible in one file:
@@ -382,10 +380,11 @@ mod tests {
         // sees the validator WARN line. BASE_IGNORE_LIST_IS_INERT is the
         // warning the warns-v1 fixture provokes.
         //
-        // It was BLOCKLIST_TAGS_MATCH_NOTHING until the plp cutover. That
-        // WARN was computed from `tags`, which stopped deciding which lists
-        // reach which profile at S3; the fixture row moved to
-        // `base = "ignore"`, which is the shape P6 keeps from being silent.
+        // It was BLOCKLIST_TAGS_MATCH_NOTHING until the tag-model cutover.
+        // That WARN was computed from `tags`, which stopped deciding which
+        // lists reach which profile; the fixture row moved to
+        // `base = "ignore"`, which is the shape the inert-list WARN keeps
+        // from being silent.
         // Asserted through the on-disk fixture rather than an inline config
         // deliberately: this is the path an operator's file actually takes.
         let path =
@@ -402,7 +401,8 @@ mod tests {
 
     /// The reference fixture's warning set, pinned **exactly**.
     ///
-    /// This asserted `warnings.is_empty()` until N1. It went red because
+    /// This asserted `warnings.is_empty()` until the anti_bypass warning
+    /// was added. It went red because
     /// `minimal-v1` omits `[anti_bypass]`, and the section's serde
     /// defaults are `enabled = true, extra_domains = []` — the state that
     /// builds no checker at all. The fixture was not edited to silence
@@ -433,10 +433,10 @@ mod tests {
         );
     }
 
-    // ── tag_model_consolidation §3.3 ─────────────────────────────────
+    // ── inert-list warning coverage ─────────────────────────────────
     //
-    // Lint is NOT rewritten here. §3.3 says its job for the inert-list
-    // work is to *verify* the existing channel already covers both
+    // Lint is NOT rewritten here — the job for the inert-list work is
+    // to *verify* the existing channel already covers both
     // cases and pin that — so these tests only assert, and would catch
     // a future change that silently drops one of the two WARNs out of
     // the capture layer (which is how a signal goes quiet without
@@ -448,7 +448,7 @@ mod tests {
         path
     }
 
-    /// **Case 1, inverted by `plp-s3`.** It used to read "inert case 1 — an
+    /// **Case 1, inverted.** It used to read "inert case 1 — an
     /// allow-list with no tags […] installed, visible, and filters nothing.
     /// This is how `mycompany` got onto the live box."
     ///
@@ -457,7 +457,7 @@ mod tests {
     /// override it. `lint` must therefore stop saying "has no effect" — the
     /// string would have survived the cutover intact and described the
     /// opposite of what the daemon does — and must instead surface the
-    /// standing exposure (§2.5), which is what a permanent, silent allow for
+    /// standing exposure, which is what a permanent, silent allow for
     /// everybody actually is.
     ///
     /// Still WARN, still exit 0: an operator who wants a global allow-list is
@@ -515,12 +515,12 @@ servers = ["192.0.2.1:53"]
     /// to any profile that does not override it. Asserted here alongside
     /// case 1 so "lint covers BOTH" is one visible claim.
     ///
-    /// **This asked about tags until the plp cutover** (`tags =
+    /// **This asked about tags until the tag-model cutover** (`tags =
     /// ["nobody-has-this"]` → `BLOCKLIST_TAGS_MATCH_NOTHING`). Tags stopped
-    /// deciding which lists reach which profile at S3, so that WARN and its
-    /// predicate left; `base = "ignore"` is the shape that means the same
-    /// thing now, and P6 exists precisely so it cannot be silent — it is,
-    /// byte for byte, the 2026-05-07 incident shape.
+    /// deciding which lists reach which profile at that point, so that WARN
+    /// and its predicate left; `base = "ignore"` is the shape that means the
+    /// same thing now, and the inert-list WARN exists precisely so it
+    /// cannot be silent.
     ///
     /// `tests/plp_s3b_rename_and_r7.rs` already pins the WARN at the
     /// validator; what this adds is that it reaches the operator through
@@ -572,7 +572,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    // ── N1 — the anti-bypass drop is loud ────────────────────────────
+    // ── the anti-bypass drop is loud ────────────────────────────
     //
     // `[anti_bypass] enabled = true` with an empty `extra_domains` builds
     // no checker at all (`SecurityLayer::from_config` drops it to `None`
@@ -648,8 +648,8 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// §3.2 — the duplicate-URL rule reaches the operator through the
-    /// same channel, and (§2.1) never as an error: the live config
+    /// The duplicate-URL rule reaches the operator through the
+    /// same channel, and never as an error: the live config
     /// already contains a duplicate pair, and exit 1 there would mean a
     /// daemon that refuses to start.
     #[test]

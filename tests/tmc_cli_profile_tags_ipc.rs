@@ -87,6 +87,7 @@ async fn spawn_fixture() -> Fixture {
         listen_addr: "127.0.0.1:15353".into(),
         upstream_mode: "plain".into(),
         upstream_count: 0,
+        upstream_servers: Vec::new(),
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -193,7 +194,7 @@ async fn a_profile_tags_delta_is_refused_over_ipc_and_writes_nothing() {
 /// The TUI's profile modal submits its whole patch on every save, so a form
 /// that changed only a scalar can carry `TagsPatch { add: [], remove: [] }`.
 /// Refusing that would make unrelated fields unwritable through a rule about
-/// tags — the refusal-that-cannot-be-satisfied shape project rules records for
+/// tags — the refusal-that-cannot-be-satisfied shape CLAUDE.md records for
 /// the old TUI consent gate.
 #[tokio::test]
 async fn an_empty_tags_delta_is_not_refused() {

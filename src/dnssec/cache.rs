@@ -1,4 +1,4 @@
-//! Validation-verdict cache (§4.10-3a).
+//! Validation-verdict cache.
 //!
 //! Walking the chain of trust is expensive — several upstream round-trips and
 //! signature verifications per name. This cache memoises the [`ChainResult`] for
@@ -9,8 +9,8 @@
 //!
 //! Validation runs **off** the hot query path (the chain walk awaits upstream
 //! fetches), so unlike the answer cache this may use a lock-bearing cache —
-//! [`moka`], the same crate the answer cache uses. The cache is engine-only this
-//! sprint: nothing in the live path reads or writes it yet (that is §4.10-4).
+//! [`moka`], the same crate the answer cache uses. The cache is engine-only:
+//! nothing in the live path reads or writes it yet.
 
 use std::time::Duration;
 
@@ -62,13 +62,12 @@ impl VerdictCache {
 
     /// Cache `result` for `(name, rtype)` for the configured TTL.
     ///
-    /// Defense-in-depth (cache-01): only STABLE verdicts are cacheable. A
-    /// transient [`ChainResult::Indeterminate`] (a tripped DoS cap, a failed
-    /// fetch, no anchor match, or a no-DS delegation awaiting a denial proof) is
-    /// dropped — caching it would pin a transient outage for the full TTL
-    /// (`dnssec_validation.md` §4.10-4b). The out-of-section caller already
-    /// filters; keeping the invariant here means a future caller cannot silently
-    /// regress availability.
+    /// Defense-in-depth: only STABLE verdicts are cacheable. A transient
+    /// [`ChainResult::Indeterminate`] (a tripped DoS cap, a failed fetch, no
+    /// anchor match, or a no-DS delegation awaiting a denial proof) is
+    /// dropped — caching it would pin a transient outage for the full TTL.
+    /// The caller already filters; keeping the invariant here means a
+    /// future caller cannot silently regress availability.
     pub async fn insert(&self, name: &Name, rtype: RecordType, result: ChainResult) {
         if matches!(result, ChainResult::Indeterminate(_)) {
             return;
@@ -134,8 +133,8 @@ mod tests {
     #[tokio::test]
     async fn entry_expires_after_ttl() {
         let cache = VerdictCache::with_ttl(Duration::from_millis(40), 16);
-        // A STABLE verdict (cache-01: an Indeterminate would be refused) so the
-        // test exercises TTL expiry, not the cacheability gate.
+        // A STABLE verdict (an Indeterminate would be refused) so the test
+        // exercises TTL expiry, not the cacheability gate.
         cache
             .insert(&n("example.org."), RecordType::A, ChainResult::Secure)
             .await;
@@ -152,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn insert_refuses_indeterminate() {
         let cache = VerdictCache::new(&DnssecConfig::default());
-        // cache-01: a transient verdict must never be cached…
+        // A transient verdict must never be cached…
         cache
             .insert(
                 &n("example.org."),

@@ -26,7 +26,7 @@ use super::atomic_window::AtomicWindowCounter;
 use super::bounded_map::BoundedMap;
 use crate::config::settings::RrlConfig;
 
-/// Hard cap on the number of tracked destination prefixes (P0-4).
+/// Hard cap on the number of tracked destination prefixes.
 ///
 /// RRL buckets keyed per /24 (IPv4) or /48 (IPv6) give 2^24 and 2^48
 /// possible keys respectively. A spoofed-source amplification flood can
@@ -55,17 +55,18 @@ pub enum RrlAction {
 /// Per-/24 (or /48 for IPv6) counter state.
 struct PrefixState {
     /// Packed `[count:u32 | window_start_secs:u32]` — atomic window reset
-    /// closes the Hermes T2.3 TOCTOU between the prior two-store reset
-    /// pattern. Preserves the L-11 invariant: first responder sees prior
-    /// count = 0, so a single `check_and_bump` covers first-responder and
-    /// subsequent-responder paths uniformly.
+    /// closes the TOCTOU a two-store reset pattern would have between the
+    /// window-start write and the count write. Preserves the invariant
+    /// that the first responder sees prior count = 0, so a single
+    /// `check_and_bump` covers first-responder and subsequent-responder
+    /// paths uniformly.
     counter: AtomicWindowCounter,
-    /// Per-prefix slip selection counter (rrl-02, rev-2606). BIND-style:
-    /// each throttled prefix gets its own deterministic 1-in-N TC-slip
-    /// cadence. Pre-fix this was one global counter, so under concurrent
-    /// over-budget prefixes one victim /24 could draw consecutive Drops
-    /// (clients waiting out full timeouts) while another absorbed the
-    /// Slips — the alternation was only statistical globally.
+    /// Per-prefix slip selection counter. BIND-style: each throttled
+    /// prefix gets its own deterministic 1-in-N TC-slip cadence. A
+    /// single global counter would let one victim /24 draw consecutive
+    /// Drops (clients waiting out full timeouts) while another absorbed
+    /// the Slips under concurrent over-budget prefixes — the alternation
+    /// would only be statistical globally.
     slip: AtomicU32,
 }
 
@@ -82,7 +83,7 @@ impl PrefixState {
 ///
 /// Backed by a [`BoundedMap`] capped at [`MAX_TRACKED_PREFIXES`] — prevents
 /// memory DoS from spoofed-source floods that would otherwise create one
-/// tracker per attacker-chosen /24 or /48 (P0-4).
+/// tracker per attacker-chosen /24 or /48.
 pub struct Rrl {
     prefixes: BoundedMap<u64, PrefixState>,
     /// Live-swappable throughput settings. See [`RrlParams`].
@@ -112,10 +113,10 @@ impl RrlParams {
     fn from_config(config: &RrlConfig) -> Self {
         Self {
             responses_per_second: config.responses_per_second,
-            // settings-12 (rev-2606): a zero window resets the counter on
-            // every probe and zeroes max_count — RRL silently off. The
-            // validator rejects 0 when rrl is enabled; this floor is the
-            // backstop for construction AND reload paths that bypass it.
+            // A zero window resets the counter on every probe and zeroes
+            // max_count — RRL silently off. The validator rejects 0
+            // when rrl is enabled; this floor is the backstop for
+            // construction AND reload paths that bypass it.
             window_secs: config.window_secs.max(1),
             slip_rate: config.slip_rate,
         }
@@ -138,26 +139,27 @@ impl Rrl {
     }
 
     /// Current number of tracked destination prefixes.
-    #[allow(dead_code)] // wired to stats/metrics in P1-13
+    #[allow(dead_code)] // not yet wired to stats/metrics
     pub fn entry_count(&self) -> usize {
         self.prefixes.len()
     }
 
     /// Check if a response to this destination IP should be allowed, dropped, or slipped.
     ///
-    /// L-11 (rev-2026-05-rrl-tunneling-toctou): atomic get-or-insert via
-    /// [`super::bounded_map::BoundedMap::entry_or_insert_with`] closes the
-    /// prior get-then-insert race. Pre-fix two concurrent first responses
-    /// to a fresh prefix both saw `get(...) = None` and both ran
-    /// `prefixes.insert(...)`, with the second `insert` overwriting the
-    /// first — the per-prefix counter restarted at 1 instead of climbing.
-    /// On a spoofed-source amplification flood (the scenario RRL exists to
-    /// mitigate) this leaked the budget by `concurrency` on every fresh
-    /// /24 the attacker chose. Mirrors the L-1 fix in `rate_limiter.rs`.
+    /// Atomic get-or-insert via
+    /// [`super::bounded_map::BoundedMap::entry_or_insert_with`] closes a
+    /// get-then-insert race a naive check-then-insert would have. Two
+    /// concurrent first responses to a fresh prefix would otherwise both
+    /// see `get(...) = None` and both run `prefixes.insert(...)`, with
+    /// the second `insert` overwriting the first — the per-prefix
+    /// counter restarting at 1 instead of climbing. On a spoofed-source
+    /// amplification flood (the scenario RRL exists to mitigate) this
+    /// would leak the budget by `concurrency` on every fresh /24 the
+    /// attacker chose. Mirrors the same fix in `rate_limiter.rs`.
     ///
-    /// Hermes T2.3 (rev-2026-05-18): window reset uses the packed
-    /// [`AtomicWindowCounter`] so the prior two-store reset (ws then
-    /// count) is now a single CAS — no torn intermediate state.
+    /// Window reset uses the packed [`AtomicWindowCounter`] so a
+    /// two-store reset (ws then count) is a single CAS — no torn
+    /// intermediate state.
     ///
     /// `per_client` narrows the budget from a shared prefix to this exact
     /// address. See [`client_key`] for why the caller — not this function
@@ -175,11 +177,11 @@ impl Rrl {
         };
         let now_secs = self.created_at.elapsed().as_secs();
         let p = self.params.load();
-        // settings-12 (rev-2606): saturate the u64→u32 narrowing instead of
-        // `as`-truncating it — a window of exactly 2^32 truncated to 0,
-        // turning the budget into "throttle everything". Saturation errs
-        // toward a huge budget (≈ RRL off for absurd windows), never a
-        // zero one; the validator bounds the window to 1..=86400 anyway.
+        // Saturate the u64→u32 narrowing instead of `as`-truncating it —
+        // a window of exactly 2^32 would truncate to 0, turning the
+        // budget into "throttle everything". Saturation errs toward a
+        // huge budget (≈ RRL off for absurd windows), never a zero one;
+        // the validator bounds the window to 1..=86400 anyway.
         let window_u32 = u32::try_from(p.window_secs).unwrap_or(u32::MAX);
         let max_count = p.responses_per_second.saturating_mul(window_u32);
 
@@ -188,11 +190,11 @@ impl Rrl {
             .entry_or_insert_with(prefix_key, || PrefixState::new(now_secs));
 
         let count = state.counter.check_and_bump(now_secs, p.window_secs);
-        // rrl-02 (rev-2606): slip selection reads the prefix's OWN counter,
-        // so the decision happens while the shard guard is still held —
-        // one Relaxed fetch_add, nanoseconds. (The pre-fix guard-drop here
-        // protected same-shard inserts from waiting on the then-*global*
-        // slip counter; per-prefix state removed that coupling.)
+        // Slip selection reads the prefix's OWN counter, so the decision
+        // happens while the shard guard is still held — one Relaxed
+        // fetch_add, nanoseconds. A global slip counter would instead
+        // force same-shard inserts to wait on it; per-prefix state
+        // removes that coupling.
         let action = if count < max_count {
             RrlAction::Allow
         } else {
@@ -202,10 +204,10 @@ impl Rrl {
         action
     }
 
-    /// Decide between Drop and Slip from the prefix's slip counter
-    /// (rrl-02: per-prefix, BIND-style — each victim /24 gets its own
-    /// deterministic 1-in-N TC-slip cadence instead of competing with
-    /// every other throttled prefix for a global alternation).
+    /// Decide between Drop and Slip from the prefix's slip counter —
+    /// per-prefix, BIND-style: each victim /24 gets its own deterministic
+    /// 1-in-N TC-slip cadence instead of competing with every other
+    /// throttled prefix for a global alternation.
     ///
     /// `slip_rate` is passed in rather than reread from `self.params` so
     /// that [`Self::check`]'s single load stays the only one on this path.
@@ -249,12 +251,10 @@ impl Rrl {
 /// # Why it is nonetheless right inside `allow_from`
 ///
 /// Grouping the whole household into a single budget made one device able
-/// to deny service to another. Measured 2026-07-28 on the live CT: a
-/// 500-query burst from the dev box (192.0.2.14) caused RRL_DROP and
-/// RRL_SLIP on a real Philips Hue bridge (192.0.2.243) and a second
-/// device, purely because they shared 192.0.2.0/24 — with the CT running
-/// `responses_per_second = 5`, i.e. 75 responses per 15s window for the
-/// entire house. Baseline throttling outside that test window was zero.
+/// to deny service to another: a 500-query burst from one dev box was
+/// enough to trip RRL_DROP and RRL_SLIP on an unrelated IoT device
+/// sharing the same /24 — with `responses_per_second = 5` (75 responses
+/// per 15s window), that single prefix budget covers the entire house.
 ///
 /// Within `allow_from` the spoofing calculus also changes: the ACL has
 /// already refused anything outside those CIDRs (the refusal exits above
@@ -341,14 +341,14 @@ mod tests {
     /// not be able to exhaust another device's response budget.
     ///
     /// Reproduces the measured incident — a burst from the dev box
-    /// (192.0.2.14) throttled a Philips Hue bridge (192.0.2.243) sharing
-    /// 192.0.2.0/24. The control arm runs the identical burst with
+    /// (10.10.1.14) throttled a Philips Hue bridge (10.10.1.243) sharing
+    /// 10.10.1.0/24. The control arm runs the identical burst with
     /// `per_client = false` and asserts the victim IS throttled, so a pass
     /// cannot come from the budget simply being generous.
     #[test]
     fn a_noisy_device_cannot_exhaust_its_neighbours_budget() {
-        let noisy = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 14));
-        let victim = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 243));
+        let noisy = IpAddr::V4(Ipv4Addr::new(10, 10, 1, 14));
+        let victim = IpAddr::V4(Ipv4Addr::new(10, 10, 1, 243));
 
         let cfg = RrlConfig {
             enabled: true,
@@ -386,7 +386,7 @@ mod tests {
     /// one client spend another's budget. Bit 63 = IPv6, bit 62 = per-client.
     #[test]
     fn client_and_prefix_key_spaces_never_collide() {
-        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 14));
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 10, 1, 14));
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
 
         let keys = [
@@ -405,7 +405,7 @@ mod tests {
 
         // Per-client keying must separate addresses that prefix keying
         // deliberately merges — the whole point of the mode.
-        let neighbour = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 243));
+        let neighbour = IpAddr::V4(Ipv4Addr::new(10, 10, 1, 243));
         assert_eq!(prefix_key(&v4), prefix_key(&neighbour));
         assert_ne!(client_key(&v4), client_key(&neighbour));
     }
@@ -438,10 +438,9 @@ mod tests {
         assert_ne!(prefix_key(&v4), prefix_key(&v6));
     }
 
-    /// settings-12 (rev-2606): a window of exactly 2^32 used to truncate to
-    /// 0 via `as u32`, zeroing max_count — every response throttled, RRL
-    /// effectively inverted. The saturating conversion must keep the budget
-    /// huge instead.
+    /// A window of exactly 2^32 would truncate to 0 via `as u32`, zeroing
+    /// max_count — every response throttled, RRL effectively inverted.
+    /// The saturating conversion must keep the budget huge instead.
     #[test]
     fn oversized_window_saturates_instead_of_throttling_all() {
         let rrl = Rrl::new(&test_config(10, (u32::MAX as u64) + 16, 0));
@@ -453,9 +452,9 @@ mod tests {
         );
     }
 
-    /// settings-12 (rev-2606): window_secs = 0 reset the counter on every
-    /// probe and zeroed max_count (throttle-all). The constructor floor
-    /// keeps a validator-bypassing zero from disabling RRL.
+    /// window_secs = 0 would reset the counter on every probe and zero
+    /// max_count (throttle-all). The constructor floor keeps a
+    /// validator-bypassing zero from disabling RRL.
     #[test]
     fn zero_window_floored_at_construction() {
         let rrl = Rrl::new(&test_config(10, 0, 0));
@@ -516,13 +515,13 @@ mod tests {
         );
     }
 
-    /// rrl-02 (rev-2606) regression: slip selection is per-prefix. With
-    /// the old single global counter, two concurrently-throttled prefixes
-    /// shared one alternation — one victim /24 could draw consecutive
-    /// Drops while the other absorbed the Slips. Per-prefix state makes
-    /// the cadence deterministic: with slip_rate = 2 every prefix's FIRST
-    /// throttled response is a Slip (its own counter starts at 0), then
-    /// alternates, regardless of what other prefixes are doing.
+    /// Slip selection is per-prefix. A single global counter would let
+    /// two concurrently-throttled prefixes share one alternation — one
+    /// victim /24 drawing consecutive Drops while the other absorbed the
+    /// Slips. Per-prefix state makes the cadence deterministic: with
+    /// slip_rate = 2 every prefix's FIRST throttled response is a Slip
+    /// (its own counter starts at 0), then alternates, regardless of
+    /// what other prefixes are doing.
     #[test]
     fn slip_selection_is_per_prefix_deterministic() {
         let rrl = Rrl::new(&test_config(1, 1, 2));
@@ -554,11 +553,11 @@ mod tests {
         assert_eq!(rrl.check(&ip_b, false), RrlAction::Slip, "prefix B third");
     }
 
-    /// rrl-01 (rev-2606) regression: the DEFAULT config must absorb a busy
-    /// home LAN. RRL keys by /24 and a home LAN is exactly one /24, so the
-    /// budget is shared by every device — pre-fix it was 5 resp/s × 15 s
-    /// = 75 per window, which two browsing sessions exceeded (50 % TC-slip +
-    /// 50 % silent drop on the overflow). With the raised default, 16
+    /// The DEFAULT config must absorb a busy home LAN. RRL keys by /24
+    /// and a home LAN is exactly one /24, so the budget is shared by
+    /// every device — a low default (5 resp/s × 15 s = 75 per window)
+    /// two browsing sessions alone would exceed (50% TC-slip + 50%
+    /// silent drop on the overflow). With the current default, 16
     /// devices × 50 responses inside one window (800 total — well above a
     /// realistic LAN peak) must all be allowed.
     #[test]
@@ -649,17 +648,16 @@ mod tests {
 
     #[test]
     fn concurrent_first_responses_capped_at_max_count() {
-        // L-11 (rev-2026-05-rrl-tunneling-toctou) regression pin: two or
-        // more concurrent first responses to the same fresh /24 previously
-        // each passed the `get(...) = None` check and each inserted a
-        // fresh PrefixState — the last writer won, but the per-prefix
-        // counter restarted from 1 instead of climbing, leaking the
-        // budget by `concurrency` on every fresh prefix an attacker
-        // chose. The fix replaces get-then-insert with
-        // `BoundedMap::entry_or_insert_with`, atomic at the shard level.
+        // Regression pin: a naive get-then-insert would let two or more
+        // concurrent first responses to the same fresh /24 each pass the
+        // `get(...) = None` check and each insert a fresh PrefixState —
+        // the last writer wins, but the per-prefix counter restarts from
+        // 1 instead of climbing, leaking the budget by `concurrency` on
+        // every fresh prefix an attacker chose. `BoundedMap::entry_or_insert_with`
+        // is atomic at the shard level, which closes this.
         // Pin: with `max_count = 2` and 8 threads racing on the same
         // fresh /24, exactly 2 Allows surface (the other 6 see Drop).
-        // Mirrors L-1's `concurrent_first_queries_share_one_burst_budget`
+        // Mirrors `concurrent_first_queries_share_one_burst_budget`
         // in `rate_limiter.rs`.
         use std::sync::{Arc, Barrier};
         use std::thread;

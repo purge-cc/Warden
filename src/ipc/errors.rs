@@ -1,41 +1,40 @@
-//! §4.33 — Frozen IPC error envelope.
+//! Frozen IPC error envelope.
 //!
 //! Every operator-facing error path the daemon writes onto the IPC
-//! socket flows through [`IpcError`]. The on-wire shape is unchanged
-//! from the pre-§4.33 daemon — `IpcResponse::Error { message: String }`
-//! still ships as a JSON string field — but the daemon-side code can
-//! no longer pass arbitrary `format!()` payloads into that field. Per-
-//! site detail (file paths, validator dumps, internal type names) now
-//! lives on the daemon log via `tracing::warn!(target: "ipc.error",
-//! ...)`; the wire-side `message` is one of a small set of frozen
-//! operator strings indexed by [`IpcError`] variant.
+//! socket flows through [`IpcError`]. The on-wire shape is
+//! `IpcResponse::Error { message: String }` — a JSON string field —
+//! but daemon-side code must not pass arbitrary `format!()` payloads
+//! into that field. Per-site detail (file paths, validator dumps,
+//! internal type names) lives on the daemon log via
+//! `tracing::warn!(target: "ipc.error", ...)`; the wire-side
+//! `message` is one of a small set of frozen operator strings indexed
+//! by [`IpcError`] variant.
 //!
 //! Why this exists:
 //!
-//! 1. **Pre-§4.32, the IPC socket was 0o660 group-readable.** Any
-//!    process in the `purge-warden` group could read error payloads.
-//!    Leaking `config_path.display()` to those payloads disclosed the
-//!    daemon's filesystem layout. §4.32 tightened the socket to
-//!    0o600 + peer-uid gate; §4.33 closes the same hole on the
-//!    payload axis.
-//! 2. **S37 frozen-strings was never extended to IPC.** Other modules
-//!    pin operator strings via byte-for-byte test gates so a refactor
-//!    cannot silently re-word a message that scripts grep on. The
-//!    IPC error path was the largest unfrozen surface left in the
-//!    codebase (~91 sites). This module brings it under the same
-//!    invariant.
+//! 1. **The IPC socket's permissions gate who can connect, not what a
+//!    connected peer can read on the wire.** Putting
+//!    `config_path.display()` or similar detail into an error payload
+//!    would disclose the daemon's filesystem layout to any process
+//!    that can open the socket. Keeping paths off the wire is a
+//!    second line of defense independent of the socket's mode bits.
+//! 2. **Frozen strings let operator tooling depend on exact text.**
+//!    Other modules pin operator-facing strings via byte-for-byte
+//!    test gates so a refactor cannot silently re-word a message that
+//!    scripts grep on. This module brings the IPC error path under
+//!    the same invariant.
 //!
 //! How to use:
 //!
 //! ```ignore
 //! use crate::ipc::errors::{ipc_error, IpcError};
 //!
-//! // Path-leaking site BEFORE:
+//! // Path-leaking:
 //! return IpcResponse::Error {
 //!     message: format!("couldn't write {}: {e}.", config_path.display()),
 //! };
 //!
-//! // Site AFTER §4.33:
+//! // Instead:
 //! tracing::warn!(
 //!     target: "ipc.error",
 //!     path = %config_path.display(),
@@ -259,21 +258,21 @@ pub enum IpcError {
         ip: String,
     },
 
-    /// `profile_list_policy` §4 S4 — a `ListPolicyPatch.set` key that no
-    /// `[[blocklists]]` entry declares. Refused in the handler rather
-    /// than left to the post-write validator's `CrossRefMiss`: that
-    /// rejects the WHOLE file, so the other fields of the same patch are
-    /// lost along with the typo.
+    /// A `ListPolicyPatch.set` key that no `[[blocklists]]` entry
+    /// declares. Refused in the handler rather than left to the
+    /// post-write validator's `CrossRefMiss`: that rejects the WHOLE
+    /// file, so the other fields of the same patch are lost along with
+    /// the typo.
     ListPolicyUnknownList {
         id: String,
         list: String,
     },
 
-    /// `profile_list_policy` §4 S4 / §2.3 — a per-profile `allow`
-    /// override on a `trust = remote-unsigned` list whose row does not
-    /// already carry `accept_unsigned_allow = true`. An override cannot
-    /// declare that consent: at the daemon there is no operator to ask,
-    /// and rewriting the list's row would widen the declaration to every
+    /// A per-profile `allow` override on a `trust = remote-unsigned`
+    /// list whose row does not already carry
+    /// `accept_unsigned_allow = true`. An override cannot declare that
+    /// consent: at the daemon there is no operator to ask, and
+    /// rewriting the list's row would widen the declaration to every
     /// other profile overriding it.
     OverrideAllowNeedsConsent {
         id: String,
@@ -341,7 +340,7 @@ impl IpcError {
 /// Build an [`IpcResponse::Error`] from a frozen [`IpcError`] variant.
 ///
 /// This is the only sanctioned constructor for `IpcResponse::Error` in
-/// `socket_server.rs` post-§4.33. The trip-wire test
+/// `socket_server.rs`. The trip-wire test
 /// `tests/frozen_strings_ipc_errors.rs` greps `socket_server.rs` for
 /// any direct `IpcResponse::Error { message: format!` and fails CI if
 /// one slips back in.

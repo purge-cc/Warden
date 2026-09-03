@@ -34,12 +34,12 @@ impl UpstreamResolver {
     ///
     /// The `client` is the shared reqwest::Client (used for DoH and list downloads).
     ///
-    /// **§4.8 §2/2 (T4):** the per-profile ECS option is no longer
-    /// baked into the upstream at construction time; the handler now
-    /// derives it per query from the resolved profile and passes it
-    /// through [`Upstream::lookup`]. The `[upstream.ecs].enabled`
-    /// master switch still gates the plain-transport dispatch
-    /// (Resolver vs Raw) because `hickory_resolver` has no ECS API.
+    /// The per-profile ECS option is not baked into the upstream at
+    /// construction time; the handler derives it per query from the
+    /// resolved profile and passes it through [`Upstream::lookup`]. The
+    /// `[upstream.ecs].enabled` master switch still gates the
+    /// plain-transport dispatch (Resolver vs Raw) because `hickory_resolver`
+    /// has no ECS API.
     pub fn from_config(
         config: &UpstreamConfig,
         client: &reqwest::Client,
@@ -55,8 +55,8 @@ impl UpstreamResolver {
             client,
             dot_pool_size,
             ecs_enabled,
-            // §4.10: the client-facing resolver never sets the DO bit — the
-            // DNSSEC validator builds its own DO-on upstream (§4.10-4b).
+            // The client-facing resolver never sets the DO bit — the DNSSEC
+            // validator builds its own DO-on upstream.
             false,
         )?;
         let primary = CircuitBreaker::new(primary);
@@ -87,7 +87,7 @@ impl UpstreamResolver {
         Ok(Self { primary, fallback })
     }
 
-    /// §4.10-4b — build a DNSSEC-validating sibling of the client-facing
+    /// Build a DNSSEC-validating sibling of the client-facing
     /// resolver: identical upstream targets (primary + fallback, same circuit
     /// breakers) but every leaf query carries the DO bit (`dnssec_ok = true`),
     /// so RRSIG / NSEC / NSEC3 material arrives for the chain walk. ECS is
@@ -109,7 +109,7 @@ impl UpstreamResolver {
             client,
             dot_pool_size,
             false, // ecs_enabled — the validator queries by name, no client subnet
-            true,  // dnssec_ok — DO + CD + 1232-byte EDNS buffer (§4.10-4a)
+            true,  // dnssec_ok — DO + CD + 1232-byte EDNS buffer
         )?);
 
         let fallback = match &config.fallback {
@@ -137,7 +137,7 @@ impl UpstreamResolver {
 
 /// Build an upstream implementation from mode + servers.
 ///
-/// `dnssec_ok` bakes the EDNS DO bit into the leaf transport (§4.10): the
+/// `dnssec_ok` bakes the EDNS DO bit into the leaf transport: the
 /// client-facing resolver passes `false` (byte-identical wire packets); the
 /// DNSSEC validator's upstream passes `true`. For `Plain` it forces the
 /// raw-socket path, since hickory's `Resolver` has no DO knob.
@@ -157,7 +157,7 @@ pub(crate) fn build_upstream(
         }
         UpstreamMode::Doh => {
             // DoH + DoT have ECS injection at the wire-format layer
-            // (build_query_bytes); they don't need a constructor-time
+            // (build_query); they don't need a constructor-time
             // flag.
             let _ = ecs_enabled;
             let upstream = DohUpstream::new(client.clone(), servers.to_vec(), timeout, dnssec_ok)?;

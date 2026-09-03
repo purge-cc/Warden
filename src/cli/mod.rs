@@ -207,7 +207,7 @@ pub enum Commands {
     /// REFUSED is an answer, not an error — it no longer shares a code
     /// with "could not compute an answer".
     Resolve {
-        /// Source IP address to resolve (e.g. `192.0.2.107`).
+        /// Source IP address to resolve (e.g. `10.10.1.107`).
         ip: std::net::IpAddr,
     },
     /// Manage list subscriptions
@@ -928,7 +928,7 @@ pub enum DeviceAction {
         /// Group memberships (comma-separated ids).
         #[arg(long, value_delimiter = ',')]
         groups: Vec<String>,
-        /// Optional human owner ("Alex", "Sam")
+        /// Optional human owner ("Operator", "Casey")
         #[arg(long)]
         owner: Option<String>,
         /// Optional device label ("iPad personale")
@@ -1303,7 +1303,8 @@ pub enum BlocklistAction {
         /// Update interval in hours. Default: 12.
         #[arg(long)]
         update_interval_hours: Option<u32>,
-        /// Maximum acceptable entry count. Default: 5_000_000.
+        /// Entry cap recorded on this list. The daemon enforces the global
+        /// `[lists] max_entries` (default 20_000_000), not this value.
         #[arg(long)]
         max_entries: Option<u64>,
         /// Whether this list is active.
@@ -1516,8 +1517,43 @@ pub enum ClusterAction {
         #[arg(long, value_name = "ADDR:PORT")]
         upstream: Option<String>,
     },
+    /// Primary: turn clustering on and mint the TLS material a secondary
+    /// will pin. Writes `[cluster]` and `[api]` in ONE validated write —
+    /// they cannot be separate, because `api.enabled = true` is refused at
+    /// load until the token hash and the TLS pair are all present together.
+    Enable {
+        /// This node's cluster role.
+        #[arg(long, value_enum)]
+        role: EnableRole,
+        /// An address a secondary will use to reach this node. Repeatable.
+        /// Required when this node has no `api.tls_cert` yet. Bare host or
+        /// IP — no scheme, no port, no path.
+        #[arg(long = "san", value_name = "ADDR")]
+        sans: Vec<String>,
+        /// Bind address for the API server, e.g. 192.0.2.10:8053. A primary
+        /// must be reachable by its secondaries, and the default listen is
+        /// loopback — without this the operator is back to hand-editing
+        /// TOML, which is what this verb exists to remove.
+        #[arg(long, value_name = "IP:PORT")]
+        api_listen: Option<SocketAddr>,
+        /// Certificate validity in days. A pinned self-signed certificate
+        /// has no CA to expire against, and rotating it means touching both
+        /// nodes — so the default is long on purpose.
+        #[arg(long, default_value_t = 3650)]
+        validity_days: u32,
+    },
     /// Print this node's cluster role / peer / enabled state.
     Status,
+}
+
+// Both variants exist so `--role secondary` reaches the verb and is refused
+// by name, pointing at `cluster join`. With only `Primary`, clap's own
+// "invalid value for '--role'" is what a mistaken operator sees, and that
+// error cannot name the verb they actually wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EnableRole {
+    Primary,
+    Secondary,
 }
 
 #[derive(Subcommand)]

@@ -376,9 +376,9 @@ mod tests {
     /// written to admit.
     #[test]
     fn any_contains_matches_an_ipv4_mapped_source() {
-        let acl = vec![Cidr::parse("192.0.2.0/24").unwrap()];
-        assert!(any_contains(&acl, "::ffff:192.0.2.5".parse().unwrap()));
-        assert!(any_contains(&acl, "192.0.2.5".parse().unwrap()));
+        let acl = vec![Cidr::parse("10.10.1.0/24").unwrap()];
+        assert!(any_contains(&acl, "::ffff:10.10.1.5".parse().unwrap()));
+        assert!(any_contains(&acl, "10.10.1.5".parse().unwrap()));
 
         // Controls: normalising must widen the ACL to the mapped spelling of
         // the SAME addresses, and to nothing else.

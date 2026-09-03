@@ -19,20 +19,16 @@ use crate::tui::query_log_filter_modal::QueryLogFilterModal;
 
 // ── Sections + Leaves ───────────────────────────────────────────────────────
 //
-// Sprint 45 T1: the flat 9-tab menu was renamed `Tab` → `Leaf` and grouped
-// under a 4-entry `Section` enum (Overview / Network / Filtering / Settings).
-//
-// Sprint 46 T1: post-S45 UX review promoted Dashboard and Query Log out of
-// the artificial "Overview" hub to top-level. The `Section` enum is now
+// The flat tab menu is renamed `Tab` → `Leaf` and grouped
+// under a `Section` enum. The `Section` enum is
 // 5-entry — Dashboard / QueryLog / Network / Filtering / Settings — with
 // three singleton sections (Dashboard / QueryLog / Settings) that render no
 // sub-tab strip. The mnemonic table + linear `Tab`/`Shift+Tab` cycle stay
-// identical to S45; only the top-level shape changes. See
-// `_docs/features/tui_menu_ux_refinement.md` §2.1 for the authoritative spec.
+// identical across that split; only the top-level shape changes.
 //
-// §4.67-a (2026-08-05): `Filtering` → `Filters`, `Settings` → `Configuration`,
-// and `Leaf::Tags` re-homed from the first to the second. The IA rule in force
-// since 2026-07-24 split the world into two questions — "who is on the wire"
+// `Filtering` → `Filters`, `Settings` → `Configuration`,
+// and `Leaf::Tags` re-homed from the first to the second. The IA rule
+// splits the world into two questions — "who is on the wire"
 // (Network) and "what policy applies" (Filtering). A vocabulary registry
 // answers neither, so Tags sat in Filtering for want of a better box. The
 // third question — "what elements exist to be reused" — is `Configuration`,
@@ -45,7 +41,7 @@ use crate::tui::query_log_filter_modal::QueryLogFilterModal;
 ///
 /// `#[cfg]` cannot sit on an element of an array literal — an attribute in
 /// expression position needs `stmt_expr_attributes`, which is unstable. That
-/// is why the pre-§4.67-a code carried two entire `Leaf::ALL` arrays. Gating
+/// is why the code used to carry two entire `Leaf::ALL` arrays. Gating
 /// the whole `const` is the stable shape; this macro keeps the five core rows
 /// written exactly once regardless of how many `const`s that costs.
 macro_rules! layout_table {
@@ -53,13 +49,13 @@ macro_rules! layout_table {
         &[
             (Section::Dashboard, &[Leaf::Dashboard] as &[Leaf]),
             (Section::QueryLog, &[Leaf::QueryLog]),
-            // §4.64 G1: Groups sits second, right after Devices — the order the
+            // Groups sits second, right after Devices — the order the
             // operator asked for. `default_leaf(Network)` stays Devices.
             (
                 Section::Network,
                 &[Leaf::Devices, Leaf::Groups, Leaf::Subnets, Leaf::LocalDns],
             ),
-            // §4.67-a MN6: order is Profiles, Lists, Rules — the 2026-07-24
+            // Order is Profiles, Lists, Rules — the
             // decision that a profile is the policy hub an operator tuning
             // filtering reaches for, while lists are background-synced content
             // with the lowest daily interaction rate. Putting lists first
@@ -76,14 +72,14 @@ macro_rules! layout_table {
                     Leaf::Rules,
                 ],
             ),
-            // §4.67-a MN5: Tags is vocabulary, not policy. Settings keeps its
+            // Tags is vocabulary, not policy. Settings keeps its
             // own leaf here — it carries the Tracking form and backup/restore
             // (`b` / `R`), so the section rename does not retire it.
-            // §4.67-b MN3: File is APPENDED, not prepended. `default_leaf`
+            // File is APPENDED, not prepended. `default_leaf`
             // does not read this row, but the `[`/`]` cycle does, and putting
             // the viewer before Settings would move where that cycle lands
             // for no operator-visible gain.
-            // `logs-tab`: Logs is APPENDED for the same reason File was —
+            // Logs is APPENDED for the same reason File was —
             // the operator's rule is that a section lands on its LEFTMOST
             // leaf, so anything but the tail would move where `5` lands.
             // Configuration keeps landing on Labels.
@@ -96,7 +92,7 @@ macro_rules! layout_table {
     };
 }
 
-/// **Single source of truth for the TUI navigation hierarchy** (§4.67-a).
+/// **Single source of truth for the TUI navigation hierarchy.**
 ///
 /// Row order is the section bar's left-to-right order; within a row, leaf
 /// order is the sub-tab strip's left-to-right order. Everything ordered about
@@ -117,7 +113,7 @@ macro_rules! layout_table {
 #[cfg(not(feature = "cluster"))]
 const LAYOUT: &[(Section, &[Leaf])] = layout_table!();
 
-/// §4.11-4b — `cluster`-build variant: the Cluster section is appended LAST so
+/// The `cluster`-build variant: the Cluster section is appended LAST so
 /// section indices 0-4, numeric hotkeys 1-5, and the linear `Tab` cycle order
 /// of the first ten leaves are byte-identical to the default build. The
 /// section bar runtime-filters it out when `!cluster_visible()`.
@@ -141,15 +137,14 @@ pub enum Section {
     Dashboard,
     QueryLog,
     Network,
-    /// §4.67-a: renamed from `Filtering`. Label only — nothing persists a
+    /// Renamed from `Filtering`. Label only — nothing persists a
     /// section name, so the rename costs no migration.
     Filters,
-    /// §4.67-a: renamed from `Settings`, and no longer a singleton. It hosted
-    /// `Leaf::Tags` alongside `Leaf::Settings` when that was written;
-    /// `plp-s5d` deleted the Tags leaf, and the section now holds Labels,
-    /// Settings, File and Logs.
+    /// Renamed from `Settings`, and no longer a singleton. It once hosted
+    /// `Leaf::Tags` alongside `Leaf::Settings`; the Tags leaf is gone, and
+    /// the section now holds Labels, Settings, File and Logs.
     Configuration,
-    /// §4.11-4b (CS9) — top-level cluster monitoring section (decision 4).
+    /// Top-level cluster monitoring section.
     /// Compile-gated behind `cluster` AND runtime-hidden from the nav unless
     /// `[cluster].enabled` (`App::cluster_visible`). Appended last so the
     /// existing section indices + numeric hotkeys are unchanged.
@@ -195,16 +190,16 @@ impl Section {
     ///
     /// Deliberately NOT derived from [`LAYOUT`]. The landing leaf is a UX
     /// choice, not a structural fact: `Configuration` leads with **Labels**
-    /// in the strip (it led with Tags until §4.66 L2 prepended the registry)
-    /// but lands on Settings, because `5` has meant "Settings" for the whole
-    /// life of the product and a section rename does not move the operator's
-    /// muscle memory.
+    /// in the strip (it led with Tags until the vocabulary registry was
+    /// prepended) but lands on Settings, because `5` has meant "Settings" for
+    /// the whole life of the product and a section rename does not move the
+    /// operator's muscle memory.
     ///
     /// That drift is the argument, not an aside: this row has been prepended
-    /// **twice** since §4.67-a. A derived landing leaf would have changed
+    /// **twice**. A derived landing leaf would have changed
     /// where `5` goes on both occasions, silently.
     pub fn default_leaf(self) -> Leaf {
-        // Operator rule (2026-08-24): entering a section ALWAYS lands on its
+        // Entering a section ALWAYS lands on its
         // leftmost leaf, so the landing is predictable instead of decided
         // per-section. Derived from [`LAYOUT`] rather than restated, because a
         // hand-written match is a second source of truth for something the
@@ -213,7 +208,8 @@ impl Section {
         // leaf.
         //
         // **What this retires, kept because the reasoning is the precedent.**
-        // The divergence was deliberate, not an oversight: §4.67-a argued that
+        // The divergence was deliberate, not an oversight: an earlier design
+        // argued that
         // `5` had meant "Settings" for the life of the product and that moving
         // a section boundary must not move the operator's muscle memory. That
         // was a *proxy* for the operator's preference. The operator has since
@@ -248,21 +244,22 @@ pub enum Leaf {
     QueryLog,
     Devices,
     Subnets,
-    /// §4.64 G1: read-only view of `[[groups]]`. A group is POLICY, not
+    /// Read-only view of `[[groups]]`. A group is POLICY, not
     /// vocabulary — `profile` is required and `priority` resolves which
-    /// single profile a multi-group device gets (DM2), while `tags` are
-    /// UNIONED across every group. G2 makes this leaf writable.
+    /// single profile a multi-group device gets, while `tags` are
+    /// UNIONED across every group. The Add/Edit/Delete modal makes this
+    /// leaf writable.
     Groups,
-    /// Sprint 44: Local DNS Scoping v2 — global + per-profile static
+    /// Local DNS Scoping — global + per-profile static
     /// records. Master/detail tab with in-tab Add / Edit / Delete
     /// modals (tiered confirm) and an audit-history side-card.
     LocalDns,
-    /// §4.26 Phase 2: Profile Editor v1 — the 4th Network leaf (D3).
+    /// Profile Editor — the 4th Network leaf.
     /// Offline-backed master/detail tab over `[profiles]`; Add / Edit /
-    /// Delete drive the Phase 1 IPC verbs (`ProfileCreate` /
-    /// `ProfileUpdate` / `ProfileDelete`) directly.
+    /// Delete drive the
+    /// `ProfileCreate` / `ProfileUpdate` / `ProfileDelete` IPC verbs directly.
     Profiles,
-    /// Sprint 43 T2: per-blocklist visibility — counts, last update,
+    /// Per-blocklist visibility — counts, last update,
     /// fetch outcome, used-by-profiles. Consumes
     /// `IpcCommand::BlocklistStats { source_id: None }`.
     Lists,
@@ -273,28 +270,28 @@ pub enum Leaf {
     /// tab's nine columns answer "how did the download go?", a question a
     /// local file never has.
     CustomLists,
-    /// Sprint 43 T2: read-only placeholder for admin rules. T5 wires
-    /// the data source (`[[admin_rules]]`) and `e`/`d` keybindings.
+    /// Interactive rules tab, wired to the data source (`[[admin_rules]]`)
+    /// and `e`/`d` keybindings.
     Rules,
     Settings,
-    /// §4.66 L2: the `[[labels]]` vocabulary — owner / device-type /
+    /// The `[[labels]]` vocabulary — owner / device-type /
     /// department. Declaring is optional: without a vocabulary those device
     /// fields stay free text, which is what every config does today.
     Labels,
-    /// §4.67-b MN3: the master config file as a *document* — read-only
+    /// The master config file as a *document* — read-only
     /// syntax-coloured TOML, `/` section jump, `e` to open it in `$EDITOR`.
     /// Split out of `Leaf::Settings`, which had been rendering either the
-    /// Tracking form or this viewer from one 854-line module. The two are
+    /// Tracking form or this viewer from one module. The two are
     /// different jobs: Settings administers the configuration (tracking
     /// knobs, backup, restore), File shows the bytes on disk.
     File,
-    /// `logs-tab`: the daemon's own recent `tracing` events, read over
+    /// The daemon's own recent `tracing` events, read over
     /// `IpcCommand::DaemonLogs` from an in-process ring buffer. Answers
     /// "what has the daemon been saying" — distinct from `Leaf::QueryLog`,
     /// which answers "what did clients ask for". Labelled **Log Messages**
     /// so the two are not read as the same thing at a glance.
     Logs,
-    /// §4.11-4b (CS9) — cluster monitoring leaf, sole leaf of the top-level
+    /// Cluster monitoring leaf, sole leaf of the top-level
     /// `Section::Cluster`. Compile-gated behind `cluster` + runtime-hidden
     /// from `Tab`/`g`/numeric nav unless `[cluster].enabled`. Appended last
     /// so leaf indices 0-9 and the mnemonic table are unchanged.
@@ -303,24 +300,15 @@ pub enum Leaf {
 }
 
 impl Leaf {
-    // 2026-04-29: TopDomains tab retired — the same data now renders
-    // inline on the Dashboard's bottom row as two of the three ranked
-    // cards. Numeric hotkeys 5..8 shifted down by one accordingly.
-    // 2026-05-01 (S44 T3): LocalDns inserted at hotkey 5 between
-    // Subnets (4) and Resolver (now 6); Settings shifts from 8 to 9.
-    // 2026-05-01 (S45 T1): renamed `Tab` → `Leaf`, grouped under
-    // `Section`. Linear order preserved so `Tab`/`Shift+Tab` cycling
-    // walks all 10 leaves identically to pre-S45.
-    // 2026-05-14 (§4.26 P2): Leaf::Profiles inserted at index 5 between
-    // LocalDns (4) and Lists (now 6); Rules/Tags/Settings shift down one.
-    // 2026-08-05 (§4.67-a): the array is gone — `ALL` is now FLATTENED from
+    // `ALL` is FLATTENED from
     // `LAYOUT` at compile time, so the linear `Tab` order and the per-section
-    // `]` order cannot disagree. They had to agree before too (`Tab` walks
+    // `]` order cannot disagree. They have to agree
+    // (`Tab` walks
     // this array while `]` walks `leaves()`, and a divergence means the same
-    // section cycles differently depending on which key you press); the
-    // difference is that agreement used to be a test and is now a
-    // construction. Leaf indices are not operator-visible — S46 dropped the
-    // numeric prefixes from `label()`.
+    // section cycles differently depending on which key you press); flattening
+    // from one table makes that a construction rather than a test to keep
+    // green. Leaf indices are not operator-visible — `label()` carries no
+    // numeric prefix.
     /// Linear `Tab` / `Shift+Tab` cycle order: every [`LAYOUT`] row's leaves,
     /// concatenated left to right. Under `cluster` the gated Cluster leaf is
     /// last, so indices 0-9 are identical to the default build; the cycle
@@ -351,21 +339,18 @@ impl Leaf {
     }
 
     pub fn label(self) -> &'static str {
-        // Post-S46: leaves no longer carry a numeric prefix. Pre-S45 the
-        // 1-9 numerics doubled as direct hotkeys; S45 grouped the leaves
-        // under sections and S46 promoted Dashboard/Query Log to the top
-        // level — leaves are now reached via section hotkeys (1-5) +
-        // `[`/`]` cycle or `g <letter>` mnemonics, never by the leaf's
-        // own number. The leftover digits in the sub-tab strip read as a
-        // false promise of a hotkey that no longer exists, so they're
-        // dropped.
+        // Leaves do not carry a numeric prefix: they are reached via
+        // section hotkeys (1-5) + `[`/`]` cycle or `g <letter>`
+        // mnemonics, never by a leaf's own number. Digits in the sub-tab
+        // strip would read as a false promise of a hotkey that does not
+        // exist, so they're dropped.
         match self {
             Leaf::Dashboard => "Dashboard",
             Leaf::QueryLog => "Query Log",
-            // S42 T5 — variant now matches the tab label and data model
-            // naming. S33 had renamed only the label; the variant stayed
-            // `Clients` to avoid churning the Sprint 22 modal-form
-            // fields. T5 finishes the rename end-to-end.
+            // Variant matches the tab label and data model
+            // naming; the label was renamed separately from the variant,
+            // which stayed `Clients` for a while to avoid churning
+            // modal-form fields. This finishes the rename end-to-end.
             Leaf::Devices => "Devices",
             Leaf::Subnets => "Subnets",
             Leaf::Groups => "Groups",
@@ -390,12 +375,12 @@ impl Leaf {
         }
     }
 
-    /// Sprint 45 T1: home section for grouped navigation. Drives the
+    /// Home section for grouped navigation. Drives the
     /// breadcrumb in the footer and the sub-tab strip highlight.
-    /// Sprint 46 T1: Dashboard and QueryLog now map to their own
-    /// singleton sections — the `Overview` hub was retired so the two
+    /// Dashboard and QueryLog map to their own
+    /// singleton sections — the `Overview` hub is retired so the two
     /// most-used leaves sit at top level.
-    /// §4.67-a: derived from [`LAYOUT`] instead of a parallel match, so a
+    /// Derived from [`LAYOUT`] instead of a parallel match, so a
     /// re-home is one row edit and cannot half-land.
     ///
     /// Falls back to the first section rather than panicking if `self` has no
@@ -414,25 +399,24 @@ impl Leaf {
         Leaf::ALL[(self.index() + 1) % Leaf::ALL.len()]
     }
 
-    /// Sprint 45 T3: `g <letter>` direct-jump mnemonic table. Returns
+    /// `g <letter>` direct-jump mnemonic table. Returns
     /// `Some(leaf)` for a known mnemonic, `None` otherwise — the caller
     /// (`handle_key`) then drains `pending_goto` and falls through to
     /// the normal handler so the second key still gets a chance to
     /// fire its tab-local binding. Letters that collide with a leaf's
     /// own initial (Devices, Lists, Rules, Settings) reuse the second
-    /// strong consonant, e.g. `v` for deVices, `i` for lIsts. The full
-    /// table is pinned in the design doc §4.
+    /// strong consonant, e.g. `v` for deVices, `i` for lIsts.
     pub fn from_mnemonic(ch: char) -> Option<Leaf> {
         match ch {
             'd' => Some(Leaf::Dashboard),
             'q' => Some(Leaf::QueryLog),
             'v' => Some(Leaf::Devices),
             's' => Some(Leaf::Subnets),
-            // §4.64 G1: `g` is the PREFIX of the `g <letter>` sequence and can
+            // `g` is the PREFIX of the `g <letter>` sequence and can
             // never be a leaf's own mnemonic, so Groups takes `o` (grOups).
             'o' => Some(Leaf::Groups),
             'l' => Some(Leaf::LocalDns),
-            // §4.26 Phase 2: `p` is free in the mnemonic table (the
+            // `p` is free in the mnemonic table (the
             // global `[p] pause` lives in a separate keyspace — mnemonics
             // only fire after the `g` prefix), so it's the natural letter
             // for Profiles.
@@ -444,17 +428,17 @@ impl Leaf {
             // keeps the underline inside its own label.
             't' => Some(Leaf::CustomLists),
             'e' => Some(Leaf::Settings),
-            // §4.67-b MN3: `f` verified free against the whole table and is
+            // `f` verified free against the whole table and is
             // the initial of "File" — no second-consonant workaround needed.
             'f' => Some(Leaf::File),
-            // `logs-tab`: `m` verified free against the whole table and is
+            // `m` verified free against the whole table and is
             // the initial of the second word of "Log Messages".
             'm' => Some(Leaf::Logs),
-            // §4.66 L2: `l` is LocalDns and `g` is the sequence prefix, so
+            // `l` is LocalDns and `g` is the sequence prefix, so
             // Labels takes `b` (laBels) — the second-strong-consonant rule
-            // this table has used since S45.
+            // this table uses throughout.
             'b' => Some(Leaf::Labels),
-            // §4.11-4b — `c` is free in the mnemonic table (Devices owns `v`,
+            // `c` is free in the mnemonic table (Devices owns `v`,
             // Cache has no leaf). The `g c` jump is itself gated at the
             // dispatch site so it no-ops when the Cluster section is hidden.
             #[cfg(feature = "cluster")]
@@ -463,7 +447,7 @@ impl Leaf {
         }
     }
 
-    /// 2026-07-24 (IA Option B): inverse of [`Leaf::from_mnemonic`]. The
+    /// Inverse of [`Leaf::from_mnemonic`]. The
     /// sub-tab strip underlines this character inside the leaf's own label
     /// so the `g <letter>` jump is discoverable from the chrome instead of
     /// only from the `?` help screen — the mnemonics were previously
@@ -511,7 +495,7 @@ impl Leaf {
         Leaf::ALL[(self.index() + Leaf::ALL.len() - 1) % Leaf::ALL.len()]
     }
 
-    /// Sprint 45 T2: cycle to the next leaf within the same section,
+    /// Cycle to the next leaf within the same section,
     /// wrapping at the section boundary. Bound to `]`. On a single-leaf
     /// section (Dashboard / Query Log) this is a no-op — the modulo
     /// collapses to 0.
@@ -527,7 +511,7 @@ impl Leaf {
         leaves[(cur + 1) % leaves.len()]
     }
 
-    /// Sprint 45 T2: cycle to the previous leaf within the same section.
+    /// Cycle to the previous leaf within the same section.
     /// Bound to `[`. No-op on the singleton sections (Dashboard / Query Log).
     pub fn prev_in_section(self) -> Leaf {
         let leaves = self.section().leaves();
@@ -552,21 +536,18 @@ pub enum InputMode {
     FilterRules(String),
     /// Devices tab subnet filter buffer (focused with `/`).
     ///
-    /// Lane C built the read side and could not wire this: `InputMode`
-    /// lives in `app.rs`, which was the wave's serialisation point and
-    /// owned by another lane. Added by the integrator together with the
-    /// keybinding and the `build_filtered_rows` switch — see the note on
-    /// `tabs::devices::build_filtered_rows` for why those three cannot be
-    /// split across commits.
+    /// See the note on
+    /// `tabs::devices::build_filtered_rows` for why this variant, the
+    /// keybinding, and the `build_filtered_rows` switch have to land
+    /// together.
     FilterDevicesSubnet(String),
     /// Log Messages tab search buffer (focused with `/`). Same
     /// `drive_text_input` path as Lists and Rules; `R` clears, which is
     /// free on this leaf.
     ///
-    /// The sibling `FilterTags(String)` that landed beside this one on
-    /// `main` is deliberately NOT carried across: `plp-s5d` deleted the
-    /// Tags tab, so an input mode for it would be a variant nothing can
-    /// ever enter.
+    /// There is deliberately no sibling `FilterTags(String)`: the
+    /// Tags tab is gone, so an input mode for it would be a variant
+    /// nothing can ever enter.
     FilterLogs(String),
 }
 
@@ -580,7 +561,7 @@ pub struct DashboardState {
 #[derive(Debug, Clone)]
 pub struct QueryLogState {
     pub table_state: TableState,
-    /// qlog-06: stable per-entry selection key `(timestamp, domain,
+    /// Stable per-entry selection key `(timestamp, domain,
     /// client_ip)`. The Query Log is a sliding tail refreshed every 3s,
     /// so a bare `TableState` index slides onto a different row when the
     /// window shifts; anchoring on this key keeps the cursor — and the
@@ -591,16 +572,16 @@ pub struct QueryLogState {
     pub filter_domain: Option<String>,
     pub filter_client: Option<String>,
     pub blocked_only: bool,
-    /// Sprint 41 time preset: cycles Off → 1h → 6h → 24h with the `t`
+    /// Time preset: cycles Off → 1h → 6h → 24h with the `t`
     /// key. Rendered on row 3 of the Filters panel; threaded to the
     /// daemon as `since_secs` via the IPC poller.
     pub since: SincePreset,
     /// Daemon-reported `tracking.query_log_enabled` at the time of the
-    /// last successful poll. Drives the Sprint 37 empty-state picker
+    /// last successful poll. Drives the empty-state picker
     /// together with `file_state`.
     pub logging_enabled: bool,
     pub file_state: QueryLogFileState,
-    /// `qlog-paging-cursor`: the cursor used to request each page the
+    /// The cursor used to request each page the
     /// operator has visited, indexed by page. `page_cursors[0]` is
     /// always `None` — page 0 is the live tail — and the invariant is
     /// restored by [`QueryLogState::reset_paging`], never by hand.
@@ -618,7 +599,7 @@ pub struct QueryLogState {
     /// the current page is the oldest retained — `PgDn` at the bottom
     /// has nowhere to go.
     pub next_cursor: Option<QueryLogCursor>,
-    /// `qlog-advanced-filter-form`: the Tier-1 client predicates the
+    /// The Tier-1 client predicates the
     /// operator has APPLIED. Default-empty, and an empty one compiles to
     /// no predicate at all — which is what makes the form additive rather
     /// than a fifth control every existing operator has to learn.
@@ -634,6 +615,13 @@ impl QueryLogState {
         self.page_cursors.get(self.page_index).cloned().flatten()
     }
 
+    /// The advanced filter to send, or `None` when the form is unused.
+    /// Collapsing an all-blank form to `None` here means the daemon never
+    /// compiles a predicate for an operator who has not opened it.
+    pub fn advanced_for_request(&self) -> Option<AdvancedClientFilterDto> {
+        (!self.advanced.is_empty()).then(|| self.advanced.clone())
+    }
+
     /// Return to the live tail and forget every stored cursor.
     ///
     /// **Every filter mutation must call this**, and that is the whole
@@ -643,13 +631,6 @@ impl QueryLogState {
     /// serves rows that do not belong to the filters now displayed —
     /// silently wrong data in a surface operators use to decide what to
     /// block.
-    /// The advanced filter to send, or `None` when the form is unused.
-    /// Collapsing an all-blank form to `None` here means the daemon never
-    /// compiles a predicate for an operator who has not opened it.
-    pub fn advanced_for_request(&self) -> Option<AdvancedClientFilterDto> {
-        (!self.advanced.is_empty()).then(|| self.advanced.clone())
-    }
-
     pub fn reset_paging(&mut self) {
         self.page_cursors.clear();
         self.page_cursors.push(None);
@@ -706,9 +687,9 @@ impl Default for QueryLogState {
     }
 }
 
-/// Time-window preset for the Query Log tab's Sprint 41 filter. Cycles
+/// Time-window preset for the Query Log tab's filter. Cycles
 /// with the `t` key through four discrete states — free-form input was
-/// rejected in favour of a single-keystroke UX (design doc §3.4).
+/// rejected in favour of a single-keystroke UX.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SincePreset {
     #[default]
@@ -794,23 +775,18 @@ pub struct DevicesState {
     /// helper that skips group-header rows.
     pub table_state: TableState,
     pub group_by: DeviceGroupBy,
-    /// dev-03: operator's stable selection key — the mapped device id
-    /// (or its name slug for a pre-S44 id-less DTO), or the unmapped
+    /// Operator's stable selection key — the mapped device id
+    /// (or its name slug for an older id-less DTO), or the unmapped
     /// device's IP. Resolved to a row index every frame so a background
     /// `GetAllDevices` poll that reshuffles the list can't drift the
     /// cursor onto a different device. `None` until the first interaction
     /// seeds it; `table_state` is the visual cache kept in step with it.
     pub selected_id: Option<String>,
     /// Active modal overlay for add/edit/delete/promote on this tab.
-    /// `None` when no modal is open. Sprint 23 s23-tui-devices-modal-form.
+    /// `None` when no modal is open.
     pub modal: Option<DeviceModal>,
     /// Operator's subnet filter over the device list — a CIDR string
-    /// (`192.0.2.0/24`). `None` means no filter.
-    ///
-    /// Declared HERE, by the wave's integrator, so the lane that implements
-    /// the filter never has to edit `app.rs`: all nineteen tab state structs
-    /// live in this file, so it is the wave's serialisation point and exactly
-    /// one lane may own it.
+    /// (`10.10.1.0/24`). `None` means no filter.
     pub filter_subnet: Option<String>,
 }
 
@@ -833,8 +809,8 @@ pub enum DeviceModal {
     /// Yes/no confirmation before sending `DeviceRemove` over IPC.
     /// Carries the target's stable v1 id (used as the IPC key — the
     /// display name can diverge from `slug(name)` after a rename) and
-    /// the friendly display name for the prompt. Sprint 23 design
-    /// decision: delete is a modal, not a key chord.
+    /// the friendly display name for the prompt. Delete is a modal, not
+    /// a key chord.
     DeleteConfirm { id: String, display_name: String },
 }
 
@@ -864,10 +840,10 @@ pub enum DeviceFormField {
     MacAliases,
     Name,
     Profile,
-    /// Group memberships — a `Vec<Id>` in the schema and, since §4.64 G4,
+    /// Group memberships — a `Vec<Id>` in the schema and
     /// a multi-select in the form too (Edit only; the Add wire carries a
-    /// single id). Only the highest-priority group's **profile** applies
-    /// (DM2). Dropping one is a policy change, not a display detail — it
+    /// single id). Only the highest-priority group's **profile** applies.
+    /// Dropping one is a policy change, not a display detail — it
     /// changes which groups a device belongs to, and `priority` decides
     /// which of those groups' profiles wins.
     Group,
@@ -919,7 +895,7 @@ impl DeviceFormFocus {
 #[derive(Debug, Clone)]
 pub struct DeviceFormState {
     pub mode: DeviceFormMode,
-    /// mod-03: the stable IPC id of the device an Edit form was opened
+    /// The stable IPC id of the device an Edit form was opened
     /// on, captured at modal-open. The Edit submit patches THIS id rather
     /// than re-deriving the target from the live cursor — a 5s poll can
     /// reshuffle the row set under an open modal, so re-resolution at
@@ -939,8 +915,9 @@ pub struct DeviceFormState {
     /// Empty means "no direct group membership". Parsed into a `Vec` at
     /// submit, exactly like [`Self::mac_aliases`] — the schema's
     /// `Device.groups` is a `Vec<Id>` and the form must be able to hold
-    /// all of it. (`plp-s5d`: this named `Self::tags`, which the same
-    /// lane removed. `cargo doc -D rustdoc::broken_intra_doc_links` is
+    /// all of it. (This field used to be named `Self::tags`, and a
+    /// rename left a doc link pointing at the old name.
+    /// `cargo doc -D rustdoc::broken_intra_doc_links` is
     /// the ONLY gate leg that sees a link like this go stale — clippy,
     /// fmt and the test suite were all green on it.)
     ///
@@ -949,8 +926,7 @@ pub struct DeviceFormState {
     /// the picker, which offers ids that exist. The plural name is not
     /// cosmetic: while this field was called `group`, the Edit submit
     /// wrapped it in a one-element `Vec` and every extra membership the
-    /// operator had set from the CLI was destroyed on the next Save —
-    /// §4.64 G4.
+    /// operator had set from the CLI was destroyed on the next Save.
     pub groups: String,
     pub owner: String,
     pub device_type: String,
@@ -991,12 +967,12 @@ pub struct DeviceFormState {
     /// Snapshot of configured group ids (config order), taken at
     /// modal-open. Drives the Group field's popup radio picker.
     pub groups_snapshot: Vec<String>,
-    /// §4.66 L3: the `[[labels]]` vocabulary for the three metadata fields,
+    /// The `[[labels]]` vocabulary for the three metadata fields,
     /// one snapshot per kind, taken at modal-open.
     ///
     /// These hold **display names**, not ids, and that is the whole point.
-    /// `Device.owner` is free text (`"Alex"`) while `Label.id` is an `Id`
-    /// (`"alex"`), so the two can never be equal — the intersection is
+    /// `Device.owner` is free text (`"Operator"`) while `Label.id` is an `Id`
+    /// (`"operator"`), so the two can never be equal — the intersection is
     /// empty by construction. `Label::matches_value` accepts id **or**
     /// display_name, so writing the display name is what silences the
     /// unknown-value WARN while staying readable in the Devices table.
@@ -1025,8 +1001,8 @@ pub struct FieldPicker {
     /// selection. Only the Group picker on an **Edit** form sets it —
     /// the Add wire (`ClientConfig.group`) is a singular `Option<String>`,
     /// so offering multi-select there would write one id and drop the
-    /// rest: the very silent loss §4.64 G4 closes, re-opened in another
-    /// mode.
+    /// rest: the exact silent loss single-select is meant to avoid,
+    /// re-opened in another mode.
     pub multi: bool,
     /// Chosen ids in **selection order**, seeded from the field's current
     /// value (i.e. the file's order) and appended to as the operator
@@ -1183,7 +1159,7 @@ impl DeviceFormState {
         self
     }
 
-    /// §4.66 L3: seed the three metadata pickers from the `[[labels]]`
+    /// Seed the three metadata pickers from the `[[labels]]`
     /// vocabulary. Additive to [`Self::with_options`] so the existing call
     /// sites keep working unchanged.
     pub fn with_label_vocab(
@@ -1198,7 +1174,7 @@ impl DeviceFormState {
         self
     }
 
-    /// mod-03: pin the stable IPC id captured at modal-open (Edit forms).
+    /// Pin the stable IPC id captured at modal-open (Edit forms).
     /// The submit patches this id verbatim instead of re-resolving the
     /// target from the live cursor, which a background poll can move under
     /// the open modal. Chained onto `new_edit` at the open site.
@@ -1252,13 +1228,13 @@ impl DeviceFormState {
     /// Whether the given field is read-only in the current form mode.
     /// Tab navigation skips locked fields; the renderer dims them and
     /// the key handler refuses keystrokes on them.
-    /// §4.64 G4: Group is locked on **Promote** because the promote wire
+    /// Group is locked on **Promote** because the promote wire
     /// has no group field — `handle_device_promote` writes the device
     /// with `group: None` by design ("the operator can assign one later
     /// via Edit"). The row was editable anyway, so anything the operator
-    /// chose there was dropped without a word: the same silent loss G4
-    /// closed on the Edit path, one mode over. Locked, not hidden — a row
-    /// that vanishes reads as a bug, a row that says when it becomes
+    /// chose there was dropped without a word: the same class of silent
+    /// loss fixed on the Edit path, one mode over. Locked, not hidden —
+    /// a row that vanishes reads as a bug, a row that says when it becomes
     /// available reads as an instruction.
     pub fn is_locked(&self, field: DeviceFormField) -> bool {
         (self.ip_locked && field == DeviceFormField::Ip)
@@ -1296,7 +1272,7 @@ impl DeviceFormState {
     }
 }
 
-/// §4.68 UX8: which of the Labels leaf's two panes has the cursor.
+/// Which of the Labels leaf's two panes has the cursor.
 ///
 /// The leaf is drawn as two side-by-side cards, so it is navigated on
 /// that axis: `←` / `→` move **between** the cards, `↑` / `↓` move
@@ -1306,18 +1282,15 @@ impl DeviceFormState {
 /// unconditionally, which meant the vertical menu was walked with a
 /// horizontal key. That mismatch is what an operator reported as
 /// "VIM navigation"; `h`/`l` was the only such pair in the whole TUI.
-/// Those four aliases were **deleted** TUI-wide by N3 (2026-08-24) and
-/// are not rebound (N11) — only the arrows reach this focus today.
+/// Those four aliases are **deleted** TUI-wide and
+/// not rebound — only the arrows reach this focus today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LabelsFocus {
     KindMenu,
     Entries,
 }
 
-/// §4.67-b MN3: everything the [`Leaf::File`] document viewer needs, split
-/// out of `SettingsState`. The config *text* lives here; the config as an
-/// administered thing (tracking knobs, backups) stays on `SettingsState`.
-/// §4.66 L2: cursor state of the Labels leaf. `selected_kind` is which
+/// Cursor state of the Labels leaf. `selected_kind` is which
 /// vocabulary the left menu has focused; `selected_id` anchors the row in
 /// the right table by **id**, not index — a config reload can add, remove
 /// or reorder entries.
@@ -1325,9 +1298,9 @@ pub(crate) enum LabelsFocus {
 pub struct LabelsState {
     pub selected_kind: crate::config::schema::LabelKind,
     pub selected_id: Option<String>,
-    /// §4.68 UX8: which pane `↑`/`↓` scroll. See [`LabelsFocus`].
+    /// Which pane `↑`/`↓` scroll. See [`LabelsFocus`].
     pub(crate) focus: LabelsFocus,
-    /// §4.66 L7: the open Add / Edit / Delete modal, or `None`. While it
+    /// The open Add / Edit / Delete modal, or `None`. While it
     /// is `Some` it grabs every keystroke — the gate sits in `handle_key`
     /// ahead of the per-leaf dispatch, next to the Groups one.
     pub(crate) modal: Option<crate::tui::label_modal::LabelModal>,
@@ -1348,6 +1321,10 @@ pub struct LabelsState {
     /// rendered yet behaves like the wide layout, which is the common
     /// case; the first frame corrects it either way.
     pub(crate) menu_painted: bool,
+    /// Visual scroll/highlight cache for the entries table. `selected_id`
+    /// is the identity that survives a reload; this is only the viewport
+    /// ratatui reads and writes back into on every render.
+    pub table_state: TableState,
 }
 
 impl Default for LabelsState {
@@ -1362,6 +1339,7 @@ impl Default for LabelsState {
             // The menu, not the table: the kind decides what the table
             // even contains, so it is the choice that comes first.
             focus: LabelsFocus::KindMenu,
+            table_state: TableState::default(),
         }
     }
 }
@@ -1450,6 +1428,14 @@ pub struct CustomListsState {
     /// rendered yet behaves like the wide layout; the first frame corrects
     /// it either way.
     pub(crate) rules_pane_painted: bool,
+    /// Visual scroll/highlight cache for the lists pane. `selected_id` is
+    /// the identity that survives a reload; this is only the viewport
+    /// ratatui reads and writes back into on every render.
+    pub table_state: TableState,
+    /// Same role as `table_state`, for the rules/pack pane on the right —
+    /// a separate table with its own viewport, anchored on `selected_line`
+    /// rather than `selected_id`.
+    pub rules_table_state: TableState,
 }
 
 impl Default for CustomListsState {
@@ -1464,25 +1450,34 @@ impl Default for CustomListsState {
             modal: None,
             pack: None,
             rules_pane_painted: true,
+            table_state: TableState::default(),
+            rules_table_state: TableState::default(),
         }
     }
 }
 
-/// §4.64 G1: cursor state of the Groups leaf. The anchor is the group
+/// Cursor state of the Groups leaf. The anchor is the group
 /// **id**, not a row index: an index survives a config reload that
 /// reorders or removes rows and then points at the wrong group.
 #[derive(Debug, Clone, Default)]
 pub struct GroupsState {
     pub selected_id: Option<String>,
-    /// §4.64 G2: the Add / Edit / Delete modal. `None` = closed; a `Some`
+    /// The Add / Edit / Delete modal. `None` = closed; a `Some`
     /// grabs every keystroke until submit lands or Esc closes it, exactly
     /// as `SubnetsState::modal` does.
     pub modal: Option<crate::tui::group_modal::GroupModal>,
+    /// Visual scroll/highlight cache for the master table. `selected_id`
+    /// is the identity that survives a reload; this is only the viewport
+    /// ratatui reads and writes back into on every render.
+    pub table_state: TableState,
 }
 
+/// Everything the [`Leaf::File`] document viewer needs, split
+/// out of `SettingsState`. The config *text* lives here; the config as an
+/// administered thing (tracking knobs, backups) stays on `SettingsState`.
 #[derive(Debug, Clone, Default)]
 pub struct FileState {
-    /// Selection cursor of the pre-`tui-wave1` permanent "Sections"
+    /// Selection cursor of the former permanent "Sections"
     /// sidebar. The sidebar is gone — `/` replaced it — so this is
     /// seeded once at startup and never read. Carried across the split
     /// verbatim rather than dropped: retiring it is a separate change
@@ -1491,7 +1486,7 @@ pub struct FileState {
     pub config_text: String,
     pub sections: Vec<String>,
     pub scroll_offset: u16,
-    /// tui-wave1/settings-sidebar: on-demand section-jump popup, opened
+    /// On-demand section-jump popup, opened
     /// with `/` now that the permanent left "Sections" sidebar is gone.
     /// `None` = closed; `Some(filter)` = open with the current
     /// type-to-filter buffer (starts empty on open).
@@ -1500,7 +1495,7 @@ pub struct FileState {
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
-    /// Sprint 39: interactive Tracking panel state. `None` when not
+    /// Interactive Tracking panel state. `None` when not
     /// in form mode — the landing view is rendered instead.
     /// `Some` when the operator pressed `t` from the Settings tab;
     /// the pane renders the form until Esc.
@@ -1513,15 +1508,15 @@ pub struct SettingsState {
     /// gate as `restore_modal`; replaces the prior silent backup that
     /// routed both outcomes into the red `last_error` footer.
     pub backup_modal: Option<crate::tui::backup_restore_modal::BackupModal>,
-    /// Sprint 5: cached auto-backup engine state for the Settings tab's
+    /// Cached auto-backup engine state for the Settings tab's
     /// status line + failure banner. Refreshed on tab-entry / config
     /// reload, not per-render (the render fn has no `config_path`).
     pub auto_backup: AutoBackupView,
 }
 
-/// Sprint 5: snapshot of the Sprint 4 auto-backup engine state, read
+/// Snapshot of the auto-backup engine state, read
 /// from `<backup_dir>/.auto_state` + the newest `list_backups` entry.
-/// Surfaced read-only on the Settings tab (Q4 status line, Q5 banner).
+/// Surfaced read-only on the Settings tab (status line, failure banner).
 #[derive(Debug, Clone, Default)]
 pub struct AutoBackupView {
     /// Newest archive timestamp, if any — drives `Last auto-backup:
@@ -1532,11 +1527,11 @@ pub struct AutoBackupView {
     /// The most recent failure message, when the last outcome was an
     /// error (the banner's `<reason>`).
     pub last_error: Option<String>,
-    /// The Q5 auto-disable latch — drives the stronger disabled banner.
+    /// The auto-disable latch — drives the stronger disabled banner.
     pub disabled: bool,
 }
 
-/// Sprint 39: state for the Settings tab's interactive Tracking
+/// State for the Settings tab's interactive Tracking
 /// form — mirrors the three `TrackingPatch` fields plus local UI
 /// state (focus, retention-input buffer, last submit feedback).
 #[derive(Debug, Clone)]
@@ -1622,26 +1617,26 @@ pub struct DaemonStatus {
     pub cache_entries: u64,
     pub list_count: usize,
     pub uptime_secs: u64,
-    /// §4.19 — daemon binary version string. Empty when polling a
-    /// pre-§4.19 daemon; the dashboard hides the version chip in that
+    /// Daemon binary version string. Empty when polling an older
+    /// daemon that predates this field; the dashboard hides the version chip in that
     /// case rather than rendering "v" with no number.
     pub version: String,
-    /// §4.19 — configured weighted cache capacity. 0 when polling a
-    /// pre-§4.19 daemon; the dashboard's existing `cache_capacity`
+    /// Configured weighted cache capacity. 0 when polling an older
+    /// daemon; the dashboard's existing `cache_capacity`
     /// extrapolation is the legacy fallback in that case.
     pub cache_cap: u64,
-    /// §4.19 — number of blocklist sources whose most recent refresh
-    /// succeeded. 0 when polling a pre-§4.19 daemon (or when no
+    /// Number of blocklist sources whose most recent refresh
+    /// succeeded. 0 when polling an older daemon (or when no
     /// sources are configured).
     pub lists_active: u32,
-    /// §4.19 — total number of configured blocklist sources. 0 when
-    /// polling a pre-§4.19 daemon; `list_count` above is the legacy
+    /// Total number of configured blocklist sources. 0 when
+    /// polling an older daemon; `list_count` above is the legacy
     /// fallback.
     pub lists_total: u32,
-    /// §4.13 — resource-budget sample (RSS / VSZ / fd count / CPU%)
+    /// Resource-budget sample (RSS / VSZ / fd count / CPU%)
     /// plus the configured `rss_warn_mb` threshold. `None` until the
     /// daemon's sampler produces its first snapshot, or when polling
-    /// a pre-§4.13 daemon, or on non-Linux daemon targets.
+    /// an older daemon that predates this field, or on non-Linux daemon targets.
     pub resource_budget: Option<crate::resource_budget::ResourceBudgetSnapshot>,
     /// The standing corpus refusal, when the last reload cycle produced
     /// more unique domains than `max_total_domains` and was therefore
@@ -1652,20 +1647,32 @@ pub struct DaemonStatus {
     /// `lists_total` describe *fetching*, so a refused cycle reports a
     /// perfectly truthful `N/N` while the daemon serves the previous
     /// generation — or, past the hard cap with no previous generation,
-    /// nothing at all. `warden status` has refused to call that state
-    /// "active" since the corpus-ceiling sprint; this field is what lets
-    /// the TUI stop doing so too (`tui-blind-to-corpus-refusal`).
+    /// nothing at all. `warden status` refuses to call that state
+    /// "active"; this field is what lets
+    /// the TUI stop doing so too.
     pub lists_corpus_refusal: Option<crate::lists::status::CorpusRefusal>,
+    /// How long a standing refusal has stood, and across how many cycles.
+    ///
+    /// Carried beside the refusal because the refusal payload is rebuilt by
+    /// every refused cycle and so reads identically on day one and on day
+    /// fourteen. Not rendered yet — the field exists so the projection
+    /// cannot lose it before a panel is there to show it.
+    #[allow(dead_code)] // carried for the TUI; no panel renders it yet
+    pub lists_corpus_freeze: Option<crate::lists::status::CorpusFreeze>,
     /// Number of sources whose most recent refresh hit `max_entries` and
     /// dropped entries on the floor.
     ///
-    /// The **second** blind spot of the same shape, found by the check
-    /// `tui-blind-to-corpus-refusal` step 5 asked for: a truncated source
+    /// The **second** blind spot of the same shape: a truncated source
     /// is *also* active, so it too is invisible in `lists_active`, and
     /// before this the TUI carried no notion of list truncation at all.
     /// Weaker than a refusal — the corpus did install, just short — so it
     /// annotates the counts rather than replacing them.
     pub lists_truncated: u32,
+    /// Per-server upstream list (primary then fallback), each with its
+    /// literal address and kind. Empty when polling a daemon that does not
+    /// report it; the System card falls back to the legacy
+    /// `upstream_mode (upstream_count)` rendering in that case.
+    pub upstream_servers: Vec<crate::ipc::protocol::UpstreamServerInfo>,
 }
 
 /// Daemon-reported tracking metrics mirrored into TUI state.
@@ -1701,54 +1708,55 @@ pub struct TrackingData {
     /// the 24h average in each gauge's under-label.
     pub cache_hit_rate_delta_1h: f64,
     pub blocked_pct_delta_1h: f64,
-    /// §4.6 per-`TypeBucket` query counts in canonical order
+    /// Per-`TypeBucket` query counts in canonical order
     /// (`A, AAAA, TXT, PTR, NS, SOA, SRV, SVCB, HTTPS, Other`).
     /// Drives the Dashboard QTYPE distribution widget.
     pub qtype_distribution: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-    /// Sprint E per-`TypeBucket` BLOCKED query counts in the same
+    /// Per-`TypeBucket` BLOCKED query counts in the same
     /// canonical order. Drives the second (red) bar of the QTYPE
-    /// chart card. Defaults to all-zero when the daemon is pre-Sprint-E
+    /// chart card. Defaults to all-zero when the daemon predates this field
     /// (the wire field has `#[serde(default = "zero_qtype_distribution")]`).
     pub qtype_blocked_distribution: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-    /// Sprint F — same shape as `qtype_distribution` but summed over
+    /// Same shape as `qtype_distribution` but summed over
     /// the trailing 24 hourly buckets (rolling window). Drives the
     /// QTYPE chart card so blocked bars stay proportional to live
-    /// activity. Defaults to all-zero when the daemon is pre-Sprint-F.
+    /// activity. Defaults to all-zero when the daemon predates this field.
     pub qtype_distribution_24h: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-    /// Sprint F — same shape as `qtype_blocked_distribution` but
+    /// Same shape as `qtype_blocked_distribution` but
     /// summed over the trailing 24 hourly buckets. Drives the Blocked
     /// bar of the QTYPE chart card.
     pub qtype_blocked_distribution_24h: [u64; crate::tracking::TYPE_BUCKET_COUNT],
-    /// Sprint §4.4 P1 — number of domains currently in the prefetch
+    /// Number of domains currently in the prefetch
     /// pool (promoted by the hit-frequency tracker). Drives the
     /// Dashboard's `Prefetch  pool N` row. The IPC field is `u32` —
     /// pool size is bounded at `max_pool_size` (default 1024) so
     /// 32 bits is plenty.
     pub prefetch_pool_size: u32,
-    /// Sprint §4.4 P1 — cumulative promotion events. The TUI uses the
+    /// Cumulative promotion events. The TUI uses the
     /// inter-poll delta to derive `prefetch_promotions_per_min` below.
     pub prefetch_promotions_total: u64,
-    /// Sprint §4.4 P1 — cumulative demotion events. Currently unused
+    /// Cumulative demotion events. Currently unused
     /// at render time but kept on TrackingData so the IPC destructure
     /// stays exhaustive and a future extension (e.g. churn warning)
     /// has the data without another wire change.
     pub prefetch_demotions_total: u64,
-    /// Sprint §4.4 P2 — promotions-per-minute derived client-side from
+    /// Promotions-per-minute derived client-side from
     /// the inter-poll delta of `prefetch_promotions_total`. Computed
     /// inside `IpcPoller::fetch_tracking_stats` using a wall-clock
     /// `Instant` snapshot kept on the poller. `0.0` until the second
     /// poll provides a baseline; renderer shows `collecting…` while it
     /// is `0.0` AND `prefetch_pool_size == 0 && prefetch_promotions_total == 0`.
     pub prefetch_promotions_per_min: f64,
-    /// Sprint C Dashboard v2 — daemon-resolved per-list block counts
+    /// Daemon-resolved per-list block counts
     /// (top-5, ranked desc). Empty until the daemon has seen at least
-    /// one Tier 1 `BlockSource::List(bit)`. Pre-Sprint-B daemons send
-    /// nothing for this field; the IPC-side `#[serde(default)]` makes
+    /// one Tier 1 `BlockSource::List(bit)`. An older daemon that predates
+    /// this field sends
+    /// nothing for it; the IPC-side `#[serde(default)]` makes
     /// the empty vec graceful → "collecting…" placeholder on render.
     pub top_blocked_lists: Vec<crate::ipc::protocol::ListBlockCount>,
     /// 24h-rolling Top-N by block count (per-domain). Drives the
     /// row-4 wide-branch `Top Blocked Domains (24h)` card. Empty on
-    /// pre-Sprint-N daemons → `collecting…` placeholder.
+    /// an older daemon that predates this field → `collecting…` placeholder.
     pub top_blocked_24h: Vec<crate::ipc::protocol::DomainCount>,
     /// 24h-rolling Top-N by query count (per-domain). Drives the
     /// narrow-branch `Top Domains (24h)` card.
@@ -1758,7 +1766,7 @@ pub struct TrackingData {
     pub top_blocked_lists_24h: Vec<crate::ipc::protocol::ListBlockCount>,
 }
 
-/// Severity of the transient footer status line (ui-01). Before this,
+/// Severity of the transient footer status line. Before this existed,
 /// `App` carried a single `last_error: Option<String>` that every modal
 /// submit wrote its *outcome* into — success ("added subnet x"),
 /// neutral ("rule unchanged") and error alike — and the footer rendered
@@ -1774,12 +1782,12 @@ pub enum StatusSeverity {
     Info,
 }
 
-/// §4.62 N3 — how long a non-sticky status stays on screen. `Ok` and
+/// How long a non-sticky status stays on screen. `Ok` and
 /// `Info` share it; `Error` is sticky (see [`StatusSeverity::ttl`]).
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
 
 impl StatusSeverity {
-    /// §4.62 N3 — time-to-live by severity. `None` means sticky: the
+    /// Time-to-live by severity. `None` means sticky: the
     /// message stays until the operator dismisses it with a keystroke.
     ///
     /// Asymmetric on purpose. An error the operator did not read is a
@@ -1794,9 +1802,9 @@ impl StatusSeverity {
 
 /// What raised a status — the operator, or the background poller.
 ///
-/// N3 ("an error the operator did not read is a lost error") was written
+/// "An error the operator did not read is a lost error" was written
 /// about *action* errors: I pressed Save and it failed. Background poll
-/// health is a different animal. By N4's own state/event split a poll
+/// health is a different animal. By the state/event split a poll
 /// failure is a **state** — it describes a condition that either holds
 /// or does not, and the header RUNNING/DISCONNECTED pill is already its
 /// permanent surface. Making it sticky would leave a red toast reporting
@@ -1804,7 +1812,7 @@ impl StatusSeverity {
 /// forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusOrigin {
-    /// Raised by something the operator did. Obeys N3 in full.
+    /// Raised by something the operator did. Obeys the rule above in full.
     Action,
     /// Raised by a background poll. Sticky while the condition holds —
     /// but cleared the moment a poll succeeds, with no keystroke
@@ -1813,15 +1821,15 @@ pub enum StatusOrigin {
 }
 
 /// A transient status message plus its severity, rendered as an
-/// auto-expiring toast over the tab content (ui-01, §4.62 N1).
+/// auto-expiring toast over the tab content.
 ///
-/// §4.62 N2: `shown_at` is what decouples the message lifetime from the
+/// `shown_at` is what decouples the message lifetime from the
 /// poll cadence. Before it, clearing happened only in the success arms
 /// of `poll_active_leaf`, so the effective lifetime was 2 s on Dashboard
-/// and *never* on the six leaves that don't poll (Tags, Subnets, Rules,
-/// Profiles, Settings, Cluster) — the operator's "non è chiaro dopo
-/// quanto tempo la notifica sparisca". Expiry is now evaluated on the
-/// render path and on `Event::Tick`, both of which run on every leaf.
+/// and *never* on the leaves that don't poll (Tags, Subnets, Rules,
+/// Profiles, Settings, Cluster) — the operator reported it was not clear
+/// how long a notification took to disappear. Expiry is now evaluated on
+/// the render path and on `Event::Tick`, both of which run on every leaf.
 #[derive(Debug, Clone)]
 pub struct StatusLine {
     pub severity: StatusSeverity,
@@ -1852,7 +1860,7 @@ impl StatusLine {
 }
 
 /// Resolve a stable selection key to a row index by scanning the current
-/// rows (dev-03 / qlog-06). The cross-tab pattern — subnets / profiles /
+/// rows. The cross-tab pattern — subnets / profiles /
 /// cluster each store a stable key and re-resolve it to an index every
 /// frame — that keeps a cursor on the entity the operator chose even
 /// after a background poll rebuilds and re-sorts the list underneath it.
@@ -1866,8 +1874,8 @@ where
     rows.iter().position(|r| key_of(r).as_ref() == Some(key))
 }
 
-/// A result delivered back to the UI loop from a background task
-/// (mod-04). The loop applies it via `apply_job_result` and redraws, so
+/// A result delivered back to the UI loop from a background task.
+/// The loop applies it via `apply_job_result` and redraws, so
 /// long-running work (remote HTTP) never blocks the render/input path.
 pub enum UiJob {
     /// A purge.cc catalog fetch finished — refresh the cache and the open
@@ -1929,7 +1937,7 @@ pub struct App {
     /// silently drift out of date.
     pub leaf_key_unhandled: bool,
     pub input_mode: InputMode,
-    /// Sprint 45 T3: one-shot `g <letter>` mnemonic dispatch. Set to
+    /// One-shot `g <letter>` mnemonic dispatch. Set to
     /// `true` after the operator presses `g`; the next event reads the
     /// mnemonic table (`Leaf::from_mnemonic`) and either jumps to the
     /// matching leaf or — on an unknown letter — silently clears the
@@ -1945,15 +1953,15 @@ pub struct App {
     /// `None` before the first successful fetch.
     pub device_view: Option<DeviceViewDto>,
     pub connected: bool,
-    /// Transient action feedback + its severity (ui-01), rendered as an
-    /// auto-expiring toast over the tab content (§4.62 N1). Set by
+    /// Transient action feedback + its severity, rendered as an
+    /// auto-expiring toast over the tab content. Set by
     /// `status_ok` / `status_err` / `status_info`; dropped by its TTL on
     /// the tick (`expire_status`), by a keystroke when sticky
     /// (`dismiss_sticky_status`), or explicitly via `clear_status`.
     ///
     /// It no longer lives in the footer: the footer's left slot is the
     /// tab keyboard legend, which is the discovery surface for the whole
-    /// screen and must never be traded for an event (§4.62 N4).
+    /// screen and must never be traded for an event.
     pub last_status: Option<StatusLine>,
     /// Non-fatal message emitted before the TUI started (e.g. "no config
     /// file found, using defaults"). Shown in the footer when no active
@@ -1992,62 +2000,62 @@ pub struct App {
     /// source), the Resolver modal (build `ProfileResolver` on
     /// demand), and the Devices tab (source-file annotation per row).
     /// `None` if the config doesn't parse — the tabs render a friendly
-    /// "load failed" state in that case. S33 addition.
+    /// "load failed" state in that case.
     pub loaded_config: Option<LoadedConfig>,
 
-    /// Sprint 43 T5: scope modal lifecycle. Opened from the Query Log
-    /// tab via `a` (allow) / `d` (deny). `Some` while the operator
-    /// walks the SN1 menu + SN2 confirm; `None` otherwise.
-    pub scope_modal: Option<crate::tui::scope_modal::ScopeModal>,
+    /// Query Log rule-picker lifecycle. Opened from the Query Log tab
+    /// via `Enter`. `Some` while the operator marks custom lists, creates
+    /// one, or reads the per-list report; `None` otherwise.
+    pub query_log_rule_modal: Option<crate::tui::query_log_rule_modal::QueryLogRuleModal>,
 
-    /// Sprint 43 T6: one-shot welcome banner shown on the first launch
+    /// One-shot welcome banner shown on the first launch
     /// after an upgrade to a version not yet recorded in
     /// `~/.config/purge-warden/seen_versions`. `Some` with banner
     /// state until the operator dismisses it; the dismissal records
     /// the version on disk so subsequent launches show `None`.
     pub welcome_banner: Option<crate::tui::welcome_banner::WelcomeBanner>,
 
-    /// mod-02: shared with the event-reader thread to pause it across the
+    /// Shared with the event-reader thread to pause it across the
     /// Settings-tab `$EDITOR` handoff. While `reader_suspended` is set the
     /// reader stops touching the tty (so the editor owns input cleanly and no
     /// stolen byte replays against the TUI), acking via `reader_parked` once it
     /// has reached the park point. Cloned into `spawn_event_reader`; the `e`
     /// handler toggles them around the blocking editor spawn.
     pub reader_suspended: Arc<AtomicBool>,
-    /// mod-02: reader-thread ack for `reader_suspended` — `true` once the reader
+    /// Reader-thread ack for `reader_suspended` — `true` once the reader
     /// has parked and is no longer reading the tty. The editor handoff waits on
     /// this (bounded) before leaving raw mode so no in-flight read consumes a byte.
     pub reader_parked: Arc<AtomicBool>,
 
-    /// Sprint 52: source-IP resolver modal. Opened from any leaf via
+    /// Source-IP resolver modal. Opened from any leaf via
     /// the global hotkey `s`; pre-fills from QueryLog/Devices when the
     /// active leaf has a focused row. `None` when closed.
     pub resolver_modal: Option<crate::tui::resolver_modal::ResolverModal>,
 
-    /// S53.3: cached purge.cc catalog snapshot. Populated on the first
+    /// Cached purge.cc catalog snapshot. Populated on the first
     /// `[B]` press; subsequent opens within the 5-min TTL skip the
     /// network round-trip. Lives on `App` (not on `ListsState`) so a
     /// tab refresh / poll doesn't accidentally invalidate it.
     pub catalog_cache: Option<CatalogCache>,
-    /// mod-04: sender for background-job results (the catalog fetch). Set
+    /// Sender for background-job results (the catalog fetch). Set
     /// once at startup in `run_app`; `None` in tests and other non-loop
     /// contexts, where the catalog open falls back to the inline await.
     pub job_tx: Option<tokio::sync::mpsc::UnboundedSender<UiJob>>,
 
-    /// §4.11-4b (CS9) — live cluster view (`IpcCommand::ClusterStatus`),
+    /// Live cluster view (`IpcCommand::ClusterStatus`),
     /// polled on the heartbeat cadence when `[cluster].enabled`. `None` on a
     /// standalone node or while the first poll is in flight. Drives both the
     /// dashboard System-card dot and the Cluster tab.
     #[cfg(feature = "cluster")]
     pub cluster_status: Option<ClusterStatusDto>,
-    /// §4.11-4b — Cluster tab roster cursor. Operator-stable selection keyed
+    /// Cluster tab roster cursor. Operator-stable selection keyed
     /// by node name (survives roster reordering / stale-eviction).
     #[cfg(feature = "cluster")]
     pub cluster: ClusterState,
 }
 
 impl App {
-    /// Set a success status (green `✓` toast). ui-01.
+    /// Set a success status (green `✓` toast).
     pub fn status_ok(&mut self, text: String) {
         self.last_status = Some(StatusLine {
             severity: StatusSeverity::Ok,
@@ -2057,10 +2065,10 @@ impl App {
         });
     }
 
-    /// Set an error / refusal status (red `✕`). ui-01.
+    /// Set an error / refusal status (red `✕`).
     ///
     /// Action-origin: this is the outcome of something the operator did,
-    /// so it is sticky until they acknowledge it (N3). Background
+    /// so it is sticky until they acknowledge it. Background
     /// pollers must use [`Self::status_err_poll`] instead.
     pub fn status_err(&mut self, text: String) {
         self.last_status = Some(StatusLine {
@@ -2071,12 +2079,26 @@ impl App {
         });
     }
 
-    /// Set an error raised by a background poll rather than by an
-    /// operator action. Same red `✕`, different lifetime: it is retired
-    /// by [`Self::clear_poll_status`] as soon as a poll succeeds, so a
-    /// recovered blip does not leave a permanent false alarm on an idle
-    /// dashboard.
+    /// Set an error raised by a background poll rather than by an operator
+    /// action. Same red `✕`, different lifetime: retired by
+    /// [`Self::clear_poll_status`] as soon as a poll succeeds.
+    ///
+    /// **Yields to a sticky action error.** The slot holds one message and
+    /// the poller fires every 2-5 s, so without this guard a poll blip
+    /// overwrites a `Save failed` the operator has not read yet — and, by
+    /// becoming poll-origin, gets retired by the next success with no
+    /// keystroke. The operator's error would vanish having never been seen,
+    /// which is the exact loss the rule above forbids. Connection health also has a
+    /// permanent surface already (the header RUNNING/DISCONNECTED pill), so
+    /// dropping this message costs strictly less than dropping that one.
     pub fn status_err_poll(&mut self, text: String) {
+        if self
+            .last_status
+            .as_ref()
+            .is_some_and(|s| s.origin == StatusOrigin::Action && s.severity.ttl().is_none())
+        {
+            return;
+        }
         self.last_status = Some(StatusLine {
             severity: StatusSeverity::Error,
             text,
@@ -2085,7 +2107,7 @@ impl App {
         });
     }
 
-    /// Set a neutral / informational status (muted). ui-01.
+    /// Set a neutral / informational status (muted).
     pub fn status_info(&mut self, text: String) {
         self.last_status = Some(StatusLine {
             severity: StatusSeverity::Info,
@@ -2128,7 +2150,7 @@ impl App {
         false
     }
 
-    /// §4.62 N2 — the status the toast renderer should paint as of
+    /// The status the toast renderer should paint as of
     /// `now`, or `None` if it has expired. Read-only: the render path
     /// takes `&App`, so expiry there is a *filter*, not a mutation.
     /// [`Self::expire_status`] does the actual dropping on the tick.
@@ -2141,7 +2163,7 @@ impl App {
         self.visible_status_at(Instant::now())
     }
 
-    /// §4.62 N2 — drop the status if it has outlived its TTL as of
+    /// Drop the status if it has outlived its TTL as of
     /// `now`. Returns `true` when something was actually cleared.
     ///
     /// The bool matters: the caller is the 33 ms tick, and repainting
@@ -2164,11 +2186,11 @@ impl App {
         self.expire_status_at(Instant::now())
     }
 
-    /// §4.62 N3 — dismiss a sticky (`Error`) status. Called for every
+    /// Dismiss a sticky (`Error`) status. Called for every
     /// key the operator presses; `Ok`/`Info` are left to their TTL so a
     /// success toast is not stolen by an unrelated arrow key.
     ///
-    /// N6: this never consumes the keystroke. The caller runs it as a
+    /// This never consumes the keystroke. The caller runs it as a
     /// side effect and then dispatches the key normally, so the toast
     /// surface is structurally incapable of gating input.
     pub fn dismiss_sticky_status(&mut self) -> bool {
@@ -2189,7 +2211,7 @@ impl App {
         self.last_status.as_ref().map(|s| s.text.as_str())
     }
 
-    /// §4.11-4b — the single runtime gate for every cluster TUI surface
+    /// The single runtime gate for every cluster TUI surface
     /// (dashboard dot, Cluster tab nav, cluster poll). `true` only when built
     /// with the `cluster` feature AND the loaded config has
     /// `[cluster].enabled = true`; always `false` on a default build.
@@ -2236,7 +2258,7 @@ impl App {
             file: FileState::default(),
             logs: LogsState::default(),
             loaded_config: None,
-            scope_modal: None,
+            query_log_rule_modal: None,
             welcome_banner: None,
             reader_suspended: Arc::new(AtomicBool::new(false)),
             reader_parked: Arc::new(AtomicBool::new(false)),
@@ -2257,7 +2279,7 @@ impl Default for App {
     }
 }
 
-// ── Cluster tab state (§4.11-4b) ────────────────────────────────────────────
+// ── Cluster tab state ────────────────────────────────────────────────────
 //
 // Read-only roster view. The cursor is operator-stable: `selected_name`
 // carries the focused node's display name (roster `RosterEntryDto.name`), so
@@ -2271,14 +2293,18 @@ impl Default for App {
 pub struct ClusterState {
     /// Focused node's name (the single source of truth for the roster cursor;
     /// `None` until the first key seeds it). The renderer resolves it back to
-    /// a row index each frame and builds a transient `TableState` from it, so
-    /// the highlight follows the node even when the roster reorders.
+    /// a row index each frame, so the highlight follows the node even when
+    /// the roster reorders.
     pub selected_name: Option<String>,
+    /// Visual scroll/highlight cache for the roster table. `selected_name`
+    /// is the identity that survives a reorder; this is only the viewport
+    /// ratatui reads and writes back into on every render.
+    pub table_state: TableState,
 }
 
-// ── Subnets tab state (S33 + S51) ──────────────────────────────────────────
+// ── Subnets tab state ───────────────────────────────────────────────────
 //
-// S33 shipped a single read-only TableState. S51 grew the tab into a
+// Originally a single read-only TableState, later grown into a
 // master/detail layout: the master list mixes configured subnets with
 // auto-discovered candidate buckets, so the cursor now tracks both
 // shapes. `selected_id` is the operator-stable selection key — it
@@ -2295,13 +2321,13 @@ pub struct SubnetsState {
     /// Active modal lifecycle (Add / Edit / Delete). `None` while the
     /// tab is in normal navigation mode; `Some` while the operator is
     /// editing a form, confirming a removal, or has just received the
-    /// submit outcome and not yet dismissed the modal. S51 T3.
+    /// submit outcome and not yet dismissed the modal.
     pub modal: Option<crate::tui::subnet_modal::SubnetModal>,
 }
 
-// ── Profiles tab state (§4.26 Phase 2) ──────────────────────────────────────
+// ── Profiles tab state ──────────────────────────────────────────────────
 //
-// Profile Editor v1 — the 4th Network leaf (D3). Offline-backed
+// Profile Editor — the 4th Network leaf. Offline-backed
 // master/detail tab: the master list reads `[profiles]` from
 // `app.loaded_config`, the side-card drills into the focused profile.
 // Add / Edit / Delete drive the Phase 1 IPC verbs (`ProfileCreate` /
@@ -2321,16 +2347,15 @@ pub struct ProfilesState {
     pub modal: Option<crate::tui::profile_modal::ProfileModal>,
 }
 
-// ── Local DNS tab state (S44 T3) ────────────────────────────────────────────
+// ── Local DNS tab state ─────────────────────────────────────────────────
 
-// N6 (2026-08-24) removed `LocalDnsPanel` from this module.
-//
-// It used to sit here, doc-commented *"Cycles via `Tab` (forward) /
-// `BackTab` (backward)"* — which was **already false** when N6 found it:
-// `ldns_04_tab_still_cycles_leaf` pins `Tab` as the global leaf cycle, and
-// the panel switch had been `o` since rev-2606 §11. A comment describing a
-// key binding that a test forbids is the shape of rot this wave keeps
-// finding; recorded here rather than deleted silently.
+// `LocalDnsPanel` used to live in this module, doc-commented
+// *"Cycles via `Tab` (forward) / `BackTab` (backward)"* — which was
+// **already false** by the time it was found:
+// `ldns_04_tab_still_cycles_leaf` pins `Tab` as the global leaf cycle,
+// and the panel switch had long been `o` instead. A comment describing a
+// key binding that a test forbids is a class of rot worth recording here
+// rather than deleting silently.
 //
 // There is no panel to switch any more. The two stacked tables are one
 // list with non-selectable group headers, Devices-style, so `o`, `n` and
@@ -2339,8 +2364,8 @@ pub struct ProfilesState {
 /// Local DNS tab state. One cursor over the unified record list.
 ///
 /// The `a` / `d`|`Delete` / `e` keypresses open modal-driven mutations
-/// against `cli::commands::local_dns::add_inner` / `remove_inner` (R7
-/// single-seat); the open modal lives on [`Self::modal`].
+/// against `cli::commands::local_dns::add_inner` / `remove_inner` (the
+/// single-seat path); the open modal lives on [`Self::modal`].
 #[derive(Debug, Clone, Default)]
 pub struct LocalDnsState {
     /// Visual cursor into the row vector built by
@@ -2360,14 +2385,14 @@ pub struct LocalDnsState {
     /// so it round-trips through
     /// [`tabs::local_dns::row_key`](crate::tui::tabs::local_dns::row_key)
     /// without a second vocabulary. Domain is stored lowercased: domains
-    /// are case-normalised at ingestion (design rule 3) but the on-disk
+    /// are case-normalised at ingestion and lookup elsewhere, but the on-disk
     /// record need not be, and a key that disagrees with itself on case
     /// loses the cursor on reload.
     pub selected_id: Option<(String, String)>,
     /// Cached snapshot of `(scope, domain) → hits` from the daemon.
-    /// `None` before the first IPC poll wires the field through (T3:
-    /// the wire is not yet implemented; field is reserved so a
-    /// follow-up adds the IpcCommand without struct churn).
+    /// `None` before the first IPC poll wires the field through — the
+    /// wire is not yet implemented; field is reserved so a
+    /// follow-up adds the IpcCommand without struct churn.
     #[allow(dead_code)]
     pub hits_snapshot: Option<Vec<(String, String, u64)>>,
     /// Active modal lifecycle (Add / Remove / Edit). `None` when the
@@ -2375,7 +2400,7 @@ pub struct LocalDnsState {
     /// editing a form, confirming a removal, or has just received the
     /// submit outcome and not yet dismissed the modal.
     pub modal: Option<crate::tui::local_dns_modal::LocalDnsModal>,
-    /// Open audit-history side-card (`s44-tui-modal-audit-history`).
+    /// Open audit-history side-card.
     /// `None` while the side-card is closed; `Some` carries the loaded
     /// audit slice for the focused row. Refreshed on Enter (open) and on
     /// any cursor move while open so the card follows the cursor; cleared
@@ -2403,42 +2428,42 @@ pub struct LocalDnsAuditView {
     pub entries: Vec<crate::config::audit::AuditRecord>,
 }
 
-// ── Lists tab state (S43 T2) ────────────────────────────────────────────────
+// ── Lists tab state ─────────────────────────────────────────────────────
 
-/// Sprint 43 T2: state for the new Lists visibility tab.
+/// State for the Lists visibility tab.
 ///
 /// Populated on every `Leaf::Lists` poll cycle (default 30 s, see
 /// `POLL_LISTS` in `tui::mod`). `entries` is the raw payload from
 /// `IpcCommand::BlocklistStats { source_id: None }`; `table_state`
-/// drives `↑`/`↓` row selection. `Enter` opens the Sprint 53
+/// drives `↑`/`↓` row selection. `Enter` opens the
 /// [`EditListModal`] (60×22 centered) so the operator can edit every
 /// metadata field or delete the list with a typed-id confirm — the
-/// pre-S53 split-pane drill-down was removed (decision L8).
+/// earlier split-pane drill-down was removed.
 /// The reverse-lookup "used by profiles" annotation is computed at
 /// render time against the cached `app.loaded_config` — no separate
 /// IPC call.
 ///
-/// Sprint 50 T4: post-grouping refactor, the cursor `table_state.selected()`
+/// The cursor `table_state.selected()`
 /// indexes into the grouped row vector built by
 /// `tabs::lists::build_grouped_rows` (which interleaves category headers
 /// with list rows), NOT into `entries` directly. The ↑/↓ handler skips
 /// header rows via `tabs::lists::next_selectable_index`.
 ///
-/// rev-2606 §11 (mod-06 / lists-08b): the `[c]` create-category, `[m]`
+/// The `[c]` create-category, `[m]`
 /// move-category, and `[p]` list↔profile assignment modals were
-/// unmounted — categories are gone in v2 and tag assignment ships via
+/// unmounted — categories are gone and tag assignment ships via
 /// the edit-modal chip picker + Tags tab; `[K]` still toggles kind
 /// directly without a modal.
 ///
-/// Sprint 53: ENTER on a list row now opens the [`EditListModal`] (60×22
+/// ENTER on a list row opens the [`EditListModal`] (60×22
 /// centered overlay) where every metadata field is editable in-place
 /// and a typed-id Delete confirm tears the list out of the catalog. The
-/// pre-S53 `show_detail` split-pane was removed — the modal supersedes
-/// it (decision L8 in `_docs/features/lists_edit_modal.md`).
+/// earlier `show_detail` split-pane was removed — the modal supersedes
+/// it.
 #[derive(Debug, Clone, Default)]
 pub struct ListsState {
     pub table_state: TableState,
-    /// rev-2607: operator's stable selection key — the row's canonical id,
+    /// Operator's stable selection key — the row's canonical id,
     /// or its source string when it has none (see
     /// [`crate::tui::tabs::lists::row_key`]). `entries` is rewritten by the
     /// 30 s Lists poll *and* by the Dashboard poll arm, so a bare
@@ -2457,7 +2482,7 @@ pub struct ListsState {
     pub filter_text: Option<String>,
     pub kind_filter: ListsKindFilter,
     pub edit_modal: Option<EditListModal>,
-    /// Sprint 53 follow-up — purge.cc catalog picker opened by the
+    /// The purge.cc catalog picker opened by the
     /// `[B]` hotkey on the Lists tab. Operator browses the curated
     /// catalog (offline-safe via [`crate::lists::catalog::Catalog::fallback`])
     /// as a table, toggles the ON column on any number of rows, and
@@ -2603,13 +2628,17 @@ pub struct CatalogPickerRow {
     /// Operator's staged direction. Seeded from the existing entry's
     /// `base`, else [`BlocklistBase::Deny`].
     ///
-    /// **Read-only in the UI today** — no key mutates it. The column
-    /// renders it and Save writes from this field rather than a
-    /// constant, so making the cell interactive is a key binding, not a
-    /// restructure. `base = allow` on a catalog row is refused by the
-    /// validator regardless (`ALLOW_LIST_REQUIRES_LOCAL_TRUST`: an
-    /// allow-direction list needs `trust = local`, which only a local
-    /// file import can supply).
+    /// **Read-only in the UI today** — no key mutates it. Binding one is
+    /// not "just" a key binding: [`CatalogPickerRow::is_dirty`] compares
+    /// only `staged_enabled`, and the catalog refetch
+    /// (`merge_catalog_picker_state`) carries staged state forward only
+    /// for dirty rows — so a kind-only edit would be silently dropped
+    /// before Save ever sees it. `base = allow` would also be refused by
+    /// the validator for any row not already `trust = local` on disk:
+    /// `build_catalog_blocklist_value` never sets `accept_unsigned_allow`,
+    /// and a brand-new entry's `trust` defaults to `remote-unsigned`, so
+    /// either lands on
+    /// [`crate::config::error::ConfigError::UnsignedAllowListRequiresAck`].
     pub staged_kind: BlocklistBase,
     /// Wire format the save path writes as `format = "…"`. `Domains` for
     /// every `lists.purge.cc` entry today; carried per-row so an index
@@ -2634,27 +2663,27 @@ pub struct CatalogCache {
     pub catalog: crate::lists::catalog::Catalog,
 }
 
-// ── Sprint 53 — Lists tab edit modal ───────────────────────────────────────
-//
+// ── Lists tab edit modal ───────────────────────────────────────────────
+
 // `EditListModal` carries the buffers the operator types into while a 60×22
-// centered modal is open; submit reuses the S35/S36/S50 write pipeline
+// centered modal is open; submit reuses the existing write pipeline
 // (`cli::commands::target::*` + `cli::commands::ipc_reload::attempt_reload`)
 // verbatim, so no new write helpers exist. Two-step Delete with typed-id
 // confirm acts as a deliberation gate; `validate_or_revert` is the
 // referential-integrity guardrail that rolls the file back when removing
 // the list would dangle a profile or rule reference.
 //
-// L1 — `id` is read-only (immutable in schema). L2 — `trust` is read-only
-// (W2.1 re-validation deferred). See `_docs/features/lists_edit_modal.md` §5.
+// `id` is read-only (immutable in schema). `trust` is read-only too
+// (re-validation on trust change is not yet implemented).
 
-/// Open-state for a Sprint 53 list edit modal. Built from the focused
+/// Open-state for the list edit modal. Built from the focused
 /// row by [`crate::tui::tabs::lists::build_edit_modal_for`]. The buffers
 /// hold local edits until `Ctrl+S` commits via the shared write pipeline,
 /// or `Esc` discards them.
 #[derive(Debug, Clone)]
 pub struct EditListModal {
-    /// Stable list id captured at modal open. Read-only in the modal
-    /// (L1) — every save / delete uses this id to find the row in the
+    /// Stable list id captured at modal open. Read-only in the modal —
+    /// every save / delete uses this id to find the row in the
     /// `[[blocklists]]` array.
     pub blocklist_id: String,
     /// Edit vs. typed-id confirm screen. `Esc` from `ConfirmDelete` falls
@@ -2666,8 +2695,8 @@ pub struct EditListModal {
     pub url: String,
     pub nature: BlocklistBase,
     pub enabled: bool,
-    /// Sprint C T5 of `lists_categories_v2`: operator opted out of the
-    /// §6.1 gate-3 reachability probe via the modal's advanced
+    /// Operator opted out of the
+    /// reachability probe via the modal's advanced
     /// affordance. CLI `--skip-head-check` is the symmetric path. The
     /// catalog subscribe flow always sets this to `true` since rows
     /// are pre-validated by the catalog publisher.
@@ -2696,7 +2725,7 @@ pub struct EditListModal {
     pub error_message: Option<String>,
     pub status_message: Option<String>,
     /// `true` while the save / delete IPC + write is in flight; blocks
-    /// re-entrant submits, mirroring the S43 T3 assignment-modal pattern.
+    /// re-entrant submits, mirroring the assignment-modal pattern.
     pub submitting: bool,
 
     /// The operator typed this list's id into the
@@ -2808,7 +2837,7 @@ impl EditField {
     /// fields it governs (Format, Interval, AuthTokenRef) appear only
     /// while `advanced_expanded`. The button row (Delete, Cancel, Save)
     /// anchors the tail — Delete is dropped in Add mode (nothing to
-    /// delete). Variant-A modal-ecosystem redesign; supersedes the old
+    /// delete). Supersedes the old
     /// static `ORDER` / `PROMOTE_ORDER` constants.
     pub fn cycle(mode: &EditModalMode, advanced_expanded: bool) -> Vec<EditField> {
         let mut v: Vec<EditField> = Vec::with_capacity(13);
@@ -2943,19 +2972,14 @@ impl IntervalChoice {
     }
 }
 
-// ── Rules tab state (S43 T2 placeholder) ────────────────────────────────────
+// ── Rules tab state ─────────────────────────────────────────────────────
 
-/// Sprint 43 T2: state for the new Rules placeholder tab.
-///
-/// Read-only in T2 — no admin_rules data source exists yet (T5 wires
-/// the `[[admin_rules]]` schema + `e/d` keybindings). For now the
-/// state carries only the navigation cursor; the renderer surfaces an
-/// empty-state explainer that points the operator at T5's incoming
-/// commands.
+/// State for the Rules tab: navigation cursor, filter, the joined
+/// `[[admin_rules]]` row view, and the edit/add modal lifecycles.
 #[derive(Debug, Clone, Default)]
 pub struct RulesState {
     pub table_state: TableState,
-    /// rev-2607: operator's stable selection key — the `[[admin_rules]]`
+    /// Operator's stable selection key — the `[[admin_rules]]`
     /// id. The rows are rebuilt from `loaded_config` on every reload
     /// (including this tab's own delete), so a bare `TableState` index can
     /// point past the end, or at a *different* rule when one above the
@@ -2963,11 +2987,10 @@ pub struct RulesState {
     /// one the table paints and `build_rule_edit_modal_for` indexes — before
     /// every draw (`reconcile_rules_selection`). `None` until seeded.
     pub selected_id: Option<String>,
-    /// Filter chip cycle: All → Allow → Deny → All. Cycled with `f`.
-    /// S53.4 promotes this from a placeholder chip to a live filter
+    /// Filter chip cycle: All → Allow → Deny → All. Cycled with `f`,
     /// applied against [`Self::entries`].
     pub filter: RulesFilter,
-    /// S53.4 — joined view of `[[admin_rules]]` master entries with
+    /// Joined view of `[[admin_rules]]` master entries with
     /// reverse-indexed scope (which device/profile points at each id)
     /// and parsed action/domain extracted from the AdGuard rule
     /// string. Rebuilt on every render from `loaded_config` (cheap
@@ -2979,16 +3002,16 @@ pub struct RulesState {
     /// action chip). Applied client-side in `render_table` +
     /// `visible_rule_rows_count`.
     pub filter_text: Option<String>,
-    /// S53.5 — open edit modal lifecycle. `Some` while the operator is
+    /// Open edit modal lifecycle. `Some` while the operator is
     /// editing/deleting a rule from the Rules tab; `None` otherwise.
     pub edit_modal: Option<RuleEditModal>,
-    /// wave2/rules-add-key — open add-rule modal lifecycle. `Some` while
+    /// Open add-rule modal lifecycle. `Some` while
     /// the operator is creating a new rule via `[a]`; `None` otherwise.
     /// Mirrors `edit_modal`'s Option-lifecycle contract.
     pub add_modal: Option<crate::tui::rule_add_modal::RuleAddModal>,
 }
 
-/// Open-state for the Rules tab edit modal (S53.5). The modal lets
+/// Open-state for the Rules tab edit modal. The modal lets
 /// the operator flip Allow ↔ Deny, move the rule between scopes
 /// (Default / Profile / Device), or delete it via typed-id confirm.
 /// The rule string itself is **read-only** — to change the domain the
@@ -3021,7 +3044,7 @@ pub struct RuleEditModal {
     pub mode: RuleEditMode,
     pub error_message: Option<String>,
     pub status_message: Option<String>,
-    /// `true` while the IPC + write is in flight. Mirrors the S53
+    /// `true` while the IPC + write is in flight. Mirrors the
     /// list-edit-modal pattern.
     pub submitting: bool,
 }
@@ -3030,8 +3053,8 @@ pub struct RuleEditModal {
 /// (id, raw_rule) are deliberately absent — the cycler never lands on
 /// them.
 ///
-/// `SaveButton` is an *addition* to the interaction model (§4.65 UX3
-/// §3.6 / D7′-extended), not a replacement of the `Ctrl+S`-from-
+/// `SaveButton` is an *addition* to the interaction model, not a
+/// replacement of the `Ctrl+S`-from-
 /// anywhere contract: the chord still commits from any focus, this
 /// just gives the keyboard a second, discoverable route to the same
 /// outcome.
@@ -3318,27 +3341,28 @@ impl ListsKindFilter {
     }
 }
 
-// `plp-s5d` removed the Tags-manager state that stood here — `TagsState`,
-// `TagsFilterChip`, `TagMembers`, `TagsRow` and `TagsModal` — with the
-// `Leaf::Tags` tab they backed. Tags decide nothing after the `plp-s3`
-// cutover, so a CRUD surface over the implicit tag registry had nothing
-// left to administer.
+// The Tags-manager state that once stood here — `TagsState`,
+// `TagsFilterChip`, `TagMembers`, `TagsRow` and `TagsModal` — is gone
+// along with the
+// `Leaf::Tags` tab they backed. Tags decide nothing under the
+// per-list policy model, so a CRUD surface over the implicit tag
+// registry had nothing left to administer.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── §4.62 status TTL (B2 / N2 / N3) ──────────────────────────────
+    // ── Status TTL ─────────────────────────────────────────────────────
 
-    /// The six leaves with no poll of their own. Before N2 a status set
+    /// The leaves with no poll of their own. Before per-message expiry
+    /// existed, a status set
     /// on any of them lived until the operator navigated away or fired
-    /// another action — the "never" column of
-    /// `tui_notification_surface_v1.md` §1 B2, and the mechanism behind
-    /// *"non è chiaro dopo quanto tempo la notifica sparisca"*.
+    /// another action — the mechanism behind the operator's report that
+    /// it was not clear how long a notification took to disappear.
     const NEVER_POLLING_LEAVES: &[Leaf] =
         &[Leaf::Subnets, Leaf::Rules, Leaf::Profiles, Leaf::Settings];
 
-    // B2 — a success message set on a leaf that never polls must still
+    // A success message set on a leaf that never polls must still
     // be gone after its TTL. The expiry is deliberately leaf-agnostic;
     // the loop pins that it stays that way.
     #[test]
@@ -3376,7 +3400,7 @@ mod tests {
         assert!(app.visible_status_at(t0 + STATUS_TTL).is_none());
     }
 
-    // N3 — an error the operator did not read is a lost error, so it
+    // An error the operator did not read is a lost error, so it
     // outlives the Ok TTL and waits for a keystroke.
     #[test]
     fn error_status_survives_the_ok_ttl() {
@@ -3457,6 +3481,26 @@ mod tests {
         assert!(app.dismiss_sticky_status());
     }
 
+    /// tui-infra-02: the mirror of `action_raised_error_survives_a_successful_poll`
+    /// from the other direction — a poll error arriving *while* the action
+    /// error is still unread must not evict it. Asserted through
+    /// `status_text()`, not `last_status.is_some()`: the pre-fix code also
+    /// leaves `last_status` `Some` after the overwrite, so an `is_some()`
+    /// check would pass on the bug.
+    #[test]
+    fn a_poll_error_does_not_evict_an_unread_action_error() {
+        let mut app = App::new();
+        app.status_err("subnet saved but daemon rejected reload: timeout".to_string());
+        app.status_err_poll("connection refused".to_string());
+        assert_eq!(
+            app.status_text(),
+            Some("subnet saved but daemon rejected reload: timeout"),
+            "a poll blip must not overwrite an error the operator has not read"
+        );
+        // ...and the recovery must not then retire what it never raised.
+        assert!(!app.clear_poll_status());
+    }
+
     // Successes and info are action-origin too — a poll pass must not
     // eat the "list saved" toast the operator is mid-read of.
     #[test]
@@ -3499,7 +3543,7 @@ mod tests {
         assert!(app.visible_status_at(Instant::now()).is_some());
     }
 
-    // ── DeviceFormState navigation + lifecycle (Sprint 23 modal) ──
+    // ── DeviceFormState navigation + lifecycle ──────────────────────
 
     #[test]
     fn add_form_starts_focused_on_ip() {
@@ -3674,16 +3718,16 @@ mod tests {
     #[test]
     fn field_buf_writes_propagate_to_named_field() {
         let mut f = DeviceFormState::new_add();
-        f.field_buf(DeviceFormField::Name).push_str("sam-laptop");
+        f.field_buf(DeviceFormField::Name).push_str("casey-laptop");
         f.field_buf(DeviceFormField::Ip).push_str("192.168.1.42");
         f.field_buf(DeviceFormField::Department)
             .push_str("famiglia");
-        assert_eq!(f.name, "sam-laptop");
+        assert_eq!(f.name, "casey-laptop");
         assert_eq!(f.ip, "192.168.1.42");
         assert_eq!(f.department, "famiglia");
     }
 
-    /// The two §net-name fields must be reachable through the SAME buffer
+    /// The two network-name fields must be reachable through the SAME buffer
     /// accessor every other field uses. `field_buf` is the only way the key
     /// handler writes a character, so a variant added to the enum but not to
     /// that match arm compiles, takes focus, and silently swallows typing.
@@ -3707,7 +3751,7 @@ mod tests {
             "AA:BB:CC:DD:EE:01,AA:BB:CC:DD:EE:02".into(),
             "kids".into(),
             "kids-group".into(),
-            "Sam".into(),
+            "Casey".into(),
             "iPad".into(),
             "famiglia".into(),
             "compleanno: gennaio".into(),
@@ -3744,15 +3788,15 @@ mod tests {
         }
     }
 
-    // ── Sprint 45 T2 / Sprint 46 T1: grouped section/leaf navigation ─
+    // ── Grouped section/leaf navigation ─────────────────────────────
 
     #[test]
     fn section_all_carries_five_entries_with_numeric_labels() {
-        // S46 T1 reshape: 5 sections in render order. Dashboard and
-        // QueryLog were promoted out of the retired `Overview` hub.
+        // 5 sections in render order. Dashboard and
+        // QueryLog are promoted out of the retired `Overview` hub.
         // The labels carry the numeric chrome prefix consumed by the
         // top bar Tabs widget (chrome-side strips it for the breadcrumb).
-        // §4.11-4b: the `cluster` build appends a 6th section (`6 Cluster`),
+        // The `cluster` build appends a 6th section (`6 Cluster`),
         // runtime-hidden unless `[cluster].enabled`; the default build is
         // unchanged at 5.
         #[cfg(not(feature = "cluster"))]
@@ -3762,7 +3806,7 @@ mod tests {
         assert_eq!(Section::Dashboard.label(), "1 Dashboard");
         assert_eq!(Section::QueryLog.label(), "2 Query Log");
         assert_eq!(Section::Network.label(), "3 Network");
-        // §4.67-a: "4 Filtering" → "4 Filters", "5 Settings" →
+        // "4 Filtering" → "4 Filters", "5 Settings" →
         // "5 Configuration". The numeric prefix is chrome consumed by the
         // top-bar Tabs widget, so the hotkeys 1-5 are unmoved.
         assert_eq!(Section::Filters.label(), "4 Filters");
@@ -3773,7 +3817,7 @@ mod tests {
 
     #[test]
     fn dashboard_section_is_singleton() {
-        // S46 T1: Dashboard is its own top-level section with itself
+        // Dashboard is its own top-level section with itself
         // as the sole leaf. `default_leaf` and `leaves()` both return
         // Leaf::Dashboard so `[`/`]` cycling collapses to a no-op and
         // the chrome can skip the sub-tab row.
@@ -3783,7 +3827,7 @@ mod tests {
 
     #[test]
     fn query_log_section_is_singleton() {
-        // S46 T1: Query Log shares the singleton pattern with Dashboard
+        // Query Log shares the singleton pattern with Dashboard
         // and Settings. Pinning it as a structural test catches a
         // future refactor that accidentally re-buries it under a hub.
         assert_eq!(Section::QueryLog.default_leaf(), Leaf::QueryLog);
@@ -3792,7 +3836,7 @@ mod tests {
 
     #[test]
     fn leaf_labels_carry_no_numeric_prefix() {
-        // Post-S46 leaves are reached via section hotkeys (1-5) +
+        // Leaves are reached via section hotkeys (1-5) +
         // `[`/`]` cycle or `g <letter>` mnemonics, never by a leaf's own
         // number. A `"3 Devices"` label would falsely promise a `3`
         // hotkey that today jumps to Network (the section), not the
@@ -3803,19 +3847,19 @@ mod tests {
             let first = label.chars().next().unwrap_or(' ');
             assert!(
                 !first.is_ascii_digit(),
-                "leaf {leaf:?} label {label:?} starts with a digit; the numeric prefix was retired in S46"
+                "leaf {leaf:?} label {label:?} starts with a digit; the numeric prefix is retired"
             );
         }
     }
 
     #[test]
     fn network_section_carries_four_leaves_in_render_order() {
-        // S52 collapsed Resolver into a global modal; §4.26 Phase 2 added
-        // Profiles as a 4th destination. 2026-07-24 (IA Option B) moved
-        // Profiles out to Filtering. §4.64 G1 then added Groups — a group
+        // Resolver collapsed into a global modal; Profiles was
+        // added as a 4th destination, then moved to Filtering. Groups
+        // was added after that — a group
         // IS "who is on the wire" (a membership list of devices), which is
-        // the same test §4.66 answered the opposite way for the Labels
-        // registry. Groups sits second, right after Devices, per the
+        // the same test the Labels registry answered the opposite way.
+        // Groups sits second, right after Devices, per the
         // operator's own menu note. The render order is the sub-tab strip's
         // left-to-right order.
         assert_eq!(
@@ -3827,11 +3871,11 @@ mod tests {
 
     #[test]
     fn filters_section_is_profiles_lists_custom_lists_rules() {
-        // 2026-07-24 (IA Option B). Filters owns the whole policy story and
+        // Filters owns the whole policy story and
         // leads with it — a Profile is the hub an operator tuning filtering
         // reaches for, and landing on Lists would put the download ledger in
         // front of the policy.
-        // §4.67-a MN5/MN6: Tags left for Configuration (it is vocabulary, not
+        // Tags left for Configuration (it is vocabulary, not
         // policy), leaving the three leaves that are policy: what applies
         // (Profiles), what it resolves to (Lists), what overrides it (Rules).
         // Custom Lists was inserted between Lists and Rules; the landing
@@ -3870,39 +3914,34 @@ mod tests {
 
     #[test]
     fn configuration_section_holds_labels_tags_settings_file_and_lands_on_labels() {
-        // §4.67-a MN1/MN4/MN5. Configuration answers the third IA question —
-        // "what elements exist to be reused" — which is why Tags leads the
-        // strip. `default_leaf` deliberately does NOT follow: `5` has meant
-        // "Settings" for the life of the product, and §4.67-a moves a section
-        // boundary, not the operator's muscle memory. Settings itself stays a
+        // Configuration answers the third IA question —
+        // "what elements exist to be reused". `default_leaf` deliberately
+        // does NOT follow the row order: `5` has meant
+        // "Settings" for the life of the product, and moving a section
+        // boundary must not move the operator's muscle memory. Settings itself stays a
         // leaf because it carries the Tracking form and backup/restore.
-        // §4.67-b MN3 appended File — the row is what `[`/`]` walks.
-        // §4.66 L2 put Labels FIRST: it is the registry the other two
-        // vocabulary-ish leaves read from, and `default_leaf` deliberately
-        // does not follow the row order — `5` has meant Settings for the
-        // life of the product.
-        // `logs-tab` appended Log Messages. `default_leaf` still does not
+        // File is appended — the row is what `[`/`]` walks.
+        // Labels sits FIRST: it is the registry the other two
+        // vocabulary-ish leaves read from.
+        // Log Messages is appended too. `default_leaf` still does not
         // follow the row order — the section lands on Labels.
         assert_eq!(
             Section::Configuration.leaves(),
             &[Leaf::Labels, Leaf::Settings, Leaf::File, Leaf::Logs]
         );
-        // Was `Leaf::Settings` until 2026-08-24. Flipped on operator
+        // Was `Leaf::Settings`. Flipped on operator
         // authority, not by refactor drift: see `default_leaf` for why a
         // stated preference retires the muscle-memory argument. Landing on
         // Labels also happens to answer the operator's separate report that
         // they could not find where owner / device-type / department are
         // declared — Labels is that registry, and now it is what the section
         // opens on.
-        //
-        // The two `Leaf::Tags` assertions that sat here on `main` are gone
-        // with the leaf itself (`plp-s5d`), not because they were wrong.
         assert_eq!(Section::Configuration.default_leaf(), Leaf::Labels);
     }
 
     #[test]
     fn layout_covers_every_variant() {
-        // §4.67-a. `Section::leaves` and `Leaf::section` fall back instead of
+        // `Section::leaves` and `Leaf::section` fall back instead of
         // panicking — they run on the render path, where a wrong breadcrumb
         // degrades and a panic does not. That safety costs a silent failure
         // mode: a variant with no LAYOUT row reports the wrong section and
@@ -4020,12 +4059,11 @@ mod tests {
         // `Section::leaves()`. If a section's leaves are not a contiguous
         // in-order run of ALL, the same section cycles in two different
         // orders depending on which key the operator presses — and `Tab`
-        // re-enters a section it already left. Prose-only invariant until
-        // 2026-07-24; pinned here so the NEXT reorder trips a test instead
-        // of shipping.
+        // re-enters a section it already left. Pinned here so the NEXT
+        // reorder trips a test instead of shipping.
         //
-        // §4.67-a demoted this from a safety net to a tautology: both sides
-        // are now flattened from the same `LAYOUT` rows, so contiguity holds
+        // This is now a tautology rather than a safety net: both sides
+        // are flattened from the same `LAYOUT` rows, so contiguity holds
         // by construction. Kept deliberately — it costs nothing, it is the
         // executable statement of WHY `Leaf::ALL` may not be hand-ordered,
         // and it goes red again the day someone reintroduces a second source.
@@ -4096,7 +4134,7 @@ mod tests {
 
     #[test]
     fn next_in_section_wraps_within_network() {
-        // §4.64 G1 inserted Groups between Devices and Subnets, so the
+        // Groups sits between Devices and Subnets, so the
         // ring is four long. Local DNS is still last — `]` on it must wrap
         // to Devices, not fall through into the next section.
         assert_eq!(Leaf::Devices.next_in_section(), Leaf::Groups);
@@ -4110,7 +4148,7 @@ mod tests {
 
     #[test]
     fn next_in_section_wraps_within_filters() {
-        // §4.67-a: Filters is the 3-leaf section (Tags left for
+        // Filters is a 4-leaf section (Tags left for
         // Configuration). Twin of the Network cycle test — the wrap is where
         // an off-by-one in `leaves()` would leak the operator into another
         // section. `]` on Rules must land back on Profiles, not on Tags.
@@ -4123,14 +4161,13 @@ mod tests {
 
     #[test]
     fn next_in_section_wraps_within_configuration() {
-        // §4.67-a gave the Settings section a second leaf, so `[`/`]` there
-        // is not a no-op. §4.67-b MN3: three. §4.66 L2: four.
+        // The Settings section grew from one leaf to four over time, so
+        // `[`/`]` there
+        // is not a no-op.
         //
-        // **A ring of FOUR, and the number is a merge.** `plp-s5d` removed
-        // `Leaf::Tags` with the tab; `logs-tab` added `Leaf::Logs`. The ring
-        // is Labels → Settings → File → Logs → Labels. Taking either side of
-        // the conflict whole would have put Tags back or dropped Logs, and
-        // both compile.
+        // **A ring of FOUR.** `Leaf::Tags` is gone
+        // with the tab; `Leaf::Logs` was added. The ring
+        // is Labels → Settings → File → Logs → Labels.
 
         assert_eq!(Leaf::Labels.next_in_section(), Leaf::Settings);
         assert_eq!(Leaf::Settings.next_in_section(), Leaf::File);
@@ -4152,14 +4189,14 @@ mod tests {
         // Dashboard and Query Log are the remaining single-leaf sections;
         // cycling within one is a structural no-op so the operator pressing
         // `[`/`]` there doesn't surprise-jump elsewhere. (Settings held this
-        // role until §4.67-a gave it Tags for company.)
+        // role until it gained a second leaf.)
         for leaf in [Leaf::Dashboard, Leaf::QueryLog] {
             assert_eq!(leaf.next_in_section(), leaf);
             assert_eq!(leaf.prev_in_section(), leaf);
         }
     }
 
-    // ── Variant-A modal-ecosystem redesign: dynamic focus cycle ─────
+    // ── Dynamic focus cycle ──────────────────────────────────────────
     // The SOURCE section hides Format / Interval / AuthTokenRef behind
     // an "Advanced" collapse; Delete / Cancel / Save anchor a button
     // row. The cycle adapts to (mode, advanced_expanded).
@@ -4217,14 +4254,14 @@ mod tests {
         );
     }
 
-    // ── Sprint 45 T3: g <letter> mnemonic dispatch ──────────────────
+    // ── g <letter> mnemonic dispatch ──────────────────────────────────
 
     #[test]
     fn mnemonic_table_covers_every_leaf_exactly_once() {
-        // Each of the 10 leaves has a unique mnemonic letter — no
-        // collisions, no orphans. S52 dropped `g r` (Resolver) when
+        // Each leaf has a unique mnemonic letter — no
+        // collisions, no orphans. `g r` (Resolver) is dropped since
         // the leaf was promoted to a global modal (`s` from anywhere);
-        // §4.26 Phase 2 added `g p` (Profiles).
+        // `g p` (Profiles) was added.
         #[cfg(not(feature = "cluster"))]
         let pairs: [(char, Leaf); 14] = [
             ('d', Leaf::Dashboard),
@@ -4242,16 +4279,12 @@ mod tests {
             ('b', Leaf::Labels),
             ('m', Leaf::Logs),
         ];
-        // §4.11-4b — the `cluster` build adds `g c` → Cluster as one more
+        // The `cluster` build adds `g c` → Cluster as one more
         // mnemonic; the inverse coverage check below then also sees that
         // leaf in `Leaf::ALL`.
         //
-        // **FOURTEEN and FIFTEEN, and the number has already been a merge
-        // of two changes that landed in parallel.** `plp-s5d` removed
-        // `('t', Leaf::Tags)` when the tab went; `logs-tab` added
-        // `('m', Leaf::Logs)`. Taking either side of the conflict whole
-        // would have resurrected the Tags mnemonic or dropped the Logs
-        // one, and BOTH mistakes compile. `t` is taken again now, by
+        // **FOURTEEN and FIFTEEN.** `('t', Leaf::Tags)` is gone
+        // with the tab; `('m', Leaf::Logs)` was added. `t` is taken again now, by
         // Custom Lists — the letter being free was a fact about one
         // moment, not a property of the letter.
         //
@@ -4296,7 +4329,7 @@ mod tests {
 
     #[test]
     fn no_mnemonic_jumps_outside_leaf_all() {
-        // §4.67-a closes the one route by which `app.active_leaf` could hold a
+        // Closes the one route by which `app.active_leaf` could hold a
         // leaf that has no LAYOUT row: `from_mnemonic` is a hand-written match,
         // so `g <letter>` is the only setter that does not read LAYOUT. A leaf
         // reachable only that way would render with the fallback section and an
@@ -4313,7 +4346,7 @@ mod tests {
 
     #[test]
     fn unknown_mnemonic_returns_none() {
-        // Anything not in the §4 table — uppercase letters, digits,
+        // Anything not in the mnemonic table — uppercase letters, digits,
         // punctuation, common typos — must return None so the caller
         // drains pending_goto and falls through to the active leaf's
         // handler instead of swallowing the keystroke silently.

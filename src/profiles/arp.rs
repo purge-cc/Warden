@@ -14,12 +14,12 @@ const ARP_PATH: &str = "/proc/net/arp";
 /// Read the system ARP table and return an IP → MAC mapping.
 ///
 /// MAC addresses are normalized to uppercase (the resolver compares them
-/// against upper-cased `mac_pin` / `mac_aliases`, res-09). Keyed by IP
+/// against upper-cased `mac_pin` / `mac_aliases`). Keyed by IP
 /// because `/proc/net/arp` has one row per IP, so an IP key is lossless —
-/// the prior MAC-keyed map silently dropped all-but-one IP for a MAC that
+/// a MAC-keyed map silently drops all-but-one IP for a MAC that
 /// holds several (DHCP-renew overlap, IP alias, dual-NIC bridge), and
-/// `HashMap` iteration made *which* row survived nondeterministic per
-/// refresh (rev-2606 arp-01). Returns an empty map on read failure
+/// `HashMap` iteration makes *which* row survives nondeterministic per
+/// refresh. Returns an empty map on read failure
 /// (non-Linux, permission denied, etc.) — the caller falls back to
 /// configured IPs.
 pub fn read_arp_by_ip() -> HashMap<IpAddr, CompactString> {
@@ -60,8 +60,7 @@ fn read_arp_from(path: &str) -> HashMap<IpAddr, CompactString> {
 ///
 /// Flags 0x2 means the entry is complete (resolved). We skip incomplete
 /// entries (0x0). Keyed by IP (unique per row) so every resolved entry
-/// survives — see [`read_arp_by_ip`] for why MAC-keying was lossy
-/// (rev-2606 arp-01).
+/// survives — see [`read_arp_by_ip`] for why MAC-keying is lossy.
 fn parse_arp_table(content: &str) -> HashMap<IpAddr, CompactString> {
     let mut map = HashMap::new();
     for line in content.lines().skip(1) {
@@ -149,12 +148,11 @@ short line
 
     #[test]
     fn multi_ip_per_mac_all_preserved() {
-        // rev-2606 arp-01: one MAC holding two complete IPv4 rows
-        // (DHCP-renew overlap / IP alias / dual-NIC bridge). The old
-        // MAC-keyed map kept only the last-iterated row, and *which* one
-        // survived was nondeterministic. The IP-keyed map keeps BOTH,
-        // each pointing at the shared MAC, so neither IP loses its
-        // snapshot entry.
+        // One MAC holding two complete IPv4 rows (DHCP-renew overlap /
+        // IP alias / dual-NIC bridge). A MAC-keyed map would keep only
+        // the last-iterated row, nondeterministically. The IP-keyed map
+        // keeps BOTH, each pointing at the shared MAC, so neither IP
+        // loses its snapshot entry.
         let content = "\
 IP address       HW type     Flags       HW address            Mask     Device
 192.168.1.10     0x1         0x2         aa:bb:cc:dd:ee:99     *        eth0

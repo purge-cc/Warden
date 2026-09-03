@@ -14,9 +14,9 @@
 //! colour switches on `ok` exactly like the restore outcome.
 //!
 //! ## Chrome
-//! Both flows are **Archetype C** (§4.61 §4): [`NoticeSpec`] →
+//! Both flows are **Archetype C**: [`NoticeSpec`] →
 //! `modal_form::notice_body` → `modal_form::render_modal`, anchored on the
-//! tab content rect per **D18**. Seven stages across the two — four
+//! tab content rect. Seven stages across the two — four
 //! restore, three backup — and every one of them is a `NoticeSpec`.
 //!
 //! ## State machine
@@ -168,7 +168,7 @@ impl RestoreModal {
 /// `YYYY-MM-DD HH:MM` — minute precision is enough for an operator to
 /// recognise a restore point; seconds live in the archive filename.
 /// `pub(crate)` so the Settings tab's "Last auto-backup" line reuses the
-/// same formatting (Sprint 5).
+/// same formatting.
 pub(crate) fn format_date(ts: time::OffsetDateTime) -> String {
     use time::macros::format_description;
     const FMT: &[time::format_description::FormatItem<'static>] =
@@ -178,8 +178,7 @@ pub(crate) fn format_date(ts: time::OffsetDateTime) -> String {
 }
 
 /// Coarse relative age — mirrors the Devices tab's "last seen" buckets.
-/// `pub(crate)` so the Settings tab's "Last auto-backup" line reuses it
-/// (Sprint 5).
+/// `pub(crate)` so the Settings tab's "Last auto-backup" line reuses it.
 pub(crate) fn format_age(now: time::OffsetDateTime, ts: time::OffsetDateTime) -> String {
     let secs = (now - ts).whole_seconds().max(0) as u64;
     if secs < 60 {
@@ -196,7 +195,7 @@ pub(crate) fn format_age(now: time::OffsetDateTime, ts: time::OffsetDateTime) ->
     }
 }
 
-/// Ecosystem modal width (§4.61 Archetype C). 64 is the house figure every
+/// Ecosystem modal width (Archetype C). 64 is the house figure every
 /// migrated overlay uses — interior 62, or 61 once the body scrolls.
 const MODAL_W: u16 = 64;
 
@@ -215,10 +214,10 @@ const DOT_D_NOTE: &str =
 /// Archetype-C overlay for the restore flow's four stages
 /// (`Picking` → `Confirming` → `Restoring` → `Submitted`).
 ///
-/// §4.61 **D18**: the anchor is the tab content rect, so the header, the
+/// The anchor is the tab content rect, so the header, the
 /// menu card and the footer legend stay visible behind the modal —
-/// §4.62 **N1** forbids anything transient from covering the last two.
-/// **D18′** is why the anchor lands in the same commit as the
+/// nothing transient may cover either permanent surface.
+/// That anchor has to land in the same commit as the
 /// `ScrollBody` migration: on its own it would cut the budget and clip.
 pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &RestoreModal) {
     modal_form::render_modal(f, anchor, MODAL_W, |w| {
@@ -226,7 +225,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &RestoreModal) {
     });
 }
 
-/// Per §2.1 of the modal contract a body's **row count** must depend only
+/// A body's **row count** must depend only
 /// on the spec, never on the width — `render_modal` builds twice, at
 /// `width - 2` and again at `width - 3` when the body scrolls, and a count
 /// that differed between the two passes would mis-size the frame. None of
@@ -803,7 +802,7 @@ mod tests {
         assert!(bad.contains("Close"), "action row cut:\n{bad}");
     }
 
-    // ---- D15 — no red borders anywhere in this file --------------------
+    // ---- No red borders anywhere in this file ---------------------------
 
     /// Eyeball all seven stages at the floor:
     /// `cargo test --lib backup_visual_dump -- --ignored --nocapture`.
@@ -863,8 +862,8 @@ mod tests {
     }
 
     /// The chrome now comes from `modal_form::render_modal`, which owns
-    /// the border, its colour and the elevated surface. **D15** (no red
-    /// border), **D13** (no wrapping body) and "zero hand-rolled colour"
+    /// the border, its colour and the elevated surface. No red
+    /// border, no wrapping body, and "zero hand-rolled colour"
     /// as a test rather than a claim in a commit message.
     ///
     /// Needles are split with `concat!` so this assertion cannot match
@@ -887,7 +886,7 @@ mod tests {
         }
     }
 
-    // ---- D18 / §4.62 N1 — the permanent orientation surfaces -----------
+    // ---- The permanent orientation surfaces ------------------------------
     //
     // At the 80×24 floor `ui::layout_chunks` splits the frame into
     // header 4 (rows 0..=3) · menu card 3 (rows 4..=6, Settings is a
@@ -896,7 +895,7 @@ mod tests {
     // transient may repaint.
     const CONTENT_ROWS: std::ops::RangeInclusive<usize> = 7..=22;
 
-    fn full_frame_dump(app: &App, w: u16, h: u16) -> String {
+    fn full_frame_dump(app: &mut App, w: u16, h: u16) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -904,11 +903,11 @@ mod tests {
         dump_buffer(term.backend().buffer())
     }
 
-    /// The observable form of D18 and N1: opening the overlay must change
-    /// the content region and **nothing else**. Comparing the two frames
-    /// row-by-row rather than grepping for a legend needle is deliberate —
-    /// a needle that also occurs inside the modal gives a false green, and
-    /// this workstream has shipped that mistake twice.
+    /// The observable form of the anchor rule: opening the overlay must
+    /// change the content region and **nothing else**. Comparing the two
+    /// frames row-by-row rather than grepping for a legend needle is
+    /// deliberate — a needle that also occurs inside the modal gives a
+    /// false green.
     fn assert_only_the_content_region_changed(before: &str, after: &str, what: &str) {
         let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
         assert_eq!(b.len(), a.len(), "frame height changed");
@@ -917,8 +916,8 @@ mod tests {
                 assert_eq!(
                     bl, al,
                     "{what} repainted row {y}, which is header / menu card / footer \
-                     — D18 anchors on the content rect and N1 forbids occluding either \
-                     permanent surface\n--- without the overlay ---\n{before}\n\
+                     — the overlay anchors on the content rect and must not occlude \
+                     either permanent surface\n--- without the overlay ---\n{before}\n\
                      --- with the overlay ---\n{after}"
                 );
             }
@@ -941,25 +940,25 @@ mod tests {
     #[test]
     fn restore_overlay_never_occludes_the_menu_card_or_the_footer_legend() {
         let mut app = settings_app();
-        let before = full_frame_dump(&app, 80, 24);
+        let before = full_frame_dump(&mut app, 80, 24);
         app.settings.restore_modal = Some(RestoreModal {
             stage: RestoreStage::Picking {
                 entries: mk_points(30),
                 selected: 15,
             },
         });
-        let after = full_frame_dump(&app, 80, 24);
+        let after = full_frame_dump(&mut app, 80, 24);
         assert_only_the_content_region_changed(&before, &after, "the restore picker");
     }
 
     #[test]
     fn backup_overlay_never_occludes_the_menu_card_or_the_footer_legend() {
         let mut app = settings_app();
-        let before = full_frame_dump(&app, 80, 24);
+        let before = full_frame_dump(&mut app, 80, 24);
         app.settings.backup_modal = Some(BackupModal::Confirm {
             dir: PathBuf::from(BACKUP_DIR),
         });
-        let after = full_frame_dump(&app, 80, 24);
+        let after = full_frame_dump(&mut app, 80, 24);
         assert_only_the_content_region_changed(&before, &after, "the backup confirm");
     }
 }

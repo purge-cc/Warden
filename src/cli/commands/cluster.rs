@@ -1,15 +1,14 @@
-//! `warden cluster …` — primary/secondary replication CLI (§4.11).
+//! `warden cluster …` — primary/secondary replication CLI.
 //!
-//! `token` (§4.11-1) mints the primary's bearer credential; `status` prints
-//! local cluster state. `join` (§4.11-1, extended in §4.11-3) makes a node a
-//! working secondary: it persists the `[cluster]` section AND — on a
-//! `cluster`-feature build — adds the `cluster.d/*.toml` include and saves the
-//! PLAINTEXT token (`crate::cluster::secret`) the poll loop sends on every
-//! heartbeat (CS2). The serve endpoints (§4.11-2) and the secondary poll loop
-//! (§4.11-3) live in `crate::cluster` (only built under the `cluster`
-//! feature, so it is absent from a default doc build); there is still no
-//! live handshake at
-//! `join` time (deferred).
+//! `token` mints the primary's bearer credential; `status` prints local
+//! cluster state. `join` makes a node a working secondary: it persists
+//! the `[cluster]` section AND — on a `cluster`-feature build — adds
+//! the `cluster.d/*.toml` include and saves the PLAINTEXT token
+//! (`crate::cluster::secret`) the poll loop sends on every heartbeat.
+//! The serve endpoints and the secondary poll loop live in
+//! `crate::cluster` (only built under the `cluster` feature, so it is
+//! absent from a default doc build); there is still no live handshake
+//! at `join` time.
 //!
 //! Config writes mirror the hardened path proven by `token.rs`: read the
 //! master as a format-preserving document, mutate only the `[cluster]`
@@ -121,7 +120,7 @@ fn resolve_join_peer_cert(peer_cert: Option<&Path>) -> anyhow::Result<Option<Str
     Ok(Some(stored))
 }
 
-/// Resolve the cluster bearer token off the command line (`cluster-01`):
+/// Resolve the cluster bearer token off the command line:
 /// `--token-file` (preferred) → stdin (piped or interactive prompt) →
 /// the discouraged inline `--token`. Command-line arguments are world-readable
 /// via `ps`/`/proc/<pid>/cmdline` and persist in shell history, so the inline
@@ -205,13 +204,13 @@ fn read_token_from_stdin() -> anyhow::Result<String> {
 ///
 /// Writes the `[cluster]` section (`enabled = true`, `role = "secondary"`,
 /// `peer`, `token_hash`); on a `cluster`-feature build it also adds the
-/// `cluster.d/*.toml` include and saves the plaintext token (§4.11-3). The
-/// token is hashed with [`hash_token`] before storage. A live handshake
-/// against the primary at join time is still deferred — `join` only persists
-/// config (the staging validator confirms it loads); the poll loop performs
-/// the first real contact once the daemon (re)starts.
+/// `cluster.d/*.toml` include and saves the plaintext token. The token is
+/// hashed with [`hash_token`] before storage. There is no live handshake
+/// against the primary at join time — `join` only persists config (the
+/// staging validator confirms it loads); the poll loop performs the
+/// first real contact once the daemon (re)starts.
 ///
-/// The bearer token is resolved off the command line (`cluster-01`): from
+/// The bearer token is resolved off the command line: from
 /// `--token-file` (preferred), else stdin (piped or an interactive prompt),
 /// else the discouraged inline `--token` (with a `ps`/history-exposure warning).
 /// `cluster join` with no pin supplied — delegates to [`run_join_pinned`].
@@ -231,7 +230,7 @@ pub fn run_join(
 }
 
 /// [`run_join`] plus `--peer-cert`, the certificate this secondary pins for
-/// the primary's API listener (§6).
+/// the primary's API listener.
 pub fn run_join_pinned(
     config_path: &Path,
     peer: &str,
@@ -239,15 +238,14 @@ pub fn run_join_pinned(
     token_file: Option<&Path>,
     peer_cert: Option<&Path>,
 ) -> anyhow::Result<()> {
-    // cli-h1: refuse before anything is persisted. See `ensure_can_join`.
+    // Refuse before anything is persisted. See `ensure_can_join`.
     ensure_can_join()?;
 
     let now = time::OffsetDateTime::now_utc();
-    // No pre-load. It used to be `let _loaded = load_config(…)?` — a guard,
-    // never a data dependency — and since §5.3 it was an outright deadlock:
-    // a policy-free secondary master does not validate until `enabled = true`
-    // is written, and writing it is what `join` does. The node could not join
-    // because it had not joined.
+    // No pre-load: a policy-free secondary master does not validate
+    // until `enabled = true` is written, and writing it is what `join`
+    // does — a pre-load guard here would deadlock a node that could not
+    // join because it had not joined.
     //
     // Nothing is lost. `write_cluster_fields_to_master` parses the raw master
     // itself, and `atomic_write_and_validate` validates the POST state with
@@ -261,7 +259,7 @@ pub fn run_join_pinned(
     // `run_token` keeps its pre-load on purpose: minting is a PRIMARY
     // operation, and failing it on an unjoined secondary is correct.
 
-    // §5.2 — refuse a policy-carrying master HERE, before anything is
+    // Refuse a policy-carrying master HERE, before anything is
     // written. The permanent guard in the validator would catch it too, but
     // only on the staged-write path, where the provenance map names the
     // STAGING TEMP FILE: a remedy pointing at a path that no longer exists
@@ -269,13 +267,13 @@ pub fn run_join_pinned(
     ensure_master_carries_no_policy(config_path)?;
 
     let peer = peer.trim();
-    // poll-02: a secondary sends the plaintext cluster token to `peer` on every
+    // A secondary sends the plaintext cluster token to `peer` on every
     // poll, so reject a non-https (or non-loopback-http) peer at join time —
     // before it is persisted — mirroring the config validator's defence in depth.
     if let Err(reason) = crate::config::schema::cluster::validate_peer_url(peer) {
         anyhow::bail!("--peer {reason}");
     }
-    // §6: the pin is what authenticates the channel. Resolve it BEFORE the
+    // The pin is what authenticates the channel. Resolve it BEFORE the
     // token prompt so a bad path fails without the operator having typed a
     // secret, and before anything is persisted.
     let peer_cert = resolve_join_peer_cert(peer_cert)?;
@@ -302,15 +300,14 @@ pub fn run_join_pinned(
 
     write_cluster_fields_to_master(config_path, &fields, now)?;
 
-    // §4.11-3: make this node a working secondary. Both steps are gated on the
-    // `cluster` feature. (This block used to justify writing the fields on a
-    // feature-less build too — "it can never run as a secondary anyway". That
-    // was backwards: see `ensure_can_join`, which now refuses upstream.)
+    // Make this node a working secondary. Both steps are gated on the
+    // `cluster` feature — a feature-less build refuses upstream in
+    // `ensure_can_join`, so these fields are never written there.
     //   (a) include the sync-owned `cluster.d/` drop-in so the loader picks up
     //       applied policy bundles (wildcard zero-match is allowed, so it loads
     //       cleanly before the first bundle lands);
     //   (b) persist the PLAINTEXT token so the poll loop can authenticate
-    //       (CS2 verifies plaintext vs the primary's stored hash — D1).
+    //       against the primary's stored hash.
     #[cfg(feature = "cluster")]
     {
         ensure_cluster_include(config_path, now)?;
@@ -325,10 +322,9 @@ pub fn run_join_pinned(
     println!();
     #[cfg(feature = "cluster")]
     {
-        // NOT "policy + domain map". S1 stopped shipping the map: the secondary
-        // downloads its own lists from the replicated policy and derives the
-        // Tier-1 bits itself. The old wording survived the deletion because a
-        // println! is invisible to every gate — nothing type-checks prose.
+        // NOT "policy + domain map": the secondary downloads its own
+        // lists from the replicated policy and derives the Tier-1 bits
+        // itself.
         println!("(Re)start the daemon to begin syncing: it will poll the primary every");
         println!("poll_interval_secs, converge on its policy, and download its own lists");
         println!("from it. `warden cluster status`.");
@@ -342,14 +338,13 @@ pub fn run_join_pinned(
 /// unconditional `bail!` in the body would make the rest of the function
 /// unreachable on a feature-less build, and `unreachable_code` is denied here.
 ///
-/// **Why this has to run before the write (cli-h1, P0).** `run_join` used to
-/// persist `cluster.enabled = true` first and only *then* consult the `cluster`
-/// feature, reasoning that a feature-less binary "can never run as a secondary
-/// anyway". It cannot — which is precisely why the write is destructive:
-/// [`super::start::check_cluster_build`] refuses to start the daemon while
-/// `cluster.enabled`, and there is no `warden cluster leave` to undo it. On a
-/// stock build (`[features]` has no `default` key, so `cluster` is off) the
-/// verb therefore took DNS down and left hand-editing TOML as the only way back.
+/// **Why this has to run before the write.** Persisting
+/// `cluster.enabled = true` before checking the `cluster` feature is
+/// destructive on a feature-less binary: [`super::start::check_cluster_build`]
+/// refuses to start the daemon while `cluster.enabled`, and there is no
+/// `warden cluster leave` to undo it. On a stock build (`[features]` has
+/// no `default` key, so `cluster` is off) that ordering would take DNS
+/// down and leave hand-editing TOML as the only way back.
 #[cfg(not(feature = "cluster"))]
 fn ensure_can_join() -> anyhow::Result<()> {
     anyhow::bail!(
@@ -366,14 +361,14 @@ fn ensure_can_join() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// §5.2 — refuse to join when the master carries policy of its own, before
-/// any write.
+/// Refuse to join when the master carries policy of its own, before any
+/// write.
 ///
 /// The permanent enforcement is the validator's
 /// `CLUSTER_SECONDARY_MASTER_CARRIES_POLICY`, which fires at every load and is
 /// the rule that actually holds; a join-time check does not stop an operator
-/// adding a device a month later. This is the *early, readable* half, and §5.2
-/// is explicit that one does not replace the other.
+/// adding a device a month later. This is the *early, readable* half —
+/// one does not replace the other.
 ///
 /// It exists as its own check rather than as "the staged write will catch it"
 /// for one concrete reason: on the staged-write path the provenance map names
@@ -461,17 +456,18 @@ pub const LEAVE_UPSTREAM_NOT_NEEDED: &str =
 #[derive(Debug, PartialEq, Eq)]
 enum OwnUpstream {
     /// Loads, and `upstream.servers` is empty — the joined-but-never-synced
-    /// shape. Clearing membership drops the §5.3 exemption and that same
-    /// emptiness becomes a hard `UPSTREAM_SERVERS_EMPTY`.
+    /// shape. Clearing membership drops the exemption a cluster secondary
+    /// gets from the empty-upstream check, and that same emptiness
+    /// becomes a hard `UPSTREAM_SERVERS_EMPTY`.
     WouldStrand,
     /// Loads and already resolves a non-empty `upstream.servers`, whether from
     /// the master or from a synced bundle the include keeps.
     Present,
     /// Does not load, so nothing can be concluded. `run_leave` must rescue
-    /// configs that do NOT load — that is the verb's reason to exist
-    /// (`cli-h1`), and `leave_clears_membership_on_a_stock_build` pins it. This
-    /// arm therefore changes no behaviour: the staged write decides, exactly as
-    /// before.
+    /// configs that do NOT load — that is the verb's reason to exist —
+    /// and `leave_clears_membership_on_a_stock_build` pins it. This arm
+    /// therefore changes no behaviour: the staged write decides, exactly
+    /// as before.
     Unknown,
 }
 
@@ -680,8 +676,8 @@ fn asserts_membership(cluster: &toml::value::Table) -> bool {
 
 /// `warden cluster status` — print this node's cluster state.
 ///
-/// §4.11-4 (CS9): on a `cluster`-feature build it first asks the RUNNING daemon
-/// for the live view (peer roster + sync telemetry) over IPC; if the daemon is
+/// On a `cluster`-feature build it first asks the RUNNING daemon for
+/// the live view (peer roster + sync telemetry) over IPC; if the daemon is
 /// unreachable or clustering is off it falls back to the on-disk config
 /// summary. A feature-less binary can never run a live cluster, so it always
 /// prints the config summary. The token hash value is never printed — only
@@ -880,8 +876,9 @@ fn write_cluster_fields_to_master(
 /// `upstream.servers`, mutated into the SAME staged write.
 ///
 /// The two cannot be separate writes and that is the whole point. On a
-/// never-synced secondary, clearing membership drops the §5.3 exemption while
-/// no `[upstream]` exists yet — and adding `[upstream]` first is refused by
+/// never-synced secondary, clearing membership drops the cluster
+/// secondary's exemption from the empty-upstream check while no
+/// `[upstream]` exists yet — and adding `[upstream]` first is refused by
 /// `CLUSTER_SECONDARY_MASTER_CARRIES_POLICY` while membership still stands.
 /// Either order fails; only the simultaneous one is representable, because
 /// `atomic_write_and_validate` validates the post state and nothing in
@@ -892,6 +889,40 @@ fn write_cluster_fields_to_master_with_upstream(
     upstream: Option<&str>,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
+    write_master_sections(config_path, fields, &[], upstream, now)
+}
+
+/// [`write_cluster_fields_to_master`] plus `[api]` fields, mutated into the
+/// SAME staged write (S4).
+///
+/// Third instance of the same argument, and the sharpest one.
+/// `check_api` turns on **four** rules the instant `api.enabled = true`:
+/// a non-blank `token_hash`, both halves of the TLS pair on a non-loopback
+/// `listen`, and never a half pair. `atomic_write_and_validate` validates the
+/// POST state and nothing in between, so `[cluster]` first and `[api]` second
+/// — or the reverse — passes through a document the loader rejects, and the
+/// verb fails half-applied. Only the simultaneous write is representable.
+fn write_cluster_and_api_fields_to_master(
+    config_path: &Path,
+    cluster_fields: &[(&str, Option<toml::Value>)],
+    api_fields: &[(&str, Option<toml::Value>)],
+    now: time::OffsetDateTime,
+) -> anyhow::Result<()> {
+    write_master_sections(config_path, cluster_fields, api_fields, None, now)
+}
+
+/// The one staged, validated master write the three wrappers above share.
+///
+/// Kept private and reached only through them: every caller expresses its
+/// intent in its own name, and none of them has to restate why the sections
+/// travel together.
+fn write_master_sections(
+    config_path: &Path,
+    cluster_fields: &[(&str, Option<toml::Value>)],
+    api_fields: &[(&str, Option<toml::Value>)],
+    upstream: Option<&str>,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<()> {
     let content = super::toml_write::edit_document(config_path, |doc| {
         if let Some(u) = upstream {
             let mut servers = toml_edit::Array::new();
@@ -899,14 +930,22 @@ fn write_cluster_fields_to_master_with_upstream(
             super::toml_write::table_mut(doc, "upstream")?
                 .insert("servers", toml_edit::value(servers));
         }
-        let cluster = super::toml_write::table_mut(doc, "cluster")?;
-        for (k, v) in fields {
-            match v {
-                Some(v) => {
-                    cluster.insert(k, super::toml_write::value_to_item(v)?);
-                }
-                None => {
-                    cluster.remove(k);
+        for (section, fields) in [("cluster", cluster_fields), ("api", api_fields)] {
+            if fields.is_empty() {
+                // Not a micro-optimisation: `table_mut` CREATES the table, so
+                // an unconditional pass would add an empty `[api]` header to
+                // every `join` and `leave` write.
+                continue;
+            }
+            let table = super::toml_write::table_mut(doc, section)?;
+            for (k, v) in fields {
+                match v {
+                    Some(v) => {
+                        table.insert(k, super::toml_write::value_to_item(v)?);
+                    }
+                    None => {
+                        table.remove(k);
+                    }
                 }
             }
         }
@@ -925,8 +964,448 @@ fn write_cluster_fields_to_master_with_upstream(
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// §4.11-3: ensure the master's top-level `includes` contains the
-/// sync-owned `cluster.d/*.toml` drop-in glob, then atomically re-write the
+/// `warden cluster enable --role primary` — S4: turn a standalone node into a
+/// cluster primary and mint the TLS material the secondary will pin.
+///
+/// # Why this writes `[api]` too, and why it is ONE write
+///
+/// The sync channel IS the API server: the cluster routes mount on it. So a
+/// primary needs `api.enabled = true` on an address its secondary can reach,
+/// and `check_api` makes four rules bite the instant that flips — a non-blank
+/// `token_hash`, both halves of the TLS pair on a non-loopback `listen`, and
+/// never a half pair. `atomic_write_and_validate` validates the POST state and
+/// nothing in between, so any split write passes through a document the loader
+/// rejects. See [`write_cluster_and_api_fields_to_master`].
+///
+/// # Why the pre-state is necessarily `api.enabled = false`
+///
+/// Worth stating because the S3 plan got it backwards and had this verb
+/// *require* the API already on. It cannot be: `enabled = true` on a
+/// non-loopback listen does not load without a cert, and nothing else mints
+/// one — so "already enabled" describes no node that needs this verb. The
+/// verb sets it.
+///
+/// # Refusals write NOTHING
+///
+/// Seven of them (R1-R7), all evaluated before the first byte reaches disk,
+/// each pinned by a frozen const in [`crate::config::schema::cluster`]. The
+/// tests assert both that the master is byte-identical afterwards *and* which
+/// const came back — byte-identity alone is satisfied by any refusal, so on
+/// its own it cannot tell a test that pinned its rule from one that went green
+/// on an earlier check.
+pub fn run_enable(
+    config_path: &Path,
+    role: crate::cli::EnableRole,
+    sans: &[String],
+    api_listen: Option<std::net::SocketAddr>,
+    validity_days: u32,
+) -> anyhow::Result<()> {
+    use crate::config::schema::cluster as cluster_schema;
+
+    // R1 first, and deliberately ahead of the build guard: `--role secondary`
+    // is the same mistake on every build, and the answer to it (`cluster
+    // join`) is more useful than "rebuild with --features cluster".
+    if role == crate::cli::EnableRole::Secondary {
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_ROLE_SECONDARY_USE_JOIN);
+    }
+    // Not one of R1-R7 — see `ensure_can_enable`. It has to run before the
+    // write for the cli-h1 reason, and here the trap is worse than it was for
+    // `join`: a retry after rebuilding hits R6, and there is no `--force`.
+    ensure_can_enable()?;
+
+    let now = time::OffsetDateTime::now_utc();
+    // Pre-load, unlike `run_join`. A would-be PRIMARY's master is an ordinary
+    // standalone config that already loads — the §5.3 deadlock that forced
+    // `join` to read raw is a SECONDARY-only condition. Same reasoning keeps
+    // `run_token`'s pre-load. It also buys the parsed `api.listen`, defaults
+    // applied, which R3 needs and a raw TOML read cannot give.
+    let loaded = loader::load_config(config_path, now).map_err(format_load_errs)?;
+    let cluster = &loaded.config.cluster;
+    let api = &loaded.config.api;
+
+    // R2 — the credential must exist before the door opens.
+    if !is_set(cluster.token_hash.as_deref()) {
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_TOKEN_HASH);
+    }
+
+    // R3 — the RESULTING listen, not the configured one: `--api-listen` is
+    // what makes a fresh node (default `127.0.0.1:8053`) reachable at all.
+    let listen = api_listen.unwrap_or(api.listen);
+    if listen.ip().is_loopback() {
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_LISTEN_IS_LOOPBACK);
+    }
+
+    // R4 — without it the post state is refused by
+    // `API_ENABLED_REQUIRES_TOKEN_HASH`, i.e. the verb would build a master
+    // the daemon cannot start from and fail late, in the staged write, naming
+    // a temp path that is unlinked by the time the operator reads the error.
+    if !is_set(api.token_hash.as_deref()) {
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH);
+    }
+
+    // Either half counts as "the operator brought their own". A lone
+    // `tls_cert` is loadable today only because `check_api` is inert while
+    // `api.enabled = false`; treating it as absent would mint over half a
+    // pair the operator configured on purpose.
+    let has_own_cert = api.tls_cert.is_some() || api.tls_key.is_some();
+
+    if has_own_cert && !sans.is_empty() {
+        // R7 — the certificate would be written and never used.
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT);
+    }
+    if !has_own_cert && sans.is_empty() {
+        // R5.
+        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_SAN);
+    }
+
+    let dir = config_dir(config_path)?;
+    let crt = dir.join("api.crt");
+    let key = dir.join("api.key");
+
+    let minted = if has_own_cert {
+        // R7's mirror, and NOT a refusal: existing material plus no `--san`
+        // means "use what I already have", a supported way to run a primary.
+        // Nothing is generated and `api.tls_cert` is left exactly as it is.
+        None
+    } else {
+        // R6 — checked here so the message can name both paths before
+        // anything is minted. `create_new(true)` below re-checks it
+        // atomically; this one exists for the diagnostic, not the guarantee.
+        if crt.exists() || key.exists() {
+            anyhow::bail!(cluster_schema::format_cluster_enable_cert_already_exists(
+                &[crt.clone(), key.clone()]
+            ));
+        }
+        Some(mint_primary_cert(sans, validity_days, now)?)
+    };
+
+    let cluster_fields: [(&str, Option<toml::Value>); 2] = [
+        ("enabled", Some(toml::Value::Boolean(true))),
+        ("role", Some(toml::Value::String("primary".into()))),
+    ];
+    let mut api_fields: Vec<(&str, Option<toml::Value>)> =
+        vec![("enabled", Some(toml::Value::Boolean(true)))];
+    if api_listen.is_some() {
+        // Only when the operator asked. Absence must preserve whatever the
+        // master already carries — the same rule `join` follows for
+        // `peer_cert`, and for the same reason: a flag's absence is not an
+        // instruction to overwrite.
+        api_fields.push(("listen", Some(toml::Value::String(listen.to_string()))));
+    }
+    if minted.is_some() {
+        api_fields.push((
+            "tls_cert",
+            Some(toml::Value::String(crt.display().to_string())),
+        ));
+        api_fields.push((
+            "tls_key",
+            Some(toml::Value::String(key.display().to_string())),
+        ));
+    }
+    // Certificate first, then the config, and the order is not arbitrary.
+    // `check_api` only checks `is_some()` on the TLS pair — nothing in the
+    // loader stats the file — so a config-first order can leave a node whose
+    // master says `api.enabled = true` pointing at a certificate that does
+    // not exist. That node cannot bind, and no verb undoes it. Orphaned files
+    // are the recoverable failure; a non-bootable master is not.
+    let mut created: Vec<std::path::PathBuf> = Vec::new();
+    let outcome = (|| -> anyhow::Result<()> {
+        if let Some(m) = &minted {
+            // The master is the ownership reference: it is what the daemon
+            // loads, so its owner is the identity that has to be able to read
+            // the key sitting next to it. See `create_exclusive`.
+            create_exclusive(&crt, m.cert_pem.as_bytes(), 0o644, &crt, &key, config_path)?;
+            created.push(crt.clone());
+            // 0600 AT CREATION, never write-then-`set_permissions`: that
+            // leaves a world-readable window on a private key, which is the
+            // exact race `hardened_atomic_write` exists to close for config.
+            create_exclusive(&key, m.key_pem.as_bytes(), 0o600, &crt, &key, config_path)?;
+            created.push(key.clone());
+        }
+        write_cluster_and_api_fields_to_master(config_path, &cluster_fields, &api_fields, now)
+    })();
+
+    if let Err(e) = outcome {
+        // Undo only what THIS call created. Without it a validator refusal on
+        // the staged write leaves the pair on disk, and the operator's retry
+        // hits R6 — with no `--force`, a dead end produced by our own
+        // half-finished attempt.
+        return Err(match unwind_created(&created) {
+            Ok(()) => e,
+            Err(paths) => e.context(format!(
+                "could not remove the certificate material this attempt created — \
+                 remove it by hand before re-running: {paths}"
+            )),
+        });
+    }
+
+    println!("Cluster enabled — this node is now a primary.");
+    println!("  role:       primary");
+    println!("  api.listen: {listen}");
+    if let Some(m) = &minted {
+        println!("  certificate: {}", crt.display());
+        println!("  private key: {} (mode 0600)", key.display());
+        println!("  expires:     {}", m.not_after);
+        println!();
+        println!("  SHA-256 fingerprint:");
+        println!("    {}", m.fingerprint_sha256);
+        println!();
+        println!("Copy {} to the secondary and run there:", crt.display());
+        println!(
+            "  warden cluster join --peer https://<this node>:{} \\",
+            listen.port()
+        );
+        println!("      --token-file <path> --peer-cert <copy of api.crt>");
+        println!();
+        println!("Compare the fingerprint out-of-band before trusting the copy — on the");
+        println!("secondary, `openssl x509 -in <copy> -noout -fingerprint -sha256` must");
+        println!("print the same digest. The pin is the only thing authenticating the");
+        println!("channel; a certificate that arrived over a channel you have not checked");
+        println!("pins whatever an interceptor substituted.");
+    } else if let Some(own) = api.tls_cert.as_ref() {
+        // No trailing `else`: the only way here with `tls_cert` unset is a
+        // half pair (`tls_key` alone), and that post state is refused by
+        // `API_TLS_PAIR_INCOMPLETE` in the staged write above — so this
+        // branch is not reached with nothing to print.
+        println!("  certificate: {} (unchanged — your own)", own.display());
+        println!();
+        println!("Nothing was generated: this node already carries its own TLS material.");
+        println!("The secondary still has to pin it — copy that certificate across and");
+        println!("pass it to `warden cluster join --peer-cert`.");
+    }
+    println!();
+    println!("Restart the daemon for the change to take effect.");
+    Ok(())
+}
+
+/// Non-blank, the way `check_api` and `check_cluster` both read a hash.
+fn is_set(v: Option<&str>) -> bool {
+    v.is_some_and(|h| !h.trim().is_empty())
+}
+
+/// The directory the master config lives in, absolute.
+///
+/// `Path::new("config.toml").parent()` is `Some("")`, not `None` — and
+/// CLAUDE.md documents `./config.toml` as the development path, so the empty
+/// parent is reachable, not theoretical. Left relative it would put
+/// `tls_cert = "api.crt"` in the master, which the daemon then resolves
+/// against ITS working directory rather than the config's. A test suite built
+/// on `tempfile::tempdir()` cannot see this: every path there is already
+/// absolute.
+fn config_dir(config_path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let parent = config_path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    parent
+        .canonicalize()
+        .with_context(|| format!("cannot resolve the config directory {}", parent.display()))
+}
+
+/// The uid/gid owning `path`, or `None` if it cannot be stat'd.
+///
+/// The reference for the TLS pair's ownership is the **config master**: the
+/// process that has to read the key is the daemon, and the daemon runs as the
+/// user that owns the config it loads. Deriving the owner from anything else
+/// (the caller's uid, a hardcoded name) re-opens exactly the hole this closes.
+#[cfg(unix)]
+fn owner_of(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+}
+
+/// Create `path` with `mode` **at creation**, refusing if it already exists.
+///
+/// `create_new(true)` is what makes R6 a guarantee rather than a check: an
+/// existence test followed by a write is a TOCTOU window, and the thing on the
+/// other side of it is a private key. `r6_crt`/`r6_key` are carried only so
+/// the collision reports the same frozen message the pre-check does — the
+/// operator must not get two different stories for one condition.
+///
+/// `owner_ref` is the file whose uid/gid the created file must inherit — the
+/// **config master**. It is taken as a path, not as an `Option<(uid, gid)>`, on
+/// purpose: with the tuple there is a spelling (`None`) that silently restores
+/// the bug, and nothing in the type system objects to it. A required path has
+/// no such spelling, and the effect this guards is invisible to any test that
+/// does not run as root — so the defence has to be structural, not asserted.
+///
+/// **What it guards.** Run as root without it, `enable` mints `api.key` as
+/// `0600 root:root` while the daemon runs as `purge-warden`: the key the master
+/// now points at is one the daemon cannot open, `api.enabled = true` is already
+/// written, and the node no longer starts. The config writer learned this
+/// already — `atomic_write.rs` captures and re-applies the owner — and this is
+/// the same lesson on the sibling path.
+///
+/// **Why `geteuid() == 0` is the right gate, not a lazy one.** `lchown` needs
+/// CAP_CHOWN when the target differs from the caller, and the daemon's seccomp
+/// filter excludes `@chown`, so an unconditional call dies on SIGSYS. The
+/// non-root case cannot go wrong regardless: the config directory is
+/// `drwxr-x---` owned by the daemon user, so a caller who is neither root nor
+/// that user cannot create anything here at all — either the owner already
+/// matches, or the open fails long before this.
+fn create_exclusive(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    r6_crt: &Path,
+    r6_key: &Path,
+    owner_ref: &Path,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!(
+                crate::config::schema::cluster::format_cluster_enable_cert_already_exists(&[
+                    r6_crt.to_path_buf(),
+                    r6_key.to_path_buf()
+                ])
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("cannot create {}", path.display())))
+        }
+    };
+    f.write_all(bytes)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+
+    // Owner BEFORE the fsync below, so the metadata is made durable with the
+    // bytes rather than in a second, unsynced step — same ordering, and same
+    // reason, as `atomic_write`'s chmod/lchown-then-fsync.
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner_of(owner_ref) {
+        // SAFETY: geteuid takes no arguments, cannot fail, and is
+        // async-signal-safe.
+        if unsafe { libc::geteuid() } == 0 {
+            if let Err(e) = std::os::unix::fs::lchown(path, Some(uid), Some(gid)) {
+                // Leave nothing behind: a key the daemon cannot read is the
+                // failure this whole function exists to prevent, so a
+                // half-applied one must not survive to be picked up by R6 on
+                // the operator's retry.
+                drop(f);
+                let _ = std::fs::remove_file(path);
+                return Err(anyhow::Error::new(e).context(format!(
+                    "cannot set ownership {uid}:{gid} on {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    // Durability matters here for the same reason it does for config: the pin
+    // is copied off this file, and a truncated certificate that survives a
+    // crash is a node that cannot be joined.
+    f.sync_all()
+        .with_context(|| format!("cannot flush {}", path.display()))?;
+    Ok(())
+}
+
+/// Best-effort removal of the files this invocation created. Returns the
+/// paths it could NOT remove, so the caller can name them — a cleanup that
+/// fails silently reproduces exactly the dead end it exists to prevent.
+fn unwind_created(created: &[std::path::PathBuf]) -> Result<(), String> {
+    let left: Vec<String> = created
+        .iter()
+        .filter(|p| std::fs::remove_file(p).is_err() && p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(left.join(", "))
+    }
+}
+
+/// What [`run_enable`] needs from a minted certificate, in a shape that exists
+/// in **both** feature configurations.
+///
+/// `crate::cluster` is `#[cfg(feature = "cluster")]`, so `GeneratedCert`
+/// simply is not a type on a default build — and `run_enable` is compiled
+/// there regardless, because the verb has to exist in order to refuse.
+struct MintedPair {
+    cert_pem: String,
+    key_pem: String,
+    fingerprint_sha256: String,
+    not_after: time::OffsetDateTime,
+}
+
+/// Classify the operator's `--san` values and mint the primary's certificate.
+#[cfg(feature = "cluster")]
+fn mint_primary_cert(
+    sans: &[String],
+    validity_days: u32,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<MintedPair> {
+    use crate::cluster::certgen;
+
+    let classified = sans
+        .iter()
+        .map(|raw| {
+            certgen::classify_san(raw).map_err(|reason| anyhow::anyhow!("--san `{raw}` {reason}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let g = certgen::generate_self_signed(&classified, validity_days, now)?;
+    Ok(MintedPair {
+        cert_pem: g.cert_pem,
+        key_pem: g.key_pem,
+        fingerprint_sha256: g.fingerprint_sha256,
+        not_after: g.not_after,
+    })
+}
+
+/// Unreachable in practice — [`ensure_can_enable`] bails first on this build —
+/// but it has to *compile*, because `run_enable` does.
+#[cfg(not(feature = "cluster"))]
+fn mint_primary_cert(
+    sans: &[String],
+    validity_days: u32,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<MintedPair> {
+    let _ = (sans, validity_days, now);
+    anyhow::bail!(
+        "this binary was built without the `cluster` feature, so it cannot mint a cluster \
+         certificate. Nothing has been written."
+    )
+}
+
+/// Refuse `warden cluster enable` on a build that cannot run as a primary.
+///
+/// The same guard, and the same reasoning, as [`ensure_can_join`] — see its
+/// doc comment for cli-h1. It is NOT one of the contract's R1-R7; it is the
+/// build-gating every `cluster.enabled = true` writer in this module owes,
+/// because `super::start::check_cluster_build` refuses to start the daemon
+/// while that flag is set on a feature-less binary.
+///
+/// The trap is strictly worse here than for `join`. `enable` also mints a
+/// certificate pair, so an operator who ran it on a stock build, rebuilt with
+/// `--features cluster`, and re-ran would hit R6 on their own leftovers — and
+/// S4 ships no `--force`.
+#[cfg(not(feature = "cluster"))]
+fn ensure_can_enable() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "this binary was built without the `cluster` feature, so it cannot run as a primary.\n\
+         Enabling would set cluster.enabled = true, after which the daemon refuses to start.\n\
+         Nothing has been written. Rebuild with `--features cluster` to enable clustering."
+    )
+}
+
+/// Feature-enabled counterpart of [`ensure_can_enable`] — this build can be a primary.
+#[cfg(feature = "cluster")]
+fn ensure_can_enable() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Ensure the master's top-level `includes` contains the sync-owned
+/// `cluster.d/*.toml` drop-in glob, then atomically re-write the
 /// master. Idempotent — a re-join does not duplicate the entry. The glob's
 /// zero-match-is-allowed rule means the master still loads before any bundle
 /// has been synced into `cluster.d/`.
@@ -962,6 +1441,17 @@ fn ensure_cluster_include(config_path: &Path, now: time::OffsetDateTime) -> anyh
         },
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Flatten loader errors into one operator-facing message.
+///
+/// The wrapper is per-verb because the text names the operation; the
+/// flattener underneath is shared with `token`.
+fn format_load_errs(errs: Vec<crate::config::error::ConfigError>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot load config for cluster operation: {}",
+        crate::cli::commands::token::format_errs_flat(errs)
+    )
 }
 
 #[cfg(test)]
@@ -1020,7 +1510,7 @@ servers = ["192.0.2.1:53"]
         path
     }
 
-    /// A master shaped the way §5.3 requires of a cluster secondary: the
+    /// A master shaped the way a cluster secondary requires: the
     /// node-local keep-list and nothing else. No `[profiles.*]`, no
     /// `[upstream]` — those arrive in the primary's bundle, and a secondary
     /// keeping its own copies is refused by
@@ -1053,7 +1543,7 @@ token_hash = ""
     /// closing note), so on a synced node the bundle still supplies the
     /// policy after leaving and the post-leave master validates. Without a
     /// bundle the node is joined-but-never-synced, and there `leave` cannot
-    /// write — a real residue of the §5.3 exemption, tracked separately.
+    /// write — a real residue of the missing-`[upstream]` exemption.
     ///
     /// Gated: only the `cluster`-feature tests reach a synced node, and an
     /// ungated helper would be dead code in the default build. `#[expect(dead_code)]`
@@ -1090,8 +1580,8 @@ token_hash = ""
     }
 
     // The four `run_join` tests below exercise paths that only exist on a
-    // `cluster` build: since cli-h1, a feature-less binary refuses the verb
-    // before peer validation or any write. Left ungated, the two `rejects`
+    // `cluster` build: a feature-less binary refuses the verb before peer
+    // validation or any write. Left ungated, the two `rejects`
     // tests would still pass on a default build — but for the wrong reason,
     // green on the early refusal while never reaching the peer check they
     // claim to pin. The refusal itself is covered by `join_refused_*` below.
@@ -1120,8 +1610,9 @@ token_hash = ""
     }
 
     /// A joined-but-NEVER-SYNCED secondary has no `[upstream]` anywhere: not
-    /// in its own master (§5.2 forbids it) and not in `cluster.d/` (no bundle
-    /// has landed). Clearing membership drops the §5.3 exemption, so the
+    /// in its own master (a cluster secondary may not carry policy) and not
+    /// in `cluster.d/` (no bundle has landed). Clearing membership drops
+    /// the missing-`[upstream]` exemption, so the
     /// post-leave config fails `UPSTREAM_SERVERS_EMPTY` and the write is
     /// refused — leaving the operator joined, told about `upstream.servers`
     /// by a verb they ran about cluster membership.
@@ -1245,9 +1736,9 @@ token_hash = ""
         assert!(!reload(&master).enabled);
     }
 
-    /// cli-h1 (P0): on a stock build `cluster join` must refuse and persist
-    /// NOTHING. The old code wrote `cluster.enabled = true` first, which made
-    /// the daemon refuse to start with no `cluster leave` to undo it.
+    /// On a stock build `cluster join` must refuse and persist NOTHING:
+    /// writing `cluster.enabled = true` first would make the daemon
+    /// refuse to start with no `cluster leave` to undo it.
     ///
     /// Asserts the file is byte-identical, not merely that `enabled` is false:
     /// a partial write that landed `role`/`peer`/`token_hash` without `enabled`
@@ -1300,7 +1791,7 @@ token_hash = ""
     #[test]
     #[cfg(feature = "cluster")]
     fn join_rejects_plaintext_offbox_peer() {
-        // poll-02: a non-loopback http:// peer is refused before any write.
+        // A non-loopback http:// peer is refused before any write.
         let dir = tempfile::tempdir().unwrap();
         let master = write_master(&dir);
         assert!(run_join(&master, "http://192.0.2.1:8053", Some("ps_tok"), None).is_err());
@@ -1309,8 +1800,8 @@ token_hash = ""
 
     #[test]
     fn resolve_token_prefers_file_then_arg() {
-        // cluster-01: --token-file wins and is trimmed; --token works and is
-        // trimmed; empty file / empty arg both error.
+        // --token-file wins and is trimmed; --token works and is trimmed;
+        // empty file / empty arg both error.
         let dir = tempfile::tempdir().unwrap();
         let tf = dir.path().join("tok");
         std::fs::write(&tf, "  ps_fromfile\n").unwrap();
@@ -1330,8 +1821,8 @@ token_hash = ""
     #[test]
     #[cfg(feature = "cluster")]
     fn join_reads_token_from_file() {
-        // cluster-01: the secret never touches argv — the hash matches the
-        // file's plaintext.
+        // The secret never touches argv — the hash matches the file's
+        // plaintext.
         let dir = tempfile::tempdir().unwrap();
         let master = write_secondary_master(&dir);
         let tf = dir.path().join("tok");
@@ -1465,15 +1956,15 @@ token_hash = ""
         print_config_status(&master).unwrap();
 
         // Enabled arm. Writes the secondary state directly rather than via
-        // `run_join`: the subject here is `status`, and since cli-h1 `join`
-        // refuses on a feature-less build, routing through it would have made
-        // this test cluster-only for a reason that has nothing to do with it.
+        // `run_join`: `join` refuses on a feature-less build, and routing
+        // through it would make this test cluster-only for a reason that
+        // has nothing to do with `status`.
         //
-        // A SEPARATE, policy-free master — this arm used to reuse the one
-        // above, and since §5.1 that config is illegal: flipping a master
-        // that carries `[profiles.*]` and `[upstream]` to `role = secondary`
-        // is exactly the state where the primary's bundle would silently
-        // union with the node's own policy.
+        // A SEPARATE, policy-free master: reusing the one above would
+        // flip a master that carries `[profiles.*]` and `[upstream]` to
+        // `role = secondary`, which is exactly the illegal state where
+        // the primary's bundle would silently union with the node's own
+        // policy.
         let sec_dir = tempfile::tempdir().unwrap();
         let master = write_secondary_master(&sec_dir);
         write_cluster_fields_to_master(
@@ -1534,7 +2025,7 @@ token_hash = ""
             loaded.config.includes
         );
 
-        // (b) the plaintext token landed where the poll loop reads it (D1).
+        // (b) the plaintext token landed where the poll loop reads it.
         assert_eq!(
             crate::cluster::secret::load_cluster_token(&master)
                 .unwrap()
@@ -1858,8 +2349,8 @@ token_hash = ""
         );
     }
 
-    /// §5.2/§11 — `join` refuses a policy-carrying master AND writes
-    /// nothing. The byte-identity assertion is the point: a refusal that
+    /// `join` refuses a policy-carrying master AND writes nothing. The
+    /// byte-identity assertion is the point: a refusal that
     /// half-wrote `[cluster]` leaves the node in a state neither `join` nor
     /// `leave` describes.
     #[cfg(feature = "cluster")]
@@ -1925,5 +2416,622 @@ token_hash = ""
             .filter(|p| p.as_str() == "cluster.d/*.toml")
             .count();
         assert_eq!(n, 1, "re-join must not duplicate the include");
+    }
+
+    // ── S4 `cluster enable` ────────────────────────────────────
+    //
+    // Every refusal test asserts TWO things: the master is byte-identical
+    // afterwards, AND the specific frozen const came back. Byte-identity
+    // alone does not discriminate — it is satisfied by any refusal, so seven
+    // tests could all be green on R2 and the suite would read clean. That is
+    // this module's own documented failure mode; see the note above the
+    // `run_join` tests.
+    //
+    // Gated on `cluster` for the second half of the same reason: on a
+    // feature-less build `ensure_can_enable` bails before every one of them,
+    // so they would pass without reaching the rule they claim to pin.
+
+    /// A 64-hex-char hash, the shape `hash_token` produces. The value is
+    /// never verified by anything under test — only its non-blankness is.
+    #[cfg(feature = "cluster")]
+    const HASH64: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Knobs for a would-be primary's master. `Default` is the node that
+    /// SHOULD succeed: both token hashes present, no TLS material, and no
+    /// `[api] listen` — i.e. the loopback default, which is the state of
+    /// every fresh install and the reason `--api-listen` exists.
+    #[cfg(feature = "cluster")]
+    #[derive(Default)]
+    struct PrimaryFixture {
+        no_cluster_token: bool,
+        no_api_token: bool,
+        listen: Option<&'static str>,
+        tls: Option<(&'static str, &'static str)>,
+    }
+
+    #[cfg(feature = "cluster")]
+    fn write_primary_master(dir: &tempfile::TempDir, f: &PrimaryFixture) -> std::path::PathBuf {
+        let mut s = String::from(
+            "schema_version = 3\n\n\
+             [server]\ndefault_profile = \"default\"\n\n\
+             [profiles.default]\ndisplay_name = \"Default\"\n\n\
+             [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+             [cluster]\n",
+        );
+        if !f.no_cluster_token {
+            s.push_str(&format!("token_hash = \"{HASH64}\"\n"));
+        }
+        s.push_str("\n[api]\n");
+        if !f.no_api_token {
+            s.push_str(&format!("token_hash = \"{HASH64}\"\n"));
+        }
+        if let Some(l) = f.listen {
+            s.push_str(&format!("listen = \"{l}\"\n"));
+        }
+        if let Some((c, k)) = f.tls {
+            s.push_str(&format!("tls_cert = \"{c}\"\ntls_key = \"{k}\"\n"));
+        }
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, s).unwrap();
+        path
+    }
+
+    /// The arguments of a call that would otherwise succeed, so a refusal
+    /// test isolates exactly the one condition its fixture breaks.
+    #[cfg(feature = "cluster")]
+    fn good_sans() -> Vec<String> {
+        vec!["192.0.2.10".to_string()]
+    }
+
+    #[cfg(feature = "cluster")]
+    fn reachable() -> Option<std::net::SocketAddr> {
+        Some("192.0.2.10:8053".parse().unwrap())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn assert_refused(
+        master: &Path,
+        before: &str,
+        err: &anyhow::Error,
+        expected: &str,
+        which: &str,
+    ) {
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(expected),
+            "{which} must refuse with its own frozen string, got: {text}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read_to_string(master).unwrap(),
+            "{which}: a refusal must leave the master byte-identical"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    fn material(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        (dir.path().join("api.crt"), dir.path().join("api.key"))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn owner_of_reports_the_files_real_uid_gid() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("master.toml");
+        std::fs::write(&f, b"x").unwrap();
+
+        // Whatever uid the suite runs under — asserting against `getuid()`
+        // rather than a literal keeps this true as root and as anyone else.
+        let expected = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!(owner_of(&f), Some(expected));
+    }
+
+    #[test]
+    fn owner_of_is_none_when_the_reference_cannot_be_stat_d() {
+        // The degradation path: an unstattable master must not abort the mint.
+        // `create_exclusive` then simply skips the lchown, which is the old
+        // behaviour — strictly no worse than before this guard existed.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(owner_of(&dir.path().join("absent.toml")), None);
+    }
+
+    /// The mutation guard for the lchown, and it can only run as root.
+    ///
+    /// Delete the `lchown` block in `create_exclusive` and this goes red — but
+    /// **only** in a root session, because the block is gated on
+    /// `geteuid() == 0` for the seccomp reason documented there. Under an
+    /// ordinary user there is nothing to observe: the created file is already
+    /// owned by the caller, so a correct implementation and a gutted one are
+    /// byte-identical on disk. That is why the primary defence is the required
+    /// `owner_ref: &Path` parameter and not this assertion — a test that skips
+    /// is not a test that protects.
+    ///
+    /// Feature-gated because `mode_of` above is: `create_exclusive` is only
+    /// *reachable* through `run_enable`, which is `#[cfg(feature = "cluster")]`,
+    /// so under the default build there is no live path to guard. Leaving this
+    /// ungated broke the default config of `make test` with E0425 while
+    /// `cargo test --features cluster` stayed green — the gate the other one
+    /// cannot see.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn a_file_created_as_root_inherits_the_reference_files_owner() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!(
+                "SKIPPED a_file_created_as_root_inherits_the_reference_files_owner: \
+                 needs root; the lchown it checks is gated on geteuid() == 0"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        std::fs::write(&master, b"# master").unwrap();
+
+        // `nobody` on Linux. Any uid that is NOT root's works — the point is
+        // that the created file must follow the REFERENCE, not the caller.
+        const NOBODY: u32 = 65534;
+        std::os::unix::fs::lchown(&master, Some(NOBODY), Some(NOBODY)).unwrap();
+
+        let crt = dir.path().join("api.crt");
+        let key = dir.path().join("api.key");
+        create_exclusive(&key, b"-----BEGIN-----\n", 0o600, &crt, &key, &master).unwrap();
+
+        assert_eq!(
+            owner_of(&key),
+            Some((NOBODY, NOBODY)),
+            "the key must be owned by the master's owner, not by root — \
+             otherwise the daemon cannot open the key it is told to load"
+        );
+        assert_eq!(mode_of(&key), 0o600, "the private key must stay 0600");
+    }
+
+    /// R1 — `--role secondary` is refused by NAME, pointing at `cluster
+    /// join`. The variant exists in `EnableRole` only so this refusal is
+    /// reachable at all: with a single-variant enum the operator gets clap's
+    /// "invalid value", which cannot name the verb they wanted.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_role_secondary() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Secondary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_ROLE_SECONDARY_USE_JOIN,
+            "R1",
+        );
+        let (crt, key) = material(&dir);
+        assert!(!crt.exists() && !key.exists(), "R1 must mint nothing");
+    }
+
+    /// R2 — no `[cluster] token_hash`. Every other input is the one that
+    /// would succeed, so nothing but the missing hash can be what refuses.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_without_a_cluster_token_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                no_cluster_token: true,
+                ..Default::default()
+            },
+        );
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_REQUIRES_TOKEN_HASH,
+            "R2",
+        );
+    }
+
+    /// R3 — no `--api-listen` on a node whose configured listen is the
+    /// loopback default. This is the state of every fresh install, which is
+    /// why the refusal names the flag rather than the TOML key.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_a_loopback_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            None,
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_LISTEN_IS_LOOPBACK,
+            "R3",
+        );
+    }
+
+    /// R3 again, via an explicitly loopback `--api-listen`. The check is on
+    /// the RESULTING address, so passing the flag must not launder it.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_an_explicitly_loopback_api_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                listen: Some("192.0.2.10:8053"),
+                ..Default::default()
+            },
+        );
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            Some("127.0.0.1:8053".parse().unwrap()),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_LISTEN_IS_LOOPBACK,
+            "R3 (explicit)",
+        );
+    }
+
+    /// R4 — no `[api] token_hash`. Without this check the verb would build a
+    /// master `API_ENABLED_REQUIRES_TOKEN_HASH` refuses, failing late in the
+    /// staged write and naming a temp path that no longer exists.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_without_an_api_token_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                no_api_token: true,
+                ..Default::default()
+            },
+        );
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH,
+            "R4",
+        );
+    }
+
+    /// R5 — minting with no `--san`. A SAN-less certificate matches no host,
+    /// so it would fail every poll while looking perfectly well-formed.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_to_mint_without_a_san() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &[],
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_REQUIRES_SAN,
+            "R5",
+        );
+        let (crt, key) = material(&dir);
+        assert!(!crt.exists() && !key.exists(), "R5 must mint nothing");
+    }
+
+    /// R6 — existing material is never overwritten, and the message names
+    /// BOTH absolute paths. The paths are the whole remedy: S4 ships no
+    /// `--force`, so an operator not told what to remove has no way forward.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_to_overwrite_existing_material_and_names_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let (crt, key) = material(&dir);
+        std::fs::write(&crt, "an already-pinned certificate").unwrap();
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            // Only the prefix: the const carries a `{paths}` placeholder the
+            // formatter substitutes, so the full literal never appears.
+            "TLS material already exists beside the master config",
+            "R6",
+        );
+        let text = format!("{err:#}");
+        for p in [&crt, &key] {
+            assert!(
+                text.contains(&p.display().to_string()),
+                "R6 must name {} — there is no --force, so the paths ARE the remedy: {text}",
+                p.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&crt).unwrap(),
+            "an already-pinned certificate",
+            "R6 must not have touched the existing certificate"
+        );
+        assert!(!key.exists(), "R6 must not have created the missing half");
+    }
+
+    /// R7 — `--san` with operator-supplied TLS material already configured:
+    /// the minted certificate would be written and never used.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_a_san_when_the_config_already_carries_a_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                tls: Some((
+                    "/etc/purge-warden/operator.crt",
+                    "/etc/purge-warden/operator.key",
+                )),
+                ..Default::default()
+            },
+        );
+        let before = std::fs::read_to_string(&master).unwrap();
+
+        let err = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap_err();
+
+        assert_refused(
+            &master,
+            &before,
+            &err,
+            crate::config::schema::cluster::CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT,
+            "R7",
+        );
+        let (crt, key) = material(&dir);
+        assert!(!crt.exists() && !key.exists(), "R7 must mint nothing");
+    }
+
+    /// The happy path. Asserts the post state LOADS, not merely that the keys
+    /// are present: a diff of the TOML proves the write happened, it does not
+    /// prove the daemon could start from the result — which is the property
+    /// `[cluster]` and `[api]` travelling in one staged write exists to buy.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_writes_cluster_and_api_together_and_the_result_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let (crt, key) = material(&dir);
+
+        run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let loaded = loader::load_config(&master, now).unwrap_or_else(|e| {
+            panic!(
+                "the post state must load: {}",
+                crate::cli::commands::token::format_errs_flat(e)
+            )
+        });
+
+        assert!(loaded.config.cluster.enabled);
+        assert_eq!(loaded.config.cluster.role, ClusterRole::Primary);
+        assert!(loaded.config.api.enabled);
+        assert_eq!(
+            loaded.config.api.listen,
+            "192.0.2.10:8053".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(loaded.config.api.tls_cert.as_deref(), Some(crt.as_path()));
+        assert_eq!(loaded.config.api.tls_key.as_deref(), Some(key.as_path()));
+        assert!(crt.exists() && key.exists());
+        // The certificate path written into the config must be absolute, or
+        // the daemon resolves it against ITS working directory.
+        assert!(loaded.config.api.tls_cert.as_ref().unwrap().is_absolute());
+    }
+
+    /// The private key is `0600` **at creation** — never written first and
+    /// chmod'd after, which would leave a world-readable window on a key.
+    ///
+    /// Exact equality is safe for `0600` specifically: `umask` can only clear
+    /// bits, and `0600` has no group or other bits to clear. The certificate
+    /// is asserted loosely for the mirror-image reason — `0644` under a
+    /// `077` umask lands as `0600`, so `== 0o644` would be a fixture-
+    /// dependent failure.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn the_minted_private_key_is_0600_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let (crt, key) = material(&dir);
+
+        run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap();
+
+        assert_eq!(mode_of(&key), 0o600, "the private key must be 0600");
+        assert_eq!(
+            mode_of(&crt) & 0o022,
+            0,
+            "the certificate must not be group- or world-writable"
+        );
+    }
+
+    /// R7's mirror, and NOT a refusal: operator TLS material already
+    /// configured, no `--san` ⇒ generate nothing, write only `[cluster]` plus
+    /// `api.enabled` / `listen`, and leave the operator's paths alone.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_with_an_existing_cert_and_no_san_generates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                tls: Some((
+                    "/etc/purge-warden/operator.crt",
+                    "/etc/purge-warden/operator.key",
+                )),
+                ..Default::default()
+            },
+        );
+        let (crt, key) = material(&dir);
+
+        run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &[],
+            reachable(),
+            3650,
+        )
+        .unwrap();
+
+        assert!(
+            !crt.exists() && !key.exists(),
+            "the mirror path must mint nothing"
+        );
+        let now = time::OffsetDateTime::now_utc();
+        let loaded = loader::load_config(&master, now).unwrap_or_else(|e| {
+            panic!(
+                "the post state must load: {}",
+                crate::cli::commands::token::format_errs_flat(e)
+            )
+        });
+        assert!(loaded.config.cluster.enabled);
+        assert!(loaded.config.api.enabled);
+        assert_eq!(
+            loaded.config.api.tls_cert.as_deref(),
+            Some(Path::new("/etc/purge-warden/operator.crt")),
+            "the operator's own certificate path must survive untouched"
+        );
+    }
+
+    /// Absence of `--api-listen` preserves whatever the master carries — the
+    /// same rule `join` follows for `peer_cert`. A flag's absence is not an
+    /// instruction to overwrite.
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_without_api_listen_keeps_a_reachable_configured_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(
+            &dir,
+            &PrimaryFixture {
+                listen: Some("192.0.2.11:9053"),
+                ..Default::default()
+            },
+        );
+
+        run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            None,
+            3650,
+        )
+        .unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let loaded = loader::load_config(&master, now).unwrap();
+        assert_eq!(
+            loaded.config.api.listen,
+            "192.0.2.11:9053".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    /// `Path::new("config.toml").parent()` is `Some("")`, not `None`, and
+    /// CLAUDE.md documents `./config.toml` as the dev path — so the empty
+    /// parent is reachable. Left relative it would write `tls_cert =
+    /// "api.crt"`, which the daemon resolves against its own working
+    /// directory.
+    ///
+    /// Tested on the helper rather than through the verb on purpose: the only
+    /// way to reach the branch end-to-end is to change the process working
+    /// directory, which is global state and would race every other test in
+    /// this binary. Ungated — the helper is not feature-dependent.
+    #[test]
+    fn a_bare_config_filename_still_yields_an_absolute_directory() {
+        let d = config_dir(Path::new("config.toml")).unwrap();
+        assert!(d.is_absolute(), "{} must be absolute", d.display());
+        assert_eq!(d, std::env::current_dir().unwrap().canonicalize().unwrap());
     }
 }

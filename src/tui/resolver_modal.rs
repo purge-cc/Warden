@@ -7,10 +7,10 @@
 //! claim every keystroke until `Esc` (no leading `i` ceremony).
 //!
 //! The 5-level attribution body of [`resolve_for_tui`] is a lift from
-//! the pre-S52 leaf — same `ProfileResolver::build` invocation, same
+//! the former leaf — same `ProfileResolver::build` invocation, same
 //! strings. Only the input source moved (modal buffer instead of leaf
-//! state) and, in §4.61 Wave 4b, the order the strings come back in:
-//! see that function for why the answer now leads.
+//! state) and the order the strings come back in: see that function
+//! for why the answer now leads.
 
 use std::net::IpAddr;
 
@@ -79,7 +79,7 @@ impl ResolverModal {
         self.error = None;
     }
 
-    /// rev-2607 (#12): paste is delivered through the crossterm
+    /// Paste is delivered through the crossterm
     /// `Event::Paste` path (`handle_paste` in `tui::mod`), which never
     /// goes through `handle_resolver_modal_key` — so it cannot rely on
     /// that handler's dispatch to keep `input` and the displayed result
@@ -154,12 +154,12 @@ pub fn prefill_from_active_leaf(app: &App) -> Option<(String, &'static str)> {
     }
 }
 
-// ── render (§4.61 Wave 4b — Archetype C via `modal_form`) ─────────────
+// ── render (Archetype C via `modal_form`) ──────────────────────────────
 //
 // Not one colour is chosen in this module; every span comes out of
-// `modal_form`. That is the wave's acceptance criterion rather than an
-// aesthetic preference — R1 is twelve surfaces each re-deriving the
-// ecosystem colour rule locally until they drift apart. Pinned by
+// `modal_form`. That is deliberate rather than an aesthetic preference —
+// every modal surface re-deriving the ecosystem colour rule locally is
+// how they drift apart. Pinned by
 // `no_hand_rolled_colour_or_chrome_in_this_module`.
 //
 // This is a *not-a-form*: nothing is edited, nothing is saved, there is no
@@ -174,8 +174,8 @@ pub fn prefill_from_active_leaf(app: &App) -> Option<(String, &'static str)> {
 /// [`resolve_for_tui`] as single pre-padded strings carrying a 17-column
 /// label field, and the longest of them — the `Overrides:` placeholder —
 /// is 67 characters, 69 once [`modal_form::prose_row`] adds its 2-cell
-/// indent. `prose_row` truncates where the pre-migration body wrapped
-/// (style-01.1), so anything narrower would silently eat that tail
+/// indent. `prose_row` truncates where the pre-migration body wrapped,
+/// so anything narrower would silently eat that tail
 /// instead of costing it a second row. At 74 the inner rect is 72, 71
 /// once the scrollbar claims its column. Pinned by
 /// `widest_attribution_line_is_not_ellipsized_at_the_modal_width`.
@@ -189,18 +189,19 @@ const QUERY_LABEL: &str = "Source IP   ";
 const QUERY_COL: usize = 2 + QUERY_LABEL.len();
 
 /// Nav-key legend — the same three keys the pre-migration footer
-/// advertised, in the same order. D7′ changes chrome, layout and colour
-/// and leaves the keying alone, so the legend must not move either.
+/// advertised, in the same order. The migration to `modal_form` changes
+/// chrome, layout and colour and leaves the keying alone, so the
+/// legend must not move either.
 const KEYS: &str = "Enter resolve \u{b7} Ctrl-U clear \u{b7} Esc close";
 
 /// Draw the modal as an Archetype-C overlay anchored on the tab content
 /// rect.
 ///
-/// `anchor` is the tab content area (§4.61 D18), never `f.area()`. This
+/// `anchor` is the tab content area, never `f.area()`. This
 /// modal answers the global `s` from every page, so it is the one most
 /// likely to be opened over an arbitrary tab — and the header, the menu
-/// card and the footer legend have to survive it (§4.62 N1). Before this
-/// wave the parameter was accepted and discarded (`let _ = anchor;`) and
+/// card and the footer legend have to survive it. The parameter used to
+/// be accepted and discarded (`let _ = anchor;`) and
 /// the overlay centred on the whole frame, painting over all three.
 ///
 /// Honouring it costs rows. At the declared 80×24 floor the content rect
@@ -305,8 +306,8 @@ fn attribution_row(line: &str) -> ProseRow {
 /// lines for `input`. Same offline computation as `warden resolve`, and
 /// every line is byte-identical to the string that command prints.
 ///
-/// **The order is presentation order, not `warden resolve`'s order**
-/// (§4.61 Wave 4b). The D18 anchor leaves four content rows at the 80×24
+/// **The order is presentation order, not `warden resolve`'s order.**
+/// The anchor leaves four content rows at the 80×24
 /// floor and `overlay::centered_rect` clamps rather than scrolls, so
 /// whatever sits at the bottom of this vector is what the operator does
 /// not get to read — and with the old order that was `Active profile`,
@@ -392,10 +393,9 @@ pub fn resolve_for_tui(app: &App, input: &str) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// Sprint 43 T2 placeholder for the per-device overlay badge — kept as
-/// a one-function swap point so T4 (when `[[devices]]` gains
-/// `allow_rules` / `deny_rules` / `override_profile_deny`) can wire the
-/// real `+N override(s)` count without scattered edits.
+/// Placeholder for the per-device overlay badge — kept as
+/// a one-function swap point so a future `[[devices]]` overrides field
+/// can wire the real `+N override(s)` count without scattered edits.
 fn render_overlay_badge(_device_id: Option<&crate::config::schema::Id>) -> Vec<String> {
     vec!["Overrides:       <none yet — populated in the device-overlay phase>".to_string()]
 }
@@ -483,7 +483,7 @@ mod tests {
             network_name_wildcard: false,
         });
         cfg.server.default_profile = Some(mk_id("default"));
-        // §4.39 / profiles-h1: `laptop` is pin-less (mac: None); keep
+        // `laptop` is pin-less (mac: None); keep
         // MAC enforcement off so it still resolves device-direct.
         cfg.server.enforce_device_mac = false;
         LoadedConfig {
@@ -593,17 +593,17 @@ mod tests {
         assert_eq!(prefill.1, "queries");
     }
 
-    // ── §4.61 Wave 4b: render, the anchor, and the 80×24 floor ───────
+    // ── Render, the anchor, and the 80×24 floor ─────────────────────
     //
     // `ui.rs` declares MIN_WIDTH 80 × MIN_HEIGHT 24. At that size the tab
-    // content rect this overlay anchors on (D18) is
+    // content rect this overlay anchors on is
     // `24 − 4 header − 5 menu card − 1 footer = 14` rows, leaving a
     // 12-row interior: 3 for the pinned head, 5 for the pinned tail, 4
     // for content. `overlay::centered_rect` CLAMPS rather than scrolls,
     // so anything past that budget is silently cut. Every assertion
-    // below reads the RENDERED BUFFER, never the line vector — in every
-    // past instance of this defect (`lists-modal-min-height-clip`) the
-    // vector was correct and only the render was wrong.
+    // below reads the RENDERED BUFFER, never the line vector — a
+    // truncation bug can leave the vector correct and only the render
+    // wrong.
 
     fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
@@ -618,7 +618,7 @@ mod tests {
 
     /// Render the real [`render_overlay`] into a `w`×`h` backend, handing
     /// the whole frame in as the anchor — so `h` **is** the tab content
-    /// rect's height, which is the number that matters (D18).
+    /// rect's height, which is the number that matters.
     fn render_overlay_in(modal: &ResolverModal, w: u16, h: u16) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -754,14 +754,13 @@ mod tests {
         wrap(cfg)
     }
 
-    /// §4.61 D18 — the anchor is the tab content rect, and the overlay
+    /// The anchor is the tab content rect, and the overlay
     /// has to stay inside it.
     ///
-    /// **Fail-before:** `HEAD` accepted `anchor` and threw it away
+    /// **Fail-before:** this used to accept `anchor` and throw it away
     /// (`let _ = anchor;`), centring on `f.area()` instead. On the 80×24
     /// floor that puts the modal's top rows over the header and the menu
-    /// card — which §4.62 N1 forbids outright, and which is the same
-    /// full-bleed occlusion §4.2.1 measured on Profiles.
+    /// card — the same full-bleed occlusion class measured on Profiles.
     #[test]
     fn overlay_stays_inside_the_anchor_and_never_covers_the_header() {
         use ratatui::backend::TestBackend;
@@ -954,7 +953,8 @@ mod tests {
         );
     }
 
-    /// §4.61 R1, as a test rather than a claim in a commit message: a
+    /// The no-hand-rolled-colour rule, as a test rather than a claim in
+    /// a commit message: a
     /// surface that reaches for the theme directly is a surface that will
     /// drift from the other eleven. Needles are split so this assertion
     /// cannot match itself.

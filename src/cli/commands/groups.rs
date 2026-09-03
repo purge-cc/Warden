@@ -1,10 +1,10 @@
 //! `warden group` — v1-native CRUD for `[[groups]]` entries.
 //!
-//! Sprint 33 mirror of the device command surface: list / add / set /
-//! remove / show, with `--into <file>` target selection and
-//! validate-or-revert on every mutation. Groups are the DM2 profile
-//! anchor — a device inherits its profile from the highest-priority
-//! group it belongs to (unless it has a direct `profile` field).
+//! Mirrors the device command surface: list / add / set / remove /
+//! show, with `--into <file>` target selection and validate-or-revert
+//! on every mutation. Groups are a profile anchor — a device inherits
+//! its profile from the highest-priority group it belongs to (unless
+//! it has a direct `profile` field).
 
 use std::path::Path;
 
@@ -83,9 +83,7 @@ fn render_group_detail(g: &Group) -> String {
         let _ = writeln!(out, "devices:      {}", n.join(", "));
     }
     // A group's tags are shown because the config still stores them, NOT
-    // because they do anything. This comment used to end "...and the tag
-    // set is what decides which blocklists apply" — true until the
-    // `plp-s3` cutover, false since. What a member device filters comes
+    // because they do anything anymore. What a member device filters comes
     // from its profile: `profiles.<id>.lists` if that profile declares a
     // direction for the list, else the list's own `base`.
     //
@@ -98,14 +96,14 @@ fn render_group_detail(g: &Group) -> String {
     out
 }
 
-// ── Sync inner writers (§4.64 G2) ────────────────────────────────────
+// ── Sync inner writers ─────────────────────────────────────────────────
 //
 // The TUI cannot call `run_add` / `run_set` / `run_remove`: those are
 // CLI-shaped and `println!` their outcome, which on a raw-mode alternate
 // screen bypasses ratatui's diff buffer and staircases one column per line
-// (the v0.29.1 defect). DG2 therefore says replicate the *pipeline*, not the
-// entry points — so the pipeline moved here, and the `run_*` verbs became
-// thin printing wrappers over it. One implementation, not two that drift.
+// (the v0.29.1 defect). The pipeline is replicated here, not the entry
+// points — so the pipeline lives here, and the `run_*` verbs are thin
+// printing wrappers over it. One implementation, not two that drift.
 //
 // All three are **sync**: the caller owns the post-write reload, so a TUI
 // Save that changes both scalars and tags costs exactly one reload instead
@@ -165,10 +163,10 @@ fn validate_group_refs(
 ///
 /// Builds a whole row and hands it to `upsert_id_keyed`, which replaces the
 /// matched row outright. That is safe *here* because the row is new, but it
-/// is exactly the reset-on-omit trap DG5 guards: any field this builder
-/// forgets is absent from the created group. The exhaustive-destructuring
-/// test in this module fails the build if `Group` grows a field this
-/// function does not consider.
+/// is exactly the reset-on-omit trap the test below guards against: any
+/// field this builder forgets is absent from the created group. The
+/// exhaustive-destructuring test in this module fails the build if
+/// `Group` grows a field this function does not consider.
 pub(crate) fn add_inner(
     config_path: &Path,
     id: &str,
@@ -202,7 +200,7 @@ pub(crate) fn add_inner(
     // `tags` is deliberately NOT written here: it is a delta primitive owned
     // by `entity_tags::TagEntity::Group`, and `apply_group_field` refuses it
     // too. A new group starts with no tags; the caller adds them as a second
-    // write. See §3.3 of the design doc.
+    // write.
 
     let target_path = resolve_target_file(config_path, EntityClass::Groups, into)?;
     let (mut doc, _) = read_or_empty(&target_path)?;
@@ -296,7 +294,7 @@ pub(crate) fn set_fields_inner(
 ///
 /// Refuses while any device or schedule still references it, with the same
 /// words the CLI verb uses. `Ok(None)` means the group was already absent —
-/// removal is idempotent (verbs-02) and the caller decides how to say so.
+/// removal is idempotent, and the caller decides how to say so.
 pub(crate) fn remove_inner(
     config_path: &Path,
     id: &str,
@@ -356,10 +354,10 @@ pub(crate) fn remove_inner(
     }))
 }
 
-// Must sit HERE, on the function it guards. Step 1 of this sprint
-// inserted the inner-writer block between this attribute and `run_add`,
-// which orphaned it above a comment: clippy then reported both an empty
-// line after an outer attribute AND an unguarded 8-argument `run_add`.
+// Must sit HERE, on the function it guards: an inner-writer block
+// between this attribute and `run_add` orphans it above a comment, and
+// clippy then reports both an empty line after an outer attribute AND
+// an unguarded 8-argument `run_add`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_add(
     config_path: &Path,
@@ -382,7 +380,6 @@ pub async fn run_add(
     )?;
     println!("added group {id} → {}", report.target_path.display());
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
     Ok(())
@@ -415,14 +412,13 @@ pub async fn run_remove(
 ) -> anyhow::Result<()> {
     match remove_inner(config_path, id, into)? {
         None => {
-            // verbs-02: remove of an absent entity is idempotent (exit 0).
+            // Remove of an absent entity is idempotent (exit 0).
             println!("group \"{id}\" not found — nothing to remove");
             return Ok(());
         }
         Some(_) => println!("removed group {id}"),
     }
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
     Ok(())
@@ -529,13 +525,13 @@ servers = ["192.0.2.1:53"]
     }
 
     /// Socket path that does not exist → `attempt_reload` lands on
-    /// `DaemonUnreachable`, which is benign; the HR2 post-write wiring
-    /// is transparent to the "change lands on disk" assertions.
+    /// `DaemonUnreachable`, which is benign; the post-write reload
+    /// wiring is transparent to the "change lands on disk" assertions.
     fn fake_socket(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("ghost.sock")
     }
 
-    /// **DG5 gate.** `add_inner` builds a WHOLE ROW and `upsert_id_keyed`
+    /// `add_inner` builds a WHOLE ROW and `upsert_id_keyed`
     /// replaces the matched row outright (`*item = entry`), so any field the
     /// builder omits is reset to its serde default — on save of *anything*,
     /// not of that field. That is the `accept_unsigned_allow` bug class,
@@ -590,10 +586,10 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// The other half of DG5: a `set` must not disturb fields it was not
-    /// asked about. `set_fields_inner` is field-surgical (DG4), so this is
-    /// true by construction — pinned because "by construction" is exactly
-    /// what stops being true when someone swaps in a row builder for
+    /// A `set` must not disturb fields it was not asked about.
+    /// `set_fields_inner` is field-surgical, so this is true by
+    /// construction — pinned because "by construction" is exactly what
+    /// stops being true when someone swaps in a row builder for
     /// convenience.
     #[test]
     fn dg4_a_field_surgical_set_leaves_every_other_field_alone() {
@@ -731,13 +727,13 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let master = mk_master(&dir);
         let sock = fake_socket(&dir);
-        // verbs-02: remove of an absent group returns Ok (exit 0), not an error.
+        // Remove of an absent group returns Ok (exit 0), not an error.
         assert!(run_remove(&master, &sock, "ghost", None).await.is_ok());
     }
 
     #[tokio::test]
     async fn remove_group_with_schedule_ref_refuses() {
-        // verbs-05: a group still targeted by a schedule is refused with a
+        // A group still targeted by a schedule is refused with a
         // friendly message naming the schedule.
         let dir = tempfile::tempdir().unwrap();
         let master = dir.path().join("config.toml");
@@ -792,7 +788,7 @@ servers = ["192.0.2.1:53"]
         assert!(loaded.config.groups.is_empty());
     }
 
-    // ── Sprint 36 HR2: hot-reload wiring ───────────────────────────────
+    // ── Hot-reload wiring ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn groups_add_triggers_reload_when_daemon_up() {
@@ -814,11 +810,10 @@ servers = ["192.0.2.1:53"]
         server.await.unwrap();
         assert_single_reload_with_resolved_token(&recorded);
     }
-    // ── cli-h10: `group show` prints tags ──────────────────────────────
+    // ── `group show` prints tags ──────────────────────────────
     //
     // A group's tags are unioned into every member device's effective tag
-    // set, and the effective tag set is what decides which blocklists
-    // apply. Before cli-h10 the word "tags" appeared ZERO times in this
+    // set. Before this, the word "tags" appeared nowhere in this
     // module: an operator could not learn, from any command, that a group
     // was contributing a tag to its members.
 }

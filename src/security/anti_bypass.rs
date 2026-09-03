@@ -5,12 +5,12 @@
 //! browser or OS at it and skip the filter entirely. Blocking those names
 //! forces traffic back through purge-warden.
 //!
-//! **neutrality-01: warden ships no such names.** This module used to
+//! **Warden ships no such names.** This module used to
 //! compile in 41 hostnames belonging to 13 named providers — on by
 //! default, add-only, checked ahead of the filter engine, and absent from
 //! the config `warden init` writes, so a fresh install blocked 41 names
 //! the operator could neither see nor override. That is warden holding an
-//! opinion about named companies, which project rules §Neutrality forbids in
+//! opinion about named companies, which CLAUDE.md §Neutrality forbids in
 //! both directions. The domains now come from exactly two operator-owned
 //! places: `anti_bypass.extra_domains` in their config, and a published
 //! list they choose to import (which, going through the filter engine,
@@ -31,12 +31,12 @@ pub struct AntiBypass {
 
 impl AntiBypass {
     pub fn new(config: &AntiBypassConfig) -> Self {
-        // neutrality-01: the set starts EMPTY. Every entry is
-        // operator-authored — there is no compiled-in seed to add to.
+        // The set starts EMPTY. Every entry is operator-authored — there
+        // is no compiled-in seed to add to.
         let mut domains = AHashSet::with_capacity(config.extra_domains.len());
 
-        // anti-bypass-01 (rev-2606): mirror the lookup-side normalization
-        // at ingestion. `is_bypass_domain` strips the query's trailing dot
+        // Mirror the lookup-side normalization at ingestion.
+        // `is_bypass_domain` strips the query's trailing dot
         // before matching, so an FQDN-habit entry like
         // "mydns.example.com." could never match anything — silently, as
         // no validator covers the field. Trim whitespace, strip one
@@ -102,8 +102,8 @@ impl AntiBypass {
     /// True when no domain is configured, i.e. this checker can never
     /// match.
     ///
-    /// neutrality-01: with the compiled-in list gone, the default install
-    /// reaches here with an empty set. The caller uses this to skip
+    /// With no compiled-in list, the default install reaches here with
+    /// an empty set. The caller uses this to skip
     /// building the checker at all, so the hot path does not pay for a
     /// subdomain walk that cannot succeed.
     pub fn is_empty(&self) -> bool {
@@ -128,9 +128,9 @@ mod tests {
         }
     }
 
-    /// neutrality-01: the mechanism tests below (subdomain walk, case
-    /// folding, trailing-dot stripping, no-partial-match) used to lean on
-    /// the compiled-in provider list as their fixture. The behaviour they
+    /// The mechanism tests below (subdomain walk, case folding,
+    /// trailing-dot stripping, no-partial-match) used to lean on a
+    /// compiled-in provider list as their fixture. The behaviour they
     /// cover is still worth pinning — only the fixture had to move to
     /// operator-authored config, which is now the only source of domains.
     fn operator_config(domains: &[&str]) -> AntiBypassConfig {
@@ -140,14 +140,14 @@ mod tests {
         }
     }
 
-    /// neutrality-01 — warden ships **no** provider domain knowledge.
+    /// Warden ships **no** provider domain knowledge.
     ///
     /// The built-in list used to carry 41 DoH/DoT hostnames belonging to
     /// 13 named providers. It was on by default, could only be added to
     /// (`AntiBypassConfig` has no removal field), ran ahead of the filter
     /// engine so operator allow rules never got a say, and `warden init`
     /// never wrote the `[anti_bypass]` section — so a fresh install
-    /// blocked 41 names the operator could not see. See project rules
+    /// blocked 41 names the operator could not see. See CLAUDE.md
     /// §Neutrality. The replacement is a published list the operator
     /// imports and can drop.
     #[test]
@@ -209,10 +209,10 @@ mod tests {
         assert!(ab.is_bypass_domain("custom-dns.example.com"));
     }
 
-    /// anti-bypass-01 (rev-2606) regression: FQDN-style entries (trailing
-    /// root dot) and padded entries were inserted verbatim while the
-    /// lookup side strips the dot from the query — such entries could
-    /// never match. Ingestion now mirrors the lookup normalization.
+    /// Regression: FQDN-style entries (trailing root dot) and padded
+    /// entries were inserted verbatim while the lookup side strips the
+    /// dot from the query — such entries could never match. Ingestion
+    /// now mirrors the lookup normalization.
     #[test]
     fn extra_domains_trailing_dot_and_whitespace_normalized() {
         let config = AntiBypassConfig {
@@ -239,15 +239,15 @@ mod tests {
             extra_domains: vec![".".into(), "   ".into()],
         };
         let ab = AntiBypass::new(&config);
-        // neutrality-01: nothing is compiled in, so an all-invalid
-        // `extra_domains` leaves the set empty.
+        // Nothing is compiled in, so an all-invalid `extra_domains`
+        // leaves the set empty.
         assert_eq!(ab.domain_count(), 0);
     }
 
     #[test]
     fn bypass_domain_mixed_case_normalized() {
-        // sec-anti-bypass-caller-normalization: a mixed-case input must
-        // not slip the filter even though the set is lowercase-keyed.
+        // A mixed-case input must not slip the filter even though the
+        // set is lowercase-keyed.
         let ab = AntiBypass::new(&operator_config(&["doh.example.net"]));
         assert!(ab.is_bypass_domain("DOH.Example.Net"));
         assert!(ab.is_bypass_domain("FOO.DOH.EXAMPLE.NET"));

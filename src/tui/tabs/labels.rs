@@ -1,15 +1,15 @@
-//! Labels tab — the `[[labels]]` vocabulary (§4.66 L2, extended by L5).
+//! Labels tab — the `[[labels]]` vocabulary.
 //!
 //! Left card: the kinds with their counts. Right card: the entries of
 //! the selected kind, with how many entities actually use each. `Tab` /
 //! `←` / `→` move focus between the two cards; `↑` / `↓` move inside the
-//! focused one (§4.68 UX8).
+//! focused one.
 //!
-//! The menu lists the kinds [`menu_kinds`] yields — **three**, not the
-//! enum's four; see that function for why the narrowing cannot live in
-//! [`LabelKind::valid_values`]. The fourth, `tag`, is not offered here and
-//! is not shown anywhere else either — `plp-s5d` removed the surfaces that
-//! consumed it. `LabelKind::Tag` itself belongs to `plp-s5a`.
+//! The menu lists the three declared kinds — [`menu_kinds`] is
+//! `LabelKind::ALL` with nothing filtered out. A fourth, `tag`, existed
+//! briefly and is gone from the enum itself, not merely hidden from this
+//! view; see "Why a registry existed here for tags" below for what it was
+//! and why removing it made [`LabelKind::device_field`] total again.
 //!
 //! ## Why a registry existed here for tags — and why it no longer does
 //!
@@ -19,16 +19,16 @@
 //! pickers use — but that derivation inserts **only what is attached**, so
 //! it answers *autocomplete*, never *naming a tag before anything uses
 //! it*, which was the operator's actual request. Hence a declared
-//! vocabulary. `device_grouping_v1.md` §12.9 carries both measurements.
+//! vocabulary.
 //!
 //! A second lesson from the same paragraph, and it outlives the feature:
-//! the enumeration of carriers read "blocklists / devices / profiles /
-//! subnets" until §4.65 UX2b found the missing `groups` walk. The sentence
+//! the enumeration of carriers once read "blocklists / devices / profiles /
+//! subnets", missing a `groups` walk. The sentence
 //! was written to *defend* the derivation's completeness while the
 //! derivation was incomplete, and no test disagreed — **prose counting a
 //! set is a claim, not a check.**
 //!
-//! `plp-s5d` removed both the pickers and their derivation. There is no
+//! Both the pickers and their derivation are gone. There is no
 //! autocomplete left to feed and nothing that reads a tag, so the whole
 //! argument is now historical: `menu_kinds` had already stopped offering
 //! the Tags bucket, and `usage_count` no longer counts one.
@@ -40,13 +40,13 @@
 //! ## The USED column counts two different things
 //!
 //! For the three metadata kinds: `Device.owner` is free text
-//! (`"Alex"`); `Label.id` is an `Id` (`"alex"`). They can never be
+//! (`"Operator"`); `Label.id` is an `Id` (`"operator"`). They can never be
 //! equal, so the count goes through [`Label::matches_value`], which
 //! accepts **id or display_name**.
 //!
 //! `tag` used to be the second thing: `TagSlug`s counted across five
 //! carrier entities, delegated to `cli::commands::tags::collect_tag_usage`
-//! so the TUI and the CLI could not disagree. `plp-s5d` dropped that — see
+//! so the TUI and the CLI could not disagree. That is gone — see
 //! [`usage_count`] — and no `Tag` row reaches this tab anyway.
 //!
 //! A count of 0 means "nothing uses this value", not "this label is
@@ -56,13 +56,19 @@
 //! ```text
 //! Labels (3)                       (focus on the kind menu)
 //!   KIND            │   ID          NAME        DESCRIPTION      USED
-//!   ▸ Owners      2 │ · alex     Alex     Personal kit        4
-//!     Device types 1│   emanuela    Emanuela    —                   2
+//!   ▸ Owners      2 │ · operator     Operator     Personal kit        4
+//!     Device types 1│   member    Member    —                   2
 //!     Departments  0│
 //! ```
 //!
 //! `▸` marks the cursor of the **focused** pane, `·` the resting cursor
 //! of the other one. Pressing `→` swaps them.
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_labels_key` (`a`/`e`/`d` open the modal)
+//! - Form:  `tui::label_modal` (fields, validation, submit)
+//! - State: `app::LabelsState` (cursor, focus, selected_kind)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -89,7 +95,7 @@ const CHROME_W: u16 = 4;
 /// Does a terminal this wide actually paint the kind menu?
 ///
 /// **The focus must never rest on a pane the layout does not draw**, and
-/// at the D18 floor of 80×24 this leaf has only one pane: the rect
+/// at the minimum-terminal floor of 80×24 this leaf has only one pane: the rect
 /// reaching [`render`] is 76 columns, below [`NARROW_THRESHOLD`], so the
 /// split collapses to the entry table. A `KindMenu` focus there is
 /// unhonourable — `↑`/`↓` would change the whole table's *contents*
@@ -111,40 +117,19 @@ pub fn menu_is_painted(viewport_width: u16) -> bool {
 /// enumerate — the menu, the empty-state hint, and the key handler all
 /// read this one function.
 ///
-/// ## Why `tag` is not here, and why the filter lives in the TUI
-///
-/// §4.68 UX8 narrowed this because the operator saw "Tags" in two places
-/// — this registry and a separate Tags tab — and asked the registry to
-/// stop claiming it. The two were not duplicates: a tag was an **open**
-/// set defined by use, derived from what entities actually carried, while
-/// these three are a **closed** vocabulary that exists only because
-/// someone declared it.
-///
-/// `plp-s5d` deleted the Tags tab and the derivation behind it, so only
-/// the closed half survives. The narrowing stands on its own terms — a
-/// `tag` declares nothing this tab can administer — and is now enforced
-/// by the same `device_field()` rule stated below rather than by the
-/// existence of somewhere else to look.
-///
-/// **The filter cannot live in [`LabelKind::valid_values`].** That
-/// function has two other consumers — the `--kind` help of
-/// `warden label add` and the validator's unknown-kind suggestion — and
-/// both must keep offering `tag`, because declaring a tag from the CLI
-/// stays legal. Narrowing it at the source would silently delete a CLI
-/// affordance. So the narrowing is a **view** concern and lives here.
-///
-/// Derived rather than spelled out: a kind is a Labels-registry kind iff
-/// it supplies a `[[devices]]` field. That is the same distinction the
-/// module doc draws — `owner`/`device-type`/`department` are free text on
-/// a device and have no derived vocabulary anywhere, `tag` has one. A new
-/// device-metadata kind therefore arrives here for free, and a second
-/// use-derived kind stays out for the same reason `tag` does.
+/// Every declared kind, in `LabelKind::ALL` order — the same order
+/// `warden label list` groups by, so the menu and the CLI read alike.
+/// Nothing here is filtered: a `tag` kind existed once and is retired
+/// from the enum itself, not merely hidden from this view (see the
+/// module doc's "Why a registry existed here for tags"), so there is no
+/// fourth variant left to exclude.
 pub fn menu_kinds() -> Vec<LabelKind> {
     LabelKind::ALL.to_vec()
 }
 
 /// Named so the empty state can point at the verb that makes the first one.
-/// L2 is read-plus-declare; there is no other way to seed a vocabulary.
+/// This leaf is read-plus-declare; there is no other way to seed a
+/// vocabulary.
 ///
 /// Built from [`menu_kinds`] — the same list the menu draws — so the tab
 /// can never tell an operator to declare a kind it refuses to show them.
@@ -166,7 +151,7 @@ pub fn kind_menu_label(kind: LabelKind) -> &'static str {
     }
 }
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         render_no_config(f, area);
         return;
@@ -175,9 +160,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let labels = &loaded.config.labels;
     let title = format!("Labels ({})", labels.len());
     let outer = render_section_chrome(f, area, &title, T.text_secondary);
+    let kind = app.labels.selected_kind;
+    let focus = app.labels.focus;
 
     if outer.width < NARROW_THRESHOLD {
-        render_entries(f, outer, app, loaded, labels);
+        render_entries(
+            f,
+            outer,
+            loaded,
+            labels,
+            kind,
+            focus,
+            (
+                app.labels.selected_id.as_deref(),
+                &mut app.labels.table_state,
+            ),
+        );
         return;
     }
 
@@ -190,7 +188,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     render_kind_menu(f, cols[0], app, labels);
     draw_v_divider(f, cols[1]);
-    render_entries(f, cols[2], app, loaded, labels);
+    render_entries(
+        f,
+        cols[2],
+        loaded,
+        labels,
+        kind,
+        focus,
+        (
+            app.labels.selected_id.as_deref(),
+            &mut app.labels.table_state,
+        ),
+    );
 }
 
 // ── Left card: the kinds ─────────────────────────────────────────────
@@ -240,11 +249,13 @@ fn render_kind_menu(f: &mut Frame, area: Rect, app: &App, labels: &[Label]) {
 fn render_entries(
     f: &mut Frame,
     area: Rect,
-    app: &App,
     loaded: &crate::config::loader::LoadedConfig,
     labels: &[Label],
+    kind: crate::config::schema::LabelKind,
+    focus: LabelsFocus,
+    cursor: (Option<&str>, &mut TableState),
 ) {
-    let kind = app.labels.selected_kind;
+    let (selected_id, table_state) = cursor;
     let rows_data = rows_for_kind(labels, kind);
 
     if rows_data.is_empty() {
@@ -279,20 +290,17 @@ fn render_entries(
 
     // Re-resolve the anchor every frame rather than carrying an index: a
     // config reload can add, remove or reorder entries, and an index from
-    // the previous frame then points at a different label. Mirrors Groups
-    // and Profiles.
-    let mut state = TableState::default();
-    if let Some(idx) = resolve_selected_index(&rows_data, app.labels.selected_id.as_deref()) {
-        state.select(Some(idx));
-    } else if !rows.is_empty() {
-        state.select(Some(0));
-    }
+    // the previous frame then points at a different label. The scroll
+    // offset persists regardless (see `tabs::subnets::render_master` for
+    // why that is safe across a row-count change).
+    let selected =
+        resolve_selected_index(&rows_data, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
 
     // Mirror of the kind menu's marker, for the same reason: the glyph
     // carries the focus, not the colour, so a style-blind buffer dump can
     // still tell the two states apart. Both are 2 cells wide, so the
     // columns stay put when focus moves.
-    let symbol = if app.labels.focus == LabelsFocus::Entries {
+    let symbol = if focus == LabelsFocus::Entries {
         "\u{25b8} "
     } else {
         "\u{00b7} "
@@ -311,34 +319,21 @@ fn render_entries(
     .highlight_symbol(symbol)
     .row_highlight_style(theme::highlight_style());
 
-    f.render_stateful_widget(table, area, &mut state);
+    super::render_table(f, area, table, table_state, selected);
 }
 
 /// How many entities use this label's value.
 ///
-/// For the kinds with a [`device_field`](LabelKind::device_field) it is
-/// devices matched via [`Label::matches_value`] — id **or** display_name,
-/// because the two sets never intersect on their own.
+/// Devices matched via [`Label::matches_value`] against whichever field
+/// `label.kind` names (`owner`, `device_type` or `department`) — id **or**
+/// display_name, because the two sets never intersect on their own.
 ///
-/// **the retired `LabelKind::Tag` returns 0, and `plp-s5d` is where that changed.**
-/// It used to delegate to
-/// `collect_tag_usage` (removed with `cli::commands::tags` in `plp-s5a`) —
-/// the same collector `warden tags list` uses, so the TUI and the CLI
-/// could not report different numbers — and `plp-s5c` deletes that
-/// collector with the rest of `cli::commands::tags`.
-///
-/// **Returning 0 is not a silent loss here, and the reason is worth
-/// checking rather than assuming.** A `Tag` label is already unreachable
-/// from this tab: [`menu_kinds`] filters on `device_field().is_some()`, so
-/// the left menu has not offered a Tags bucket since that narrowing, and
-/// no rendered row can reach this branch. It survives only as the
-/// non-`device_field` arm of a total match over a variant `plp-s5a` owns.
-///
-/// **Reported, not fixed here:** an operator whose config still declares
-/// `[[labels]]` rows with `kind = "tag"` sees nothing about them in this
-/// tab — not an empty bucket, not a notice. That predates this lane (the
-/// `menu_kinds` narrowing did it) and is not this lane's to change, but it
-/// is the shape of a silent drop and belongs in the S5 handoff.
+/// A `[[labels]]` row declaring `kind = "tag"` cannot reach this function:
+/// `LabelKind` has no such variant (see the module doc's "Why a registry
+/// existed here for tags"), and `Vec<Label>` deserialisation is
+/// all-or-nothing, so a config still carrying one fails to load entirely.
+/// The operator sees the ordinary "could not load config" state on every
+/// tab that reads `app.loaded_config`, not a gap local to this one.
 pub fn usage_count(loaded: &crate::config::loader::LoadedConfig, label: &Label) -> usize {
     loaded
         .config
@@ -362,9 +357,8 @@ pub fn usage_count(loaded: &crate::config::loader::LoadedConfig, label: &Label) 
 /// resolves which row `e` and `d` act on. If those two derived their row
 /// set separately — a different filter, a different order — the operator
 /// would edit or delete a row other than the one under the highlight, and
-/// nothing on screen would say so. §4.68 UX8 named this hazard for this
-/// sprint in advance: *"innocuo finché read-only, portante appena arriva
-/// la CRUD"*.
+/// nothing on screen would say so — harmless while read-only, load-bearing
+/// the moment CRUD arrives.
 pub fn rows_for_kind(labels: &[Label], kind: LabelKind) -> Vec<&Label> {
     labels.iter().filter(|l| l.kind == kind).collect()
 }
@@ -390,8 +384,8 @@ fn render_empty_for_kind(f: &mut Frame, area: Rect, kind: LabelKind, whole_vocab
         //
         // It used to branch on the kind: telling a Tags-row operator that
         // "these device fields stay free text" would have been false, since
-        // a tag was neither a device field nor free text. `plp-s5a` removed
-        // that kind, so every kind reaching here governs a device field and
+        // a tag was neither a device field nor free text. With that kind
+        // removed, every kind reaching here governs a device field and
         // one sentence is true for all of them.
         let (why_a, why_b) = (
             "  a vocabulary is optional — without one these device fields",
@@ -409,14 +403,13 @@ fn render_empty_for_kind(f: &mut Frame, area: Rect, kind: LabelKind, whole_vocab
     }
 
     lines.push(Line::from(""));
-    // §4.66 L7: the dashboard can declare now, so the empty state leads
+    // The dashboard can declare now, so the empty state leads
     // with the key. The CLI line stays underneath, unchanged and pinned —
     // it is what an operator scripting the box needs.
     //
-    // Unconditional since `plp-s5a`. It used to be gated on the same
-    // discriminator `menu_kinds` used, so the Tags state would not promise
-    // `a` for a kind the leaf refused to focus; with that kind gone, every
-    // kind the menu can select is one `a` can declare.
+    // Unconditional: every kind the menu can select is one `a` can
+    // declare, so this no longer needs to be gated on the same
+    // discriminator `menu_kinds` uses.
     lines.push(Line::from(Span::styled(
         "  press [a] to declare one.",
         Style::default().fg(T.text_secondary),
@@ -455,6 +448,9 @@ mod tests {
     use super::*;
     use crate::config::loader::LoadedConfig;
     use crate::config::schema::{ConfigV1, Device, Id};
+    use crate::tui::cfg_scan::{
+        classify_tail, is_test_cfg_marker, split_leading_attr, without_line_comment, StripState,
+    };
 
     fn label(id: &str, kind: LabelKind, display: &str) -> Label {
         Label {
@@ -520,12 +516,12 @@ mod tests {
     /// would report 0 for a label that is in use everywhere.
     #[test]
     fn usage_counts_by_display_name_not_only_by_id() {
-        let l = label("alex", LabelKind::Owner, "Alex");
+        let l = label("operator", LabelKind::Owner, "Operator");
         let lc = loaded(
             vec![l.clone()],
             vec![
-                device("a", Some("Alex"), LabelKind::Owner),
-                device("b", Some("Alex"), LabelKind::Owner),
+                device("a", Some("Operator"), LabelKind::Owner),
+                device("b", Some("Operator"), LabelKind::Owner),
             ],
         );
         assert_eq!(
@@ -537,10 +533,10 @@ mod tests {
 
     #[test]
     fn usage_counts_the_id_form_too() {
-        let l = label("alex", LabelKind::Owner, "Alex");
+        let l = label("operator", LabelKind::Owner, "Operator");
         let lc = loaded(
             vec![l.clone()],
-            vec![device("a", Some("alex"), LabelKind::Owner)],
+            vec![device("a", Some("operator"), LabelKind::Owner)],
         );
         assert_eq!(usage_count(&lc, &l), 1);
     }
@@ -603,7 +599,7 @@ mod tests {
     /// The hint is derived, so a kind added to the menu cannot leave the
     /// operator reading a command line that omits it.
     ///
-    /// Re-pointed from `LabelKind::ALL` to [`menu_kinds`] in §4.68 UX8.
+    /// Reads from [`menu_kinds`], not `LabelKind::ALL`.
     /// On its own that would be tautological — one list feeding both
     /// sides can never disagree with itself — so the two tests below
     /// carry the halves that can actually fail.
@@ -615,21 +611,21 @@ mod tests {
         }
     }
 
-    /// §4.68 UX8: the hint must not name a kind the menu does not paint.
+    /// The hint must not name a kind the menu does not paint.
     ///
-    /// **INVERTED by `plp-s5a`, and the inversion is the record.** The
+    /// **INVERTED, and the inversion is the record.** The
     /// second assertion used to read `LabelKind::valid_values().contains("tag")`
     /// — *"the CLI's own enumeration must be untouched; `warden label add
     /// --kind tag` stays legal, and this test fails loudly if a future
-    /// session narrows the schema instead of the view"*. §4.68 had narrowed
-    /// only the view, and this pinned the gap shut.
+    /// session narrows the schema instead of the view"*. That earlier
+    /// change had narrowed only the view, and this pinned the gap shut.
     ///
-    /// The operator then decided to narrow the schema, which is what
-    /// `plp-s5a` does: `LabelKind::Tag` is gone, so `--kind tag` is refused
-    /// by `parse_kind` and no longer enumerated. Kept and inverted rather
-    /// than deleted — a deletion sprint that leaves its old pins standing
-    /// is this repo's neutrality-#5 scar, and a test that quietly
-    /// disappears takes the record of the old rule with it.
+    /// The schema was later narrowed too: `LabelKind::Tag` is gone, so
+    /// `--kind tag` is refused by `parse_kind` and no longer enumerated.
+    /// Kept and inverted rather than deleted — a change that removes a
+    /// capability but leaves its old pinning test standing is a known
+    /// class of bug, and a test that quietly disappears takes the
+    /// record of the old rule with it.
     #[test]
     fn neither_the_hint_nor_the_cli_enumeration_offers_the_retired_tag_kind() {
         let hint = empty_hint();
@@ -655,8 +651,8 @@ mod tests {
                 LabelKind::DeviceType,
                 LabelKind::Department
             ],
-            "three closed vocabularies — every kind there is since \
-             `plp-s5a` retired `tag`"
+            "three closed vocabularies — every kind there is now that \
+             `tag` is retired"
         );
     }
 
@@ -669,12 +665,12 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let labels = vec![label("alex", LabelKind::Owner, "Alex")];
+        let labels = vec![label("operator", LabelKind::Owner, "Operator")];
         let mut app = App::new();
         app.loaded_config = Some(loaded(labels.clone(), Vec::new()));
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        term.draw(|f| render(f, f.area(), &mut app)).unwrap();
         let dump = term.backend().to_string();
 
         let hint = empty_hint();
@@ -691,7 +687,7 @@ mod tests {
         );
     }
 
-    // ── §4.68 UX8: the focus marker is drawn where it is claimed ──────
+    // ── The focus marker is drawn where it is claimed ──────────────────
     //
     // Geometry, so the coordinates below are derived and not guessed.
     // `render_section_chrome` returns `x = 2, y = 2` (block border +
@@ -706,13 +702,13 @@ mod tests {
         let mut app = App::new();
         app.loaded_config = Some(loaded(
             vec![
-                label("alex", LabelKind::Owner, "Alex"),
-                label("emanuela", LabelKind::Owner, "Emanuela"),
+                label("operator", LabelKind::Owner, "Operator"),
+                label("member", LabelKind::Owner, "Member"),
             ],
             Vec::new(),
         ));
         app.labels.focus = focus;
-        app.labels.selected_id = Some("alex".to_string());
+        app.labels.selected_id = Some("operator".to_string());
         app
     }
 
@@ -734,7 +730,7 @@ mod tests {
             .collect()
     }
 
-    fn draw(app: &App, w: u16, h: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    fn draw(app: &mut App, w: u16, h: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -744,7 +740,7 @@ mod tests {
 
     #[test]
     fn the_cursor_marks_the_kind_menu_when_the_kind_menu_has_focus() {
-        let term = draw(&focus_app(LabelsFocus::KindMenu), 100, 24);
+        let term = draw(&mut focus_app(LabelsFocus::KindMenu), 100, 24);
         assert_eq!(
             span_at(&term, MENU_MARK_X, 2, 8),
             "\u{25b8} Owners",
@@ -762,10 +758,10 @@ mod tests {
     /// fails exactly one of the pair.
     #[test]
     fn the_cursor_marks_the_entries_when_the_entries_have_focus() {
-        let term = draw(&focus_app(LabelsFocus::Entries), 100, 24);
+        let term = draw(&mut focus_app(LabelsFocus::Entries), 100, 24);
         assert_eq!(
             span_at(&term, TABLE_MARK_X, 3, 10),
-            "\u{25b8} alex    ",
+            "\u{25b8} operator ",
             "the focused pane's cursor is the filled marker"
         );
         assert_eq!(
@@ -775,7 +771,7 @@ mod tests {
         );
     }
 
-    /// **The D18 floor is 80×24, and at 80 columns this leaf has only one
+    /// **The minimum-terminal floor is 80×24, and at 80 columns this leaf has only one
     /// pane.** `NARROW_THRESHOLD = 90` collapses the split to the entry
     /// table — a deliberate call with its own comment, since the table is
     /// the part that carries data. So the two-pane assertions above run
@@ -791,29 +787,30 @@ mod tests {
         // the focus must not rest on a pane the layout omits. Rendering
         // `KindMenu` here would be staging a state production cannot
         // reach.
-        let term = draw(&focus_app(LabelsFocus::Entries), 80, 24);
+        let term = draw(&mut focus_app(LabelsFocus::Entries), 80, 24);
         let dump = term.backend().to_string();
         assert!(
             !dump.contains("Device types"),
             "below NARROW_THRESHOLD the kind menu is not painted:\n{dump}"
         );
         assert!(
-            dump.contains("alex"),
+            dump.contains("operator"),
             "the entry table is the pane that survives the collapse:\n{dump}"
         );
         assert!(
-            dump.contains("\u{25b8} alex"),
+            dump.contains("\u{25b8} operator"),
             "the surviving pane carries the live cursor, not the resting \
              one — at this width there is nothing else it could be:\n{dump}"
         );
     }
 
     /// [`menu_is_painted`] is the predicate the clamp keys off, so its
-    /// boundary is worth pinning directly: 80 is the D18 floor and must
-    /// be false, and the first width that paints the menu must be true.
+    /// boundary is worth pinning directly: 80 is the minimum-terminal
+    /// floor and must be false, and the first width that paints the
+    /// menu must be true.
     #[test]
     fn the_menu_is_not_painted_at_the_floor_but_is_when_wide() {
-        assert!(!menu_is_painted(80), "the D18 floor collapses the split");
+        assert!(!menu_is_painted(80), "the floor collapses the split");
         assert!(
             !menu_is_painted(NARROW_THRESHOLD + CHROME_W - 1),
             "one column short of the threshold still collapses"
@@ -825,12 +822,12 @@ mod tests {
         assert!(menu_is_painted(100), "a comfortable terminal");
     }
 
-    // `plp-s5d` removed `a_tag_counts_carriers_not_device_metadata`.
+    // `a_tag_counts_carriers_not_device_metadata` no longer exists.
     //
-    // It was the §4.66 L5 discriminator: a fixture whose device `owner`
+    // It was a discriminator: a fixture whose device `owner`
     // reads `kids` while its `tags` do NOT, so a tag routed through
     // `matches_value` reports 1 and the correct carrier walk reports 0.
-    // The carrier walk was `collect_tag_usage`, which `plp-s5c` deletes;
+    // The carrier walk was `collect_tag_usage`, since deleted;
     // `usage_count` now returns 0 for every `LabelKind::Tag` and there is
     // no second count left to tell apart from the first.
     //
@@ -840,18 +837,18 @@ mod tests {
     // `owner` label named `kids`. That direction is unaffected by this
     // lane and is what keeps the metadata branch honest.
 
-    /// §4.66 L7 — the twin of `tui_never_reaches_the_printing_tag_helper`
-    /// (`tabs/tags.rs`), for the verbs this sprint made reachable.
+    /// The twin of `tui_never_reaches_the_printing_tag_helper`
+    /// (`tabs/tags.rs`), for the verbs this leaf makes reachable.
     ///
     /// **Read that test's comments for the reasoning; it is not repeated
-    /// here.** The one thing worth restating is the shape of the skip,
-    /// because getting it wrong is what made the tags scanner blind for
-    /// two sprints: a scanner that `break`s at the first `#[cfg(test)]`
-    /// reads **11%** of `src/tui/mod.rs` — which carries 26 top-level test
-    /// modules — and the offending call sites lived in the other 89%. The
-    /// column-0 `#[cfg(test)]` … `}` pair delimits a top-level test
-    /// module; an indented one is an attribute on a single item and stays
-    /// scanned. That holds because `cargo fmt --check` is a gate.
+    /// here.** The one thing worth restating is the shape of the skip:
+    /// a scanner that `break`s at the first `#[cfg(test)]` marker reads
+    /// only the file's leading fraction, and every module past the first
+    /// test block goes unscanned — that is how this class of scanner
+    /// previously went blind to real call sites. The column-0
+    /// `#[cfg(test)]` … `}` pair delimits a top-level test module; an
+    /// indented one is an attribute on a single item and stays scanned.
+    /// That holds because `cargo fmt --check` is a gate.
     ///
     /// The needle is the **call** — `labels::run_add(` — never the bare
     /// name: `label_modal.rs` and `mod.rs` deliberately name these verbs
@@ -860,136 +857,74 @@ mod tests {
     ///
     /// One list, read by the scanner **and** by its negative control. Two
     /// lists that "must stay in sync" are one commit away from not being.
-    const FORBIDDEN: [&str; 5] = [
-        "labels::run_add(",
-        "labels::run_set(",
-        "labels::run_remove(",
-        "labels::run_list(",
-        "labels::run_show(",
-    ];
+    const VERBS: [&str; 5] = ["run_add", "run_set", "run_remove", "run_list", "run_show"];
 
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum ScanState {
-        Normal,
-        Classifying,
-        SkippingBlock,
-    }
-
-    /// Same shape and rationale as `tui/mod.rs`'s `split_leading_attr` —
-    /// an independent copy, not shared code. The two scanners check
-    /// different properties for different reasons (this one bounds a
-    /// forbidden-call scan across a whole subtree; `mod.rs`'s bounds a
-    /// key-handling regex scan of one file), and sharing now would mean
-    /// inventing a cross-file visibility surface for logic the
-    /// already-planned test-file-split is about to reshuffle anyway.
-    fn split_leading_attr(line: &str) -> Option<(&str, &str)> {
-        let rest = line.strip_prefix('#')?.strip_prefix('[')?;
-        let bytes = rest.as_bytes();
-        let mut depth: i32 = 1;
+    /// The line with its `//` comment cut and every string literal blanked,
+    /// so what is searched is code. A verb named in prose or quoted inside a
+    /// message is documentation, not a call; a scan that cannot tell them
+    /// apart makes correct prose unwritable and eventually gets deleted.
+    fn code_of(line: &str) -> String {
+        let code = without_line_comment(line);
+        let mut out = String::with_capacity(code.len());
         let mut in_string = false;
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'"' => in_string = !in_string,
-                b'[' if !in_string => depth += 1,
-                b']' if !in_string => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((&rest[..i], rest[i + 1..].trim_start()));
-                    }
+        let mut escaped = false;
+        for c in code.chars() {
+            if escaped {
+                out.push(' ');
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' if in_string => {
+                    out.push(' ');
+                    escaped = true;
                 }
-                _ => {}
+                '"' => {
+                    out.push(' ');
+                    in_string = !in_string;
+                }
+                _ if in_string => out.push(' '),
+                _ => out.push(c),
             }
         }
-        None
+        out
     }
 
-    fn cfg_inner_predicate(attr: &str) -> Option<&str> {
-        attr.strip_prefix("cfg(")?.strip_suffix(')')
-    }
-
-    /// True when `test` appears as a bare predicate token inside a
-    /// `cfg(...)` attribute's predicate text. False for `feature = "test"`
-    /// (string value) and `not(test)` (compiles OUTSIDE test builds).
-    /// Panics on any other combination of `not(` with `test` — a real
-    /// cfg-expression parser is out of scope, and a loud failure beats a
-    /// silent wrong classification.
-    fn cfg_predicate_names_test(predicate: &str) -> bool {
-        let mut masked = String::with_capacity(predicate.len());
-        let mut in_string = false;
-        for c in predicate.chars() {
-            if c == '"' {
-                in_string = !in_string;
-                masked.push(' ');
-            } else if in_string {
-                masked.push(' ');
-            } else {
-                masked.push(c);
-            }
+    /// True when `line` reaches a printing helper — by calling it outright,
+    /// or by importing it. An alias (`use ..labels::run_add as add_label;`)
+    /// renames the verb, so the call site never spells `labels::run_add(`
+    /// and a call-only scan is blind to it; the import is the one place the
+    /// real name must still appear.
+    fn forbidden_hit(line: &str) -> bool {
+        let code = code_of(line);
+        if code.trim_start().starts_with("use ") && code.contains("labels::") {
+            return VERBS.iter().any(|v| code.contains(v));
         }
-        let no_ws: String = masked.chars().filter(|c| !c.is_whitespace()).collect();
-        if no_ws == "not(test)" {
-            return false;
-        }
-        let has_test_token = masked
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|tok| tok == "test");
-        if !has_test_token {
-            return false;
-        }
-        assert!(
-            !no_ws.contains("not("),
-            "cfg predicate {predicate:?} combines `not(` with a `test` token in \
-             a shape other than exactly `not(test)` — this needs a real \
-             cfg-expression parser to classify correctly, not this heuristic"
-        );
-        true
-    }
-
-    /// Column-0 gate + attribute recognition, mirroring `tui/mod.rs`'s
-    /// `is_test_cfg_marker`. Returns the marker's own tail so the caller
-    /// can tell a bare declaration (`mod t;`) apart from a block opener
-    /// (`mod t {`).
-    fn is_test_cfg_marker(line: &str) -> Option<&str> {
-        if line.starts_with(char::is_whitespace) {
-            return None;
-        }
-        let (attr, tail) = split_leading_attr(line)?;
-        let predicate = cfg_inner_predicate(attr)?;
-        cfg_predicate_names_test(predicate).then_some(tail)
-    }
-
-    fn classify_tail(tail: &str) -> ScanState {
-        if tail.is_empty() {
-            ScanState::Classifying
-        } else if tail.ends_with('{') {
-            ScanState::SkippingBlock
-        } else if tail.ends_with(';') {
-            ScanState::Normal
-        } else {
-            ScanState::Classifying
-        }
+        VERBS
+            .iter()
+            .any(|v| code.contains(&format!("labels::{v}(")))
     }
 
     /// One file's worth of the scan: skip every test-cfg item (block or
     /// bare declaration, same 3-state walk as `tui/mod.rs`'s
     /// `strip_test_items`) and record a `path:line: text` hit for every
-    /// `FORBIDDEN` needle found in what's left. Pulled out of `scan` so it
+    /// forbidden needle found in what is left. Pulled out of `scan` so it
     /// is testable against fixture strings, not only real files on disk.
     fn scan_source(hits: &mut Vec<String>, path_label: &str, src: &str) {
-        let mut state = ScanState::Normal;
+        let mut state = StripState::Normal;
         for (i, line) in src.lines().enumerate() {
             state = match state {
-                ScanState::Normal => {
+                StripState::Normal => {
                     if let Some(tail) = is_test_cfg_marker(line) {
                         classify_tail(tail)
                     } else {
-                        if FORBIDDEN.iter().any(|n| line.contains(n)) {
+                        if forbidden_hit(line) {
                             hits.push(format!("{path_label}:{}: {}", i + 1, line.trim()));
                         }
-                        ScanState::Normal
+                        StripState::Normal
                     }
                 }
-                ScanState::Classifying => {
+                StripState::Classifying => {
                     if line.starts_with("#[") {
                         match split_leading_attr(line) {
                             Some((_, tail)) => classify_tail(tail),
@@ -1003,18 +938,18 @@ mod tests {
                         classify_tail(line.trim_end())
                     }
                 }
-                ScanState::SkippingBlock => {
+                StripState::SkippingBlock => {
                     if line == "}" {
-                        ScanState::Normal
+                        StripState::Normal
                     } else {
-                        ScanState::SkippingBlock
+                        StripState::SkippingBlock
                     }
                 }
             };
         }
         assert_eq!(
             state,
-            ScanState::Normal,
+            StripState::Normal,
             "scan of {path_label} ended in {state:?} at EOF — a test item's \
              closing brace or semicolon was never found"
         );
@@ -1029,7 +964,7 @@ mod tests {
                 // in the file that declares it, not in these files, so a
                 // plain recursive scan would read every line here as
                 // production code and misfire on any test fixture that
-                // happens to contain a FORBIDDEN call.
+                // happens to contain a forbidden call.
                 if path.file_name().and_then(|n| n.to_str()) == Some("tests") {
                     continue;
                 }
@@ -1061,7 +996,7 @@ mod tests {
     }
 
     /// Proves the `tests/` directory skip added for the `#[path]` test-file
-    /// move: a FORBIDDEN call inside `<dir>/tests/*.rs` must not surface,
+    /// move: a forbidden call inside `<dir>/tests/*.rs` must not surface,
     /// while the same call one level up still does.
     #[test]
     fn scan_skips_the_tests_directory() {
@@ -1106,7 +1041,7 @@ mod tests {
     fn scan_source_resumes_correctly_after_a_bare_mod_declaration() {
         // The fix for the bare-declaration gap: before this fix, a bare
         // `mod t;` (no closing brace of its own) would leave the scanner
-        // skipping past FORBIDDEN_AFTER looking for some unrelated `}`,
+        // skipping past PROD_AFTER looking for some unrelated `}`,
         // silently blinding the scan to everything past it.
         let mut hits = Vec::new();
         let src = "#[cfg(test)]\nmod t;\nlabels::run_add(x)\n";
@@ -1131,7 +1066,7 @@ mod tests {
         // The fix for the exact-string-spelling gap: `editor_failure_tests`
         // in `tui/mod.rs` is spelled exactly this way. Before this fix, a
         // module gated like this was left unskipped, so a legitimate
-        // reference to a FORBIDDEN name inside its own test code would have
+        // reference to a forbidden name inside its own test code would have
         // been reported as a false positive.
         let mut hits = Vec::new();
         let src = "#[cfg(all(test, unix))]\nmod t {\nlabels::run_add(x)\n}\n";
@@ -1162,25 +1097,46 @@ mod tests {
     /// more brittle of the pair, because the seam it protects is *new*:
     /// `labels::run_add` and `add_inner` differ by six characters.
     #[test]
-    fn the_printing_labels_needle_matches_a_real_call() {
-        let call = "        match crate::cli::commands::labels::run_add(config_path, ...) {";
-        assert!(call.contains("labels::run_add("));
+    fn the_scan_reads_code_not_prose() {
+        assert!(forbidden_hit(
+            "        match crate::cli::commands::labels::run_add(config_path, ...) {"
+        ));
 
-        // The prose that names the verb — three real lines from this
-        // sprint's own sources — must NOT fire.
-        for prose in [
+        // The same spelling as a comment or inside a string literal is text,
+        // not a call. An earlier control only used prose that avoided the
+        // `(`, which proved the needle's shape rather than the scan's ability
+        // to tell code from text.
+        for text in [
+            "        // never call labels::run_add( from here",
+            "        const W: &str = \"labels::run_remove(\";",
+            "        /// `labels::run_list(` prints; drive `list_inner` instead.",
             "//! `cli::commands::labels::{add_inner, set_inner, remove_inner}` — the",
-            "    // **Mai** `labels::run_add` / `run_set` / `run_remove`: stampano.",
-            "/// - Add → `add_inner` once.",
         ] {
-            assert!(
-                !FORBIDDEN.iter().any(|n| prose.contains(n)),
-                "the needle matched prose, not a call: {prose}"
-            );
+            assert!(!forbidden_hit(text), "text read as a call: {text}");
         }
 
         // The seam itself must not be caught by its own guard.
-        let seam = "        match add_inner(config_path, &resolved.id, form.kind, ...) {";
-        assert!(!FORBIDDEN.iter().any(|n| seam.contains(n)));
+        assert!(!forbidden_hit(
+            "        match add_inner(config_path, &resolved.id, form.kind, ...) {"
+        ));
+    }
+
+    #[test]
+    fn the_scan_sees_a_printing_verb_imported_under_an_alias() {
+        for import in [
+            "use crate::cli::commands::labels::run_add as add_label;",
+            "    use crate::cli::commands::labels::{run_add, run_set};",
+            "use crate::cli::commands::labels::run_show;",
+        ] {
+            assert!(forbidden_hit(import), "alias import not seen: {import}");
+        }
+
+        // The non-printing seam may be imported freely, aliased or not.
+        for import in [
+            "use crate::cli::commands::labels::{add_inner, set_inner, remove_inner};",
+            "use crate::cli::commands::labels::set_fields_inner;",
+        ] {
+            assert!(!forbidden_hit(import), "seam import refused: {import}");
+        }
     }
 }

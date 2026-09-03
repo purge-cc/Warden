@@ -1,4 +1,4 @@
-//! Cluster tab (§4.11-4b / CS9) — the operator-facing view of cluster sync.
+//! Cluster tab — the operator-facing view of cluster sync.
 //!
 //! Role-adaptive, read-only:
 //! - **Primary** → a roster table (self-row first; NODE / ROLE / STATUS / QPS
@@ -13,6 +13,12 @@
 //! `render` is only ever reached when the tab is visible. Detail fields are
 //! exactly what `RosterEntryDto` carries — no per-node generations/cache-hit
 //! (those are cluster-wide and live in the titles / secondary card).
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_cluster_key` (`j`/`k` move the roster cursor)
+//! - Form:  none — read-only, no modal
+//! - State: `app::ClusterState` (`selected_name`, `table_state`)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -53,7 +59,7 @@ impl ClusterRoleView {
     }
 }
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(status) = app.cluster_status.as_ref() else {
         render_no_view(f, area);
         return;
@@ -78,7 +84,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         ClusterRoleView::Primary => {
             // Primary: roster table on top, per-node detail below.
             let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(8)]).split(area);
-            render_roster(f, rows[0], app, status);
+            render_roster(
+                f,
+                rows[0],
+                status,
+                app.cluster.selected_name.as_deref(),
+                &mut app.cluster.table_state,
+            );
             render_node_detail(f, rows[1], app, status);
         }
         ClusterRoleView::Unknown => render_unknown_role(f, area, status),
@@ -90,11 +102,16 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 /// arrived yet" from "the answers stopped arriving".
 ///
 /// It used to read *"waiting for first cluster poll…"*, which after the first
-/// answer is simply false. That mattered more than it looks: the fix for
-/// `rev-2607-cluster-stale-as-fresh` drops the cached DTO when the status fetch
-/// fails (see `NOTES-stale.md` §5, seam S3), so this state is exactly where a
-/// broken TUI↔daemon link lands. Saying "waiting for the first poll" there
-/// would move the lie rather than remove it.
+/// answer is simply false. Saying "waiting for the first poll" in a state that
+/// is also "the answers stopped arriving" would move the lie rather than
+/// remove it.
+///
+/// **A failing poll does not reach this state.** The poll site keeps the
+/// previous DTO on error — `if let Ok(..)`, "on error keep the last-known
+/// view" — so a broken TUI-to-daemon link shows stale data, not this. The
+/// wording above is kept because it is the right wording for when the drop
+/// does land; dropping the DTO on the first error would blank the tab on a
+/// transient IPC hiccup, so it needs a sustained-failure threshold.
 fn render_no_view(f: &mut Frame, area: Rect) {
     let content = render_section_chrome(f, area, "Cluster", T.info);
     f.render_widget(
@@ -155,7 +172,13 @@ fn render_unknown_role(f: &mut Frame, area: Rect, status: &ClusterStatusDto) {
 
 // ── Primary: roster table ───────────────────────────────────────────────────
 
-fn render_roster(f: &mut Frame, area: Rect, app: &App, status: &ClusterStatusDto) {
+fn render_roster(
+    f: &mut Frame,
+    area: Rect,
+    status: &ClusterStatusDto,
+    selected_name: Option<&str>,
+    table_state: &mut TableState,
+) {
     let title = format!(
         "Cluster \u{00b7} primary \u{00b7} cfg gen {}",
         status.config_generation,
@@ -188,9 +211,7 @@ fn render_roster(f: &mut Frame, area: Rect, app: &App, status: &ClusterStatusDto
     );
 
     let rows: Vec<Row> = status.roster.iter().map(roster_row).collect();
-
-    let mut table_state = TableState::default();
-    table_state.select(Some(resolve_idx(status, app)));
+    let selected = Some(resolve_idx(status, selected_name));
 
     let table = Table::new(
         rows,
@@ -206,7 +227,7 @@ fn render_roster(f: &mut Frame, area: Rect, app: &App, status: &ClusterStatusDto
     .header(header)
     .row_highlight_style(theme::highlight_style());
 
-    f.render_stateful_widget(table, content, &mut table_state);
+    super::render_table(f, content, table, table_state, selected);
 }
 
 fn roster_row(r: &RosterEntryDto) -> Row<'static> {
@@ -236,7 +257,10 @@ fn roster_row(r: &RosterEntryDto) -> Row<'static> {
 // ── Primary: per-node detail card ───────────────────────────────────────────
 
 fn render_node_detail(f: &mut Frame, area: Rect, app: &App, status: &ClusterStatusDto) {
-    let Some(r) = status.roster.get(resolve_idx(status, app)) else {
+    let Some(r) = status
+        .roster
+        .get(resolve_idx(status, app.cluster.selected_name.as_deref()))
+    else {
         let content = render_section_chrome(f, area, "Node", T.text_secondary);
         f.render_widget(
             Paragraph::new(Span::styled(" \u{2014}", Style::default().fg(T.text_muted))),
@@ -339,9 +363,9 @@ fn render_secondary_card(f: &mut Frame, area: Rect, status: &ClusterStatusDto) {
         ),
     ));
 
-    // Sync — the headline health signal (§9: a secondary must be able to state
+    // Sync — the headline health signal: a secondary must be able to state
     // which policy it is applying and how old that answer is, and degrade
-    // audibly when it cannot).
+    // audibly when it cannot.
     //
     // Classified by the SHARED classifier, not by `converged`. `converged` is
     // `synced_at_least_once && last_poll_ok`, which collapses "has never synced
@@ -382,9 +406,9 @@ fn render_secondary_card(f: &mut Frame, area: Rect, status: &ClusterStatusDto) {
     ));
 
     // Applied — the hash, plus what an operator most needs to know in each
-    // degraded state. "still filtering" is not decoration: §9 is *degrade
-    // audibly, never refuse*, and an operator who reads STALE without it will
-    // assume DNS is down and start restarting things.
+    // degraded state. "still filtering" is not decoration: the rule is
+    // *degrade audibly, never refuse*, and an operator who reads STALE
+    // without it will assume DNS is down and start restarting things.
     let applied = match health {
         SyncHealth::Current => format!("policy {}", short_hash(&status.config_hash)),
         SyncHealth::Stale => format!(
@@ -417,11 +441,9 @@ fn render_secondary_card(f: &mut Frame, area: Rect, status: &ClusterStatusDto) {
 /// Resolve the operator's stable `selected_name` back to a roster index for
 /// the current frame; default to the top row (self) when unset or the node
 /// dropped out of the roster.
-fn resolve_idx(status: &ClusterStatusDto, app: &App) -> usize {
-    app.cluster
-        .selected_name
-        .as_ref()
-        .and_then(|name| status.roster.iter().position(|r| &r.name == name))
+fn resolve_idx(status: &ClusterStatusDto, selected_name: Option<&str>) -> usize {
+    selected_name
+        .and_then(|name| status.roster.iter().position(|r| r.name == name))
         .unwrap_or(0)
 }
 
@@ -631,7 +653,7 @@ mod tests {
             out.contains("STALE \u{00b7} last confirmed 6m ago"),
             "the stale card must carry the age of the last confirmation:\n{out}"
         );
-        // §9: degrade audibly, never refuse. Without this the operator reads
+        // Degrade audibly, never refuse. Without this the operator reads
         // STALE and assumes DNS is down.
         assert!(
             out.contains("still filtering"),
@@ -703,7 +725,7 @@ mod tests {
 
     /// The no-DTO state has to serve both "not yet" and "not any more" — it is
     /// where a failed status fetch lands once the `Err` arm drops the cached
-    /// view (NOTES-stale.md §5, seam S3).
+    /// view.
     #[test]
     fn the_empty_view_does_not_claim_it_is_only_the_first_poll() {
         let out = joined(&painted(60, 10, |f| {

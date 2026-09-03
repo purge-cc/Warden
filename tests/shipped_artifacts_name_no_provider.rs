@@ -1,6 +1,6 @@
 //! neutrality-09 — the shipped installer and config templates name no DNS provider.
 //!
-//! **Why this exists as a test and not only as a sweep.** `project rules` §Neutrality
+//! **Why this exists as a test and not only as a sweep.** `CLAUDE.md` §Neutrality
 //! documents Sweep C, which greps these same files. A documented sweep is a thing a
 //! human has to remember to run; `neutrality-03` was declared closed on a sweep that
 //! structurally could not see `scripts/install.sh`, and the installer kept routing every
@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-/// Same needles as Sweep C in `project rules` §Neutrality. Keep the two in sync: a needle
+/// Same needles as Sweep C in `CLAUDE.md` §Neutrality. Keep the two in sync: a needle
 /// added there and not here leaves the sweep ahead of the gate, which is how the
 /// installer default survived in the first place.
 const PROVIDER_NEEDLES: &[&str] = &[
@@ -113,7 +113,7 @@ fn install_sh_names_no_provider() {
     assert!(
         hits.is_empty(),
         "scripts/install.sh names a DNS provider: {hits:?}. \
-         Every default install consumes this file — see project rules §Neutrality."
+         Every default install consumes this file — see CLAUDE.md §Neutrality."
     );
 }
 

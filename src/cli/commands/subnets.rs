@@ -1,17 +1,17 @@
 //! `warden subnet` — v1-native CRUD for `[[subnets]]` entries.
 //!
-//! Subnets are resolved via longest-prefix match (SN1); `priority` is
+//! Subnets are resolved via longest-prefix match; `priority` is
 //! informational only. The operator can say "the 10.10.10.0/24 range uses
 //! the marketing profile" with a single TOML entry.
 //!
-//! # Single-seat (R7) — Sprint 50
+//! # Single-seat
 //!
 //! The public `run_*` helpers are thin async wrappers over sync
-//! `*_inner` cores. Mirror of [`super::rules::add_inner`] (S43 T5).
-//! CLI dispatch (the binary's `main` via clap) and any future TUI submit
+//! `*_inner` cores. Mirror of [`super::rules::add_inner`].
+//! CLI dispatch (the binary's `main` via clap) and the TUI submit
 //! path call the same `*_inner` so the validate-or-revert / TOCTOU
 //! re-check / friendly error UX lives in one place. Only the wrappers
-//! perform the post-write [`super::ipc_reload::attempt_reload`] (HR2).
+//! perform the post-write [`super::ipc_reload::attempt_reload`].
 
 use std::path::{Path, PathBuf};
 
@@ -37,8 +37,8 @@ use crate::config::schema::{Id, Subnet};
 // from the input args.
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields land in CLI println! / future TUI status
-                    // bar; clippy only sees one direct caller here.
+#[allow(dead_code)] // Fields land in CLI println!; clippy only sees
+                    // one direct caller here.
 pub(crate) struct AddReport {
     pub id: String,
     pub target_path: PathBuf,
@@ -126,23 +126,23 @@ fn render_subnet_detail(s: &Subnet) -> String {
     let _ = writeln!(out, "profile:      {}", s.profile.as_str());
     let _ = writeln!(out, "priority:     {}", s.priority);
     // A subnet's tags are shown because the config still stores them,
-    // NOT because they select anything — `plp-s3` retired that. What a
+    // NOT because they select anything anymore. What a
     // client on this subnet filters comes from its profile:
     // `profiles.<id>.lists`, else each list's own `base`. Displayed
     // rather than hidden so a pre-cutover config's stored values stay
     // visible while being inert.
     //
-    // Historically: a subnet's tags landed in the effective tag set of every device that
+    // A subnet's tags used to land in the effective tag set of every device that
     // falls inside its CIDRs but has no `[[devices]]` record — i.e. of
     // exactly the clients the operator never enumerated, and can least
     // afford to guess about.
     out
 }
 
-// ── Inner cores (sync; R7 single-seat) ─────────────────────────────────
+// ── Inner cores (sync; single-seat) ─────────────────────────────────
 
 /// Add a `[[subnets]]` entry. **Sync** — caller owns the post-write
-/// `ipc_reload::attempt_reload` (HR2). Friendly errors:
+/// `ipc_reload::attempt_reload`. Friendly errors:
 ///
 /// - `subnet "..." already exists` if the id collides (the pre-write
 ///   check; a concurrent-add race is caught by the merged pre-promote
@@ -216,8 +216,8 @@ pub(crate) fn add_inner(
     // `warden subnet add` that landed the same id in another file is caught
     // here as a cross-file duplicate and the write is refused — nothing is
     // promoted. The friendly pre-check above covers the common (non-race)
-    // case; the rare race now surfaces the validator's DuplicateId message
-    // rather than a bespoke string (all-01 concurrency, a separate finding).
+    // case; the rare race surfaces the validator's DuplicateId message
+    // rather than a bespoke string.
     write_value_validated(config_path, &target_path, &doc)?;
 
     let id_for_audit = id.to_string();
@@ -340,7 +340,7 @@ pub(crate) fn remove_inner(
 
 // ── Public async wrappers (CLI dispatch surface) ───────────────────────
 //
-// Byte-identical operator-facing strings vs pre-S50: any change here
+// Byte-identical operator-facing strings: any change here
 // would surprise scripts grepping warden output.
 
 #[allow(clippy::too_many_arguments)]
@@ -369,7 +369,6 @@ pub async fn run_add(
         report.target_path.display()
     );
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -387,7 +386,6 @@ pub async fn run_set(
     let report = set_inner(config_path, id, field, value, into)?;
     println!("updated {}.{} = {}", report.id, report.field, report.value);
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -405,13 +403,12 @@ pub async fn run_remove(
             println!("removed subnet {}", report.id);
         }
         RemoveOutcome::NotFound { .. } => {
-            // verbs-02: idempotent — nothing changed, so no reload either.
+            // Idempotent — nothing changed, so no reload either.
             println!("subnet \"{id}\" not found — nothing to remove");
             return Ok(());
         }
     }
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -462,7 +459,7 @@ fn apply_subnet_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Re
 
 /// Validate + normalise each cidr input. Tries the strict
 /// [`Cidr::parse`] first so already-canonical inputs land on disk
-/// byte-identical to what the operator typed (preserves pre-S50
+/// byte-identical to what the operator typed (preserves
 /// scripts that grep the TOML). Falls through to
 /// [`Cidr::parse_friendly`] for wildcards / ranges / etc; those land
 /// on disk in canonical `network/prefix` form because the validator
@@ -599,7 +596,7 @@ servers = ["192.0.2.1:53"]
             &sock,
             "lan-guest",
             Some("Guest range"),
-            &["192.0.2.200/29".into()],
+            &["10.10.1.200/29".into()],
             "guest",
             Some(10),
             None,
@@ -733,11 +730,11 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let master = mk_master(&dir);
         let sock = fake_socket(&dir);
-        // verbs-02: remove of an absent subnet returns Ok (exit 0), not an error.
+        // Remove of an absent subnet returns Ok (exit 0), not an error.
         assert!(run_remove(&master, &sock, "ghost", None).await.is_ok());
     }
 
-    // ── S50 T1: inner-core lib tests ──────────────────────────────────
+    // ── inner-core lib tests ──────────────────────────────────
 
     #[test]
     fn subnet_add_inner_returns_applied_outcome() {
@@ -788,7 +785,7 @@ servers = ["192.0.2.1:53"]
         // validator at the next `load_config` round-trips. Plain
         // CIDR inputs should still pass through byte-identical
         // (covered indirectly by the existing `add_subnet_writes_*`
-        // tests which use `10.0.0.0/8` and `192.0.2.200/29`).
+        // tests which use `10.0.0.0/8` and `10.10.1.200/29`).
         let dir = tempfile::tempdir().unwrap();
         let master = mk_master(&dir);
         let report = add_inner(
@@ -838,8 +835,8 @@ servers = ["192.0.2.1:53"]
         // Editing display_name + an invalid cidr in ONE call must leave the
         // on-disk display_name unchanged: the earlier (valid) field is
         // applied in-memory but the call bails before any write, so nothing
-        // persists. (subnet_modal-01 — the old per-field `set_inner` loop
-        // committed display_name before the cidr field failed.)
+        // persists. (The old per-field `set_inner` loop committed
+        // display_name before the cidr field failed.)
         let dir = tempfile::tempdir().unwrap();
         let master = mk_master(&dir);
         add_inner(
@@ -919,7 +916,7 @@ servers = ["192.0.2.1:53"]
         }
     }
 
-    // ── Sprint 36 HR2: hot-reload wiring ───────────────────────────────
+    // ── hot-reload wiring ───────────────────────────────
 
     #[tokio::test]
     async fn subnets_add_triggers_reload_when_daemon_up() {
@@ -939,7 +936,7 @@ servers = ["192.0.2.1:53"]
             &sock,
             "lan-guest",
             None,
-            &["192.0.2.200/29".into()],
+            &["10.10.1.200/29".into()],
             "guest",
             None,
             None,
@@ -950,10 +947,9 @@ servers = ["192.0.2.1:53"]
         server.await.unwrap();
         assert_single_reload_with_resolved_token(&recorded);
     }
-    // ── cli-h10: `subnet show` prints tags ─────────────────────────────
+    // ── `subnet show` prints tags ─────────────────────────────
     //
     // A subnet's tags land in the effective tag set of every device inside
     // its CIDRs that has no `[[devices]]` record — the clients the
-    // operator never enumerated. "tags" appeared ZERO times in this module
-    // before cli-h10.
+    // operator never enumerated.
 }

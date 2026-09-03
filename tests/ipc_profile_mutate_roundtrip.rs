@@ -77,6 +77,7 @@ async fn spawn_fixture() -> Fixture {
         listen_addr: "127.0.0.1:15353".into(),
         upstream_mode: "plain".into(),
         upstream_count: 0,
+        upstream_servers: Vec::new(),
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,

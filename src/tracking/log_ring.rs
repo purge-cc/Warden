@@ -20,7 +20,7 @@
 //! the category **semantic**: the level already *is* error/warn/info, so
 //! nothing has to be inferred from message text.
 //!
-//! # Hot-path contract (project rules Design Rule 1)
+//! # Hot-path contract (CLAUDE.md Design Rule 1)
 //!
 //! `dns/handler.rs` emits from the query path, so this layer sits on it.
 //! Three properties keep the cost at zero for a query that succeeds:
@@ -135,16 +135,22 @@ pub struct LogRing {
 
 /// ASCII-case-insensitive `str::contains` that allocates nothing.
 ///
-/// `needle` must already be ASCII-lowercased; only the haystack byte is
-/// folded, so neither side is copied. [`LogRing::snapshot`] runs this once
-/// per retained entry **inside the buffer lock**, and [`LogRing::push`]
-/// discards events rather than waiting for that lock — so an allocation
-/// here is paid in log lines the operator never sees.
+/// `needle` must already be ASCII-lowercased, and only the haystack byte is
+/// folded, so neither side is copied. Every caller lowers once, outside its
+/// scan: [`LogRing::snapshot`] before it takes the buffer lock, the
+/// query-log filter by construction — its needles exist only as a
+/// `LoweredNeedle` or as a `Glob` segment, and both lower on the way in.
 ///
-/// ASCII-only is sufficient and deliberate: targets are Rust module paths
-/// and messages are operator-facing ASCII. A full Unicode fold would need
-/// the allocation this exists to avoid.
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+/// Both scans are places an allocation here would be expensive. `snapshot`
+/// runs this once per retained entry **inside the buffer lock**, which
+/// [`LogRing::push`] refuses to wait on — a cost here is paid in log lines
+/// the operator never sees — and the query-log filter runs it once per line
+/// of a file that can reach hundreds of megabytes.
+///
+/// ASCII-only is sufficient and deliberate: targets are Rust module paths,
+/// domains are ASCII after IDNA, and messages are operator-facing ASCII. A
+/// full Unicode fold would need the allocation this exists to avoid.
+pub(super) fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
     let (hay, ndl) = (haystack.as_bytes(), needle.as_bytes());
     // `windows(0)` panics, so the empty needle cannot reach the scan.
     if ndl.is_empty() {

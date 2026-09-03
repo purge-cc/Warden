@@ -6,8 +6,8 @@ pub mod io;
 
 pub use grammar::{compose_line, normalise_domain, parse_pack_line, GrammarError, PackLine};
 pub use io::{
-    add_rule, create_pack, read_pack, read_pack_lines, remove_rule, write_pack, AddOutcome,
-    CompiledCustomList, PackLineView, PackReadError, PackWriteError,
+    add_rule, create_pack, read_pack, read_pack_lines, remove_rule, replace_rule_at_line,
+    write_pack, AddOutcome, CompiledCustomList, PackLineView, PackReadError, PackWriteError,
 };
 
 use std::collections::BTreeMap;

@@ -133,35 +133,35 @@ negative_ttl_secs = 300
 department = "living-room"
 display_name = "decoder-sky"
 id = "decoder-sky"
-ip = "192.0.2.51"
+ip = "10.10.1.51"
 mac = "02:00:00:00:00:01"
 profile = "default"
 
 [[devices]]
 display_name = "nvidia-shield"
 id = "nvidia-shield"
-ip = "192.0.2.207"
+ip = "10.10.1.207"
 mac = "02:00:00:00:00:02"
 profile = "default"
 
 [[devices]]
 display_name = "hue-lights"
 id = "hue-lights"
-ip = "192.0.2.243"
+ip = "10.10.1.243"
 mac = "02:00:00:00:00:03"
 profile = "default"
 
 [[devices]]
 display_name = "apple-tv"
 id = "apple-tv"
-ip = "192.0.2.52"
+ip = "10.10.1.52"
 mac = "02:00:00:00:00:04"
 profile = "default"
 
 [[devices]]
 display_name = "printer-hp"
 id = "printer-hp"
-ip = "192.0.2.4"
+ip = "10.10.1.4"
 mac = "02:00:00:00:00:05"
 profile = "default"
 
@@ -187,7 +187,7 @@ display_name = "Default household profile"
 tags = ["uncategorized"]
 
 [server]
-allow_from = ["192.0.2.0/24", "100.64.0.0/10", "127.0.0.0/8"]
+allow_from = ["10.10.1.0/24", "100.64.0.0/10", "127.0.0.0/8"]
 default_profile = "default"
 listen = "0.0.0.0:53"
 log_level = "info"

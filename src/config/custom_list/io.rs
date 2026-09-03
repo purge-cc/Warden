@@ -1,6 +1,22 @@
 //! Reading and writing pack files.
 //!
 //! The only module in this feature that touches the filesystem.
+//!
+//! # Why every writer takes a `&ConfigWriteLock` it never reads
+//!
+//! Appending and removing a rule are read-modify-write cycles: read the
+//! whole file, edit the line set, rewrite it. The rewrite is atomic, so no
+//! reader ever sees a torn file — but atomicity says nothing about
+//! staleness. Two writers that both read the pre-state each rewrite from
+//! it, and the second erases the first operator's rule with no error on
+//! either side.
+//!
+//! Possession of a live guard is the entire contract, so it is a parameter
+//! rather than a `let _lock = acquire(..)` inside each function: a binding
+//! can be dropped early or reduced to `let _ =` — which releases
+//! immediately — and no fast test separates "held" from "created, then
+//! released". As a parameter the requirement is the type system's, and
+//! these functions cannot be entered without one.
 
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -9,6 +25,7 @@ use std::path::{Path, PathBuf};
 use compact_str::CompactString;
 
 use crate::config::atomic_write::{hardened_atomic_write, AtomicWriteOpts};
+use crate::config::write_lock::ConfigWriteLock;
 
 use super::grammar::{compose_line, normalise_domain, parse_pack_line, GrammarError, PackLine};
 
@@ -227,6 +244,30 @@ pub enum PackWriteError {
          [custom_list_limits] max_file_bytes limit"
     )]
     TooLarge { path: PathBuf, size: u64, cap: u64 },
+    /// The file moved under a surface that had already rendered it.
+    ///
+    /// A file line number names a different rule after any write the
+    /// renderer did not see, so an editor keyed on the number alone edits
+    /// whatever now sits there. `expected` is what the operator was
+    /// looking at; `found` is what the line holds now.
+    #[error(
+        "line {line} of {path} no longer holds {expected} — it holds {found}. \
+         Reopen the list and try again"
+    )]
+    StaleLine {
+        path: PathBuf,
+        line: usize,
+        expected: String,
+        found: String,
+    },
+    /// The replacement is already in the file, on another line. Writing it
+    /// would leave the operator diffing a pack that carries one rule twice.
+    #[error("{rule} is already on line {line} of {path}")]
+    Duplicate {
+        path: PathBuf,
+        rule: String,
+        line: usize,
+    },
 }
 
 /// Replace a pack file's whole content, atomically, after validating every
@@ -235,7 +276,12 @@ pub enum PackWriteError {
 /// The first invalid line rejects the entire write. This is not the list
 /// parser's skip-and-count: that discipline is a supply-chain signal for a
 /// body nobody in this house wrote, and this is the operator's own file.
-pub fn write_pack(path: &Path, lines: &[String], max_bytes: u64) -> Result<(), PackWriteError> {
+pub fn write_pack(
+    lock: &ConfigWriteLock,
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+) -> Result<(), PackWriteError> {
     for (n, l) in lines.iter().enumerate() {
         if let Err(e) = parse_pack_line(l) {
             return Err(PackWriteError::InvalidLine {
@@ -244,24 +290,29 @@ pub fn write_pack(path: &Path, lines: &[String], max_bytes: u64) -> Result<(), P
             });
         }
     }
-    write_all_raw(path, lines, max_bytes)
+    write_all_raw(lock, path, lines, max_bytes)
 }
 
-/// Create the file for a new custom list.
+/// Create the file for a new custom list, empty.
 ///
 /// Written immediately, so a mounted list always has a file and "missing"
 /// is unambiguously a fault rather than possibly just an empty list.
-pub fn create_pack(path: &Path, display_name: &str) -> Result<(), PackWriteError> {
-    let header = if display_name.is_empty() {
-        "# purge-warden custom list\n".to_string()
-    } else {
-        // The name goes in a comment, so a newline in it would produce a
-        // line the operator never approved.
-        let safe = display_name.replace(['\n', '\r'], " ");
-        format!("# purge-warden custom list: {safe}\n")
-    };
-    hardened_atomic_write(path, header.as_bytes(), AtomicWriteOpts::default())
-        .map_err(|e| PackWriteError::Write(path.to_path_buf(), e))
+///
+/// Empty and not a generated header: the list's name already lives in the
+/// master's `[[custom_lists]]` entry, so a header would put a comment the
+/// operator never wrote on line 1 of every list they own. `display_name`
+/// is unused: nothing is written from it.
+///
+/// Routed through `write_all_raw` like every other writer here, so an
+/// empty pack still goes through the write lock and the byte cap rather
+/// than bypassing them for the one writer that "obviously" can't overflow.
+pub fn create_pack(
+    lock: &ConfigWriteLock,
+    path: &Path,
+    _display_name: &str,
+    max_bytes: u64,
+) -> Result<(), PackWriteError> {
+    write_all_raw(lock, path, &[], max_bytes)
 }
 
 /// Append one rule, unless an identical one is already there.
@@ -269,6 +320,7 @@ pub fn create_pack(path: &Path, display_name: &str) -> Result<(), PackWriteError
 /// Idempotent and order-preserving: the operator diffs these files, and a
 /// verb that reshuffles them makes the diff useless.
 pub fn add_rule(
+    lock: &ConfigWriteLock,
     path: &Path,
     domain: &str,
     allow: bool,
@@ -293,14 +345,120 @@ pub fn add_rule(
     }
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     lines.push(line);
-    write_all_raw(path, &lines, max_bytes).map(|()| AddOutcome::Added)
+    write_all_raw(lock, path, &lines, max_bytes).map(|()| AddOutcome::Added)
+}
+
+/// Replace the rule on one file line, in place.
+///
+/// **Not remove-then-add.** `remove_rule` matches the domain and ignores
+/// the direction, so composing a flip out of the two primitives destroys
+/// the opposite direction of the same domain — a rule the operator never
+/// touched. Rewriting the one line also keeps every other rule under the
+/// comment heading that describes it, and leaves comments and blanks
+/// untouched by construction.
+///
+/// **`expect` is what the operator SAW on `line_no`, and it is not
+/// optional.** A surface renders a pack once and keys its cursor on file
+/// line numbers; any write it did not see — another session, the CLI, an
+/// editor — makes line N a different rule, and a writer keyed on the
+/// number alone silently edits the wrong one. The mismatch is refused
+/// instead.
+pub fn replace_rule_at_line(
+    lock: &ConfigWriteLock,
+    path: &Path,
+    line_no: usize,
+    expect: (&str, bool),
+    domain: &str,
+    allow: bool,
+    max_bytes: u64,
+) -> Result<(), PackWriteError> {
+    // Grammar errors here are about the domain the operator just typed,
+    // which is the field they can fix.
+    let new_line = compose_line(domain, allow)?;
+    let want = normalise_domain(domain)?;
+
+    let text = read_raw(path, max_bytes)?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    let stale = |found: String| PackWriteError::StaleLine {
+        path: path.to_path_buf(),
+        line: line_no,
+        expected: describe_expected(expect),
+        found,
+    };
+    let Some(idx) = line_no.checked_sub(1).filter(|i| *i < lines.len()) else {
+        return Err(stale(format!(
+            "nothing — the file ends at line {}",
+            lines.len()
+        )));
+    };
+
+    // A malformed expectation cannot match anything, so it lands here
+    // rather than as a grammar error: the operator's complaint would read
+    // as being about the domain they typed.
+    let (expect_domain, expect_allow) = expect;
+    let holds_what_was_seen = match parse_pack_line(&lines[idx]) {
+        Ok(PackLine::Allow(d)) if expect_allow => normalise_domain(expect_domain) == Ok(d),
+        Ok(PackLine::Deny(d)) if !expect_allow => normalise_domain(expect_domain) == Ok(d),
+        _ => false,
+    };
+    if !holds_what_was_seen {
+        return Err(stale(describe_line(&lines[idx])));
+    }
+
+    // The row being replaced is excluded, so confirming a form unchanged
+    // is not refused by its own rule. Compared as parsed rules for the
+    // reason `add_rule` gives: a text compare misses `||EXAMPLE.COM^`.
+    let duplicate = lines.iter().enumerate().find_map(|(i, l)| {
+        if i == idx {
+            return None;
+        }
+        match parse_pack_line(l) {
+            Ok(PackLine::Allow(d)) if allow && d == want => Some(i + 1),
+            Ok(PackLine::Deny(d)) if !allow && d == want => Some(i + 1),
+            _ => None,
+        }
+    });
+    if let Some(line) = duplicate {
+        return Err(PackWriteError::Duplicate {
+            path: path.to_path_buf(),
+            rule: new_line,
+            line,
+        });
+    }
+
+    lines[idx] = new_line;
+    write_all_raw(lock, path, &lines, max_bytes)
+}
+
+/// The rule the caller says was on the line, in the file's own syntax.
+///
+/// Falls back to the raw value when it is not a rule at all: an
+/// expectation that cannot be composed is still what has to be reported.
+fn describe_expected((domain, allow): (&str, bool)) -> String {
+    compose_line(domain, allow).unwrap_or_else(|_| format!("{domain:?}"))
+}
+
+/// What the line holds now, said the way the operator reads the file.
+fn describe_line(text: &str) -> String {
+    match parse_pack_line(text) {
+        Ok(PackLine::Allow(d)) => format!("@@||{d}^"),
+        Ok(PackLine::Deny(d)) => format!("||{d}^"),
+        Ok(PackLine::Blank) => "a comment or a blank line".to_string(),
+        Err(_) => format!("{:?}, which is not a rule", text.trim()),
+    }
 }
 
 /// Drop every rule naming `domain`, in either direction.
 ///
 /// Returns whether anything was removed, so the caller can say "not there"
 /// instead of reporting a no-op as a success.
-pub fn remove_rule(path: &Path, domain: &str, max_bytes: u64) -> Result<bool, PackWriteError> {
+pub fn remove_rule(
+    lock: &ConfigWriteLock,
+    path: &Path,
+    domain: &str,
+    max_bytes: u64,
+) -> Result<bool, PackWriteError> {
     let target = normalise_domain(domain)?;
     let text = read_raw(path, max_bytes)?;
     let kept: Vec<String> = text
@@ -313,7 +471,7 @@ pub fn remove_rule(path: &Path, domain: &str, max_bytes: u64) -> Result<bool, Pa
         .collect();
     let removed = kept.len() != text.lines().count();
     if removed {
-        write_all_raw(path, &kept, max_bytes)?;
+        write_all_raw(lock, path, &kept, max_bytes)?;
     }
     Ok(removed)
 }
@@ -341,8 +499,13 @@ fn read_raw(path: &Path, max_bytes: u64) -> Result<String, PackWriteError> {
 /// so such a file fails the WHOLE config on the next load — and every surface
 /// that could repair it loads the config first, leaving the operator no route
 /// back in through warden at all. Checked in this function rather than at each
-/// caller because all three writers route through it.
-fn write_all_raw(path: &Path, lines: &[String], max_bytes: u64) -> Result<(), PackWriteError> {
+/// caller because all four writers route through it.
+fn write_all_raw(
+    _lock: &ConfigWriteLock,
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+) -> Result<(), PackWriteError> {
     let mut body = lines.join("\n");
     if !body.is_empty() {
         body.push('\n');
@@ -361,6 +524,15 @@ fn write_all_raw(path: &Path, lines: &[String], max_bytes: u64) -> Result<(), Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree write lock every writer demands.
+    ///
+    /// One guard per test, bound to a variable: two live guards in one
+    /// statement would contend against each other, since `flock` attaches
+    /// to the open file description and not to the process.
+    fn lock(dir: &std::path::Path) -> ConfigWriteLock {
+        crate::config::write_lock::acquire(&dir.join("config.toml")).unwrap()
+    }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);
@@ -494,18 +666,19 @@ mod tests {
     #[test]
     fn a_symlinked_pack_is_refused_by_the_write_path_too() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let real = write(dir.path(), "elsewhere.txt", "||smuggled.example.com^\n");
         let link = dir.path().join("a.txt");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let err = add_rule(&link, "new.example.com", false, 1024 * 1024)
+        let err = add_rule(&lk, &link, "new.example.com", false, 1024 * 1024)
             .expect_err("an append through a symlink must be refused");
         assert!(
             matches!(err, PackWriteError::Read(_, PackReadError::Symlink { .. })),
             "expected a symlink refusal, got {err:?}"
         );
         assert!(
-            remove_rule(&link, "smuggled.example.com", 1024 * 1024).is_err(),
+            remove_rule(&lk, &link, "smuggled.example.com", 1024 * 1024).is_err(),
             "the remove path must refuse it too"
         );
         assert_eq!(
@@ -535,8 +708,9 @@ mod tests {
     #[test]
     fn create_writes_a_readable_empty_file() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "Minecraft").unwrap();
+        create_pack(&lk, &p, "Minecraft", 1024 * 1024).unwrap();
         let c = read_pack(&p, 1024 * 1024).unwrap();
         assert!(c.allow.is_empty() && c.deny.is_empty() && c.skipped == 0);
     }
@@ -546,8 +720,9 @@ mod tests {
     fn create_leaves_the_dir_at_0750_and_the_file_at_0640() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
         let dmode = std::fs::metadata(p.parent().unwrap())
             .unwrap()
             .permissions()
@@ -561,15 +736,16 @@ mod tests {
     #[test]
     fn adding_the_same_rule_twice_is_byte_identical() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
         assert_eq!(
-            add_rule(&p, "ads.example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "ads.example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::Added
         );
         let once = std::fs::read(&p).unwrap();
         assert_eq!(
-            add_rule(&p, "ads.example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "ads.example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::AlreadyPresent
         );
         assert_eq!(
@@ -587,10 +763,11 @@ mod tests {
     #[test]
     fn a_rule_already_present_in_another_case_is_not_appended_again() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = write(dir.path(), "a.txt", "||EXAMPLE.COM^\n");
         let before = std::fs::read(&p).unwrap();
         assert_eq!(
-            add_rule(&p, "example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::AlreadyPresent
         );
         assert_eq!(
@@ -606,10 +783,11 @@ mod tests {
     #[test]
     fn an_indented_rule_already_present_is_not_appended_again() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = write(dir.path(), "a.txt", "   @@||CDN.Example.Com^\t\n");
         let before = std::fs::read(&p).unwrap();
         assert_eq!(
-            add_rule(&p, "cdn.example.com", true, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "cdn.example.com", true, 1024 * 1024).unwrap(),
             AddOutcome::AlreadyPresent
         );
         assert_eq!(std::fs::read(&p).unwrap(), before);
@@ -621,9 +799,10 @@ mod tests {
     #[test]
     fn an_allow_for_a_domain_does_not_suppress_adding_its_deny() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = write(dir.path(), "a.txt", "@@||example.com^\n");
         assert_eq!(
-            add_rule(&p, "example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::Added
         );
         let c = read_pack(&p, 1024 * 1024).unwrap();
@@ -636,9 +815,10 @@ mod tests {
     #[test]
     fn a_commented_out_rule_does_not_count_as_present() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = write(dir.path(), "a.txt", "# ||ads.example.com^ under review\n");
         assert_eq!(
-            add_rule(&p, "ads.example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "ads.example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::Added
         );
         assert_eq!(read_pack(&p, 1024 * 1024).unwrap().deny.len(), 1);
@@ -647,10 +827,11 @@ mod tests {
     #[test]
     fn adding_preserves_the_existing_order() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
         for d in ["c.example.com", "a.example.com", "b.example.com"] {
-            add_rule(&p, d, false, 1024 * 1024).unwrap();
+            add_rule(&lk, &p, d, false, 1024 * 1024).unwrap();
         }
         let text = std::fs::read_to_string(&p).unwrap();
         let ci = text.find("c.example.com").unwrap();
@@ -662,18 +843,20 @@ mod tests {
     #[test]
     fn a_hostile_domain_is_refused_and_the_file_is_untouched() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
-        add_rule(&p, "ads.example.com", false, 1024 * 1024).unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
+        add_rule(&lk, &p, "ads.example.com", false, 1024 * 1024).unwrap();
         let before = std::fs::read(&p).unwrap();
         assert!(add_rule(
+            &lk,
             &p,
             "evil.example.com\n@@||x.example.com",
             false,
             1024 * 1024
         )
         .is_err());
-        assert!(add_rule(&p, "evil.example.com^", true, 1024 * 1024).is_err());
+        assert!(add_rule(&lk, &p, "evil.example.com^", true, 1024 * 1024).is_err());
         assert_eq!(
             std::fs::read(&p).unwrap(),
             before,
@@ -687,10 +870,12 @@ mod tests {
         // bodies; this is the operator's own file, and lines supplied
         // wholesale are the caller's to get right.
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
         let before = std::fs::read(&p).unwrap();
         let err = write_pack(
+            &lk,
             &p,
             &[
                 "||good.example.com^".to_string(),
@@ -714,12 +899,13 @@ mod tests {
         // un-editable through the verbs — the "became uneditable from
         // there" class. A write judges only the line it authors.
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "# header\n||*.example.com^\n||good.example.com^\n").unwrap();
 
         assert_eq!(
-            add_rule(&p, "new.example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "new.example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::Added,
             "a pre-existing bad line must not block an add"
         );
@@ -739,10 +925,11 @@ mod tests {
     #[test]
     fn a_pre_existing_bad_line_does_not_block_a_remove() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "||*.example.com^\n||good.example.com^\n").unwrap();
-        assert!(remove_rule(&p, "good.example.com", 1024 * 1024).unwrap());
+        assert!(remove_rule(&lk, &p, "good.example.com", 1024 * 1024).unwrap());
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(
             text.contains("||*.example.com^"),
@@ -754,11 +941,12 @@ mod tests {
     #[test]
     fn remove_reports_whether_it_removed_anything() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
-        add_rule(&p, "ads.example.com", false, 1024 * 1024).unwrap();
-        assert!(remove_rule(&p, "ads.example.com", 1024 * 1024).unwrap());
-        assert!(!remove_rule(&p, "ads.example.com", 1024 * 1024).unwrap());
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
+        add_rule(&lk, &p, "ads.example.com", false, 1024 * 1024).unwrap();
+        assert!(remove_rule(&lk, &p, "ads.example.com", 1024 * 1024).unwrap());
+        assert!(!remove_rule(&lk, &p, "ads.example.com", 1024 * 1024).unwrap());
         let c = read_pack(&p, 1024 * 1024).unwrap();
         assert!(c.deny.is_empty());
     }
@@ -884,6 +1072,7 @@ mod tests {
     #[test]
     fn an_append_that_would_breach_the_cap_leaves_a_file_the_reader_still_loads() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let mut body = String::new();
         for i in 0..10 {
             body.push_str(&format!("||d{i}.example.com^\n"));
@@ -897,7 +1086,7 @@ mod tests {
         );
         let before = std::fs::read(&p).unwrap();
 
-        let err = add_rule(&p, "new.example.com", false, cap)
+        let err = add_rule(&lk, &p, "new.example.com", false, cap)
             .expect_err("an append over the cap must be refused");
         assert!(
             matches!(err, PackWriteError::TooLarge { .. }),
@@ -917,10 +1106,11 @@ mod tests {
     #[test]
     fn an_append_inside_the_cap_still_lands() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let body = "||d0.example.com^\n";
         let p = write(dir.path(), "a.txt", body);
         assert_eq!(
-            add_rule(&p, "new.example.com", false, 1024 * 1024).unwrap(),
+            add_rule(&lk, &p, "new.example.com", false, 1024 * 1024).unwrap(),
             AddOutcome::Added
         );
         assert_eq!(read_pack(&p, 1024 * 1024).unwrap().deny.len(), 2);
@@ -931,12 +1121,13 @@ mod tests {
     #[test]
     fn a_full_replacement_over_the_cap_is_refused() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let p = dir.path().join("packs").join("a.txt");
-        create_pack(&p, "A").unwrap();
+        create_pack(&lk, &p, "A", 1024 * 1024).unwrap();
         let before = std::fs::read(&p).unwrap();
         let lines: Vec<String> = (0..10).map(|i| format!("||d{i}.example.com^")).collect();
-        let err =
-            write_pack(&p, &lines, 32).expect_err("a replacement over the cap must be refused");
+        let err = write_pack(&lk, &p, &lines, 32)
+            .expect_err("a replacement over the cap must be refused");
         assert!(matches!(err, PackWriteError::TooLarge { .. }));
         assert_eq!(std::fs::read(&p).unwrap(), before, "nothing may be written");
     }
@@ -947,13 +1138,14 @@ mod tests {
     #[test]
     fn a_removal_that_shrinks_the_file_is_not_blocked_by_the_cap() {
         let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
         let mut body = String::new();
         for i in 0..10 {
             body.push_str(&format!("||d{i}.example.com^\n"));
         }
         let cap = body.len() as u64;
         let p = write(dir.path(), "a.txt", &body);
-        assert!(remove_rule(&p, "d3.example.com", cap).unwrap());
+        assert!(remove_rule(&lk, &p, "d3.example.com", cap).unwrap());
         read_pack(&p, cap).expect("the shrunk file must still load");
     }
 
@@ -966,5 +1158,352 @@ mod tests {
             read_pack_lines(&p, 64).unwrap_err(),
             PackReadError::TooLarge { .. }
         ));
+    }
+
+    /// **`create_pack` cannot exceed the cap, at any `display_name`.**
+    ///
+    /// Retired `create_refuses_a_header_over_the_cap` and its negative
+    /// control here: both tested a `TooLarge` refusal driven by
+    /// `display_name`'s length, which `create_pack` no longer reads —
+    /// it always writes zero bytes, so no cap this small or this large
+    /// can ever refuse it. This is the replacement: a display name long
+    /// enough to have tripped the old cap check now creates cleanly.
+    #[test]
+    fn create_pack_ignores_the_cap_because_it_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let p = dir.path().join("packs").join("a.txt");
+
+        create_pack(&lk, &p, &"n".repeat(200), 1).expect("an empty write can't exceed any cap");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+    }
+
+    /// Routing creation through `write_all_raw` must not have moved a
+    /// byte: the header is one comment line, newline-terminated, and both
+    /// the named and the unnamed form keep their exact shape.
+    #[test]
+    fn the_created_pack_is_empty_regardless_of_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+
+        let named = dir.path().join("packs").join("named.txt");
+        create_pack(&lk, &named, "Minecraft", 1024 * 1024).unwrap();
+        assert_eq!(std::fs::read_to_string(&named).unwrap(), "");
+
+        let bare = dir.path().join("packs").join("bare.txt");
+        create_pack(&lk, &bare, "", 1024 * 1024).unwrap();
+        assert_eq!(std::fs::read_to_string(&bare).unwrap(), "");
+    }
+
+    /// A pack shaped like one an operator keeps: comment headings, a
+    /// blank between sections, and a line the grammar refuses.
+    const MESSY: &str = "\
+# ---- Minecraft / Mojang ----
+@@||minecraft.net^
+||tracking.example.com^
+
+# ---- broken on purpose ----
+*.wildcard.example.com
+||ads.example.com^
+";
+
+    fn comments(text: &str) -> usize {
+        text.lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .count()
+    }
+
+    /// **The trip-wire for the in-place writer.**
+    ///
+    /// Reading a pack is permissive and writing one with `write_pack` is
+    /// strict, so a replacement built by rebuilding the file from the rows
+    /// a pane drew would either refuse a file that loaded cleanly or
+    /// "repair" it by deleting every comment and every skipped line.
+    /// Mutation: swap the body for such a rebuild and the comment count
+    /// goes from 2 to 0.
+    #[test]
+    fn replacing_a_rule_touches_one_line_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let p = write(dir.path(), "a.txt", MESSY);
+        assert!(comments(MESSY) >= 2, "the fixture must carry comments");
+
+        replace_rule_at_line(
+            &lk,
+            &p,
+            3,
+            ("tracking.example.com", false),
+            "telemetry.example.com",
+            true,
+            1024 * 1024,
+        )
+        .expect("the replacement must land");
+
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            after,
+            "\
+# ---- Minecraft / Mojang ----
+@@||minecraft.net^
+@@||telemetry.example.com^
+
+# ---- broken on purpose ----
+*.wildcard.example.com
+||ads.example.com^
+",
+            "only line 3 may differ"
+        );
+        assert_eq!(comments(&after), comments(MESSY));
+    }
+
+    /// **The property that makes this writer a requirement rather than a
+    /// convenience.** `remove_rule` matches the domain and ignores the
+    /// direction, so a flip built as remove-then-add destroys the opposite
+    /// direction of the same domain — a rule the operator never touched.
+    #[test]
+    fn flipping_one_direction_leaves_the_other_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let p = write(
+            dir.path(),
+            "a.txt",
+            "@@||both.example.com^\n||other.example.com^\n",
+        );
+
+        replace_rule_at_line(
+            &lk,
+            &p,
+            2,
+            ("other.example.com", false),
+            "other.example.com",
+            true,
+            1024 * 1024,
+        )
+        .unwrap();
+        // Line 1 names a different domain, so it is untouched either way;
+        // the discriminating case is the same domain in both directions.
+        let p2 = write(
+            dir.path(),
+            "b.txt",
+            "@@||both.example.com^\n||both.example.com^\n",
+        );
+        replace_rule_at_line(
+            &lk,
+            &p2,
+            1,
+            ("both.example.com", true),
+            "renamed.example.com",
+            true,
+            1024 * 1024,
+        )
+        .expect("the flip must land");
+
+        assert_eq!(
+            std::fs::read_to_string(&p2).unwrap(),
+            "@@||renamed.example.com^\n||both.example.com^\n",
+            "the deny for the same domain must survive — remove+add takes it"
+        );
+    }
+
+    /// The rule pane's line numbers come from the last read, and any
+    /// writer the pane did not see moves them. Refusing on the mismatch is
+    /// what stops an edit landing on a rule nobody looked at.
+    #[test]
+    fn a_line_that_no_longer_holds_what_the_operator_saw_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "||a.example.com^\n||b.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+
+        let err = replace_rule_at_line(
+            &lk,
+            &p,
+            2,
+            ("a.example.com", false),
+            "c.example.com",
+            false,
+            1024 * 1024,
+        )
+        .expect_err("a stale expectation must be refused");
+        assert!(
+            matches!(err, PackWriteError::StaleLine { line: 2, .. }),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            body,
+            "nothing written"
+        );
+    }
+
+    /// Direction is half the expectation: the same domain in the other
+    /// direction is a different rule.
+    #[test]
+    fn the_expectation_covers_the_direction_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "@@||a.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+
+        let err = replace_rule_at_line(
+            &lk,
+            &p,
+            1,
+            ("a.example.com", false),
+            "b.example.com",
+            false,
+            1024 * 1024,
+        )
+        .expect_err("a deny expectation must not match an allow line");
+        assert!(matches!(err, PackWriteError::StaleLine { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+    }
+
+    /// A comment, a blank and a line the grammar refused carry no rule,
+    /// so there is nothing to replace and nothing that could form an
+    /// expectation.
+    #[test]
+    fn a_line_that_is_not_a_rule_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let p = write(dir.path(), "a.txt", MESSY);
+        let before = std::fs::read_to_string(&p).unwrap();
+
+        for line in [1, 4, 6] {
+            let err = replace_rule_at_line(
+                &lk,
+                &p,
+                line,
+                ("tracking.example.com", false),
+                "new.example.com",
+                false,
+                1024 * 1024,
+            )
+            .expect_err("a line carrying no rule must be refused");
+            assert!(matches!(err, PackWriteError::StaleLine { .. }), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+
+    /// A line past the end of a file that shrank under the pane.
+    #[test]
+    fn a_line_past_the_end_of_the_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "||a.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+
+        let err = replace_rule_at_line(
+            &lk,
+            &p,
+            9,
+            ("a.example.com", false),
+            "b.example.com",
+            false,
+            1024 * 1024,
+        )
+        .expect_err("a line the file does not have must be refused");
+        assert!(
+            matches!(err, PackWriteError::StaleLine { line: 9, .. }),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+    }
+
+    /// The grammar is the same on this writer as on every other: the
+    /// error names the NEW domain, because that is the field the operator
+    /// can fix.
+    #[test]
+    fn a_domain_the_grammar_refuses_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "||a.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+
+        for bad in ["*.evil.example.com", "evil.example.com\n@@||anything^", ""] {
+            let err = replace_rule_at_line(
+                &lk,
+                &p,
+                1,
+                ("a.example.com", false),
+                bad,
+                false,
+                1024 * 1024,
+            )
+            .expect_err("the grammar must refuse this domain");
+            assert!(matches!(err, PackWriteError::Grammar(_)), "{bad:?}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+    }
+
+    /// Flipping a direction onto one the file already carries would leave
+    /// the pack with the same rule twice — a line the operator never
+    /// typed, in a file they diff.
+    #[test]
+    fn a_replacement_that_would_duplicate_an_existing_rule_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "@@||d.example.com^\n||d.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+
+        let err = replace_rule_at_line(
+            &lk,
+            &p,
+            1,
+            ("d.example.com", true),
+            "d.example.com",
+            false,
+            1024 * 1024,
+        )
+        .expect_err("the deny is already on line 2");
+        assert!(
+            matches!(err, PackWriteError::Duplicate { line: 2, .. }),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+    }
+
+    /// The duplicate scan skips the row being replaced, so an operator who
+    /// opens the form and confirms it unchanged is not refused by their
+    /// own rule. Compared as parsed rules, so a file carrying the domain
+    /// in upper case is recognised as carrying THIS rule.
+    #[test]
+    fn a_rule_does_not_count_as_a_duplicate_of_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let p = write(dir.path(), "a.txt", "# head\n||D.Example.COM^\n");
+
+        replace_rule_at_line(
+            &lk,
+            &p,
+            2,
+            ("d.example.com", false),
+            "d.example.com",
+            false,
+            1024 * 1024,
+        )
+        .expect("replacing a rule with itself must be allowed");
+
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "# head\n||d.example.com^\n",
+            "the line is rewritten in its normalised form, in place"
+        );
+    }
+
+    /// The cap is the reader's, applied here, so no replacement can
+    /// produce a file the next load refuses.
+    #[test]
+    fn a_replacement_over_the_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let body = "||a.example.com^\n";
+        let p = write(dir.path(), "a.txt", body);
+        let long = format!("{}.example.com", "a".repeat(60));
+
+        let err = replace_rule_at_line(&lk, &p, 1, ("a.example.com", false), &long, false, 32)
+            .expect_err("a write over the cap must be refused");
+        assert!(matches!(err, PackWriteError::TooLarge { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
     }
 }

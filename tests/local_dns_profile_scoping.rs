@@ -82,18 +82,13 @@ fn rec(domain: &str, rt: LocalDnsRecordType, value: &str, sub: bool) -> LocalDns
 
 #[test]
 fn t2_int_profile_scoped_record_resolves_via_pipeline() {
-    // The `example.test → 192.0.2.50` record on the demo profile must travel
+    // The `example.test → 10.10.1.50` record on the demo profile must travel
     // from TOML-equivalent struct → validator → resolver-map → `ResolvedProfile`
     // → `ProfileLocalRecords::lookup`, all without intervention. This is
     // the canonical happy path the operator will hit on day one.
     let profile = Profile {
         display_name: "demo".into(),
-        local_records: vec![rec(
-            "example.test",
-            LocalDnsRecordType::A,
-            "192.0.2.50",
-            false,
-        )],
+        local_records: vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", false)],
         ..Default::default()
     };
     let resolver = resolver_with("demo", profile, Ipv4Addr::new(10, 0, 0, 1), vec![]);
@@ -108,7 +103,7 @@ fn t2_int_profile_scoped_record_resolves_via_pipeline() {
         .expect("profile-scope hit");
     assert_eq!(records.len(), 1);
     match records[0].data {
-        RData::A(ref a) => assert_eq!(a.0, Ipv4Addr::new(192, 0, 2, 50)),
+        RData::A(ref a) => assert_eq!(a.0, Ipv4Addr::new(10, 10, 1, 50)),
         _ => panic!("expected A"),
     }
 }
@@ -121,12 +116,7 @@ fn t2_int_subdomain_wildcard_via_pipeline() {
     // the suffix index; lookup must walk and hit.
     let profile = Profile {
         display_name: "demo".into(),
-        local_records: vec![rec(
-            "example.test",
-            LocalDnsRecordType::A,
-            "192.0.2.50",
-            true,
-        )],
+        local_records: vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)],
         ..Default::default()
     };
     let resolver = resolver_with("demo", profile, Ipv4Addr::new(10, 0, 0, 1), vec![]);
@@ -149,7 +139,7 @@ fn t2_int_subdomain_wildcard_via_pipeline() {
         "wildcard descendant RR must be owned by the queried name"
     );
     match records[0].data {
-        RData::A(ref a) => assert_eq!(a.0, Ipv4Addr::new(192, 0, 2, 50)),
+        RData::A(ref a) => assert_eq!(a.0, Ipv4Addr::new(10, 10, 1, 50)),
         _ => panic!("expected A"),
     }
 }
@@ -163,12 +153,7 @@ fn t2_int_profile_shadows_global_silently() {
     // distinct from the global, with the profile's IP value.
     let profile = Profile {
         display_name: "demo".into(),
-        local_records: vec![rec(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.99",
-            false,
-        )],
+        local_records: vec![rec("example.test", LocalDnsRecordType::A, "10.0.0.99", false)],
         ..Default::default()
     };
     let global = vec![rec("example.test", LocalDnsRecordType::A, "1.1.1.1", false)];
@@ -222,12 +207,7 @@ fn t2_int_dr4_non_addr_qtype_returns_none() {
     // though we return None at the lookup boundary here.
     let profile = Profile {
         display_name: "demo".into(),
-        local_records: vec![rec(
-            "example.test",
-            LocalDnsRecordType::A,
-            "192.0.2.50",
-            false,
-        )],
+        local_records: vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", false)],
         ..Default::default()
     };
     let resolver = resolver_with("demo", profile, Ipv4Addr::new(10, 0, 0, 1), vec![]);
@@ -244,10 +224,7 @@ fn t2_int_dr4_non_addr_qtype_returns_none() {
         RecordType::SOA,
     ] {
         assert!(
-            resolved
-                .local_records
-                .lookup("example.test", qtype)
-                .is_none(),
+            resolved.local_records.lookup("example.test", qtype).is_none(),
             "qtype {qtype:?} must bypass profile-scope local records"
         );
     }

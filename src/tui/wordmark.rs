@@ -13,14 +13,13 @@
 //! render with cell-drift on many terminals.
 
 /// PURGE in 3-cell letters — 19 cells wide. Used at every terminal
-/// width (the wide variant was retired 2026-04-29 because the 4-cell
-/// glyphs rendered malformed on certain font/terminal combinations).
+/// width; a wider 4-cell variant renders malformed on some
+/// font/terminal combinations, so this is the only variant kept.
 ///
-/// The "P" originally closed its bowl with `▘` (QUADRANT UPPER LEFT),
-/// but that glyph carries East-Asian-Width "Ambiguous" — exactly what
-/// the safe-glyph rule above forbids. Replaced with `▀` on
-/// 2026-04-29, which closes the bowl with a clean horizontal bar at
-/// the middle row and drops the cell-drift risk.
+/// The "P" closes its bowl with `▀` (a clean horizontal bar at the
+/// middle row), not `▘` (QUADRANT UPPER LEFT) — that glyph carries
+/// East-Asian-Width "Ambiguous", exactly what the safe-glyph rule
+/// above forbids, and causes cell-drift on affected terminals.
 pub const PURGE_COMPACT: [&str; 3] = [
     "█▀█ █ █ █▀█ █▀▀ █▀▀",
     "█▀▀ █ █ █▀▄ █ █ █▀▀",

@@ -6,7 +6,7 @@
 //! edit` opening `$EDITOR` was the only path, which is a poor answer for
 //! settings an operator tunes in response to a live incident.
 //!
-//! Follows project rules design rule 6 — the config file stays the single
+//! Follows CLAUDE.md design rule 6 — the config file stays the single
 //! source of truth. `set` edits the TOML through
 //! [`write_value_validated`] (which validates the COMBINED master +
 //! includes state before promoting anything) and then asks the daemon to

@@ -1,6 +1,6 @@
 //! `warden config restore <archive>` — staged replace from a tar.gz backup.
 //!
-//! Flow (per design doc §11.6):
+//! Flow:
 //!
 //! 1. Extract the archive into a staging directory.
 //! 2. Locate the master `config.toml` in the staging tree.
@@ -55,9 +55,8 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
 
     // Validate the staged tree before touching anything live. The load
     // also tells us WHICH files the archive's config actually declares —
-    // cli-h4 derives the install set from that instead of the seven-name
-    // `KNOWN_INCLUDE_DIRS` list this file used to duplicate from
-    // `backup.rs`. Two properties come out of using the STAGED master's
+    // the install set is derived from that instead of a hardcoded
+    // `KNOWN_INCLUDE_DIRS` list. Two properties come out of using the STAGED master's
     // own graph rather than the archive's contents: an include the
     // operator declared outside `<class>.d/` is reinstalled, and the set
     // still bounds what an operator-supplied archive may write into the
@@ -84,13 +83,13 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
 
     // Save the previous master with a `.pre-restore-<ts>` suffix so the
     // operator has a trivial rollback path — and so we can roll the
-    // master back if the include-dir swap below fails (cli-m4).
+    // master back if the include-dir swap below fails.
     let pre_restore_master: Option<PathBuf> = if live_config.exists() {
         let ts = time::OffsetDateTime::now_utc()
             .format(&TIMESTAMP_FORMAT)
             .map_err(|e| anyhow::anyhow!("failed to format timestamp: {}", e))?;
         // Bump the name on a same-second collision so a rapid restore retry
-        // can't silently clobber the rollback copy it just wrote (cli §9 #8).
+        // can't silently clobber the rollback copy it just wrote.
         let backup = crate::cli::commands::make_unique_path(
             live_config.with_extension(format!("toml.pre-restore-{ts}")),
         );
@@ -101,16 +100,16 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
         None
     };
 
-    // Sprint 35 CS2 atomic install: read the staged master once, then
-    // write-temp + validate + rename into place. Rename is atomic on
-    // POSIX within a single filesystem; the temp + validate sequence
-    // guarantees that a mid-operation crash never exposes a partially-
-    // written master to the next reader. The validator here is a
-    // cheap TOML parse — the full cross-reference load already ran at
-    // line ~57 against `staged_master`; re-running it after the copy
-    // would fail in the split-file layout until the sibling `.d/`
-    // directories are swapped below, and the upstream validation is
-    // the authoritative gate for installation anyway.
+    // Atomic install: read the staged master once, then write-temp +
+    // validate + rename into place. Rename is atomic on POSIX within a
+    // single filesystem; the temp + validate sequence guarantees that a
+    // mid-operation crash never exposes a partially-written master to the
+    // next reader. The validator here is a cheap TOML parse — the full
+    // cross-reference load already ran above against `staged_master`;
+    // re-running it after the copy would fail in the split-file layout
+    // until the sibling `.d/` directories are swapped below, and the
+    // upstream validation is the authoritative gate for installation
+    // anyway.
     let staged_bytes = std::fs::read_to_string(&staged_master).map_err(|e| {
         anyhow::anyhow!(
             "cannot read staged master {}: {}",
@@ -137,7 +136,7 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
     })?;
 
     // Swap each include entry the staged config declares. The swap is
-    // crash-safe (cli-m4): staged entries are copied to side paths first
+    // crash-safe: staged entries are copied to side paths first
     // (non-destructive), then promoted via metadata-only renames with
     // full rollback on failure. See `install_include_entries`.
     let staged_root = staged_master
@@ -197,8 +196,8 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
         |from, to| std::fs::rename(from, to),
     ) {
         // Roll the master back so we never leave a post-restore master
-        // paired with the pre-restore `.d/` — the inconsistent window the
-        // cli-m4 DoD forbids. Best-effort: if the rollback rename itself
+        // paired with the pre-restore `.d/` — an inconsistent window this
+        // restore must never produce. Best-effort: if the rollback rename itself
         // fails, the master's `.pre-restore-<ts>` aside is still on disk
         // for manual recovery.
         if let Some(prev) = &pre_restore_master {
@@ -262,7 +261,7 @@ pub fn run_restore(
 /// need the `tempfile` crate as a runtime dependency (it stays a
 /// dev-dep used only by the test suite).
 ///
-/// `pub(crate)` so the §4.11-3 cluster apply path (`crate::cluster::apply`)
+/// `pub(crate)` so the cluster apply path (`crate::cluster::apply`)
 /// reuses the exact hardened CSPRNG-named 0o700 staging dir rather than
 /// re-implementing the TOCTOU-safe creation.
 pub(crate) struct StagingDir {
@@ -283,7 +282,7 @@ impl StagingDir {
     /// succeeds on EEXIST — so a local attacker could pre-create the dir or
     /// plant a symlink there and interpose on the validate↔install window (a
     /// classic TOCTOU; these flows may run privileged and write into system
-    /// config dirs). `OsRng` (CSPRNG, per project rules) names it and
+    /// config dirs). `OsRng` (CSPRNG, per CLAUDE.md) names it and
     /// `DirBuilder::create` (NOT create_dir_all) fails on EEXIST, so we either
     /// own a freshly-made `0o700` directory or we abort.
     ///
@@ -332,7 +331,7 @@ impl Drop for StagingDir {
 }
 
 fn extract_archive(archive: &Path, dest: &Path) -> anyhow::Result<()> {
-    // §9 P1 — defend against a hostile backup archive. Before extracting,
+    // Defend against a hostile backup archive. Before extracting,
     // list the members and reject any that could write outside `dest`:
     // absolute paths, `..` traversal, or symlink/hardlink members (a crafted
     // archive can use a symlink member to redirect a later write outside the
@@ -381,8 +380,8 @@ fn reject_hostile_members(archive: &Path) -> anyhow::Result<()> {
     // Second pass: the leading type column of `-tvzf` classifies each member.
     // Whitelist regular files (`-`) and directories (`d`); reject everything
     // else — symlink (`l`), hardlink (`h`), char/block device (`c`/`b`), FIFO
-    // (`p`), socket (`s`). The previous blacklist only caught `l`/`h`, so a
-    // device/fifo/socket member passed (rev-2606 restore-02). A legit backup
+    // (`p`), socket (`s`). A blacklist that only catches `l`/`h` lets a
+    // device/fifo/socket member through. A legit backup
     // (`tar -czf` of the config dir) holds only files and dirs, so this is a
     // fail-fast on obviously-hostile archives; copy_dir_recursive re-checks the
     // actually-extracted bytes as the authoritative, TOCTOU-immune gate.
@@ -497,7 +496,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     // Create the destination at 0o750 rather than the umask default so a
     // restored `.d/` tree can't end up world-listable. recursive(true) makes
     // this a no-op on an existing dir (like create_dir_all), applying the mode
-    // only to dirs we actually create (rev-2606 restore-03).
+    // only to dirs we actually create.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o750)
@@ -513,8 +512,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         // (or a swapped archive slipped past), we re-check the *extracted*
         // bytes and refuse anything that isn't a plain file or directory — a
         // symlink/fifo/device/socket here could redirect the copy outside the
-        // live tree (fs::copy follows symlinks) or hang it (rev-2606
-        // restore-02).
+        // live tree (fs::copy follows symlinks) or hang it.
         let ft = entry.file_type()?;
         if ft.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -522,7 +520,7 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
             std::fs::copy(&src_path, &dst_path)?;
             // Normalise to the house DEFAULT_TARGET_MODE instead of trusting
             // the archive's stored bits (a crafted/lax-umask backup could carry
-            // 0o644/0o666 device-inventory slices) (rev-2606 restore-03).
+            // 0o644/0o666 device-inventory slices).
             std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o640))
                 .map_err(|e| anyhow::anyhow!("cannot set mode on {}: {}", dst_path.display(), e))?;
         } else {
@@ -552,7 +550,7 @@ fn swap_side_path(live_parent: &Path, dir: &str, kind: &str) -> PathBuf {
 }
 
 /// Crash-safe replacement of the live include entries with the staged
-/// copies (cli-m4). A two-phase transaction:
+/// copies. A two-phase transaction:
 ///
 /// * **Phase A (non-destructive):** copy each staged entry into a fresh
 ///   same-directory `…incoming…` side path. The live tree is untouched,
@@ -560,8 +558,8 @@ fn swap_side_path(live_parent: &Path, dir: &str, kind: &str) -> PathBuf {
 /// * **Phase B (metadata-only):** for each prepared entry, rename the
 ///   live one aside to `…pre-restore…`, then rename the incoming into
 ///   place. These are intra-filesystem renames (microseconds), shrinking
-///   the crash window from "the whole recursive copy" (the pre-cli-m4
-///   bug) to two `rename(2)`s.
+///   the crash window from the whole recursive copy down to two
+///   `rename(2)`s.
 ///
 /// On any Phase B failure the transaction rolls back — promoted entries
 /// are dropped and every aside renamed back — leaving the live tree
@@ -569,16 +567,15 @@ fn swap_side_path(live_parent: &Path, dir: &str, kind: &str) -> PathBuf {
 ///
 /// **Mirror semantics:** a restored include directory ends up equal to
 /// the archive; a file an operator hand-dropped into the live `.d/` that
-/// is absent from the archive is removed (whole-dir replacement). This is
-/// the intent of "restore" and matches the pre-cli-m4 behaviour. (Contrast
+/// is absent from the archive is removed (whole-dir replacement). (Contrast
 /// `migrate.rs::promote_recursive`, which deliberately chose file-granular
 /// *overlay* so unmanaged files survive a migration.)
 ///
-/// cli-h4: entries are now derived from the staged config's own includes
-/// rather than a hardcoded `<class>.d` list, so an entry can be a plain
-/// FILE — `includes = ["extra.toml"]` is legal, and backup captures it.
-/// Dropping it here would have made a capturable include un-restorable,
-/// which is the same silent omission one layer down.
+/// Entries are derived from the staged config's own includes rather than
+/// a hardcoded `<class>.d` list, so an entry can be a plain FILE —
+/// `includes = ["extra.toml"]` is legal, and backup captures it. Dropping
+/// it here would have made a capturable include un-restorable, which is
+/// the same silent omission one layer down.
 ///
 /// `copy` / `rename` are injectable so the regression test can force a
 /// Phase B `rename` failure and assert the rollback restores the live
@@ -693,8 +690,8 @@ where
 
 /// Copy one regular file to `dst`, normalising the mode to the house
 /// 0o640 rather than trusting the archive's stored bits — the same policy
-/// [`copy_dir_recursive`] applies to every file it copies (rev-2606
-/// restore-03). Used for a top-level include that is a plain file.
+/// [`copy_dir_recursive`] applies to every file it copies. Used for a
+/// top-level include that is a plain file.
 fn copy_regular_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::copy(src, dst)
@@ -737,11 +734,10 @@ fn rollback_include_entries(
 
 fn send_sighup_from_pid(pid_file: &Path) -> anyhow::Result<()> {
     // Reuse the shared `u32` reader: it rejects a leading '-' at parse (so
-    // `-1`/`-N` can never reach `kill`), as well as empty/garbage content, and
-    // renders a clear operator error. restore.rs previously reimplemented this
-    // read with an `i32` parse and dropped that guard, so a PID file of `-1`
-    // turned `libc::kill(pid, SIGHUP)` into a host-wide broadcast when restore
-    // runs as root (rev-2606 restore-01).
+    // `-1`/`-N` can never reach `kill`), as well as empty/garbage content,
+    // and renders a clear operator error. A PID file of `-1` parsed as
+    // `i32` would turn `libc::kill(pid, SIGHUP)` into a host-wide broadcast
+    // when restore runs as root.
     let pid = crate::cli::commands::pid::read_pid_file(pid_file)?;
     // POSIX kill() overloads non-positive PIDs into broadcasts. Route the range
     // check through the shared `pid::checked_pid` seam (the same guard
@@ -818,9 +814,8 @@ servers = ["192.0.2.1:53"]
         assert_eq!(reloaded, BASE);
     }
 
-    /// cli-h4, the whole point of the sprint on this seat: an include that
-    /// does NOT live in a `<class>.d/` directory must survive backup and
-    /// come back on restore.
+    /// An include that does NOT live in a `<class>.d/` directory must
+    /// survive backup and come back on restore.
     ///
     /// Pre-fix, `KNOWN_INCLUDE_DIRS` listed seven names, `custom` was not
     /// one of them, and the archive silently omitted the file. Restore
@@ -881,7 +876,7 @@ servers = ["192.0.2.1:53"]
         assert!(loaded.config.profiles.contains_key("kids"));
     }
 
-    /// cli-h4: `includes = ["extra.toml"]` puts an include at the TOP
+    /// `includes = ["extra.toml"]` puts an include at the TOP
     /// level of the config directory rather than inside a directory.
     /// Backup can capture such a file, so restore has to be able to
     /// reinstall it — a captured-but-unrestorable include is the same
@@ -1075,7 +1070,6 @@ servers = ["192.0.2.1:53"]
 "#,
         )
         .unwrap();
-        // Build a tar.gz of the bad config manually via the backup helper.
         let archive = run_backup(&bad_config, None).unwrap();
 
         let rc = run_restore(&live, &archive, None).unwrap();
@@ -1092,7 +1086,7 @@ servers = ["192.0.2.1:53"]
         assert!(err.is_err());
     }
 
-    /// §9 P1: the member-path safety predicate flags absolute paths and
+    /// The member-path safety predicate flags absolute paths and
     /// `..` traversal while leaving normal config-tree members alone.
     #[test]
     fn is_unsafe_member_path_flags_traversal_and_absolute() {
@@ -1104,7 +1098,7 @@ servers = ["192.0.2.1:53"]
         assert!(!is_unsafe_member_path("./config.toml"));
     }
 
-    /// §9 P1: a hostile archive carrying a symlink member must be rejected
+    /// A hostile archive carrying a symlink member must be rejected
     /// before extraction — a symlink can redirect a later write outside the
     /// staging root. (GNU tar stores symlinks as symlink members by default,
     /// so this reproduces the vector portably.)
@@ -1142,7 +1136,7 @@ servers = ["192.0.2.1:53"]
         assert_eq!(std::fs::read_to_string(&live).unwrap(), BASE);
     }
 
-    /// cli-m4: a failure during the Phase B *rename* (the only
+    /// A failure during the Phase B *rename* (the only
     /// destructive window) must roll the whole swap back — every live
     /// `.d/` left byte-identical to its pre-restore content and no
     /// transient side path leaked into the config dir.
@@ -1196,7 +1190,7 @@ servers = ["192.0.2.1:53"]
         }
     }
 
-    /// cli-m4 mirror semantics: a successful swap makes the live `.d/`
+    /// Mirror semantics: a successful swap makes the live `.d/`
     /// equal to the archive — a file the operator hand-dropped that is
     /// absent from the archive is removed (whole-dir replacement).
     #[test]
@@ -1231,13 +1225,13 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    // ── restore-02/03: archive member type + restored perms ─────────────
+    // ── archive member type + restored perms ─────────────
 
     #[test]
     fn restore_rejects_archive_with_fifo_member() {
         // A FIFO (`p`) member must be rejected by the pre-extraction scan —
-        // the old blacklist only caught symlink/hardlink, letting special
-        // files through (rev-2606 restore-02).
+        // a blacklist that only catches symlink/hardlink lets special
+        // files through.
         let dir = tempfile::tempdir().unwrap();
         let payload = dir.path().join("payload");
         std::fs::create_dir(&payload).unwrap();
@@ -1304,8 +1298,7 @@ servers = ["192.0.2.1:53"]
     fn copy_dir_recursive_normalises_file_mode_to_0640() {
         use std::os::unix::fs::PermissionsExt;
         // A world-readable slice in the source (crafted or lax-umask archive)
-        // must land 0o640 after restore, not inherit the source bits
-        // (rev-2606 restore-03).
+        // must land 0o640 after restore, not inherit the source bits.
         let src = tempfile::tempdir().unwrap();
         let sub = src.path().join("devices.d");
         std::fs::create_dir(&sub).unwrap();
@@ -1337,7 +1330,7 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn staging_dir_create_in_is_0700_and_under_parent() {
         use std::os::unix::fs::PermissionsExt;
-        // migrate-02 reuses this to stage on the target filesystem: a
+        // `migrate.rs` reuses this to stage on the target filesystem: a
         // CSPRNG-named 0o700 dir under the given parent, never a fixed name.
         let parent = tempfile::tempdir().unwrap();
         let s = StagingDir::create_in(parent.path()).unwrap();
@@ -1352,7 +1345,7 @@ servers = ["192.0.2.1:53"]
         assert_ne!(name, ".staging", "must not use the old predictable name");
     }
 
-    // ── restore-01: PID validation before SIGHUP ────────────────────────
+    // ── PID validation before SIGHUP ────────────────────────
     //
     // A corrupt/hostile PID file must never reach `libc::kill` with a value
     // that could broadcast (`-1`, `0`, a negative, or a value that wraps

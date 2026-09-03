@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use purge_warden::cli::commands::migrate::migrate_v2_to_v3;
 use purge_warden::config::loader::load_config;
 
-const ZIMA: &str = include_str!("fixtures/plp_v2_site_a.toml");
-const PROXMOX: &str = include_str!("fixtures/plp_v2_site_b.toml");
+const ZIMA: &str = include_str!("fixtures/plp_v2_node_a.toml");
+const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
 
 // ── raw-TOML helpers: the oracle, and the anti-promotion check ─────────
 

@@ -740,7 +740,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         ("api", |c| c.api.enabled = !c.api.enabled),
         ("forwarding", |c| {
             c.forwarding.push(entity(
-                "suffix = \"h10.lan\"\nservers = [\"192.0.2.1:53\"]\n",
+                "suffix = \"h10.lan\"\nservers = [\"10.10.1.1:53\"]\n",
             ))
         }),
         ("local_dns", |c| c.local_dns.ttl_secs += 1),

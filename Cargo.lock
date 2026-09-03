@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "purge-warden"
-version = "0.38.0"
+version = "0.40.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1941,6 +1941,7 @@ dependencies = [
  "libc",
  "memmap2",
  "moka",
+ "pem",
  "proptest",
  "quinn",
  "rand_core 0.6.4",

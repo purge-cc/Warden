@@ -1,10 +1,14 @@
-//! Rules tab — read-only placeholder for admin-rule visibility (Sprint 43 T2).
+//! Rules tab — the operator's view of `[[admin_rules]]`, joined to every
+//! device and profile that references each rule.
 //!
-//! T2 ships only the chrome (Tab variant + render + filter chip
-//! cycling). The data source is `[[admin_rules]]` which T5 introduces
-//! along with `e/d` editing keybindings and the scope-modal flow.
-//! Until then the table renders zero rows on a fresh CT and the
-//! empty-state message points the operator at T5's incoming verbs.
+//! Admin rules outrank every blocklist for the scope they apply to, so the
+//! SCOPE column is the load-bearing one: it answers "who does this affect"
+//! for a rule that can unblock a domain the lists deny. A rule with no
+//! references is shown as `<orphan>` — present in the file, deciding
+//! nothing.
+//!
+//! Mutating: `Enter` opens the edit modal, `d`/`Del` a typed-id delete
+//! confirm, `a` the add modal. All three write through `tui/mod.rs`.
 //!
 //! Keybindings (handled in `tui/mod.rs`):
 //!   j/k / ↑/↓   scroll the table
@@ -174,15 +178,15 @@ fn format_pattern(p: &RulePattern) -> String {
 /// Draw the Rules tab into `area` — the tab content rect handed down by
 /// `ui::render_active_tab`.
 ///
-/// Both overlays take `area`, not `f.area()`, which is the §4.61 D18
-/// anchor: the header, the menu card and the footer legend stay visible
-/// behind an open modal. That is also the whole row budget they get —
+/// Both overlays take `area`, not `f.area()`: the header, the menu card
+/// and the footer legend stay visible behind an open modal. That is
+/// also the whole row budget they get —
 /// `24 − 4 header − 5 menu card − 1 footer = 14` rows at the declared
 /// 80×24 floor — and `overlay::centered_rect` clamps rather than scrolls,
 /// which is why both are `modal_form::ScrollBody` surfaces.
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::vertical([
-        Constraint::Length(3), // N13 shared filter card, no title
+        Constraint::Length(3), // shared filter card, no title
         Constraint::Min(5),    // table
     ])
     .split(area);
@@ -190,20 +194,20 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     render_filters(f, chunks[0], app);
     render_table(f, chunks[1], app);
 
-    // S53.5 — edit modal overlays the tab content. Renders LAST so it
+    // Edit modal overlays the tab content. Renders LAST so it
     // sits above the table; key dispatch in `tui::mod` gates every
     // keystroke through the modal handler while it's open.
     if let Some(modal) = app.rules.edit_modal.as_ref() {
         render_rule_edit_modal(f, area, modal);
     }
-    // wave2/rules-add-key — same overlay-last / same-gate-in-mod
-    // pattern as the edit modal above, for the `[a]` add-rule modal.
+    // Same overlay-last / same-gate-in-mod pattern as the edit modal
+    // above, for the `[a]` add-rule modal.
     if let Some(modal) = app.rules.add_modal.as_ref() {
         crate::tui::rule_add_modal::render_overlay(f, area, modal);
     }
 }
 
-/// N13 shared filter card: a text search (`/`) combined with the
+/// Shared filter card: a text search (`/`) combined with the
 /// all/allow/deny action chip (`f`). Mirrors `tabs::query_log::render_filters`
 /// / `tabs::lists::render_filters` — all three (plus Tags) go through
 /// `theme::render_filter_card`. No title; the fields are the label.
@@ -262,7 +266,7 @@ fn render_filters(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), content_area);
 }
 
-fn render_table(f: &mut Frame, area: Rect, app: &App) {
+fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let entries = build_rule_rows(app);
     let filtered: Vec<&RuleRowMeta> = entries
         .iter()
@@ -310,7 +314,11 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
         .column_spacing(COLUMN_SPACING)
         .row_highlight_style(crate::tui::theme::highlight_style());
 
-    f.render_stateful_widget(table, content, &mut app.rules.table_state.clone());
+    // Selection is already reconciled onto `app.rules.table_state` before
+    // render runs (`reconcile_active_leaf_selection`); render only needs
+    // to keep painting it without resetting the viewport.
+    let selected = app.rules.table_state.selected();
+    super::render_table(f, content, table, &mut app.rules.table_state, selected);
 
     // Query-Log-style vertical separators between columns.
     crate::tui::ui::draw_table_column_separators(f, content, &constraints, COLUMN_SPACING);
@@ -318,8 +326,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
 
 /// Empty-state copy. Two variants:
 ///   - **Truly empty** (no rules at all): leads with the `[a]` add-rule
-///     modal (wave2/rules-add-key), then demotes the Query Log +
-///     scope_modal path and the `warden` CLI verbs to secondary hints.
+///     modal, then demotes the Query Log + scope_modal path and the
+///     `warden` CLI verbs to secondary hints.
 ///   - **Filtered to zero** (rules exist, but the chip excludes them
 ///     all): hint that they should `[f]` cycle to see them.
 fn render_empty_state(f: &mut Frame, area: Rect, app: &App, has_filtered_out: bool) {
@@ -460,8 +468,8 @@ fn render_rule_row(r: &RuleRowMeta) -> Row<'static> {
 /// The rule rows the table actually paints: [`build_rule_rows`] narrowed
 /// by the action chip AND the `/` text search (`matches_rule_filters`).
 ///
-/// rev-2607: the single definition of "the visible row set", shared by
-/// the cursor reconciler, the j/k bounds and the modal builder below. A
+/// The single definition of "the visible row set", shared by the
+/// cursor reconciler, the j/k bounds and the modal builder below. A
 /// cursor index is only meaningful against one specific vec — filtering
 /// by the action chip alone here would build a *larger* vec than the
 /// table shows, so under an active text filter `Enter`/`d` would act on a
@@ -480,8 +488,8 @@ pub fn visible_rule_rows(app: &App) -> Vec<RuleRowMeta> {
 /// — the hotkey handler surfaces a footer hint in that case.
 pub fn build_rule_edit_modal_for(app: &App) -> Option<RuleEditModal> {
     let rows = visible_rule_rows(app);
-    // rev-2607: resolve the operator's stable rule id, **not** the
-    // positional cursor. The rows are rebuilt from `loaded_config` on
+    // Resolve the operator's stable rule id, **not** the positional
+    // cursor. The rows are rebuilt from `loaded_config` on
     // every reload — including this tab's own delete — so an index
     // captured on an earlier frame can silently address a *different*
     // rule: drop a rule above the cursor and the index stays in range
@@ -537,8 +545,8 @@ pub fn build_rule_edit_modal_for(app: &App) -> Option<RuleEditModal> {
 /// `[profiles.*]` id alphabetically → every `[[devices]].id`
 /// alphabetically.
 ///
-/// wave2/rules-add-key: promoted to `pub(crate)` (and dropped the
-/// unused `_current` param — the edit modal never used it either) so
+/// `pub(crate)`, not private — and the unused `_current` param is gone
+/// too, since the edit modal never used it either — so
 /// `rule_add_modal::RuleAddModal::open` can snapshot the same option
 /// set the edit modal uses, rather than re-deriving it.
 pub(crate) fn build_scope_options(app: &App) -> Vec<ScopeChoice> {
@@ -586,7 +594,7 @@ pub fn cycle_scope_choice(modal: &mut RuleEditModal, dir: i32) {
     modal.error_message = None;
 }
 
-// ── §4.61 W3b MODAL REGION BEGINS ─────────────────────────────────────
+// ── MODAL REGION BEGINS ─────────────────────────────────────────────
 //
 // Everything between this marker and the closing one is overlay chrome:
 // Archetype F for the edit form, Archetype C for the delete confirm.
@@ -600,8 +608,8 @@ pub fn cycle_scope_choice(modal: &mut RuleEditModal, dir: i32) {
 // the comment that describes it.
 //
 // The tab's own chrome (table header, scope column, filter chips) is
-// deliberately NOT in scope and keeps its own styles — §4.61 §1.1: tab
-// chrome is a separate, tab-wide palette question.
+// deliberately NOT in scope and keeps its own styles: tab chrome is a
+// separate, tab-wide palette question.
 
 /// Modal width, matching the rest of the Archetype-F ecosystem
 /// (`tabs/lists.rs`, `subnet_modal.rs`, `rule_add_modal.rs`).
@@ -651,9 +659,9 @@ fn value_budget(width: u16) -> usize {
 /// The transient "we are talking to the config right now" message, if
 /// any. It goes to [`modal_form::form_tail_with_status`]'s own slot — its
 /// own row, in the theme's neutral status colour — and the focused
-/// control keeps its guidance underneath. Before §4.63 S1 it was handed
-/// to every row's hint AND to the Delete action's, because Archetype F's
-/// tail had nowhere else to put it. An error still wins over both.
+/// control keeps its guidance underneath. It used to be handed to every
+/// row's hint AND to the Delete action's, because Archetype F's tail had
+/// nowhere else to put it. An error still wins over both.
 fn transient_status(modal: &RuleEditModal) -> Option<&str> {
     modal.status_message.as_deref().or({
         if modal.submitting {
@@ -715,7 +723,7 @@ fn references_cell(modal: &RuleEditModal) -> (String, ValueKind) {
 }
 
 /// The two description rows for the edit form, on their own `bg_main`
-/// strip under the title band ([`modal_form::desc_band2`], 2026-08-07).
+/// strip under the title band ([`modal_form::desc_band2`]).
 ///
 /// Not the title's `bg_highlight` — teal on it is 3.37:1 against a 4.5:1
 /// prose bar, and no contrast gate covers the pair. See `desc_band2`.
@@ -743,8 +751,9 @@ const EDIT_DESC: [&str; 2] = [
 /// pinned head, scrolling field region, pinned tail.
 ///
 /// The head is **4** rows ([`EDIT_DESC`] is two of them). `scroll_layout`
-/// serves the tail first and the head second, so at the D18 floor's 12
-/// interior rows that comes out of the field viewport: with this modal's
+/// serves the tail first and the head second, so at the minimum-terminal
+/// floor's 12 interior rows that comes out of the field viewport: with
+/// this modal's
 /// default 5-row tail (spacer + 2 note + keys + actions) the viewport went
 /// 4 rows → **3**. Re-derived here from this modal's own tail, not
 /// inherited from `profile_modal`, whose tail is 6.
@@ -824,9 +833,8 @@ fn edit_form_body(
         width,
     ));
 
-    // §4.65 UX3 (§3.6): Save is now Tab-reachable — `Enter` on it
-    // commits, same as `Ctrl+S` from anywhere (D7′ extended, not
-    // replaced: the chord still works from every other focus too).
+    // Save is Tab-reachable — `Enter` on it commits, same as `Ctrl+S`
+    // from anywhere (the chord still works from every other focus too).
     let actions = [
         Action::new(
             "  Delete rule\u{2026}  ",
@@ -865,8 +873,8 @@ fn edit_form_body(
 /// Three prose rows, and the *rendered* count is load-bearing:
 /// [`modal_form::notice_body`] leaves `focus_row` at `None` when there
 /// are no choices, so nothing scrolls the typed-input row back into
-/// view. §4.63 S1 gave Archetype C a 2-row head and a 4-row tail, so the
-/// content budget against the 12-row interior the D18 anchor leaves at
+/// view. Archetype C has a 2-row head and a 4-row tail, so the content
+/// budget against the 12-row interior the content-area anchor leaves at
 /// the 80×24 floor is **6**. Three rows fit with three to spare — and
 /// the id row spends a second one whenever it wraps, which every id past
 /// 59 characters does. Pinned by
@@ -899,8 +907,8 @@ fn delete_notice(modal: &RuleEditModal, typed: &str) -> modal_form::NoticeSpec {
 
 /// Render the rule edit modal, anchored on the tab content rect.
 ///
-/// `anchor` is the Rules tab's content area (§4.61 D18), never
-/// `f.area()`: the header, the menu card and the footer legend stay
+/// `anchor` is the Rules tab's content area, never `f.area()`: the
+/// header, the menu card and the footer legend stay
 /// visible behind it. That leaves a 12-row interior at the declared
 /// 80×24 floor against an edit body of 21, which is why both stages are
 /// built on a [`modal_form::ScrollBody`] and rendered through
@@ -911,7 +919,7 @@ fn delete_notice(modal: &RuleEditModal, typed: &str) -> modal_form::NoticeSpec {
 /// `Tab` went on reaching the rows that were cut.
 ///
 /// The border accent is not a parameter any more: chrome stays neutral
-/// grey and `brand_red` is never a border (D15). The confirm carries its
+/// grey and `brand_red` is never a border. The confirm carries its
 /// meaning in the body — a `Blocking` value colour on the id — instead
 /// of in the frame.
 pub fn render_rule_edit_modal(f: &mut Frame, anchor: Rect, modal: &RuleEditModal) {
@@ -941,7 +949,7 @@ pub fn render_rule_edit_modal(f: &mut Frame, anchor: Rect, modal: &RuleEditModal
     }
 }
 
-// ── §4.61 W3b MODAL REGION ENDS ───────────────────────────────────────
+// ── MODAL REGION ENDS ───────────────────────────────────────────────
 
 /// Char-count truncation with ellipsis, keeping the **head**. ASCII-fast
 /// for the typical case (id strings, plain domain rules) but UTF-8-correct
@@ -962,7 +970,7 @@ pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    // ── §4.61 Wave 3b: modal render ──────────────────────────────────
+    // ── Modal render ─────────────────────────────────────────────────
 
     /// One string per buffer row, so an assertion can tell "on screen"
     /// from "somewhere in the line vector".
@@ -1056,7 +1064,7 @@ mod tests {
     // ── the 80×24 floor ──────────────────────────────────────────────
     //
     // `ui.rs` declares MIN_WIDTH 80 × MIN_HEIGHT 24. At that size the tab
-    // content rect these overlays anchor on (D18) is
+    // content rect these overlays anchor on is
     // `24 − 4 header − 5 menu card − 1 footer = 14` rows, leaving a
     // 12-row interior. `overlay::centered_rect` CLAMPS rather than
     // scrolls, so a body taller than that is cut at the bottom while
@@ -1101,15 +1109,15 @@ mod tests {
         );
     }
 
-    /// §4.68 DoD, **at the floor**: the two description rows are on screen,
+    /// **At the floor**: the two description rows are on screen,
     /// they fill the modal interior with `bg_main` `Rgb(15,15,15)` in teal
     /// `Rgb(13,148,136)`, they are NOT on the title's `Rgb(51,51,51)`, and
     /// the action row survived the head growing.
     ///
-    /// Asserting the actions is not ceremony — §4.63 S2a+S2c grew the
-    /// Devices form without re-deriving this budget and cost it `Save`,
-    /// `Cancel` and 9 of 13 fields, while the focus ring still reached the
-    /// buttons that were no longer drawn.
+    /// Asserting the actions is not ceremony — growing the Devices form
+    /// without re-deriving this budget once cost it `Save`, `Cancel` and
+    /// 9 of 13 fields, while the focus ring still reached the buttons
+    /// that were no longer drawn.
     #[test]
     fn floor_the_description_band_renders_on_its_own_strip_with_the_actions() {
         use ratatui::backend::TestBackend;
@@ -1128,8 +1136,8 @@ mod tests {
 
     /// The copy ships at a width, so the width is a test rather than a
     /// comment. `render_body_fixed` does not wrap and prints no marker
-    /// where it cuts — which is how the pre-2026-08-07 one-liner sat 2
-    /// cells over this budget without anyone noticing.
+    /// where it cuts — a one-liner sitting a few cells over this budget
+    /// can go unnoticed without this assertion.
     #[test]
     fn no_desc_row_outruns_the_narrow_build_pass() {
         // −2 chrome, −1 for the scrollbar column on the narrow pass,
@@ -1260,10 +1268,9 @@ mod tests {
     /// the same 2 the old hardcoded `TYPED_PROSE_ROW` did and it passes
     /// whether or not the conversion is right. A wrapped id makes the
     /// field rows `[id-1, id-2, prompt, input]`, so an off-by-one lands
-    /// the caret on `then Enter:` — which is audit finding **F1**, the
-    /// "cursor blinking on a row the operator is not typing into" half
-    /// that made it a P1. Reopening it for exactly the ids this sprint
-    /// exists to serve would be the worst possible regression here.
+    /// the caret on `then Enter:` — a cursor blinking on a row the
+    /// operator is not typing into. Reopening that for exactly the long
+    /// ids this covers would be the worst possible regression here.
     #[test]
     fn delete_confirm_cursor_follows_the_input_row_past_a_wrapped_id() {
         use ratatui::backend::TestBackend;
@@ -1333,7 +1340,7 @@ mod tests {
 
     #[test]
     fn overlay_is_confined_to_the_anchor_rect() {
-        // D18: the anchor is the tab content rect, so the header, the
+        // The anchor is the tab content rect, so the header, the
         // menu card and the footer legend stay visible behind the modal.
         // Anchoring on `f.area()` instead paints over all three.
         use ratatui::backend::TestBackend;
@@ -1363,8 +1370,8 @@ mod tests {
 
     #[test]
     fn transient_status_has_its_own_slot_and_the_focus_guidance_survives() {
-        // §4.63 S1 gave the status its own tail slot
-        // (`modal_form::form_tail_with_status`), so it no longer has to
+        // The status has its own tail slot
+        // (`modal_form::form_tail_with_status`), so it does not have to
         // be smuggled through every row's hint — and the guidance for
         // whatever holds focus survives the submit alongside it.
         //
@@ -1424,19 +1431,19 @@ mod tests {
 
     #[test]
     fn no_hand_rolled_colour_in_the_modal_region() {
-        // §4.61 Wave 3b's acceptance criterion as a test rather than a
+        // The no-hand-rolled-colour rule as a test rather than a
         // claim in a commit message. Scoped to the modal region: this
         // file is a *tab* as well as two overlays, and the table header,
         // the scope column and the filter chips keep their own styles —
-        // §4.61 §1.1 puts tab chrome outside this workstream.
+        // tab chrome is out of scope for this rule.
         //
         // Both markers are `expect`ed: a renamed marker would otherwise
         // turn this into a vacuous pass over an empty slice, which is
-        // the same class of false green the whole wave is about. The
+        // the same class of false green this whole rule is about. The
         // needles are split so the assertion cannot match itself.
         let src = include_str!("rules.rs");
-        let begin = concat!("\u{a7}4.61 W3b MODAL REGION ", "BEGINS");
-        let end = concat!("\u{a7}4.61 W3b MODAL REGION ", "ENDS");
+        let begin = concat!("MODAL REGION ", "BEGINS");
+        let end = concat!("MODAL REGION ", "ENDS");
         let start = src.find(begin).expect("modal region BEGINS marker");
         let stop = start
             + src[start..]
@@ -1592,7 +1599,7 @@ servers = ["192.0.2.1:53"]
 default_profile = "default"
 
 [[admin_rules]]
-id = "alex-allow-bank"
+id = "operator-allow-bank"
 rule = "@@||bank.example^"
 
 [[admin_rules]]
@@ -1607,7 +1614,7 @@ rule = "||nobody-refs-me.example^"
 id = "iphone"
 display_name = "iPhone"
 mac = "aa:bb:cc:dd:ee:ff"
-allow_rules = ["alex-allow-bank"]
+allow_rules = ["operator-allow-bank"]
 
 [profiles.default]
 display_name = "Default"
@@ -1632,7 +1639,7 @@ admin_rules = ["default-deny-tracker"]
         let rows = build_rule_rows(&app);
         let bank = rows
             .iter()
-            .find(|r| r.id == "alex-allow-bank")
+            .find(|r| r.id == "operator-allow-bank")
             .expect("bank rule must be in the row vec");
         assert_eq!(bank.action, RuleAction::Allow);
         assert_eq!(bank.domain_label, "bank.example");
@@ -1647,7 +1654,7 @@ admin_rules = ["default-deny-tracker"]
     fn build_rule_rows_resolves_scope_to_device_when_referenced() {
         let app = app_with_three_rules();
         let rows = build_rule_rows(&app);
-        let bank = rows.iter().find(|r| r.id == "alex-allow-bank").unwrap();
+        let bank = rows.iter().find(|r| r.id == "operator-allow-bank").unwrap();
         match &bank.scope {
             RuleScope::Device(id) => assert_eq!(id, "iphone"),
             other => panic!("expected Device scope, got {other:?}"),

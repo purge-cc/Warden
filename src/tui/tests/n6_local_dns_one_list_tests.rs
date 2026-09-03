@@ -34,7 +34,7 @@ display_name = "Empty"
 
 [profiles.kids]
 display_name = "Kids"
-local_records = [{ domain = "youtube.local", type = "A", value = "192.0.2.9" }]
+local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
 
 [profiles.work]
 display_name = "Work"

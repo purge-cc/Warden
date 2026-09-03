@@ -1,12 +1,11 @@
-//! Atomic write + pre-rename validation helper — Sprint 35 CS2,
-//! hardened in §4.31 (2026-05).
+//! Atomic write + pre-rename validation helper.
 //!
-//! Before CS2 landed, every writer that touched a user-visible config file
-//! (master, `.d/*.toml` slice, or restored archive) used a streaming
-//! `fs::write` followed by a `rename`. The class of failures that bit the
-//! 2026-04-23 incident — disk-full mid-write, SIGKILL between `fs::write`
-//! and the validator, or a loader that would have rejected the new bytes —
-//! would all leave the master in a state the daemon could not boot from.
+//! A naive writer that touches a user-visible config file (master,
+//! `.d/*.toml` slice, or restored archive) using a streaming `fs::write`
+//! followed by a `rename` is vulnerable to a whole class of failures —
+//! disk-full mid-write, a process kill between `fs::write` and the
+//! validator, or a loader that would have rejected the new bytes — any
+//! of which can leave the master in a state the daemon cannot boot from.
 //!
 //! [`atomic_write_and_validate`] closes that window. It writes to a
 //! same-directory temp file, re-reads that temp file through a caller-
@@ -16,8 +15,7 @@
 //! across filesystems, EPERM, target is a directory), the temp is
 //! cleaned up (best-effort) and the target is untouched.
 //!
-//! §4.31 extends the contract with three new properties that the
-//! original CS2 design failed to enforce end-to-end:
+//! The contract has three further properties, enforced end-to-end:
 //!
 //! 1. **fsync.** The temp's bytes are flushed to the storage layer
 //!    (`File::sync_all`) BEFORE rename, and the parent directory is
@@ -43,8 +41,6 @@
 //! full `loader::load_config` for v1 masters, a cheap `toml::Value`
 //! parse for the `.d/*.toml` mutation path, etc.). The helper stays
 //! agnostic about which schema it is guarding.
-//!
-//! See `_docs/features/config_safety_v11.md` §2 CS2 for the closed decision.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -88,11 +84,10 @@ pub enum AtomicWriteError {
         source: std::io::Error,
     },
     /// Setting the mode (`chmod`) or owner (`lchown`) on the staged temp
-    /// failed. Distinct from [`AtomicWriteError::WriteTemp`] — the previous
-    /// code reused that variant here, sending the operator chasing a write
-    /// error when the real problem is permission / ownership semantics
-    /// (atomic-write-03). The temp is cleaned up best-effort; the target is
-    /// untouched.
+    /// failed. Distinct from [`AtomicWriteError::WriteTemp`] so the
+    /// operator isn't sent chasing a write error when the real problem
+    /// is permission / ownership semantics. The temp is cleaned up
+    /// best-effort; the target is untouched.
     #[error("cannot set mode/owner on staged temp {tmp}: {source}")]
     Metadata {
         tmp: PathBuf,
@@ -111,10 +106,10 @@ pub enum AtomicWriteError {
         source: std::io::Error,
     },
     /// `fsync` (or the parent-dir `fsync`) failed. The temp has been
-    /// cleaned up best-effort; the target on disk is untouched. §4.31
-    /// new variant — the bytes hit page cache but never reached the
-    /// storage layer, so a power loss before the next kernel writeback
-    /// would have left a zero-byte target.
+    /// cleaned up best-effort; the target on disk is untouched. Without
+    /// this the bytes hit page cache but never reach the storage layer,
+    /// so a power loss before the next kernel writeback would leave a
+    /// zero-byte target.
     #[error("fsync failed on {path}: {source}")]
     Fsync {
         path: PathBuf,
@@ -178,13 +173,13 @@ impl Default for AtomicWriteOpts<'_> {
 /// Write `content` to `path` via a same-directory temp file, run
 /// `validator` on the temp, then atomically rename it into place.
 ///
-/// String-flavoured wrapper preserved for back-compat with the CS2
-/// call-sites that pass a `&str` payload and a typed validator
-/// closure. Internally builds an [`AtomicWriteOpts`] with the validator
-/// adapted to the `Result<(), String>` shape and delegates to
+/// String-flavoured wrapper preserved for back-compat with call-sites
+/// that pass a `&str` payload and a typed validator closure. Internally
+/// builds an [`AtomicWriteOpts`] with the validator adapted to the
+/// `Result<(), String>` shape and delegates to
 /// [`hardened_atomic_write`].
 ///
-/// Invariants (all §4.31-enforced):
+/// Invariants:
 /// - On every error path, the file at `path` is left untouched (bytes
 ///   identical to what was there before the call) — with ONE documented
 ///   exception: a parent-directory fsync failure raised *after* the
@@ -199,7 +194,7 @@ impl Default for AtomicWriteOpts<'_> {
 ///   crash (SIGKILL / panic) between temp creation and the rename leaves a
 ///   `.{name}.tmp-{pid}-{seq}` orphan: the dot-prefix keeps it out of
 ///   `*.toml` include globs so it is inert, but nothing in-tree sweeps it,
-///   so operators may see stale temps after a crash (atomic-write-05).
+///   so operators may see stale temps after a crash.
 /// - `rename(2)` is atomic on POSIX when source + destination share a
 ///   filesystem. Placing the temp in the same directory guarantees
 ///   that property.
@@ -248,7 +243,7 @@ where
 /// `lists/` sidecars, `tracking/` snapshots, and the string-flavoured
 /// [`atomic_write_and_validate`] wrapper.
 ///
-/// See module-level doc for the full §4.31 contract (fsync, mode
+/// See module-level doc for the full contract (fsync, mode
 /// preservation, owner preservation).
 pub fn hardened_atomic_write(
     path: &Path,
@@ -257,8 +252,8 @@ pub fn hardened_atomic_write(
 ) -> Result<(), AtomicWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() {
-        // atomic-write-02: create missing parents at 0o750 (matching the
-        // audit dir + the 0o640 files), not the umask-default 0o755 a plain
+        // Create missing parents at 0o750 (matching the audit dir + the
+        // 0o640 files), not the umask-default 0o755 a plain
         // `create_dir_all` would leave.
         #[cfg(unix)]
         {
@@ -295,12 +290,12 @@ pub fn hardened_atomic_write(
         }
     };
 
-    // atomic-write-01: `metadata` above follows a symlink (capturing the
-    // TARGET's mode/owner), but the `rename` below replaces the LINK itself
-    // with a regular file — severing an operator's `config.toml -> checkout`
+    // `metadata` above follows a symlink (capturing the TARGET's
+    // mode/owner), but the `rename` below replaces the LINK itself with
+    // a regular file — severing an operator's `config.toml -> checkout`
     // symlink on the first write, after which edits diverge from the
-    // checkout. We don't refuse (that breaks a legitimate workflow and the
-    // config-dir writer is trusted, §10.2), but the severing must not be
+    // checkout. We don't refuse (that breaks a legitimate workflow and
+    // the config-dir writer is trusted), but the severing must not be
     // silent.
     #[cfg(unix)]
     if std::fs::symlink_metadata(path)
@@ -327,20 +322,20 @@ pub fn hardened_atomic_write(
     // Stage the temp with the intended mode set at open time. On Unix
     // this still goes through the umask, so the explicit
     // `set_permissions` below re-asserts the exact bits — both calls
-    // together close the 0o644 race window documented at
-    // `src/config/audit.rs:476`. Truncate semantics (rather than
-    // `create_new`) so a stale temp from a prior crashed write is
-    // overwritten instead of forcing the operator to clean it up by
-    // hand. Process-local uniqueness on the staged name is already
-    // provided by [`staged_path`].
+    // together close the create-then-chmod race window that would
+    // otherwise leave the file briefly at umask-default mode. Truncate
+    // semantics (rather than `create_new`) so a stale temp from a prior
+    // crashed write is overwritten instead of forcing the operator to
+    // clean it up by hand. Process-local uniqueness on the staged name
+    // is already provided by [`staged_path`].
     //
     // `O_NOFOLLOW` (Unix): the staged name is predictable
     // (`.{name}.tmp-{pid}-{seq}`), so if a symlink were planted there the
     // create+truncate would follow it and clobber the link target. With
     // `O_NOFOLLOW` the open fails (ELOOP) instead. Defence-in-depth: the
-    // config-dir-write attacker is out of the threat model (§10.2), but
-    // this is the canonical hardened write path. `O_NOFOLLOW` does not
-    // block overwriting a stale *regular* temp, so the truncate semantics
+    // config-dir-write attacker is out of the threat model, but this is
+    // the canonical hardened write path. `O_NOFOLLOW` does not block
+    // overwriting a stale *regular* temp, so the truncate semantics
     // above are preserved.
     let open_result = {
         let mut opts_o = OpenOptions::new();
@@ -370,16 +365,16 @@ pub fn hardened_atomic_write(
         });
     }
 
-    // atomic-write-06: assert the exact mode + owner on the staged temp
-    // BEFORE the fsync, so the single `sync_all` below flushes the data AND
-    // the mode/owner inode metadata together. The previous order fsynced the
-    // data first and the chmod/lchown that followed were never re-synced — a
-    // crash could leave the correct bytes with the umask-default mode.
+    // Assert the exact mode + owner on the staged temp BEFORE the fsync,
+    // so the single `sync_all` below flushes the data AND the mode/owner
+    // inode metadata together — fsyncing the data first and the
+    // chmod/lchown after would let a crash leave the correct bytes with
+    // the umask-default mode.
 
     // Defence-in-depth on Unix: force the exact mode bits even when
-    // OpenOptions::mode was umask-bitten on the platform. atomic-write-03:
-    // chmod/lchown failures get the dedicated `Metadata` variant, not the
-    // misleading `WriteTemp`.
+    // OpenOptions::mode was umask-bitten on the platform. chmod/lchown
+    // failures get the dedicated `Metadata` variant, not the misleading
+    // `WriteTemp`.
     #[cfg(unix)]
     if let Err(source) =
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(target_mode))
@@ -421,9 +416,9 @@ pub fn hardened_atomic_write(
         }
     }
 
-    // fsync the data + the just-asserted mode/owner metadata together
-    // (atomic-write-06): fsync flushes the inode's data AND metadata, so the
-    // chmod/lchown above are now crash-durable, not just the bytes.
+    // fsync the data + the just-asserted mode/owner metadata together:
+    // fsync flushes the inode's data AND metadata, so the chmod/lchown
+    // above are now crash-durable, not just the bytes.
     if let Err(source) = file.sync_all() {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
@@ -641,7 +636,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "payload-abc");
     }
 
-    // --- §4.31 hardened_atomic_write tests --------------------------
+    // --- hardened_atomic_write tests ---------------------------------
 
     #[cfg(unix)]
     #[test]
@@ -662,8 +657,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardened_atomic_write_creates_parent_dir_without_world_access() {
-        // atomic-write-02: a missing parent (e.g. a fresh `devices.d/`) is
-        // created at 0o750, not the umask-default 0o755 — no other access.
+        // A missing parent (e.g. a fresh `devices.d/`) is created at
+        // 0o750, not the umask-default 0o755 — no other access.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("fresh.d");
@@ -683,9 +678,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardened_atomic_write_replaces_symlinked_target() {
-        // atomic-write-01: writing through a symlinked config path replaces
-        // the LINK with a regular file (documented severing — we warn, we
-        // don't refuse). Pins the behaviour so a future "follow the link"
+        // Writing through a symlinked config path replaces the LINK
+        // with a regular file (documented severing — we warn, we don't
+        // refuse). Pins the behaviour so a future "follow the link"
         // change is a conscious one.
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real.toml");
@@ -766,9 +761,8 @@ mod tests {
         // from user-space without a crash sim, but we can at least
         // exercise the code path — the call must return Ok on a healthy
         // filesystem. A future fault-injection suite can layer on top.
-        // TODO(§4.31 follow-up): real power-loss durability test via
-        // syscall-level injection; see _docs/features/config_safety_v11.md
-        // §2 CS2 for the full design.
+        // TODO: real power-loss durability test via syscall-level
+        // injection.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("durable.toml");
         hardened_atomic_write(&target, b"bytes", AtomicWriteOpts::default()).unwrap();

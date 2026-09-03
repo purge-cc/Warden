@@ -10,11 +10,11 @@
 //! warden completion fish  > ~/.config/fish/completions/warden.fish
 //! ```
 //!
-//! Sprint 33 ships a static completion tree (every subcommand / flag
-//! clap knows). Entity-ID completion (reading the loaded config and
-//! suggesting device / group / subnet ids) is a follow-up — it would
-//! need a shell callback rather than a static script. The current
-//! surface already handles the 90% case: `warden <TAB>` completes the
+//! Ships a static completion tree (every subcommand / flag clap knows).
+//! Entity-ID completion (reading the loaded config and suggesting
+//! device / group / subnet ids) would need a shell callback rather than
+//! a static script, so it is not covered here. The current surface
+//! already handles the 90% case: `warden <TAB>` completes the
 //! subcommand name, `warden device <TAB>` completes the action name,
 //! `warden device add --<TAB>` completes the flag list.
 
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn script_mentions_new_s33_subcommands() {
-        // Smoke-test that S33 subcommands appear in the completion
+        // Smoke-test that these subcommands appear in the completion
         // output — catches the clap tree falling out of sync with the
         // completion generator.
         let mut cmd = Cli::command();
@@ -121,10 +121,10 @@ mod tests {
         }
     }
 
-    /// Sprint 38 QLP8: the new top-level `warden reload` subcommand
-    /// must appear in the generated bash completion. Pinning this
-    /// here catches the `Commands::Reload` variant being silently
-    /// dropped in a future refactor.
+    /// The top-level `warden reload` subcommand must appear in the
+    /// generated bash completion. Pinning this here catches the
+    /// `Commands::Reload` variant being silently dropped in a future
+    /// refactor.
     #[test]
     fn script_mentions_warden_reload() {
         let mut cmd = Cli::command();

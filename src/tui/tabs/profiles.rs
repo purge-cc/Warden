@@ -1,10 +1,9 @@
 //! Profiles tab — master/detail view of the v1 `[profiles]` map.
 //!
-//! §4.26 Phase 2: the 4th Network leaf (locked decision D3). The master
-//! list (left) shows every configured profile with summary columns; the
-//! side-card (right) drills into the focused profile — the 6 MUTATE
-//! fields plus an offline "What it blocks" summary (tui-wave1): the
-//! effective blocklists it resolves to through
+//! The master list (left) shows every configured profile with summary
+//! columns; the side-card (right) drills into the focused profile — the 6
+//! MUTATE fields plus an offline "What it blocks" summary: the effective
+//! blocklists it resolves to through
 //! [`effective_direction`](crate::config::schema::effective_direction) —
 //! each list's `base` as overridden by `profiles.<id>.lists` — a total
 //! domain count, and a demoted local-records / rewrites pointer.
@@ -47,17 +46,24 @@ use crate::config::settings::EcsMode;
 use crate::lists::status::BlocklistStatusDto;
 use crate::profiles::profile::resolve_profile_blocklist_ids;
 use crate::tui::app::App;
+use crate::tui::format::count as humanize_domains;
 use crate::tui::theme::{self, T};
 use crate::tui::ui::render_section_chrome;
 
-/// Below this width the master/detail split collapses to master-only.
-/// Mirrors the Subnets tab threshold — the side-card needs ≥40 cells for
-/// the KV rows + the "What it blocks" summary to stay legible.
+/// Below this *inner* width (measured after `render_section_chrome` takes
+/// its border) the master/detail split collapses to master-only — the
+/// side-card needs room for the KV rows + the "What it blocks" summary to
+/// stay legible.
+///
+/// Not the same number as the Subnets tab's `NARROW_THRESHOLD`, and not
+/// measured against the same rect: that one is 110 against the pre-chrome
+/// `area.width`. Both are deliberately conservative; neither is derived
+/// from the other.
 const NARROW_THRESHOLD: u16 = 100;
 
 // ── Public render entry point ────────────────────────────────────────
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         render_no_config(f, area);
         return;
@@ -75,7 +81,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if outer.width < NARROW_THRESHOLD {
         // Single-column fallback: master list only. The operator still
         // sees every profile; the detail card returns when they widen.
-        render_master(f, outer, app, profiles);
+        render_master(
+            f,
+            outer,
+            profiles,
+            app.profiles.selected_id.as_deref(),
+            &mut app.profiles.table_state,
+        );
         return;
     }
 
@@ -86,14 +98,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(outer);
 
-    render_master(f, cols[0], app, profiles);
+    render_master(
+        f,
+        cols[0],
+        profiles,
+        app.profiles.selected_id.as_deref(),
+        &mut app.profiles.table_state,
+    );
     render_detail(f, cols[2], app, loaded, profiles);
     draw_v_divider(f, cols[1]);
 }
 
 // ── Master pane ──────────────────────────────────────────────────────
 
-fn render_master(f: &mut Frame, area: Rect, app: &App, profiles: &BTreeMap<String, Profile>) {
+fn render_master(
+    f: &mut Frame,
+    area: Rect,
+    profiles: &BTreeMap<String, Profile>,
+    selected_id: Option<&str>,
+    table_state: &mut TableState,
+) {
     let header = Row::new(vec![
         Cell::from("ID"),
         Cell::from("DISPLAY NAME"),
@@ -111,15 +135,10 @@ fn render_master(f: &mut Frame, area: Rect, app: &App, profiles: &BTreeMap<Strin
 
     // Resolve `selected_id` back to a row index every frame — modal CRUD
     // moves rows in/out, so an index from the previous frame is stale.
-    let mut table_state = TableState::default();
-    if let Some(idx) = resolve_selected_index(profiles, app.profiles.selected_id.as_deref()) {
-        table_state.select(Some(idx));
-    } else if !rows.is_empty() {
-        table_state.select(Some(0));
-    }
-    // No manual offset copy — a stale offset desyncs the viewport from the
-    // freshly-resolved index when a rename/CRUD jumps rows; let ratatui
-    // derive the scroll offset from `select()`. (prof-03; mirrors sub-01)
+    // The scroll offset persists regardless (see `tabs::subnets::render_master`
+    // for why that is safe across a row-count change).
+    let selected =
+        resolve_selected_index(profiles, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
 
     let table = Table::new(
         rows,
@@ -134,7 +153,7 @@ fn render_master(f: &mut Frame, area: Rect, app: &App, profiles: &BTreeMap<Strin
     .header(header)
     .row_highlight_style(theme::highlight_style());
 
-    f.render_stateful_widget(table, area, &mut table_state);
+    super::render_table(f, area, table, table_state, selected);
 }
 
 /// Build the master list rows — one per profile, in `BTreeMap` key
@@ -238,48 +257,20 @@ fn render_detail(
     ));
     lines.push(kv_str("ECS", &ecs_detail_label(profile), T.text_primary));
 
-    lines.push(divider_line());
+    lines.push(divider_line(area.width));
 
-    // ── "What it blocks" summary (tui-wave1 profiles-summary) ──
-    // Offline: resolve the profile's effective blocklists through the
-    // daemon's own predicate and sum their polled domain counts. Replaces
-    // the former read-only drill-out pointer block — the collections it
-    // pointed at now surface as the demoted "Also" line.
-    //
-    // **This comment said "via tag intersection" until `plp-s4c`, and it
-    // had been wrong since S3.** `resolve_profile_blocklist_ids`
-    // (`profiles/profile.rs`) has read `effective_direction` — the list's
-    // `base` as overridden by `profiles.<id>.lists` — since the plp
-    // cutover; `profile.tags` decides nothing. The CODE was migrated and
-    // the sentence describing it was not, which is the failure mode a
-    // doc-comment has that a test does not: it cannot go red.
-    //
-    // `plp-s5d` took the first of the two surfaces s4c reported: the
-    // `Tags` KV line is gone, along with `BlocksSummary::tags` that fed
-    // it and the `TAGS` master column, which showed the operator a count
-    // of something that had stopped deciding anything.
-    //
-    // `PROFILE_BLOCKS_NONE` was the second, and `plp-s5f` closed it with
-    // its pin in `tests/frozen_strings_tui_t1.rs`, in one commit — which
-    // is what this comment asked for ("it retires with them in
-    // `plp-s5f`/`plp-s5g` or not at all", because editing the const alone
-    // turns a lane owning neither test nor doc red on both).
-    //
-    // It used to send an operator with no effective lists to "add tags in
-    // the Tags tab": a tab `plp-s5d` deleted, reached by a verb that
-    // already refused. That is a rendered string — `blocklists_value`
-    // returns it whenever a profile resolves to zero lists — so it was not
-    // stale prose but a dead end shown to an operator mid-task. It now
-    // names the per-list override rows in the profile editor, which are
-    // where the direction is actually set (`profile_modal.rs`
-    // `LIST_OVERRIDE_HINT`).
-    //
-    // **The catalog mirror is NOT closed** and is reported rather than
-    // touched: `_catalog/**` belongs to no lane this agent owns.
+    // "What it blocks" summary — offline: resolve the profile's effective
+    // blocklists through `effective_direction` (each list's `base` as
+    // overridden by `profiles.<id>.lists`; `profile.tags` decides nothing)
+    // and sum their polled domain counts. Replaces the former read-only
+    // drill-out pointer block — the collections it pointed at now surface
+    // as the demoted "Also" line. The per-list override rows in the
+    // profile editor (`profile_modal.rs` `LIST_OVERRIDE_HINT`) are where
+    // an operator with no effective lists actually sets direction.
     let summary = profile_blocks_summary(profile, &loaded.config.blocklists, &app.lists.entries);
     push_blocks_summary(&mut lines, &summary, profile, &loaded.custom_lists);
 
-    lines.push(divider_line());
+    lines.push(divider_line(area.width));
 
     // ── Reference count (also the delete pre-check input) ──
     lines.push(kv_str(
@@ -426,12 +417,12 @@ fn admin_rules_label(profile: &Profile) -> String {
         .join(", ")
 }
 
-// ── "What it blocks" summary (tui-wave1 profiles-summary) ────────────
+// ── "What it blocks" summary ──────────────────────────────────────────
 //
 // The Profiles detail pane summarises the effective blocklists a profile
-// resolves to via tag intersection (offline — no daemon round-trip) plus a
-// total domain count. The operator-facing literals below are frozen by
-// `tests/frozen_strings_tui_t1.rs` (reached through the `pub use` in
+// resolves to via `effective_direction` (offline — no daemon round-trip)
+// plus a total domain count. The operator-facing literals below are frozen
+// by `tests/frozen_strings_tui_t1.rs` (reached through the `pub use` in
 // `src/tui/mod.rs`); land any copy change in the same commit as the docs.
 
 /// Section header above the summary block.
@@ -472,7 +463,9 @@ pub const PROFILE_CUSTOM_LISTS_NONE: &str = "none mounted";
 enum BlocksCount {
     /// `block_all = true` — list filtering is bypassed entirely.
     BlockAll,
-    /// No tag intersects any list — the profile blocks nothing via lists.
+    /// `resolve_profile_blocklist_ids` returned empty — no list's
+    /// effective direction blocks for this profile, so it filters
+    /// nothing via lists.
     NoLists,
     /// Lists resolved, but `app.lists.entries` is empty (poll not landed).
     Loading,
@@ -563,19 +556,6 @@ fn render_list_names(names: &[String]) -> String {
         names.join(", ")
     } else {
         format!("{} (+{} more)", names[..MAX].join(", "), names.len() - MAX)
-    }
-}
-
-/// Humanise a domain count to a compact magnitude string: `950`, `152k`,
-/// `2.5M`. The sums are overlap upper bounds, so precision past the leading
-/// digits is noise.
-fn humanize_domains(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
     }
 }
 
@@ -754,9 +734,9 @@ fn kv_str(label: &'static str, value: &str, color: Color) -> Line<'static> {
     )
 }
 
-fn divider_line() -> Line<'static> {
+fn divider_line(width: u16) -> Line<'static> {
     Line::from(Span::styled(
-        "\u{2500}".repeat(40),
+        "\u{2500}".repeat(width as usize),
         Style::default().fg(T.text_muted),
     ))
 }
@@ -837,13 +817,12 @@ mod tests {
         }
     }
 
-    // ── Leaf wiring (§4.26 P2 renumber) ───────────────────────────────
+    // ── Leaf wiring ──────────────────────────────────────────────────
 
     #[test]
     fn profiles_leaf_is_wired_to_the_filters_section() {
-        // §4.67-a deleted this test's original body. It used to assert
-        // `Leaf::Profiles.index() == 5`, `Leaf::ALL[5] == Leaf::Profiles` and
-        // `Leaf::ALL.len() == 10`/`11` — three hand-transcribed constants
+        // Not `Leaf::Profiles.index() == 5`, `Leaf::ALL[5] == Leaf::Profiles`
+        // or `Leaf::ALL.len() == 10`/`11` — three hand-transcribed constants
         // that were correct only for as long as nobody inserted a leaf ahead
         // of Profiles, and which the compiler could not protect. `Leaf::ALL`
         // is now flattened from `app::LAYOUT`, so a leaf index is not
@@ -900,7 +879,7 @@ block_all = true
 [[devices]]
 id = "phone"
 display_name = "Phone"
-ip = "192.0.2.50"
+ip = "10.10.1.50"
 profile = "kids"
 
 [[subnets]]
@@ -964,8 +943,8 @@ profile = "kids"
         use ratatui::Terminal;
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();
-        let app = App::new();
-        term.draw(|f| render(f, Rect::new(0, 0, 80, 20), &app))
+        let mut app = App::new();
+        term.draw(|f| render(f, Rect::new(0, 0, 80, 20), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut content = String::new();
@@ -990,7 +969,7 @@ profile = "kids"
         };
         app.loaded_config = Some(loaded_with(cfg));
         app.profiles.selected_id = Some("kids".to_string());
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut content = String::new();
@@ -1143,13 +1122,8 @@ url = "https://lists.example/adult.txt"
     }
 
     // ── render-string helpers (pure) ──────────────────────────────────
-
-    #[test]
-    fn humanize_domains_scales_by_magnitude() {
-        assert_eq!(humanize_domains(950), "950");
-        assert_eq!(humanize_domains(152_340), "152k");
-        assert_eq!(humanize_domains(2_500_000), "2.5M");
-    }
+    // `humanize_domains` is `tui::format::count` (aliased above) — its
+    // magnitude-scaling behavior is tested there, not here.
 
     #[test]
     fn list_names_line_truncates_past_five() {
@@ -1179,7 +1153,7 @@ url = "https://lists.example/adult.txt"
                 partial: false
             })
             .unwrap(),
-            "~152k domains"
+            "~152K domains"
         );
         assert_eq!(
             count_line(&BlocksCount::Counted {
@@ -1187,7 +1161,7 @@ url = "https://lists.example/adult.txt"
                 partial: true
             })
             .unwrap(),
-            "~100k domains (partial)"
+            "~100K domains (partial)"
         );
     }
 
@@ -1206,7 +1180,7 @@ url = "https://lists.example/adult.txt"
         app.lists.entries = vec![dto("ads-basic", 100_000), dto("mal-core", 52_000)];
         app.profiles.selected_id = Some("kids".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut content = String::new();
@@ -1219,7 +1193,7 @@ url = "https://lists.example/adult.txt"
         assert!(content.contains("What it blocks"));
         assert!(content.contains("Ads Basic"));
         assert!(content.contains("Malware Core"));
-        assert!(content.contains("152k domains"));
+        assert!(content.contains("152K domains"));
         // The demoted pointer.
         assert!(content.contains("Also"));
 
@@ -1311,7 +1285,7 @@ url = "https://lists.example/adult.txt"
         app.loaded_config = Some(loaded);
         app.profiles.selected_id = Some("kids".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1328,7 +1302,7 @@ url = "https://lists.example/adult.txt"
             .expect("Blocklists row renders");
         let count_row = &rows[blocklists_y + 1];
         assert!(
-            count_row.contains("152k domains"),
+            count_row.contains("152K domains"),
             "row right after Blocklists is not its count-line continuation:\n{}",
             rows.join("\n")
         );
@@ -1372,7 +1346,7 @@ url = "https://lists.example/adult.txt"
         app.loaded_config = Some(loaded);
         app.profiles.selected_id = Some("kids".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, 160, 30), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 160, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1429,7 +1403,7 @@ url = "https://lists.example/adult.txt"
         // "default" mounts no custom lists (`Profile::default()`).
         app.profiles.selected_id = Some("default".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1491,7 +1465,7 @@ url = "https://lists.example/adult.txt"
         app.loaded_config = Some(loaded);
         app.profiles.selected_id = Some("kids".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, width, 30), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, width, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1567,7 +1541,7 @@ url = "https://lists.example/adult.txt"
         app.loaded_config = Some(loaded_with(mk_blocks_config()));
         app.profiles.selected_id = Some("kids".to_string());
 
-        term.draw(|f| render(f, Rect::new(0, 0, 200, 30), &app))
+        term.draw(|f| render(f, Rect::new(0, 0, 200, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
         let mut content = String::new();

@@ -2,13 +2,20 @@
 //! Tracking form, backup, restore, and the auto-backup status those verbs
 //! produce.
 //!
-//! §4.67-b MN3 moved the TOML *document* out to [`super::file`]. What is
+//! The TOML *document* lives in [`super::file`]. What is
 //! left here is deliberate: a knob, a backup and the health of the backup
 //! belong together, and none of them is the file's text.
 //!
 //! With the viewer gone this leaf needed a default view — before the split
 //! it had none of its own, rendering either the Tracking form or the
 //! document. `render_landing` is that view.
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_settings_key` (`t` opens Tracking, `b`/`R` open backup/restore)
+//! - Form:  `tui::backup_restore_modal` for backup/restore; Tracking is an
+//!   inline form (`TrackingPanelState`), not a separate `*_modal.rs`
+//! - State: `app::SettingsState` (`tracking_panel`, `restore_modal`, `backup_modal`, `auto_backup`)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -21,16 +28,14 @@ use crate::tui::app::{App, TrackingFocus, TrackingPanelState};
 use crate::tui::theme::T;
 use crate::tui::ui::render_section_chrome;
 
-// Sprint 39: frozen strings for the Tracking form, matching the
-// `_docs/features/query_log_policy_v1.md` §3 QLP5 "Frozen strings" block.
-// The S39 tests pin these; changing them without updating the
-// design doc + frozen-string audit is a regression.
+// Frozen strings for the Tracking form. Tests below pin these; changing
+// them without updating the frozen-string audit is a regression.
 pub const TRACKING_VALIDATION_RETENTION_OUT_OF_RANGE: &str =
     "retention_days must be between 1 and 365.";
 pub const TRACKING_SAMPLED_LABEL: &str = "Sampled (10%)";
 
-// Sprint 5: frozen strings for the auto-backup status line (Q4) + the
-// failure banner (Q5). Pinned by the `auto_backup_*` tests below;
+// Frozen strings for the auto-backup status line and the failure
+// banner. Pinned by the `auto_backup_*` tests below;
 // the re-enable hint must stay verbatim with the `warden config backup
 // --reset-auto-failure` CLI verb it points at.
 pub const AUTO_BACKUP_LABEL: &str = "Last auto-backup: ";
@@ -48,7 +53,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
 /// The actions this leaf owns, spelled out on screen. The footer carries
 /// them too, but the footer is chrome an operator learns to stop reading —
-/// and after §4.67-b this pane would otherwise be a status line on an
+/// without this, the pane would otherwise be a status line on an
 /// empty rectangle.
 const LANDING_ACTIONS: &[(&str, &str)] = &[
     ("t", "Tracking — query-log retention and sampling"),
@@ -56,13 +61,12 @@ const LANDING_ACTIONS: &[(&str, &str)] = &[
     ("R", "Restore — pick an archive to roll back to"),
 ];
 
-/// §4.67-b MN3: the default view of `Leaf::Settings`.
+/// The default view of `Leaf::Settings`.
 ///
 /// The card is titled after its LEAF, which is what every other tab does
 /// (Devices → "Devices", Lists → "Lists", …). This module was the single
 /// exception before the split — it titled its card "Configuration" while
-/// its leaf said "Settings", and had done so since before §4.67 renamed
-/// the section. Fixed here rather than inherited.
+/// its leaf said "Settings". Fixed here rather than inherited.
 fn render_landing(f: &mut Frame, area: Rect, app: &App) {
     let content = render_section_chrome(f, area, "Settings", T.text_secondary);
 
@@ -95,7 +99,7 @@ fn render_landing(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
 }
 
-/// Sprint 5 (Q4): the "Last auto-backup" status line. `None` archive ⇒ a
+/// The "Last auto-backup" status line. `None` archive ⇒ a
 /// muted "never" state; otherwise `<date> (<age>)`, reusing the restore
 /// modal's `format_date`/`format_age` so the formatting matches the
 /// restore picker. `now` is injected so the relative age is testable.
@@ -119,9 +123,9 @@ pub(crate) fn auto_backup_status_line(
     }
 }
 
-/// Sprint 5 (Q5): the failure banner. Empty when healthy. One red
+/// The failure banner. Empty when healthy. One red
 /// `✗ auto-backup failed: <reason>` line when failing but not disabled.
-/// Two lines when the Q5 latch tripped — a stronger
+/// Two lines when the disable-after-N-failures latch tripped — a stronger
 /// `✗ auto-backup disabled after N failures: <reason>` line plus a muted
 /// hint naming the `--reset-auto-failure` recovery verb. `<reason>`
 /// falls back to "unknown" when no error message was recorded.
@@ -155,7 +159,7 @@ pub(crate) fn auto_backup_banner_lines(
     }
 }
 
-/// Sprint 39: render the Tracking form — three stacked rows
+/// Render the Tracking form — three stacked rows
 /// (checkbox / radio / numeric input) plus a help + footer line.
 /// Focused row is highlighted; unfocused rows render at muted
 /// intensity so the operator always sees WHICH control is live.
@@ -295,7 +299,7 @@ mod tests {
     use super::*;
     use time::macros::datetime;
 
-    // Mirrors the Sprint 1 `backup_submitted_*_color` color-assertion
+    // Mirrors the `backup_submitted_*_color` color-assertion
     // idiom: build the pure Line(s), then assert the foreground colour
     // and the frozen text on `spans[0]`.
 

@@ -16,7 +16,7 @@
 //!   [`device_type`](super::device::Device::device_type) and
 //!   [`department`](super::device::Device::department) stay
 //!   `Option<String>`. Promoting them to `Option<Id>` would make every
-//!   config on disk unloadable — `"Alex"` and `"Apple TV"` are not
+//!   config on disk unloadable — `"Operator"` and `"Apple TV"` are not
 //!   valid [`Id`]s, and the boxes holding those values serve real
 //!   household DNS.
 //! - A value outside the vocabulary still loads. The validator emits
@@ -169,9 +169,9 @@ impl FromStr for LabelKind {
 ///
 /// ```toml
 /// [[labels]]
-/// id           = "alex"
+/// id           = "operator"
 /// kind         = "owner"
-/// display_name = "Alex"
+/// display_name = "Operator"
 /// description  = "Dispositivi personali"
 /// ```
 ///
@@ -189,7 +189,7 @@ pub struct Label {
     pub kind: LabelKind,
     /// The value as a human writes it. This is also what the metadata
     /// fields on `[[devices]]` are matched against — a device with
-    /// `owner = "Alex"` is inside the vocabulary if some `owner`
+    /// `owner = "Operator"` is inside the vocabulary if some `owner`
     /// label has either that `id` or that `display_name`, so declaring
     /// the vocabulary never forces a mass rewrite of existing configs.
     pub display_name: String,
@@ -218,7 +218,7 @@ impl Label {
     /// Matches the [`Self::id`] **or** the [`Self::display_name`],
     /// exactly and case-sensitively. Accepting the display name is the
     /// whole reason declaring a vocabulary does not force a mass rewrite:
-    /// the live configs hold `owner = "Alex"`, which can never equal
+    /// the live configs hold `owner = "Operator"`, which can never equal
     /// an [`Id`] (uppercase), so an id-only rule would WARN on every
     /// device that is already correct and push the operator toward
     /// exactly the bulk edit this feature is meant to avoid.
@@ -246,15 +246,15 @@ mod tests {
     fn minimal_label_deserialises() {
         let l: Label = toml::from_str(
             r#"
-id = "alex"
+id = "operator"
 kind = "owner"
-display_name = "Alex"
+display_name = "Operator"
 "#,
         )
         .unwrap();
-        assert_eq!(l.id.as_str(), "alex");
+        assert_eq!(l.id.as_str(), "operator");
         assert_eq!(l.kind, LabelKind::Owner);
-        assert_eq!(l.display_name, "Alex");
+        assert_eq!(l.display_name, "Operator");
         assert!(l.description.is_none());
     }
 
@@ -262,9 +262,9 @@ display_name = "Alex"
     fn full_label_deserialises() {
         let l: Label = toml::from_str(
             r#"
-id = "alex"
+id = "operator"
 kind = "owner"
-display_name = "Alex"
+display_name = "Operator"
 description = "Dispositivi personali"
 "#,
         )
@@ -331,7 +331,7 @@ colour = "red"
     /// a vocabulary entry no picker can round-trip.
     #[test]
     fn invalid_id_rejected() {
-        for bad in ["Alex", "-alex", "alex-", "edo ardo"] {
+        for bad in ["Operator", "-operator", "operator-", "edo ardo"] {
             let src = format!("id = \"{bad}\"\nkind = \"owner\"\ndisplay_name = \"E\"\n");
             assert!(
                 toml::from_str::<Label>(&src).is_err(),
@@ -362,13 +362,14 @@ colour = "red"
     #[test]
     fn matches_the_id_and_the_display_name_but_nothing_else() {
         let l: Label =
-            toml::from_str("id = \"alex\"\nkind = \"owner\"\ndisplay_name = \"Alex\"\n").unwrap();
-        assert!(l.matches_value("alex"));
-        assert!(l.matches_value("Alex"));
+            toml::from_str("id = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n")
+                .unwrap();
+        assert!(l.matches_value("operator"));
+        assert!(l.matches_value("Operator"));
         // Case folding is deliberately absent: `Personal` vs `Persona`
         // is the defect being hunted, and no folding would merge those.
-        assert!(!l.matches_value("ALEX"));
-        assert!(!l.matches_value("ale"));
+        assert!(!l.matches_value("EDOARDO"));
+        assert!(!l.matches_value("edoard"));
     }
 
     #[test]

@@ -6,7 +6,15 @@
 //! note in the same commit.
 
 use purge_warden::cli::commands::cluster::{LEAVE_UPSTREAM_NOT_NEEDED, LEAVE_WOULD_STRAND_NODE};
-use purge_warden::config::schema::cluster::CLUSTER_SECONDARY_REQUIRES_PEER_CERT;
+use std::path::PathBuf;
+
+use purge_warden::config::schema::cluster::{
+    format_cluster_enable_cert_already_exists, CLUSTER_ENABLE_CERT_ALREADY_EXISTS,
+    CLUSTER_ENABLE_LISTEN_IS_LOOPBACK, CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH,
+    CLUSTER_ENABLE_REQUIRES_SAN, CLUSTER_ENABLE_REQUIRES_TOKEN_HASH,
+    CLUSTER_ENABLE_ROLE_SECONDARY_USE_JOIN, CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT,
+    CLUSTER_SECONDARY_REQUIRES_PEER_CERT,
+};
 use purge_warden::config::schema::validator::{
     CLUSTER_ALLOW_PEER_INVALID_CIDR, CLUSTER_ENABLED_REQUIRES_TOKEN_HASH,
     CLUSTER_POLL_INTERVAL_ZERO, CLUSTER_SECONDARY_MASTER_CARRIES_POLICY,
@@ -85,7 +93,7 @@ fn allow_peer_invalid_cidr_byte_for_byte() {
     assert_eq!(
         CLUSTER_ALLOW_PEER_INVALID_CIDR,
         "cluster: `allow_peer` entry '{entry}' is not a valid CIDR ({reason}). \
-         Use forms like 192.0.2.10/32 or 192.0.2.0/24."
+         Use forms like 192.0.2.10/32 or 10.10.1.0/24."
     );
 }
 
@@ -162,4 +170,111 @@ fn cluster_consts_are_scoped_and_nonempty() {
     // The peer-invalid template keeps its placeholders.
     assert!(CLUSTER_SECONDARY_PEER_INVALID.contains("{peer}"));
     assert!(CLUSTER_SECONDARY_PEER_INVALID.contains("{reason}"));
+}
+
+// ── S4 `warden cluster enable` ─────────────────────────────────
+//
+// Seven refusals, all frozen. They live in the UNGATED
+// `config::schema::cluster` module, so this file pins them in the default
+// build too — a const behind `--features cluster` is unpinned in the build
+// almost everyone compiles, which is the same reasoning that put
+// `CLUSTER_SECONDARY_REQUIRES_PEER_CERT` there.
+
+#[test]
+fn enable_role_secondary_use_join_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_ROLE_SECONDARY_USE_JOIN,
+        "cluster: `enable --role secondary` is not how a secondary is turned on. A secondary must \
+         also record the primary it follows, the token it authenticates with, and the certificate \
+         it pins — none of which this verb takes. \
+         Run `warden cluster join --peer <primary-url> --token-file <path> --peer-cert <pem>`. \
+         Nothing has been written."
+    );
+}
+
+#[test]
+fn enable_requires_token_hash_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_REQUIRES_TOKEN_HASH,
+        "cluster: `token_hash` is unset, so an enabled primary would reject every secondary's \
+         poll. Run `warden cluster token` first — it mints the bearer credential and prints the \
+         plaintext ONCE, to carry to the secondary. Nothing has been written."
+    );
+}
+
+/// Frozen because it is the only place the operator learns that `--api-listen`
+/// exists at all: no other verb sets `api.listen`, and the default is
+/// loopback, so without this sentence a fresh node has no route to a working
+/// primary short of hand-editing TOML.
+#[test]
+fn enable_listen_is_loopback_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_LISTEN_IS_LOOPBACK,
+        "cluster: a primary whose `api.listen` is a loopback address can serve no remote \
+         secondary — the sync channel is the API server. Pass an address the secondary can \
+         reach, e.g. `--api-listen 192.0.2.10:8053`. Nothing has been written."
+    );
+}
+
+#[test]
+fn enable_requires_api_token_hash_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH,
+        "api: `token_hash` is unset. Enabling clustering turns the API server on — the cluster \
+         routes mount on it — and an API without a token hash is refused at every load. \
+         Run `warden token generate` first. Nothing has been written."
+    );
+}
+
+#[test]
+fn enable_requires_san_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_REQUIRES_SAN,
+        "cluster: this node carries no `api.tls_cert`, so `enable` has to mint one — and a \
+         certificate needs at least one subject alternative name. Pinning does not disable \
+         hostname verification: rustls checks the SAN against the host the secondary dials, so a \
+         certificate minted without it fails every poll while looking perfectly well-formed. \
+         Pass `--san <ADDR>` once per address a secondary will use, e.g. `--san 192.0.2.10`. \
+         Nothing has been written."
+    );
+}
+
+#[test]
+fn enable_cert_already_exists_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_CERT_ALREADY_EXISTS,
+        "cluster: TLS material already exists beside the master config, and minting over it \
+         would invalidate the pin of every secondary that has already joined. There is no \
+         `--force`: if replacing the certificate is what you mean to do, remove these files \
+         yourself first, then re-run — {paths}. Nothing has been written."
+    );
+}
+
+/// The const and the substitution are pinned together, for the same reason
+/// `format_api_metrics_public_unauth` is: the literal alone stays green while
+/// the formatter silently drops a path — and the paths ARE the remedy here,
+/// because S4 ships no `--force`.
+#[test]
+fn enable_cert_already_exists_names_every_path_it_is_given() {
+    let out = format_cluster_enable_cert_already_exists(&[
+        PathBuf::from("/etc/purge-warden/api.crt"),
+        PathBuf::from("/etc/purge-warden/api.key"),
+    ]);
+    assert!(out.contains("/etc/purge-warden/api.crt"), "{out}");
+    assert!(out.contains("/etc/purge-warden/api.key"), "{out}");
+    assert!(
+        !out.contains("{paths}"),
+        "the placeholder must be substituted, not printed: {out}"
+    );
+}
+
+#[test]
+fn enable_san_with_existing_cert_byte_for_byte() {
+    assert_eq!(
+        CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT,
+        "cluster: `--san` was passed, but this node already carries its own `api.tls_cert` — a \
+         minted certificate would be written and never used. Drop `--san` to enable clustering \
+         with the certificate you already have, or clear `api.tls_cert` and `api.tls_key` first. \
+         Nothing has been written."
+    );
 }

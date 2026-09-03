@@ -1,12 +1,12 @@
-//! Sprint 36 HR1 — Shared IPC-reload helper for post-write hot reload.
+//! Shared IPC-reload helper for post-write hot reload.
 //!
-//! Every `warden` subcommand that mutates the v1 master on disk (Sprint
-//! 34's `devices`/`groups`/`subnets`/`schedules`/`blocklists` editors,
-//! plus `profiles set block-response` from Sprint 23) calls
-//! [`attempt_reload`] after the write lands atomically via CS2. The
-//! result is classified into a [`ReloadOutcome`] and surfaced to the
-//! operator through [`report_reload_outcome`] with the four frozen
-//! strings documented in `_docs/features/config_safety_v12.md` §2 HR1.
+//! Every `warden` subcommand that mutates the v1 master on disk (the
+//! `devices`/`groups`/`subnets`/`schedules`/`blocklists` editors, plus
+//! `profiles set block-response`) calls [`attempt_reload`] after the
+//! write lands atomically. The result is classified into a
+//! [`ReloadOutcome`] and surfaced to the operator through
+//! [`report_reload_outcome`] with four frozen strings shared by every
+//! editor subcommand.
 //!
 //! # Why not reuse `token::attempt_ipc_reload`?
 //!
@@ -18,23 +18,21 @@
 //! Unifying the two would muddy both contracts, so `token.rs` keeps its
 //! specialised helper and this module owns the generic "post-write" one.
 //!
-//! # Panel refinements (review 2026-04-23)
+//! # Panel refinements
 //!
 //! - `"response timeout"` from `send_command` is classified as
-//!   [`ReloadOutcome::DaemonUnreachable`]. The design doc §2 HR1 only
-//!   listed the three connect-side errors; a read-side stall is
-//!   operationally equivalent (daemon can't tell us it reloaded).
+//!   [`ReloadOutcome::DaemonUnreachable`]: a read-side stall is
+//!   operationally equivalent to a connect-side failure (daemon can't
+//!   tell us it reloaded).
 //! - [`load_token`] returning `Err(io::Error)` — file present but
 //!   unreadable — maps to [`ReloadOutcome::NoToken`] with an extra
-//!   diagnostic line on stderr naming the I/O error. The design doc
-//!   §2 HR1 did not distinguish "absent" from "unreadable"; both yield
-//!   the same operator action (regenerate or restart), so the shared
-//!   variant is correct and the extra line resolves the ambiguity.
+//!   diagnostic line on stderr naming the I/O error, since "absent" and
+//!   "unreadable" yield the same operator action (regenerate or
+//!   restart) but the extra line resolves the ambiguity.
 //! - One-shot retry after 50 ms on `ReloadFailed` whose message looks
-//!   like an authentication mismatch. Mitigates the known Sprint 35
-//!   race between a concurrent `warden token regenerate` and any
-//!   entity-editor command (see `config_safety_v11.md` §8.3 pitfall
-//!   3). A single retry is enough because the rotation window is
+//!   like an authentication mismatch. Mitigates a race between a
+//!   concurrent `warden token regenerate` and any entity-editor
+//!   command. A single retry is enough because the rotation window is
 //!   bounded by a single daemon reload; more retries would only mask
 //!   genuine auth failures.
 
@@ -123,8 +121,8 @@ async fn attempt_reload_with(socket_path: &Path, load: &TokenLoader) -> ReloadOu
 
     let outcome = send_reload(socket_path, &token).await;
 
-    // Panel refinement: one-shot retry on authentication-like failures.
-    // A concurrent `warden token regenerate` can swap the daemon's
+    // One-shot retry on authentication-like failures: a concurrent
+    // `warden token regenerate` can swap the daemon's
     // token_hash between our token load and the daemon's verify. The
     // window is microseconds on a local socket and bounded by a single
     // daemon reload — a single retry after 50 ms is enough.
@@ -158,9 +156,9 @@ async fn send_reload(socket_path: &Path, token: &str) -> ReloadOutcome {
 ///
 /// Matches on the rendered string because `socket_client::send_command`
 /// collapses its transport failures into `anyhow` — a typed `io::ErrorKind`
-/// match would be sturdier but needs a return-type change in `ipc/`
-/// (cross-section, not chased here). Shared with `token::attempt_ipc_reload`
-/// so both post-write reload paths classify identically. cli §9 #7.
+/// match would be sturdier but needs a return-type change in `ipc/`. Shared
+/// with `token::attempt_ipc_reload` so both post-write reload paths classify
+/// identically.
 pub(crate) fn is_unreachable_transport_msg(msg: &str) -> bool {
     // "response timeout" (read-side stall) joins the connect-side errors: a
     // daemon that accepted the connection but never wrote a response line is,
@@ -194,9 +192,8 @@ fn looks_like_auth_mismatch(outcome: &ReloadOutcome) -> bool {
 ///
 /// `stdout` for the benign outcomes (`Reloaded`, `DaemonUnreachable`),
 /// `stderr` for the ones the operator may need to act on (`NoToken`,
-/// `ReloadFailed`). The strings themselves are frozen in
-/// `_docs/features/config_safety_v12.md` §2 HR1 so every editor speaks the
-/// same vocabulary.
+/// `ReloadFailed`). The strings themselves are frozen so every editor
+/// speaks the same vocabulary.
 pub fn report_reload_outcome(outcome: &ReloadOutcome) {
     match outcome {
         ReloadOutcome::Reloaded => {
@@ -367,10 +364,9 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_reload_returns_no_token_with_io_error_when_unreadable() {
-        // Panel refinement (review 2026-04-23): a token file that exists
-        // but can't be read (e.g. permission denied for the calling
-        // user) must carry the I/O error forward so the operator sees
-        // it alongside the frozen message.
+        // A token file that exists but can't be read (e.g. permission
+        // denied for the calling user) must carry the I/O error forward
+        // so the operator sees it alongside the frozen message.
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("unused.sock");
 
@@ -457,10 +453,10 @@ mod tests {
 
     #[test]
     fn classify_transport_error_maps_response_timeout_to_unreachable() {
-        // Design doc §2 HR1 listed only the three connect-side errors
+        // Only the three connect-side errors were originally handled
         // ("No such file or directory", "Connection refused",
-        // "connection timeout"). Panel refinement: "response timeout"
-        // from `send_command`'s read-side must also map to
+        // "connection timeout"). "response timeout" from
+        // `send_command`'s read-side must also map to
         // DaemonUnreachable because from the CLI's perspective the
         // daemon hasn't confirmed the reload — same outcome class.
         assert!(matches!(

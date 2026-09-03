@@ -19,15 +19,15 @@ use crate::config::settings::{LocalDnsConfig, LocalDnsRecordType};
 
 type RecordMap = HashMap<CompactString, Vec<Record>, ahash::RandomState>;
 
-/// Outcome of a global local-records probe (rev-2606 local-01).
+/// Outcome of a global local-records probe.
 pub enum LocalLookup {
     /// Records matching the qtype (possibly via one local CNAME hop),
     /// plus the **matched record's apex** — the configured record identity
     /// that fired (the exact forward key, the wildcard suffix key, or the
     /// PTR's owning forward name). The handler keys the per-record hit
     /// counter by this apex, not by the raw QNAME, so a wildcard flood of
-    /// distinct subdomains all roll up under the one apex (perfmem T1 /
-    /// TRK-01 — bounds `LocalRecordsHits` cardinality to the config).
+    /// distinct subdomains all roll up under the one apex — this bounds
+    /// `LocalRecordsHits` cardinality to the config, not to observed traffic.
     Hit {
         records: Vec<Record>,
         apex: CompactString,
@@ -62,8 +62,8 @@ struct LocalData {
     /// sorted by label depth **descending** so a linear scan returns the
     /// longest matching suffix first. Mirrors
     /// [`crate::dns::local_profile::ProfileLocalRecords`]'s `suffix_index`; the
-    /// global `LocalData` is its exact-only sibling, extended here for
-    /// rev-2606 global-localdns-wildcard-dead.
+    /// global `LocalData` is its exact-only sibling, extended to also serve
+    /// wildcard-descendant lookups.
     suffix_index: Vec<(CompactString, Vec<Record>)>,
     /// Fast-path bit. When `false` (no record sets `match_subdomains`),
     /// [`LocalRecords::lookup`] skips the suffix walk entirely and keeps its
@@ -116,8 +116,8 @@ impl LocalRecords {
     pub fn lookup(&self, domain: &str, qtype: RecordType) -> LocalLookup {
         let data = self.inner.load();
 
-        // Exact forward match (Sprint 18 path — behaviour unchanged).
-        // `None` owner: an exact hit's record already owns the queried name.
+        // Exact forward match. `None` owner: an exact hit's record already
+        // owns the queried name.
         if let Some(records) = data.forward.get(domain) {
             return resolve_forward(
                 records,
@@ -130,16 +130,14 @@ impl LocalRecords {
             );
         }
 
-        // rev-2606 global-localdns-wildcard-dead: walk ancestors for a
-        // `match_subdomains = true` record. Gated two ways so nothing else
-        // regresses:
+        // Walk ancestors for a `match_subdomains = true` record. Gated two
+        // ways so nothing else regresses:
         //   * `has_subdomain_records` — a config with no wildcards skips the
         //     walk entirely and keeps its exact-only cost (the common case, on
         //     the per-query hot path);
         //   * `A | AAAA | CNAME` — PTR and every other qtype keep the exact +
-        //     NODATA + reverse path below byte-identical, and we never claim
-        //     authority over an infinite MX/TXT namespace under a wildcard
-        //     (matches profile-scope DR4).
+        //     NODATA + reverse path byte-identical, and this never claims
+        //     authority over an infinite MX/TXT namespace under a wildcard.
         // A wildcard record's apex lives in `forward`, so the exact probe above
         // already served it; here we only match proper descendants. Longest
         // suffix wins (`suffix_index` is sorted depth-descending). Mirrors
@@ -158,7 +156,7 @@ impl LocalRecords {
                     let owner = Name::from_str(&format!("{domain}.")).ok();
                     // Apex = the matched suffix key (`current`), NOT the raw
                     // QNAME `domain`: every distinct subdomain of one wildcard
-                    // record counts under the single configured apex (TRK-01).
+                    // record counts under the single configured apex.
                     return resolve_forward(
                         records,
                         qtype,
@@ -169,8 +167,8 @@ impl LocalRecords {
                         current,
                     );
                 }
-                // Stop once the single-label TLD has been probed — DR9 forbids
-                // wildcards on public suffixes, so nothing shorter can match.
+                // Stop once the single-label TLD has been probed — wildcards
+                // on public suffixes aren't allowed, so nothing shorter can match.
                 if current.is_empty() || !current.contains('.') {
                     break;
                 }
@@ -224,20 +222,19 @@ fn build_data(config: &LocalDnsConfig) -> LocalData {
     let mut forward: RecordMap = HashMap::with_hasher(ahash::RandomState::new());
     let mut reverse: RecordMap = HashMap::with_hasher(ahash::RandomState::new());
     let nodata_for_missing_types = config.nodata_for_missing_types;
-    // rev-2606 global-localdns-wildcard-dead: wildcard (`match_subdomains`)
-    // records accumulate here keyed on their apex, then become `suffix_index`.
+    // Wildcard (`match_subdomains`) records accumulate here keyed on their
+    // apex, then become `suffix_index`.
     let mut subdomain_groups: RecordMap = HashMap::with_hasher(ahash::RandomState::new());
 
     for entry in &config.records {
-        // rev-2606 cfg-validator-02: per-record TTL override wins; the
-        // section value is the fallback — the same DR5 contract the
-        // profile-scope builder has always implemented. Derived PTR
-        // records inherit their parent record's effective TTL.
+        // Per-record TTL override wins; the section value is the fallback —
+        // the same contract the profile-scope builder implements. Derived
+        // PTR records inherit their parent record's effective TTL.
         let ttl = entry.ttl_secs.unwrap_or(config.ttl_secs);
-        // Same canonicalization the validator keys its checks on
-        // (cfg-validator-03): trim + strip trailing dots + lowercase, so a
-        // validated spelling like "NAS.Home." builds the same table entry
-        // the handler's lowercase dot-less query probe will hit.
+        // Same canonicalization the validator keys its checks on: trim +
+        // strip trailing dots + lowercase, so a validated spelling like
+        // "NAS.Home." builds the same table entry the handler's lowercase
+        // dot-less query probe will hit.
         let domain = crate::config::validator::canonicalize_domain(&entry.domain);
         let Ok(name) = Name::from_str(&format!("{domain}.")) else {
             // Unreachable for validated configs (FQDN gate + shared
@@ -256,9 +253,9 @@ fn build_data(config: &LocalDnsConfig) -> LocalData {
                 let record = Record::from_rdata(name.clone(), ttl, RData::A(A(ip)));
 
                 // Auto-generate PTR — reuse the already-parsed forward `name`
-                // as the PTR target rather than re-parsing `{domain}.` (the
-                // pre-fix `.unwrap()` was a latent panic on the build / hot-reload
-                // path had the two strings ever drifted).
+                // as the PTR target rather than re-parsing `{domain}.`: two
+                // independent parses of what should be the same string could
+                // drift and panic on unwrap during build or hot-reload.
                 let ptr_domain = ipv4_to_ptr(&ip);
                 if let Ok(ptr_name) = Name::from_str(&format!("{ptr_domain}.")) {
                     let ptr_record = Record::from_rdata(ptr_name, ttl, RData::PTR(PTR(name)));
@@ -276,9 +273,9 @@ fn build_data(config: &LocalDnsConfig) -> LocalData {
                 let record = Record::from_rdata(name.clone(), ttl, RData::AAAA(AAAA(ip)));
 
                 // Auto-generate PTR — reuse the already-parsed forward `name`
-                // as the PTR target rather than re-parsing `{domain}.` (the
-                // pre-fix `.unwrap()` was a latent panic on the build / hot-reload
-                // path had the two strings ever drifted).
+                // as the PTR target rather than re-parsing `{domain}.`: two
+                // independent parses of what should be the same string could
+                // drift and panic on unwrap during build or hot-reload.
                 let ptr_domain = ipv6_to_ptr(&ip);
                 if let Ok(ptr_name) = Name::from_str(&format!("{ptr_domain}.")) {
                     let ptr_record = Record::from_rdata(ptr_name, ttl, RData::PTR(PTR(name)));
@@ -335,7 +332,7 @@ fn build_data(config: &LocalDnsConfig) -> LocalData {
 /// exact probe and the wildcard suffix walk in [`LocalRecords::lookup`].
 /// Direct qtype match → [`LocalLookup::Hit`]; for A/AAAA, one local CNAME hop
 /// is followed; a locally-defined name with nothing for this qtype synthesises
-/// [`LocalLookup::NodataSynthesis`] (anti-leak, local-01) unless the operator
+/// [`LocalLookup::NodataSynthesis`] (an anti-leak measure) unless the operator
 /// disabled it, in which case it falls through to [`LocalLookup::Miss`].
 fn resolve_forward(
     records: &[Record],
@@ -402,8 +399,8 @@ fn resolve_forward(
     }
 
     // Name exists locally but holds nothing for this qtype: synthesise NODATA
-    // instead of leaking the name upstream (local-01). Flag-off restores the
-    // legacy fall-through.
+    // instead of leaking the name upstream. Flag-off restores the legacy
+    // fall-through.
     if nodata_for_missing_types {
         return LocalLookup::NodataSynthesis { ttl };
     }
@@ -471,9 +468,9 @@ fn ipv6_to_ptr(ip: &Ipv6Addr) -> String {
         nibbles.push(seg & 0xf);
     }
     nibbles.reverse();
-    // local-02: single-buffer write instead of a Vec<String> of 32 one-char
-    // `format!`s + `join` + a final `format!` (~35 allocs). 32 nibbles × "x."
-    // = 64 bytes + "ip6.arpa" = 72. Cold path (config build/reload), so this is
+    // Single-buffer write instead of a Vec<String> of 32 one-char `format!`s
+    // + `join` + a final `format!` (~35 allocs). 32 nibbles × "x." = 64 bytes
+    // + "ip6.arpa" = 72. Cold path (config build/reload), so this is
     // tidiness, not a hot-loop win — but the output is byte-identical.
     let mut out = String::with_capacity(72);
     for n in &nibbles {
@@ -508,7 +505,7 @@ mod tests {
     }
 
     /// Like [`config_with`] but each tuple carries its `match_subdomains` flag
-    /// — for the rev-2606 global-localdns-wildcard-dead suffix-walk tests.
+    /// — for the suffix-walk tests.
     fn config_with_flags(records: Vec<(&str, LocalDnsRecordType, &str, bool)>) -> LocalDnsConfig {
         LocalDnsConfig {
             ttl_secs: 3600,
@@ -582,9 +579,9 @@ mod tests {
         assert_eq!(result[1].record_type(), RecordType::A);
         // Owner split — the same invariant `wildcard_cname_follow_local_target_owner_split`
         // pins for the wildcard path. Asserted here too because the exact-match
-        // case never got the treatment when localdns-wildcard-owner was fixed:
-        // a regression on this path would have been masked by its passing
-        // wildcard sibling sitting a few tests below.
+        // case gets no equivalent re-owning treatment: a regression on this
+        // path would have been masked by its passing wildcard sibling sitting
+        // a few tests below.
         assert_eq!(
             &result[0].name,
             &Name::from_str("media.home.").unwrap(),
@@ -624,8 +621,8 @@ mod tests {
 
     #[test]
     fn per_record_ttl_override_wins_fallback_elsewhere() {
-        // rev-2606 cfg-validator-02: the validated per-record TTL is the
-        // served TTL on the global path too (profile scope always did).
+        // The validated per-record TTL is the served TTL on the global path
+        // too (profile scope always did).
         let mut cfg = config_with(vec![
             ("nas.home", LocalDnsRecordType::A, "192.168.1.50"),
             ("printer.home", LocalDnsRecordType::A, "192.168.1.60"),
@@ -666,8 +663,8 @@ mod tests {
 
     #[test]
     fn lookup_wrong_type_synthesises_nodata() {
-        // local-01: AAAA query for a domain that only has an A record must
-        // NOT fall through to upstream — the name is locally authoritative.
+        // AAAA query for a domain that only has an A record must NOT fall
+        // through to upstream — the name is locally authoritative.
         let cfg = config_with(vec![("nas.home", LocalDnsRecordType::A, "192.168.1.50")]);
         let local = LocalRecords::build(&cfg);
 
@@ -751,8 +748,8 @@ mod tests {
     fn ipv6_ptr_format() {
         let ip: Ipv6Addr = "fd00::1".parse().unwrap();
         let ptr = ipv6_to_ptr(&ip);
-        // local-02: exact byte-for-byte pin so the single-buffer rewrite is
-        // provably identical to the old Vec<String>+join form.
+        // Exact byte-for-byte pin so the single-buffer rewrite is provably
+        // identical to the old Vec<String>+join form.
         // fd00::1 expanded = fd00:0000:0000:0000:0000:0000:0000:0001
         assert_eq!(
             ptr,
@@ -760,7 +757,7 @@ mod tests {
         );
     }
 
-    // ── rev-2606 global-localdns-wildcard-dead: global match_subdomains ──
+    // ── Global match_subdomains suffix-walk tests ──
     // Mirrors the `local_profile` t2_* suffix-walk cases on the global table.
 
     fn a_ip(records: &[Record]) -> Ipv4Addr {
@@ -774,40 +771,27 @@ mod tests {
     fn wildcard_apex_served_via_exact_path() {
         // A `match_subdomains` record answers its own apex via the exact probe
         // (the apex is also in `forward`), no walk needed.
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
         assert!(local.has_subdomain_records());
         assert_eq!(local.suffix_count(), 1);
         let hit = local.lookup("example.test", RecordType::A).hit().unwrap();
         assert_eq!(a_ip(&hit), Ipv4Addr::new(10, 0, 0, 1));
         // Apex guard: the exact/apex answer stays owned by the apex (which
-        // equals the queried name here) — the owner-rewrite fix must NOT
-        // touch this path. Passes both pre- and post-fix.
+        // equals the queried name here) — the wildcard-descendant owner
+        // rewrite must not touch this path.
         assert_eq!(&hit[0].name, &Name::from_str("example.test.").unwrap());
     }
 
     #[test]
     fn wildcard_matches_descendant() {
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
-        let hit = local
-            .lookup("app.example.test", RecordType::A)
-            .hit()
-            .unwrap();
+        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
         assert_eq!(a_ip(&hit), Ipv4Addr::new(10, 0, 0, 1));
-        // localdns-wildcard-owner: the wire invariant — a wildcard-descendant
-        // answer must be OWNED by the QNAME, not the configured apex, or
-        // RFC-conformant stubs (glibc getanswer_r strcasecmp) discard it.
+        // The wire invariant — a wildcard-descendant answer must be OWNED by
+        // the QNAME, not the configured apex, or RFC-conformant stubs (glibc
+        // getanswer_r strcasecmp) discard it.
         assert_eq!(&hit[0].name, &Name::from_str("app.example.test.").unwrap());
         // ...and a deeper descendant too.
         let deep = local
@@ -844,21 +828,13 @@ mod tests {
             ("app.example.test", LocalDnsRecordType::A, "10.0.0.2", false),
         ]);
         let local = LocalRecords::build(&cfg);
-        let hit = local
-            .lookup("app.example.test", RecordType::A)
-            .hit()
-            .unwrap();
+        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
         assert_eq!(a_ip(&hit), Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]
     fn wildcard_does_not_match_unrelated_name() {
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("google.com", RecordType::A),
@@ -896,12 +872,7 @@ mod tests {
     fn wildcard_descendant_wrong_address_qtype_synthesises_nodata() {
         // Wildcard A-only → an AAAA query for a descendant is anti-leaked as
         // NODATA, same as the exact-match path does for the apex.
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("app.example.test", RecordType::AAAA),
@@ -912,14 +883,10 @@ mod tests {
     #[test]
     fn wildcard_descendant_non_address_qtype_misses() {
         // Non-A/AAAA/CNAME qtypes never enter the walk → the descendant falls
-        // through to upstream (Miss), matching profile-scope DR4. The exact
-        // apex still NODATAs every qtype (covered by the exact-path tests).
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        // through to upstream (Miss), matching profile-scope behaviour. The
+        // exact apex still NODATAs every qtype (covered by the exact-path
+        // tests).
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("app.example.test", RecordType::MX),
@@ -937,21 +904,18 @@ mod tests {
         )]);
         let local = LocalRecords::build(&cfg);
         // A query on a descendant → CNAME only (external target).
-        let hit = local
-            .lookup("api.example.test", RecordType::A)
-            .hit()
-            .unwrap();
+        let hit = local.lookup("api.example.test", RecordType::A).hit().unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].record_type(), RecordType::CNAME);
-        // localdns-wildcard-owner: the wildcard CNAME RR is owned by the
-        // QNAME, not the apex. (Its RDATA target is untouched.)
+        // The wildcard CNAME RR is owned by the QNAME, not the apex. (Its
+        // RDATA target is untouched.)
         assert_eq!(&hit[0].name, &Name::from_str("api.example.test.").unwrap());
     }
 
     #[test]
     fn wildcard_cname_follow_local_target_owner_split() {
-        // localdns-wildcard-owner: wildcard CNAME on `example.test` → local
-        // target `nas.home` (A). A descendant A query must return TWO RRs:
+        // Wildcard CNAME on `example.test` → local target `nas.home` (A). A
+        // descendant A query must return TWO RRs:
         //   * the CNAME RR owned by the QNAME (`app.example.test`), and
         //   * the followed target's A RR still owned by the concrete target
         //     name (`nas.home`) — the target is NOT the wildcard.
@@ -960,10 +924,7 @@ mod tests {
             ("nas.home", LocalDnsRecordType::A, "192.168.1.50", false),
         ]);
         let local = LocalRecords::build(&cfg);
-        let hit = local
-            .lookup("app.example.test", RecordType::A)
-            .hit()
-            .unwrap();
+        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
         assert_eq!(hit.len(), 2);
         assert_eq!(hit[0].record_type(), RecordType::CNAME);
         assert_eq!(
@@ -1005,19 +966,14 @@ mod tests {
 
     #[test]
     fn wildcard_flood_bounds_hit_table_to_apex_global() {
-        // TRK-01 / perfmem T1 — the load-bearing regression. A single
-        // `match_subdomains` record answers an unbounded set of distinct
-        // subdomains; every hit must key by the ONE configured apex the
-        // lookup surfaces (`Hit.apex`), NOT the raw QNAME, so the
-        // `LocalRecordsHits` table can't be grown by a LAN wildcard flood.
+        // Load-bearing regression: a single `match_subdomains` record answers
+        // an unbounded set of distinct subdomains; every hit must key by the
+        // ONE configured apex the lookup surfaces (`Hit.apex`), NOT the raw
+        // QNAME, so the `LocalRecordsHits` table can't be grown by a LAN
+        // wildcard flood.
         use crate::tracking::{LocalRecordsHits, LocalRecordsScopeKey};
 
-        let cfg = config_with_flags(vec![(
-            "example.test",
-            LocalDnsRecordType::A,
-            "10.0.0.1",
-            true,
-        )]);
+        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
         let local = LocalRecords::build(&cfg);
         let hits = LocalRecordsHits::new();
 

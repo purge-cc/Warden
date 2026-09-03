@@ -12,4 +12,4 @@ retired_at = "2026-04-01T00:00:00Z"
 [[devices]]
 id = "freshly-retired"
 display_name = "Collided"
-ip = "192.0.2.42"
+ip = "10.10.1.42"

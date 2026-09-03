@@ -255,20 +255,14 @@ fn print_corpus(config_path: &Path, live: &LiveCorpus) {
 /// whose whole job is talking to the daemon.
 ///
 /// **Loader.** Uses the v1 [`loader::load_config`] (the same loader the
-/// daemon and the rest of the post-§4.24 CLI surface use). Pre-§4.24
-/// follow-up this path was on the legacy `Settings::from_file` which
-/// did not carry `[[blocklists]]` structurally — with `[lists].sources
-/// = []` (post-S53 steady state) and `[[blocklists]]` populated it
-/// silently exited with `"no list sources configured"`. The migration
-/// closes that gap on the foreground path; the SIGHUP path on a live
-/// daemon was already correct via §4.24.
+/// daemon and the rest of the CLI surface use), so a config with
+/// `[lists].sources = []` and `[[blocklists]]` populated is read
+/// correctly here rather than reporting "no list sources configured".
 ///
 /// **Cache directory.** Reuses [`lists_cache_dir`] from `start.rs` so
 /// the foreground tool writes into the same FHS-aware path as the
 /// daemon (`/var/lib/<pkg>/lists/` on prod, `<config-parent>/<cache_dir>`
-/// on dev). Pre-fix this path had its own ad-hoc resolution that wrote
-/// to `<config-parent>/<cache_dir>` regardless — silently inconsistent
-/// with the daemon on FHS installs.
+/// on dev).
 pub async fn run_update(
     config_path: &Path,
     pid_file: &Path,
@@ -345,11 +339,10 @@ pub async fn run_update(
 /// the [`FilterEngine`] this produces. `run_update` itself only surfaces an
 /// exit code, a domain count, and the on-disk list cache — none of which can
 /// distinguish a domain that landed in `allow_mask` from one that landed in
-/// `block_mask`, so none of them would have caught the bug this function's
-/// `set_allow_bits` call fixes (neutrality-06 follow-up: this command built
-/// its manager without ever telling it which sources were allow-direction,
-/// so every list — `base = allow` included — was stamped
-/// `DomainMasks::block_only`).
+/// `block_mask`, so none of them would catch a manager built without ever
+/// telling it which sources are allow-direction — every list, `base =
+/// allow` included, would be stamped `DomainMasks::block_only`. The
+/// `set_allow_bits` call below is what prevents that.
 ///
 /// Returns the engine (the caller is free to drop it immediately — nothing
 /// outside this one-shot process reads it again) and the merged domain
@@ -392,7 +385,7 @@ async fn refresh_foreground_filter(
     let source_bits = SourceBitMap::build(&merged_sources, &config.blocklists)
         .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
 
-    // `plp-s3`: the operator's per-profile list policy, projected onto this
+    // The operator's per-profile list policy, projected onto this
     // bit assignment. Computed here, before `source_bits` moves into the
     // manager below, mirroring `start.rs`'s boot and reload paths.
     let policy_masks = source_bits.project_policy(&config.blocklists, &config.profiles);
@@ -639,16 +632,17 @@ servers = ["192.0.2.1:53"]
         master
     }
 
-    /// neutrality-06 follow-up. `run_update`'s foreground path built its
-    /// `ListManager` without ever calling `set_allow_bits`, so
-    /// `Spill::build_shard` stamped every domain — `base = allow` lists
-    /// included — as `DomainMasks::block_only`. This pins the actual
-    /// per-domain verdict `FilterEngine::list_membership` returns, which is
-    /// the primitive the bug corrupts. `run_update`'s exit code and printed
-    /// domain count are identical whether the wiring is present or not
-    /// (both lists contribute one domain each either way), so neither
-    /// would have caught this — this test calls the extracted
-    /// `refresh_foreground_filter` directly to get at the engine itself.
+    /// Guards `run_update`'s foreground path calling `set_allow_bits`
+    /// before building its `ListManager` — without it `Spill::build_shard`
+    /// stamps every domain, `base = allow` lists included, as
+    /// `DomainMasks::block_only`. This pins the actual per-domain verdict
+    /// `FilterEngine::list_membership` returns, which is the primitive a
+    /// missing wiring call would corrupt. `run_update`'s exit code and
+    /// printed domain count are identical whether the wiring is present
+    /// or not (both lists contribute one domain each either way), so
+    /// neither would catch a regression here — this test calls the
+    /// extracted `refresh_foreground_filter` directly to get at the
+    /// engine itself.
     #[tokio::test(flavor = "current_thread")]
     async fn foreground_refresh_honors_list_direction() {
         let tmp = tempfile::tempdir().unwrap();

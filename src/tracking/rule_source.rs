@@ -1,4 +1,4 @@
-//! Sprint 43 T4 (DM5): per-query attribution of WHICH layer matched.
+//! Per-query attribution of WHICH layer matched.
 //!
 //! When the resolver chain + per-device overlay decide a query, the
 //! winning rule belongs to one of three layers:
@@ -9,23 +9,20 @@
 //! - **Device** (`Device.allow_rules` / `Device.deny_rules` reference).
 //!   The device id attribution lets the TUI Rules tab and the audit
 //!   log reflect "this rule fired for THIS device, not the profile".
-//! - **AdminBuiltin** — reserved for future built-in safety rails
-//!   (e.g. anti-bypass NXDOMAIN canaries shipped by the binary itself,
-//!   never serialised to config). Not used yet in T4; declared so T5+
-//!   work can extend the enum without a wire-format break.
+//! - **AdminBuiltin** — reserved for built-in safety rails (e.g.
+//!   anti-bypass NXDOMAIN canaries shipped by the binary itself, never
+//!   serialised to config). Not currently emitted; declared so a future
+//!   producer can extend the enum without a wire-format break.
 //!
-//! Used by:
-//! - `crate::tracking` query log + per-device stats (T5 wires it).
-//! - `crate::profiles::resolver::apply_overlay` ([§4 truth table]) which
-//!   computes the source as a side effect of the 9-row decision.
-//! - `crate::audit` (T6) — every `RuleAdd` / `RuleRemove` audit entry
-//!   carries the source so an operator post-hoc can tell who-allowed-what.
+//! Used by `crate::tracking` (query log + per-device stats),
+//! `crate::profiles::resolver::apply_overlay` (which computes the source
+//! as a side effect of its decision), and `crate::audit`, where every
+//! `RuleAdd` / `RuleRemove` entry carries the source so an operator
+//! post-hoc can tell who-allowed-what.
 //!
-//! Construction kept lean — `RuleSource` is `Clone + Debug + PartialEq`
-//! but does NOT derive `Hash` or `Eq` because `crate::config::schema::Id`
-//! already wraps a `CompactString` and the Eq derive is sufficient for
-//! tracking attribution. If a future module needs `RuleSource` as a
-//! HashMap key, derive `Hash` then.
+//! `RuleSource` derives `Debug + Clone + PartialEq + Eq` but not `Hash` —
+//! nothing keys a collection by `RuleSource` today. If a future module
+//! needs it as a HashMap key, derive `Hash` then.
 
 use crate::config::schema::Id;
 
@@ -39,19 +36,16 @@ pub enum RuleSource {
     /// block matched. The carried `Id` is the profile id (NOT the
     /// admin_rule id) — that is the layer attribution the operator
     /// wants to see ("default profile blocked this", not "rule
-    /// auto-block-abc12345 blocked this", though T5 also surfaces
-    /// the rule id in the detail pane).
+    /// auto-block-abc12345 blocked this").
     Profile(Id),
     /// A `Device.allow_rules` / `Device.deny_rules` reference matched.
-    /// The carried `Id` is the device id. Per truth table §4 row 7
-    /// this can also represent an `[OVERRIDE]` allow that beats a
-    /// profile-level deny — the override marker rides separately on
-    /// the audit entry, not on this enum.
+    /// The carried `Id` is the device id. This can also represent an
+    /// `[OVERRIDE]` allow that beats a profile-level deny — the override
+    /// marker rides separately on the audit entry, not on this enum.
     Device(Id),
     /// Reserved: built-in / anti-bypass rules shipped by the binary
-    /// itself (no `[[admin_rules]]` row). Not emitted by T4. Kept on
-    /// the enum so adding them in S44+ doesn't need a wire-format
-    /// migration.
+    /// itself (no `[[admin_rules]]` row). Not currently emitted; kept on
+    /// the enum so a future producer doesn't need a wire-format migration.
     AdminBuiltin,
 }
 
@@ -92,9 +86,9 @@ mod tests {
 
     #[test]
     fn device_attribution_carries_device_id() {
-        let src = RuleSource::Device(Id::new("alex-iphone").unwrap());
+        let src = RuleSource::Device(Id::new("operator-iphone").unwrap());
         assert_eq!(src.as_label(), "device");
-        assert_eq!(src.entity_id().map(|i| i.as_str()), Some("alex-iphone"));
+        assert_eq!(src.entity_id().map(|i| i.as_str()), Some("operator-iphone"));
     }
 
     #[test]

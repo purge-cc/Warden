@@ -8,7 +8,7 @@
 //! (`Sprint 43 T5`), design-doc section marks (`§4.12`), decision ids
 //! (`D14`, `SN1`, `DR9`), internal document names
 //! (`tag_model_consolidation`), and Rust symbol paths
-//! (`Cidr::parse_friendly`). `project rules` enforces exactly this
+//! (`Cidr::parse_friendly`). `CLAUDE.md` enforces exactly this
 //! internal/public boundary between `CONFIG_GUIDE.md` and its `.public`
 //! sibling; it was unenforced in the surface operators actually meet
 //! first.
@@ -188,7 +188,7 @@ fn find_internal_doc(s: &str) -> Option<String> {
         "public_launch",
         "DEVPLAN",
         "PROJECT.md",
-        "project rules",
+        "CLAUDE.md",
     ] {
         if s.contains(name) {
             return Some(name.to_string());

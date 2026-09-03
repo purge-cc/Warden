@@ -1,21 +1,14 @@
 //! Subnets tab — master/detail view of configured + discovered subnets.
 //!
-//! ## History
-//!
-//! * **Sprint 33** — single read-only table listing the `[[subnets]]`
-//!   entries from the on-disk config.
-//! * **Sprint 51 T1** — refactor to master/detail. The left list mixes
-//!   configured subnets with auto-discovered candidate buckets; the
-//!   right card splits 3-ways: linechart of per-subnet hourly traffic
-//!   on top, KV stats panel bottom-left, client list bottom-right.
-//! * **Sprint 51 T2** — fills in real data: `discover_candidates`
-//!   buckets unmapped IPs by /24 (v4) / /64 (v6) with a ≥2-host
-//!   threshold, `filter_clients_in_subnet` resolves CIDR membership,
-//!   `aggregate_subnet_hourly` sums element-wise the per-device
-//!   `hourly_queries` rings.
-//! * **Sprint 51 T3** — Add / Edit / Delete modals against
-//!   `cli::commands::subnets::{add_inner,set_inner,remove_inner}`
-//!   (R7 single-seat) + promote-from-suggestion on `Enter`.
+//! The left list mixes configured subnets with auto-discovered candidate
+//! buckets; the right card splits 3-ways: linechart of per-subnet hourly
+//! traffic on top, KV stats panel bottom-left, client list bottom-right.
+//! `discover_candidates` buckets unmapped IPs by /24 (v4) / /64 (v6) with a
+//! ≥2-host threshold; `filter_clients_in_subnet` resolves CIDR membership;
+//! `aggregate_subnet_hourly` sums element-wise the per-device
+//! `hourly_queries` rings. Add / Edit / Delete modals write through the
+//! same `cli::commands::subnets::{add_inner,set_inner,remove_inner}` the
+//! CLI uses, plus promote-from-suggestion on `Enter`.
 //!
 //! ## Data sources
 //!
@@ -57,6 +50,7 @@ use crate::config::loader::LoadedConfig;
 use crate::config::schema::Subnet;
 use crate::ipc::protocol::{DeviceViewDto, UnmappedDeviceDto};
 use crate::tui::app::App;
+use crate::tui::format::count as format_count;
 use crate::tui::theme::{self, T};
 use crate::tui::ui::render_section_chrome;
 
@@ -69,23 +63,27 @@ pub const SUBNET_SUGGESTED_TAG: &str = " [suggested]";
 /// column (master only). Mirrors the Dashboard's narrow-screen
 /// fallback policy: the right detail pane needs ≥60 cells for the
 /// chart + KV rows + client list to stay legible, on top of the
-/// fixed 38-cell master list card + 1-cell gutter.
+/// fixed 38-cell master list card + 1-cell gutter — a conservative
+/// margin, not an exact sum (60+38+1=99, not 110).
+///
+/// Measured against the pre-chrome `area.width`. The Profiles tab
+/// branches on its own post-chrome `outer.width` instead, so the two
+/// tabs' thresholds are not directly comparable even where the
+/// numbers are close.
 const NARROW_THRESHOLD: u16 = 110;
 
 // ── Public render entry point ──────────────────────────────────────────────
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         render_no_config(f, area);
         return;
     };
 
     let configured = &loaded.config.subnets;
+    let device_view = app.device_view.as_ref();
     let candidates = discover_candidates(
-        app.device_view
-            .as_ref()
-            .map(|dv| dv.unmapped.as_slice())
-            .unwrap_or(&[]),
+        device_view.map(|dv| dv.unmapped.as_slice()).unwrap_or(&[]),
         configured,
     );
     let total = configured.len() + candidates.len();
@@ -102,7 +100,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         // Operators on narrow terminals still see what's configured +
         // suggested, they just lose the per-subnet detail card until
         // they widen the window.
-        render_master(f, area, app, configured, &candidates);
+        render_master(
+            f,
+            area,
+            device_view,
+            configured,
+            &candidates,
+            app.subnets.selected_id.as_deref(),
+            &mut app.subnets.table_state,
+        );
         return;
     }
 
@@ -118,7 +124,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
 
-    render_master(f, cols[0], app, configured, &candidates);
+    render_master(
+        f,
+        cols[0],
+        device_view,
+        configured,
+        &candidates,
+        app.subnets.selected_id.as_deref(),
+        &mut app.subnets.table_state,
+    );
     render_detail(f, cols[2], app, configured, &candidates);
 }
 
@@ -151,9 +165,11 @@ fn draw_h_divider(f: &mut Frame, area: Rect) {
 fn render_master(
     f: &mut Frame,
     area: Rect,
-    app: &App,
+    device_view: Option<&DeviceViewDto>,
     configured: &[Subnet],
     candidates: &[CandidateSubnet],
+    selected_id: Option<&str>,
+    table_state: &mut TableState,
 ) {
     // Self-framed card. Compact title (configured\u{00b7}suggested) — the long
     // "N configured \u{00b7} M suggested" form clips in the narrow master column.
@@ -171,25 +187,22 @@ fn render_master(
             .add_modifier(Modifier::BOLD),
     );
 
-    let device_view = app.device_view.as_ref();
     let rows: Vec<Row> = master_rows(configured, candidates, device_view).collect();
 
     // Resolve `selected_id` back to a row index every frame — the row
     // count moves with each refresh (configured CRUD + new candidates
     // appearing), so an index from the previous frame is unreliable.
-    let mut table_state = TableState::default();
-    if let Some(idx) =
-        resolve_selected_index(configured, candidates, app.subnets.selected_id.as_deref())
-    {
-        table_state.select(Some(idx));
-    } else if !rows.is_empty() {
-        table_state.select(Some(0));
-    }
-    // No manual offset copy: on a poll that moves the row count a stale
-    // offset desyncs the viewport from the freshly-resolved index (the
-    // highlight/viewport land on the wrong row for a frame). Let ratatui
-    // derive the scroll offset from `select()` so the highlighted row is
-    // always in view — the devices.rs snap-before-index pattern. (sub-01)
+    //
+    // The scroll *offset* carries over regardless (via the persisted
+    // `table_state` `super::render_table` writes into), and that is safe
+    // even across a refresh that changes the row count: ratatui clamps
+    // both `offset` and `selected` to the current row count before it
+    // computes the visible window, so a value left over from a larger or
+    // reordered set can never point past the end or land on the wrong
+    // row — worst case it re-derives the window from scratch, same as a
+    // fresh `TableState` would.
+    let selected = resolve_selected_index(configured, candidates, selected_id)
+        .or_else(|| (!rows.is_empty()).then_some(0));
 
     let table = Table::new(
         rows,
@@ -202,7 +215,7 @@ fn render_master(
     .header(header)
     .row_highlight_style(theme::highlight_style());
 
-    f.render_stateful_widget(table, content, &mut table_state);
+    super::render_table(f, content, table, table_state, selected);
 }
 
 /// Build the master list rows: configured subnets first (by id, the
@@ -551,7 +564,11 @@ fn render_stats_for_configured(f: &mut Frame, area: Rect, app: &App, s: &Subnet)
     let device_counts = dv.map(|d| device_counts_in(d, &parsed));
     let queries_today = dv.map(|d| queries_today_in(d, &parsed)).unwrap_or(0);
     let buckets = dv.map(|d| aggregate_subnet_hourly(d, &s.cidrs));
-    let queries_1h = buckets
+    // `b.last()` is `hourly_queries[23]` — the CURRENT wall-clock hour
+    // bucket, not a trailing 60-minute window. At :01 past the hour this
+    // holds one minute of traffic. Labelled accordingly below rather than
+    // pro-rated, so the number never implies a window it isn't.
+    let queries_this_hour = buckets
         .as_ref()
         .and_then(|b| b.last().copied())
         .unwrap_or(0);
@@ -578,7 +595,7 @@ fn render_stats_for_configured(f: &mut Frame, area: Rect, app: &App, s: &Subnet)
         ("Source", source),
         ("Devices", device_label),
         ("Queries today", format_count(queries_today)),
-        ("Queries 1h", format_count(queries_1h)),
+        ("Queries (hour)", format_count(queries_this_hour)),
         (
             "Blocked 24h",
             format!("{} ({})", format_count(blocked_24h), block_pct),
@@ -1023,16 +1040,6 @@ fn subnet_source_label(app: &App, s: &Subnet) -> String {
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".into())
-}
-
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
 }
 
 // ── Empty / error states ───────────────────────────────────────────────────

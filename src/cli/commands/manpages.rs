@@ -22,10 +22,8 @@ pub const DEFAULT_MAN_DIR: &str = "/usr/local/share/man/man1";
 /// Manpage-only atomic-write helper. **Not for config mutation.**
 /// Routes through [`hardened_atomic_write`] so even man-page output
 /// gets fsync + mode preservation, but skips the validator round-trip
-/// a config caller would need. Private to this module — the previous
-/// `pub(crate) writer::atomic_write` escape hatch was removed in §4.31
-/// to prevent a future grep-and-paste from landing the legacy unchecked
-/// writer back on a config path.
+/// a config caller would need. Private to this module so a
+/// grep-and-paste cannot land this unchecked writer on a config path.
 fn atomic_write_unchecked(path: &Path, content: &str) -> anyhow::Result<()> {
     hardened_atomic_write(path, content.as_bytes(), AtomicWriteOpts::default())
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -98,8 +96,7 @@ mod tests {
         let root = dir.path().join("warden.1");
         assert!(root.exists(), "warden.1 written");
 
-        // Check a few subcommand pages that are guaranteed to exist
-        // in the S33 tree.
+        // Check a few subcommand pages that are guaranteed to exist.
         for sub in &["device", "group", "subnet", "blocklist", "completion"] {
             let p = dir.path().join(format!("warden-{sub}.1"));
             assert!(p.exists(), "warden-{sub}.1 must be written");
@@ -160,9 +157,9 @@ mod tests {
         assert!(content.to_lowercase().contains("add"), "must mention add");
     }
 
-    /// T6: Sprint 43 T5 added five new top-level verbs (`profile`,
-    /// `device`, `group`, `subnet`, `default`) for scoped rule writes
-    /// plus `rule undo`. Every one of them must produce a manpage so
+    /// Five top-level verbs (`profile`, `device`, `group`, `subnet`,
+    /// `default`) exist for scoped rule writes plus `rule undo`. Every
+    /// one of them must produce a manpage so
     /// `man warden-default` / `man warden-rule` resolves on a fresh
     /// install. clap_mangen iterates `cmd.get_subcommands()` so this
     /// is automatic; the test pins the result.
@@ -176,7 +173,7 @@ mod tests {
         }
     }
 
-    /// T6: the `warden rule` manpage should mention the `undo`
+    /// The `warden rule` manpage should mention the `undo`
     /// sub-action. clap exposes it via `RuleVerb`; clap_mangen surfaces
     /// it in the SUBCOMMANDS section.
     #[test]
@@ -190,7 +187,7 @@ mod tests {
         );
     }
 
-    /// T6: the `warden default` manpage should mention `allow` and
+    /// The `warden default` manpage should mention `allow` and
     /// `deny` (`DefaultAction` variants).
     #[test]
     fn default_manpage_mentions_allow_and_deny() {
@@ -208,10 +205,10 @@ mod tests {
         );
     }
 
-    /// S44 T4: the new `warden local-dns` top-level verb (Sprint 44 T3)
-    /// must produce a manpage so `man warden-local-dns` resolves on a
-    /// fresh install. clap_mangen iterates `cmd.get_subcommands()` so
-    /// generation is automatic; the test pins the result.
+    /// The `warden local-dns` top-level verb must produce a manpage so
+    /// `man warden-local-dns` resolves on a fresh install. clap_mangen
+    /// iterates `cmd.get_subcommands()` so generation is automatic; the
+    /// test pins the result.
     #[test]
     fn s44_local_dns_manpage_is_generated() {
         let dir = tempfile::tempdir().unwrap();
@@ -223,7 +220,7 @@ mod tests {
         );
     }
 
-    /// S44 T4: the `warden local-dns` manpage should advertise the
+    /// The `warden local-dns` manpage should advertise the
     /// four sub-actions `add` / `remove` / `list` / `show`. clap
     /// surfaces them via `LocalDnsAction`; clap_mangen renders them
     /// in the SUBCOMMANDS section.
@@ -241,7 +238,7 @@ mod tests {
         }
     }
 
-    /// S44 T4: the manpage should mention "local DNS" / "records" in
+    /// The manpage should mention "local DNS" / "records" in
     /// the description so an operator running `man warden-local-dns`
     /// confirms it is the right page (vs. the global `[local_dns]`
     /// in `warden.1`). clap_mangen lifts the about-line from

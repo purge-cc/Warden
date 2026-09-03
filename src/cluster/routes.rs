@@ -1,13 +1,13 @@
-//! `/api/cluster/*` serve-side endpoints (CS6 / §4.1) + cluster-token auth.
+//! `/api/cluster/*` serve-side endpoints + cluster-token auth.
 //!
 //! Mounted on the EXISTING axum server only when `cluster.enabled && role ==
 //! primary` — the mount site (`api::routes::build_router`) checks
 //! `ApiState.cluster.is_some()`. The cluster routes carry their OWN auth layer,
 //! distinct from `/api`'s:
-//!   1. optional `allow_peer` CIDR gate (CS2 defence-in-depth — network layer);
-//!   2. the SHARED per-IP [`crate::auth::middleware::AuthRateLimiter`] from `ApiState` (CS2);
+//!   1. optional `allow_peer` CIDR gate (defence-in-depth — network layer);
+//!   2. the SHARED per-IP [`crate::auth::middleware::AuthRateLimiter`] from `ApiState`;
 //!   3. a DISTINCT cluster bearer token verified constant-time against
-//!      `[cluster] token_hash` — the API token does NOT work here (CS2).
+//!      `[cluster] token_hash` — the API token does NOT work here.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -62,15 +62,12 @@ pub fn cluster_router(state: Arc<ApiState>) -> Router<Arc<ApiState>> {
 /// doc listed the chain as an open item precisely because a reader cannot tell
 /// an intended default from a missing branch by looking at it.
 fn source_ip_is_barred(allow_peer: &[crate::config::cidr::Cidr], ip: std::net::IpAddr) -> bool {
-    // Normalise `::ffff:a.b.c.d` to `a.b.c.d` first. `Cidr::contains` answers
-    // `false` on a family mismatch (`cidr.rs` `_ => false`), and a dual-stack
-    // listener hands us the mapped form for a peer dialling over IPv4 — so
-    // without this an operator who wrote `allow_peer = ["100.64.0.0/10"]`
-    // locks out their own secondary. Fails CLOSED, which is why it presents as
-    // sync mysteriously stopping rather than as a breach. Four other sites
-    // already do this (`config/validator.rs`, `config/schema/validator.rs`,
-    // `lists/http_client.rs`, `cli/commands/init/upstream.rs`); this one was
-    // missing the step.
+    // Normalise `::ffff:a.b.c.d` to `a.b.c.d` before the ACL compare.
+    // `Cidr::contains` is family-strict and a dual-stack listener hands us
+    // the mapped form for every peer dialling over IPv4, so an `allow_peer`
+    // of IPv4 CIDRs that does not see through it locks the operator out of
+    // their own secondary. `any_contains` normalises on its way in, so this
+    // is idempotent.
     let ip = match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
         v4 => v4,
@@ -78,7 +75,7 @@ fn source_ip_is_barred(allow_peer: &[crate::config::cidr::Cidr], ip: std::net::I
     !allow_peer.is_empty() && !any_contains(allow_peer, ip)
 }
 
-/// Cluster auth middleware (CS2). Order: allow_peer gate → lockout → token.
+/// Cluster auth middleware. Order: allow_peer gate → lockout → token.
 async fn cluster_auth_middleware(
     State(state): State<Arc<ApiState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -92,7 +89,7 @@ async fn cluster_auth_middleware(
     };
     let ip = addr.ip();
 
-    // (1) CS2 defence-in-depth: source-IP CIDR gate, before any token work.
+    // (1) Defence-in-depth: source-IP CIDR gate, before any token work.
     if source_ip_is_barred(&cluster.allow_peer, ip) {
         tracing::warn!(
             target: "audit",
@@ -103,7 +100,7 @@ async fn cluster_auth_middleware(
     }
 
     // (2) Shared per-IP lockout (same AuthRateLimiter instance as /api).
-    // roundup-01 (rev-2606): because the instance is shared, an IP flooding
+    // Because the instance is shared, an IP flooding
     // `/api/cluster/*` with bad cluster tokens also locks itself out of `/api`
     // (and vice-versa). Defensible — lockout is per-IP and a peer has no reason
     // to share an IP with an API client — but the cross-surface amplification is
@@ -148,9 +145,8 @@ async fn cluster_auth_middleware(
     next.run(request).await
 }
 
-/// `POST /api/cluster/heartbeat` (CS6). Accepts the secondary's generations +
-/// stats; returns the primary's authoritative view. The peer stats are parsed
-/// for the contract but not retained in §4.11-2.
+/// `POST /api/cluster/heartbeat`. Accepts the secondary's generations +
+/// stats; returns the primary's authoritative view.
 async fn heartbeat(
     State(state): State<Arc<ApiState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -159,7 +155,7 @@ async fn heartbeat(
     let Some(cluster) = state.cluster.as_ref() else {
         return cluster_absent();
     };
-    // §4.11-4 (CS9): retain the peer's view in the roster, keyed by source IP.
+    // Retain the peer's view in the roster, keyed by source IP.
     // `body` stays optional so a malformed/empty body still yields a useful
     // response — we record the peer only when it parsed. `record_self` samples
     // this primary's own counters on every beat so the contribution-share
@@ -212,10 +208,8 @@ async fn bundle(State(state): State<Arc<ApiState>>, headers: HeaderMap) -> Respo
 /// `GET /api/cluster/status` — this node's role/generation/hash/stats + the
 /// peers it has heard from.
 ///
-/// `peers` was a `Vec::new()` literal until S3 Task 5: the roster behind
-/// `cluster_observe` was populated on every heartbeat while this endpoint kept
-/// reporting an empty cluster. A reporting gap, not a correctness one — the IPC
-/// view (`warden cluster status`, the TUI) always read the same roster
+/// A reporting gap here is not a correctness one — the IPC
+/// view (`warden cluster status`, the TUI) always reads the same roster
 /// correctly — but "no peers" and "peers I cannot see" must not look alike on
 /// the one surface a script can reach.
 async fn status(State(state): State<Arc<ApiState>>) -> Response {
@@ -244,8 +238,8 @@ async fn status(State(state): State<Arc<ApiState>>) -> Response {
 ///    `last_seen`, so a stale peer is indistinguishable from a live one here —
 ///    but *omitting* it would report a shrinking cluster as a healthy one,
 ///    which is failing open silently on the surface least likely to be watched
-///    by a human. Reporting it is the lesser gap, and it is written down in
-///    `NOTES-stale.md` as a `dto.rs` follow-up;
+///    by a human. Reporting it is the lesser gap; adding `online` to
+///    `PeerView` is the open follow-up;
 ///  * **`role` is `Secondary` by construction, not by measurement.** Only a
 ///    secondary POSTs `/api/cluster/heartbeat` (the poll loop is the sole
 ///    caller, and this router is mounted only on a primary), so every roster
@@ -354,23 +348,21 @@ mod tests {
     /// exactly that form for a peer dialling over IPv4.
     ///
     /// **The failure this pins is a LOCKOUT, not a bypass.** `Cidr::contains`
-    /// answers `false` for a family mismatch (`_ => false`), so without
-    /// normalisation `any_contains` says "not in the list" and
-    /// `source_ip_is_barred` bars the **legitimate** secondary — sync stops
-    /// with a FORBIDDEN the operator did not configure. An allowlist fails
-    /// closed; the same missing normalisation in a *denylist* would fail open.
-    /// Worth stating because the reflex on reading "IPv4-mapped ACL" is to
-    /// assume bypass, and the remedy is the same either way.
+    /// is family-strict (`_ => false`), so a gate that compares the mapped
+    /// form as-is reads it as "not in the list" and bars the **legitimate**
+    /// secondary — sync stops with a FORBIDDEN the operator did not
+    /// configure. An allowlist fails closed; the same missing normalisation
+    /// in a *denylist* would fail open. Worth stating because the reflex on
+    /// reading "IPv4-mapped ACL" is to assume bypass, and the remedy is the
+    /// same either way.
     ///
-    /// The codebase already normalises in four other places
-    /// (`config/validator.rs`, `config/schema/validator.rs`,
-    /// `lists/http_client.rs`, `cli/commands/init/upstream.rs`) — this path
-    /// was simply missing the step.
+    /// Asserted through `source_ip_is_barred` rather than at whichever call
+    /// normalises, so the property survives the step moving between them.
     #[test]
     fn an_ipv4_mapped_source_is_matched_against_an_ipv4_cidr() {
         let allow = cidrs(&["100.64.0.0/10"]);
         assert!(
-            !source_ip_is_barred(&allow, "::ffff:100.64.0.3".parse().unwrap()),
+            !source_ip_is_barred(&allow, "::ffff:192.0.2.3".parse().unwrap()),
             "a mapped form of a listed address must reach the token check"
         );
         assert!(
@@ -386,9 +378,9 @@ mod tests {
     /// comment used to claim.
     #[test]
     fn a_configured_allow_peer_is_enforced_both_ways() {
-        let allow = cidrs(&["192.0.2.0/24", "100.64.0.0/10"]);
+        let allow = cidrs(&["10.10.1.0/24", "100.64.0.0/10"]);
         assert!(!source_ip_is_barred(&allow, "192.0.2.10".parse().unwrap()));
-        assert!(!source_ip_is_barred(&allow, "100.64.0.3".parse().unwrap()));
+        assert!(!source_ip_is_barred(&allow, "192.0.2.3".parse().unwrap()));
         assert!(source_ip_is_barred(&allow, "203.0.113.7".parse().unwrap()));
         assert!(
             source_ip_is_barred(&allow, "10.10.2.1".parse().unwrap()),
@@ -430,7 +422,7 @@ mod tests {
     /// *dropping* it would render a cluster losing its members as a healthy
     /// smaller cluster, which is failing open silently on the one surface a
     /// script reads. Reporting it is the lesser gap; adding `online` to
-    /// `PeerView` is the fix (NOTES-stale.md §5, seam S5).
+    /// `PeerView` is the fix.
     #[test]
     fn a_stale_peer_is_still_reported() {
         let out = project_peers(vec![row("203.0.113.9", false, false)]);

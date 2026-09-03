@@ -7,9 +7,10 @@
 
 use std::time::Duration;
 
+use hickory_proto::op::Query;
 use hickory_proto::rr::{Name, RecordType};
 
-use super::{build_query_bytes, parse_response_bytes, Upstream, UpstreamResponse};
+use super::{build_query, parse_response_bytes, Upstream, UpstreamResponse};
 use crate::dns::edns::EdnsClientSubnet;
 use crate::dns::error::DnsError;
 
@@ -19,18 +20,16 @@ const MAX_DOH_RESPONSE_BYTES: usize = 65535;
 
 /// DNS-over-HTTPS upstream resolver.
 ///
-/// §4.8 §2/2 (T4): Sprint 1 carried a constructor-time `ecs:
-/// Option<EdnsClientSubnet>` field for a single fixed anonymous option;
-/// Sprint 2 promotes ECS to a per-query knob driven by the resolved
-/// profile's [`crate::profiles::profile::EcsPolicy`] and the client IP,
-/// so the field is gone — the handler passes the option through
+/// ECS is a per-query parameter driven by the resolved profile's
+/// [`crate::profiles::profile::EcsPolicy`] and the client IP, not baked into
+/// the upstream at construction — the handler passes the option through
 /// [`Upstream::lookup`].
 pub struct DohUpstream {
     client: reqwest::Client,
     /// DoH endpoint URLs (e.g. "https://192.0.2.53/dns-query").
     urls: Vec<String>,
     timeout: Duration,
-    /// §4.10: when set, outbound queries carry the EDNS DNSSEC OK (DO) bit.
+    /// When set, outbound queries carry the EDNS DNSSEC OK (DO) bit.
     /// Baked at construction (global policy); the client-facing upstream is
     /// built with `false` → byte-identical wire packets.
     dnssec_ok: bool,
@@ -49,8 +48,8 @@ impl DohUpstream {
             anyhow::bail!("DoH upstream requires at least one URL");
         }
         for url in &urls {
-            // rev-2606: the https:// gate is shared with `config lint` so the
-            // same URL is accepted/rejected identically at lint and at boot.
+            // The https:// gate is shared with `config lint` so the same URL
+            // is accepted/rejected identically at lint and at boot.
             crate::upstream::shape::validate_doh_url(url)
                 .map_err(|_| anyhow::anyhow!("DoH URL must start with https://: \"{url}\""))?;
         }
@@ -71,13 +70,13 @@ impl Upstream for DohUpstream {
         record_type: RecordType,
         ecs: Option<EdnsClientSubnet>,
     ) -> Result<UpstreamResponse, DnsError> {
-        let query_bytes = build_query_bytes(name, record_type, ecs, self.dnssec_ok)?;
+        let (query_bytes, expected) = build_query(name, record_type, ecs, self.dnssec_ok)?;
 
         // Try each URL in order (round-robin would need shared state; sequential
         // failover is simpler and matches the plain upstream behavior).
         let mut last_err = None;
         for url in &self.urls {
-            match self.do_request(url, &query_bytes).await {
+            match self.do_request(url, &query_bytes, &expected).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     tracing::debug!(url, error = %e, "DoH request failed, trying next");
@@ -96,6 +95,7 @@ impl DohUpstream {
         &self,
         url: &str,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         let resp = self
             .client
@@ -125,24 +125,25 @@ impl DohUpstream {
             }
         }
 
-        // doh-01: bound the body to MAX_DOH_RESPONSE_BYTES regardless of
-        // transfer-encoding. The previous `content_length()` pre-check was
-        // bypassable — a chunked / no-`Content-Length` response reports no
-        // length, so the whole stream was buffered before the size was checked.
+        // Bound the body to MAX_DOH_RESPONSE_BYTES regardless of
+        // transfer-encoding: a `Content-Length` check alone is bypassable — a
+        // chunked / no-`Content-Length` response reports no length, so relying
+        // on it would buffer the whole stream before checking the size.
         // `read_capped_body` aborts the instant the streamed total exceeds the
-        // cap, so a hostile upstream cannot exhaust memory with an unbounded body.
+        // cap, so a hostile upstream cannot exhaust memory with an unbounded
+        // body.
         let body = read_capped_body(resp).await?;
-        parse_response_bytes(&body)
+        parse_response_bytes(&body, expected)
     }
 }
 
 /// Read a DoH response body bounded to [`MAX_DOH_RESPONSE_BYTES`] regardless of
-/// transfer-encoding (doh-01). `Content-Length` is used only as a capacity HINT,
+/// transfer-encoding. `Content-Length` is used only as a capacity HINT,
 /// clamped to the cap so a dishonest server cannot force a huge pre-allocation;
-/// the streamed running total is the real bound. Mirrors the in-tree idiom of
-/// `lists::manager::read_bounded_body_bytes` (M-22) and cluster
-/// `poll::read_body_capped` (poll-01) — `bytes_stream()` is unavailable (reqwest
-/// is built without the `stream` feature), so chunks are pulled via `chunk()`.
+/// the streamed running total is the real bound. Mirrors the same idiom used by
+/// `lists::manager::read_bounded_body_bytes` and the cluster's
+/// `poll::read_body_capped` — `bytes_stream()` is unavailable (reqwest is built
+/// without the `stream` feature), so chunks are pulled via `chunk()`.
 async fn read_capped_body(mut resp: reqwest::Response) -> Result<Vec<u8>, DnsError> {
     let initial = resp
         .content_length()
@@ -202,7 +203,7 @@ mod tests {
 
     /// Spawn a one-shot raw-HTTP mock that writes `headers` then streams
     /// `body_len` bytes of `'a'` and closes. With no `Content-Length` header the
-    /// client learns the size only at EOF — the streamed body doh-01 must bound.
+    /// client learns the size only at EOF — the streamed body must still be bound.
     async fn spawn_stream_server(headers: &'static str, body_len: usize) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -233,10 +234,10 @@ mod tests {
         addr
     }
 
-    /// doh-01: an oversized body with NO `Content-Length` (the bypass vector)
-    /// must trip the cap. The loop checks the projected size BEFORE extending the
-    /// buffer, so the abort happens at ~cap+one-chunk — never after buffering the
-    /// whole stream (the old `resp.bytes()` read-to-EOF behaviour).
+    /// An oversized body with NO `Content-Length` (the bypass vector) must
+    /// trip the cap. The loop checks the projected size BEFORE extending the
+    /// buffer, so the abort happens at ~cap+one-chunk — never after buffering
+    /// the whole stream.
     #[tokio::test]
     async fn read_capped_body_aborts_on_oversized_stream_no_content_length() {
         let addr = spawn_stream_server(

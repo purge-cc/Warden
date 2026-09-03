@@ -1,11 +1,9 @@
-//! Multi-file v1 configuration loader (Sprint 29).
+//! Multi-file v1 configuration loader.
 //!
 //! Consumes a master `config.toml` and every file reachable via its
 //! `includes` globs, producing a single [`LoadedConfig`] that packages
 //! the merged [`ConfigV1`] together with a sidecar provenance map for
 //! downstream error enrichment.
-//!
-//! Design source of truth: `_docs/features/config_architecture.md` §7 + §13-Sprint-29.
 //!
 //! Behaviours implemented here:
 //!
@@ -15,19 +13,19 @@
 //! - **Deterministic glob ordering.** Globs are resolved with a
 //!   byte-wise sort so two operators on two hosts see the same load
 //!   order regardless of filesystem traversal quirks.
-//! - **Merge rules per §7.3.** Array-of-tables sections are concatenated
+//! - **Merge rules.** Array-of-tables sections are concatenated
 //!   (validator enforces `id` uniqueness after merge); `[profiles.<id>]`
 //!   is merged by sub-key with duplicate-key detection; every other
 //!   table is treated as a singleton (duplicate across files → error
 //!   with both file:line citations).
-//! - **Path security per §7.4 (N12).** Include patterns must be relative
+//! - **Path security.** Include patterns must be relative
 //!   and free of `..`. Resolved paths are canonicalised with the
 //!   parent-dir + leaf trick so freshly-created-but-missing files still
 //!   surface a precise error. Symlink targets that escape the config
 //!   root are rejected.
-//! - **Load limits per §7.5 (N11).** 1000 files, 50 MB aggregate bytes;
+//! - **Load limits.** 1000 files, 50 MB aggregate bytes;
 //!   either cap is a hard error carrying the count / size.
-//! - **Cycle detection per §7.2.** Visited-set on canonical paths +
+//! - **Cycle detection.** Visited-set on canonical paths +
 //!   max depth 4; the error reports the full include chain.
 //! - **Provenance map.** A [`ProvenanceMap`] records the (file, line)
 //!   for every top-level key + named-map sub-key + array-of-tables
@@ -47,16 +45,15 @@ use super::schema::{
     ConfigV1,
 };
 
-/// Hard cap on the number of files reachable via `includes`. Design
-/// doc N11.
+/// Hard cap on the number of files reachable via `includes`.
 pub const MAX_INCLUDE_FILES: usize = 1000;
 
 /// Hard cap on the aggregate size in bytes of every file loaded via
-/// `includes`. Design doc N11.
+/// `includes`.
 pub const MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum include depth (a master at depth 0, its includes at depth 1,
-/// etc.). Any file at depth > 4 is rejected. Design doc §7.2.
+/// etc.). Any file at depth > 4 is rejected.
 pub const MAX_INCLUDE_DEPTH: usize = 4;
 
 /// Top-level keys recognised by [`ConfigV1`]. Per-file unknown-key
@@ -69,9 +66,9 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "server",
     "retired",
     "blocklists",
-    // NOTE: `categories` was the S49 organisational-tag entity; it was
-    // RETIRED in the v2-tags migration and is intentionally absent here
-    // (rev-2606 loader-01). A config still carrying `[[categories]]` hits
+    // NOTE: `categories` was the organisational-tag entity; it was
+    // RETIRED in the tags migration and is intentionally absent here.
+    // A config still carrying `[[categories]]` hits
     // the directed migration branch in `reject_unknown_top_level`.
     "profiles",
     "devices",
@@ -84,13 +81,11 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     // from `custom_lists` because TOML cannot hold a table and an array of
     // tables under one name; keep it OUT of `ARRAY_OF_TABLES_KEYS`.
     "custom_list_limits",
-    // §4.66 L1 — the `[[labels]]` vocabulary.
     "labels",
-    // S30 pass-through sections — daemon-wide config the `ConfigV1`
-    // struct now holds verbatim (reusing the legacy `config::settings`
-    // types until S31-33 ports individual sections to fresh v1 shapes).
+    // Pass-through sections — daemon-wide config the `ConfigV1`
+    // struct holds verbatim (reusing the legacy `config::settings` types).
     "upstream",
-    // §4.10 — DNSSEC validation section (opt-in, OFF by default).
+    // DNSSEC validation section (opt-in, OFF by default).
     "dnssec",
     "cache",
     "tracking",
@@ -105,14 +100,13 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     // with a `tracing::warn!`. Remove at schema_version = 3.
     "ip_denylists",
     "lists",
-    // §4.13 — resource budget sampler section.
     "resource_budget",
     // `[backup]` — config-backup output dir (tooling-only; CLI + TUI read it).
     "backup",
-    // §4.11 — primary/secondary cluster replication (node-local, inert in
-    // §4.11-1). Singleton section, so NOT in ARRAY_OF_TABLES_KEYS / NAMED_MAP_KEYS.
+    // Primary/secondary cluster replication (node-local, inert by
+    // default). Singleton section, so NOT in ARRAY_OF_TABLES_KEYS / NAMED_MAP_KEYS.
     "cluster",
-    // DEPRECATED (S42 T5) legacy alias for `[[devices]]` — accepted at load
+    // DEPRECATED legacy alias for `[[devices]]` — accepted at load
     // time with a `tracing::warn!`. Remove at schema_version = 3.
     "clients",
 ];
@@ -133,7 +127,7 @@ const ARRAY_OF_TABLES_KEYS: &[&str] = &[
     // `[[custom_lists]]` in a sibling include file is rejected as a
     // duplicate singleton.
     "custom_lists",
-    // §4.66 L1. Same reasoning as the entry above — see its comment.
+    // Same reasoning as the entry above — see its comment.
     "labels",
 ];
 
@@ -142,7 +136,7 @@ const ARRAY_OF_TABLES_KEYS: &[&str] = &[
 const NAMED_MAP_KEYS: &[&str] = &["profiles"];
 
 /// The sync-owned drop-in directory, a sibling of the master, resolved by a
-/// secondary's `includes = ["cluster.d/*.toml"]` glob (§4.11).
+/// secondary's `includes = ["cluster.d/*.toml"]` glob.
 ///
 /// Lives here, ungated, because it has **two** consumers on opposite sides of
 /// the `cluster` feature flag: the writer (`cluster::apply`, gated OFF by
@@ -174,7 +168,7 @@ pub fn is_cluster_drop_in(file: &Path) -> bool {
 /// `[server]` is the only such section: a cluster secondary keeps its
 /// node-local `server.listen` in the master while the synced policy bundle
 /// (dropped into `cluster.d/`) supplies `server.default_profile` and the
-/// other policy fields (§4.11-3 / `cluster_sync.md` §4.2). The merge is
+/// other policy fields. The merge is
 /// field-level — a duplicate *sub-key* (the same `server.*` field defined
 /// in two files) is still a hard `DuplicateId`, mirroring the named-map
 /// rule. Every singleton NOT in this list still errors on a second
@@ -261,13 +255,12 @@ impl LoaderOverlay {
 /// - Resolves `includes` globs relative to each file's own directory.
 /// - Enforces path security, load limits, and cycle detection
 ///   before deserialisation.
-/// - Merges singleton / array-of-tables / named-map sections per
-///   design doc §7.3.
+/// - Merges singleton / array-of-tables / named-map sections.
 /// - Runs [`validate_collect`] on the merged config; any
 ///   [`ConfigError::context`] whose `entity` matches a provenance key
 ///   is stamped with the corresponding `(file, line)`.
 ///
-/// `now` is threaded through the validator so the N8 retired-id window
+/// `now` is threaded through the validator so the retired-id window
 /// stays deterministic in tests.
 pub fn load_config(
     master_path: &Path,
@@ -394,7 +387,7 @@ fn load_config_inner(
         warns.push(msg);
     }
 
-    // s4 config-m4 — resolve `secrets.toml` so the validator can cross-check
+    // Resolve `secrets.toml` here so the validator can cross-check
     // `auth_token_ref` against the names that actually exist. Loaded here,
     // not inside the validator, so `validate_collect` stays a pure function
     // of (config, now) and its tests need no filesystem.
@@ -417,10 +410,10 @@ fn load_config_inner(
     // — sub-files did either), bypass the merge/deserialise pipeline
     // and reuse the single-file facade. This keeps the "one-file
     // deployment" case a one-parse fast-path with identical error
-    // classification as Sprint 28.
+    // classification.
     if ctx.files_loaded.len() == 1 {
-        // config-m3: reuse the bytes `load_file` already read under the N11
-        // guards. This used to be a second, uncapped `fs::read_to_string` of
+        // Reuse the bytes `load_file` already read under the load-limit
+        // guards, rather than a second, uncapped `fs::read_to_string` of
         // the master — the only read in the loader with nothing in front of
         // it, and (on the shipped single-file layout) a second full copy of a
         // file already in memory.
@@ -449,7 +442,7 @@ fn load_config_inner(
             secrets.as_ref(),
             Some(&ctx.provenance),
         )?;
-        // The s4 config-m4 `auth_token_ref` cross-check is preserved: it rides
+        // The `auth_token_ref` cross-check is preserved: it rides
         // on the `secrets` argument above, which the single pass now carries.
         // That check fires on the shipped single-file layout or on nobody.
         let custom_lists = build_custom_list_store(&ctx.root, &config)?;
@@ -538,9 +531,9 @@ struct LoadCtx<'o> {
     merged: toml::Table,
     provenance: ProvenanceMap,
     /// The master file's source text, as `load_file` actually read it —
-    /// after the overlay substitution and after the N11 size guards.
+    /// after the overlay substitution and after the size guards.
     ///
-    /// `s-review-2605-config-m3`: the single-file fast path used to re-read
+    /// The single-file fast path used to re-read
     /// the master with a bare `fs::read_to_string`, which was the one read in
     /// the loader with no cap in front of it. Handing the bytes over instead
     /// removes that read entirely rather than capping it — so there is no
@@ -551,7 +544,7 @@ struct LoadCtx<'o> {
     /// Key-deprecation notices raised while reading the include graph, in
     /// file order. Drained into the caller's [`AuditWarnings`] once every
     /// file is in, so `warden config lint` sees the same set the daemon logs
-    /// at boot (`config-lint-blind-to-loader-deprecations`).
+    /// at boot.
     deprecations: Vec<String>,
     /// Optional read-substitution + extra-member overlay. `None` on every
     /// daemon load; `Some` only under a validating writer (cold CLI/IPC path).
@@ -595,7 +588,7 @@ fn load_file(
 
     ctx.loading_stack.push(canonical.to_path_buf());
 
-    // Per-file size guard (N11): stat BEFORE reading so a single oversized
+    // Per-file size guard: stat BEFORE reading so a single oversized
     // include — malicious, a stray log redirect, or a glob that captured a
     // huge generated file — cannot be slurped fully into memory and OOM
     // the process before the aggregate cap (below) is ever consulted.
@@ -614,7 +607,7 @@ fn load_file(
                         .with_file(canonical.to_path_buf()),
                 )]
             })?;
-            // loader-07: reject a non-regular file (FIFO, socket, device,
+            // Reject a non-regular file (FIFO, socket, device,
             // directory) BEFORE `read_to_string` below can block forever on
             // it. `metadata` follows symlinks (and never blocks — it's a
             // stat), so a glob symlink pointing at a FIFO inside the config
@@ -650,7 +643,7 @@ fn load_file(
     let src = match ctx.overlay.and_then(|o| o.substitution(canonical)) {
         Some(bytes) => bytes.to_string(),
         None => {
-            // loader-08: bound the read by the REMAINING aggregate budget so a
+            // Bound the read by the REMAINING aggregate budget so a
             // file that grew past `file_len` in the stat->read TOCTOU window
             // can't be slurped unbounded (the post-read aggregate check only
             // fires AFTER allocation). `take(remaining + 1)` caps peak memory
@@ -709,7 +702,7 @@ fn load_file(
     // everything into one toml::Value).
     reject_unknown_top_level(&table, canonical, &src)?;
 
-    // Terminology deprecation (S42 T2): `[ip_denylists]` is renamed
+    // Terminology deprecation: `[ip_denylists]` is renamed
     // `[ip_blocklists]`. Accept both, but WARN once per file when the
     // legacy key is present AND normalise it to the canonical key name
     // before the merge/deserialise pipeline runs — so multi-file loads
@@ -723,7 +716,7 @@ fn load_file(
     // applicable) per-entity sub-paths.
     record_provenance(&table, canonical, &src, &mut ctx.provenance);
 
-    // config-m3 — last use of `src` in this frame, so the master's bytes move
+    // Last use of `src` in this frame, so the master's bytes move
     // into the context instead of being dropped and re-read by the single-file
     // fast path. Set here rather than at the top of the function so it cannot
     // hold bytes for a file that failed a guard above; every path between here
@@ -743,7 +736,7 @@ fn load_file(
                     .with_entity("schema_version"),
             )]
         })?;
-        // loader-06: `ConfigV1.schema_version` is a `u32` — reject a negative
+        // `ConfigV1.schema_version` is a `u32` — reject a negative
         // or oversized value HERE, where we still have the precise file:line,
         // instead of losing provenance to the post-merge `try_into`.
         if this_version < 0 || this_version > i64::from(u32::MAX) {
@@ -766,10 +759,10 @@ fn load_file(
                 );
             }
             None => {
-                // loader-09: an INCLUDE declares schema_version but the master
-                // did not. The previous code silently let the first include
-                // supply it, then misattributed any later mismatch to "the
-                // master's value". Require the master to be the authority.
+                // An INCLUDE declares schema_version but the master
+                // did not. Silently letting the first include
+                // supply it would misattribute any later mismatch to "the
+                // master's value" — require the master to be the authority.
                 return Err(vec![ConfigError::ValidationFailed(
                     ErrorContext::new(
                         "schema_version is declared in an include but not in the master config; \
@@ -816,8 +809,7 @@ fn load_file(
     merge_into(&mut ctx.merged, table, &other_file_source, &ctx.provenance)?;
 
     // Recurse into this file's own includes. Glob base = this file's
-    // directory (design doc §7.2: "Paths are relative to the file that
-    // declares the includes").
+    // directory — paths are relative to the file that declares the includes.
     let this_dir = canonical.parent().unwrap_or(&ctx.root).to_path_buf();
     for pattern in &child_includes {
         let matched = resolve_include_pattern(pattern, &this_dir, &ctx.root, canonical)?;
@@ -1001,7 +993,7 @@ fn expand_wildcard(
             if !(ft.is_file() || ft.is_symlink()) {
                 continue;
             }
-            // loader-10: skip a glob self-match — the declaring file caught by
+            // Skip a glob self-match — the declaring file caught by
             // its own `*.toml` — so it doesn't recurse into a spurious
             // "include cycle detected" error (logrotate/systemd self-skip
             // semantics). Compare canonically since `entry.path()` and
@@ -1016,7 +1008,7 @@ fn expand_wildcard(
                 Some(s) => s,
                 None => continue, // non-UTF-8 filename, skip
             };
-            // loader-11: a bare `*` has an empty prefix, so `*.toml` would
+            // A bare `*` has an empty prefix, so `*.toml` would
             // match `.disabled.toml` — defeating the rename-to-dotfile disable
             // convention (and could transiently catch staged temps). Skip
             // dotfiles unless the pattern's prefix explicitly opts in with a
@@ -1032,14 +1024,13 @@ fn expand_wildcard(
             }
         }
     }
-    // Empty match is allowed per design §7.2 ("Glob matching zero files
-    // → allowed, supports fresh install with empty .d dir").
+    // Empty match is allowed — supports a fresh install with an empty .d dir.
     Ok(out)
 }
 
 /// Read a file to a `String`, capping the read at `cap + 1` bytes so a
 /// file that grew past the remaining aggregate size budget in the
-/// stat->read TOCTOU window (loader-08, N11) can't be slurped unbounded.
+/// stat->read TOCTOU window can't be slurped unbounded.
 /// Returns a `ValidationFailed` when the file exceeds `cap`; peak memory
 /// stays bounded by `cap + 1`.
 fn read_to_string_capped(path: &Path, cap: u64) -> Result<String, Vec<ConfigError>> {
@@ -1074,7 +1065,7 @@ fn read_to_string_capped(path: &Path, cap: u64) -> Result<String, Vec<ConfigErro
 // ── path security ───────────────────────────────────────────────────
 
 /// Canonicalise a path with the "parent + leaf" trick so files that
-/// don't yet exist still produce a deterministic canonical form (N12).
+/// don't yet exist still produce a deterministic canonical form.
 /// Returns a Parse error if neither the path nor its parent exist.
 pub(crate) fn canonicalize_path(p: &Path) -> Result<PathBuf, ConfigError> {
     if p.exists() {
@@ -1254,7 +1245,7 @@ fn merge_singleton(
     provenance: &ProvenanceMap,
     errs: &mut Vec<ConfigError>,
 ) {
-    // §4.11-3: a small allowlist of singletons (currently only `[server]`)
+    // A small allowlist of singletons (currently only `[server]`)
     // may be split across files and field-merged rather than rejected as a
     // whole-section duplicate. See [`SPLIT_MERGE_SINGLETONS`]. Cluster-only —
     // the default build keeps the original singleton-duplicate semantics.
@@ -1282,8 +1273,8 @@ fn merge_singleton(
     }
 }
 
-/// Field-merge a split-allowed singleton (currently only `[server]`,
-/// §4.11-3). The incoming table's sub-keys are unioned into the
+/// Field-merge a split-allowed singleton (currently only `[server]`).
+/// The incoming table's sub-keys are unioned into the
 /// accumulated table; a duplicate *sub-key* across files is reported as a
 /// `DuplicateId` (mirroring [`merge_named_map`]). The first occurrence
 /// simply inserts. A non-table value on either side fails closed as a
@@ -1362,7 +1353,7 @@ fn is_named_map_key(key: &str) -> bool {
 
 // ── unknown-key + provenance helpers ────────────────────────────────
 
-/// Build the same-file legacy+canonical conflict error (loader-02). When
+/// Build the same-file legacy+canonical conflict error. When
 /// a single file declares BOTH a deprecated key and its canonical
 /// replacement, the legacy value would otherwise be silently dropped — a
 /// config could lose a security control (`[ip_denylists]` is a
@@ -1388,23 +1379,21 @@ fn deprecated_key_conflict(file: &Path, line: usize, legacy: &str, canonical: &s
 /// top-level sections and nested fields) to their canonical form in
 /// place. Silent when only the canonical name is used. If a single file
 /// declares BOTH the legacy and canonical spelling the load is REFUSED
-/// with a `ValidationFailed` (loader-02): silently keeping the canonical
+/// with a `ValidationFailed`: silently keeping the canonical
 /// and dropping the legacy could discard a security control, and the
 /// cross-file case already hard-errors as a duplicate singleton, so the
 /// same-file case must be just as loud.
 ///
-/// DEPRECATED — remove at schema_version = 3 (design doc §3 R1).
+/// DEPRECATED — remove at schema_version = 3.
 /// Emit one key-deprecation notice on **both** channels.
 ///
-/// `config-lint-blind-to-loader-deprecations`: these notices used to exist
-/// only as `tracing::warn!`, a different channel from the validator's
-/// `AuditWarnings`. The daemon has a global subscriber so they reached
-/// journald at boot; `warden config lint` installs none and takes its
-/// warnings from `load_config_collect`'s return value, so it reported 1
-/// warning where boot emitted 5 — and the four it missed were exactly the
-/// "this key disappears at schema_version = 3" notices, all four in use on
-/// real installs. A deploy gated on `warden config lint` therefore never told
-/// the operator that keys they depend on are going away.
+/// Both channels matter: `tracing::warn!` is a different channel from the
+/// validator's `AuditWarnings`. The daemon has a global subscriber so
+/// deprecation warnings reach journald at boot; `warden config lint`
+/// installs none and takes its warnings only from `load_config_collect`'s
+/// return value. A notice pushed to only one channel is invisible on the
+/// other path — silently under-reporting exactly the "this key disappears
+/// at schema_version = 3" notices a deploy gate relies on.
 ///
 /// The fix is to feed the existing notices into the channel lint already
 /// reads, **not** to restate them in the validator: two copies of the same
@@ -1423,7 +1412,7 @@ fn note_deprecation(deprecations: &mut Vec<String>, file: &Path, line: usize, ms
 /// What a `[[blocklists]]` row carrying the pre-v3 `kind` key is told.
 ///
 /// **Why this is an ERROR and not a silent alias.** `kind` was renamed to
-/// `base` in plp-s3b, and adding `#[serde(alias = "kind")]` would have made
+/// `base`, and adding `#[serde(alias = "kind")]` would have made
 /// every v2 config load unchanged — which is precisely the danger. A v2
 /// config has no `profiles.<id>.lists` overrides, so under v3 every list is
 /// inherited by every profile: the tag intersection that used to scope a
@@ -1471,7 +1460,7 @@ fn normalise_deprecated_keys(
 ) -> Result<(), Vec<ConfigError>> {
     let mut errs = Vec::new();
 
-    // plp-s3b — `[[blocklists]].kind` → `base`, WITHOUT a rewrite. Every
+    // `[[blocklists]].kind` → `base`, WITHOUT a rewrite. Every
     // other arm in this function normalises a legacy key into its
     // successor; this one refuses. See `BLOCKLIST_KIND_RENAMED_TO_BASE`
     // for why an alias here would be a silent verdict change rather than
@@ -1499,7 +1488,7 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T2 — top-level `[ip_denylists]` → `[ip_blocklists]`.
+    // Top-level `[ip_denylists]` → `[ip_blocklists]`.
     if let Some(legacy) = table.remove("ip_denylists") {
         let line = line_of_top_anchor(src, "ip_denylists").unwrap_or(1);
         if table.contains_key("ip_blocklists") {
@@ -1515,9 +1504,9 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T5 — top-level `[[clients]]` → `[[devices]]`. Reuses the T2
-    // verbatim template (array-of-tables section, single top-level key
-    // swap).
+    // Top-level `[[clients]]` → `[[devices]]`. Reuses the same
+    // verbatim template as the `ip_denylists` rename above (array-of-tables
+    // section, single top-level key swap).
     if let Some(legacy) = table.remove("clients") {
         let line = line_of_top_anchor(src, "clients").unwrap_or(1);
         if table.contains_key("devices") {
@@ -1567,7 +1556,7 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T4 — nested `[lists].refresh_interval_secs` →
+    // Nested `[lists].refresh_interval_secs` →
     // `update_interval_secs`. `line_of_top_anchor` resolves the `[lists]`
     // block heading, so the WARN points at the section header — close
     // enough for operators to locate the field in their own file.
@@ -1588,7 +1577,7 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T5 — nested `[tracking].max_clients` → `max_devices`.
+    // Nested `[tracking].max_clients` → `max_devices`.
     if let Some(tracking_table) = table.get_mut("tracking").and_then(|v| v.as_table_mut()) {
         if let Some(legacy) = tracking_table.remove("max_clients") {
             let line = line_of_top_anchor(src, "tracking").unwrap_or(1);
@@ -1606,7 +1595,7 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T5 — nested `[server].enforce_client_mac` → `enforce_device_mac`.
+    // Nested `[server].enforce_client_mac` → `enforce_device_mac`.
     if let Some(server_table) = table.get_mut("server").and_then(|v| v.as_table_mut()) {
         if let Some(legacy) = server_table.remove("enforce_client_mac") {
             let line = line_of_top_anchor(src, "server").unwrap_or(1);
@@ -1624,7 +1613,7 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // S42 T4 — per-entry `[[blocklists]].refresh_interval_hours` →
+    // Per-entry `[[blocklists]].refresh_interval_hours` →
     // `update_interval_hours`. Iterate the array so every entry that
     // carries the legacy key is normalised; each match emits its own
     // WARN so operators see which list triggered the deprecation.
@@ -1658,15 +1647,15 @@ fn normalise_deprecated_keys(
         }
     }
 
-    // plp-s5a F1 — `tags` is gone from all five entity structs, and every
+    // `tags` is gone from all five entity structs, and every
     // one of them is `#[serde(deny_unknown_fields)]`. Strip the retired key
     // before serde sees it, and tell the operator which entities carried
     // it.
     //
     // This is the `ip_denylists` shape above (remove + note), NOT the
     // `kind` shape (refuse). The `kind` refusal is right because renaming
-    // that key by hand changes a filtering verdict; `tags` decided nothing
-    // after the plp-s3 cutover, so removing it changes none — and a
+    // that key by hand changes a filtering verdict; `tags` no longer decides
+    // which lists apply, so removing it changes no filtering behaviour — and a
     // refusal here is precisely the outage the strip exists to prevent.
     //
     // **Belt-and-braces, and the second half is not optional.** The
@@ -1712,24 +1701,18 @@ fn reject_unknown_top_level(
                 .with_file(file.to_path_buf())
                 .with_line(line)
                 .with_entity(key.clone());
-            // loader-01: a config migrating off v1 most often still carries
+            // A config migrating off v1 most often still carries
             // `[[categories]]` — give it a directed next step instead of the
             // generic allowed-keys dump.
             //
-            // **The manual route was removed in `plp-s5f`, and it was the
-            // harmful half.** This used to end "or move each category's
-            // members onto the relevant entity's `tags`". `tags` replaced
-            // `categories` in schema_version 2 and was itself retired at the
-            // plp cutover; `plp-s5a` deleted the field and the loader now
-            // strips it. So the advice, followed exactly, produced a config
-            // whose tags are dropped at load with the operator's intent
-            // silently discarded — defect E2, the failure this whole
-            // workstream exists to repair, recommended by warden's own error
-            // message to the one population that would act on it.
-            //
-            // Only the migrate route survives, and it is the one that works:
-            // `v1-to-v3` writes `profiles.<id>.lists`, which is what decides
-            // filtering now.
+            // **Only the migrate route is offered, deliberately.** `tags`
+            // replaced `categories` in schema_version 2 and has itself since
+            // been retired — the loader strips it on load. Advising an operator
+            // to hand-move category members onto an entity's `tags` field would
+            // produce a config whose tags are silently dropped at load, with
+            // the operator's intent discarded and no error to say so. Only
+            // `warden migrate v1-to-v3`, which writes `profiles.<id>.lists`
+            // (what actually decides filtering now), avoids that trap.
             let ctx = if key == "categories" {
                 ctx.with_suggestion(
                     "`categories` was removed in schema_version 2, and the per-entity `tags` \
@@ -1818,7 +1801,7 @@ fn record_provenance(table: &toml::Table, file: &Path, src: &str, provenance: &m
             }
             toml::Value::Table(inner) => {
                 let line = table_headings.get(key).copied().unwrap_or(1);
-                // loader-05: also record per-sub-key provenance so a
+                // Also record per-sub-key provenance so a
                 // split-merge duplicate-sub-key error (a `server.*` field
                 // defined across two files on a cluster secondary) is
                 // attributed to the file that contributed the field, not
@@ -1889,7 +1872,7 @@ fn collect_table_headings(src: &str) -> BTreeMap<String, usize> {
 /// heading, or a `key = ...` scalar / inline line. `line_of_top_key`
 /// alone matched only the scalar form, so every `[section]`-anchored
 /// diagnostic (deprecation WARNs, unknown-key errors) reported line 1
-/// (loader-03).
+/// without this fallback.
 fn line_of_top_anchor(src: &str, key: &str) -> Option<usize> {
     for (i, line) in src.lines().enumerate() {
         let t = line.trim_start();
@@ -1998,8 +1981,8 @@ fn lookup_entity_prefix<'a>(
 
 fn classify_merged_error(err: toml::de::Error, _provenance: &ProvenanceMap) -> ConfigError {
     let msg = err.to_string();
-    // loader-12: shared, drift-proof, user-content-masked classifier.
-    // error-01: bound the stored reason (toml can excerpt a multi-MB line);
+    // Shared, drift-proof, user-content-masked classifier.
+    // Bound the stored reason (toml can excerpt a multi-MB line);
     // classification still matches on the full `msg`.
     super::error::classify_config_error(
         &msg,

@@ -6,8 +6,8 @@
 //! Subnet option on outbound queries.
 //!
 //! `PlainUpstream` keeps the existing `Resolver` path when ECS is disabled
-//! (no behavioural change vs pre-§4.8 baseline) and dispatches to
-//! `PlainRawClient` only when the operator opts in.
+//! (no behavioural change) and dispatches to `PlainRawClient` only when the
+//! operator opts in.
 //!
 //! Implements UDP-first with TCP fallback when the upstream response carries
 //! the TC (truncation) bit, mirroring the standard plain-DNS behaviour. Retry
@@ -15,7 +15,7 @@
 //! around `UpstreamResolver` handles longer-term failover, this client just
 //! handles per-query semantics.
 //!
-//! §4.30 UDP fast-path: UDP sockets are pooled per-server (default 4 slots,
+//! UDP fast-path: UDP sockets are pooled per-server (default 4 slots,
 //! see [`UDP_POOL_SIZE`]) instead of bind-per-query. Each slot serializes its
 //! own send→recv through a tokio Mutex — UDP recv on a shared socket can
 //! otherwise steal another query's response. The non-truncated UDP path
@@ -28,29 +28,29 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use hickory_proto::op::Query;
 use hickory_proto::rr::{Name, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use super::{build_query_bytes, parse_response_bytes, UpstreamResponse};
+use super::{build_query, parse_response_bytes, UpstreamResponse};
 use crate::dns::edns::EdnsClientSubnet;
 use crate::dns::error::DnsError;
 
 const UDP_BUFFER_SIZE: usize = 4096;
 
-/// §4.30 m4: per-server pool slot count. Mirrors the DoT default
-/// (`src/upstream/dot.rs`) and balances burst capacity against fd budget
-/// (4 × N_servers, typically 16–32 fds total — well under any soft cap).
-/// Hardcoded internally; an operator-configurable knob can land as a
-/// follow-up via a `new(servers, timeout, pool_size)` overload.
+/// Per-server pool slot count. Mirrors the DoT default (`src/upstream/dot.rs`)
+/// and balances burst capacity against fd budget (4 × N_servers, typically
+/// 16–32 fds total — well under any soft cap). Hardcoded internally; not
+/// exposed as an operator config knob.
 const UDP_POOL_SIZE: usize = 4;
 
-/// §4.30 m2/m3: outcome of a single `udp_exchange`. `Response` carries
-/// the already-parsed answer (the non-truncated UDP path parses exactly
-/// once); `Truncated` signals to `exchange()` that the TC bit was set
-/// and the caller must retry over TCP.
+/// Outcome of a single `udp_exchange`. `Response` carries the
+/// already-parsed answer (the non-truncated UDP path parses exactly once);
+/// `Truncated` signals to `exchange()` that the TC bit was set and the
+/// caller must retry over TCP.
 enum UdpResult {
     Response(UpstreamResponse),
     Truncated,
@@ -60,21 +60,21 @@ pub struct PlainRawClient {
     servers: Vec<SocketAddr>,
     timeout: Duration,
     next: AtomicUsize,
-    /// §4.30 m4: per-server pool of lazily-bound, connected `UdpSocket`s.
+    /// Per-server pool of lazily-bound, connected `UdpSocket`s.
     /// Shape: `servers.len()` outer × [`UDP_POOL_SIZE`] inner. Each slot
     /// is independently lockable; the Mutex serializes the send→recv
     /// sequence on that single socket so a delayed reply from a
     /// previous query can't be misrouted by a concurrent recv on the
-    /// same fd. Slot set to `None` on recv error or message-id
-    /// mismatch — the next caller will rebind.
+    /// same fd. Slot set to `None` on recv error, or on any reply we
+    /// refuse (message-id mismatch, unusable wire bytes, a question we
+    /// did not ask) — the next caller will rebind.
     sockets: Vec<Vec<Mutex<Option<UdpSocket>>>>,
-    /// §4.30 m4: round-robin pointer per server. Relaxed ordering: the
-    /// slot index is an advisory dispatch hint, not a synchronisation
-    /// handle (collision on the same slot just means waiting briefly
-    /// for the per-slot Mutex).
+    /// Round-robin pointer per server. Relaxed ordering: the slot index is
+    /// an advisory dispatch hint, not a synchronisation handle (collision
+    /// on the same slot just means waiting briefly for the per-slot Mutex).
     next_slot: Vec<AtomicUsize>,
-    /// §4.10: when set, outbound queries carry the EDNS DNSSEC OK (DO) bit so
-    /// the upstream returns RRSIG / NSEC / NSEC3 material. Baked at construction
+    /// When set, outbound queries carry the EDNS DNSSEC OK (DO) bit so the
+    /// upstream returns RRSIG / NSEC / NSEC3 material. Baked at construction
     /// (global policy); the client-facing upstream is built with `false` →
     /// byte-identical wire packets.
     dnssec_ok: bool,
@@ -89,8 +89,8 @@ impl PlainRawClient {
         if servers.is_empty() {
             anyhow::bail!("plain upstream requires at least one server");
         }
-        // rev-2606: shape parse shared with `config lint` (single source of
-        // truth) — a typo'd plain server is rejected identically at lint/boot.
+        // Shape parse shared with `config lint` (single source of truth) — a
+        // typo'd plain server is rejected identically at lint/boot.
         let parsed: Vec<SocketAddr> = servers
             .iter()
             .map(|s| {
@@ -122,14 +122,17 @@ impl PlainRawClient {
         record_type: RecordType,
         ecs: Option<EdnsClientSubnet>,
     ) -> Result<UpstreamResponse, DnsError> {
-        let query_bytes = build_query_bytes(name, record_type, ecs, self.dnssec_ok)?;
+        let (query_bytes, expected) = build_query(name, record_type, ecs, self.dnssec_ok)?;
         let n = self.servers.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let mut last_err: Option<DnsError> = None;
         for offset in 0..n {
             let server_idx = (start + offset) % n;
             let server = self.servers[server_idx];
-            match self.exchange(server_idx, server, &query_bytes).await {
+            match self
+                .exchange(server_idx, server, &query_bytes, &expected)
+                .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     tracing::debug!(
@@ -151,10 +154,14 @@ impl PlainRawClient {
         server_idx: usize,
         server: SocketAddr,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
-        match self.udp_exchange(server_idx, server, query_bytes).await? {
+        match self
+            .udp_exchange(server_idx, server, query_bytes, expected)
+            .await?
+        {
             UdpResult::Response(resp) => Ok(resp),
-            UdpResult::Truncated => self.tcp_exchange(server, query_bytes).await,
+            UdpResult::Truncated => self.tcp_exchange(server, query_bytes, expected).await,
         }
     }
 
@@ -163,6 +170,7 @@ impl PlainRawClient {
         server_idx: usize,
         server: SocketAddr,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UdpResult, DnsError> {
         let slot_idx = self.next_slot[server_idx].fetch_add(1, Ordering::Relaxed) % UDP_POOL_SIZE;
         let mut slot = self.sockets[server_idx][slot_idx].lock().await;
@@ -202,9 +210,9 @@ impl PlainRawClient {
             )));
         }
 
-        // §4.30 m3: stack array instead of `vec![0u8; UDP_BUFFER_SIZE]`.
-        // 4 KB on the tokio task stack (default 2 MB) is fine at any
-        // realistic concurrent load; the heap alloc per query is gone.
+        // Stack array instead of `vec![0u8; UDP_BUFFER_SIZE]`. 4 KB on the
+        // tokio task stack (default 2 MB) is fine at any realistic
+        // concurrent load; the heap alloc per query is gone.
         let mut buf = [0u8; UDP_BUFFER_SIZE];
         let recv_result = match timeout(self.timeout, socket.recv(&mut buf)).await {
             Ok(r) => r,
@@ -227,10 +235,10 @@ impl PlainRawClient {
             }
         };
 
-        // §4.30 m4: msg-id check. With pooled sockets a stray reply
-        // from a previous (timed-out / cancelled) query could land in
-        // our buffer; mismatch poisons the slot so the next caller
-        // rebinds on a fresh ephemeral port.
+        // Msg-id check. With pooled sockets a stray reply from a previous
+        // (timed-out / cancelled) query could land in our buffer; mismatch
+        // poisons the slot so the next caller rebinds on a fresh ephemeral
+        // port.
         if n < 12 {
             *slot = None;
             return Err(DnsError::WireFormatError(format!(
@@ -246,15 +254,22 @@ impl PlainRawClient {
             )));
         }
 
-        // §4.30 m2: RFC 1035 §4.1.1 — header byte 2 bit 1 (mask 0x02) is
-        // the TC flag. Reading it directly off the wire avoids parsing
-        // the full message twice (the non-truncated branch parses
-        // exactly once via `parse_response_bytes`).
+        // RFC 1035 §4.1.1 — header byte 2 bit 1 (mask 0x02) is the TC flag.
+        // Reading it directly off the wire avoids parsing the full message
+        // twice (the non-truncated branch parses exactly once via
+        // `parse_response_bytes`).
         let truncated = (buf[2] & 0x02) != 0;
         if truncated {
             Ok(UdpResult::Truncated)
         } else {
-            parse_response_bytes(&buf[..n]).map(UdpResult::Response)
+            // A datagram this socket delivered that we cannot accept as our
+            // answer leaves the slot suspect for the same reason an id
+            // mismatch does — more of the same may still be queued on it.
+            let parsed = parse_response_bytes(&buf[..n], expected);
+            if parsed.is_err() {
+                *slot = None;
+            }
+            parsed.map(UdpResult::Response)
         }
     }
 
@@ -262,6 +277,7 @@ impl PlainRawClient {
         &self,
         server: SocketAddr,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         let mut stream = timeout(self.timeout, TcpStream::connect(server))
             .await
@@ -292,7 +308,7 @@ impl PlainRawClient {
                 DnsError::UpstreamRequestFailed(format!("TCP recv-body timeout {server}"))
             })?
             .map_err(|e| DnsError::UpstreamRequestFailed(format!("TCP recv-body {server}: {e}")))?;
-        parse_response_bytes(&body)
+        parse_response_bytes(&body, expected)
     }
 }
 
@@ -321,9 +337,9 @@ mod tests {
 
     #[test]
     fn pool_shape_matches_servers_and_pool_size() {
-        // §4.30 m4 regression pin: outer = servers.len(), inner =
-        // UDP_POOL_SIZE. Lock the shape against an accidental flat
-        // refactor (same posture as `dot.rs` pool_shape test).
+        // Regression pin: outer = servers.len(), inner = UDP_POOL_SIZE.
+        // Lock the shape against an accidental flat refactor (same posture
+        // as `dot.rs` pool_shape test).
         let c = PlainRawClient::new(
             &["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()],
             Duration::from_secs(2),
@@ -339,7 +355,7 @@ mod tests {
 
     #[test]
     fn tc_bit_byte_mask_matches_hickory_truncated() {
-        // §4.30 m2 pin: the RFC 1035 §4.1.1 byte-mask check
+        // Regression pin: the RFC 1035 §4.1.1 byte-mask check
         // `(buf[2] & 0x02) != 0` must agree with hickory's full-message
         // `truncated()` flag on every input. Without that equivalence
         // the single-parse optimisation could misroute responses
@@ -360,17 +376,84 @@ mod tests {
         }
     }
 
+    /// Stand-in upstream: answers the first query honestly, then echoes a
+    /// question warden never asked — with a matching A record, and the
+    /// requester's own message id, so it clears the id check ahead of the
+    /// question check.
+    async fn honest_then_forging_upstream(sock: tokio::net::UdpSocket) {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let mut buf = [0u8; 512];
+        for honest in [true, false] {
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            let req = Message::from_vec(&buf[..n]).unwrap();
+            let question = if honest {
+                req.queries[0].clone()
+            } else {
+                Query::query("attacker.example.net.".parse().unwrap(), RecordType::A)
+            };
+            let mut resp = Message::new(req.metadata.id, MessageType::Response, OpCode::Query);
+            resp.add_answer(Record::from_rdata(
+                question.name().clone(),
+                300,
+                RData::A(A::new(203, 0, 113, 7)),
+            ));
+            resp.add_query(question);
+            sock.send_to(&resp.to_vec().unwrap(), peer).await.unwrap();
+        }
+    }
+
+    /// End-to-end over the real UDP transport, which is the one exposed to
+    /// off-path forgery: a reply carrying records for a name we never asked
+    /// about is refused, so the caller has nothing to cache or serve — and
+    /// the socket that delivered it is dropped from the pool.
+    ///
+    /// The honest exchange first is what makes the pool assertion mean
+    /// something: it leaves exactly one slot bound, so a second bound slot
+    /// afterwards would be the forgery's socket surviving.
+    #[tokio::test]
+    async fn forged_question_is_refused_and_drops_the_pooled_socket() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        tokio::spawn(honest_then_forging_upstream(upstream));
+
+        let client =
+            PlainRawClient::new(&[addr.to_string()], Duration::from_secs(5), false).unwrap();
+        let name: Name = "example.com.".parse().unwrap();
+
+        let honest = client
+            .lookup(&name, RecordType::A, None)
+            .await
+            .expect("a conforming answer is accepted");
+        assert_eq!(honest.records.len(), 1, "honest answer carries its record");
+
+        let err = client.lookup(&name, RecordType::A, None).await.unwrap_err();
+        assert!(
+            matches!(&err, DnsError::WireFormatError(m) if m.contains("does not match")),
+            "forged question must be refused, got {err:?}"
+        );
+
+        let mut bound = 0;
+        for slot in &client.sockets[0] {
+            if slot.lock().await.is_some() {
+                bound += 1;
+            }
+        }
+        assert_eq!(bound, 1, "the socket that delivered the forgery is dropped");
+    }
+
     #[test]
     fn udp_exchange_uses_stack_buffer_not_heap_vec() {
-        // §4.30 m3 pin: source-grep guard for the stack-array literal
-        // on the UDP hot path. The literal is uniquely sited inside
-        // `udp_exchange`; its absence means someone reverted to a
-        // heap-allocating buffer and regressed the per-query
-        // allocator churn that §4.30 was sized to eliminate. The
-        // negative assertion (no `vec!` of that buffer) is omitted
-        // because the forbidden pattern would otherwise appear
-        // verbatim inside this same test source via
-        // `include_str!`, self-matching.
+        // Source-grep guard for the stack-array literal on the UDP hot
+        // path. The literal is uniquely sited inside `udp_exchange`; its
+        // absence means someone reverted to a heap-allocating buffer and
+        // regressed the per-query allocator churn this was sized to
+        // eliminate. The negative assertion (no `vec!` of that buffer) is
+        // omitted because the forbidden pattern would otherwise appear
+        // verbatim inside this same test source via `include_str!`,
+        // self-matching.
         let src = include_str!("plain_raw.rs");
         assert!(
             src.contains("let mut buf = [0u8; UDP_BUFFER_SIZE];"),

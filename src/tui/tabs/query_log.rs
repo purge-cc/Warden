@@ -1,4 +1,10 @@
 //! Query Log tab — scrollable table with domain/client/blocked/time filters.
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_query_log_key`
+//! - Form:  `tui::query_log_filter_modal` (the advanced-filter popup)
+//! - State: `app::QueryLogState` (`selected_key`, the filter fields, paging cursors)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -10,11 +16,11 @@ use crate::ipc::protocol::QueryLogFileState;
 use crate::tui::app::{App, InputMode};
 use crate::tui::theme::{self, T};
 
-// ── Sprint 37 §3 D4 frozen empty-state strings ────────────────────
+// ── Frozen empty-state strings ──────────────────────────────────────
 // These four pairs are the universal operator feedback for the Query
-// Log tab. They must not drift: any future sprint that changes the
-// daemon→TUI protocol extends the enum with new states, it does not
-// rewrite these strings.
+// Log tab. They must not drift: a future protocol change that extends
+// the enum with new states adds to these strings, it does not rewrite
+// them.
 
 const EMPTY_DISABLED_LINE1: &str = "Query log disabled.";
 const EMPTY_DISABLED_LINE2: &str = "Toggle it in Settings → Tracking, or set `tracking.query_log_enabled = true` in config.toml and run `warden reload`.";
@@ -28,7 +34,7 @@ const EMPTY_MISSING_LINE2: &str = "The writer starts on the first query. If this
 const EMPTY_UNREADABLE_LINE1: &str = "Query log unreadable.";
 const EMPTY_UNREADABLE_LINE2: &str = "The daemon opened the file but reading failed. Check file permissions at `/var/lib/purge-warden/query.log`.";
 
-// ── §4.5 Sprint 2/2 — CNAME chain block badge ─────────────────────
+// ── CNAME chain block badge ─────────────────────────────────────────
 // Compact label rendered in the RESULT column when a row's
 // `cname_chain_via` is populated (i.e. the block fired because a hop
 // inside the CNAME chain matched a list/rule/admin-deny, not because
@@ -37,13 +43,12 @@ const EMPTY_UNREADABLE_LINE2: &str = "The daemon opened the file but reading fai
 // glance. Pinned in `tests/frozen_strings_s45_p2.rs`.
 pub const CNAME_CHAIN_BLOCK_BADGE: &str = "[CNAME]";
 
-// ── Sprint 47 T2 — footer messages on Enter for non-actionable rows ──
+// ── Footer messages on Enter for non-actionable rows ─────────────────
 // When the operator presses Enter on a Query Log row whose `result`
 // status maps to `inferred_action(...) == None`, the handler does NOT
-// open the scope modal. Instead `app.last_error` is set to one of these
-// frozen strings so the footer surfaces *why* nothing happened. T5 will
-// pin them in `tests/frozen_strings_s47.rs`; do not rephrase.
-// See `_docs/features/query_log_quick_action_ux.md` §3 for the full mapping.
+// open the rule picker. Instead `app.last_error` is set to one of these
+// frozen strings so the footer surfaces *why* nothing happened. Pinned
+// in `tests/frozen_strings_s47.rs`; do not rephrase.
 
 /// Footer message when Enter is pressed on a Query Log row whose
 /// `result` is `"LOCAL"` (local DNS record). Local records live in the
@@ -67,7 +72,8 @@ pub const QUERY_NOT_ACTIONABLE_REFUSED: &str =
 
 /// Footer message when Enter is pressed on a Query Log row whose
 /// `result` is anything else (unknown future status, empty selection).
-/// Future-proof fallback per `_docs/features/query_log_quick_action_ux.md` §3.
+/// Future-proof fallback for a status this leaf does not yet know how
+/// to act on.
 pub const QUERY_NOT_ACTIONABLE_UNKNOWN: &str =
     "This query status is not actionable from the Query Log.";
 
@@ -88,14 +94,14 @@ pub fn pick_empty_state_message(
     }
 }
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    // N13 (`_docs/features/tui_nav_and_help_v1.md` §10a): Query Log
-    // rejoins the shared filter-card frame. qlog-scan had dropped the
-    // frame to hand ~3 rows to the table on the theory that a frame
-    // needs 3 rows minimum and this leaf couldn't spare them; N13
-    // spends exactly those 3 rows on purpose so all four filterable
-    // leaves read as one family. No interior title either way — the
-    // per-control labels ("Domain [/]", "Time [t]", …) are self-describing.
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
+    // Query Log uses the shared filter-card frame. An earlier version
+    // dropped the frame to hand ~3 rows to the table on the theory that
+    // a frame needs 3 rows minimum and this leaf couldn't spare them;
+    // spending exactly those 3 rows is deliberate so all four
+    // filterable leaves read as one family. No interior title either
+    // way — the per-control labels ("Domain [/]", "Time [t]", …) are
+    // self-describing.
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).split(area);
 
     render_filters(f, chunks[0], app);
@@ -104,7 +110,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // The advanced-search form is a LEAF-local modal, so it renders from
     // the leaf — the same choice `tabs::lists` makes for its own modals,
     // rather than the `ui.rs` overlay stack, which exists for modals
-    // reachable from more than one leaf (scope, resolver). Drawn last so
+    // reachable from more than one leaf (the rule picker, resolver). Drawn last so
     // it lands over both the card and the table.
     if let Some(modal) = app.query_log.advanced_modal.as_ref() {
         crate::tui::query_log_filter_modal::render_overlay(f, area, modal);
@@ -199,7 +205,7 @@ fn render_filters(f: &mut Frame, area: Rect, app: &App) {
         }
     );
 
-    // N13: only the value actually being edited turns `T.info` with a
+    // Only the value actually being edited turns `T.info` with a
     // trailing `_` cursor — matches Lists/Rules. Query Log used to tint
     // the whole strip on any edit; that stops here.
     let domain_style = match &app.input_mode {
@@ -262,14 +268,14 @@ pub fn entry_key(e: &crate::ipc::protocol::QueryLogDto) -> (String, String, Stri
     (e.timestamp.clone(), e.domain.clone(), e.client_ip.clone())
 }
 
-/// Query Log table column headers, post qlog-scan: the standalone DATE
-/// column was folded into a relative TIME column, leaving six. Named so
+/// Query Log table column headers: the standalone DATE
+/// column is folded into a relative TIME column, leaving six. Named so
 /// the scannable shape is guarded by one in-file assertion
 /// (`header_columns_dropped_date_and_kept_time`) instead of a rendered
 /// buffer scan that the 80×24 column squeeze would truncate.
 pub(crate) const QLOG_HEADERS: [&str; 6] = ["TIME", "CLIENT", "DOMAIN", "TYPE", "RESULT", "RTT"];
 
-fn render_table(f: &mut Frame, area: Rect, app: &App) {
+fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let block = theme::framed_block_colored(T.text_primary);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -331,7 +337,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    // qlog-scan: today's UTC date, captured once per render, so each
+    // Today's UTC date, captured once per render, so each
     // row's TIME cell can show a bare clock for same-day rows and fold
     // the date in for older ones. Both this and the DTO timestamps are
     // UTC, so the `date == today` comparison in `format_log_time` holds.
@@ -349,7 +355,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
         .entries
         .iter()
         .map(|entry| {
-            // §4.5 Sprint 2/2: a CNAME chain block surfaces with two
+            // A CNAME chain block surfaces with two
             // changes from the standard BLOCKED row:
             //   - DOMAIN cell: `qname → offending` (U+2192 RIGHTWARDS
             //     ARROW) so the operator sees the apex AND the offending
@@ -359,8 +365,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
             // Pinned via `tests/frozen_strings_s45_p2.rs` so a future
             // rename of the badge silently can't reshape the audit view.
             let chain_via = entry.cname_chain_via.as_deref();
-            // qlog-scan: the RESULT text is the CNAME badge for a chain
-            // block, else the raw status; its colour now comes from the
+            // The RESULT text is the CNAME badge for a chain
+            // block, else the raw status; its colour comes from the
             // tri-colour severity bucket (red = blocked, amber = degraded,
             // grey = clean serve) instead of the old red/green split.
             let badge_text = if chain_via.is_some() {
@@ -398,7 +404,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
     // Column constraints — `domain` is the sole flexible (Min) column
     // and absorbs leftover width. The same array feeds both the Table
     // and the separator helper so the two layouts cannot diverge.
-    // qlog-scan: DATE(10)+CLOCK(8) merged into a single TIME(11) column
+    // DATE(10)+CLOCK(8) merged into a single TIME(11) column
     // (fits `MM-DD HH:MM`); the reclaimed width goes to CLIENT (16→20)
     // and, via the flex column, to DOMAIN.
     const TIME_W: u16 = 11;
@@ -425,15 +431,21 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
     // qlog-06: resolve the operator's stable entry key to the current
     // index so the highlight follows the row across the sliding tail
     // instead of staying on a fixed slot that now holds a different entry.
-    let mut table_state = app.query_log.table_state.clone();
-    if let Some(idx) = crate::tui::app::resolve_row_index(
+    // Falls back to the already-selected row when the key doesn't resolve
+    // (e.g. no key seeded yet) rather than clearing the cursor.
+    let selected = crate::tui::app::resolve_row_index(
         &app.query_log.entries,
         app.query_log.selected_key.as_ref(),
         |e| Some(entry_key(e)),
-    ) {
-        table_state.select(Some(idx));
-    }
-    f.render_stateful_widget(table, content_area, &mut table_state);
+    )
+    .or_else(|| app.query_log.table_state.selected());
+    super::render_table(
+        f,
+        content_area,
+        table,
+        &mut app.query_log.table_state,
+        selected,
+    );
 
     // qlog-05: paint the inter-column separators by re-running ratatui's
     // own column layout (`draw_table_column_separators`) on the same
@@ -447,8 +459,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
     crate::tui::ui::draw_table_column_separators(f, content_area, &constraints, COLUMN_SPACING);
 }
 
-/// Compact per-row timestamp for the merged TIME column (qlog-scan: the
-/// standalone DATE column was folded in here). `ts` is the ISO-8601 UTC
+/// Compact per-row timestamp for the merged TIME column (the
+/// standalone DATE column is folded in here). `ts` is the ISO-8601 UTC
 /// stamp (`2026-04-08T15:32:01Z`); `today` is the current UTC date
 /// (`YYYY-MM-DD`, same source as the DTO's date substring) captured once
 /// per render. Same-day rows show the wall clock `HH:MM:SS`; older rows
@@ -473,14 +485,14 @@ pub(crate) fn format_log_time(ts: &str, today: &str) -> String {
 }
 
 /// Severity bucket a Query Log `result` maps to for the RESULT cell's
-/// colour (qlog-scan). Colour carries severity only — the old
+/// colour. Colour carries severity only — the old
 /// green-everything wall told the operator nothing at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResultSeverity {
     /// The query was stopped. Red. — `BLOCKED`, CNAME-chain block.
     Blocked,
     /// Served, but degraded. Amber. — `STALE` (expired cache served),
-    /// `REFUSED` (declined before filtering).
+    /// `REFUSED` (declined by a security check).
     Degraded,
     /// Clean serve. No accent colour (grey). — `ALLOWED` / `CACHED` /
     /// `LOCAL`, plus any unknown future status.
@@ -558,7 +570,7 @@ mod tests {
 
         // Real render path: table + separator overlay.
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| render_table(f, f.area(), &app)).unwrap();
+        term.draw(|f| render_table(f, f.area(), &mut app)).unwrap();
         let with = term.backend().buffer().clone();
 
         // A bare Table with identical constraints + spacing, no separator
@@ -604,9 +616,7 @@ mod tests {
         );
     }
 
-    // Byte-for-byte pin on the Sprint 37 §3 D4 frozen strings. Any
-    // edit to the four pairs below must come with a design-doc update
-    // in `_docs/features/query_log_ux_fix.md` §3 D4 — CT operators rely on
+    // Byte-for-byte pin on the frozen strings. CT operators rely on
     // these to diagnose the four distinct failure modes.
     #[test]
     fn pick_empty_state_message_covers_all_four_combinations() {
@@ -651,11 +661,11 @@ mod tests {
         );
     }
 
-    // ── Sprint 41 / 41.1: SincePreset cycle + as_secs mapping ─────
+    // ── SincePreset cycle + as_secs mapping ───────────────────────────
     //
-    // The S41 `filter_hint_line_is_frozen` test was retired in S41.1
-    // together with the inline hint row — the hints live in the global
-    // footer now (`ui.rs::footer_hints_for`), pinned by
+    // `filter_hint_line_is_frozen` was retired together with the
+    // inline hint row — the hints live in the global footer now
+    // (`ui.rs::footer_hints_for`), pinned by
     // `footer_hints_for_query_log_tab_carries_all_five_keys` there.
 
     #[test]
@@ -676,7 +686,7 @@ mod tests {
         assert_eq!(SincePreset::Last24Hours.as_secs(), Some(86_400));
     }
 
-    // ── qlog-scan: merged TIME column formatting ──────────────────────
+    // ── Merged TIME column formatting ───────────────────────────────
 
     #[test]
     fn format_log_time_same_day_shows_clock_only() {
@@ -708,7 +718,7 @@ mod tests {
         assert_eq!(format_log_time("not-a-timestamp", "2026-04-08"), "not-a-ti");
     }
 
-    // ── qlog-scan: RESULT tri-colour severity mapping ─────────────────
+    // ── RESULT tri-colour severity mapping ──────────────────────────
 
     #[test]
     fn result_severity_blocked_bucket() {
@@ -739,7 +749,7 @@ mod tests {
         );
     }
 
-    // ── qlog-scan: table shape — DATE folded into TIME ────────────────
+    // ── Table shape — DATE folded into TIME ─────────────────────────
 
     #[test]
     fn header_columns_dropped_date_and_kept_time() {

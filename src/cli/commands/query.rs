@@ -54,8 +54,8 @@ pub async fn run_query(
             blocked,
             blocked_by,
         }) => {
-            // §4.2 G1a — show what blocked it when the daemon attributed
-            // the block (`list:<name>`, `rule:<pattern>`, `admin_block`…).
+            // Show what blocked it when the daemon attributed the block
+            // (`list:<name>`, `rule:<pattern>`, `admin_block`…).
             match (blocked, blocked_by) {
                 (true, Some(source)) => println!("BLOCKED  {domain}  ({source})"),
                 (true, None) => println!("BLOCKED  {domain}"),

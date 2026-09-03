@@ -62,9 +62,8 @@ pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::R
         CommandTier::ReadOnly => command,
         CommandTier::Mutating | CommandTier::Admin if command.token().is_some() => {
             // Caller already attached a token explicitly — do not override.
-            // Sprint 35 CS3 introduces the first caller that relies on this
-            // contract: `warden token regenerate` must authenticate its
-            // post-write `IpcCommand::Reload` with the *old* plaintext
+            // `warden token regenerate` relies on this: it must authenticate
+            // its post-write `IpcCommand::Reload` with the *old* plaintext
             // (still valid against the daemon's in-memory hash), not the
             // new plaintext that it is about to persist.
             command
@@ -269,6 +268,7 @@ mod tests {
             listen_addr: "127.0.0.1:15353".into(),
             upstream_mode: "plain".into(),
             upstream_count: 2,
+            upstream_servers: Vec::new(),
             list_count: 0,
             started_at: Instant::now(),
             shutdown_tx: None,

@@ -28,38 +28,24 @@ use crate::common::domain::is_valid_domain;
 /// --blocklist`, tests). The configurable path (ListManager) uses
 /// `settings.lists.max_entries`.
 ///
-/// # Why 10M, and why a cap at all
+/// # Why 20M, and why a cap at all
 ///
-/// The cap is a supply-chain defence (project rules rule 4: external lists
-/// are hostile by assumption) and is **not** to be removed. It was 5M,
-/// which was below the real corpus: measured 2026-07-28 on the live
-/// the lab host lists, four of eight sources exceeded it —
-/// malicious 8,392,756 raw lines, tracking 8,155,822, ads 6,823,153,
-/// suspicious 5,087,874 — so the daemon silently discarded 2,370,261
-/// unique domains, 19% of the corpus.
+/// The cap is a supply-chain defence (CLAUDE.md rule 4: external lists
+/// are hostile by assumption) and is **not** to be removed. A list past
+/// the cap is refused for the cycle, not truncated.
 ///
-/// 10M is picked against two measured bounds, not by feel:
-/// - **Above** the largest real list (8.39M) with ~19% growth headroom.
-/// - **Below** what used to be the merged-map cliff. Historically the
-///   filter engine sized [`crate::filter::engine::DOMAIN_SHARDS`] = 16
-///   hashbrown shards at total/16 and held 7/8 load, so 16 × 1,048,576
-///   buckets topped out at 14,680,064 entries; one more and every shard
-///   doubled, taking the map from ~690 MB to ~1.37 GB. **That step is
-///   gone** — `mem-t6` replaced the shards with exact-size sorted slices,
-///   which have neither buckets nor a load factor, so the curve is a ramp
-///   and no longer a step. 10M is retained on the first bullet's ground
-///   alone (above the largest real list, with headroom).
+/// 20M is roughly 2.2x the largest real list (9.03M entries), which grows
+/// by roughly 12k/day — headroom sized against measured growth, not
+/// picked by feel. Each shard of the filter engine's domain map is an
+/// exact-size sorted slice, so memory grows linearly with the entry
+/// count: there is no allocation step this cap needs to sit under.
 ///
-/// Raising 5M → 10M costs ~+20-40 MB, NOT the ~+160 MB a linear estimate
-/// suggests: 9.92M and 12.29M entries round to the *same* 16,777,216
-/// buckets, and ~40% of them sit empty either way.
-///
-/// A per-list cap still does not bound the aggregate — eight lists at 10M
-/// is 80M on paper. Only dedup keeps the real union at 12.29M. The global
-/// budget that actually constrains the resource is tracked separately as
-/// step 4 of `lists-truncation-silent-19pct`; until it lands, this cap is
-/// a per-source sanity bound, not a memory guarantee.
-pub const DEFAULT_MAX_LIST_ENTRIES: usize = 10_000_000;
+/// A per-list cap still does not bound the aggregate — eight lists at 20M
+/// is 160M on paper. Only dedup keeps the real union far below that; the
+/// budget that actually constrains the merged corpus is
+/// `settings::default_max_total_domains`, a separate knob. This cap is a
+/// per-source sanity bound, not a memory guarantee.
+pub const DEFAULT_MAX_LIST_ENTRIES: usize = 20_000_000;
 
 /// Parse a domain-only blocklist into a new `HashSet`.
 ///
@@ -437,11 +423,11 @@ fn adguard_extract(line: &str) -> LineDecision<'_> {
     };
 
     // Sandbox: skip $important — same supply-chain signal as `@@`.
-    // rev-2606 §06 carryover-1: compare case-insensitively. AdGuard
-    // modifiers are case-insensitive, so `$Important` / `$IMPORTANT` are
-    // the same override; a case-sensitive check let `$Important` slip past
-    // the sandbox counter (and, worse, fall through to be ingested as a
-    // plain block — fail-safe, but it evaded the supply-chain signal).
+    // Compare case-insensitively: AdGuard modifiers are case-insensitive,
+    // so `$Important` / `$IMPORTANT` are the same override; a
+    // case-sensitive check would let `$Important` slip past the sandbox
+    // counter (and, worse, fall through to be ingested as a plain block —
+    // fail-safe, but it would evade the supply-chain signal).
     if let Some(mods) = modifiers {
         if mods
             .split(',')
@@ -498,8 +484,8 @@ pub fn parse_adguard_list_into_map(
 
 /// Parse a blocklist of any supported format into a bitmask-tagged `HashMap`.
 ///
-/// `declared` is the operator-declared wire format (`rev-2606 §06 parser-02`):
-/// when `Some`, it **forces** the parser; when `None`, the format is
+/// `declared` is the operator-declared wire format: when `Some`, it
+/// **forces** the parser; when `None`, the format is
 /// auto-detected via [`detect_format`]. The manager passes `Some` only for
 /// sources whose `[[blocklists]]` row declares `hosts`/`adguard` — a declared
 /// (or omitted) `domains` resolves to `None` and defers to detection, so an
@@ -528,16 +514,15 @@ pub fn parse_list_into_map(
     }
 }
 
-// ── Streaming entry point (PerfMem S2, lane B; sink-generic since wave 2) ──
+// ── Streaming entry point ──────────────────────────────────────
 //
 // `parse_list_into_map` above requires the whole body as a `&str`.
 // `ListManager` currently gets there via `std::fs::read_to_string`,
 // which holds an entire list body (up to ~200 MB for the largest cached
-// source) resident for the duration of the parse — on top of the
-// merged map(s) already live at reload time (`_docs/features/
-// memory_architecture_evaluation.md` §1.2 row 5). The functions below
-// parse straight off a `BufRead` — a file, a chained buffer, anything —
-// one line at a time, so that body is never fully resident.
+// source) resident for the duration of the parse — on top of the merged
+// map(s) already live at reload time. The functions below parse straight
+// off a `BufRead` — a file, a chained buffer, anything — one line at a
+// time, so that body is never fully resident.
 //
 // `detect_format` needs a `&str` prefix to sniff from, and a stream has
 // no such thing without buffering. [`sniff_format_reader`] buffers a
@@ -587,7 +572,7 @@ const DETECT_PREFIX_MAX_LINES: usize = 256;
 /// an OOM on the 1 GB-class hardware this product targets.
 ///
 /// This is not a hypothetical input class. External blocklists are an
-/// explicit supply-chain threat (`project rules` rule 4), and
+/// explicit supply-chain threat (`CLAUDE.md` rule 4), and
 /// [`super::status::MAX_SKIPPED_SAMPLE_BYTES`] exists in this very module
 /// tree for the same hostile-body shape one layer down. 64 KiB is ~256 B
 /// per line at the line cap, comfortably past any real list header, and
@@ -1056,9 +1041,9 @@ mod tests {
 
     #[test]
     fn adguard_sandbox_skips_important_case_insensitively() {
-        // rev-2606 §06 carryover-1: `$Important` / `$IMPORTANT` are the
-        // same override and must be sandboxed (SkipCounted), not slip
-        // through to be ingested as a plain block.
+        // `$Important` / `$IMPORTANT` are the same override and must be
+        // sandboxed (SkipCounted), not slip through to be ingested as a
+        // plain block.
         let content = "||a.com^$Important\n||b.com^$IMPORTANT\n||c.com^$ImPoRtAnT\n";
         let mut map = HashMap::with_hasher(RandomState::new());
         let counts = parse_adguard_list_into_map(content, 1, &mut map, T, S);
@@ -1252,7 +1237,7 @@ mod tests {
         assert_eq!(counts.parsed_skipped, 1);
     }
 
-    // --- rev-2606 §06 parser-02: declared format forces the dispatch ---
+    // --- declared format forces the dispatch ---
 
     #[test]
     fn declared_hosts_forces_parser_on_tab_separated_body() {

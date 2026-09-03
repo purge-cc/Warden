@@ -1,4 +1,4 @@
-//! Production [`ChainFetcher`] over the daemon's upstream (§4.10-4a).
+//! Production [`ChainFetcher`] over the daemon's upstream.
 //!
 //! [`crate::dnssec::fetcher::UpstreamChainFetcher`] adapts the live [`crate::upstream::Upstream`] into
 //! the [`ChainFetcher`] seam the chain walk consumes. It issues DNSSEC OK (DO)
@@ -11,8 +11,8 @@
 //! type and the RRSIG(s) covering them, plus the authority section verbatim (the
 //! NSEC/NSEC3 no-DS denial proofs the chain reads at a no-DS delegation).
 //!
-//! This adapter is built but **not yet wired into the response path** — that is
-//! §4.10-4b (the `dnssec.mode` consumer + AD/CD/SERVFAIL). 4a ships the plumbing.
+//! This adapter is built but **not yet wired into the response path** — no
+//! `dnssec.mode` consumer sets AD/CD/SERVFAIL from its result yet.
 
 use std::sync::Arc;
 
@@ -287,10 +287,10 @@ mod tests {
 
     // ── Live engine proof (network; run ON the CT) ───────────────────────────
     //
-    // The five-sprint payoff at the engine+fetcher level: the production fetcher
-    // feeds the FROZEN `validate_chain` from a real DO-enabled upstream.
-    // `#[ignore]`d (network, non-hermetic). The client-visible AD/SERVFAIL smokes
-    // are §4.10-4b (there is no response hook yet).
+    // End-to-end proof at the engine+fetcher level: the production fetcher
+    // feeds `validate_chain` from a real DO-enabled upstream. `#[ignore]`d
+    // (network, non-hermetic) — there is no response hook wiring AD/SERVFAIL
+    // to a client yet, so this exercises the validation result directly.
     //
     //   cargo test --features dnssec -- --ignored dnssec_live
     #[tokio::test]

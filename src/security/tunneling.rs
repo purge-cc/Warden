@@ -2,7 +2,7 @@
 //!
 //! Tunneling tools encode data in DNS labels, producing long unbroken
 //! payload runs and high rates of never-before-seen names under one base
-//! domain. Two independent surfaces (tunneling-rate-01, rev-2606):
+//! domain. Two independent surfaces:
 //!
 //! - [`TunnelingDetector::check`] — stateless shape heuristics (per-label
 //!   length, longest `-`-free run, and a length-gated entropy backstop).
@@ -13,10 +13,10 @@
 //!   (every exfil name is unique); cache hits prove repetition, so counting
 //!   them — or sharing one bucket LAN-wide — only manufactured false
 //!   positives on popular bases (googlevideo.com, amazonaws.com).
-//!   It counts **distinct names** in the window rather than calls
-//!   (sec-tunneling-rate-counts-repeats): a cache-missing name can repeat
-//!   too — a short TTL is enough — and one such name spending a whole
-//!   base's budget is what REFUSED its innocent siblings for 8 days. See
+//!   It counts **distinct names** in the window rather than calls: a
+//!   cache-missing name can repeat too — a short TTL is enough — and one
+//!   such name spending a whole base's budget is what REFUSED its
+//!   innocent siblings for 8 days. See
 //!   `RecentNames` for the ring that does the de-duplication and the
 //!   four-part cost justification behind its size.
 //!
@@ -56,7 +56,7 @@ use super::bounded_map::BoundedMap;
 use super::MAX_LABELS;
 use crate::config::settings::TunnelingConfig;
 
-/// Hard cap on the number of tracked base domains (P0-4).
+/// Hard cap on the number of tracked base domains.
 ///
 /// Without this cap, an attacker flooding unique eTLD+1s (or unique
 /// attacker-owned subdomains under different 2LDs) pins one tracker
@@ -69,7 +69,7 @@ const MAX_TRACKED_BASE_DOMAINS: usize = 100_000;
 /// **ICANN entries only.** These are structural DNS facts: registries
 /// that sell at the third level, so `evil.co.uk` is one registrant's
 /// name and `co.uk` is not. Naming them favours nobody, which is why
-/// project rules §Neutrality lists this table as a *legal* site.
+/// CLAUDE.md §Neutrality lists this table as a *legal* site.
 ///
 /// # `neutrality-05`: the twelve private-section entries are gone
 ///
@@ -134,9 +134,9 @@ const MAX_TWO_LABEL_SUFFIX_LEN: usize = 6;
 /// Returns `None` if there are fewer than 2 labels. Returned value is the
 /// base domain joined with `.`.
 ///
-/// L-9 (rev-2026-04-tunneling-allocs): returns `CompactString` (inline
-/// ≤24 bytes, no heap alloc for the common case) and uses `write!` into
-/// a single stackbuf rather than two `format!` heap allocations.
+/// Returns `CompactString` (inline ≤24 bytes, no heap alloc for the
+/// common case) and uses `write!` into a single stackbuf rather than two
+/// `format!` heap allocations.
 fn compute_base_domain(labels: &[&str]) -> Option<CompactString> {
     use std::fmt::Write;
     let n = labels.len();
@@ -195,7 +195,7 @@ const _: () = assert!(
 /// Fixed-size ring of the name hashes most recently counted in one
 /// `(client, base domain)` bucket. Lets [`TunnelingDetector::check_rate`]
 /// count **distinct names** in the window instead of every cache-missing
-/// call (sec-tunneling-rate-counts-repeats).
+/// call.
 ///
 /// Copied in shape — not imported — from `MacMismatchRing`
 /// (`profiles/resolver.rs`), which is not generic and lives in another
@@ -211,7 +211,7 @@ const _: () = assert!(
 ///    them a tunnel. The obvious exact fix, a `HashSet` of seen names per
 ///    bucket, is up to [`MAX_TRACKED_BASE_DOMAINS`] independent jemalloc
 ///    allocations reached from the DNS cache-miss path — the thing
-///    `project rules` §Hot path exists to forbid.
+///    `CLAUDE.md` §Hot path exists to forbid.
 /// 2. **Structural bound after.** 8 × `AtomicU64` = 64 B inline per
 ///    bucket, zero heap allocations, `size_of::<SubdomainTracker>()` =
 ///    72 B. At the 100 000-entry cap the map goes from ~7.5 MB (48 B key
@@ -225,9 +225,9 @@ const _: () = assert!(
 ///    contention has the same effect as a displacement.
 /// 4. **Why that cost is bounded.** A displacement can only *fail to
 ///    suppress* a repeat — never suppress a name the bucket has not seen.
-///    The error floor is therefore exactly the pre-fix behaviour, so this
-///    ring can never make a false refusal more likely than the code it
-///    replaces; it can only make it less likely. The converse error, two
+///    The error floor is therefore exactly the count-every-call behaviour
+///    this ring replaces, so it can never make a false refusal more
+///    likely — only less likely. The converse error, two
 ///    *distinct* names collapsing into one, needs the low 3 index bits
 ///    **and** the high 32 hash bits to match (~2^-35) and costs one
 ///    uncounted name out of the budget — the false-negative direction
@@ -306,10 +306,11 @@ fn name_hash(domain: &str) -> u64 {
 /// Per-base-domain subdomain rate tracker.
 struct SubdomainTracker {
     /// Packed `[count:u32 | window_start_secs:u32]` — atomic window reset
-    /// closes the Hermes T2.1 TOCTOU between the prior two-store reset
-    /// pattern. Preserves the L-11 invariant: first responder sees prior
-    /// count = 0, so a single `check_and_bump` covers first-responder and
-    /// subsequent-responder paths uniformly.
+    /// closes the TOCTOU a two-store reset pattern would have between the
+    /// window-start write and the count write. Preserves the invariant
+    /// that the first responder sees prior count = 0, so a single
+    /// `check_and_bump` covers first-responder and subsequent-responder
+    /// paths uniformly.
     counter: AtomicWindowCounter,
     /// Names already counted in this bucket's window. Deliberately
     /// **beside** [`Self::counter`] and not inside it: the packed counter
@@ -334,12 +335,12 @@ impl SubdomainTracker {
 /// DNS tunneling detector. Stateful — tracks subdomain rates over time.
 ///
 /// Backed by a [`BoundedMap`] capped at [`MAX_TRACKED_BASE_DOMAINS`] to
-/// prevent memory DoS from a flood of unique base domains (P0-4). When the
+/// prevent memory DoS from a flood of unique base domains. When the
 /// cap is hit, the oldest tracker is evicted via sample-8 approximate LRU.
 pub struct TunnelingDetector {
-    /// Per-`(client, base domain)` cache-miss rate tracking
-    /// (tunneling-rate-01: keyed per client so one device's fan-out can't
-    /// exhaust a base's budget for the whole LAN).
+    /// Per-`(client, base domain)` cache-miss rate tracking — keyed per
+    /// client so one device's fan-out can't exhaust a base's budget for
+    /// the whole LAN.
     subdomain_rates: BoundedMap<(IpAddr, CompactString), SubdomainTracker>,
     /// Live-swappable thresholds + exemption list. See [`TunnelingParams`].
     params: ArcSwap<TunnelingParams>,
@@ -418,7 +419,7 @@ fn is_exempt(domain: &str, exempt: &[CompactString]) -> bool {
 /// `in-addr.arpa` (RFC 1035 §3.5) and `ip6.arpa` (RFC 3596 §2.5) are
 /// protocol structure, not third-party knowledge — the same class as
 /// `RESERVED_TLDS` in the config validator and `HOSTS_SKIP` in the list
-/// parser, and outside what `project rules` §Neutrality forbids: that rule
+/// parser, and outside what `CLAUDE.md` §Neutrality forbids: that rule
 /// governs named *services*, and these two names belong to DNS itself.
 ///
 /// Written from scratch because no reusable predicate existed —
@@ -426,7 +427,7 @@ fn is_exempt(domain: &str, exempt: &[CompactString]) -> bool {
 /// the zones in comments and tests.
 ///
 /// **Lives here, not in `dns/handler.rs`,** for a mechanical reason worth
-/// keeping: the handler is one of the four files `project rules` §Neutrality
+/// keeping: the handler is one of the four files `CLAUDE.md` §Neutrality
 /// pins at *zero* domain literals outside tests, and its check is a plain
 /// `grep -cE '"[a-z0-9-]+\.[a-z]{2,}"'` that cannot tell an RFC zone from
 /// a vendor name. A legal literal there would still read as a violation
@@ -474,7 +475,7 @@ impl TunnelingDetector {
     }
 
     /// Current number of tracked `(client, base domain)` rate buckets.
-    #[allow(dead_code)] // wired to stats/metrics in P1-13
+    #[allow(dead_code)] // not yet wired to stats/metrics
     pub fn entry_count(&self) -> usize {
         self.subdomain_rates.len()
     }
@@ -482,7 +483,7 @@ impl TunnelingDetector {
     /// Analyze a domain's *shape* for tunneling indicators (per-label
     /// length, longest `-`-free run, length-gated entropy backstop).
     /// Stateless — the query-rate heuristic lives in [`Self::check_rate`]
-    /// and is bumped on cache misses only (tunneling-rate-01).
+    /// and is bumped on cache misses only.
     ///
     /// `domain` should be the full domain name (already lowercased).
     /// Returns `Suspicious` if any heuristic triggers and the name is not
@@ -497,8 +498,8 @@ impl TunnelingDetector {
     /// after 100 calls, so any future heuristic that memoises per base
     /// domain breaks that test by design.
     ///
-    /// L-9 (rev-2026-04-tunneling-allocs): hot-path is allocation-free in
-    /// the common case. Labels live in a stack array sized at MAX_LABELS,
+    /// Hot-path is allocation-free in the common case. Labels live in a
+    /// stack array sized at MAX_LABELS,
     /// the eTLD+1 lives in a `CompactString` (inline ≤24 bytes), and the
     /// entropy backstop streams bytes from a chained iterator instead of
     /// materializing a `String::concat`.
@@ -584,27 +585,28 @@ impl TunnelingDetector {
     /// Track and check the per-`(client, base domain)` query rate.
     /// Returns true if the rate exceeds the limit.
     ///
-    /// tunneling-rate-01 (rev-2606): the handler calls this on the
-    /// cache-MISS path only — pre-fix the bump lived inside [`Self::check`]
-    /// (pre-cache, so cache hits counted) and the bucket was keyed on base
-    /// domain alone (one budget shared by every client on the LAN). Any
-    /// base receiving >limit queries/window aggregate flipped to REFUSED
+    /// The handler calls this on the cache-MISS path only. If the bump
+    /// instead lived inside [`Self::check`] (pre-cache, so cache hits
+    /// counted) and the bucket were keyed on base domain alone (one
+    /// budget shared by every client on the LAN), any base whose
+    /// aggregate exceeds `limit` queries/window would flip to REFUSED
     /// for the whole network. Repeat lookups of a cached name prove
-    /// repetition, not fan-out; only names the resolver actually has to go
-    /// upstream for count against the budget.
+    /// repetition, not fan-out; only names the resolver actually has to
+    /// go upstream count against the budget.
     ///
     /// Names with no labels beyond the base (e.g. `example.com`) never
     /// count — same guard as the shape check.
     ///
-    /// L-11 (rev-2026-05-rrl-tunneling-toctou): atomic get-or-insert via
-    /// [`super::bounded_map::BoundedMap::entry_or_insert_with`] closes the
-    /// prior get-then-insert race (two concurrent fresh-key queries both
-    /// inserting, the second overwrite restarting the counter at 1).
-    /// Mirrors the L-1 fix in `rate_limiter.rs`.
+    /// Atomic get-or-insert via
+    /// [`super::bounded_map::BoundedMap::entry_or_insert_with`] closes a
+    /// get-then-insert race a naive check-then-insert would have (two
+    /// concurrent fresh-key queries both inserting, the second overwrite
+    /// restarting the counter at 1). Mirrors the same fix in
+    /// `rate_limiter.rs`.
     ///
-    /// Hermes T2.1 (rev-2026-05-18): window reset uses the packed
-    /// [`AtomicWindowCounter`] so the prior two-store reset (ws then
-    /// count) is now a single CAS — no torn intermediate state.
+    /// Window reset uses the packed [`AtomicWindowCounter`] so a
+    /// two-store reset (ws then count) is a single CAS — no torn
+    /// intermediate state.
     pub fn check_rate(&self, client_ip: &IpAddr, domain: &str) -> bool {
         let mut label_buf: [&str; MAX_LABELS] = [""; MAX_LABELS];
         let mut n = 0usize;
@@ -656,16 +658,17 @@ impl TunnelingDetector {
             .subdomain_rates
             .entry_or_insert_with(key, || SubdomainTracker::new(now_secs));
 
-        // sec-tunneling-rate-counts-repeats: count distinct names, not
-        // calls. A name this bucket already counted in the window is
-        // repetition — the exact opposite of the unique-name fan-out this
-        // gate exists to detect — so it neither bumps nor trips.
+        // Count distinct names, not calls. A name this bucket already
+        // counted in the window is repetition — the exact opposite of
+        // the unique-name fan-out this gate exists to detect — so it
+        // neither bumps nor trips.
         //
         // Not tripping (rather than bumping-nothing-and-comparing) is a
-        // decision, not an oversight: once a bucket is over budget the
-        // pre-fix gate REFUSEs every later miss under that base for the
-        // rest of the window, repeats included, and that collateral is
-        // half of what makes the defect visible. A ring-resident name was
+        // decision, not an oversight: once a bucket is over budget, a
+        // count-every-call gate REFUSEs every later miss under that base
+        // for the rest of the window, repeats included, and that
+        // collateral is half of what makes the defect visible. A
+        // ring-resident name was
         // already answered in this window by construction, so letting it
         // be answered again grants no query the client has not already
         // made. Fan-out is untouched: every *new* name still bumps, and
@@ -704,9 +707,9 @@ pub fn shannon_entropy(s: &str) -> f64 {
 /// Shannon entropy from a byte iterator. `total_len` must equal the
 /// iterator's byte count (callers know this without re-traversing).
 ///
-/// L-9 (rev-2026-04-tunneling-allocs): lets the tunneling detector
-/// compute concatenated-label entropy without materializing the joined
-/// string — saves one heap allocation per query when entropy is checked.
+/// Lets the tunneling detector compute concatenated-label entropy
+/// without materializing the joined string — saves one heap allocation
+/// per query when entropy is checked.
 pub fn shannon_entropy_bytes(bytes: impl Iterator<Item = u8>, total_len: usize) -> f64 {
     if total_len == 0 {
         return 0.0;
@@ -934,11 +937,11 @@ mod tests {
         assert!(!d.check_rate(&ip, "s0.sub.other.com"));
     }
 
-    /// tunneling-rate-01 regression: the rate bucket is keyed per
-    /// `(client, base)` — one client exhausting a base's budget must not
-    /// REFUSE the same base for every other device on the LAN (pre-fix the
-    /// key was the base alone, so >limit aggregate queries to a popular
-    /// base flipped it to Suspicious network-wide).
+    /// Regression: the rate bucket is keyed per `(client, base)` — one
+    /// client exhausting a base's budget must not REFUSE the same base
+    /// for every other device on the LAN. If the key were the base
+    /// alone, >limit aggregate queries to a popular base would flip it
+    /// to Suspicious network-wide.
     #[test]
     fn subdomain_rate_isolated_per_client() {
         let mut config = test_config();
@@ -955,9 +958,9 @@ mod tests {
         assert!(!d.check_rate(&client(20), "b0.cdn.example.com"));
     }
 
-    /// tunneling-rate-01: `check` is shape-only — arbitrary repeat volume
-    /// through it must never flip a low-entropy name to Suspicious (the
-    /// rate heuristic lives in `check_rate`, bumped on cache misses only).
+    /// `check` is shape-only — arbitrary repeat volume through it must
+    /// never flip a low-entropy name to Suspicious (the rate heuristic
+    /// lives in `check_rate`, bumped on cache misses only).
     #[test]
     fn shape_check_never_trips_on_volume() {
         let mut config = test_config();
@@ -974,7 +977,7 @@ mod tests {
         );
     }
 
-    // --- eTLD+1 fix (P0-4) ---
+    // --- eTLD+1 base-domain computation ---
 
     /// ICANN two-label suffixes must be treated as suffixes, so `foo.co.uk`
     /// is the base domain rather than `co.uk` itself. Without this each
@@ -1086,7 +1089,7 @@ mod tests {
     }
 
     /// `neutrality-05` — the twelve PSL *private*-section entries must
-    /// not come back. Named here, in a test, which per project rules
+    /// not come back. Named here, in a test, which per CLAUDE.md
     /// §Neutrality is the right place for a vendor name: proving warden
     /// holds no opinion about them.
     #[test]
@@ -1159,10 +1162,10 @@ mod tests {
         assert_eq!(uk, "victim.co.uk");
     }
 
-    /// sec-tunneling-base-domain-probe-alloc regression: adversarial
-    /// last-two labels longer than any 2LD suffix must still fall back to
-    /// the last-two-labels base (the length-bail skips the probe, never
-    /// the fallback). Pins that the bail did not change base computation.
+    /// Regression: adversarial last-two labels longer than any 2LD
+    /// suffix must still fall back to the last-two-labels base (the
+    /// length-bail skips the probe, never the fallback). Pins that the
+    /// bail did not change base computation.
     #[test]
     fn compute_base_domain_long_last_two_labels_uses_two_label_base() {
         let long_a = "a".repeat(40);
@@ -1174,12 +1177,11 @@ mod tests {
 
     #[test]
     fn shannon_entropy_bytes_matches_string_form() {
-        // L-9 (rev-2026-04-tunneling-allocs) regression pin: the new
-        // iterator-based shannon_entropy_bytes must produce the same
-        // result as shannon_entropy(&str) for the same byte sequence.
-        // The detector relies on this equivalence to swap concat-then-
-        // entropy for stream-bytes-to-entropy without changing detection
-        // semantics.
+        // Regression pin: the iterator-based shannon_entropy_bytes must
+        // produce the same result as shannon_entropy(&str) for the same
+        // byte sequence. The detector relies on this equivalence to swap
+        // concat-then-entropy for stream-bytes-to-entropy without
+        // changing detection semantics.
         let cases: &[&str] = &[
             "",
             "aaaa",
@@ -1200,9 +1202,9 @@ mod tests {
 
     #[test]
     fn shannon_entropy_bytes_chained_iterator_matches_concat_form() {
-        // L-9 sibling: the concrete callsite chains label.bytes() across
-        // multiple labels via flat_map. Verify the result equals the
-        // entropy of the concatenated string. This guarantees the
+        // The concrete callsite chains label.bytes() across multiple
+        // labels via flat_map. Verify the result equals the entropy of
+        // the concatenated string. This guarantees the
         // detector's "concat → entropy" swap in the hot path is
         // semantically lossless.
         let labels: &[&str] = &["abcd", "efgh", "ijkl"];
@@ -1270,14 +1272,15 @@ mod tests {
         assert_eq!(d.check(&name), TunnelingVerdict::Clean);
     }
 
-    /// The rate-bucket half of the `neutrality-05` trade-off, kept as a test
-    /// because it is the consequence an operator will actually feel.
+    /// The rate-bucket half of the `neutrality-05` trade-off documented
+    /// on [`TWO_LABEL_SUFFIXES`], kept as a test because it is the
+    /// consequence an operator will actually feel.
     ///
-    /// This test asserted the **opposite** until 2026-08-16, and the inversion
-    /// is the record: while `github.io` was a compiled-in suffix, each tenant
-    /// got its own bucket. It is not one now, so every tenant on the platform
-    /// shares one — three queries under `victim.github.io` exhaust the budget
-    /// for `other.github.io` too.
+    /// This test asserted the **opposite** while `github.io` was a
+    /// compiled-in suffix: back then each tenant got its own bucket. It
+    /// is not a suffix now, so every tenant on the platform shares one —
+    /// three queries under `victim.github.io` exhaust the budget for
+    /// `other.github.io` too.
     ///
     /// The ICANN case immediately below is the control: `co.uk` **is** still a
     /// suffix, so two registrants under it keep separate buckets. If both
@@ -1353,19 +1356,18 @@ mod tests {
 
     #[test]
     fn concurrent_first_subdomains_capped_at_subdomain_rate_limit() {
-        // L-11 (rev-2026-05-rrl-tunneling-toctou) regression pin: two or
-        // more concurrent fresh-base queries previously each passed the
-        // `get(...) = None` check and each inserted a fresh
-        // SubdomainTracker — the last writer won, but the per-base
-        // counter restarted at 1 on every overwrite, lifting the
-        // effective per-base subdomain budget. Mirrors L-1's
-        // `concurrent_first_queries_share_one_burst_budget` in
+        // Regression pin: a naive get-then-insert would let two or more
+        // concurrent fresh-base queries each pass the `get(...) = None`
+        // check and each insert a fresh SubdomainTracker — the last
+        // writer wins, but the per-base counter restarts at 1 on every
+        // overwrite, lifting the effective per-base subdomain budget.
+        // Mirrors `concurrent_first_queries_share_one_burst_budget` in
         // `rate_limiter.rs`.
         //
-        // The rate path is `check_rate(client, domain)` (tunneling-rate-01
-        // split): 8 distinct fresh subdomains under the same (client, base)
-        // key, racing in parallel. With `subdomain_rate = 2` exactly 2
-        // should pass and the rest trip.
+        // The rate path is `check_rate(client, domain)`: 8 distinct
+        // fresh subdomains under the same (client, base) key, racing in
+        // parallel. With `subdomain_rate = 2` exactly 2 should pass and
+        // the rest trip.
         use std::sync::{Arc, Barrier};
         use std::thread;
 
@@ -1424,19 +1426,19 @@ mod tests {
         assert!(d.check_rate(&ip, "abcdef6.tunnel.example.com"));
     }
 
-    // ── distinct-name counting (sec-tunneling-rate-counts-repeats) ───
+    // ── distinct-name counting ───────────────────────────────────────
 
     /// The gate counts **distinct names** in the window, not calls.
     ///
-    /// Measured failure this repairs: one name —
-    /// `ephemeralcounters.api.roblox.com` — sent 954 cache-missing
-    /// queries in 8 days, drained the `(client, roblox.com)` bucket, and
-    /// took its siblings down with it: 65 REFUSED on traffic that was
-    /// never a tunnel.
+    /// This closes a real failure mode: a single legitimate name that
+    /// polls frequently (short TTL, cache-missing every time) can drain
+    /// a `(client, base)` bucket by itself and take its siblings down
+    /// with it — REFUSED traffic that was never a tunnel.
     ///
-    /// **Pre-fix this trips on call 6.** No prior test called
-    /// `check_rate` twice with the same name, so the repeat-name
-    /// semantics were pinned in neither direction — this is the first.
+    /// Counting calls instead of distinct names would trip this test on
+    /// call 6. No prior test called `check_rate` twice with the same
+    /// name, so the repeat-name semantics were pinned in neither
+    /// direction — this is the first.
     #[test]
     fn repeated_name_never_trips_the_rate_gate() {
         let mut config = test_config();
@@ -1458,8 +1460,9 @@ mod tests {
     /// incident — the flood was one name, the refusals landed on two
     /// others under the same base.
     ///
-    /// Pre-fix the 200 repeats alone exhaust a budget of 5, so every
-    /// sibling is REFUSED on arrival.
+    /// Counting calls instead of distinct names, the 200 repeats alone
+    /// would exhaust a budget of 5, so every sibling would be REFUSED
+    /// on arrival.
     #[test]
     fn a_repeated_name_does_not_drain_its_siblings_budget() {
         let mut config = test_config();
@@ -1515,9 +1518,9 @@ mod tests {
     }
 
     /// Pins justification part 4: a slot collision can only *fail to
-    /// suppress* a repeat (degrading to the pre-fix behaviour), never
-    /// suppress a name the ring has not seen. If this inverts, the ring
-    /// starts hiding fan-out instead of hiding repetition.
+    /// suppress* a repeat (degrading to counting it as a fresh call),
+    /// never suppress a name the ring has not seen. If this inverts, the
+    /// ring starts hiding fan-out instead of hiding repetition.
     #[test]
     fn ring_displacement_fails_toward_counting_never_toward_suppressing() {
         let ring = RecentNames::new();

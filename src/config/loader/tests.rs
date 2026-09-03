@@ -52,7 +52,7 @@ fn single_file_no_includes_uses_fast_path() {
     // Fast-path populates provenance too (so downstream error
     // enrichment still has top-level keys available).
     assert!(loaded.provenance.contains_key("server"));
-    assert!(loaded.provenance.contains_key("devices.alex-iphone"));
+    assert!(loaded.provenance.contains_key("devices.operator-iphone"));
 }
 
 // ── 2. happy-path multi-file (committed full-v1 fixture) ────────────
@@ -79,11 +79,11 @@ fn full_v1_fixture_provenance_points_at_the_actual_files() {
     let loaded = load_config(&master, now()).expect("load");
     let (file, _line) = loaded
         .provenance
-        .get("devices.alex-iphone")
+        .get("devices.operator-iphone")
         .expect("entity provenance must be recorded");
     assert!(
-        file.ends_with("devices.d/alex.toml"),
-        "expected alex.toml, got {}",
+        file.ends_with("devices.d/operator.toml"),
+        "expected operator.toml, got {}",
         file.display()
     );
     let (server_file, _) = loaded.provenance.get("server").expect("server provenance");
@@ -2353,7 +2353,7 @@ fn a_secondary_master_may_keep_its_node_local_sections() {
         // `allow_from` is not decoration here: a 0.0.0.0 bind with an empty
         // one is an open resolver, and the validator says so — which would
         // red this test for a reason that has nothing to do with the guard.
-        "[server]\nlisten = \"0.0.0.0:53\"\nallow_from = [\"192.0.2.0/24\"]\n\n\
+        "[server]\nlisten = \"0.0.0.0:53\"\nallow_from = [\"10.10.1.0/24\"]\n\n\
          [tracking]\nenabled = true\n\n\
          [socket]\nenabled = true\n\n\
          [backup]\nauto_interval = \"24h\"\n",

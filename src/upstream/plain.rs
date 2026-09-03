@@ -10,7 +10,7 @@
 //!   because `hickory_resolver` 0.25 has no public ECS API.
 //!
 //! The Resolver path is preserved bit-for-bit when `ecs.enabled = false` —
-//! LAN-only deploys see zero behavioural change vs the pre-§4.8 baseline.
+//! LAN-only deploys that never turn on ECS see no behavioural change.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -45,32 +45,32 @@ impl PlainUpstream {
     /// Create a new upstream resolver. Servers are parsed as `IP:port`
     /// strings.
     ///
-    /// **§4.8 §2/2 (T4):** `ecs_enabled` is the global
-    /// `[upstream.ecs].enabled` master kill-switch, not a per-query
-    /// option. When `false`, this upstream uses the existing
-    /// `hickory_resolver::Resolver` path: each server registers both
-    /// UDP (primary) and TCP (fallback); truncated UDP responses retry
-    /// over TCP automatically — the per-query `ecs` arg on
+    /// `ecs_enabled` is the global `[upstream.ecs].enabled` master
+    /// kill-switch, not a per-query option. When `false`, this upstream
+    /// uses the `hickory_resolver::Resolver` path: each server registers
+    /// both UDP (primary) and TCP (fallback); truncated UDP responses
+    /// retry over TCP automatically — the per-query `ecs` arg on
     /// [`Upstream::lookup`] is ignored by this branch (the resolver
     /// has no ECS API).
     ///
     /// When `true`, the upstream dispatches to [`PlainRawClient`] which
-    /// builds outbound queries via the shared `build_query_bytes()` and
+    /// builds outbound queries via the shared `build_query()` and
     /// honours the per-query ECS option. The dispatch decision happens
     /// once at construction time because the resolver path cannot inject
-    /// ECS at all; we cannot mix-and-match per query. Operators who want
-    /// per-profile ECS off-but-master-switch-on still pay the raw-socket
-    /// price for the off-profile queries (the build_option returns
-    /// `None`, the wire is byte-identical to baseline anyway).
+    /// ECS at all — there is no mixing per query. Operators who want
+    /// per-profile ECS off but the master switch on still pay the
+    /// raw-socket price for the off-profile queries (the build_option
+    /// returns `None`, so the wire is byte-identical to the resolver
+    /// path anyway).
     pub fn new(
         servers: &[String],
         timeout: Duration,
         ecs_enabled: bool,
         dnssec_ok: bool,
     ) -> Result<Self, anyhow::Error> {
-        // §4.10: the hickory `Resolver` path has no DO-bit knob, so when DNSSEC
-        // OK is required (the validator's upstream) we force the raw-socket
-        // path — exactly as ECS injection already does. `dnssec_ok = false` (the
+        // The hickory `Resolver` path has no DO-bit knob, so when DNSSEC OK is
+        // required (the validator's upstream) the raw-socket path is forced —
+        // exactly as ECS injection already does. `dnssec_ok = false` (the
         // client-facing upstream) preserves the Resolver path bit-for-bit.
         let inner = if ecs_enabled || dnssec_ok {
             PlainInner::Raw(PlainRawClient::new(servers, timeout, dnssec_ok)?)
@@ -82,8 +82,8 @@ impl PlainUpstream {
 
     /// Returns `true` when this upstream is dispatching to the raw-socket
     /// client (rather than hickory's `Resolver`). The raw path is selected
-    /// when ECS injection (§4.8) **or** the DNSSEC DO bit (§4.10) is required.
-    /// Useful for tests and operator introspection.
+    /// when ECS injection **or** the DNSSEC DO bit is required. Useful for
+    /// tests and operator introspection.
     pub fn uses_ecs(&self) -> bool {
         matches!(self.inner, PlainInner::Raw(_))
     }
@@ -91,7 +91,7 @@ impl PlainUpstream {
 
 /// Build the hickory `Resolver` used by the non-ECS, non-DNSSEC plain path.
 ///
-/// **Single-retry-layer invariant M5/M6.** `opts.attempts` is deliberately
+/// **Single-retry-layer invariant.** `opts.attempts` is deliberately
 /// `1`: this resolver retries *nothing*, because warden already has exactly one
 /// retry surface above it and stacking a second multiplies tail latency instead
 /// of adding resilience.
@@ -123,16 +123,16 @@ fn build_resolver(
 ) -> Result<Resolver<TokioRuntimeProvider>, anyhow::Error> {
     let mut resolver_config = ResolverConfig::default();
     for server in servers {
-        // rev-2606: the shape parse is shared with `config lint` so a typo
-        // is rejected identically at lint and at boot (single source of truth).
+        // The shape parse is shared with `config lint` so a typo is rejected
+        // identically at lint and at boot (single source of truth).
         let addr: SocketAddr = crate::upstream::shape::validate_plain_server(server)
             .map_err(|e| anyhow::anyhow!("invalid plain upstream server: {e}"))?;
-        // 0.26: a single NameServerConfig per IP now carries a Vec of
+        // Since hickory 0.26, a single NameServerConfig per IP carries a Vec of
         // ConnectionConfigs (0.25 registered UDP + TCP as two separate
         // NameServerConfigs). Same wire behaviour — UDP primary, TCP fallback.
-        // `ConnectionConfig::udp()/tcp()` default to port 53, so set the parsed
-        // port explicitly. `trust_negative_responses = true` matches the 0.26
-        // default and the pre-bump behaviour (we cache upstream negatives).
+        // `ConnectionConfig::udp()/tcp()` default to port 53, so the parsed
+        // port is set explicitly, and `trust_negative_responses = true` so
+        // upstream negative responses are cached.
         let mut udp = ConnectionConfig::udp();
         udp.port = addr.port();
         let mut tcp = ConnectionConfig::tcp();
@@ -143,12 +143,13 @@ fn build_resolver(
     let mut opts = ResolverOpts::default();
     opts.cache_size = 0;
     opts.timeout = timeout;
-    // [M6] One attempt, not two — see the single-retry-layer invariant on this
+    // One attempt, not two — see the single-retry-layer invariant on this
     // function. Pinned by `build_resolver_uses_a_single_attempt`.
     opts.attempts = 1;
 
     let provider = TokioRuntimeProvider::default();
-    // 0.26: ResolverBuilder::build() now returns Result (was infallible).
+    // Since hickory 0.26, ResolverBuilder::build() returns Result (it used
+    // to be infallible).
     Ok(Resolver::builder_with_config(resolver_config, provider)
         .with_options(opts)
         .build()?)
@@ -165,14 +166,13 @@ impl Upstream for PlainUpstream {
         match &self.inner {
             PlainInner::Raw(raw) => raw.lookup(name, record_type, ecs).await,
             PlainInner::Resolver(resolver) => {
-                // §4.8 §2/2 (T4): hickory_resolver has no ECS injection
-                // API; when the master switch is off, the per-query ecs
-                // value is silently dropped. The handler's resolved-
-                // profile + EcsPolicy chain guarantees `ecs.is_none()`
-                // along this branch in practice — we drop the param
-                // defensively rather than assert, because integration
-                // shims (e.g. circuit-breaker probing) may exercise
-                // mixed paths.
+                // hickory_resolver has no ECS injection API; when the
+                // master switch is off, the per-query ecs value is
+                // silently dropped. The handler's resolved-profile +
+                // EcsPolicy chain guarantees `ecs.is_none()` along this
+                // branch in practice — the param is dropped defensively
+                // rather than asserted, because integration shims (e.g.
+                // circuit-breaker probing) may exercise mixed paths.
                 let _ = ecs;
                 match resolver.lookup(name.clone(), record_type).await {
                     Ok(lookup) => Ok(UpstreamResponse {
@@ -221,7 +221,7 @@ fn extract_negative_meta(err: &NetError) -> (Option<ResponseCode>, Option<u32>) 
 mod tests {
     use super::*;
 
-    /// §4.10: `dnssec_ok = true` forces the raw-socket path even with ECS off,
+    /// `dnssec_ok = true` forces the raw-socket path even with ECS off,
     /// because hickory's `Resolver` has no DO-bit knob. `dnssec_ok = false`
     /// keeps the Resolver path — the byte-identical client-facing baseline.
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         );
     }
 
-    /// M6 Pins the single-retry-layer invariant documented on
+    /// Pins the single-retry-layer invariant documented on
     /// [`build_resolver`].
     ///
     /// `attempts` multiplies `timeout` *before* the circuit breaker above ever

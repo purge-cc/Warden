@@ -8,7 +8,7 @@
 //! These rules complement the DNS-level anti-bypass blocking — even if
 //! a client knows a resolver IP, the firewall blocks direct access.
 //!
-//! # `neutrality-02`: layer 2 no longer ships an address list
+//! # Layer 2 no longer ships an address list
 //!
 //! A `RESOLVER_IPS` const used to carry 22 addresses belonging to eight
 //! named providers, and every one of them was written into the
@@ -20,14 +20,12 @@
 //! list was hand-maintained and would drift.
 //!
 //! The list is gone and **nothing replaced it with a default**. No
-//! non-empty value is neutral — project rules records that exact mistake
-//! being made twice (`neutrality-03` shipped a provider as the default
-//! upstream; `neutrality-07` put the same address in the safe-mode
-//! config) and a third time in a shipped artifact rather than in `src/`
-//! (`neutrality-09`, the installer's `DEFAULT_UPSTREAM`), which is why
-//! the sweep grew a section for files outside `src/`. Layer 1 — the DNS
-//! redirect, which is what actually forces traffic through warden — is
-//! unchanged and still emitted.
+//! non-empty value is neutral — this codebase has shipped that exact
+//! mistake more than once (a provider as the default upstream; the same
+//! address in the safe-mode config) and once more in a shipped artifact
+//! rather than in `src/` (the installer's `DEFAULT_UPSTREAM`). Layer 1 —
+//! the DNS redirect, which is what actually forces traffic through
+//! warden — is unchanged and still emitted.
 //!
 //! What layer 2 emits instead is a commented block explaining that no
 //! addresses are configured, the two rule templates to copy per address,
@@ -42,14 +40,13 @@
 //!
 //! Wiring this to the operator's config properly — deriving candidate
 //! addresses from `[[upstreams]]` or an imported list — needs the
-//! command's caller (`main.rs`), which is outside this change. See
-//! `NOTES-e.md`.
+//! command's caller (`main.rs`).
 
 use std::net::SocketAddr;
 
 /// Render the iptables/nftables rules for DNS enforcement as text.
 /// Separated from [`run_firewall_rules`] so the generated artifact can be
-/// asserted in tests (rev-2606 firewall_rules-01).
+/// asserted in tests.
 fn render_firewall_rules(listen: SocketAddr) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -187,8 +184,7 @@ fn render_firewall_rules(listen: SocketAddr) -> String {
         // Loopback listener: redirect locally-originated DNS via the nat
         // OUTPUT chain — the nft mirror of the iptables REDIRECT above.
         // Without it an nft-only operator with a loopback listen got the
-        // DoH-block rules but NO DNS redirect at all (rev-2606
-        // firewall_rules-01).
+        // DoH-block rules but NO DNS redirect at all.
         let _ = writeln!(
             out,
             "# nft add chain inet purge-warden output {{ type nat hook output priority -100 \\; }}"
@@ -269,7 +265,7 @@ mod tests {
     use super::*;
 
     /// The 22 addresses `RESOLVER_IPS` used to emit, named here and only
-    /// here. Per project rules §Neutrality a provider value belongs in
+    /// here. A provider value belongs in
     /// `#[cfg(test)]` when it proves warden does **not** touch it.
     const RETIRED_RESOLVER_IPS: &[&str] = &[
         "8.8.8.8",
@@ -296,8 +292,8 @@ mod tests {
         "185.228.169.168",
     ];
 
-    /// neutrality-02, inverted from `resolver_ips_not_empty` (which
-    /// asserted `len() >= 15` — the violation, pinned by a test).
+    /// Inverted from the old `resolver_ips_not_empty` test, which
+    /// asserted `len() >= 15` — the violation, once pinned by a test.
     #[test]
     fn neutrality02_no_retired_provider_address_is_emitted() {
         // Both listen shapes: the loopback and non-loopback branches
@@ -309,7 +305,7 @@ mod tests {
                 assert!(
                     !out.contains(ip),
                     "generated firewall artifact carries provider address {ip} \
-                     (listen {listen}) — see project rules §Neutrality"
+                     (listen {listen}) — see CLAUDE.md §Neutrality"
                 );
             }
         }
@@ -383,7 +379,7 @@ mod tests {
 
     #[test]
     fn apply_hint_matches_the_format_actually_emitted() {
-        // cli-help-lies: the body is a list of executable `iptables …`
+        // The body is a list of executable `iptables …`
         // commands, so the header must not send the operator to
         // `iptables-restore` — that consumes `iptables-save` table dumps
         // and fails on line 1 of this artifact.
@@ -414,9 +410,9 @@ mod tests {
 
     #[test]
     fn nft_loopback_emits_output_redirect() {
-        // firewall_rules-01: a loopback listener must still get a DNS
-        // redirect in the nftables section (nat OUTPUT redirect), mirroring
-        // the iptables REDIRECT — not silently drop to DoH-block-only.
+        // A loopback listener must still get a DNS redirect in the
+        // nftables section (nat OUTPUT redirect), mirroring the iptables
+        // REDIRECT — not silently drop to DoH-block-only.
         let out = render_firewall_rules("127.0.0.1:5300".parse().unwrap());
         assert!(
             out.contains("nft add chain inet purge-warden output"),

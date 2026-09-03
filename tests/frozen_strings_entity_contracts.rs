@@ -141,7 +141,7 @@ fn blocklist_duplicate_url_format_names_all_ids_and_the_url() {
 ///    `extra_domains` is enforced ahead of the engine where nothing can.
 ///    An operator told "subscribe a list" would get a different
 ///    guarantee than the one they asked for.
-/// 3. It names no provider. project rules §Neutrality binds frozen strings
+/// 3. It names no provider. CLAUDE.md §Neutrality binds frozen strings
 ///    too — `neutrality-08` was a vendor name that hid inside one.
 #[test]
 fn n1_anti_bypass_enabled_no_domains_byte_pinned() {
@@ -194,7 +194,7 @@ fn n1_anti_bypass_warning_names_no_provider() {
     ] {
         assert!(
             !lower.contains(needle),
-            "frozen string names a provider ({needle}) — see project rules §Neutrality"
+            "frozen string names a provider ({needle}) — see CLAUDE.md §Neutrality"
         );
     }
 }
@@ -282,7 +282,7 @@ fn neutrality04_safe_search_warning_names_the_only_remaining_source() {
 }
 
 /// The retired table, named here and only here. A vendor name in a test
-/// asserting **absence** is the sanctioned use per project rules §Neutrality;
+/// asserting **absence** is the sanctioned use per CLAUDE.md §Neutrality;
 /// any of these appearing in the operator-facing string would mean the
 /// opinion came back through the diagnostic.
 #[test]

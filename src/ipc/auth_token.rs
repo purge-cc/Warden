@@ -1,16 +1,16 @@
-//! Plaintext-token file storage for the CLI side of the IPC ACL (P0-3).
+//! Plaintext-token file storage for the CLI side of the IPC ACL.
 //!
-//! Design goals (from the usability-first memory rule):
+//! Design goals:
 //!
 //! - **Auto-discovery.** The CLI must find the token without the operator
 //!   setting an environment variable, specifying a flag, or knowing where
 //!   the file lives.
-//! - **FHS-canonical location (§4.40).** The default token file lives at
+//! - **FHS-canonical location.** The default token file lives at
 //!   `/var/lib/purge-warden/token`, next to other daemon state (audit log,
 //!   stats snapshots, list cache). The XDG-spec path
 //!   `$XDG_CONFIG_HOME/purge-warden/token` (or `$HOME/.config/...`) is
-//!   kept as a back-compat fallback for installs predating §4.40 — the
-//!   daemon migrates such tokens to the FHS location on next boot.
+//!   kept as a back-compat fallback for installs predating this location —
+//!   the daemon migrates such tokens to the FHS location on next boot.
 //! - **Safe permissions.** Token files are written mode 0600 (owner-only)
 //!   on unix. Parent directory is created mode 0700 only when we created
 //!   it; pre-existing parent dirs (e.g. `/var/lib/purge-warden/` at 0o750)
@@ -22,17 +22,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// FHS canonical token path (§4.40). Lives next to other daemon state
+/// FHS canonical token path. Lives next to other daemon state
 /// (`/var/lib/purge-warden/{audit,lists,data}`) so backup / restore / SELinux
-/// labelling all treat it as a single tree. Independent of `$HOME` — the
-/// pre-§4.40 dependency on `/home/<daemon-user>/.config/purge-warden/token`
-/// silently failed when the daemon user had no home dir (see
-/// `project_4_32_ipc_peer_uid_gate` memory).
+/// labelling all treat it as a single tree. Independent of `$HOME` — an
+/// earlier dependency on `/home/<daemon-user>/.config/purge-warden/token`
+/// silently failed when the daemon user had no home dir.
 const FHS_TOKEN_PATH: &str = "/var/lib/purge-warden/token";
 
 /// Locate the default plaintext token file.
 ///
-/// Resolution order (§4.40):
+/// Resolution order:
 /// 1. FHS path `/var/lib/purge-warden/token` if it exists.
 /// 2. Back-compat: `$XDG_CONFIG_HOME/purge-warden/token` if it exists.
 /// 3. Back-compat: `$HOME/.config/purge-warden/token` if it exists.
@@ -43,7 +42,7 @@ const FHS_TOKEN_PATH: &str = "/var/lib/purge-warden/token";
 ///
 /// Returns `None` only when the FHS path is not constructable (never
 /// happens on Unix; the const is a static literal) — kept as `Option`
-/// for back-compat with callers that handled the pre-§4.40 "neither env
+/// for back-compat with callers that handled an earlier "neither env
 /// var set" case.
 pub fn default_token_path() -> Option<PathBuf> {
     let fhs = PathBuf::from(FHS_TOKEN_PATH);
@@ -95,7 +94,7 @@ pub fn legacy_xdg_token_path() -> Option<PathBuf> {
     )
 }
 
-/// §4.40 boot-time migration: move a pre-§4.40 XDG token (at
+/// Boot-time migration: move a legacy XDG token (at
 /// `$HOME/.config/purge-warden/token` or `$XDG_CONFIG_HOME/...`) into
 /// the FHS canonical path (`/var/lib/purge-warden/token`), then remove
 /// the legacy file. Idempotent: returns early if the FHS path already
@@ -208,22 +207,22 @@ pub fn save_token(plaintext: &str) -> std::io::Result<PathBuf> {
 /// Save a plaintext token to an explicit path.
 ///
 /// The atomic file write — staged temp + fsync + mode 0600 + rename —
-/// is delegated to the shared §4.31 `hardened_atomic_write` helper, so
-/// the token file gets the same crash-safety contract as every
+/// is delegated to the shared `hardened_atomic_write` helper, so the
+/// token file gets the same crash-safety contract as every
 /// config-mutation path (and the same `geteuid() == 0` lchown gate, so
-/// it stays safe under the CT seccomp filter). Parent directories are
-/// created as needed; a *newly created* parent is chmod'd 0700, but a
-/// pre-existing one (e.g. the FHS state dir `/var/lib/purge-warden/` at
-/// 0o750) is left untouched — §4.40 DISC-3.
+/// it stays safe under a restrictive seccomp filter). Parent
+/// directories are created as needed; a *newly created* parent is
+/// chmod'd 0700, but a pre-existing one (e.g. the FHS state dir
+/// `/var/lib/purge-warden/` at 0o750) is left untouched.
 pub fn save_token_at(path: &std::path::Path, plaintext: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        // §4.40 DISC-3: only chmod the parent dir when we created it.
-        // For the FHS path (`/var/lib/purge-warden/`, mode 0o750 owned
+        // Only chmod the parent dir when we created it. For the FHS
+        // path (`/var/lib/purge-warden/`, mode 0o750 owned
         // `purge-warden:purge-warden`), the dir already exists — and a
         // forced chmod 0o700 would break sibling state writers
         // (`audit/`, `lists/`, `data/`) that rely on group access.
         // `hardened_atomic_write` creates the parent too but never
-        // chmods it, so this block stays here to keep the DISC-3 rule.
+        // chmods it, so this block stays here to keep that guarantee.
         let pre_existed = parent.exists();
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -233,12 +232,12 @@ pub fn save_token_at(path: &std::path::Path, plaintext: &str) -> std::io::Result
         }
     }
 
-    // s-4.40-disc-4: delegate the atomic file write to the shared §4.31
-    // helper instead of hand-rolling tmp + fsync + chmod + rename.
-    // Besides the consistency win, this picks up a process-unique
-    // staged path — the old fixed `path.with_extension("tmp")` could
-    // collide between two concurrent `save_token` calls. The token body
-    // keeps its trailing newline for shell friendliness.
+    // Delegate the atomic file write to the shared helper instead of
+    // hand-rolling tmp + fsync + chmod + rename. Besides the
+    // consistency win, this picks up a process-unique staged path —
+    // the old fixed `path.with_extension("tmp")` could collide between
+    // two concurrent `save_token` calls. The token body keeps its
+    // trailing newline for shell friendliness.
     let mut body = Vec::with_capacity(plaintext.len() + 1);
     body.extend_from_slice(plaintext.as_bytes());
     body.push(b'\n');
@@ -372,22 +371,22 @@ mod tests {
         }
     }
 
-    /// §4.40 — fresh install (no FHS file, no XDG file) must still
-    /// resolve to the FHS path so `save_token()` writes there by
-    /// default. We can't fully assert this without unsetting env vars
-    /// (which would race with parallel tests), but we can pin that the
-    /// function always returns `Some` post-§4.40 (pre-fix it returned
-    /// `None` when neither $HOME nor $XDG_CONFIG_HOME was set).
+    /// A fresh install (no FHS file, no XDG file) must still resolve to
+    /// the FHS path so `save_token()` writes there by default. We can't
+    /// fully assert this without unsetting env vars (which would race
+    /// with parallel tests), but we can pin that the function always
+    /// returns `Some` (an earlier version returned `None` when neither
+    /// $HOME nor $XDG_CONFIG_HOME was set).
     #[test]
     fn default_token_path_is_never_none_post_4_40() {
-        // Pin the §4.40 contract: even in a broken environment
-        // (no $HOME, no $XDG_CONFIG_HOME, no /var/lib/purge-warden/token)
-        // the function returns Some — the FHS const is unconditional.
+        // Pin the contract: even in a broken environment (no $HOME, no
+        // $XDG_CONFIG_HOME, no /var/lib/purge-warden/token) the
+        // function returns Some — the FHS const is unconditional.
         assert!(default_token_path().is_some());
     }
 
-    /// §4.40 DISC-3 — `save_token_at` must NOT chmod a pre-existing
-    /// parent directory. Pre-fix the unconditional `set_permissions(parent, 0o700)`
+    /// `save_token_at` must NOT chmod a pre-existing parent directory.
+    /// An earlier version's unconditional `set_permissions(parent, 0o700)`
     /// would clobber `/var/lib/purge-warden/` from 0o750 to 0o700, breaking
     /// sibling state directories (`audit/`, `lists/`, `data/`) that rely
     /// on group access.
@@ -409,7 +408,7 @@ mod tests {
         let token_mode = token_meta.permissions().mode() & 0o777;
         assert_eq!(token_mode, 0o600, "token file must be 0o600");
 
-        // §4.40 DISC-3 contract: parent dir mode unchanged.
+        // Parent dir mode unchanged.
         let parent_meta = std::fs::metadata(&parent).unwrap();
         let parent_mode = parent_meta.permissions().mode() & 0o777;
         assert_eq!(
@@ -418,8 +417,8 @@ mod tests {
         );
     }
 
-    /// §4.40 — `migrate_xdg_to_fhs` copies the XDG-located token to
-    /// the FHS path with mode 0o600 and unlinks the XDG file.
+    /// `migrate_xdg_to_fhs` copies the XDG-located token to the FHS
+    /// path with mode 0o600 and unlinks the XDG file.
     #[test]
     fn migrate_xdg_to_fhs_copies_token_and_unlinks_xdg() {
         let tmp = tempfile::tempdir().unwrap();
@@ -448,11 +447,11 @@ mod tests {
         }
     }
 
-    /// §4.40 — `migrate_xdg_to_fhs` is idempotent: if the FHS path
-    /// already exists, the migration is a no-op (does NOT overwrite the
-    /// FHS file with the XDG content, does NOT unlink the XDG file).
-    /// This guards against the operator generating a fresh FHS token
-    /// while a stale XDG token sits around.
+    /// `migrate_xdg_to_fhs` is idempotent: if the FHS path already
+    /// exists, the migration is a no-op (does NOT overwrite the FHS
+    /// file with the XDG content, does NOT unlink the XDG file). This
+    /// guards against the operator generating a fresh FHS token while a
+    /// stale XDG token sits around.
     #[test]
     fn migrate_xdg_to_fhs_skips_when_fhs_present() {
         let tmp = tempfile::tempdir().unwrap();
@@ -477,10 +476,10 @@ mod tests {
         );
     }
 
-    /// §4.40 — `migrate_xdg_to_fhs` returns Err on read failure (e.g.
-    /// XDG path doesn't exist). Callers in `ensure_fhs_token_path`
-    /// must swallow this and continue booting (handled via the helper
-    /// — daemon boot can't fail on a missing legacy token).
+    /// `migrate_xdg_to_fhs` returns Err on read failure (e.g. XDG path
+    /// doesn't exist). Callers in `ensure_fhs_token_path` must swallow
+    /// this and continue booting (handled via the helper — daemon boot
+    /// can't fail on a missing legacy token).
     #[test]
     fn migrate_xdg_to_fhs_errors_when_xdg_missing() {
         let tmp = tempfile::tempdir().unwrap();

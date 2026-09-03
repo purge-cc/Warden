@@ -22,8 +22,8 @@ const LOCKOUT_DURATION: Duration = Duration::from_secs(300); // 5 minutes
 /// Failure counters stay in the map for this long after the last failed
 /// attempt. Sized as 4× `LOCKOUT_DURATION` so a paced attacker must fire
 /// faster than 1 fail per 20 min to keep accumulating toward
-/// `MAX_FAILURES`. See §4.48 (parent discovery `s-4.47-disc-1`) for the
-/// pacing-attack threat model.
+/// `MAX_FAILURES` — the pacing-attack threat model this window
+/// defends against.
 const STALENESS_WINDOW: Duration = Duration::from_secs(LOCKOUT_DURATION.as_secs() * 4);
 
 /// Hard cap on the number of tracked source addresses.
@@ -52,8 +52,8 @@ const EVICTION_SCAN_LIMIT: usize = EVICTION_SAMPLE * 4;
 /// by `cleanup` to drop entries whose failure counters have gone stale
 /// (no new failures within `STALENESS_WINDOW`). Monotonic `Instant`
 /// avoids clock-skew artifacts (NTP corrections, leap seconds). See
-/// §4.48 for the pacing-attack threat model that motivated the
-/// staleness check.
+/// the pacing-attack threat model that motivated the staleness
+/// check.
 struct AuthFailureEntry {
     count: u32,
     last_failure: Instant,
@@ -209,7 +209,7 @@ impl AuthRateLimiter {
     ///    cleanup ticks (cadence ~60s, see `src/cli/commands/start.rs`)
     ///    still accumulates toward `MAX_FAILURES`. Without this, a
     ///    9-fail-per-60s pacing attack would never trip the lockout
-    ///    (see §4.48 / parent discovery `s-4.47-disc-1`).
+    ///    (see the pacing-attack regression test below).
     ///
     /// Entries with neither active lockout nor a fresh failure are dropped.
     /// That is an age bound, not a size bound: between ticks the map still
@@ -320,7 +320,7 @@ mod tests {
         limiter.record_failure(&ip);
         assert_eq!(limiter.failures.len(), 1);
 
-        // Fresh entry — staleness check keeps it (§4.48 behaviour change).
+        // Fresh entry — staleness check keeps it.
         limiter.cleanup();
         assert_eq!(limiter.failures.len(), 1);
 
@@ -387,11 +387,9 @@ mod tests {
         assert_eq!(limiter.failures.len(), 0);
     }
 
-    /// Regression for §4.48 / parent discovery `s-4.47-disc-1`.
-    ///
-    /// Pre-§4.48, a 9-fails-per-cleanup-window pacing attack reset the
-    /// counter every 60s and never tripped `MAX_FAILURES`. Post-§4.48,
-    /// the staleness window keeps the entry across cleanup ticks so the
+    /// Regression: a 9-fails-per-cleanup-window pacing attack used to
+    /// reset the counter every 60s and never trip `MAX_FAILURES`. The
+    /// staleness window keeps the entry across cleanup ticks so the
     /// 10th fail (a window later) trips the lockout as policy dictates.
     #[test]
     fn pacing_attack_trips_lockout_across_cleanup_ticks() {
@@ -405,13 +403,13 @@ mod tests {
         assert!(!limiter.is_locked_out(&ip));
 
         // Cleanup tick lands between attacker's pacing windows.
-        // Pre-§4.48: drops the entry, counter resets to 0.
-        // Post-§4.48: `last_failure` is fresh, entry kept with count=9.
+        // Without the staleness window: drops the entry, counter resets to 0.
+        // With it: `last_failure` is fresh, entry kept with count=9.
         limiter.cleanup();
 
         // Window 2: 1 more fail.
-        // Pre-§4.48: count=1 (fresh entry), no lockout — attacker paces forever.
-        // Post-§4.48: count=10 (accumulated across cleanup), lockout fires.
+        // Without the staleness window: count=1 (fresh entry), no lockout — attacker paces forever.
+        // With it: count=10 (accumulated across cleanup), lockout fires.
         let locked = limiter.record_failure(&ip);
         assert!(locked, "10th fail across cleanup tick should trip lockout");
         assert!(limiter.is_locked_out(&ip));

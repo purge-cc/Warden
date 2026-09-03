@@ -5,10 +5,10 @@
 //! same binary work from the dev repo (`./config.toml`), a user install
 //! (`~/.config/purge-warden/config.toml`), or the v1 FHS system install
 //! (`/etc/purge-warden/config.toml`) without the operator having to pass
-//! `--config` every time. The legacy pre-S34 location
+//! `--config` every time. The legacy monolithic-config location
 //! (`/var/lib/purge-warden/config.toml`) is kept as a last-resort fallback
-//! so boxes that still hold a monolithic config from before the FHS split
-//! keep working.
+//! so boxes that still hold a config from before the FHS split keep
+//! working.
 //!
 //! If none of the candidates exist, we fall back to `./config.toml` and return
 //! a warning the caller can surface to the user (TUI footer, stderr, …) so the
@@ -21,7 +21,7 @@
 //! config beside a live one. The probe opens each candidate rather than
 //! stat-ing it, so the two never collapse into one answer.
 //!
-//! **Security — privileged discovery (rev-2606 `config_discovery-01`).** A
+//! **Security — privileged discovery.** A
 //! *root* invocation without `--config` must never auto-load a config from a
 //! path a non-root user can write. The CWD (`./config.toml`) is frequently a
 //! shared/scratch dir under `sudo`, and `$HOME` may still belong to the
@@ -121,12 +121,11 @@ fn probe_path(p: &Path) -> CandidateProbe {
     }
 }
 
-/// System-install root for the v1 master config (A2 in
-/// `_docs/features/config_architecture.md`).
+/// System-install root for the v1 master config.
 const ETC_ROOT: &str = "/etc/purge-warden/";
 
 /// Legacy monolithic-config root kept for backward compatibility with
-/// pre-S34 installs.
+/// installs predating the FHS split.
 const VAR_LIB_ROOT: &str = "/var/lib/purge-warden/";
 
 /// Runtime PID file path used when the resolved config lives under a
@@ -145,20 +144,20 @@ const DEV_PID_FILE: &str = "purge-warden.pid";
 /// 1. `./config.toml` — dev workflow (running from the repo root).
 /// 2. `$XDG_CONFIG_HOME/purge-warden/config.toml` (or `$HOME/.config/...`)
 ///    — per-user install.
-/// 3. `/etc/purge-warden/config.toml` — v1 FHS system install (A2).
-/// 4. `/var/lib/purge-warden/config.toml` — legacy pre-S34 monolithic
-///    layout.
+/// 3. `/etc/purge-warden/config.toml` — v1 FHS system install.
+/// 4. `/var/lib/purge-warden/config.toml` — legacy monolithic layout
+///    (predates the FHS split).
 ///
-/// Root (`is_root == true`) — system roots ONLY (`config_discovery-01`): the
+/// Root (`is_root == true`) — system roots ONLY: the
 /// CWD and per-user candidates are dropped because a root process must not
 /// auto-load a config from a user-writable path. Only `/etc/` then `/var/lib/`
 /// remain.
 fn default_search_paths(is_root: bool) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
 
-    // config_discovery-01: skip the user-writable dev candidates entirely when
-    // running as root. `./config.toml` (CWD) and the XDG/`$HOME` path are dev
-    // conveniences; as root we trust only the root-owned system roots below.
+    // Skip the user-writable dev candidates entirely when running as root.
+    // `./config.toml` (CWD) and the XDG/`$HOME` path are dev conveniences;
+    // as root we trust only the root-owned system roots below.
     if !is_root {
         paths.push(PathBuf::from("./config.toml"));
 
@@ -206,8 +205,8 @@ fn resolve_with(
     }
     let exists = |p: &Path| probe(p) == CandidateProbe::Present;
 
-    // config_discovery-01: as root the CWD candidate was dropped from the
-    // search list. If a `./config.toml` a non-root run WOULD have loaded is
+    // As root the CWD candidate is dropped from the search list. If a
+    // `./config.toml` a non-root run WOULD have loaded is
     // sitting in the CWD, say so loudly — otherwise the operator is left
     // wondering why their local file was ignored, and a planted file's
     // shadowing would pass silently.
@@ -254,7 +253,7 @@ fn resolve_with(
         // question this answers is the one a first-run operator actually
         // asks — "do I need an upstream? a list?" — and `warden init` alone
         // does not answer it. Naming no resolver is deliberate: there is no
-        // default upstream (neutrality-03), so the operator must choose one
+        // default upstream, so the operator must choose one
         // and warden must not choose for them.
         DiscoveryWarning {
             headline: "no config file found — using built-in defaults".to_string(),
@@ -313,7 +312,7 @@ fn resolve_with(
 ///   * config under `/etc/purge-warden/` or `/var/lib/purge-warden/`
 ///     → `/run/purge-warden/purge-warden.pid` (systemd install).
 ///   * anywhere else → `./purge-warden.pid` (dev workflow; matches the
-///     pre-S34 clap default).
+///     original clap default).
 ///
 /// This keeps `warden status` / `stop` / `cache` working without a flag
 /// on a systemd install where the daemon writes its PID under `/run/`,
@@ -419,7 +418,7 @@ mod tests {
         );
     }
 
-    /// The measured home-warden failure: the master exists at
+    /// A real observed failure: the master exists at
     /// `/var/lib/purge-warden/config.toml` behind a `0750` directory owned by
     /// the daemon user, and every other candidate is genuinely absent.
     #[test]
@@ -535,7 +534,7 @@ mod tests {
 
     #[test]
     fn root_skips_planted_cwd_and_picks_system_with_notice() {
-        // config_discovery-01: a root run has system-only candidates. With a
+        // A root run has system-only candidates. With a
         // planted ./config.toml AND a real /etc master, the /etc master wins
         // and the operator is told the CWD file was ignored.
         let candidates = vec![
@@ -604,7 +603,7 @@ mod tests {
 
     #[test]
     fn root_search_paths_are_system_only() {
-        // config_discovery-01: as root the CWD and per-user candidates are
+        // As root the CWD and per-user candidates are
         // dropped — only the root-owned system roots remain, /etc first.
         let paths = default_search_paths(true);
         assert_eq!(
@@ -625,7 +624,7 @@ mod tests {
     fn default_search_paths_prefer_etc_over_var_lib() {
         // v1 FHS layout puts the master at /etc/. Both candidates must
         // appear, but /etc/ must come first so a machine still carrying
-        // a pre-S34 /var/lib/...config.toml does not shadow the new
+        // a legacy /var/lib/...config.toml does not shadow the new
         // master once it is created under /etc/.
         let paths = default_search_paths(false);
         let etc_idx = paths

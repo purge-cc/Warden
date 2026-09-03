@@ -142,9 +142,20 @@ async fn ctrl_s_saves_the_group_modal_from_the_last_field() {
 /// what this asserts: `Ctrl+S` saves from a per-list override row,
 /// which is the deepest field in the Edit ring and therefore the one
 /// an operator is most likely to be standing on. Written against a
-/// ghost socket, so the save FAILS — which is the point: the status
-/// line has to show the chord did something, and a modal that stayed
-/// in `EditingForm` would mean the keystroke was swallowed.
+/// ghost socket, so the save FAILS — which is still the point, just not
+/// the same point it used to be.
+///
+/// **`profile-01` (2026-08-28 review) inverted the passing signal.**
+/// Before that fix, `submit_profile_modal` dropped to `Stage::Submitted`
+/// on every outcome including a refused save, so this test's proof that
+/// "the chord did something" was `Stage::Submitted(_)` — a modal still
+/// in `EditingForm` meant the keystroke never reached the submit path.
+/// After the fix, a `Failed` outcome deliberately KEEPS the form open
+/// (mirrors `submit_subnet_modal` / `submit_local_dns_modal`), so
+/// `Stage::Submitted(_)` is no longer reachable from this path at all —
+/// asserting it here would be asserting the regression `profile-01`
+/// fixed. The signal that the chord was not swallowed is now
+/// `form.error_message` carrying the poller's refusal.
 #[tokio::test]
 async fn ctrl_s_saves_the_profile_modal_from_a_list_override_row() {
     use crate::tui::profile_modal::{FormField, ProfileModal, Stage};
@@ -160,9 +171,19 @@ async fn ctrl_s_saves_the_profile_modal_from_a_list_override_row() {
         )
         .unwrap(),
     ];
-    let mut modal = ProfileModal::open_edit("kids", &profile, lists);
+    let mut modal = ProfileModal::open_edit("kids", &profile, lists, vec![]);
     match &mut modal.stage {
-        Stage::EditingForm(f) => f.focused = FormField::ListOverride(0),
+        Stage::EditingForm(f) => {
+            f.focused = FormField::ListOverride(0);
+            // Focus alone stages no diff — `resolve_edit_patch` would see
+            // an empty patch and short-circuit to "unchanged" before ever
+            // dialling the poller, proving nothing about profile-01's
+            // guard. `cycle_dropdown` is a no-op on `ListOverride` by
+            // design (see its own exhaustive match); `cycle_list_policy`
+            // is the row's actual mutator, so use that to stage a real
+            // change for the ghost socket to refuse.
+            f.cycle_list_policy(true);
+        }
         other => panic!("expected EditingForm, got {other:?}"),
     }
     app.profiles.modal = Some(modal);
@@ -172,8 +193,60 @@ async fn ctrl_s_saves_the_profile_modal_from_a_list_override_row() {
     handle_profile_modal_key(&mut app, ctrl_s, &poller(), &cfg).await;
 
     match &app.profiles.modal.as_ref().expect("modal still open").stage {
-        Stage::Submitted(_) => {}
-        other => panic!("Ctrl+S on a panel row must reach the submit, got {other:?}"),
+        Stage::EditingForm(f) => assert!(
+            f.error_message.is_some(),
+            "Ctrl+S on a panel row must reach the submit path and report the \
+             refusal, not sit silent — it was swallowed if error_message is None"
+        ),
+        other => panic!("a refused save must keep the form open (profile-01), got {other:?}"),
+    }
+}
+
+/// `profile-01`, direct: a refused Add needs no daemon round-trip — `id`
+/// is validated locally in `try_resolve_add` before the poller is ever
+/// dialled — so this is the plainest repro of "leaves the form open
+/// with the operator's typed fields intact," independent of the Ctrl+S
+/// chord/IPC-refusal path the test above covers.
+#[tokio::test]
+async fn refused_profile_add_keeps_the_form_open_with_typed_fields_intact() {
+    use crate::tui::profile_modal::{ProfileModal, Stage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = mk_cfg(&dir);
+    let mut app = App::new();
+    app.active_leaf = Leaf::Profiles;
+
+    let mut modal = ProfileModal::open_add();
+    match &mut modal.stage {
+        // `id` stays blank on purpose — that is what `try_resolve_add`
+        // refuses. `display_name` is the operator-typed content that
+        // must survive the refusal.
+        Stage::EditingForm(f) => f.display_name = "My Kids Profile".to_string(),
+        other => panic!("expected EditingForm, got {other:?}"),
+    }
+    app.profiles.modal = Some(modal);
+
+    handle_profile_modal_key(&mut app, ctrl_s(), &poller(), &cfg).await;
+
+    match &app
+        .profiles
+        .modal
+        .as_ref()
+        .expect("form must stay open")
+        .stage
+    {
+        Stage::EditingForm(f) => {
+            assert_eq!(
+                f.display_name, "My Kids Profile",
+                "the operator's typed field must survive a refused save"
+            );
+            assert_eq!(
+                f.error_message.as_deref(),
+                Some("id is required"),
+                "the refusal must land on the form's own error line"
+            );
+        }
+        other => panic!("a refused Add must keep the form open (profile-01), got {other:?}"),
     }
 }
 
@@ -198,7 +271,7 @@ fn profile_modal_with_lists() -> crate::tui::profile_modal::ProfileModal {
         ]),
         ..Default::default()
     };
-    crate::tui::profile_modal::ProfileModal::open_edit("kids", &profile, lists)
+    crate::tui::profile_modal::ProfileModal::open_edit("kids", &profile, lists, vec![])
 }
 
 /// **The `_` arm this dispatch used to have was the hazard.**

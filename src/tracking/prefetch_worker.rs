@@ -1,8 +1,8 @@
-//! Sprint §4.4 P2 — Background prefetch refresh worker.
+//! Background prefetch refresh worker.
 //!
 //! Reads the promoted-domain set from `HitTracker` every `tick_secs` and
 //! proactively refreshes any entry whose remaining TTL has dropped below
-//! `lead_secs`. Coexists with Sprint 17's TTL-triggered Approach A in
+//! `lead_secs`. Coexists with the TTL-triggered Approach A in
 //! `dns::handler` — both share the `prefetch_semaphore` to bound total
 //! concurrent in-flight refreshes.
 //!
@@ -10,8 +10,7 @@
 //! indexes by domain (no record type), so the worker has no signal for
 //! which type to refresh. `A` covers the dominant traffic share; `AAAA`
 //! / `HTTPS` / others fall back to Approach A on the next user query
-//! within their TTL threshold window. See `_docs/features/cache_prefetching.md`
-//! §3.2.7 for the Phase 3 extension path (per-record-type tracking).
+//! within their TTL threshold window.
 //!
 //! Failure handling: a failed refresh logs `tracing::debug!` and does
 //! NOT evict the about-to-expire entry. Approach A would do the same on
@@ -73,10 +72,10 @@ pub async fn run(
     );
     loop {
         ticker.tick().await;
-        // prefetch-01 (rev-2606): time-demote domains that have gone
-        // cold before refreshing, so the worker stops keeping dead
-        // domains warm upstream. `now_secs` is the same unix clock
-        // `record_hit` uses to stamp window boundaries.
+        // Time-demote domains that have gone cold before refreshing, so
+        // the worker stops keeping dead domains warm upstream. `now_secs`
+        // is the same unix clock `record_hit` uses to stamp window
+        // boundaries.
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -128,8 +127,8 @@ pub async fn run(
 /// Issue one refresh upstream lookup for `domain` (RecordType::A,
 /// DNSClass::IN) and insert the response into the cache iff the answer
 /// is NoError + non-empty + the CNAME chain is clean. Mirrors the
-/// Sprint 17 Approach A spawn body in `handler.rs:734-800` so an
-/// operator grepping for "prefetch" sees consistent behaviour.
+/// Approach A spawn body in `handler.rs:734-800` so an operator
+/// grepping for "prefetch" sees consistent behaviour.
 async fn refresh_one(
     upstream: Arc<dyn Upstream>,
     cache: DnsCache,
@@ -138,13 +137,13 @@ async fn refresh_one(
     domain: &CompactString,
     cname_max_depth: usize,
 ) {
-    // prefetch_worker-01 (rev-2606): re-check the apex against the
-    // blocklist before doing any work. A domain promoted while allowed
-    // can be added to a blocklist *after* promotion; the worker pulls
-    // from the promoted pool and would otherwise keep it warm in cache.
-    // Not a bypass — the serve path re-checks the filter on cache hit,
-    // fail-closed (§01 pilot) — but wasted upstream traffic + cache
-    // occupancy. Mirrors the CNAME/IP guards below for apex symmetry.
+    // Re-check the apex against the blocklist before doing any work. A
+    // domain promoted while allowed can be added to a blocklist *after*
+    // promotion; the worker pulls from the promoted pool and would
+    // otherwise keep it warm in cache. Not a bypass — the serve path
+    // re-checks the filter on cache hit — but wasted upstream traffic +
+    // cache occupancy. Mirrors the CNAME/IP guards below for apex
+    // symmetry.
     if filter.is_blocked(domain.as_str()) {
         tracing::debug!(
             domain = %domain,
@@ -168,11 +167,10 @@ async fn refresh_one(
             return;
         }
     };
-    // §4.8 §2/2 T4: the prefetch worker has no per-client context —
-    // it refreshes the shared (None-bucket) cache slot, so it passes
-    // `ecs = None` (and the matching `ecs_prefix = None` below). Per-
-    // client ECS slots age out via TTL and are repopulated on demand
-    // by the request path.
+    // The prefetch worker has no per-client context — it refreshes the
+    // shared (None-bucket) cache slot, so it passes `ecs = None` (and
+    // the matching `ecs_prefix = None` below). Per-client ECS slots age
+    // out via TTL and are repopulated on demand by the request path.
     match upstream
         .lookup_domain(domain.as_str(), &name, RecordType::A, None)
         .await
@@ -184,18 +182,18 @@ async fn refresh_one(
             let cname_blocked =
                 cname_chain_blocked(&resp.records, cname_max_depth, |t| filter.is_blocked(t))
                     .is_some();
-            // handler-02 (rev-2606): IP-blocklist parity with the serve
-            // paths — pre-fix the worker cached entries whose A/AAAA
-            // records the request-path guard would refuse.
+            // IP-blocklist parity with the serve paths — pre-fix the
+            // worker cached entries whose A/AAAA records the
+            // request-path guard would refuse.
             //
-            // F5 (incident 2026-07-27): `check_response` now takes a
-            // `NamePolicy`, and this worker passes `Neutral` for the same
-            // reason it passes the flat `filter.is_blocked` closure above —
-            // it has no per-client context and refreshes the SHARED cache
-            // slot, so the entry it stores must be one every client may
-            // see. Fail-closed: a name some device allows, whose answer is
-            // blocked, is simply never prefetched. Hit-rate cost only; the
-            // request path still allows it under that device's policy.
+            // `check_response` takes a `NamePolicy`, and this worker
+            // passes `Neutral` for the same reason it passes the flat
+            // `filter.is_blocked` closure above — it has no per-client
+            // context and refreshes the SHARED cache slot, so the entry
+            // it stores must be one every client may see. Fail-closed: a
+            // name some device allows, whose answer is blocked, is simply
+            // never prefetched. Hit-rate cost only; the request path
+            // still allows it under that device's policy.
             let ip_blocked = ip_filter
                 .as_deref()
                 .and_then(|f| f.check_response(&resp.records, NamePolicy::Neutral))
@@ -218,7 +216,7 @@ async fn refresh_one(
                     resp.records,
                     ResponseCode::NoError,
                     None,
-                    None, // §4.8 §2/2 T3: ecs_prefix placeholder — prefetch worker has no client_ip
+                    None, // ecs_prefix placeholder — prefetch worker has no client_ip
                 )
                 .await;
             tracing::debug!(
@@ -391,9 +389,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_one_skips_on_ip_blocked_response() {
-        // handler-02 (rev-2606): a refresh whose answer contains an
-        // IP-blocklisted address must NOT land in the cache — parity
-        // with the request-path serve guards.
+        // A refresh whose answer contains an IP-blocklisted address must
+        // NOT land in the cache — parity with the request-path serve
+        // guards.
         let upstream = Arc::new(MockUpstream::new());
         // MockUpstream default answer is 1.2.3.4 — blocklist exactly that.
         let mut ips: std::collections::HashSet<std::net::IpAddr, ahash::RandomState> =

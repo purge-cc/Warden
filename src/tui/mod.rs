@@ -8,7 +8,7 @@ mod backup_restore_modal;
 mod custom_list_modal;
 mod event;
 mod format;
-// §4.64 G2: the Groups Add / Edit / Delete modal. Private, unlike
+// The Groups Add / Edit / Delete modal. Private, unlike
 // `subnet_modal` — that one was promoted so a frozen-string integration
 // test could reach `SUBNET_SUGGESTED_TAG` through it; this module exports
 // no frozen string, and `app::GroupsState` reaches it as a sibling
@@ -20,9 +20,9 @@ mod label_modal;
 mod local_dns_modal;
 mod modal_form;
 mod overlay;
-// §4.26 Phase 2: Profiles tab modal (Add / Edit / Delete).
+// Profiles tab modal (Add / Edit / Delete).
 //
-// Promoted to `pub mod` by `profile_list_policy` S4c, on the same
+// Promoted to `pub mod` on the same
 // `subnet_modal` / `rule_add_modal` precedent: the per-list override
 // panel's vocabulary is operator-facing and
 // `tests/frozen_strings_plp_list_override_panel.rs` pins it BY VALUE.
@@ -35,22 +35,22 @@ mod overlay;
 // the by-value one. The stricter of the two requirements wins.
 pub mod profile_modal;
 pub mod query_log_filter_modal;
-// S52: promoted to `pub mod` so the integration test
+mod query_log_rule_modal;
+// Promoted to `pub mod` so the integration test
 // `tests/resolver_modal_global_hotkey.rs` can reach `ResolverModal` to
 // pin the open/close lifecycle that the global `s` hotkey relies on.
 pub mod resolver_modal;
-// wave2/rules-add-key: promoted to `pub mod` (same S51/S52 precedent as
+// Promoted to `pub mod` (same precedent as
 // `subnet_modal` / `resolver_modal` below) so `app::RulesState::add_modal`
 // can hold the public `RuleAddModal` type and
 // `tests/frozen_strings_tui_rules_add.rs` can reach its consts.
 pub mod rule_add_modal;
-mod scope_modal;
-// S51 T3: promoted to `pub mod` so `app::SubnetsState::modal` can hold
+// Promoted to `pub mod` so `app::SubnetsState::modal` can hold
 // the public type and the frozen-string integration test can reach
 // `SUBNET_SUGGESTED_TAG` from `tabs::subnets`.
 pub mod subnet_modal;
 mod tabs;
-// §4.7 Phase 2 T2: re-export the pure stale predicate so the
+// Re-export the pure stale predicate so the
 // `tests/tui_stale_badge_fixture.rs` integration test can pin it
 // without promoting the whole `tabs` private module — keeps the
 // internal cargo of `tabs::lists` (render fns, modal builders)
@@ -70,12 +70,12 @@ pub use tabs::lists::{
     UNSIGNED_ALLOW_CONFIRM_RISK_1, UNSIGNED_ALLOW_CONFIRM_RISK_2, UNSIGNED_ALLOW_CONFIRM_TITLE,
 };
 mod theme;
-// §4.62 S1: the transient action-feedback overlay. Lives beside `ui`
+// The transient action-feedback overlay. Lives beside `ui`
 // rather than inside it — `ui` owns the four-chunk frame layout, the
 // toast owns a rect it floats *inside* one of those chunks.
 mod toast;
 mod ui;
-// Promoted from `mod` to `pub mod` so the R3 BLOCK integration test
+// Promoted from `mod` to `pub mod` so an integration test
 // `tests/frozen_strings_local_dns_v2.rs` can reach the banner copy
 // (`welcome_copy`). Other items in the module (constructors, fs helpers)
 // are not used externally; promoting the module is cleaner than threading
@@ -83,14 +83,14 @@ mod ui;
 pub mod welcome_banner;
 mod wordmark;
 
-// T6 frozen-strings reach: the integration test
-// `tests/frozen_strings_s43.rs` pins SN3 strings byte-for-byte. The
+// Frozen-strings reach: the integration test
+// `tests/frozen_strings_s43.rs` pins these strings byte-for-byte. The
 // const lives in the private `tabs::lists` module; this re-export
 // makes it reachable as `purge_warden::tui::LISTS_TAB_EMPTY` without
 // promoting the rest of the `tabs` module surface.
 pub use tabs::lists::LISTS_TAB_EMPTY;
 
-// S47 T5 frozen-strings reach: the integration test
+// Frozen-strings reach: the integration test
 // `tests/frozen_strings_s47.rs` pins the three Query Log neutral-status
 // footer messages byte-for-byte. Same pattern as `LISTS_TAB_EMPTY`
 // above — selective re-export keeps the rest of `tabs::query_log`
@@ -99,18 +99,18 @@ pub use tabs::query_log::{
     QUERY_NOT_ACTIONABLE_LOCAL, QUERY_NOT_ACTIONABLE_REFUSED, QUERY_NOT_ACTIONABLE_UNKNOWN,
 };
 
-// §4.5 Sprint 2/2 frozen-strings reach: the integration test
+// Frozen-strings reach: the integration test
 // `tests/frozen_strings_s45_p2.rs` pins the CNAME chain block badge
 // rendered in the Query Log RESULT column when `cname_chain_via` is
-// populated. Same pattern as the S47 T5 / LISTS_TAB_EMPTY re-exports.
+// populated. Same pattern as the other re-exports here.
 pub use tabs::query_log::CNAME_CHAIN_BLOCK_BADGE;
 
-// S51 T3 frozen-strings reach: the integration test
+// Frozen-strings reach: the integration test
 // `tests/frozen_strings_s51.rs` pins the auto-discovery suggestion
 // marker byte-for-byte. Same selective re-export idiom.
 pub use tabs::subnets::SUBNET_SUGGESTED_TAG;
 
-// tui-wave1 `profiles-summary` frozen-strings reach: the integration test
+// Frozen-strings reach: the integration test
 // `tests/frozen_strings_tui_t1.rs` pins the Profiles detail-pane "What it
 // blocks" summary literals byte-for-byte. The consts live in the private
 // `tabs::profiles` module; this selective re-export makes them reachable as
@@ -121,8 +121,8 @@ pub use tabs::profiles::{
     PROFILE_LABEL_BLOCKLISTS, PROFILE_LABEL_CUSTOM_LISTS, PROFILE_LABEL_WHAT_IT_BLOCKS,
 };
 
-// S52 reach: the integration test
-// `tests/resolver_modal_global_hotkey.rs` pins the resolver-modal
+// Reach for the integration test
+// `tests/resolver_modal_global_hotkey.rs`, which pins the resolver-modal
 // open/close lifecycle that the global `s` hotkey relies on. Selective
 // re-export of `App` + `Leaf` keeps the rest of the `app` module
 // private — only the two types the lifecycle pin needs surface.
@@ -162,11 +162,9 @@ const TICK_RATE: Duration = Duration::from_millis(33); // ~30 FPS
 const POLL_DASHBOARD: Duration = Duration::from_secs(2);
 const POLL_QUERY_LOG: Duration = Duration::from_secs(3);
 const POLL_DEVICES: Duration = Duration::from_secs(5);
-/// Sprint 43 T2: lazy poll cadence for the Lists tab. The §6 design
-/// names 30 s as the fallback when no `IpcNotification` subscriber
-/// is wired (true today — T3 introduces the subscriber endpoint).
+/// Lists poll slower than the dashboard: lists change on operator action.
 const POLL_LISTS: Duration = Duration::from_secs(30);
-/// Sprint 44 follow-up (`s44-hits-ipc-verb`): poll cadence for the
+/// Poll cadence for the
 /// `Leaf::LocalDns` hits column. Records change rarely (operator-driven
 /// via `warden local-dns add/remove`) and the counter is a stats read,
 /// so a 5 s tick is plenty — operators reading "is this firing?" see a
@@ -230,10 +228,10 @@ pub async fn run(
 
     let mut stdout = std::io::stdout();
     // EnableBracketedPaste so a terminal paste arrives as one atomic
-    // `Event::Paste` instead of a synthetic key storm (tui-paste-01). PAIRED
+    // `Event::Paste` instead of a synthetic key storm. PAIRED
     // with DisableBracketedPaste in `restore_terminal`, which both the guard
     // and the panic hook run — a half-pair would leave the operator's terminal
-    // in bracketed mode after exit (the same strand-class this campaign closed).
+    // in bracketed mode after exit.
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -315,15 +313,15 @@ async fn run_app(
     let mut app = App::new();
     app.startup_warning = startup_warning;
 
-    // S44 T4: surface the v0.4.7 welcome banner on the first launch
+    // Surface the welcome banner on the first launch
     // since upgrade. `version_already_seen` reads
     // `~/.config/purge-warden/seen_versions`; missing file → show.
     // Dismissal in `handle_key` appends the banner's dedup key to the file
     // so subsequent launches do NOT re-show. The key is fixed (not the build
     // version), so the welcome shows once per operator and survives version
-    // bumps; the copy itself is version-accurate at render (welcome_banner-01).
+    // bumps; the copy itself is version-accurate at render.
     //
-    // 2026-08-08: the decision now consults `startup_warning` first. It was
+    // The decision consults `startup_warning` first. It was
     // already at this call site — `main.rs` passes it in — and the banner
     // ignored it, so a dashboard that could not read the operator's config
     // covered four correct stderr diagnostics with a cheerful advert for
@@ -350,7 +348,7 @@ async fn run_app(
     };
 
     let poller = IpcPoller::new(socket_path);
-    // Clone the editor-handoff flags into the reader thread (mod-02): the `e`
+    // Clone the editor-handoff flags into the reader thread: the `e`
     // handler sets `reader_suspended` and waits on `reader_parked` around the
     // blocking $EDITOR spawn so two readers never race the same tty.
     let mut events = event::spawn_event_reader(
@@ -359,7 +357,7 @@ async fn run_app(
         app.reader_parked.clone(),
     );
 
-    // mod-04: channel for background-job results (the catalog fetch). The
+    // Channel for background-job results (the catalog fetch). The
     // loop drains it in the select! below and applies each result via
     // `apply_job_result`, so remote HTTP runs off-thread and never blocks
     // the render/input path. The sender lives on `app` so `handle_key`
@@ -373,15 +371,15 @@ async fn run_app(
     // `kill`, an orphan-cleanup sweep, a `timeout(1)` wrapper), tear down
     // cleanly through the terminal-restore path in `run` rather than dying by
     // default disposition mid-render — which would strand the operator's shell
-    // in raw + alt-screen mode (the 2026-05-27 orphaned-dashboard incident
-    // class, reachable one signal over). Now reuses the daemon's *full* signal
+    // in raw + alt-screen mode (the orphaned-dashboard incident
+    // class, reachable one signal over). Reuses the daemon's *full* signal
     // pattern (src/cli/commands/start.rs), which installs terminate() as well
     // as hangup(); the TUI previously copied only the hangup half.
     //
     // Every signal handled here is exit-desired. tokio's process-wide signal
     // delivery can land EINTR on the hangup watchdog thread's `poll()` (which
-    // `event::spawn_event_reader` does not auto-restart — the known-deferred
-    // `event-poll-hangup-eintr-spurious-eof`), but because an EINTR-induced
+    // `event::spawn_event_reader` does not auto-restart — a known deferred
+    // issue), but because an EINTR-induced
     // early `Event::Eof` only triggers teardown — the very outcome TERM/INT/HUP
     // ask for — widening the handler set here stays benign. Do NOT add a
     // *non-exit* handler (e.g. a SIGUSR1 stats dump) without first fixing that
@@ -402,13 +400,13 @@ async fn run_app(
         app.file.sections_state.select(Some(0));
     }
 
-    // S33 — Load the full v1 config once at startup for the new Subnets,
+    // Load the full v1 config once at startup for the Subnets,
     // Resolver tabs and the Devices source-annotation. Silent failure is
     // fine: each consuming tab renders a "config unreadable — press r"
     // hint when `loaded_config` is None.
     app.loaded_config = load_v1_config(config_path);
 
-    // Sprint 5: prime the Settings-tab auto-backup snapshot so the
+    // Prime the Settings-tab auto-backup snapshot so the
     // status line / failure banner are correct on first render.
     refresh_auto_backup_view(&mut app, config_path);
 
@@ -420,21 +418,21 @@ async fn run_app(
     loop {
         // Render if dirty
         if dirty {
-            // rev-2607: re-anchor the active tab's cursor to the rows it is
+            // Re-anchor the active tab's cursor to the rows it is
             // about to paint. A poll or a config reload can rebuild those
             // rows with no keypress involved, so this — not the key handler
             // — is the only place guaranteed to run between "the data
             // changed" and "the operator sees it".
-            // §4.68 UX8: the focus must not rest on a pane this width
-            // does not paint. Here rather than in the renderer because
-            // `ui::render` takes `&App`, and because the key handler
-            // needs the clamped value too.
+            // The focus must not rest on a pane this width
+            // does not paint. Here rather than in the renderer because the
+            // key handler needs the clamped value too, before the next
+            // frame ever draws.
             if let Ok(size) = terminal.size() {
                 clamp_labels_focus_to_layout(&mut app, size.width);
                 clamp_custom_lists_focus_to_layout(&mut app, size.width);
             }
             reconcile_active_leaf_selection(&mut app);
-            terminal.draw(|f| ui::render(f, &app))?;
+            terminal.draw(|f| ui::render(f, &mut app))?;
             dirty = false;
         }
 
@@ -447,9 +445,9 @@ async fn run_app(
                 Some(ev) => ev,
                 None => break, // channel closed — reader thread gone
             },
-            // mod-04: a background job finished — apply its result and
-            // redraw. Additive arm beside the signal/reader machinery
-            // (P1-9/P1-10); it never blocks because the work already ran
+            // A background job finished — apply its result and
+            // redraw. Additive arm beside the signal/reader machinery;
+            // it never blocks because the work already ran
             // off-thread.
             Some(job) = job_rx.recv() => {
                 apply_job_result(&mut app, job);
@@ -473,13 +471,13 @@ async fn run_app(
             }
             Event::Paste(pasted) => {
                 // Atomic paste — append to the focused text buffer only, inert
-                // in confirm/menu/nav contexts (tui-paste-01). Sync, no await:
+                // in confirm/menu/nav contexts. Sync, no await:
                 // it only mutates a buffer, so it stays out of the select!.
                 dirty = true;
                 handle_paste(&mut app, pasted);
             }
             Event::Tick => {
-                // §4.62 N2: TTL expiry rides the tick, not the poll.
+                // TTL expiry rides the tick, not the poll.
                 // Before this, a status was cleared only in the success
                 // arms of `poll_active_leaf`, so its lifetime was an
                 // accident of which leaf happened to poll — 2s on
@@ -495,7 +493,7 @@ async fn run_app(
                 if app.expire_status() {
                     dirty = true;
                 }
-                // `qlog-paging-cursor`: an explicit fetch request from a key
+                // An explicit fetch request from a key
                 // handler, honoured ahead of — and outside — the pause gate.
                 // `[p]` suspends the *automatic* refresh; `PgDn` is the
                 // operator asking for a specific page, and advancing
@@ -516,13 +514,11 @@ async fn run_app(
                         Leaf::Dashboard => POLL_DASHBOARD,
                         Leaf::QueryLog => POLL_QUERY_LOG,
                         Leaf::Devices => POLL_DEVICES,
-                        // S43 T2: Lists polls every 30s as the fallback
-                        // path. T3 will add an IpcNotification subscriber
-                        // that pushes mid-cycle so the operator sees a
-                        // refresh land within ~1s; until then 30s is the
-                        // upper bound on stale data.
+                        // Lists polls every 30s as the fallback
+                        // path when no `IpcNotification` subscriber pushes
+                        // mid-cycle; 30s is the upper bound on stale data.
                         Leaf::Lists => POLL_LISTS,
-                        // S44 follow-up (`s44-hits-ipc-verb`): records
+                        // Records
                         // are still offline-config-driven, but the hits
                         // column needs a slow IPC tick to fetch the
                         // counter snapshot. Joining the offline cohort
@@ -544,12 +540,11 @@ async fn run_app(
                         // is unfocused; a 1h interval would freeze the
                         // gauge/chart at heartbeat cadence.
                         Leaf::Subnets => POLL_DEVICES,
-                        // S33 — Resolver/Settings read from the cached
+                        // Resolver/Settings read from the cached
                         // on-disk config, not IPC. An hour interval means
                         // the tick loop only wakes for heartbeat, not
-                        // per-tab. Rules joins the cohort in T2 (data lands
-                        // in T5). §4.26 P2: Profiles is offline-config-
-                        // driven too — joins the cohort.
+                        // per-tab. Rules and Profiles are offline-config-
+                        // driven too — both join the cohort.
                         Leaf::Rules
                         | Leaf::Settings
                         | Leaf::Profiles
@@ -557,7 +552,7 @@ async fn run_app(
                         | Leaf::Groups
                         | Leaf::Labels
                         | Leaf::CustomLists => Duration::from_secs(3600),
-                        // §4.11-4b — the Cluster tab reads `app.cluster_status`,
+                        // The Cluster tab reads `app.cluster_status`,
                         // which the always-on heartbeat refreshes; no active-leaf
                         // poll of its own. Joins the offline 3600s cohort.
                         #[cfg(feature = "cluster")]
@@ -589,7 +584,7 @@ async fn run_app(
 
 /// Returns true if the app should quit.
 async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) -> bool {
-    // Sprint 43 T6: welcome banner has the absolute highest priority.
+    // Welcome banner has the absolute highest priority.
     // Any keypress dismisses it AND records the version on disk so it
     // does NOT re-show on subsequent launches. The keystroke is
     // consumed by the banner — it does NOT fall through to tab
@@ -609,28 +604,27 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // §4.62 N3: an `Error` toast is sticky — it has no TTL, because an
+    // An `Error` toast is sticky — it has no TTL, because an
     // error the operator never read is a lost error. It is dismissed by
     // the next key that acts on the tab, which is any key at all once
     // the welcome banner (which consumes its own) is out of the way.
     //
-    // N6: this is a side effect, NOT a gate. The key is not consumed and
+    // This is a side effect, NOT a gate. The key is not consumed and
     // dispatch continues below, so the toast surface is structurally
-    // incapable of swallowing a keystroke — whatever B3 turns out to be,
-    // it cannot be reintroduced here.
+    // incapable of swallowing a keystroke.
     app.dismiss_sticky_status();
 
     // Modal overlay on the Devices tab takes absolute priority — every
     // key while a form or confirmation dialog is open must reach the
     // modal handler, NOT fall through to tab navigation. Without this
     // gate, typing "1" inside the form's name field would jump to
-    // Dashboard. Sprint 23 s23-tui-clients-keybindings.
+    // Dashboard.
     if app.active_leaf == Leaf::Devices && app.devices.modal.is_some() {
         handle_modal_key(app, key, poller).await;
         return false;
     }
 
-    // Sprint 53: the edit modal absorbs every keystroke (decision L7) so
+    // The edit modal absorbs every keystroke so
     // Tab/Shift-Tab cycle fields, ↑↓ cycle picker values, Ctrl+S saves,
     // and the Delete confirm screen does not leak digits to navigation.
     if app.active_leaf == Leaf::Lists && app.lists.edit_modal.is_some() {
@@ -644,20 +638,20 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         handle_kind_confirm_key(app, key, poller, config_path).await;
         return false;
     }
-    // S53 follow-up: same gate for the catalog picker so ↑/↓ + Enter +
+    // Same gate for the catalog picker so ↑/↓ + Enter +
     // Esc all stay in the modal.
     if app.active_leaf == Leaf::Lists && app.lists.catalog_picker.is_some() {
         handle_lists_catalog_picker_key(app, key, poller, config_path).await;
         return false;
     }
-    // S53.5: gate the Rules-tab edit modal — same priority pattern.
+    // Gate the Rules-tab edit modal — same priority pattern.
     // While the modal is open every keystroke routes through the
     // dedicated handler so digit jumps / tab cycling don't leak past.
     if app.active_leaf == Leaf::Rules && app.rules.edit_modal.is_some() {
         handle_rules_edit_modal_key(app, key, poller, config_path).await;
         return false;
     }
-    // wave2/rules-add-key: same gate pattern as the edit_modal gate just
+    // Same gate pattern as the edit_modal gate just
     // above — the add-rule modal (opened with `[a]` in `handle_rules_key`)
     // captures a typed domain, so every keystroke must route here while
     // it's open rather than falling into the global keybindings below
@@ -667,17 +661,17 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         rule_add_modal::handle_key(app, key, poller, config_path).await;
         return false;
     }
-    // Sprint 43 T5 / Sprint 47 T2: scope modal opened from the Query
+    // Query Log rule picker opened from the Query
     // Log tab via `Enter`. Same priority pattern — every keystroke
     // goes through the modal handler, not the navigation dispatcher.
-    if app.scope_modal.is_some() {
-        handle_scope_modal_key(app, key, poller, config_path).await;
+    if app.query_log_rule_modal.is_some() {
+        handle_query_log_rule_modal_key(app, key, poller, config_path).await;
         return false;
     }
 
-    // Sprint 44 follow-up: Local DNS modal (Add / Remove / Edit) opened
+    // Local DNS modal (Add / Remove / Edit) opened
     // from Leaf::LocalDns via `a` / `d`|`Delete` / `e`. Same gate pattern
-    // as the Devices / Lists / Scope modals — once open, the modal
+    // as the Devices / Lists / rule-picker modals — once open, the modal
     // owns every keystroke until submit lands or Esc closes.
     if app.active_leaf == Leaf::LocalDns && app.local_dns.modal.is_some() {
         handle_local_dns_modal_key(app, key, poller, config_path).await;
@@ -700,7 +694,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // settings-03 (rev-2606 §11): the Tracking form is modal in
+    // The Tracking form is modal in
     // behaviour — it binds digits (retention), `s` (submit) and Tab
     // (field cycle), every one of which the global match below would
     // otherwise consume first (digit → section nav, `s` → resolver
@@ -714,7 +708,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // Sprint 51 T3: Subnets modal (Add / Edit / Delete) opened from
+    // Subnets modal (Add / Edit / Delete) opened from
     // Leaf::Subnets via `a` / `e` / `d`. Same gate pattern as the
     // Local DNS modal.
     if app.active_leaf == Leaf::Subnets && app.subnets.modal.is_some() {
@@ -722,14 +716,14 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // §4.64 G2: Groups modal (Add / Edit / Delete) opened from
+    // Groups modal (Add / Edit / Delete) opened from
     // Leaf::Groups via `a` / `e` / `d`. Same gate pattern as Subnets.
     if app.active_leaf == Leaf::Groups && app.groups.modal.is_some() {
         handle_group_modal_key(app, key, poller, config_path).await;
         return false;
     }
 
-    // §4.66 L7: Labels modal (Add / Edit / Delete) opened from
+    // Labels modal (Add / Edit / Delete) opened from
     // Leaf::Labels via `a` / `e` / `d`. Same gate pattern as Groups.
     if app.active_leaf == Leaf::Labels && app.labels.modal.is_some() {
         handle_label_modal_key(app, key, poller, config_path).await;
@@ -750,7 +744,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // §4.26 Phase 2: Profiles modal (Add / Edit / Delete) opened from
+    // Profiles modal (Add / Edit / Delete) opened from
     // Leaf::Profiles via `a` / `e` / `d`. Same gate pattern as the
     // Subnets modal — once open, the modal owns every keystroke until
     // submit lands or Esc closes.
@@ -768,7 +762,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
-    // Sprint 52: source-IP resolver modal opened from any leaf via the
+    // Source-IP resolver modal opened from any leaf via the
     // global hotkey `s`. The gate is global (not leaf-scoped) because
     // the modal is reachable from anywhere; once open the modal owns
     // every keystroke — digits flow into the input buffer instead of
@@ -876,22 +870,22 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         InputMode::Normal => {}
     }
 
-    // ── N8: `?` is a menu you can press ─────────────────────────────────
+    // ── `?` is a menu you can press ───────────────────────────────────────
     //
     // The overlay used to swallow every key but `?` / `Esc` / `q` / Ctrl+C.
     // It now dispatches: a key that is bound in Normal mode on this leaf
     // runs its action and the overlay closes behind it, as if help had
     // never been open.
     //
-    // The mechanism is the one §9.1 asks for and no more — clear
+    // The mechanism is minimal by design — clear
     // `show_help` and **fall through** into the same global match and
     // `handle_tab_key` a Normal-mode keystroke walks. There is deliberately
     // NO second dispatch table: the live match arms stay the only place a
-    // binding is written down. A parallel table is how `?` advertised a
-    // dead Tags verb for three sprints.
+    // binding is written down. A parallel table is how `?` once advertised a
+    // dead Tags verb for a long stretch.
     //
     // What falling through cannot answer on its own is whether the key
-    // meant anything, and §9.1 requires an unbound key to leave the overlay
+    // meant anything, and an unbound key must leave the overlay
     // OPEN so a typo does not silently mutate the tab underneath. The leaf
     // handlers' `_` arms report that via `App::leaf_key_unhandled` (see its
     // doc for why a boundness predicate would be the forbidden second
@@ -903,13 +897,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // have done against a leaf that had already changed.
     //
     // A modal open underneath cannot reach here at all — every modal gate
-    // above returns first — so §9.1's "do not execute keys while a modal is
+    // above returns first — so "do not execute keys while a modal is
     // open" holds structurally, not by a check that could rot.
     let dispatched_from_help = if app.show_help {
         match key.code {
             // Close, and do nothing else. `?` is special-cased so the
             // fall-through below cannot toggle it straight back on, and `q`
-            // closes help rather than quitting — unchanged from before N8.
+            // closes help rather than quitting.
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                 app.show_help = false;
                 return false;
@@ -929,7 +923,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // Reset before dispatch: the flag describes THIS keystroke only.
     app.leaf_key_unhandled = false;
 
-    // Sprint 45 T3: `g <letter>` one-shot mnemonic dispatch. The flag
+    // `g <letter>` one-shot mnemonic dispatch. The flag
     // was set by the previous keystroke; the current event is the
     // second half of the chord. On a known mnemonic we jump to the
     // matching leaf and skip the normal match (the second key has been
@@ -942,7 +936,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         app.pending_goto = false;
         match key.code {
             KeyCode::Char(ch) => match Leaf::from_mnemonic(ch) {
-                // §4.11-4b — ignore a mnemonic targeting a runtime-hidden leaf
+                // Ignore a mnemonic targeting a runtime-hidden leaf
                 // (`g c` when clustering is off); the jump no-ops and the key
                 // falls through.
                 Some(leaf) if leaf_visible(leaf, app) => {
@@ -961,12 +955,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-            // Sprint 45 T3 / Sprint 46 T1: numeric 1-5 jumps to the
-            // section's default leaf. 6-9 are dropped (no handler) —
-            // see `_docs/features/tui_menu_ux_refinement.md` §3. S46 T1
-            // reshape: Dashboard and Query Log are now their own
+            // Numeric 1-5 jumps to the
+            // section's default leaf. 6-9 are dropped (no handler).
+            // Dashboard and Query Log are their own
             // top-level sections (1 and 2); Network/Filters/Configuration
-            // shifted right by one. §4.67-a renamed 4 and 5 to Filters /
+            // follow. 4 and 5 are Filters /
             // Configuration; both LAND on the same leaf as before
             // (Profiles / Settings) so no muscle memory moves. The
             // `g <letter>` mnemonic above is the escape hatch for direct
@@ -976,22 +969,22 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             KeyCode::Char('3') => app.active_leaf = Section::Network.default_leaf(),
             KeyCode::Char('4') => app.active_leaf = Section::Filters.default_leaf(),
             KeyCode::Char('5') => app.active_leaf = Section::Configuration.default_leaf(),
-            // §4.11-4b — `6` jumps to the Cluster section, but only when it is
+            // `6` jumps to the Cluster section, but only when it is
             // visible (built with `cluster` + `[cluster].enabled`). Otherwise
             // it falls through as an unbound key, matching the 7-9 drop.
             #[cfg(feature = "cluster")]
             KeyCode::Char('6') if app.cluster_visible() => {
                 app.active_leaf = Section::Cluster.default_leaf()
             }
-            // Sprint 45 T2: `[` / `]` cycle the leaves of the active
+            // `[` / `]` cycle the leaves of the active
             // section (wraps within the section). `Tab` / `Shift-Tab`
             // keep cycling ALL leaves linearly so the existing operator
             // muscle memory of "press Tab to walk through everything"
-            // survives the grouped chrome. §4.11-4b: the linear cycle skips
+            // survives the grouped chrome. The linear cycle skips
             // a runtime-hidden cluster leaf via `next_visible`/`prev_visible`.
             KeyCode::Char('[') => app.active_leaf = app.active_leaf.prev_in_section(),
             KeyCode::Char(']') => app.active_leaf = app.active_leaf.next_in_section(),
-            // §4.68 UX8 asked for `Tab` to switch the Labels leaf's two
+            // `Tab` was once asked to switch the Labels leaf's two
             // panes, and it was built that way and then **reverted**.
             // Kept as a comment because it is the decision a future
             // session would otherwise re-take from scratch:
@@ -1008,12 +1001,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             // rather than per leaf. `←`/`→` already carry the whole
             // focus model, so Labels degrades rather than breaks.
             // `ux8_tab_still_cycles_leaves_on_labels` pins it. (This
-            // line read "`←`/`→` (and `h`/`l`)" until N3 deleted the
-            // aliases on 2026-08-24; the arrows were always the real
+            // line read "`←`/`→` (and `h`/`l`)" until the `h`/`l` aliases
+            // were deleted; the arrows were always the real
             // binding, so the argument is unchanged.)
             KeyCode::Tab => app.active_leaf = next_visible_leaf(app),
             KeyCode::BackTab => app.active_leaf = prev_visible_leaf(app),
-            // Sprint 45 T3: `g` arms the mnemonic prefix. The next
+            // `g` arms the mnemonic prefix. The next
             // event reads the table; `g g` re-arms (second `g` is an
             // unknown second-key, falls through here, re-sets the flag).
             KeyCode::Char('g') => app.pending_goto = true,
@@ -1021,7 +1014,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
                 app.show_help = !app.show_help;
             }
             KeyCode::Char('r') => {
-                // S33 — global refresh re-reads the on-disk config so the
+                // Global refresh re-reads the on-disk config so the
                 // Subnets / Resolver / Devices-annotation tabs pick up
                 // operator edits without a full TUI restart.
                 app.loaded_config = load_v1_config(config_path);
@@ -1041,7 +1034,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             KeyCode::Char('p') => {
                 app.paused = !app.paused;
             }
-            // Sprint 52: open the global resolver modal. Pre-fills the
+            // Open the global resolver modal. Pre-fills the
             // input from QueryLog/Devices when the active leaf has a
             // focused row (`prefill_from_active_leaf`); otherwise opens
             // blank. Distinct from the two-key `g s` (Subnets) — the
@@ -1060,7 +1053,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         }
     }
 
-    // N8 — the key turned out to mean nothing on this leaf. Nothing ran,
+    // The key turned out to mean nothing on this leaf. Nothing ran,
     // so put the overlay back: the operator mistyped while reading it, and
     // losing their place is the cost the swallow was always paying for.
     if dispatched_from_help && app.leaf_key_unhandled {
@@ -1074,7 +1067,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // from QueryLog to Dashboard sees counts that might be minutes old.
     if app.active_leaf != prev_leaf {
         poll_active_leaf(app, poller).await;
-        // Sprint 5: entering Settings re-reads the auto-backup snapshot
+        // Entering Settings re-reads the auto-backup snapshot
         // (mirrors the Tags/Dashboard on-tab-entry refresh idiom) so the
         // status line / banner reflect on-disk `.auto_state` + archives.
         if app.active_leaf == Leaf::Settings {
@@ -1089,7 +1082,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
 /// owns its own key contract; this match is intentionally a 9-line
 /// router so adding a new tab requires touching one place, not
 /// chasing through a 400-line dispatcher.
-/// §4.11-4b — a leaf is nav-visible iff its owning section is shown. The only
+/// A leaf is nav-visible iff its owning section is shown. The only
 /// hideable section is `Section::Cluster` (hidden unless `cluster_visible()`);
 /// every other leaf is always visible. On a default build there is no cluster
 /// leaf, so this is unconditionally `true`.
@@ -1105,7 +1098,7 @@ fn leaf_visible(leaf: Leaf, app: &App) -> bool {
 
 /// `Tab` cycle that skips any runtime-hidden leaf. On a default build no leaf
 /// is hidden, so the first hop returns `active_leaf.next()` — identical to the
-/// pre-§4.11-4b behaviour. Bounded by `Leaf::ALL.len()` so an all-hidden set
+/// behaviour before section visibility existed. Bounded by `Leaf::ALL.len()` so an all-hidden set
 /// (impossible today) can't spin.
 fn next_visible_leaf(app: &App) -> Leaf {
     let mut leaf = app.active_leaf.next();
@@ -1141,7 +1134,7 @@ async fn handle_tab_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
         Leaf::Lists => handle_lists_key(app, key, poller, config_path).await,
         Leaf::Rules => handle_rules_key(app, key),
         Leaf::Settings => handle_settings_key(app, key, poller, config_path).await,
-        Leaf::File => handle_file_key(app, key, config_path),
+        Leaf::File => handle_file_key(app, key, poller, config_path).await,
         // Takes no `IpcPoller`: the leaf's keys only move the cursor and
         // set filters; the fetch happens on the poll tick.
         Leaf::Logs => handle_logs_key(app, key),
@@ -1153,7 +1146,7 @@ async fn handle_tab_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
     }
 }
 
-/// §4.11-4b — Cluster tab key handling: `↑`/`↓` move the roster cursor
+/// Cluster tab key handling: `↑`/`↓` move the roster cursor
 /// (primary only; the secondary view is a single non-navigable card). The
 /// cursor is `selected_name` — resolve it to the current row index, step, and
 /// write the new node's name back, so the selection survives a roster reorder.
@@ -1166,7 +1159,7 @@ fn handle_cluster_key(app: &mut App, key: KeyEvent) {
     let roster = &status.roster;
     if roster.is_empty() {
         // Secondary / no nodes yet — nothing to move, so nothing this
-        // key could have meant (N8).
+        // key could have meant.
         app.leaf_key_unhandled = true;
         return;
     }
@@ -1181,7 +1174,7 @@ fn handle_cluster_key(app: &mut App, key: KeyEvent) {
     let next = match key.code {
         KeyCode::Down => (cur + 1).min(last),
         KeyCode::Up => cur.saturating_sub(1),
-        // N4 — jump / page. Already clamped above; these just travel further.
+        // Jump / page. Already clamped above; these just travel further.
         KeyCode::Home => 0,
         KeyCode::End => last,
         KeyCode::PageDown => (cur + NAV_PAGE).min(last),
@@ -1194,7 +1187,7 @@ fn handle_cluster_key(app: &mut App, key: KeyEvent) {
     app.cluster.selected_name = Some(roster[next].name.clone());
 }
 
-// S33 → S51 — Subnets is master/detail with modal-driven CRUD. ↑/↓
+// Subnets is master/detail with modal-driven CRUD. ↑/↓
 // scrolls the master list (configured subnets + auto-discovered
 // candidate buckets); `a` opens an Add modal; `e` opens an Edit modal
 // pre-filled from the focused row; `d` opens a Delete confirm; Enter
@@ -1220,7 +1213,7 @@ fn handle_subnets_key(app: &mut App, key: KeyEvent) {
             scroll_table_up(&mut app.subnets.table_state);
             sync_subnet_selection(app);
         }
-        // N4 — jump / page.
+        // Jump / page.
         KeyCode::Home => {
             let len = subnets_master_len(app);
             jump_table_home(&mut app.subnets.table_state, len);
@@ -1258,8 +1251,7 @@ fn handle_subnets_key(app: &mut App, key: KeyEvent) {
             // candidate's CIDR. Only fires when the focused row is a
             // discovered candidate (configured subnets handle Edit
             // via `e` instead — Enter on a configured row is a no-op
-            // for now; the design doc parks per-subnet rule shortcuts
-            // as `s51-followup-subnet-scope-modal`).
+            // for now; per-subnet rule shortcuts are parked future work).
             if let Some(cidr) = focused_candidate_cidr(app) {
                 app.subnets.modal = Some(build_subnet_promote_modal(app, &cidr));
             }
@@ -1276,7 +1268,18 @@ fn handle_subnets_key(app: &mut App, key: KeyEvent) {
 /// Configured subnets take priority over candidates (so `e`/`d` land
 /// on a real entity if one exists), and the cursor anchors at row 0
 /// to match the renderer's auto-placement.
-fn ensure_subnet_selection_seeded(app: &mut App) {
+/// The Subnets master row set, computed once: configured subnet ids
+/// first, then auto-discovered candidate CIDRs — the renderer's own row
+/// order. `ensure_subnet_selection_seeded`, `subnets_master_len` and
+/// `sync_subnet_selection` each recomputed `discover_candidates` and
+/// cloned its inputs to get this; one `↓` on the Subnets leaf ran it
+/// three times (a fourth in `reconcile_active_leaf_selection` before the
+/// frame), cloning the full `unmapped` device list — unbounded by
+/// config — every time. Borrows rather than clones: the
+/// clones the three call sites carried existed only to satisfy the
+/// borrow checker against `&mut App`, and disappear once the read
+/// happens here, against `&App`.
+fn subnet_master_keys(app: &App) -> (usize, Vec<String>) {
     let configured = app
         .loaded_config
         .as_ref()
@@ -1288,27 +1291,29 @@ fn ensure_subnet_selection_seeded(app: &mut App) {
         .map(|dv| dv.unmapped.as_slice())
         .unwrap_or(&[]);
     let candidates = crate::tui::tabs::subnets::discover_candidates(unmapped, configured);
+    let mut keys: Vec<String> = configured
+        .iter()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
+    keys.extend(candidates.into_iter().map(|c| c.cidr));
+    (configured.len(), keys)
+}
 
-    // rev-2607 (audit #8): repair a *dangling* id, not just an unset one —
+fn ensure_subnet_selection_seeded(app: &mut App) {
+    let (_, keys) = subnet_master_keys(app);
+
+    // Repair a *dangling* id, not just an unset one —
     // see `ensure_profile_selection_seeded` for the master/detail desync
     // this closes. The key is either a configured subnet id or a candidate
-    // CIDR, since the master list is configured rows first, then candidates.
+    // CIDR, since `keys` is configured rows first, then candidates.
     if let Some(key) = app.subnets.selected_id.as_deref() {
-        let resolves = configured.iter().any(|s| s.id.as_str() == key)
-            || candidates.iter().any(|c| c.cidr == key);
-        if resolves {
+        if keys.iter().any(|k| k == key) {
             return;
         }
     }
 
-    // Row 0 — the row the renderer falls back to. Configured subnets take
-    // priority over candidates (so `e`/`d` land on a real entity if one
-    // exists), which is also the renderer's row order.
-    let first = configured
-        .first()
-        .map(|s| s.id.as_str().to_string())
-        .or_else(|| candidates.first().map(|c| c.cidr.clone()));
-    match first {
+    // Row 0 — the row the renderer falls back to.
+    match keys.first().cloned() {
         Some(id) => {
             app.subnets.selected_id = Some(id);
             app.subnets.table_state.select(Some(0));
@@ -1325,57 +1330,21 @@ fn ensure_subnet_selection_seeded(app: &mut App) {
 /// `app.loaded_config` + `app.device_view`, so the math here mirrors
 /// what `tabs::subnets::render` actually paints.
 fn subnets_master_len(app: &App) -> usize {
-    let configured = app
-        .loaded_config
-        .as_ref()
-        .map(|l| l.config.subnets.len())
-        .unwrap_or(0);
-    let unmapped = app
-        .device_view
-        .as_ref()
-        .map(|dv| dv.unmapped.as_slice())
-        .unwrap_or(&[]);
-    let configured_subnets = app
-        .loaded_config
-        .as_ref()
-        .map(|l| l.config.subnets.as_slice())
-        .unwrap_or(&[]);
-    let candidates = crate::tui::tabs::subnets::discover_candidates(unmapped, configured_subnets);
-    configured + candidates.len()
+    subnet_master_keys(app).1.len()
 }
 
 /// Recompute `selected_id` from the cursor position so the right
 /// detail card stays in sync with ↑/↓ scrolling.
 fn sync_subnet_selection(app: &mut App) {
-    let configured: Vec<crate::config::schema::Subnet> = app
-        .loaded_config
-        .as_ref()
-        .map(|l| l.config.subnets.clone())
-        .unwrap_or_default();
-    let unmapped: Vec<crate::ipc::protocol::UnmappedDeviceDto> = app
-        .device_view
-        .as_ref()
-        .map(|dv| dv.unmapped.clone())
-        .unwrap_or_default();
-    let candidates = crate::tui::tabs::subnets::discover_candidates(&unmapped, &configured);
-    let total = configured.len() + candidates.len();
+    let (_, keys) = subnet_master_keys(app);
     let Some(idx) = app.subnets.table_state.selected() else {
         app.subnets.selected_id = None;
         return;
     };
-    if idx >= total {
-        app.subnets.selected_id = None;
-        return;
-    }
-    if idx < configured.len() {
-        app.subnets.selected_id = Some(configured[idx].id.as_str().to_string());
-    } else {
-        let cidx = idx - configured.len();
-        app.subnets.selected_id = candidates.get(cidx).map(|c| c.cidr.clone());
-    }
+    app.subnets.selected_id = keys.get(idx).cloned();
 }
 
-// ── S51 T3 — Subnet modal openers + key handler + submit ────────────
+// ── Subnet modal openers + key handler + submit ──────────────────────
 
 /// The currently-focused configured subnet, if any. Returns `None`
 /// when the cursor is on a discovered candidate row, on the empty
@@ -1451,9 +1420,9 @@ fn build_subnet_remove_modal(app: &App) -> Option<subnet_modal::SubnetModal> {
 }
 
 /// Drive the Subnets modal's state machine on each keypress. On
-/// submit fires the R7 single-seat helpers — `add_inner` for Add,
+/// submit fires the single-seat helpers — `add_inner` for Add,
 /// `set_inner` (per changed field) for Edit, `remove_inner` for
-/// Remove — then triggers HR2 `attempt_reload`. Mirrors
+/// Remove — then triggers `attempt_reload`. Mirrors
 /// `handle_local_dns_modal_key`.
 async fn handle_subnet_modal_key(
     app: &mut App,
@@ -1472,13 +1441,13 @@ async fn handle_subnet_modal_key(
         return;
     }
 
-    // N14 — `Ctrl+s` saves from anywhere on an Archetype-F form.
+    // `Ctrl+s` saves from anywhere on an Archetype-F form.
     //
     // Checked BEFORE the field dispatch, not as a guarded `Char('s')` arm:
     // the `KeyCode::Char(c)` catch-all at the bottom of the form match is
     // what used to append a literal `s` to the focused buffer, so an arm
-    // placed after it would be dead. §10b.2 says "from anywhere", which
-    // means ahead of the field dispatch entirely. Mirrors the check in
+    // placed after it would be dead. "From anywhere" means ahead of the
+    // field dispatch entirely. Mirrors the check in
     // `handle_edit_mode_key`, including the `S` spelling some terminals
     // send.
     //
@@ -1523,7 +1492,7 @@ async fn handle_subnet_modal_key(
                         return;
                     }
                 }
-                // `plp-s5d`: these were `if Profile {...} else if Tags {...}`.
+                // These were `if Profile {...} else if Tags {...}`.
                 // With the Tags branch gone the lone `if` trips
                 // `collapsible_if` under `-D warnings`, so the condition
                 // moves onto the arm. Behaviour is unchanged: a Left/Right
@@ -1601,7 +1570,7 @@ async fn handle_subnet_modal_key(
 /// Skip the Id field on Edit — id is read-only after creation, so focus
 /// must not land on a field the operator cannot change.
 ///
-/// `plp-s5d` removed the second skip. `FormField::Tags` was Edit-only and
+/// The second skip is gone: `FormField::Tags` was Edit-only and
 /// was stepped over in Add mode; with the picker gone there is no
 /// mode-dependent row left, and both modes walk the same ring bar `Id`.
 fn next_editable_field(
@@ -1648,7 +1617,7 @@ fn subnet_text_field_buf(form: &mut subnet_modal::AddForm) -> Option<&mut String
 ///   modal reports the first failure and stops.
 /// - Remove → `remove_inner` once.
 ///
-/// On a real Apply, fires HR2 `attempt_reload` and reloads the
+/// On a real Apply, fires the shared `attempt_reload` and reloads the
 /// cached config so the next render reflects the mutation. Audit
 /// emissions go through the standard `tracing::info!(target: "audit",
 /// ...)` cabling on the Apply path. Mirrors `submit_local_dns_modal`.
@@ -1662,7 +1631,7 @@ async fn submit_subnet_modal(
     use crate::cli::commands::subnets::{add_inner, remove_inner, RemoveOutcome};
     use subnet_modal::{Stage, SubmitOutcome};
 
-    // N14 — the armed tag valve, captured before the form is consumed.
+    // The armed tag valve, captured before the form is consumed.
     let outcome: SubmitOutcome = match &modal.stage {
         Stage::EditingForm(form) => match form.try_resolve() {
             Err(msg) => SubmitOutcome::Failed(msg),
@@ -1779,14 +1748,14 @@ async fn submit_subnet_modal(
 /// Apply the diff between `original` and `resolved`. The scalar fields
 /// (display_name/cidrs/profile/priority) stay **atomic** exactly as
 /// before: every changed one lands in a single `set_fields_inner` write,
-/// or none do (subnet_modal-01 — the partial-apply trap where an
+/// or none do (the partial-apply trap where an
 /// earlier field persisted while a later one failed and Discard then
 /// implied nothing was saved).
 ///
-/// **`plp-s5d` made this a single write again, and the atomicity above is
-/// now the whole story.** `tags` used to be a second, independent write
+/// **This is a single write, and the atomicity above is
+/// the whole story.** `tags` used to be a second, independent write
 /// through `apply_tags_inner`, so a Save could half-land: scalars written,
-/// tag delta refused, and an outcome that had to say so. `plp-s3` had
+/// tag delta refused, and an outcome that had to say so. An earlier change had
 /// already turned that second write into an unconditional refusal
 /// (`TAGS_RETIRED`) taken BEFORE the scalar write — which meant an
 /// operator who edited a display name and also touched the tag picker lost
@@ -1862,12 +1831,12 @@ mod subnet_edit_tests;
 #[path = "tests/group_edit_tests.rs"]
 mod group_edit_tests;
 
-// ── §4.26 Phase 2 — Profiles tab key handler + modal openers + submit ──
+// ── Profiles tab key handler + modal openers + submit ────────────────
 //
 // Offline-backed master/detail tab (mirrors Subnets minus the
 // candidate-promote path — profiles have no auto-discovery). ↑/↓ scrolls
 // the master list; `a` / `e` / `d` open the Add / Edit / Delete modals
-// which drive the Phase 1 IPC verbs directly (`ProfileCreate` /
+// which drive the IPC verbs directly (`ProfileCreate` /
 // `ProfileUpdate` / `ProfileDelete`). `selected_id` tracks the cursor so
 // the side-card re-renders the focused profile on the next frame.
 
@@ -1885,7 +1854,7 @@ fn handle_profiles_key(app: &mut App, key: KeyEvent) {
             scroll_table_up(&mut app.profiles.table_state);
             sync_profile_selection(app);
         }
-        // N4 — jump / page.
+        // Jump / page.
         KeyCode::Home => {
             let len = profiles_len(app);
             jump_table_home(&mut app.profiles.table_state, len);
@@ -1908,7 +1877,7 @@ fn handle_profiles_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') => {
             app.profiles.modal = Some(profile_modal::ProfileModal::open_add());
         }
-        // N5 — Enter is the primary action on the focused row, and on
+        // Enter is the primary action on the focused row, and on
         // Profiles the primary action is edit. Same branch as `e`, not a
         // new modal: Lists / Rules / mapped Devices already read this way,
         // and Profiles / Groups / Labels were the three leaves where Enter
@@ -1946,7 +1915,7 @@ fn ensure_profile_selection_seeded(app: &mut App) {
         .map(|l| l.config.profiles.keys().cloned().collect())
         .unwrap_or_default();
 
-    // rev-2607 (audit #8): repair a *dangling* id, not just an unset one.
+    // Repair a *dangling* id, not just an unset one.
     // The old guard returned early whenever the id was `Some`, so an id
     // whose profile had been deleted (a second operator, an external edit
     // + `r`) survived — and master and detail then disagreed:
@@ -2024,7 +1993,26 @@ fn build_profile_edit_modal(app: &App) -> Option<profile_modal::ProfileModal> {
         .map(|l| l.config.blocklists.clone())
         .unwrap_or_default();
     lists.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    Some(profile_modal::ProfileModal::open_edit(&id, &profile, lists))
+    // The mount panel's rows. Sorted by id for the same reason the
+    // override panel's are: the panel is a focus ring indexed by position,
+    // and file order is neither stable across reloads nor meaningful to
+    // the operator.
+    //
+    // The DECLARED entities, not the compiled store: a pack the reader
+    // could not open is still a list the operator declared and may want to
+    // unmount, and a panel that dropped it would offer no way to.
+    let mut custom_lists: Vec<crate::config::schema::custom_list::CustomList> = app
+        .loaded_config
+        .as_ref()
+        .map(|l| l.config.custom_lists.clone())
+        .unwrap_or_default();
+    custom_lists.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    Some(profile_modal::ProfileModal::open_edit(
+        &id,
+        &profile,
+        lists,
+        custom_lists,
+    ))
 }
 
 fn build_profile_remove_modal(app: &App) -> Option<profile_modal::ProfileModal> {
@@ -2065,13 +2053,13 @@ async fn handle_profile_modal_key(
         return;
     }
 
-    // N14 — `Ctrl+s` saves from anywhere on an Archetype-F form.
+    // `Ctrl+s` saves from anywhere on an Archetype-F form.
     //
     // Checked BEFORE the field dispatch, not as a guarded `Char('s')` arm:
     // the `KeyCode::Char(c)` catch-all at the bottom of the form match is
     // what used to append a literal `s` to the focused buffer, so an arm
-    // placed after it would be dead. §10b.2 says "from anywhere", which
-    // means ahead of the field dispatch entirely. Mirrors the check in
+    // placed after it would be dead. "From anywhere" means ahead of the
+    // field dispatch entirely. Mirrors the check in
     // `handle_edit_mode_key`, including the `S` spelling some terminals
     // send.
     //
@@ -2091,7 +2079,7 @@ async fn handle_profile_modal_key(
                 KeyCode::Esc => {
                     return;
                 }
-                // rev-2607 (#9) — merged with Down/Up so this matches the
+                // Merged with Down/Up so this matches the
                 // shared modal legend (`keys_line()`: "↹/↑↓ move"), and the
                 // Subnet / Local-DNS handlers, which already bind both.
                 KeyCode::Tab | KeyCode::Down => {
@@ -2141,11 +2129,19 @@ async fn handle_profile_modal_key(
                     // the arrow key would appear dead on the one field the
                     // legend advertises it hardest for.
                     FormField::ListOverride(_) => form.cycle_list_policy(true),
+                    // A mount row is two-state, so both arrows flip it —
+                    // there is no cycle to walk in a direction. Named
+                    // explicitly for the reason the row above is: the `_`
+                    // arm would send the arrow into `cycle_dropdown`,
+                    // which is a no-op here and would make the key look
+                    // dead on a row the legend advertises it for.
+                    FormField::CustomListMount(_) => form.toggle_custom_list_mount(),
                     _ => form.cycle_dropdown(true),
                 },
                 KeyCode::Left => match form.focused {
                     FormField::BlockAll | FormField::EcsClear => form.toggle(),
                     FormField::ListOverride(_) => form.cycle_list_policy(false),
+                    FormField::CustomListMount(_) => form.toggle_custom_list_mount(),
                     _ => form.cycle_dropdown(false),
                 },
                 KeyCode::Char(' ') => {
@@ -2159,6 +2155,12 @@ async fn handle_profile_modal_key(
                         // so the casual keypress cannot make a list inert.
                         // `i` is the only route to that, and it asks twice.
                         FormField::ListOverride(_) => form.cycle_list_policy(true),
+                        // Same flip both arrows take. Safe as a casual
+                        // keypress for the same reason as the row above:
+                        // the reachable states are "applies here" and
+                        // "does not", and the row shows which one gets
+                        // saved.
+                        FormField::CustomListMount(_) => form.toggle_custom_list_mount(),
                         FormField::Submit => {
                             submit_profile_modal(app, modal, poller, config_path).await;
                             return;
@@ -2295,6 +2297,23 @@ async fn submit_profile_modal(
         Stage::Submitted(_) => return,
     };
 
+    // A form (Add/Edit) failure — pre-flight validation or an apply/
+    // validator rejection — keeps the modal open with the message on the
+    // form's own error line instead of dropping to the terminal "failed"
+    // screen. The operator fixes the offending field and re-submits
+    // without retyping the rest (this form especially: 9 head fields plus
+    // one row per configured blocklist override). Remove failures still
+    // finish — their confirm screen has no form to keep. Mirrors
+    // `submit_subnet_modal` / `submit_local_dns_modal` (`profile-01`).
+    if let SubmitOutcome::Failed(msg) = &outcome {
+        if let Stage::EditingForm(form) = &mut modal.stage {
+            app.status_err(format!("profile modal: {msg}"));
+            form.error_message = Some(msg.clone());
+            app.profiles.modal = Some(modal);
+            return;
+        }
+    }
+
     let was_ok = matches!(outcome, SubmitOutcome::Ok(_));
     match &outcome {
         SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
@@ -2325,10 +2344,9 @@ async fn submit_profile_modal(
     }
 }
 
-// S44 T3 — Local DNS tab. T3 shipped read-only navigation; the
-// `s44-tui-modals` follow-up wires `a` / `d`|`Delete` / `e` to open
+// Local DNS tab. `a` / `d`|`Delete` / `e` open
 // modals that submit through `cli::commands::local_dns::add_inner` /
-// `remove_inner` (R7 single-seat — same code path as the CLI verbs).
+// `remove_inner` (single-seat — same code path as the CLI verbs).
 //
 // Keybindings:
 //   ↑/↓         scroll the focused panel's table.
@@ -2336,12 +2354,12 @@ async fn submit_profile_modal(
 //   p / n       previous / next profile (when Profile panel focused).
 //   a           open Add modal (form: domain, type, value, subdomain,
 //               TTL, profile dropdown).
-//   d / Delete  open Remove modal with tiered SN2 confirm on the
+//   d / Delete  open Remove modal with a tiered confirm on the
 //               focused row.
 //   e           open Edit modal pre-filled from the focused row.
 /// Keys of the Local DNS leaf.
 ///
-/// **N6: one list, one cursor.** `o` (panel switch) and `n` / `N`
+/// **One list, one cursor.** `o` (panel switch) and `n` / `N`
 /// (profile cycle) are gone with the panels they served — `↑`/`↓` walk
 /// every record in every scope, skipping the group headers. `Tab` is
 /// untouched and still cycles leaves (`ldns_04_tab_still_cycles_leaf`).
@@ -2388,7 +2406,7 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => focus!(tabs::local_dns::next_selectable_index(
             &rows, current, false
         )),
-        // N4 — jump / page, headers skipped and clamped at both ends.
+        // Jump / page, headers skipped and clamped at both ends.
         KeyCode::Home => {
             focus!(first_selectable_idx(
                 &rows,
@@ -2443,7 +2461,7 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        // s44-tui-modal-audit-history: Enter toggles the side-card. When
+        // Enter toggles the side-card. When
         // closed and the focused row is valid → load + open. When open →
         // close. The audit log is read off the master config path stored
         // in `loaded_config` so we don't need to thread `config_path`
@@ -2477,7 +2495,7 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
     // operator closes it explicitly with Esc.
     if app.local_dns.audit_view.is_some() {
         match key.code {
-            // N6: the follow set is exactly the cursor keys now. It used
+            // The follow set is exactly the cursor keys. It used
             // to include `o` / `n` / `N`, which no longer exist.
             KeyCode::Up
             | KeyCode::Down
@@ -2517,7 +2535,7 @@ fn build_local_dns_audit_view(app: &App) -> Option<crate::tui::app::LocalDnsAudi
     })
 }
 
-// Sprint 52 — Resolver modal: input is always live while the modal is
+// Resolver modal: input is always live while the modal is
 // open, no leading `i` ceremony. Enter resolves; Ctrl-U clears; Esc
 // closes. The modal-priority gate above ensures every keystroke lands
 // here while open, so digits flow into the input buffer instead of
@@ -2560,14 +2578,14 @@ fn handle_resolver_modal_key(app: &mut App, key: KeyEvent) {
 fn handle_dashboard_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('d') => app.dashboard.show_daily = !app.dashboard.show_daily,
-        // N8 — an `if let` cannot report the miss, and Dashboard is the
+        // An `if let` cannot report the miss, and Dashboard is the
         // leaf an operator is most likely to be standing on when they open
         // `?`. Widened to a match for the one arm that matters.
         _ => app.leaf_key_unhandled = true,
     }
 }
 
-/// qlog-06: resolve the captured entry key to its current index and
+/// Resolve the captured entry key to its current index and
 /// move the cursor there. The Query Log is a sliding tail refreshed
 /// every 3s, so the row the operator selected drifts to a new index when
 /// the window shifts; re-anchoring keeps the cursor on it. No-op when the
@@ -2583,7 +2601,7 @@ fn anchor_query_log_cursor(app: &mut App) {
     }
 }
 
-/// qlog-06: capture the stable key of the row now under the cursor, so
+/// Capture the stable key of the row now under the cursor, so
 /// the next poll can re-anchor to it. Called after every cursor move.
 fn sync_query_log_selection(app: &mut App) {
     app.query_log.selected_key = app
@@ -2653,7 +2671,7 @@ fn handle_query_log_filter_modal_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_query_log_key(app: &mut App, key: KeyEvent) {
-    // qlog-06: re-anchor the cursor to the captured entry key before
+    // Re-anchor the cursor to the captured entry key before
     // handling the key — a 3s poll may have slid the tail window, moving
     // the row out from under the bare TableState index.
     anchor_query_log_cursor(app);
@@ -2666,21 +2684,19 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             scroll_table_up(&mut app.query_log.table_state);
             sync_query_log_selection(app);
         }
-        // N4 — jump / page. **Query Log is the documented exception and it
+        // Jump / page. **Query Log is a documented exception and it
         // must say so.** Its rows are not a list in memory: they are
         // whatever the last `read_log_entries_with_state` call returned.
         // `End` lands on the oldest *loaded* row, which an operator reads
-        // as the oldest *query*. It is not. §6 forbids shipping `End` /
-        // `PgDn` here without a boundary marker, because making a limit
-        // visible for the first time and then declining to explain it is
-        // worse than the silent version it replaces.
+        // as the oldest *query*. It is not. Shipping `End` /
+        // `PgDn` here without a boundary marker would make a limit
+        // visible for the first time while declining to explain it,
+        // which is worse than the silent version it replaces.
         //
-        // The spec's marker is a row annotation, which lives in
-        // `tabs/query_log.rs` — another lane's file this wave (CONTRACT
-        // §2). The status line carries it instead: same information, same
-        // keystroke, in a file this lane owns. Recorded in LANE-REPORT.md
-        // so the orchestrator can move it onto the row later if it wants.
-        // Real backward paging stays out of scope (`qlog-paging-cursor`).
+        // The marker is a row annotation, which lives in
+        // `tabs/query_log.rs`. The status line carries it instead: same
+        // information, same keystroke, in a file this module owns.
+        // Real backward paging stays out of scope.
         KeyCode::End | KeyCode::PageDown => {
             let len = app.query_log.entries.len();
             let was_at_end = app.query_log.table_state.selected() == len.checked_sub(1);
@@ -2698,7 +2714,7 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
                     // one tick, so this reads as travel, not a jump.
                     //
                     // `selected_key` is dropped rather than re-synced: it
-                    // is the qlog-06 anchor for a *sliding tail*, and the
+                    // is the anchor for a *sliding tail*, and the
                     // row it names belongs to the page being left. Keeping
                     // it would let a coincidentally identical row on the
                     // incoming page yank the cursor off row 0.
@@ -2758,10 +2774,10 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
                 sync_query_log_selection(app);
             }
         }
-        // Sprint 45 T3 made `g` a global mnemonic prefix that arms
+        // `g` is a global mnemonic prefix that arms
         // `pending_goto` BEFORE per-tab dispatch — the previous
-        // `g`-jumps-to-top handler became unreachable. Removed in T4
-        // mini-patch; jump-to-top is uncovered (operator scrolls with
+        // `g`-jumps-to-top handler is unreachable now and was removed;
+        // jump-to-top is uncovered (operator scrolls with
         // `Up`). The help overlay no longer cites `g` for Query Log.
         KeyCode::Char('/') => {
             app.input_mode = InputMode::FilterDomain(String::new());
@@ -2787,13 +2803,13 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             app.query_log.blocked_only = !app.query_log.blocked_only;
             app.query_log.reset_paging();
         }
-        // Sprint 41: cycle the time preset on `t`. One keystroke,
-        // no text entry mode — preset rationale in design doc §3.4.
+        // Cycle the time preset on `t`. One keystroke,
+        // no text entry mode.
         KeyCode::Char('t') => {
             app.query_log.since = app.query_log.since.next();
             app.query_log.reset_paging();
         }
-        // qlog-scan: `R` resets all four filters. `Esc` no longer resets
+        // `R` resets all four filters. `Esc` no longer resets
         // here — it now cancels an in-progress filter *edit* only (handled
         // in the `InputMode::Filter*` arms of `handle_key`, which discard
         // the edit buffer and keep the committed filters). Dropping `Esc`
@@ -2812,19 +2828,18 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             app.query_log.advanced = Default::default();
             app.query_log.reset_paging();
         }
-        // Sprint 47 T2: single Enter opens the scope modal with the
+        // Single Enter opens the custom-list picker with the
         // highlighted row's domain + client captured at this moment
         // (NOT a file-tail re-read — the row may scroll out before the
-        // operator finishes typing the confirm). The action is
+        // operator finishes choosing). The action is
         // auto-flipped via `inferred_action` based on the row's status:
         // BLOCKED → Allow (whitelist), ALLOWED/CACHED/STALE → Deny
         // (blocklist). Non-actionable statuses (LOCAL / REFUSED /
         // HINFO / unknown) skip the modal and surface a footer message
-        // explaining why. The pre-S47 `a` / `d` keybindings were
-        // dropped outright; no alias period (lesson S45 T3 mini-patch).
+        // explaining why.
         KeyCode::Enter => {
-            if let Some(modal) = build_scope_modal_for_query_row(app) {
-                app.scope_modal = Some(modal);
+            if let Some(modal) = build_query_log_rule_modal(app) {
+                app.query_log_rule_modal = Some(modal);
             } else {
                 app.status_info(footer_message_for_neutral_row(app).to_string());
             }
@@ -2856,7 +2871,7 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
         }
         None => Vec::new(),
     };
-    // dev-03: resolve the operator's stable key to the current index so
+    // Resolve the operator's stable key to the current index so
     // navigation and the modal openers act on the device the highlight
     // is on — even after a background poll reshuffled the rows. Seed the
     // key and sync the visual cursor from the resolved row.
@@ -2886,11 +2901,10 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
                 app.devices.selected_id = tabs::devices::row_key(&rows[idx]);
             }
         }
-        // N4 — jump / page over a row vector that interleaves group
+        // Jump / page over a row vector that interleaves group
         // headers. Built on `is_selectable`, not on a loop over
-        // `next_selectable_index`: that helper still wraps until the
-        // sibling lane clamps it, and a paging key that wraps is the
-        // defect N4 exists to remove.
+        // `next_selectable_index`: that helper wraps, and a paging key
+        // that wraps is exactly the defect this exists to avoid.
         KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown => {
             let sel = |r: &tabs::devices::DeviceRow| r.is_selectable();
             let idx = match key.code {
@@ -2904,8 +2918,8 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
                 app.devices.selected_id = tabs::devices::row_key(&rows[idx]);
             }
         }
-        // Sprint 45 T4 mini-patch: remapped from `g` to `G` because
-        // T3's global mnemonic prefix swallowed lowercase `g` before
+        // Remapped from `g` to `G` because
+        // the global mnemonic prefix swallows lowercase `g` before
         // per-tab dispatch. Capital `G` is free on Devices (no
         // jump-to-bottom collision) and is mnemonic for "Group".
         // Subnet filter card. `/` focuses the CIDR buffer seeded with the
@@ -2924,7 +2938,7 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
             app.devices.group_by = app.devices.group_by.next();
             // After re-grouping the row positions shift — clear the
             // visual cursor so the next render re-resolves `selected_id`
-            // (dev-03) into the new layout (the device keeps its anchor).
+            // into the new layout (the device keeps its anchor).
             app.devices.table_state.select(None);
         }
         KeyCode::Enter | KeyCode::Char('e') => {
@@ -3011,15 +3025,14 @@ fn selected_row(
     current.and_then(|i| rows.get(i))
 }
 
-// S43 T2: Lists tab — ↑/↓ scroll, Enter toggles drill-down.
-// S43 T3 adds `p` to open the per-list assignment modal.
-// S50 T4 adds `[K]` direct kind toggle (BLOCK ↔ ALLOW) on the focused
-// list, dispatched through `blocklists::run_set_kind_with_ack` so the
+// Lists tab — ↑/↓ scroll, Enter toggles drill-down, `p` opens the
+// per-list assignment modal, `[K]` direct-toggles kind (BLOCK ↔ ALLOW)
+// on the focused list, dispatched through
+// `blocklists::run_set_kind_with_ack` so the
 // verb stays the sole authority on the write while the TUI owns the
 // asking (`toggle_focused_list_kind`). The
-// category-grouping ↑/↓ skip + `[c]`/`[m]` modals from the original
-// S50 T4 doc were removed by the filtering-cleanup pass — v2 dropped
-// the Category entity and the Lists tab now renders a flat table.
+// category-grouping ↑/↓ skip + `[c]`/`[m]` modals are gone — the
+// Category entity is retired and the Lists tab now renders a flat table.
 async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) {
     // Seed the cursor on the first selectable row so the very first
     // Enter / m / K press lands on a list — without this, an operator
@@ -3030,7 +3043,7 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
         let rows = tabs::lists::build_grouped_rows(app);
         if let Some(idx) = tabs::lists::next_selectable_index(&rows, None, 1) {
             app.lists.table_state.select(Some(idx));
-            // rev-2607: anchor the stable id alongside the visual cursor —
+            // Anchor the stable id alongside the visual cursor —
             // `focused_list` resolves the id, not the index.
             app.lists.selected_id = tabs::lists::row_key(&rows[idx]);
         }
@@ -3042,15 +3055,15 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
         KeyCode::Up => {
             move_lists_cursor(app, -1);
         }
-        // N4 — jump / page. Same argument as Devices: `is_selectable`,
-        // not a loop over the still-wrapping `next_selectable_index`.
+        // Jump / page. Same argument as Devices: `is_selectable`,
+        // not a loop over the wrapping `next_selectable_index`.
         KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown => {
             jump_lists_cursor(app, key.code);
         }
         // Query-Log-style filter card. `/` focuses the text search
         // (seeded with the current committed value so re-pressing edits
         // rather than retypes); `f` cycles the all/block/allow kind chip
-        // (`k` was the scroll-up alias, deleted by N3 but NOT rebound); `R` clears both.
+        // (`k` was the scroll-up alias, deleted and NOT rebound); `R` clears both.
         KeyCode::Char('/') => {
             app.input_mode =
                 InputMode::FilterLists(app.lists.filter_text.clone().unwrap_or_default());
@@ -3065,10 +3078,10 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             reconcile_lists_selection(app);
         }
         KeyCode::Enter => {
-            // Sprint 53 (decision L8): ENTER opens the edit modal in
-            // place of the pre-S53 drill-down split-pane.
+            // ENTER opens the edit modal in
+            // place of the retired drill-down split-pane.
             //
-            // S53 follow-up — orphan-source promote: when the focused
+            // Orphan-source promote: when the focused
             // row is a List but has no matching `[[blocklists]]` entry
             // (raw URL or unmapped slug in `[lists].sources`),
             // `build_edit_modal_for` returns None. Fall through to
@@ -3094,7 +3107,7 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             }
         }
         KeyCode::Char('a') => {
-            // S53 follow-up: open the form modal in Add mode. No focused
+            // Open the form modal in Add mode. No focused
             // row required — adding a brand-new list is independent of
             // the cursor position. Operator types id + URL +
             // display_name (+ optional fields) and Ctrl+S persists via
@@ -3102,9 +3115,9 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             app.lists.edit_modal = Some(tabs::lists::build_add_modal());
         }
         KeyCode::Char('B') => {
-            // S53 follow-up + S53.3 unified catalog: open the purge.cc
+            // Open the purge.cc
             // catalog picker. The first open per 5-min TTL fetches both
-            // lists.purge.cc and rules.purge.cc; mod-04 moves that HTTP
+            // lists.purge.cc and rules.purge.cc; the fetch runs
             // OFF the render loop (it used to await inline here, freezing
             // input for up to ~4s with no feedback). A fresh cache builds
             // the picker synchronously; a stale cache shows a responsive
@@ -3112,18 +3125,13 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             open_catalog_picker(app).await;
         }
         KeyCode::Char('K') => {
-            // S50 T4 — DECISION OUTSIDE DOC: design doc §8 T4 line 298
-            // names lowercase `[k]` for the kind-toggle hotkey, but
-            // lowercase `k` WAS the vim-style scroll-up alias shared by
-            // every navigable tab in this TUI. N3 (2026-08-24) deleted
-            // that alias, so the original reason is spent — the toggle
-            // STAYS on `K` anyway: N11 freezes the freed letters this
-            // wave, and moving a live hotkey costs muscle memory for
-            // nothing. Following the
-            // Devices Rule D8 precedent (`[G] group-by` uppercase for
-            // actions, lowercase for navigation) we mount the kind
-            // toggle on Shift-K. The footer hint surfaces `[K] kind`
-            // so the case is explicit.
+            // `[K]` not `[k]`: lowercase `k` was the vim-style scroll-up
+            // alias shared by every navigable tab in this TUI. That alias
+            // is deleted now, but the toggle stays on `K` anyway — moving
+            // a live hotkey costs muscle memory for nothing. Same
+            // precedent as `[G] group-by` on Devices: uppercase for
+            // actions, lowercase for navigation. The footer hint surfaces
+            // `[K] kind` so the case is explicit.
             toggle_focused_list_kind(app, poller, config_path).await;
         }
         _ => app.leaf_key_unhandled = true,
@@ -3134,7 +3142,7 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
 /// headers), keeping the stable `selected_id` anchor in step with the
 /// visual cursor — `focused_list` resolves the id, not the index, so a
 /// cursor move that forgot to re-anchor would leave `Enter` acting on the
-/// previously-selected list (rev-2607).
+/// previously-selected list.
 fn move_lists_cursor(app: &mut App, dir: i32) {
     let rows = tabs::lists::build_grouped_rows(app);
     let next = tabs::lists::next_selectable_index(&rows, app.lists.table_state.selected(), dir);
@@ -3142,7 +3150,7 @@ fn move_lists_cursor(app: &mut App, dir: i32) {
     app.lists.selected_id = next.and_then(|i| tabs::lists::row_key(&rows[i]));
 }
 
-/// N4 `Home` / `End` / `PgUp` / `PgDn` for the Lists cursor. Keeps the
+/// `Home` / `End` / `PgUp` / `PgDn` for the Lists cursor. Keeps the
 /// stable `selected_id` anchor in step with the visual cursor, exactly as
 /// [`move_lists_cursor`] does — `focused_list` resolves the id, not the
 /// index, so a jump that moved only the cursor would leave `e` / `Enter`
@@ -3163,7 +3171,7 @@ fn jump_lists_cursor(app: &mut App, code: KeyCode) {
     }
 }
 
-/// mod-04: open the purge.cc catalog picker without blocking the render
+/// Open the purge.cc catalog picker without blocking the render
 /// loop. A fresh cache builds the picker synchronously; a stale cache
 /// opens a "Loading…" placeholder and spawns the two HTTP fetches as a
 /// background job whose result (`UiJob::CatalogFetched`) the loop applies
@@ -3197,7 +3205,7 @@ async fn open_catalog_picker(app: &mut App) {
     }
 }
 
-/// mod-04: build a reqwest client and fetch the unified purge.cc catalog,
+/// Build a reqwest client and fetch the unified purge.cc catalog,
 /// falling back to the embedded catalog when the client can't be built.
 /// Pure (touches no `App`) so it runs on a spawned task off the UI thread.
 async fn fetch_catalog() -> crate::lists::catalog::Catalog {
@@ -3214,7 +3222,7 @@ async fn fetch_catalog() -> crate::lists::catalog::Catalog {
     }
 }
 
-/// mod-04: apply a background-job result on the UI thread, then the loop
+/// Apply a background-job result on the UI thread, then the loop
 /// redraws. Keeps every mutation of `App` on the single render thread.
 fn apply_job_result(app: &mut App, job: app::UiJob) {
     use backup_restore_modal::{RestoreStage, SubmitOutcome};
@@ -3264,8 +3272,8 @@ fn apply_job_result(app: &mut App, job: app::UiJob) {
                 },
             }
             // The refreshed snapshot was taken on the blocking thread after the
-            // archive landed (Sprint 5: the "Last auto-backup" line updates
-            // immediately, not at the next tab-entry). `None` ⇒ the blocking
+            // archive landed, so the "Last auto-backup" line updates
+            // immediately, not at the next tab-entry. `None` ⇒ the blocking
             // task died before it could look; keep the view we already have.
             if let Some(view) = auto_backup {
                 app.settings.auto_backup = view;
@@ -3308,8 +3316,8 @@ fn spawn_fs_side_effect<F: FnOnce() + Send + 'static>(f: F) {
 /// It used to read the list's `tags` off the **raw TOML**, never off
 /// `app.lists.entries` or `blist.tags`, because the loaded config carries
 /// the `uncategorized` the loader synthesised and a pre-check against it
-/// passed on exactly the lists that had to fail. `plp-s5a` removed the
-/// field, so what survives of that read is the existence probe: an id the
+/// passed on exactly the lists that had to fail. The `tags` field is
+/// gone, so what survives of that read is the existence probe: an id the
 /// running config knows about but no file declares.
 ///
 /// The consent DOES come from the loaded config — nothing synthesises it,
@@ -3390,17 +3398,17 @@ async fn toggle_focused_list_kind(app: &mut App, poller: &IpcPoller, config_path
         // the exit it takes. Two alternatives were weighed:
         //
         // - cycling three ways would let one keypress make a list inert
-        //   with no gate, which is the silent-inertness the workstream
-        //   exists to remove. The 3-state picker with its own affordance
-        //   is S4c (`profile_list_policy.md` §4);
+        //   with no gate, which is the silent-inertness this exists to
+        //   remove. A 3-state picker with its own affordance would still
+        //   need that gate;
         // - refusing outright would tell the operator to go and edit a
         //   TOML field the interface gives them no way to set — the exact
         //   shape of the unsatisfiable refusal this repo already paid for
-        //   with the TUI consent gate (project rules §Neutrality).
+        //   with the TUI consent gate (CLAUDE.md §Neutrality).
         //
         // So it moves, and it moves toward MORE filtering, never less:
         // deny needs no consent gate, allow does. The toast names the new
-        // direction, and until S4c the way back to `ignore` is the config
+        // direction; the way back to `ignore` is the config
         // file or `warden migrate`.
         BlocklistBase::Ignore => BlocklistBase::Deny,
     };
@@ -3519,14 +3527,14 @@ async fn handle_kind_confirm_key(
     }
 }
 
-// S53.4 → S53.5: Rules tab — ↑/↓ scroll the populated table (filtered
+// Rules tab — ↑/↓ scroll the populated table (filtered
 // by the chip), `f` cycles the filter chip, `Enter` opens the edit
 // modal on the focused row, `d` short-circuits straight to the
 // delete-confirm screen.
 /// Re-anchor the stable rule id from the cursor position after a ↑/↓
 /// move, so the anchor tracks the operator's intent. Mirrors
 /// `sync_query_log_selection`; the modal openers resolve the id, not the
-/// index (rev-2607).
+/// index.
 fn sync_rules_selection(app: &mut App) {
     let rows = tabs::rules::visible_rule_rows(app);
     app.rules.selected_id = app
@@ -3548,7 +3556,7 @@ fn handle_rules_key(app: &mut App, key: KeyEvent) {
             scroll_table_up(&mut app.rules.table_state);
             sync_rules_selection(app);
         }
-        // N4 — jump / page.
+        // Jump / page.
         KeyCode::Home => {
             jump_table_home(&mut app.rules.table_state, visible_len);
             sync_rules_selection(app);
@@ -3602,7 +3610,7 @@ fn handle_rules_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        // wave2/rules-add-key: `[a]` opens the add-rule modal — no row
+        // `[a]` opens the add-rule modal — no row
         // focus needed (unlike `Enter`/`d` above, which edit/delete the
         // row under the cursor). Blocked while another Rules modal is
         // already open; the top-level gates route keys away from this
@@ -3620,7 +3628,7 @@ fn visible_rule_rows_count(app: &App) -> usize {
     tabs::rules::visible_rule_rows(app).len()
 }
 
-/// rev-2607: reconcile the active tab's selection with the rows that are
+/// Reconcile the active tab's selection with the rows that are
 /// about to be painted. Called once per frame, immediately before the
 /// draw.
 ///
@@ -3652,7 +3660,7 @@ fn reconcile_active_leaf_selection(app: &mut App) {
         // the detail card agree on which row is selected.
         Leaf::Profiles => ensure_profile_selection_seeded(app),
         Leaf::Subnets => ensure_subnet_selection_seeded(app),
-        // §4.68 UX8 — same contract: the renderer falls back to row 0,
+        // Same contract: the renderer falls back to row 0,
         // so the anchor must agree before the operator can act on it.
         Leaf::Labels => ensure_labels_selection_seeded(app),
         // Same contract: the renderer falls back to row 0, so the anchor
@@ -3768,19 +3776,18 @@ fn reconcile_lists_selection(app: &mut App) {
 /// back to the last row, or clear the selection when the log is empty.
 /// The Query-Log filter is applied server-side, so the only place
 /// `entries` changes is the fetch result — clamp there. Without this the
-/// cursor silently points past the end and the scope-action modal
-/// (`build_scope_modal_for_query_row`) reads `None`, so Enter becomes a
+/// cursor silently points past the end and the rule picker
+/// (`build_query_log_rule_modal`) reads `None`, so Enter becomes a
 /// no-op on a row the operator can still see highlighted.
 ///
-/// rev-2607 corrects this docstring's original claim that Lists and Rules
-/// were safe because their client-side filters are "clamped on the filter
-/// keypress". Their row sets change on a *data refresh* too — no keypress
-/// involved — which is the bug this note unwittingly described. Both now
+/// Lists and Rules are not safe merely because their client-side filters
+/// are "clamped on the filter keypress" — their row sets change on a
+/// *data refresh* too, no keypress involved. Both now
 /// re-resolve a stable id before every draw (`reconcile_lists_selection`,
 /// `reconcile_rules_selection`); anchoring beats clamping, because a clamp
 /// still lets an in-range index drift onto a *different* entity. The
-/// Query-Log pairs this clamp with its own anchor (`anchor_query_log_cursor`,
-/// qlog-06), so it is covered on both halves.
+/// Query-Log pairs this clamp with its own anchor (`anchor_query_log_cursor`),
+/// so it is covered on both halves.
 /// Fold one successful Query Log poll into the tab state.
 ///
 /// **Extracted from the poll arm so it is reachable from a test.** All
@@ -3840,7 +3847,7 @@ fn clamp_query_log_cursor(app: &mut App) {
     }
 }
 
-/// S53.5 — drive the Rules-tab edit modal state machine.
+/// Drive the Rules-tab edit modal state machine.
 ///
 /// Routes by `mode`: `Edit` handles Tab cycling + arrow-key picker
 /// changes on Action/Scope + `Ctrl+S` submit + `Enter` on Delete
@@ -3858,7 +3865,7 @@ async fn handle_rules_edit_modal_key(
     };
     if modal.submitting && !matches!(key.code, KeyCode::Esc) {
         // Block re-entrant submits — only Esc escapes the in-flight
-        // state. Mirrors the S53 list-edit-modal pattern.
+        // state. Mirrors the list-edit-modal pattern.
         app.rules.edit_modal = Some(modal);
         return;
     }
@@ -3895,7 +3902,7 @@ async fn handle_rule_edit_form_key(
             app.rules.edit_modal = None;
             return;
         }
-        // §4.63-s3b nav grammar: Down/Up alias Tab/BackTab so focus moves
+        // Down/Up alias Tab/BackTab so focus moves
         // with the arrows here exactly as it already did in the Subnets /
         // Profiles / Local DNS / Devices forms. Tab and BackTab keep
         // working — this is an addition, not a swap, so the old muscle
@@ -3938,8 +3945,8 @@ async fn handle_rule_edit_form_key(
             modal.error_message = None;
             modal.status_message = None;
         }
-        // §4.65 UX3 (§3.6): Save is now Tab-reachable — Enter on it takes
-        // the same path as Ctrl+S. D7′ (Ctrl+S from anywhere) is
+        // Save is Tab-reachable — Enter on it takes
+        // the same path as Ctrl+S. Ctrl+S-from-anywhere is
         // untouched above; this is an addition, not a replacement.
         KeyCode::Enter if modal.focus == RuleEditFocus::SaveButton => {
             submit_rule_edit_modal(app, modal.clone(), poller, config_path).await;
@@ -4117,20 +4124,20 @@ async fn submit_rule_edit_modal(
     }
 }
 
-// `plp-s5d` removed the Tags-tab handlers that stood here — the table
+// The Tags-tab handlers that once stood here — the table
 // keys, the filter chip, the `/` search, and the six modals (Members,
-// Check, Declare, Describe, Rename, Delete) — with the `Leaf::Tags` tab
-// itself. The CRUD surface administered the implicit tag registry, and
-// after the `plp-s3` cutover a tag decides nothing, so there was nothing
-// left for it to administer.
+// Check, Declare, Describe, Rename, Delete) — are gone along with the
+// `Leaf::Tags` tab itself. The CRUD surface administered the implicit
+// tag registry, and after the per-list-policy cutover a tag decides
+// nothing, so there was nothing left for it to administer.
 
-/// wave2/tags-filter: `/` search buffer. Sync (unlike the Create/Rename/
+/// `/` search buffer. Sync (unlike the Create/Rename/
 /// Delete siblings) — there's no IPC round-trip, just a text commit.
 /// Enter commits `buf` into `TagsState::filter_text` (trimmed, `None`
 /// if empty) and reconciles the cursor against the new filtered view;
 /// Esc discards the buffer and leaves `filter_text` untouched.
 async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) {
-    // Sprint 39: when the Tracking form is active, route keys to the
+    // When the Tracking form is active, route keys to the
     // form handler FIRST and only fall through when it returns "pass
     // through" (currently never — the form owns its keys).
     if app.settings.tracking_panel.is_some() {
@@ -4140,7 +4147,7 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, c
 
     match key.code {
         KeyCode::Char('t') => {
-            // Sprint 39: enter the Tracking form. Load the current
+            // Enter the Tracking form. Load the current
             // tracking config fresh from disk so a prior `e`-edit is
             // picked up; fall back to a default TrackingConfig when
             // the loader fails (operator can still make edits; submit
@@ -4182,7 +4189,7 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, c
     }
 }
 
-/// N4 — move the Labels entries cursor. **Clamps**: `%` used to teleport
+/// Move the Labels entries cursor. **Clamps**: `%` used to teleport
 /// the operator from the last label to the first.
 ///
 /// Extracted from the `↑`/`↓` arm so the jump and page keys share one
@@ -4217,8 +4224,8 @@ fn step_labels_entry(app: &mut App, code: KeyCode) {
 /// Below `tabs::labels::NARROW_THRESHOLD` the leaf collapses to the
 /// entry table alone, so a `KindMenu` focus is unhonourable: `↑`/`↓`
 /// would swap the whole table's contents while the operator, seeing only
-/// a table, expects its rows to move. At the D18 floor of 80×24 that is
-/// the *default* state, not an edge case.
+/// a table, expects its rows to move. At the minimum-terminal floor of
+/// 80×24 that is the *default* state, not an edge case.
 ///
 /// Clamped in state rather than derived at draw time so the **key
 /// handler** is correct too — it has no idea how wide the terminal is,
@@ -4301,9 +4308,8 @@ fn labels_ids_of_kind(app: &App, kind: crate::config::schema::LabelKind) -> Vec<
 /// [`ensure_subnet_selection_seeded`] was written for: the renderer
 /// falls back to highlighting row 0 when the anchor is `None`
 /// (`tabs/labels.rs`, `state.select(Some(0))`), so the operator sees a
-/// cursor while the state says `None`. Harmless while the leaf is
-/// read-only — nothing consults the anchor — and load-bearing the moment
-/// L2's CRUD lands, because an opener reading `selected_id` would no-op
+/// cursor while the state says `None`. Load-bearing now that the leaf
+/// has CRUD: an opener reading `selected_id` would no-op
 /// on exactly the row the operator can see is selected.
 ///
 /// Called on every keystroke *and* on leaf entry, and again right after
@@ -4331,15 +4337,14 @@ fn ensure_labels_selection_seeded(app: &mut App) {
     app.labels.selected_id = ids.into_iter().next();
 }
 
-/// §4.66 L2 / §4.68 UX8 / §4.66 L7: Labels navigation on the axis the
+/// Labels navigation on the axis the
 /// leaf is drawn, plus `a` / `e` / `d` to author the vocabulary.
 ///
-/// **L2 shipped as a view and that was never the design.** Groups' G1
-/// read-only phase was *structural* — its handler took neither
+/// **This leaf shipped as a view first, and that was never the design.**
+/// Groups' read-only phase was *structural* — its handler took neither
 /// `config_path` nor `IpcPoller`, so a write could not arrive unannounced.
-/// Labels never had that bar: writing was inside L2's own scope and simply
-/// did not land, which is why `s466-l7` exists as a re-filed task rather
-/// than as a new feature. This signature stays `(&mut App, KeyEvent)` for
+/// Labels never had that bar: writing was inside the leaf's own scope and
+/// simply did not land at first. This signature stays `(&mut App, KeyEvent)` for
 /// the same reason Groups' did: the openers only need the app, and every
 /// write lives in `handle_label_modal_key` / `submit_label_modal`, which
 /// take both.
@@ -4363,14 +4368,14 @@ fn ensure_labels_selection_seeded(app: &mut App) {
 /// cycle; see the arm in `handle_key` for why the shadow was built and
 /// then reverted.
 ///
-/// **`h`/`l` were remapped by §4.68 UX8 and then DELETED by N3
-/// (2026-08-24).** The paragraph above is kept because it is the
-/// argument, not the state: they used to cycle the kind, UX8 moved that
-/// job to `↑`/`↓` while the menu has focus, and the two could not both
-/// hold. N3 then removed the four vim aliases TUI-wide — bound but
+/// **`h`/`l` were remapped once and then DELETED.** The paragraph above
+/// is kept because it is the
+/// argument, not the state: they used to cycle the kind, then that
+/// job moved to `↑`/`↓` while the menu has focus, and the two could not both
+/// hold. The four vim aliases were then removed TUI-wide — bound but
 /// undocumented is the one state that is wrong in both directions. The
 /// arrows are unchanged; `h`/`l`/`j`/`k` are unbound here and are
-/// deliberately NOT rebound (N11). Pinned by
+/// deliberately NOT rebound. Pinned by
 /// `ux8_h_and_l_are_no_longer_bound_on_labels`.
 fn handle_labels_key(app: &mut App, key: KeyEvent) {
     // The guard comes FIRST. Seeding against a failed load would find no
@@ -4384,7 +4389,7 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
     // Every keystroke, like Subnets: the leaf must be operable from the
     // first interaction rather than after a wake-up press.
     //
-    // §4.66 L7 leans on this harder than L2 did. It is what makes
+    // This leans on it harder now than the read-only view did. It is what makes
     // `selected_id` name the row the table highlights, and `focused_label`
     // — which `e` and `d` resolve through — reads that anchor. Seeding
     // after the openers would let the first `e` on a freshly entered tab
@@ -4392,8 +4397,8 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
     ensure_labels_selection_seeded(app);
 
     // Add first, and above every emptiness check: it is the one verb whose
-    // whole purpose is to work when the vocabulary is empty. §4.68 UX8
-    // measured **zero** `[[labels]]` rows on both live boxes, so "empty" is
+    // whole purpose is to work when the vocabulary is empty. **Zero**
+    // `[[labels]]` rows is measured on live boxes, so "empty" is
     // not the corner case here — it is the state the operator meets. The
     // kind comes from the focused pane and is not a form field; see the
     // `label_modal` module doc for the context-desync argument that
@@ -4407,7 +4412,7 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
         // `e` / `d` resolve a row first: there is nothing to edit or
         // remove when the focused kind has no entries, and
         // `build_label_*_modal` returns `None` in exactly that case.
-        // N5 — Enter is the primary action on the focused row; on Labels
+        // Enter is the primary action on the focused row; on Labels
         // that is edit. Same branch as `e`, no new modal.
         KeyCode::Enter | KeyCode::Char('e') => {
             if let Some(modal) = build_label_edit_modal(app) {
@@ -4422,18 +4427,18 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
         // **`←`/`→` mean one of two things, and which one is a property of
         // the layout rather than a mode the operator chose.**
         //
-        // Wide: they move focus between the two cards, which is §4.68 UX8's
-        // fix — a vertically drawn menu must not be walked by a horizontal
+        // Wide: they move focus between the two cards — a vertically drawn
+        // menu must not be walked by a horizontal
         // key.
         //
         // Narrow: there is no second card. `menu_is_painted` is false below
         // `NARROW_THRESHOLD`, the clamp pins focus to the table every frame,
         // and a `←` that sets `KindMenu` is undone before the next keystroke
         // is read — so the kind was **unreachable**, and with it two of the
-        // three vocabularies at the declared 80×24 floor. UX8's argument
+        // three vocabularies at the declared 80×24 floor. The axis argument
         // does not apply to a menu that is not drawn: there is no vertical
         // list to walk, so the horizontal keys are free to carry the kind,
-        // which is exactly what they did before UX8.
+        // which is exactly what they did before the axis fix.
         KeyCode::Left => {
             if app.labels.menu_painted {
                 app.labels.focus = LabelsFocus::KindMenu;
@@ -4452,14 +4457,14 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
             let forward = matches!(key.code, KeyCode::Down);
             match app.labels.focus {
                 // The kind menu is a three-item value cycler, not a list —
-                // §6 names the four `rem_euclid` sites where wrap is
-                // load-bearing and this is the same class. It keeps
+                // one of a small set of `rem_euclid` sites where wrap is
+                // load-bearing. It keeps
                 // wrapping; only the ENTRIES table is a list.
                 LabelsFocus::KindMenu => cycle_labels_kind(app, forward),
                 LabelsFocus::Entries => step_labels_entry(app, key.code),
             }
         }
-        // N4 — jump / page, entries only. `Home` / `End` on the kind menu
+        // Jump / page, entries only. `Home` / `End` on the kind menu
         // would be a jump within a three-item cycler; there is nothing to
         // jump past, so they stay unbound there rather than aliasing
         // `↑`/`↓`.
@@ -4658,16 +4663,24 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
     }
     ensure_custom_list_selection_seeded(app);
 
-    // **`a` and `d` mean different things per pane, and the focused pane
-    // is what says which.** The rule pane's cursor glyph and the footer
-    // both change with focus, which is what keeps `d` from reading as
-    // ambiguous.
+    // **`a`, `e` and `d` mean different things per pane, and the focused
+    // pane is what says which.** The rule pane's cursor glyph and the
+    // footer both change with focus, which is what keeps them from
+    // reading as ambiguous. Every arm here must stay INSIDE this guard:
+    // on the list pane the same letters act on the list, which is what
+    // the operator expects there.
     if app.custom_lists.focus == CustomListsFocus::Rules {
         match key.code {
             KeyCode::Char('a') => {
                 if let Some(id) = app.custom_lists.selected_id.clone() {
                     app.custom_lists.modal =
                         Some(custom_list_modal::CustomListModal::open_add_rule(id));
+                }
+                return;
+            }
+            KeyCode::Char('e') => {
+                if let Some(modal) = build_rule_edit_modal(app) {
+                    app.custom_lists.modal = Some(modal);
                 }
                 return;
             }
@@ -4780,6 +4793,28 @@ fn build_rule_remove_modal(app: &App) -> Option<custom_list_modal::CustomListMod
     let affected = rule_lines_naming(app, &domain);
     Some(custom_list_modal::CustomListModal::open_remove_rule(
         list_id, domain, affected,
+    ))
+}
+
+/// The edit form for the rule under the cursor, if there is one.
+///
+/// `None` on a comment, a blank, or a line the grammar refused. The first
+/// two are unreachable — the pane does not draw them — but a REFUSED line
+/// is drawn, and it carries no domain: it cannot state what the operator
+/// saw, so there is nothing the writer could check the file against. A key
+/// that opens nothing beats a form that can never save.
+fn build_rule_edit_modal(app: &App) -> Option<custom_list_modal::CustomListModal> {
+    use crate::tui::app::PackRowAction;
+    let list_id = app.custom_lists.selected_id.clone()?;
+    let pack = app.custom_lists.pack.as_ref()?;
+    let line = app.custom_lists.selected_line?;
+    let row = pack.rows.iter().find(|r| r.number == line)?;
+    let domain = row.domain.clone()?;
+    Some(custom_list_modal::CustomListModal::open_edit_rule(
+        list_id,
+        line,
+        domain,
+        matches!(row.action, PackRowAction::Allow),
     ))
 }
 
@@ -5107,7 +5142,26 @@ async fn submit_custom_list_modal(
             Err(msg) => SubmitOutcome::Failed(msg),
         },
         Stage::AddingRule(form) => {
-            match add_rule_to_pack(app, &form.list_id, form.domain.trim(), form.allow) {
+            // An edit that changes nothing must not write, for the reason
+            // the list form gives one arm up: it would churn the file's
+            // mtime, which the leaf's UPDATED column reports, and spend a
+            // daemon reload on a no-op.
+            let written = match form.replacing() {
+                None => add_rule_to_pack(app, &form.list_id, form.domain.trim(), form.allow),
+                Some((line, ..)) if form.is_unchanged() => {
+                    wrote = false;
+                    Ok(format!("line {line} of {} unchanged", form.list_id))
+                }
+                Some((line, was_domain, was_allow)) => replace_rule_in_pack(
+                    app,
+                    &form.list_id,
+                    line,
+                    (was_domain, was_allow),
+                    form.domain.trim(),
+                    form.allow,
+                ),
+            };
+            match written {
                 Ok(msg) => SubmitOutcome::Ok(msg),
                 Err(msg) => SubmitOutcome::Failed(msg),
             }
@@ -5220,6 +5274,39 @@ fn add_rule_to_pack(app: &App, list_id: &str, domain: &str, allow: bool) -> Resu
     }
 }
 
+/// Replace the rule on one file line of the selected list's pack.
+///
+/// **Not remove-then-add, and the difference is data loss.**
+/// `remove_rule` matches the domain and ignores the direction, so a flip
+/// composed from the two primitives takes the opposite direction of the
+/// same domain with it — a rule the operator never touched, in a file
+/// they diff.
+///
+/// `expect` is what the pane RENDERED on that line, and it is what makes
+/// the file line number safe to key on: the pack view is only re-read
+/// when the selection changes or a write lands here, so a write from
+/// anywhere else moves the numbering under it.
+fn replace_rule_in_pack(
+    app: &App,
+    list_id: &str,
+    line: usize,
+    expect: (&str, bool),
+    domain: &str,
+    allow: bool,
+) -> Result<String, String> {
+    if domain.is_empty() {
+        return Err("a domain is required".into());
+    }
+    let loaded = app
+        .loaded_config
+        .as_ref()
+        .ok_or_else(|| "the configuration could not be read".to_string())?;
+    let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
+    crate::tui::tabs::custom_lists::replace_rule(loaded, &id, line, expect, domain, allow)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("replaced line {line} of {list_id}"))
+}
+
 /// Drop every rule naming `domain`, **in both directions**.
 fn remove_rule_from_pack(app: &App, list_id: &str, domain: &str) -> Result<String, String> {
     let loaded = app
@@ -5283,20 +5370,37 @@ fn custom_list_value(resolved: &custom_list_modal::ResolvedForm) -> toml::Value 
 /// entry may legitimately live in a fragment. A removal aimed at the master
 /// would no-op while reporting success, and the list would still be there
 /// after the reload.
+///
+/// `Err` is a file in `files_loaded` — the loader's own record of files it
+/// successfully read — that can no longer be read or parsed: a permission
+/// change or a truncated write since load. It must not collapse into
+/// `Ok(None)`: the entity IS declared, and "no file declares it" sends the
+/// operator to look for the wrong thing; `kind_toggle_gate`
+/// already draws exactly this line elsewhere in this same
+/// file.
 fn custom_list_owner_file(
     loaded: &crate::config::loader::LoadedConfig,
     id: &str,
-) -> Option<PathBuf> {
-    loaded.files_loaded.iter().find_map(|path| {
-        let text = std::fs::read_to_string(path).ok()?;
-        let value = text.parse::<toml::Value>().ok()?;
-        value
-            .get("custom_lists")?
-            .as_array()?
-            .iter()
-            .any(|item| item.get("id").and_then(|v| v.as_str()) == Some(id))
-            .then(|| path.clone())
-    })
+) -> Result<Option<PathBuf>, String> {
+    for path in &loaded.files_loaded {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let value = text
+            .parse::<toml::Value>()
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        let declares_id = value
+            .get("custom_lists")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|item| item.get("id").and_then(|v| v.as_str()) == Some(id))
+            })
+            .unwrap_or(false);
+        if declares_id {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Create a custom list: **the file first, then the declaration.**
@@ -5310,6 +5414,15 @@ fn custom_list_owner_file(
 /// collision: `create_pack` goes through `hardened_atomic_write`, which
 /// OVERWRITES, and `upsert_id_keyed` REPLACES. An `a` on a taken id would
 /// delete that list's rules before the config write was even attempted.
+///
+/// # Why the guard is scoped rather than held across both steps
+///
+/// `write_value_validated` takes the tree lock itself, and `claim_tree`
+/// records why a guard still live here would stall against it. The scope
+/// buys exactly one thing: every pack write in this tree happens under the
+/// lock. It does **not** make the two steps one transaction, and it does
+/// not close the id collision — the existence check above runs unlocked,
+/// so two concurrent creates for one id still both pass it.
 fn create_custom_list(
     config_path: &Path,
     resolved: &custom_list_modal::ResolvedForm,
@@ -5317,6 +5430,7 @@ fn create_custom_list(
     use crate::cli::commands::target::{read_or_empty, upsert_id_keyed, write_value_validated};
     use crate::config::custom_list::{create_pack, pack_dir, pack_path};
     use crate::config::schema::Id;
+    use crate::tui::tabs::custom_lists;
 
     let id = Id::new(resolved.id.as_str()).map_err(|e| format!("id: {e}"))?;
     let loaded = load_v1_config(config_path)
@@ -5335,7 +5449,16 @@ fn create_custom_list(
     std::fs::create_dir_all(pack_dir(root))
         .map_err(|e| format!("creating the packs directory: {e}"))?;
     let path = pack_path(root, &id);
-    create_pack(&path, &resolved.display_name).map_err(|e| e.to_string())?;
+    {
+        let lock = custom_lists::claim_tree(&loaded).map_err(|e| e.to_string())?;
+        create_pack(
+            &lock,
+            &path,
+            &resolved.display_name,
+            custom_lists::max_pack_bytes(&loaded),
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     let (mut doc, _) = read_or_empty(&loaded.master_path).map_err(|e| e.to_string())?;
     upsert_id_keyed(
@@ -5365,7 +5488,7 @@ fn update_custom_list_meta(
 
     let loaded = load_v1_config(config_path)
         .ok_or_else(|| "the configuration could not be read".to_string())?;
-    let owner = custom_list_owner_file(&loaded, &resolved.id)
+    let owner = custom_list_owner_file(&loaded, &resolved.id)?
         .ok_or_else(|| format!("no file declares custom list '{}'", resolved.id))?;
     let (mut doc, _) = read_or_empty(&owner).map_err(|e| e.to_string())?;
     upsert_id_keyed(
@@ -5391,7 +5514,7 @@ fn remove_custom_list(config_path: &Path, id: &str) -> Result<String, String> {
 
     let loaded = load_v1_config(config_path)
         .ok_or_else(|| "the configuration could not be read".to_string())?;
-    let owner = custom_list_owner_file(&loaded, id)
+    let owner = custom_list_owner_file(&loaded, id)?
         .ok_or_else(|| format!("no file declares custom list '{id}'"))?;
     let (mut doc, _) = read_or_empty(&owner).map_err(|e| e.to_string())?;
     if !remove_id_keyed(&mut doc, "custom_lists", id).map_err(|e| e.to_string())? {
@@ -5504,19 +5627,29 @@ async fn submit_custom_list_mount(app: &mut App, poller: &IpcPoller, config_path
 /// refuses as a duplicate key — the whole config, not just this write.
 ///
 /// Walks `files_loaded`, the loader's own record of what it read.
+/// `Err` is a file in `files_loaded` that can no longer be read or parsed —
+/// see [`custom_list_owner_file`], which carries the same rule and the
+/// same reason.
 fn profile_owner_file(
     loaded: &crate::config::loader::LoadedConfig,
     profile: &str,
-) -> Option<PathBuf> {
-    loaded.files_loaded.iter().find_map(|path| {
-        let text = std::fs::read_to_string(path).ok()?;
-        let value = text.parse::<toml::Value>().ok()?;
-        value
-            .get("profiles")?
-            .as_table()?
-            .contains_key(profile)
-            .then(|| path.clone())
-    })
+) -> Result<Option<PathBuf>, String> {
+    for path in &loaded.files_loaded {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let value = text
+            .parse::<toml::Value>()
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        let declares_profile = value
+            .get("profiles")
+            .and_then(|v| v.as_table())
+            .map(|t| t.contains_key(profile))
+            .unwrap_or(false);
+        if declares_profile {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Set `[profiles.<id>].custom_lists`, **touching nothing else on that
@@ -5570,6 +5703,16 @@ fn set_profile_custom_lists(
 /// a time: `write_value_validated` per profile would run one full
 /// validation and one rename each, so a refusal half-way would leave the
 /// operator's intent partly applied with nothing saying which half landed.
+///
+/// **This is the second of two writers of `[profiles.<id>].custom_lists`,
+/// and the file path is chosen here rather than inherited.** The profile
+/// modal mounts through
+/// [`ProfileUpdatePatch::custom_lists`](crate::ipc::protocol::ProfileUpdatePatch::custom_lists),
+/// which is right for its gesture — one profile, N lists, one atomic patch
+/// alongside that profile's other edits. This gesture is the transpose: one
+/// list, N profiles, and those profiles need not share a file. Routing it
+/// through the per-profile seat would trade the guarantee above for N
+/// independent round-trips, so it writes the documents itself and reloads.
 fn apply_custom_list_mounts(
     config_path: &Path,
     list_id: &str,
@@ -5584,7 +5727,7 @@ fn apply_custom_list_mounts(
     // path -> (original text, edited doc)
     let mut edits: Vec<(PathBuf, String, toml::Value)> = Vec::new();
     for (profile, mount) in changes {
-        let owner = profile_owner_file(&loaded, profile)
+        let owner = profile_owner_file(&loaded, profile)?
             .ok_or_else(|| format!("no file declares profile '{profile}'"))?;
 
         let slot = match edits.iter().position(|(p, _, _)| *p == owner) {
@@ -5655,14 +5798,13 @@ mod custom_lists_advertised_keys_tests;
 #[path = "tests/custom_list_write_tests.rs"]
 mod custom_list_write_tests;
 
-// ── §4.66 L7 — Labels modal openers, key handler and submit path ──────
+// ── Labels modal openers, key handler and submit path ────────────────
 //
-// Route (b), as G2 settled it: no new IPC verb. The submit path drives the
+// No new IPC verb. The submit path drives the
 // **sync inner writers** of `cli::commands::labels` and fires a single
 // `attempt_reload` afterwards. `run_add` / `run_set` / `run_remove` are
 // forbidden — they `println!`, and a `println!` on the alternate screen in
-// raw mode staircases one column per line (v0.29.1). `s466-l7a` built that
-// seam ahead of this sprint for exactly this call site.
+// raw mode staircases one column per line.
 
 /// The label the openers act on: the anchored selection, else the first
 /// row.
@@ -5729,13 +5871,13 @@ async fn handle_label_modal_key(
         return;
     }
 
-    // N14 — `Ctrl+s` saves from anywhere on an Archetype-F form.
+    // `Ctrl+s` saves from anywhere on an Archetype-F form.
     //
     // Checked BEFORE the field dispatch, not as a guarded `Char('s')` arm:
     // the `KeyCode::Char(c)` catch-all at the bottom of the form match is
     // what used to append a literal `s` to the focused buffer, so an arm
-    // placed after it would be dead. §10b.2 says "from anywhere", which
-    // means ahead of the field dispatch entirely. Mirrors the check in
+    // placed after it would be dead. "From anywhere" means ahead of the
+    // field dispatch entirely. Mirrors the check in
     // `handle_edit_mode_key`, including the `S` spelling some terminals
     // send.
     //
@@ -6107,42 +6249,32 @@ async fn refresh_after_label_write(app: &mut App, poller: &IpcPoller, config_pat
     poll_active_leaf(app, poller).await;
 }
 
-/// Apply the diff between `original` and `resolved`, one field at a time.
+/// Apply the diff between `original` and `resolved` in one validated write.
 ///
-/// **A Labels save is NOT atomic across fields, and that is a property of
-/// the seam rather than a shortcut.** `groups::set_fields_inner` takes a
-/// slice and lands every changed scalar in one validated write;
-/// `labels::set_inner` takes a single `(field, value)`. Two changed fields
-/// are therefore two writes, and the honest thing to do with that is say
-/// so when the second one fails — a message implying atomicity would send
-/// the operator back to retype a change that already landed. This is the
-/// `submit_subnet_edit` shape, not the `submit_group_edit` one.
+/// **Was per-field, non-atomic, and that was the last surviving instance
+/// of the same partial-apply shape already closed for Subnets:**
+/// `labels::set_inner` per changed field meant a
+/// validator refusal on the second field left the first one written, so
+/// Discard stopped discarding. `labels::set_fields_inner` — new,
+/// mirroring `groups::set_fields_inner` / `subnets::set_fields_inner` —
+/// diffs the whole field vector into one `write_value_validated` call, so
+/// this is now the `submit_subnet_edit` / `submit_group_edit` shape: a
+/// single write, so nothing landed — Discard genuinely discards, with no
+/// partial-apply caveat needed.
 ///
-/// **Sequencing them is safe, and it was checked rather than assumed.**
-/// The hazard would be the second call writing against a document that
-/// predates the first, silently dropping it. It cannot: `set_inner` runs
-/// `load_config` and `read_or_empty` **inside every call**, so the second
-/// reads what the first wrote. Neither field touches the `(kind, id)` key,
-/// so the second call's `select_label` still resolves the same row.
-///
-/// The order is display_name then description: the first is the field that
-/// makes a device adopt the label (`Label::matches_value` compares id **or**
-/// display name), the second is inert by construction. If only one of the
-/// two can land, it should be the one that does something.
+/// Field order (display_name, then description) is no longer
+/// load-bearing — it was pinned only because a partial apply needed one
+/// field to have landed before the other could fail, and one write has no
+/// "before" to land in.
 fn submit_label_edit(
     config_path: &Path,
     kind: crate::config::schema::LabelKind,
     original: &label_modal::OriginalSnapshot,
     resolved: &label_modal::ResolvedForm,
 ) -> (label_modal::SubmitOutcome, Vec<String>) {
-    use crate::cli::commands::labels::set_inner;
+    use crate::cli::commands::labels::set_fields_inner;
     use label_modal::SubmitOutcome;
 
-    // Order is load-bearing and PINNED, not merely commented: swapping
-    // these two pushes reddens `l7_a_half_applied_edit_names_what_landed`,
-    // verified by mutation. With description first nothing lands at all
-    // and the operator is told a plain refusal, losing the display-name
-    // change they made in the same save.
     let mut pending: Vec<(&str, &str)> = Vec::new();
     if original.display_name != resolved.display_name {
         pending.push(("display_name", resolved.display_name.as_str()));
@@ -6158,64 +6290,45 @@ fn submit_label_edit(
         );
     }
 
-    let mut landed: Vec<&str> = Vec::new();
-    for (field, value) in &pending {
-        match set_inner(config_path, &original.id, Some(kind), field, value, None) {
-            Ok(report) => {
-                tracing::info!(
-                    target: "audit",
-                    action = "label.set",
-                    surface = "tui",
-                    id = %report.id,
-                    kind = %kind,
-                    fields = %report.fields.join(","),
-                    source_file = %report.target_path.display(),
-                    "TUI mutation"
-                );
-                landed.push(field);
-            }
-            Err(e) => {
-                // Name what already landed. `landed` is empty on the first
-                // failure, which is the ordinary case and reads as a plain
-                // refusal; it is non-empty only when the operator must know
-                // the edit is half-applied.
-                let msg = if landed.is_empty() {
-                    format!("{field}: {e}")
-                } else {
-                    format!("{field}: {e} — {} already saved", landed.join(" and "))
-                };
-                return (
-                    SubmitOutcome::Failed(msg),
-                    landed.iter().map(|f| f.to_string()).collect(),
-                );
-            }
+    match set_fields_inner(config_path, &original.id, Some(kind), &pending, None) {
+        Ok(report) => {
+            tracing::info!(
+                target: "audit",
+                action = "label.set",
+                surface = "tui",
+                id = %report.id,
+                kind = %kind,
+                fields = %report.fields.join(","),
+                source_file = %report.target_path.display(),
+                "TUI mutation"
+            );
+            // **The target file goes in the audit line, not on the
+            // screen**, and that was decided by looking at the screen.
+            // `prose_row` truncates at the modal's 62-column body, and
+            // "updated device-type apple-tv (display_name, description)"
+            // already spends 52 of them — so an appended path was
+            // ellipsed away on a real terminal every time, taking the
+            // trailing words of the field list with it. `tracing` keeps
+            // the path in a record that does not have 62 columns.
+            let msg = format!(
+                "updated {} {} ({})",
+                kind.as_str(),
+                original.id,
+                report.fields.join(", ")
+            );
+            (SubmitOutcome::Ok(msg), report.fields)
         }
+        Err(e) => (
+            SubmitOutcome::Failed(format!("edit failed: {e}")),
+            Vec::new(),
+        ),
     }
-
-    // **The target file goes in the audit line, not on the screen**, and
-    // that was decided by looking at the screen. `prose_row` truncates at
-    // the modal's 62-column body, and "updated device-type apple-tv
-    // (display_name, description)" already spends 52 of them — so an
-    // appended path was ellipsed away on a real terminal every time,
-    // taking the trailing words of the field list with it. A message that
-    // reliably loses its own tail is worse than one that never claimed it:
-    // the fields the operator changed are the part they are checking, and
-    // `tracing` keeps the path in a record that does not have 62 columns.
-    (
-        SubmitOutcome::Ok(format!(
-            "updated {} {} ({})",
-            kind.as_str(),
-            original.id,
-            landed.join(", ")
-        )),
-        landed.iter().map(|f| f.to_string()).collect(),
-    )
 }
 
-/// Keys of the Groups leaf: `↑`/`↓` move the cursor (§4.64 G1) and
-/// `a`/`e`/`d` open the Add / Edit / Delete modal (§4.64 G2).
+/// Keys of the Groups leaf: `↑`/`↓` move the cursor and
+/// `a`/`e`/`d` open the Add / Edit / Delete modal.
 ///
-/// **§4.64 G1's structural read-only is deliberately over.** That
+/// **The leaf's earlier structural read-only is deliberately over.** That
 /// property was stated as *"the signature takes neither `config_path` nor
 /// `IpcPoller`, so adding a write path would be a visible change rather
 /// than a quiet one"* — and the signature is still exactly that, because
@@ -6230,7 +6343,7 @@ fn submit_label_edit(
 /// the config where it matters — a config with no groups is the one an
 /// operator most needs to create the first one on. That is the same shape
 /// as `open_field_picker`'s empty-list no-op, which is *why* no TUI path
-/// could create a group before this sprint (design doc §2.1). `e` / `d`
+/// used to be able to create a group. `e` / `d`
 /// still require a resolved selection: there is nothing to edit or
 /// remove.
 fn handle_groups_key(app: &mut App, key: KeyEvent) {
@@ -6269,7 +6382,7 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        // N5 — Enter is the primary action on the focused row; on Groups
+        // Enter is the primary action on the focused row; on Groups
         // that is edit. Same branch as `e`, no new modal.
         KeyCode::Enter | KeyCode::Char('e') => {
             if let Some(modal) = build_group_edit_modal(app) {
@@ -6292,7 +6405,7 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
         .as_deref()
         .and_then(|want| ids.iter().position(|i| i == want))
         .unwrap_or(0);
-    // N4 — clamp, not wrap. `%` used to teleport the operator from the
+    // Clamp, not wrap. `%` used to teleport the operator from the
     // last group to the first, which reads as a lost cursor rather than as
     // navigation. Walking off the end is now a no-op.
     let last = ids.len() - 1;
@@ -6311,13 +6424,13 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
     app.groups.selected_id = Some(ids[next].clone());
 }
 
-// ── §4.64 G2 — Groups modal openers, key handler and submit path ──────
+// ── Groups modal openers, key handler and submit path ─────────────────
 //
-// Route (b) per DG1: no new IPC verb. The submit path replicates the
+// No new IPC verb. The submit path replicates the
 // `groups.rs` pipeline through the **sync inner writers** and fires a
-// single `attempt_reload` afterwards. DG2 forbids `run_add` / `run_set` /
-// `run_remove` — they `println!`, and a `println!` on the alternate
-// screen in raw mode staircases one column per line (v0.29.1).
+// single `attempt_reload` afterwards. `run_add` / `run_set` /
+// `run_remove` are forbidden — they `println!`, and a `println!` on the alternate
+// screen in raw mode staircases one column per line.
 
 /// The group the modal openers act on: the anchored selection, else the
 /// first row — matching what `tabs::groups::render_master` highlights, so
@@ -6384,13 +6497,13 @@ async fn handle_group_modal_key(
         return;
     }
 
-    // N14 — `Ctrl+s` saves from anywhere on an Archetype-F form.
+    // `Ctrl+s` saves from anywhere on an Archetype-F form.
     //
     // Checked BEFORE the field dispatch, not as a guarded `Char('s')` arm:
     // the `KeyCode::Char(c)` catch-all at the bottom of the form match is
     // what used to append a literal `s` to the focused buffer, so an arm
-    // placed after it would be dead. §10b.2 says "from anywhere", which
-    // means ahead of the field dispatch entirely. Mirrors the check in
+    // placed after it would be dead. "From anywhere" means ahead of the
+    // field dispatch entirely. Mirrors the check in
     // `handle_edit_mode_key`, including the `S` spelling some terminals
     // send.
     //
@@ -6432,7 +6545,7 @@ async fn handle_group_modal_key(
                         return;
                     }
                 }
-                // `plp-s5d`: these were `if Profile {...} else if Tags {...}`.
+                // These were `if Profile {...} else if Tags {...}`.
                 // With the Tags branch gone the lone `if` trips
                 // `collapsible_if` under `-D warnings`, so the condition
                 // moves onto the arm. Behaviour is unchanged: a Left/Right
@@ -6509,7 +6622,7 @@ async fn handle_group_modal_key(
 /// Skip the Id field on Edit — immutable after creation, so focus must
 /// not land on a field the operator cannot change.
 ///
-/// `plp-s5d` removed the second skip: `FormField::Tags` was Edit-only and
+/// The second skip is gone: `FormField::Tags` was Edit-only and
 /// stepped over in Add, and with the picker gone both modes walk the same
 /// ring bar `Id`.
 fn next_editable_group_field(
@@ -6555,7 +6668,7 @@ fn group_text_field_buf(form: &mut group_modal::AddForm) -> Option<&mut String> 
 ///   delta.
 /// - Remove → `remove_inner` once.
 ///
-/// On a real write, fires HR2 `attempt_reload` **once** and re-reads the
+/// On a real write, fires the shared `attempt_reload` **once** and re-reads the
 /// cached config. That re-read is not decoration: Groups is in the
 /// offline cohort (`poll_active_leaf` is a no-op for this leaf), so
 /// without it a successful save renders an unchanged table and reads to
@@ -6702,14 +6815,14 @@ async fn submit_group_modal(
 /// Every changed scalar field (display_name / profile / priority /
 /// devices) lands in a single `set_fields_inner` write, or none do.
 ///
-/// **`plp-s5d` made that the whole story again.** A Save used to be TWO
+/// **That is the whole story again.** A Save used to be TWO
 /// writes: the scalar batch, then a `tags` delta through
 /// `apply_tags_inner`, which could not join the batch because it was a
 /// different primitive (add-set / remove-set, not a replace). That path
 /// could half-land, so the outcome had to distinguish "nothing was
 /// written" from "the rename landed and the tags did not".
 ///
-/// `plp-s3` had already replaced the second write with an unconditional
+/// An earlier change had already replaced the second write with an unconditional
 /// `TAGS_RETIRED` refusal taken BEFORE the scalar one — which turned the
 /// picker into a trap: an operator who renamed a group and also touched
 /// the tag field lost the rename, for a field that decided nothing.
@@ -6784,8 +6897,8 @@ fn submit_group_edit(
 /// Scrolling is `tabs::file`'s convention verbatim — one line on the
 /// arrows, [`NAV_PAGE`] on the page keys, `Home`/`End` to the ends, every
 /// bound through the same saturating `u16` conversion. The filters are
-/// N13's: `/` opens the search buffer, `f` cycles the severity chip, `R`
-/// clears both.
+/// the shared filter card's: `/` opens the search buffer, `f` cycles the
+/// severity chip, `R` clears both.
 ///
 /// Every filter change resets `scroll_offset`. The daemon applies the
 /// filters during its own walk, so the next poll returns a **different
@@ -6826,14 +6939,16 @@ fn handle_logs_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// §4.67-b MN3: keys of the [`Leaf::File`] document viewer, split out of
+/// Keys of the [`Leaf::File`] document viewer, split out of
 /// `handle_settings_key`. Navigation inside the text (`/` jump, `↑`/`↓`
 /// scroll) and the `$EDITOR` hand-off live here; the administration keys
 /// (`t` / `b` / `R` / `Ctrl+r`) stayed on Settings.
 ///
-/// Takes no `IpcPoller`: this leaf issues no IPC. That is the signature
-/// saying so, not a comment promising it.
-fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
+/// `async` and takes an `IpcPoller` for exactly one reason: the `[e]` arm
+/// writes the master config, and nothing watches config files
+/// — a write reaches the daemon only through SIGHUP or an IPC reload this
+/// handler requests itself.
+async fn handle_file_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) {
     // backup/restore modals above.
     if app.file.section_jump.is_some() {
         match key.code {
@@ -6885,7 +7000,7 @@ fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
         KeyCode::Up => {
             app.file.scroll_offset = app.file.scroll_offset.saturating_sub(1);
         }
-        // N4 — jump / page. The File leaf scrolls text lines rather than
+        // Jump / page. The File leaf scrolls text lines rather than
         // table rows, so it clamps against the same `line_count - 1` the
         // `↓` arm above uses, via the same saturating `u16` conversion (a
         // bare `as` on a >65 535-line config wraps the clamp to a small
@@ -6904,16 +7019,15 @@ fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
         KeyCode::Char('e') => {
             // Open config in $EDITOR — we need to temporarily leave the
             // TUI. Capture step-by-step failures into the footer hint
-            // instead of silently swallowing them (per
-            // `feedback_usability_first`: when something goes wrong, the
-            // operator needs the exact next command). The first failure
+            // instead of silently swallowing them: when something goes
+            // wrong, the operator needs the exact next command. The first failure
             // in the chain wins so the operator sees the earliest break;
             // subsequent steps still run best-effort so the terminal
             // lands as close to a usable TUI as possible.
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
             let mut step_error: Option<String> = None;
 
-            // mod-02: pause the event-reader thread before handing the tty to
+            // Pause the event-reader thread before handing the tty to
             // $EDITOR. Otherwise it keeps calling event::read() on the same
             // terminal — racing the editor per byte (dropped chars while editing
             // the master config) and queuing the bytes it steals as keys that
@@ -6946,7 +7060,7 @@ fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
 
             // Word-split $EDITOR so multi-token values (`code -w`,
             // `emacsclient -t`) spawn — first token is the program, the rest
-            // are leading args before the config path (mod-07). Reuses the CLI
+            // are leading args before the config path. Reuses the CLI
             // `config edit` splitter so both $EDITOR shell-outs parse alike.
             // The full `editor` string is kept verbatim for the error messages.
             let (program, args) =
@@ -6978,7 +7092,7 @@ fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
                 ));
             }
 
-            // mod-02: the screen is restored — let the reader resume reading the
+            // The screen is restored — let the reader resume reading the
             // tty. Any tick it owes for the elapsed editor session fires once on
             // resume (harmless — it just refreshes the just-edited config view).
             app.reader_suspended
@@ -6991,8 +7105,37 @@ fn handle_file_key(app: &mut App, key: KeyEvent, config_path: &Path) {
             app.file.sections = sections;
             app.file.config_text = text;
 
+            // The edit landed on the master config. Nothing watches it, so
+            // this reload is what makes the operator's edit real; every
+            // other leaf reads `loaded_config`, so that has to move too
+            // — otherwise Subnets/Profiles/Rules/Local DNS/
+            // Labels/Groups/Custom Lists keep rendering, and their modal
+            // openers keep snapshotting, the pre-edit config until a
+            // manual `[r]`/SIGHUP/restart. Invalid TOML makes
+            // `load_v1_config` return `None`, same as `[r]` on a bad edit
+            // today — every consuming tab then shows its own
+            // "config unreadable" hint, which is correct.
+            app.loaded_config = load_v1_config(config_path);
+            refresh_auto_backup_view(app, config_path);
+
+            use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
+
+            // The editor's own failure outranks a reload message: it is
+            // why there may be nothing new to reload.
             if let Some(msg) = step_error {
                 app.status_err(msg);
+                return;
+            }
+            match attempt_reload(poller.socket_path()).await {
+                ReloadOutcome::Reloaded => app.status_ok("config reloaded".into()),
+                ReloadOutcome::DaemonUnreachable => app
+                    .status_err("edit saved — daemon not running, will apply on next start".into()),
+                ReloadOutcome::NoToken { .. } => app.status_err(
+                    "edit saved but no admin token is available to request a reload".into(),
+                ),
+                ReloadOutcome::ReloadFailed(msg) => {
+                    app.status_err(format!("edit saved but daemon rejected reload: {msg}"))
+                }
             }
         }
         _ => app.leaf_key_unhandled = true,
@@ -7160,8 +7303,8 @@ async fn start_backup(app: &mut App, dir: PathBuf, config_path: &Path) {
 /// pool. Owned paths so the future is `'static` and can be spawned.
 ///
 /// The snapshot is taken *inside* the blocking closure, right after the archive
-/// lands, for two reasons: it must observe the new archive (Sprint 5 wanted the
-/// "Last auto-backup" line to update immediately rather than at the next
+/// lands, for two reasons: it must observe the new archive (the
+/// "Last auto-backup" line updates immediately rather than at the next
 /// tab-entry), and it is itself sync filesystem work — a readdir plus a small
 /// JSON read. Recomputing it on the render thread would hand the loop back
 /// exactly the kind of stall this whole change exists to remove.
@@ -7218,7 +7361,7 @@ fn backup_submitted_card(
     }
 }
 
-/// Sprint 5: refresh the cached Settings-tab auto-backup snapshot from
+/// Refresh the cached Settings-tab auto-backup snapshot from
 /// `<backup_dir>/.auto_state` + the newest archive. Cheap (one readdir +
 /// one small JSON read) and deliberately event-driven — called on
 /// startup, global `r`, Settings tab-entry, and after a manual backup,
@@ -7350,9 +7493,9 @@ async fn execute_restore(
     }
 }
 
-// ── Sprint 39: Tracking form handler ─────────────────────────────────────────
+// ── Tracking form handler ────────────────────────────────────────────────────
 
-/// Sprint 39: keyboard handler for the Settings → Tracking form.
+/// Keyboard handler for the Settings → Tracking form.
 /// Called only when `app.settings.tracking_panel.is_some()`. All keys
 /// are consumed by the form; Esc exits back to the TOML viewer.
 ///
@@ -7487,7 +7630,7 @@ enum TextInputOutcome {
 }
 
 /// Maximum characters appended from a single paste — bounds a giant paste from
-/// blowing a field (tui-paste-01; the review suggests 256).
+/// blowing a field.
 const MAX_PASTE: usize = 256;
 
 /// Append a bracketed-paste payload to the focused text buffer, or drop it when
@@ -7497,7 +7640,7 @@ const MAX_PASTE: usize = 256;
 /// collapses to one line and cannot synthesize an Enter/submit, and the chunk is
 /// capped at [`MAX_PASTE`]. Dropping the paste in non-text contexts is the safety
 /// property: a pasted `y` can never confirm a destructive Remove, a pasted `q`
-/// can never quit (tui-paste-01).
+/// can never quit.
 fn handle_paste(app: &mut App, pasted: String) {
     let cleaned: String = pasted
         .chars()
@@ -7517,7 +7660,7 @@ fn handle_paste(app: &mut App, pasted: String) {
         }
     }
 
-    // §4.65 UX13: the Groups form carries the same chip-picker/text-field
+    // The Groups form carries the same chip-picker/text-field
     // split as the Lists modal above, and for the same reason cannot be
     // reached through `focused_text_buffer` — see `paste_into_group_modal`.
     // Ordered here, above the resolver, because `handle_key` gates the
@@ -7529,7 +7672,7 @@ fn handle_paste(app: &mut App, pasted: String) {
         }
     }
 
-    // rev-2607 (#12): the resolver modal's input mutation carries a
+    // The resolver modal's input mutation carries a
     // side effect (drop the now-stale prior result) that a bare
     // `&mut String` from `focused_text_buffer` can't express — handle
     // it here, same shape as the Lists case above.
@@ -7562,7 +7705,7 @@ fn paste_into_edit_list_modal(modal: &mut app::EditListModal, cleaned: &str) {
     edit_text_field(modal, |buf| buf.push_str(cleaned));
 }
 
-/// Groups form paste (§4.65 UX13): append to the chip type-ahead buffer when
+/// Groups form paste: append to the chip type-ahead buffer when
 /// the Tags field has focus, otherwise to the focused text field (Id /
 /// Display name / Devices / Priority). Inert in the `y`/`n` remove confirm and
 /// on the submitted card — neither owns a buffer.
@@ -7575,8 +7718,8 @@ fn paste_into_edit_list_modal(modal: &mut app::EditListModal, cleaned: &str) {
 /// **Paste on Tags lands in the type-ahead buffer — decided, not inherited.**
 /// The same widget in the Lists edit modal already takes paste
 /// ([`paste_into_edit_list_modal`]), and two identically-rendered chip
-/// pickers that disagree about paste is the incoherence this sprint exists to
-/// remove. Nothing is committed by pasting: the buffer only filters
+/// pickers that disagree about paste would be an incoherence worth
+/// removing. Nothing is committed by pasting: the buffer only filters
 /// suggestions until `Enter`, so an unusable paste costs a `Backspace`, not a
 /// wrong tag.
 ///
@@ -7609,10 +7752,65 @@ fn paste_into_group_modal(modal: &mut group_modal::GroupModal, cleaned: &str) {
 /// active context does not accept free text (confirm prompts, menus, pickers,
 /// toggles, plain navigation). Mirrors `handle_key`'s gate order so a paste
 /// lands exactly where a typed character would — and nowhere a typed character
-/// would trigger an action (tui-paste-01).
+/// would trigger an action.
 ///
 /// The Lists edit modal is handled in [`handle_paste`] directly (it edits
 /// through a closure, not a borrowable buffer), so it is absent here.
+/// `custom_list_modal::Form`'s id is immutable once created — it names
+/// the file — mirroring `label_text_field_buf`'s / `subnet_text_field_buf`'s
+/// treatment of the same Add-only-id shape.
+fn custom_list_form_paste_buf(form: &mut custom_list_modal::Form) -> Option<&mut String> {
+    use custom_list_modal::{FormField, FormMode};
+    match form.focused {
+        FormField::Id if form.mode == FormMode::Add => Some(&mut form.id),
+        FormField::Id => None, // immutable on Edit
+        FormField::DisplayName => Some(&mut form.display_name),
+        FormField::Description => Some(&mut form.description),
+        FormField::Submit | FormField::Cancel => None,
+    }
+}
+
+fn custom_list_rule_paste_buf(form: &mut custom_list_modal::RuleForm) -> Option<&mut String> {
+    use custom_list_modal::RuleField;
+    match form.focused {
+        RuleField::Domain => Some(&mut form.domain),
+        RuleField::Direction | RuleField::Submit | RuleField::Cancel => None,
+    }
+}
+
+/// The typed-id remove gate and the rule-remove confirm take no paste —
+/// same rule as the Lists gates: they ask for the id to buy
+/// deliberation, not transcription.
+fn custom_list_paste_buf(modal: &mut custom_list_modal::CustomListModal) -> Option<&mut String> {
+    use custom_list_modal::Stage;
+    match &mut modal.stage {
+        Stage::EditingForm(form) => custom_list_form_paste_buf(form),
+        Stage::AddingRule(form) => custom_list_rule_paste_buf(form),
+        Stage::ConfirmingRemove(_) | Stage::ConfirmingRuleRemove(_) | Stage::Submitted(_) => None,
+    }
+}
+
+/// Mirrors `query_log_filter_modal::Field::text_of`, which is private to
+/// that module — this free function is the same shape as
+/// `label_text_field_buf` / `subnet_text_field_buf` for exactly the same
+/// reason: reaching a sibling-owned modal's pub fields from here rather
+/// than adding a method to a file this function does not own.
+fn query_log_filter_paste_buf(
+    modal: &mut query_log_filter_modal::QueryLogFilterModal,
+) -> Option<&mut String> {
+    use query_log_filter_modal::Field;
+    match modal.focus {
+        Field::NamePattern => Some(modal.draft.name.get_or_insert_with(String::new)),
+        Field::IpPattern => Some(modal.draft.ip.get_or_insert_with(String::new)),
+        Field::SubnetPattern => Some(modal.draft.subnet.get_or_insert_with(String::new)),
+        Field::NamePolarity
+        | Field::IpPolarity
+        | Field::SubnetPolarity
+        | Field::Cancel
+        | Field::Apply => None,
+    }
+}
+
 fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
     // Welcome banner consumes everything until a key dismisses it — paste inert.
     if app.welcome_banner.is_some() {
@@ -7646,6 +7844,19 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
         return None;
     }
 
+    // Rules add/edit forms, in `handle_key`'s gate order (edit_modal
+    // before add_modal). The domain is copied off a Query Log row more
+    // often than it is typed, so an inert paste is felt here first —
+    // `modals-01`.
+    if app.active_leaf == Leaf::Rules {
+        if app.rules.edit_modal.is_some() {
+            return None; // picker/confirm only — inert, but STOP here
+        }
+        if let Some(m) = app.rules.add_modal.as_mut() {
+            return (m.focus == rule_add_modal::AddFocus::Domain).then_some(&mut m.domain);
+        }
+    }
+
     // Groups: the whole modal is handled in `handle_paste` (the Tags chip
     // picker needs side effects a borrowed `&mut String` cannot carry — see
     // `paste_into_group_modal`), so nothing here is borrowable.
@@ -7667,7 +7878,7 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
     //
     // **Paste matters more here than on most forms.** The values this
     // vocabulary exists to adopt are the ones already on the operator's
-    // devices — `Apple TV`, `Alex` — and the way you get them exactly
+    // devices — `Apple TV`, `Operator` — and the way you get them exactly
     // right is to copy them from the Devices tab rather than retype them
     // and introduce the very near-duplicate the vocabulary is meant to
     // prevent. Without this arm the paste was inert **and silent**.
@@ -7690,6 +7901,20 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
         return None;
     }
 
+    // Custom Lists, in `handle_key`'s gate order (modal before
+    // mount_picker). The add/edit form and the add-rule form take text;
+    // the typed-id remove gate and the rule-remove confirm do NOT — they
+    // ask for the id to buy deliberation, not transcription, same rule as
+    // the Lists gates above.
+    if app.active_leaf == Leaf::CustomLists {
+        if let Some(modal) = app.custom_lists.modal.as_mut() {
+            return custom_list_paste_buf(modal);
+        }
+        if app.custom_lists.mount_picker.is_some() {
+            return None; // multi-select picker — inert
+        }
+    }
+
     // Profile add/edit text fields; confirm → inert.
     if app.active_leaf == Leaf::Profiles && app.profiles.modal.is_some() {
         if let Some(modal) = app.profiles.modal.as_mut() {
@@ -7701,13 +7926,26 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
     }
 
     // Source-IP resolver modal (global) is handled directly in
-    // `handle_paste` (its input mutation carries a side effect — see
-    // rev-2607 #12 — that a bare `&mut String` can't express), so it
+    // `handle_paste` (its input mutation carries a side effect that a bare
+    // `&mut String` can't express), so it
     // never reaches this generic path. No arm needed here.
 
-    // Scope modal (global) is menu + confirm only — paste inert.
-    if app.scope_modal.is_some() {
-        return None;
+    // Query Log rule picker (global). The marker list and the report
+    // take no text; the create form is the Custom Lists add form, so it
+    // pastes through the same buffer that leaf uses rather than a copy.
+    if let Some(modal) = app.query_log_rule_modal.as_mut() {
+        return match &mut modal.stage {
+            query_log_rule_modal::Stage::NewList(inner) => custom_list_paste_buf(inner),
+            _ => None,
+        };
+    }
+
+    // Query Log advanced search (global, not leaf-gated — mirrors
+    // `handle_key`'s placement after the rule-picker gate). Three
+    // predicates whose values are read off other tabs; polarity and
+    // action rows have no buffer.
+    if let Some(m) = app.query_log.advanced_modal.as_mut() {
+        return query_log_filter_paste_buf(m);
     }
 
     // `/`-filter prompts.
@@ -7805,26 +8043,26 @@ fn scroll_table_up(state: &mut ratatui::widgets::TableState) {
     state.select(Some(i));
 }
 
-// ── N4: Home / End / PgUp / PgDn ────────────────────────────────────────────
+// ── Home / End / PgUp / PgDn ─────────────────────────────────────────────────
 //
-// `scroll_table_down` / `scroll_table_up` above already CLAMP — that half of
-// N4 was never broken. What was missing is the jump and the page, on every
+// `scroll_table_down` / `scroll_table_up` above already CLAMP. What was
+// missing is the jump and the page, on every
 // leaf that has `↑`/`↓`. Two families, because the TUI has two row shapes:
 // flat tables (Subnets, Profiles, Query Log, Rules, Tags, Cluster) and
 // grouped vectors that interleave non-selectable headers (Devices, Lists).
 
 /// The Query Log boundary notice raised by `End` / `PgDn`.
 ///
-/// N4 makes the loaded-window edge reachable in one keystroke for the first
-/// time. Without this line the operator lands on the oldest *loaded* row and
-/// reads it as the oldest *query*, which it is not — see §6, and the
+/// Makes the loaded-window edge reachable in one keystroke. Without this
+/// line the operator lands on the oldest *loaded* row and
+/// reads it as the oldest *query*, which it is not — see the
 /// `KeyCode::End` arm in `handle_query_log_key` for why it is a status line
-/// and not a row annotation this wave.
+/// and not a row annotation.
 /// Shown on reaching the last loaded row when the daemon reported **no**
 /// resume point — the page really is the oldest retained data.
 ///
 /// It used to fire on reaching the last row unconditionally, because
-/// before `qlog-paging-cursor` there was nothing older to load and the
+/// before paging could fetch there was nothing older to load and the
 /// message was always true. Now that `PgDn` can fetch, firing it while a
 /// `next_cursor` exists would be a lie, so the trigger is gated and
 /// `QUERY_LOG_MORE_BELOW` covers the other half. The text is unchanged.
@@ -7865,7 +8103,7 @@ fn query_log_page_label(page_index: usize) -> String {
 /// The leaf handlers never see the viewport height — the renderer owns the
 /// layout and the handler owns the key — so the spec's stated fallback
 /// applies rather than threading a height through fourteen signatures for a
-/// paging convenience. Ten rows, per §6.
+/// paging convenience. Ten rows.
 const NAV_PAGE: usize = 10;
 
 /// `Home` — first row. No-op on an empty table.
@@ -7909,14 +8147,12 @@ fn page_table_up(state: &mut ratatui::widgets::TableState) {
 // non-selectable group headers.
 //
 // They live here rather than beside `next_selectable_index` in
-// `tabs/devices.rs` / `tabs/lists.rs` because those two files belong to
-// another lane this wave (CONTRACT §2 — one owner per file, no exceptions).
+// `tabs/devices.rs` / `tabs/lists.rs` to keep one owner per file.
 // Nothing is duplicated by that: both row types already expose
 // `is_selectable()` publicly, single-step motion still routes through each
-// leaf's own helper, and these three read only that predicate. When the two
-// helpers gain their clamp in the sibling lane, this code needs no change —
-// it never depended on their wrap behaviour in the first place, which is
-// exactly why the paging was NOT built by calling `next_selectable_index` in
+// leaf's own helper, and these three read only that predicate. This code
+// never depended on `next_selectable_index`'s wrap behaviour, which is
+// exactly why the paging was NOT built by calling it in
 // a loop.
 
 /// First selectable row index, skipping headers.
@@ -7969,12 +8205,12 @@ fn page_selectable_idx<T>(
 
 // ── IPC polling ─────────────────────────────────────────────────────────────
 
-/// §4.62 N2/N3: the success arms of this function used to call
+/// The success arms of this function used to call
 /// `app.clear_status()`, which made the *poll cadence* the de-facto
 /// lifetime of every action message — 2s on Dashboard, 30s on Lists, and
 /// never at all on the six leaves that have no poll. Expiry now belongs
 /// to the tick (`App::expire_status`), so those calls are gone. They
-/// could not simply be left in place either: an `Error` is sticky by N3,
+/// could not simply be left in place either: an `Error` is sticky,
 /// and a 2s poll would have wiped it before the operator read it.
 ///
 /// What replaces them is narrower. The failure arms below raise
@@ -7991,7 +8227,7 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
 
     match app.active_leaf {
         Leaf::Dashboard => {
-            // §10 review (tui-dashboard-poll): fire the four independent
+            // Fire the four independent
             // ReadOnly fetches concurrently — one round-trip window
             // instead of four sequential connect/read cycles. Each future
             // borrows only `poller` (shared `&self`) and returns owned
@@ -7999,8 +8235,8 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
             // join, so there is no `&mut app` aliasing and the
             // last-error-wins ordering is unchanged. Also bounds the
             // worst-case freeze when the daemon stalls mid-poll to one
-            // timeout window instead of four (partial mitigation of the
-            // deferred tui-ipc-await-blocks-event-loop).
+            // timeout window instead of four (partial mitigation of a
+            // known deferred event-loop-blocking issue).
             let (status_res, tracking_res, view_res, stats_res) = tokio::join!(
                 poller.fetch_status(),
                 poller.fetch_tracking_stats(),
@@ -8022,8 +8258,8 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                     app.tracking = data;
                 }
                 Err(e) => {
-                    // §4.37 tui-m3: mirror gold standard (device_view,
-                    // lists.entries already clear in this arm). Reset to
+                    // Mirror the pattern already used for device_view /
+                    // lists.entries in this arm. Reset to
                     // default → render fns paint "collecting..." placeholders
                     // instead of stale KPI gauges + trend charts that may
                     // be minutes stale during a transient daemon hiccup.
@@ -8077,8 +8313,8 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
         {
             Ok(result) => apply_query_log_page(app, result),
             Err(e) => {
-                // §4.37 tui-m2: clear entries on Err → engage empty-state
-                // picker (gold standard from Devices/Lists). Without this,
+                // Clear entries on Err → engage empty-state
+                // picker (same pattern as Devices/Lists). Without this,
                 // operator pressing Enter→allow/blocklist on a stale row
                 // makes decisions on outdated data with only footer
                 // last_error as cue.
@@ -8098,7 +8334,7 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 app.status_err_poll(e.to_string());
             }
         },
-        // S43 T2: Lists pulls per-blocklist runtime telemetry. Empty
+        // Lists pulls per-blocklist runtime telemetry. Empty
         // list on success means "daemon has zero sources"; an IPC
         // failure clears the cached entries so the empty-state
         // message tells the operator to wait rather than mislead
@@ -8112,7 +8348,7 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 app.status_err_poll(e.to_string());
             }
         },
-        // S44 follow-up (`s44-hits-ipc-verb`): records list still comes
+        // Records list still comes
         // from the cached `LoadedConfig` (refreshed on `r`); the IPC
         // fetch only feeds the `hits` column snapshot. On error keep the
         // last good snapshot so a transient daemon hiccup doesn't blank
@@ -8131,15 +8367,14 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 app.status_err_poll(e.to_string());
             }
         },
-        // S33 — Subnets / Resolver tabs read from the cached
+        // Subnets / Resolver tabs read from the cached
         // LoadedConfig. No IPC call, so nothing to poll here. The `r`
         // keybinding in handle_key re-reads the config file. Rules
-        // (S43 T2) is also data-source-less until T5 wires
-        // [[admin_rules]] — kept here to preserve the no-poll
-        // invariant for offline-backed tabs. §4.26 P2: Profiles reads
+        // is also data-source-less — kept here to preserve the no-poll
+        // invariant for offline-backed tabs. Profiles reads
         // `[profiles]` from the same cached LoadedConfig — joins the
         // no-poll cohort.
-        // §4.67-b MN3: File joins the no-poll cohort by construction — it
+        // File joins the no-poll cohort by construction — it
         // reads the config off disk at load and on `r`, and its key handler
         // takes no `IpcPoller` at all.
         // `logs-tab`: both filters go DOWN with the request — the daemon
@@ -8180,7 +8415,7 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
         | Leaf::Groups
         | Leaf::Labels
         | Leaf::CustomLists => {} // no polling
-        // §4.11-4b — the Cluster tab is fed by `poll_heartbeat`; no
+        // The Cluster tab is fed by `poll_heartbeat`; no
         // active-leaf poll of its own.
         #[cfg(feature = "cluster")]
         Leaf::Cluster => {}
@@ -8207,9 +8442,9 @@ async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
         }
     }
 
-    // §4.11-4b — the always-on heartbeat is the single cadence feeding BOTH
-    // the dashboard dot and the Cluster tab (§8: "no second polling loop in
-    // the TUI"). Only fetch when clustering is enabled. On error keep the
+    // The always-on heartbeat is the single cadence feeding BOTH
+    // the dashboard dot and the Cluster tab — no second polling loop in
+    // the TUI. Only fetch when clustering is enabled. On error keep the
     // last-known view, exactly like `daemon_status` above — `connected`
     // drives the dot's stale / red state.
     #[cfg(feature = "cluster")]
@@ -8220,7 +8455,7 @@ async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
     }
 }
 
-// ── Modal key handling (Sprint 23 s23-tui-clients-keybindings) ─────
+// ── Modal key handling ───────────────────────────────────────────────
 
 /// Key handler for the active client modal. Routed from `handle_key`
 /// before any global navigation so typing inside the form doesn't
@@ -8246,13 +8481,13 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
                 return;
             }
             // Ctrl+s → save from anywhere, before any other dispatch —
-            // same D7′ contract as the Rules and Lists edit modals. The
+            // same contract as the Rules and Lists edit modals. The
             // footer already advertises "[Ctrl+s] save" for this form;
             // before this guard the chord had no handler at all, so
             // `KeyCode::Char(c)` below caught it and typed a literal
-            // `s` into whichever field held focus (§4.65 UX3, measured
+            // `s` into whichever field held focus — measured
             // on the CT via pty-smoke — the field silently corrupted,
-            // it did not simply ignore the chord).
+            // it did not simply ignore the chord.
             if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
@@ -8354,7 +8589,7 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
     }
 }
 
-// ── Sprint 53 — Lists edit modal key handler + save / delete flows ──
+// ── Lists edit modal key handler + save / delete flows ────────────────
 
 /// Drive the catalog picker's state machine.
 ///
@@ -8635,8 +8870,7 @@ async fn submit_catalog_picker(app: &mut App, poller: &IpcPoller, config_path: &
 /// Every enum token comes from `wire_str()`, never a local `match`. The
 /// TUI already shipped its own copy of this mapping once, missed the
 /// `Block` → `Deny` rename, and wrote `kind = "block"` — which the loader
-/// refused as `unknown variant`, so the Lists modal could not save at all
-/// (`s-tui-lists-edit-save-rejected`).
+/// refused as `unknown variant`, so the Lists modal could not save at all.
 fn build_catalog_blocklist_value(
     row: &app::CatalogPickerRow,
     on_disk: Option<&crate::config::loader::LoadedConfig>,
@@ -8702,6 +8936,20 @@ fn build_catalog_blocklist_value(
             "max_consecutive_failures".into(),
             Value::Integer(b.max_consecutive_failures as i64),
         );
+        // Same contract as the four fields above, and the one that is
+        // load-bearing: dropping it either refuses the whole apply (a
+        // `base = allow`, `trust = remote-unsigned` row loses the consent
+        // that made it legal) or silently erases a security declaration
+        // the operator cannot see to redo. This picker has no consent
+        // affordance — unlike the edit modal's `consent_declared` — so the
+        // only legitimate value is the one the file already carried. Never
+        // defaulted to `true` for a new row: a first-time add through this
+        // picker correctly gets the schema default and lets the validator
+        // refuse if the staged direction needs consent nobody gave.
+        tbl.insert(
+            "accept_unsigned_allow".into(),
+            Value::Boolean(b.accept_unsigned_allow),
+        );
         if let Some(r) = b.auth_token_ref.as_deref() {
             tbl.insert("auth_token_ref".into(), Value::String(r.to_string()));
         }
@@ -8709,7 +8957,7 @@ fn build_catalog_blocklist_value(
     Value::Table(tbl)
 }
 
-/// Handle keys for the Sprint 53 list edit modal. Routes by `mode`:
+/// Handle keys for the list edit modal. Routes by `mode`:
 ///
 /// - `Edit` — Tab / Shift-Tab cycle fields, arrow keys cycle picker
 ///   and toggle values, text fields accept char / backspace, `Ctrl+S`
@@ -8744,7 +8992,7 @@ async fn handle_lists_edit_modal_key(
 
     if modal.submitting && !matches!(key.code, KeyCode::Esc) {
         // Block re-entrant submits — only Esc escapes the in-flight
-        // state. Mirrors the S43 T3 assignment-modal pattern.
+        // state. Mirrors the assignment-modal pattern.
         app.lists.edit_modal = Some(modal);
         return;
     }
@@ -8794,7 +9042,7 @@ async fn handle_edit_mode_key(
             app.lists.edit_modal = None;
             return;
         }
-        // §4.63-s3b nav grammar: Down/Up alias Tab/BackTab. They share the
+        // Down/Up alias Tab/BackTab. They share the
         // arm, so arrow-driven focus movement clears the chip picker's
         // type-ahead state exactly like Tab does — a separate arm would
         // have leaked it.
@@ -8981,7 +9229,7 @@ async fn handle_edit_mode_key(
 /// Apply a text-buffer edit only when the focused field is a text
 /// input. Picker / toggle / read-only / Delete-button focuses ignore
 /// raw chars + backspace. `ListId` only accepts edits in Promote mode —
-/// in Edit mode it's not even in the focus cycle (L1: id is immutable).
+/// in Edit mode it's not even in the focus cycle (id is immutable).
 fn edit_text_field(modal: &mut app::EditListModal, edit: impl FnOnce(&mut String)) {
     use app::{EditField, EditModalMode, IntervalChoice};
     let target: Option<&mut String> = match modal.focus {
@@ -9036,15 +9284,14 @@ async fn handle_confirm_delete_key(
         }
         KeyCode::Enter => {
             if typed != modal.blocklist_id {
-                // §4.63 F4. Two changes, and they are one decision.
+                // Two changes, and they are one decision.
                 //
                 // **Stay in ConfirmDelete.** Bouncing to `Edit` discarded
                 // the typed buffer, and — worse — made the error row this
                 // stage reserves unreachable for the only path that can
                 // populate it: the stage that would have drawn it is no
                 // longer the stage being rendered. The Archetype-C
-                // migration made staying strictly cheaper (S2a measured
-                // it at 80x14 with a cascade target): the message wraps
+                // migration made staying strictly cheaper: the message wraps
                 // across the two rows `hint_rows: None` already reserves,
                 // so it costs ZERO extra rows and the input row survives
                 // beside it.
@@ -9052,11 +9299,11 @@ async fn handle_confirm_delete_key(
                 // **Name what was expected.** Lists was the last typed-
                 // confirm gate that refused without saying what it
                 // wanted. Rules and Tags both name the expected value;
-                // this now matches the wording S2a measured.
+                // this now matches that wording.
                 //
                 // The frozen const stays the lede rather than being
                 // replaced: it lives in `cli/commands/blocklists.rs`,
-                // which this sprint does not own, and keeping it means
+                // owned separately, and keeping it means
                 // its byte-for-byte pin still guards a string that is
                 // really on screen.
                 modal.error_message = Some(tabs::lists::delete_confirm_mismatch_message(
@@ -9148,7 +9395,7 @@ fn handle_confirm_unsigned_allow_key(
 
 /// Build a `toml::Value::Table` representing the v1 `[[blocklists]]` row
 /// the operator's modal buffers should produce. `trust` and `id` are
-/// preserved verbatim from `modal.original` (read-only fields, L1+L2).
+/// preserved verbatim from `modal.original` (read-only fields).
 /// Returns an `Err` with an operator-friendly message when the
 /// numeric buffers don't parse — caller surfaces it in the modal footer.
 fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, String> {
@@ -9182,19 +9429,18 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
         return Err("update interval must be ≥ 1 hour".to_string());
     }
 
-    // S53.1 — `max_entries` is no longer operator-editable from the modal
+    // `max_entries` is no longer operator-editable from the modal
     // (no meaningful way to choose which entries get truncated). The
     // schema field is preserved at its pre-edit value so existing TOML
     // is not silently rewritten.
     let max_entries: u64 = modal.original.max_entries;
 
     // Wire tokens come from the schema enums themselves, never from a
-    // local `match`. The previous hand-rolled map here still said
-    // `Deny => "block"` after Sprint A of `lists_categories_v2` renamed
-    // the token to `"deny"` (D15: no serde alias), so every save of a
+    // local `match`. A previous hand-rolled map here once still said
+    // `Deny => "block"` after the schema renamed
+    // the token to `"deny"` (no serde alias), so every save of a
     // deny-kind list — which is nearly every list — was refused at load
-    // with `unknown variant` and the modal could not write at all
-    // (`s-tui-lists-edit-save-rejected`).
+    // with `unknown variant` and the modal could not write at all.
     let format_label = modal.format.wire_str();
     let kind_label = modal.nature.wire_str();
     let trust_label = modal.original.trust.wire_str();
@@ -9252,7 +9498,7 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
             Value::String(modal.auth_token_ref.trim().to_string()),
         );
     }
-    // **`plp-s5d` stopped writing `tags`, and that is a deliberate
+    // **Writing `tags` stopped, and that is a deliberate
     // exception to the preservation rule stated three times above.**
     //
     // Every other unedited field is carried across because this row
@@ -9262,21 +9508,22 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
     //
     //   - Nothing reads it any more. `effective_direction` is
     //     `profile.lists[list]` falling back to `list.base`; the only
-    //     surviving readers are validator WARNs that `plp-s5b` deletes.
+    //     surviving readers are validator WARNs, since retired.
     //   - `Blocklist` is `#[serde(deny_unknown_fields)]`, so once
-    //     `plp-s5a` removes the field, a row still carrying `tags = [...]`
+    //     the field is removed from the schema, a row still carrying
+    //     `tags = [...]`
     //     does not merely look stale — it FAILS TO LOAD with `unknown
     //     field`. Preserving it here would be writing a landmine onto
     //     configs that run household DNS.
     //   - `migrate.rs` deliberately does NOT strip tags
     //     (`apply_v2_to_v3_transformations`: "`tags`, anywhere. They stay
-    //     exactly as the file had them — S5 removes the field"), so
+    //     exactly as the file had them"), so
     //     nothing else is going to clean up after this writer.
     //
     // A list edited from the TUI therefore sheds its `tags` array, which
     // narrows the blast radius of the `deny_unknown_fields` problem rather
-    // than widening it. It does NOT solve that problem — see the lane
-    // report: no S5 lane owns stripping `tags` from files on disk.
+    // than widening it. It does NOT solve that problem — nothing yet
+    // strips `tags` from files already on disk.
     Ok(Value::Table(tbl))
 }
 
@@ -9284,24 +9531,24 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
 ///
 /// **Two variants, not four — and the two that left were unreachable
 /// rather than unused.** `NeedsTag` and `NeedsNonSystemTag` dispatched on
-/// `AllowDirectionGates::needs_tag` / `needs_non_system_tag`, which
-/// `profile_list_policy` §2.5 made permanently `false`: both tag gates lost
+/// `AllowDirectionGates::needs_tag` / `needs_non_system_tag`, which became
+/// permanently `false`: both tag gates lost
 /// their premise when tag intersection stopped deciding which lists reach
-/// which clients, and the same sprint stopped `warden blocklist tag add`
+/// which clients, and the same change stopped `warden blocklist tag add`
 /// from writing tags at all — so an operator refused by them would have
 /// been told to do a thing the next verb also refuses.
 ///
 /// They were removed rather than left in place because a runtime `bool`
 /// that is always `false` fails **no** gate: not `dead_code`, not
 /// `unreachable_patterns`, not `-D warnings`. Four branches that read as
-/// live defences and are not is the "commento che mente" class one level
-/// up — prose that cannot fail a build. Deleting the variants turns the
+/// live defences and are not is prose that cannot fail a build. Deleting
+/// the variants turns the
 /// same guarantee into a compile error the day anything tries to raise
 /// them again.
 ///
 /// The **signature** of `allow_direction_gates` is untouched: its two tag
-/// parameters retire in S5, and pulling them here would break the CLI lane
-/// mid-sprint. Every caller still reads them out of the file and hands
+/// parameters are due to retire, and pulling them here would break the CLI
+/// mid-change. Every caller still reads them out of the file and hands
 /// them over, so the day they leave is a compile error and not a
 /// behaviour change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9323,10 +9570,10 @@ enum AllowGateOutcome {
 /// `modal.tags`, seeded from disk by
 /// [`tabs::lists::build_edit_modal_for`] precisely so this question had
 /// an honest input rather than the loaded config's promoted
-/// `["uncategorized"]`. `plp-s5d` removed the picker, so there is no
+/// `["uncategorized"]`. The picker is gone, so there is no
 /// reading left to take.
 ///
-/// **The two placeholder parameters are gone as of `plp-s5a`.** They were
+/// **The two placeholder parameters are gone.** They were
 /// passed as a named constant rather than a bare `true`, because a bare
 /// `true` here READ like "the file has no tags" — a measurement nobody
 /// took. Keeping them in the signature until the field itself went was
@@ -9342,7 +9589,7 @@ fn allow_gate_for_modal(modal: &app::EditListModal) -> AllowGateOutcome {
         modal.consent_declared,
     );
     // Consent is the only door left, so there is nothing to order it
-    // against — the tag gates that used to be read first went with §2.5.
+    // against — the tag gates that used to be read first are gone.
     if gates.needs_consent {
         AllowGateOutcome::NeedsConsent
     } else {
@@ -9353,7 +9600,7 @@ fn allow_gate_for_modal(modal: &app::EditListModal) -> AllowGateOutcome {
 /// The `Reloaded` arm's message: the promote warning if there is one,
 /// otherwise the plain success line.
 ///
-/// **`plp-s5d` reduced this to a two-way choice.** It used to interleave
+/// **This is reduced to a two-way choice.** It used to interleave
 /// a third element — the dropped-pending-tag notice — and the whole point
 /// of the function was RANKING those three: a partial write outranks a
 /// lost slug, because the legacy source is still in `[lists].sources` and
@@ -9386,7 +9633,7 @@ async fn submit_edit_modal(
     // Promote- and Add-mode pre-flight: id is operator-typed so it has
     // to clear schema validation + uniqueness before we touch any file.
     // Edit mode skips this because the id was captured at modal-open
-    // from an already-validated `[[blocklists]]` entry (L1: id is
+    // from an already-validated `[[blocklists]]` entry (id is
     // read-only).
     if matches!(
         &modal.mode,
@@ -9417,7 +9664,7 @@ async fn submit_edit_modal(
         modal.blocklist_id = trimmed;
     }
 
-    // Sprint C T5 of `lists_categories_v2`: §6.1 Add-list pre-flight
+    // Add-list pre-flight
     // gates 2 (dedup by URL) + 3 (HEAD reachability probe). Gate 1
     // (URL parses to http/https) lives inside `build_blocklist_value`
     // below; surfacing it here AS WELL would double the error surface
@@ -9464,7 +9711,7 @@ async fn submit_edit_modal(
     // just as easily.
     //
     // It used to be "the two doors" — the tag refusals were the other one,
-    // and they are gone with their premise (§2.5, and see
+    // and they are gone with their premise (see
     // [`AllowGateOutcome`]).
     match allow_gate_for_modal(&modal) {
         AllowGateOutcome::Proceed => {}
@@ -9569,7 +9816,7 @@ async fn submit_edit_modal(
         }
     }
 
-    // Refresh schema cache + reload daemon. Mirror S43 T3 messaging.
+    // Refresh schema cache + reload daemon.
     app.loaded_config = load_v1_config(config_path);
     let outcome = attempt_reload(poller.socket_path()).await;
     match outcome {
@@ -9772,22 +10019,22 @@ async fn submit_delete_modal(
     poll_active_leaf(app, poller).await;
 }
 
-// ── Sprint 53 — Lists edit modal key handler ends here ──────────────
+// ── Lists edit modal key handler ends here ────────────────────────────
 
-// ── Sprint 43 T5 / Sprint 47 T2 — scope modal opener + key handler ──
+// ── Query Log rule picker: opener + key handler ───────────────────────
 
-/// Build a [`scope_modal::ScopeModal`] from the focused row in the
-/// Query Log table. Returns `None` when no row is focused, the row's
-/// domain is empty, or the row's `result` status is not actionable
+/// Build a [`query_log_rule_modal::QueryLogRuleModal`] from the focused
+/// row in the Query Log table. Returns `None` when no row is focused, the
+/// row's domain is empty, or the row's `result` status is not actionable
 /// (`LOCAL` / `REFUSED` / `HINFO` / unknown future status — see
-/// [`scope_modal::inferred_action`]). Captures the data once at this
-/// moment so later scrolls do not invalidate the modal's state.
+/// [`query_log_rule_modal::inferred_action`]). Captures the data once at
+/// this moment so later scrolls do not invalidate the modal's state.
 ///
-/// Sprint 47 T2 dropped the `action` parameter — auto-flip via
-/// [`scope_modal::ScopeModal::open_for_query_row`] is now the single
-/// source of truth, so no caller can request the wrong action.
-fn build_scope_modal_for_query_row(app: &App) -> Option<scope_modal::ScopeModal> {
-    // qlog-06: resolve the operator's stable entry key to the current
+/// There is no `action` parameter — auto-flip via
+/// [`query_log_rule_modal::QueryLogRuleModal::open_for_query_row`] is the
+/// single source of truth, so no caller can request the wrong action.
+fn build_query_log_rule_modal(app: &App) -> Option<query_log_rule_modal::QueryLogRuleModal> {
+    // Resolve the operator's stable entry key to the current
     // index so the captured row is the one they highlighted, not whatever
     // slid under the cursor on the last 3s poll. Fall back to the raw
     // cursor before the key is seeded.
@@ -9807,36 +10054,62 @@ fn build_scope_modal_for_query_row(app: &App) -> Option<scope_modal::ScopeModal>
         .clone()
         .unwrap_or_else(|| entry.client_ip.clone());
 
-    // Sprint 48 — resolve all four scope ids the modal can pre-fill
-    // (device, profile, group, subnet). Each one that comes back as
-    // `None` flips its menu entry to a disabled / contextual label
-    // and the cursor skips it.
-    let resolved = resolve_device_for_client(app, entry);
-
-    scope_modal::ScopeModal::open_for_query_row(
+    query_log_rule_modal::QueryLogRuleModal::open_for_query_row(
         entry,
         display_client,
-        resolved.device_id,
-        resolved.profile_id,
-        resolved.group_id,
-        resolved.subnet_id,
+        custom_list_rows(app),
     )
 }
 
-/// Sprint 47 T2 — pick the footer message to surface when Enter is
+/// Every declared custom list, in config order, with the profiles that
+/// mount it.
+///
+/// The mount state is a snapshot: the picker states it on the row the
+/// operator is about to write into, so a list nobody mounts announces
+/// itself at the moment it would silently swallow a rule.
+fn custom_list_rows(app: &App) -> Vec<query_log_rule_modal::ListRow> {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return Vec::new();
+    };
+    loaded
+        .config
+        .custom_lists
+        .iter()
+        .map(|c| {
+            let id = c.id.as_str().to_string();
+            let display = if c.display_name.is_empty() {
+                id.clone()
+            } else {
+                format!("{} ({id})", c.display_name)
+            };
+            let mounted = profiles_mounting(app, &id);
+            query_log_rule_modal::ListRow::new(id, display, mounted)
+        })
+        .collect()
+}
+
+/// Pick the footer message to surface when Enter is
 /// pressed on a Query Log row whose status maps to no rule action.
 /// Reads `app.query_log.entries[selected].result` and returns one of
 /// the three `QUERY_NOT_ACTIONABLE_*` frozen strings. An empty
 /// selection (or out-of-range index) falls through to `_UNKNOWN` so
-/// the footer never goes silent. See `_docs/features/query_log_quick_action_ux.md` §3.
+/// the footer never goes silent.
 fn footer_message_for_neutral_row(app: &App) -> &'static str {
-    let result = app
-        .query_log
-        .table_state
-        .selected()
-        .and_then(|idx| app.query_log.entries.get(idx))
-        .map(|entry| entry.result.as_str())
-        .unwrap_or("");
+    // Same resolution `build_query_log_rule_modal` uses, right above
+    // it in the `KeyCode::Enter` arm. The two agree only because
+    // `anchor_query_log_cursor` writes the resolved index back into the
+    // `TableState` before either runs — real, but undocumented coupling
+    // on a tab whose row set slides every 3 seconds. Resolving the key
+    // directly here makes the two agree by construction.
+    let result = crate::tui::app::resolve_row_index(
+        &app.query_log.entries,
+        app.query_log.selected_key.as_ref(),
+        |e| Some(tabs::query_log::entry_key(e)),
+    )
+    .or_else(|| app.query_log.table_state.selected())
+    .and_then(|idx| app.query_log.entries.get(idx))
+    .map(|entry| entry.result.as_str())
+    .unwrap_or("");
     match result {
         "LOCAL" => tabs::query_log::QUERY_NOT_ACTIONABLE_LOCAL,
         "REFUSED" | "HINFO" => tabs::query_log::QUERY_NOT_ACTIONABLE_REFUSED,
@@ -9844,297 +10117,372 @@ fn footer_message_for_neutral_row(app: &App) -> &'static str {
     }
 }
 
-/// Sprint 48 — resolved scope ids for a Query Log row, used to
-/// pre-fill the scope modal. Every field is best-effort: a missing
-/// `loaded_config`, an unmapped client IP, or a device with no group /
-/// no matching subnet all flow to `None` on the relevant fields.
-struct ResolvedScopeIds {
-    device_id: Option<String>,
-    profile_id: Option<String>,
-    group_id: Option<String>,
-    subnet_id: Option<String>,
-}
-
-/// Find the device + the scope ids the modal can pre-fill from the
-/// cached config: device id (IP or display-name match), direct profile
-/// id (DM1), highest-priority group id (DM2), longest-prefix-match
-/// subnet id (SN1). All best-effort — every field independently falls
-/// to `None` on no match. The relevant menu entries stay disabled in
-/// that case.
-fn resolve_device_for_client(
-    app: &App,
-    entry: &crate::ipc::protocol::QueryLogDto,
-) -> ResolvedScopeIds {
-    let Some(loaded) = app.loaded_config.as_ref() else {
-        return ResolvedScopeIds {
-            device_id: None,
-            profile_id: None,
-            group_id: None,
-            subnet_id: None,
-        };
-    };
-    let device = loaded
-        .config
-        .devices
-        .iter()
-        .find(|d| {
-            d.ip.as_ref()
-                .map(|ip| ip.to_string() == entry.client_ip)
-                .unwrap_or(false)
-        })
-        .or_else(|| {
-            loaded.config.devices.iter().find(|d| {
-                entry
-                    .client_name
-                    .as_deref()
-                    .map(|name| d.id.as_str() == name || d.display_name == name)
-                    .unwrap_or(false)
-            })
-        });
-
-    let device_id = device.map(|d| d.id.as_str().to_string());
-    let profile_id = device
-        .and_then(|d| d.profile.as_ref())
-        .map(|p| p.as_str().to_string());
-
-    // DM2: highest-priority group membership wins. Same-priority +
-    // different-profile is a validator error at load time, so the
-    // first max-priority hit is canonical.
-    let group_id = device.and_then(|d| {
-        d.groups
-            .iter()
-            .filter_map(|gid| {
-                loaded
-                    .config
-                    .groups
-                    .iter()
-                    .find(|g| g.id.as_str() == gid.as_str())
-            })
-            .max_by_key(|g| g.priority)
-            .map(|g| g.id.as_str().to_string())
-    });
-
-    // SN1: longest-prefix-match across every CIDR in every subnet.
-    let subnet_id = entry
-        .client_ip
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .and_then(|client_ip| {
-            loaded
-                .config
-                .subnets
-                .iter()
-                .filter_map(|subnet| {
-                    subnet
-                        .cidrs
-                        .iter()
-                        .filter_map(|cidr_str| {
-                            crate::config::cidr::Cidr::parse(cidr_str)
-                                .ok()
-                                .and_then(|parsed| {
-                                    if parsed.contains(client_ip) {
-                                        let prefix = match parsed {
-                                            crate::config::cidr::Cidr::V4 { prefix, .. } => prefix,
-                                            crate::config::cidr::Cidr::V6 { prefix, .. } => prefix,
-                                        };
-                                        Some(prefix)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        })
-                        .max()
-                        .map(|prefix| (subnet.id.as_str().to_string(), prefix))
-                })
-                .max_by_key(|(_, prefix)| *prefix)
-                .map(|(id, _)| id)
-        });
-
-    ResolvedScopeIds {
-        device_id,
-        profile_id,
-        group_id,
-        subnet_id,
-    }
-}
-
-/// Drive the scope modal's state machine on each keypress. On submit
-/// fires `cli::commands::rules::add_inner` synchronously, then
-/// `attempt_reload` to push the change live (HR2 single shared reload).
-async fn handle_scope_modal_key(
+/// Drive the picker's state machine on each keypress. On confirm writes
+/// every marked pack, then `attempt_reload` to push the change live.
+async fn handle_query_log_rule_modal_key(
     app: &mut App,
     key: KeyEvent,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    let Some(mut modal) = app.scope_modal.take() else {
+    let Some(mut modal) = app.query_log_rule_modal.take() else {
         return;
     };
 
-    use scope_modal::ScopeStage;
+    use query_log_rule_modal::Stage;
 
-    // Submitted state — any keypress closes the modal.
-    if matches!(modal.stage, ScopeStage::Submitted(_)) {
-        return;
+    match &modal.stage {
+        // Report state — any keypress closes the modal.
+        Stage::Done(_) => {}
+        Stage::NewList(_) => {
+            handle_query_log_new_list_key(app, modal, key, poller, config_path).await;
+        }
+        Stage::Picking => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Down | KeyCode::Char('j') => {
+                modal.move_cursor(1);
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                modal.move_cursor(-1);
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Char(' ') => {
+                modal.toggle();
+                app.query_log_rule_modal = Some(modal);
+            }
+            // Both cases, like every other single-key binding in the
+            // ecosystem: an operator with CapsLock must not press a key
+            // that does nothing and says nothing.
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                modal.begin_new_list(packs_dir_display(app));
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Enter => {
+                if modal.selected_ids().is_empty() {
+                    // Say why rather than re-stashing untouched: a picker
+                    // that opens at zero selections makes an empty Enter
+                    // routine, and a silent one reads as a dead key.
+                    modal.note_no_selection();
+                    app.query_log_rule_modal = Some(modal);
+                } else {
+                    submit_query_log_rule_modal(app, modal, poller, config_path).await;
+                }
+            }
+            _ => {
+                app.query_log_rule_modal = Some(modal);
+            }
+        },
     }
+}
+
+/// Keys for the create-a-list form reached with `n`.
+///
+/// Delegates to the Custom Lists leaf's own form helpers and its create
+/// path, so the two routes to the same form cannot drift apart. The
+/// create is a *config* write and takes the tree lock itself, so it must
+/// complete and return here before any pack write starts — a guard still
+/// live in this process stalls the promotion for the whole lock deadline.
+async fn handle_query_log_new_list_key(
+    app: &mut App,
+    mut modal: query_log_rule_modal::QueryLogRuleModal,
+    key: KeyEvent,
+    poller: &IpcPoller,
+    config_path: &Path,
+) {
+    use custom_list_modal::FormField;
+
+    let Some(focused) = new_list_form(&modal).map(|f| f.focused) else {
+        app.query_log_rule_modal = Some(modal);
+        return;
+    };
 
     match key.code {
         KeyCode::Esc => {
-            // From confirm stages, Esc returns to the menu. From the
-            // menu itself, Esc closes the modal (early return without
-            // re-stashing).
-            if matches!(modal.stage, ScopeStage::Menu) {
-                return;
-            }
-            modal.back_to_menu();
-            app.scope_modal = Some(modal);
+            modal.cancel_new_list();
+            app.query_log_rule_modal = Some(modal);
         }
-        KeyCode::Down => {
-            modal.move_cursor(1);
-            app.scope_modal = Some(modal);
-        }
-        KeyCode::Up => {
-            modal.move_cursor(-1);
-            app.scope_modal = Some(modal);
+        KeyCode::Enter if focused == FormField::Cancel => {
+            modal.cancel_new_list();
+            app.query_log_rule_modal = Some(modal);
         }
         KeyCode::Enter => {
-            // From Menu → advance to confirm. From confirm → submit
-            // when ready_to_submit() is Some.
-            if matches!(modal.stage, ScopeStage::Menu) {
-                modal.enter_confirm();
-                app.scope_modal = Some(modal);
-            } else if let Some(resolved) = modal.ready_to_submit() {
-                submit_scope_modal(app, modal, resolved, poller, config_path).await;
-            } else {
-                // Not ready — say why. This branch used to re-stash the
-                // modal untouched, which made a mistyped scope id look
-                // like a dead Enter key. Covers `DefaultConfirm` too:
-                // the branch is not stage-scoped, and a lowercase
-                // `default` is rejected by the same silent path.
-                modal.note_failed_submit();
-                app.scope_modal = Some(modal);
-            }
-        }
-        KeyCode::Char('y') | KeyCode::Char('Y')
-            if matches!(modal.stage, ScopeStage::DeviceConfirm) =>
-        {
-            if let Some(resolved) = modal.ready_to_submit() {
-                submit_scope_modal(app, modal, resolved, poller, config_path).await;
-            } else {
-                app.scope_modal = Some(modal);
-            }
-        }
-        KeyCode::Char('n') | KeyCode::Char('N')
-            if matches!(modal.stage, ScopeStage::DeviceConfirm) =>
-        {
-            modal.back_to_menu();
-            app.scope_modal = Some(modal);
-        }
-        KeyCode::Backspace => {
-            modal.backspace();
-            app.scope_modal = Some(modal);
-        }
-        KeyCode::Char(c) => {
-            // Typed-confirm input — only relevant in TypedConfirm or
-            // DefaultConfirm stages.
-            if matches!(
-                modal.stage,
-                ScopeStage::TypedConfirm { .. } | ScopeStage::DefaultConfirm { .. }
-            ) {
-                modal.push_char(c);
-            }
-            app.scope_modal = Some(modal);
+            submit_query_log_new_list(app, modal, poller, config_path).await;
         }
         _ => {
-            app.scope_modal = Some(modal);
+            if let Some(form) = new_list_form_mut(&mut modal) {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        form.focused =
+                            next_editable_custom_list_field(form.focused, form.mode, true)
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        form.focused =
+                            next_editable_custom_list_field(form.focused, form.mode, false)
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(buf) = custom_list_form_buf(form) {
+                            buf.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if custom_list_form_buf(form).is_some() {
+                            // Split from the push so the error can be
+                            // cleared without holding the buffer borrow.
+                            form.error_message = None;
+                        }
+                        if let Some(buf) = custom_list_form_buf(form) {
+                            buf.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            app.query_log_rule_modal = Some(modal);
         }
     }
 }
 
-/// Fire the resolved scope into `add_inner` + reload. Routes the
-/// outcome to `app.last_error` (T3 §14.3 delta 4 pattern: the alt-
-/// screen swallows `report_reload_outcome` stdout).
-async fn submit_scope_modal(
+/// The add-list form inside the picker, when the picker is showing one.
+fn new_list_form(
+    modal: &query_log_rule_modal::QueryLogRuleModal,
+) -> Option<&custom_list_modal::Form> {
+    match &modal.stage {
+        query_log_rule_modal::Stage::NewList(inner) => match &inner.stage {
+            custom_list_modal::Stage::EditingForm(form) => Some(form),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn new_list_form_mut(
+    modal: &mut query_log_rule_modal::QueryLogRuleModal,
+) -> Option<&mut custom_list_modal::Form> {
+    match &mut modal.stage {
+        query_log_rule_modal::Stage::NewList(inner) => match &mut inner.stage {
+            custom_list_modal::Stage::EditingForm(form) => Some(form),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Create the list the form describes, then return to the picker with it
+/// marked.
+///
+/// `create_custom_list` writes the pack file **before** the declaration —
+/// a `[[custom_lists]]` entry naming a file that does not exist fails the
+/// whole config on the next load, taking every other list with it. The
+/// reload is this surface's own: nothing watches the config files, and a
+/// list the daemon never sees is a list that filters nothing.
+async fn submit_query_log_new_list(
     app: &mut App,
-    mut modal: scope_modal::ScopeModal,
-    resolved: scope_modal::ResolvedScope,
+    mut modal: query_log_rule_modal::QueryLogRuleModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use crate::cli::commands::rules::{add_inner, ChangeOutcome, NoOpReason};
-    use scope_modal::SubmitOutcome;
-
-    let scope = resolved.as_scope();
-    let action = modal.action;
-    let domain_input = modal.domain.clone();
-
-    let outcome = add_inner(config_path, scope, action, &domain_input, None, None);
-
-    let final_outcome = match outcome {
-        Ok(ChangeOutcome::Applied(report)) => {
-            tracing::info!(
-                target: "audit",
-                action = "rule.add",
-                surface = "tui",
-                scope = resolved.as_scope().as_tag(),
-                target_id = resolved.as_scope().target_id(),
-                rule_action = action.slug(),
-                domain = %report.canonical_domain,
-                rule_id = %report.rule_id,
-                profile = %report.effective_profile.as_deref().unwrap_or(""),
-                override_used = report.override_used,
-                "TUI mutation"
-            );
-            SubmitOutcome::Ok(format!(
-                "{}: rule '{}' added",
-                action.slug(),
-                report.rule_id
-            ))
+    let resolved = {
+        let Some(form) = new_list_form_mut(&mut modal) else {
+            app.query_log_rule_modal = Some(modal);
+            return;
+        };
+        match form.try_resolve() {
+            Ok(r) => r,
+            Err(msg) => {
+                // The form keeps the operator's typing: retyping the rest
+                // to fix one field is the cost of dropping it.
+                form.error_message = Some(msg.clone());
+                app.status_err(format!("custom list: {msg}"));
+                app.query_log_rule_modal = Some(modal);
+                return;
+            }
         }
-        Ok(ChangeOutcome::NoOp(NoOpReason::AlreadyPresent { rule_id })) => {
-            SubmitOutcome::Ok(format!(
-                "{} rule already present (id: {rule_id}) — no-op",
-                action.slug()
-            ))
-        }
-        Err(e) => SubmitOutcome::Failed(e.to_string()),
     };
 
-    modal.finish(final_outcome.clone());
-    app.scope_modal = Some(modal);
+    match create_custom_list(config_path, &resolved) {
+        Err(msg) => {
+            if let Some(form) = new_list_form_mut(&mut modal) {
+                form.error_message = Some(msg.clone());
+            }
+            app.status_err(format!("custom list: {msg}"));
+            app.query_log_rule_modal = Some(modal);
+        }
+        Ok(msg) => {
+            app.status_ok(msg);
+            report_reload_to_status(app, poller, "custom list").await;
+            app.loaded_config = load_v1_config(config_path);
+            modal.adopt_lists(custom_list_rows(app), Some(resolved.id.as_str()));
+            app.query_log_rule_modal = Some(modal);
+        }
+    }
+}
 
-    // Surface the outcome on app.last_error too — the renderer shows the
-    // modal AND the footer on the same frame, so the operator sees the
-    // status without having to dismiss the modal first.
-    match &final_outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(e) => app.status_err(format!("rule failed: {e}")),
+/// Write the rule into every marked pack, then reload once.
+///
+/// **One lock, N appends, one reload.** Each append is a
+/// read-modify-write, and taking the guard per list would let another
+/// surface interleave between two of them — leaving a reload able to see
+/// a multi-list write half done. The guard is scoped closed before the
+/// reload for the same reason `create_custom_list` scopes its own: a live
+/// guard in this process stalls a config promotion for the whole lock
+/// deadline.
+///
+/// Failure is reported **per list**. Three writes out of five do not
+/// collapse into one toast: the modal stays open and names which list
+/// took the rule and which did not.
+async fn submit_query_log_rule_modal(
+    app: &mut App,
+    mut modal: query_log_rule_modal::QueryLogRuleModal,
+    poller: &IpcPoller,
+    config_path: &Path,
+) {
+    use crate::cli::commands::rules::Action;
+    use crate::config::custom_list::{add_rule, pack_path, AddOutcome};
+    use crate::config::schema::Id;
+    use crate::tui::tabs::custom_lists;
+    use query_log_rule_modal::{RuleOutcome, RuleReport};
+
+    let allow = matches!(modal.action, Action::Allow);
+    let domain = modal.domain.clone();
+    let ids = modal.selected_ids();
+
+    let reports: Vec<RuleReport> = {
+        let Some(loaded) = app.loaded_config.as_ref() else {
+            app.status_err("the configuration could not be read".into());
+            app.query_log_rule_modal = Some(modal);
+            return;
+        };
+        let Some(root) = loaded.master_path.parent() else {
+            app.status_err("the configuration has no parent directory".into());
+            app.query_log_rule_modal = Some(modal);
+            return;
+        };
+        let max = custom_lists::max_pack_bytes(loaded);
+        let lock = match custom_lists::claim_tree(loaded) {
+            Ok(l) => l,
+            Err(e) => {
+                app.status_err(format!("rule: {e}"));
+                app.query_log_rule_modal = Some(modal);
+                return;
+            }
+        };
+        ids.iter()
+            .map(|id| {
+                let outcome = match Id::new(id.as_str()) {
+                    Err(e) => RuleOutcome::Failed(format!("id: {e}")),
+                    // A list dropped between open and confirm would
+                    // otherwise take a pack write with no declaration
+                    // behind it — an orphan file that filters nothing.
+                    Ok(pid) if !loaded.config.custom_lists.iter().any(|c| c.id == pid) => {
+                        RuleOutcome::Failed("no longer declared".into())
+                    }
+                    Ok(pid) => match add_rule(&lock, &pack_path(root, &pid), &domain, allow, max) {
+                        Ok(AddOutcome::Added) => RuleOutcome::Added,
+                        Ok(AddOutcome::AlreadyPresent) => RuleOutcome::AlreadyPresent,
+                        Err(e) => RuleOutcome::Failed(e.to_string()),
+                    },
+                };
+                RuleReport {
+                    id: id.clone(),
+                    outcome,
+                }
+            })
+            .collect()
+    };
+
+    let added = reports
+        .iter()
+        .filter(|r| r.outcome == RuleOutcome::Added)
+        .count();
+    let failed = reports
+        .iter()
+        .filter(|r| matches!(r.outcome, RuleOutcome::Failed(_)))
+        .count();
+
+    for report in &reports {
+        if let RuleOutcome::Failed(msg) = &report.outcome {
+            tracing::warn!(
+                target: "audit",
+                action = "custom_list.rule.add",
+                surface = "tui",
+                list = %report.id,
+                rule_action = modal.action.slug(),
+                domain = %domain,
+                error = %msg,
+                "TUI mutation refused"
+            );
+        } else {
+            tracing::info!(
+                target: "audit",
+                action = "custom_list.rule.add",
+                surface = "tui",
+                list = %report.id,
+                rule_action = modal.action.slug(),
+                domain = %domain,
+                already_present = report.outcome == RuleOutcome::AlreadyPresent,
+                "TUI mutation"
+            );
+        }
     }
 
-    // HR2 reload + cache invalidation only on a real Apply.
-    if matches!(final_outcome, SubmitOutcome::Ok(_)) {
-        let outcome = attempt_reload(poller.socket_path()).await;
-        match outcome {
-            ReloadOutcome::Reloaded => {}
-            ReloadOutcome::DaemonUnreachable => {
-                app.status_err(
-                    "rule saved on disk — daemon not running, will activate on next start".into(),
-                );
-            }
-            ReloadOutcome::NoToken { .. } => {
-                app.status_err(
-                    "rule saved on disk but no admin token is available to request a reload".into(),
-                );
-            }
-            ReloadOutcome::ReloadFailed(msg) => {
-                app.status_err(format!("rule saved but daemon rejected reload: {msg}"));
-            }
-        }
+    // The footer carries the headline while the modal carries the detail:
+    // the renderer draws both on the same frame, so the operator sees the
+    // status without dismissing the report first.
+    if failed > 0 {
+        app.status_err(format!(
+            "{failed} of {} lists did not accept it",
+            reports.len()
+        ));
+    } else {
+        app.status_ok(format!(
+            "{}: {domain} written to {} list(s)",
+            modal.action.slug(),
+            reports.len()
+        ));
+    }
+    modal.finish(reports);
+    app.query_log_rule_modal = Some(modal);
+
+    // Nothing changed on disk when every list already carried the rule,
+    // so there is nothing for the daemon to reload.
+    if added > 0 {
+        report_reload_to_status(app, poller, "rule").await;
         // Refresh cached config so subsequent renders pick up the
         // mutation without waiting for the next 30s poll.
         app.loaded_config = load_v1_config(config_path);
         poll_active_leaf(app, poller).await;
+    }
+}
+
+/// Ask the daemon to reload and route the outcome to the footer.
+///
+/// The alt-screen swallows `report_reload_outcome`'s stdout, so every
+/// arm has to reach the operator through `app`. `Reloaded` is the one
+/// arm that stays silent and therefore keeps whatever status the caller
+/// already set.
+///
+/// `noun` names what was written, because the two callers here write
+/// different things: a fixed "rule" would tell an operator who created a
+/// list against a stopped daemon that a rule was saved.
+async fn report_reload_to_status(app: &mut App, poller: &IpcPoller, noun: &str) {
+    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
+
+    match attempt_reload(poller.socket_path()).await {
+        ReloadOutcome::Reloaded => {}
+        ReloadOutcome::DaemonUnreachable => {
+            app.status_err(format!(
+                "{noun} saved on disk — daemon not running, will activate on next start"
+            ));
+        }
+        ReloadOutcome::NoToken { .. } => {
+            app.status_err(format!(
+                "{noun} saved on disk but no admin token is available to request a reload"
+            ));
+        }
+        ReloadOutcome::ReloadFailed(msg) => {
+            app.status_err(format!("{noun} saved but daemon rejected reload: {msg}"));
+        }
     }
 }
 
@@ -10144,7 +10492,7 @@ async fn submit_scope_modal(
 /// dropdown reads from this snapshot, not from the live `loaded_config`,
 /// so a config refresh during the form's lifetime cannot surprise the
 /// operator with a profile that disappeared mid-edit. Mirrors the
-/// scope_modal capture-at-render-time invariant.
+/// rule picker's capture-at-render-time invariant.
 fn snapshot_profile_ids(app: &App) -> Vec<String> {
     app.loaded_config
         .as_ref()
@@ -10162,7 +10510,7 @@ fn snapshot_profile_ids(app: &App) -> Vec<String> {
 /// Resolve the focused row on the Local DNS tab into (scope, record)
 /// for Edit / Remove modals. `None` when no record is focused.
 ///
-/// N6: one lookup through the unified row vector, resolved from the
+/// One lookup through the unified row vector, resolved from the
 /// stable `(scope, domain)` anchor rather than from a visual index — an
 /// index is not an identity once a reload or a delete reshuffles the
 /// list.
@@ -10191,8 +10539,8 @@ fn focused_local_dns_row(
 /// went somewhere else, and the fix is a delete plus a re-add in the
 /// right place. So there are exactly two cases and no third:
 ///
-/// - **A record is focused.** Its scope IS the answer, and under N6 that
-///   is one field read rather than a panel/profile-index reconstruction.
+/// - **A record is focused.** Its scope IS the answer, and with the unified
+///   row vector that is one field read rather than a panel/profile-index reconstruction.
 ///   Prefill it exactly. (The spec offered "skip the prefill if it costs
 ///   more than a few lines"; one list made it cheaper than the code it
 ///   replaces, so the escape hatch is unused.)
@@ -10260,9 +10608,9 @@ fn build_local_dns_edit_modal(app: &App) -> Option<local_dns_modal::LocalDnsModa
 }
 
 /// Drive the Local DNS modal's state machine on each keypress. On
-/// submit fires the R7 single-seat helpers — `add_inner` for Add /
-/// Edit, `remove_inner` for Remove / Edit — then triggers HR2
-/// `attempt_reload`. Mirrors `handle_scope_modal_key`.
+/// submit fires the single-seat helpers — `add_inner` for Add /
+/// Edit, `remove_inner` for Remove / Edit — then triggers
+/// `attempt_reload`. Mirrors `handle_query_log_rule_modal_key`.
 async fn handle_local_dns_modal_key(
     app: &mut App,
     key: KeyEvent,
@@ -10281,13 +10629,13 @@ async fn handle_local_dns_modal_key(
         return;
     }
 
-    // N14 — `Ctrl+s` saves from anywhere on an Archetype-F form.
+    // `Ctrl+s` saves from anywhere on an Archetype-F form.
     //
     // Checked BEFORE the field dispatch, not as a guarded `Char('s')` arm:
     // the `KeyCode::Char(c)` catch-all at the bottom of the form match is
     // what used to append a literal `s` to the focused buffer, so an arm
-    // placed after it would be dead. §10b.2 says "from anywhere", which
-    // means ahead of the field dispatch entirely. Mirrors the check in
+    // placed after it would be dead. "From anywhere" means ahead of the
+    // field dispatch entirely. Mirrors the check in
     // `handle_edit_mode_key`, including the `S` spelling some terminals
     // send.
     //
@@ -10476,7 +10824,7 @@ fn text_field_buf(form: &mut local_dns_modal::AddForm) -> &mut String {
 ///
 /// Outcomes flow through `LocalDnsModal::finish` so the renderer
 /// shows the success / error message; the modal closes on the next
-/// keypress. On a real Apply, fires HR2 `attempt_reload` and reloads
+/// keypress. On a real Apply, fires the shared `attempt_reload` and reloads
 /// the cached config so the next render reflects the mutation.
 async fn submit_local_dns_modal(
     app: &mut App,
@@ -10560,8 +10908,8 @@ async fn submit_local_dns_modal(
     modal.finish(outcome);
     app.local_dns.modal = Some(modal);
 
-    // HR2 reload + cache invalidation only on a real Apply. Same shape
-    // as `submit_scope_modal`. Errors land on `last_error` so the
+    // Reload + cache invalidation only on a real Apply. Same shape
+    // as `submit_query_log_rule_modal`. Errors land on `last_error` so the
     // operator sees them in the footer alongside the modal.
     if was_ok {
         let outcome = attempt_reload(poller.socket_path()).await;
@@ -10641,7 +10989,7 @@ async fn submit_local_dns_modal(
         // Two-phase: drop the original first so the duplicate-check on
         // the validator pre-flight does not refuse the new record on
         // an unchanged (domain, type, match_subdomains) tuple. The
-        // window between the two writes is small thanks to T1 valid-
+        // window between the two writes is small thanks to valid-
         // ation pre-flight + filesystem atomic-rename + ipc reload
         // coalescing, but the two operations are NOT atomic — if the
         // second write fails the modal reports both errors and
@@ -10737,14 +11085,14 @@ async fn submit_form(app: &mut App, mut form: DeviceFormState, poller: &IpcPolle
         }
         DeviceFormMode::Edit => {
             let patch = edit_patch_from(&parsed);
-            // mod-03: the IPC key for Update is the device's STABLE v1 id
+            // The IPC key for Update is the device's STABLE v1 id
             // CAPTURED AT MODAL-OPEN (`form.original_id`), NOT a
             // re-resolution from the live cursor. A 5s poll can reshuffle
             // the row set under the open modal, so re-deriving the target
             // here could patch a different device than the one the form
             // was opened on. Fall back to slug(parsed.name) only for a
             // form with no captured id (Add-converted-to-Edit edge; the
-            // pre-S44 id-less case is already handled at capture time).
+            // id-less case is already handled at capture time).
             let original_id = form.original_id.clone().unwrap_or_else(|| {
                 crate::cli::commands::target::slug_id(&parsed.name).unwrap_or(parsed.name.clone())
             });
@@ -10776,7 +11124,7 @@ async fn submit_form(app: &mut App, mut form: DeviceFormState, poller: &IpcPolle
 /// `groups` carries the form's **whole** membership list. It used to
 /// carry `vec![first]`, and since `DevicePatch.groups` is a full-list
 /// replacement, a Save that only renamed the device deleted every extra
-/// membership from the file (§4.64 G4). The list is passed through in
+/// membership from the file. The list is passed through in
 /// buffer order, so a Save the operator did not mean as a reorder never
 /// emits one.
 fn edit_patch_from(parsed: &ParsedForm) -> DevicePatch {
@@ -10796,11 +11144,11 @@ fn edit_patch_from(parsed: &ParsedForm) -> DevicePatch {
         // it", never "leave it alone". The leave-alone arm of
         // `Option<Option<_>>` exists for the wire's other callers.
         network_name: Some(parsed.network_name.clone()),
-        // Already `Option<bool>` on `DevicePatch` — Task 9 gave it no
+        // Already `Option<bool>` on `DevicePatch` — it has no
         // clear state — so this passes straight through with no wrapper.
         network_name_wildcard: parsed.network_name_wildcard,
         // ALWAYS `None`, and it is not a placeholder. `retired_tags` is a
-        // capture slot for a key only a pre-S5 client sends; the daemon
+        // capture slot for a key only a legacy client sends; the daemon
         // WARNs when it arrives. This binary is not that client, so a
         // `Some(...)` here would make warden accuse itself of running an
         // outdated CLI.
@@ -10931,7 +11279,7 @@ fn parse_form(form: &DeviceFormState) -> Result<ParsedForm, String> {
     // than one id. The picker enforces this at the other end by refusing
     // to open multi-select off an Edit form; this is the second gate, on
     // the write side, because a silent truncation here would be exactly
-    // the defect G4 closed re-opened in another mode.
+    // the defect already fixed once, re-opened in another mode.
     if form.mode != DeviceFormMode::Edit && groups.len() > 1 {
         return Err("a new device takes one group; save it, then edit it to add the others".into());
     }
@@ -11006,7 +11354,7 @@ fn is_macish(s: &str) -> bool {
             .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-// ── Modal pre-fill helpers (Sprint 23 s23-tui-clients-keybindings) ─
+// ── Modal pre-fill helpers ───────────────────────────────────────────
 
 /// Resolve the currently-highlighted device row in the unified list.
 /// Test-only — the live keybinding handler resolves the row inline via
@@ -11024,7 +11372,7 @@ fn selected_device_row(app: &App) -> Option<tabs::devices::DeviceRow> {
         app.devices.filter_subnet.as_deref(),
     )
     .0;
-    // dev-03: resolve by the operator's stable key first so the focused
+    // Resolve by the operator's stable key first so the focused
     // row tracks the device across poll reshuffles; fall back to the
     // positional cursor before the key is seeded.
     let idx = crate::tui::app::resolve_row_index(
@@ -11062,7 +11410,7 @@ fn build_promote_form(app: &App) -> Result<DeviceFormState, String> {
 
 /// Friendly display name of the focused mapped row. Test-only —
 /// the production path captures the device id at modal-open
-/// (mod-03, `DeviceFormState::original_id`) for IPC keys and reads the
+/// (`DeviceFormState::original_id`) for IPC keys and reads the
 /// display name straight off the DTO when needed.
 #[cfg(test)]
 fn focused_mapped_name(app: &App) -> Option<String> {
@@ -11077,19 +11425,19 @@ fn focused_mapped_name(app: &App) -> Option<String> {
 ///
 /// Groups: joined the same way, ALL of them, in the DTO's order — which
 /// is the file's order (`DeviceIndex.groups` is `dev.groups.clone()`,
-/// never sorted). Seeding from `groups[0]` was the §4.64 G4 defect: the
+/// never sorted). Seeding from `groups[0]` was a real defect: the
 /// form could only hold one, so the Save that replaced the whole array
 /// dropped the rest.
 /// Configured profile + group id snapshots for the device-form pickers,
 /// read from `app.loaded_config`. Empty vecs when no config is loaded.
 /// Profile ids come out sorted (BTreeMap key order); group ids in config
 /// order.
-/// §4.66 L3: the `[[labels]]` vocabulary for the three metadata fields,
+/// The `[[labels]]` vocabulary for the three metadata fields,
 /// as **display names**, sorted, one list per kind.
 ///
 /// Display names and not ids because `Device.{owner,device_type,department}`
-/// are free text while `Label.id` is an `Id` — the two sets never intersect
-/// (§4.66 L1 handoff, point 2). `Label::matches_value` accepts either, so
+/// are free text while `Label.id` is an `Id` — the two sets never intersect.
+/// `Label::matches_value` accepts either, so
 /// the display name is the one that both reads well in the Devices table and
 /// silences the unknown-value WARN.
 fn device_form_label_vocab(app: &App) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -11140,7 +11488,7 @@ fn is_select_only_field(form: &DeviceFormState, field: DeviceFormField) -> bool 
         // Always picker-driven: their option lists come from entities that
         // must already exist for the value to be legal.
         DeviceFormField::Profile | DeviceFormField::Group => true,
-        // §4.66 L3: the three metadata fields are picker-driven **only when
+        // The three metadata fields are picker-driven **only when
         // a vocabulary exists for that kind**.
         //
         // This condition is load-bearing, not a nicety. `field_accepts_typing`
@@ -11167,7 +11515,7 @@ fn field_accepts_typing(form: &DeviceFormState, field: DeviceFormField) -> bool 
 /// Open the popup picker for the focused select-only field, seeding the
 /// cursor on the current value. No-op when the option snapshot is empty so
 /// the operator can't get trapped in an empty popup.
-/// §4.66 L3: prepend the clear option to a metadata vocabulary. Returns the
+/// Prepend the clear option to a metadata vocabulary. Returns the
 /// list unchanged when empty — an empty vocabulary means the field is not
 /// picker-driven at all, and offering a popup with only "clear" in it would
 /// be a worse affordance than plain typing.
@@ -11225,7 +11573,7 @@ fn open_field_picker(form: &mut DeviceFormState) {
                 selected,
             )
         }
-        // §4.66 L3: the three metadata fields are optional, so their picker
+        // The three metadata fields are optional, so their picker
         // leads with an explicit clear. Without it a value set once could
         // never be removed from the TUI — the field is select-only while a
         // vocabulary exists, so Backspace is a no-op, and every other option
@@ -11272,7 +11620,7 @@ fn open_field_picker(form: &mut DeviceFormState) {
 /// row under the cursor and Enter commits the whole selection. A toggle
 /// **appends**, so the memberships the file already carried keep their
 /// positions and a Save that added one group emits a one-element diff
-/// rather than a reordered array. DM2 resolves by group priority, so the
+/// rather than a reordered array. Group membership resolves by priority, so the
 /// order is semantically inert — which is exactly why churning it would
 /// be pure noise in the operator's config.
 fn handle_form_picker_key(form: &mut DeviceFormState, code: KeyCode) {
@@ -11322,11 +11670,11 @@ fn handle_form_picker_key(form: &mut DeviceFormState, code: KeyCode) {
 }
 
 pub(crate) fn edit_form_from(row: &crate::ipc::protocol::MappedDeviceDto) -> DeviceFormState {
-    // mod-03: capture the stable IPC id NOW, at modal-open, from the DTO
+    // Capture the stable IPC id NOW, at modal-open, from the DTO
     // in hand. The submit uses it verbatim so a poll that reshuffles the
     // row set under the open modal can't redirect the patch onto another
     // device. Fall back to the slug of the ORIGINAL name (not the
-    // post-edit name) for a pre-S44 id-less DTO.
+    // post-edit name) for an id-less DTO.
     let original_id = row
         .id
         .clone()
@@ -11355,7 +11703,7 @@ pub(crate) fn edit_form_from(row: &crate::ipc::protocol::MappedDeviceDto) -> Dev
 
 /// Build a Promote form from an unmapped device. Returns an error
 /// string when the row's MAC is empty (stale ARP) — IP-only
-/// identification is bypassable per project rules, so promotion requires
+/// identification is bypassable per CLAUDE.md, so promotion requires
 /// a MAC pin so DHCP can't move the IP to a different device.
 fn promote_form_from(
     row: &crate::ipc::protocol::UnmappedDeviceDto,
@@ -11403,80 +11751,85 @@ fn install_terminal_restore_panic_hook() {
 }
 
 #[cfg(test)]
+#[path = "tests/cfg_scan.rs"]
+mod cfg_scan;
+
+#[cfg(test)]
 #[path = "tests/modal_keybinding_tests.rs"]
 mod modal_keybinding_tests;
 
-// ── T3.8 M-30: Settings 'e' editor failure formatting tests ─────
+// ── Settings 'e' editor failure formatting tests ────────────────
 
 #[cfg(all(test, unix))]
 #[path = "tests/editor_failure_tests.rs"]
 mod editor_failure_tests;
 
-// ── Sprint 39: Tracking panel tests ─────────────────────────────
+// ── Tracking panel tests ─────────────────────────────────────────
 
 #[cfg(test)]
 #[path = "tests/tracking_panel_tests.rs"]
 mod tracking_panel_tests;
 
-// ── rev-2606 §11: dispatch-level key-routing harness ────────────
+// ── Dispatch-level key-routing harness ───────────────────────────
 //
 // Every other tab test calls `handle_<tab>_key` DIRECTLY, so it never
 // exercises the global modal gates + global key match that run first in
 // `handle_key`. That is exactly the layer where global-hotkey shadowing
-// lives (settings-03, ldns-04 — and Devices `p` before them in S44).
-// These tests drive `handle_key` END-TO-END so the next global hotkey
+// lives — the Settings Tracking-form gate, the Local DNS modal gate,
+// and Devices `p` before them all shadowed a per-tab binding at one
+// point. These tests drive `handle_key` END-TO-END so the next global hotkey
 // that shadows a tab contract trips here instead of shipping silently.
 #[cfg(test)]
 #[path = "tests/dispatch_routing_tests.rs"]
 mod dispatch_routing_tests;
 
-// ── tui-02 / tui-11: no synchronous filesystem work on the loop ──
+// ── No synchronous filesystem work on the loop ────────────────────
 
 #[cfg(test)]
 #[path = "tests/event_loop_offload_tests.rs"]
 mod event_loop_offload_tests;
 
-// ── tui-06: RAII terminal restore on every return path ──────────
+// ── RAII terminal restore on every return path ────────────────────
 
 #[cfg(test)]
 #[path = "tests/terminal_guard_tests.rs"]
 mod terminal_guard_tests;
 
-// ── H-21: panic hook chain-and-cleanup pattern ──────────────────
+// ── Panic hook chain-and-cleanup pattern ──────────────────────────
 
 #[cfg(test)]
 #[path = "tests/panic_hook_tests.rs"]
 mod panic_hook_tests;
 
-// ── Sprint 45 T3 / Sprint 46 T1: numeric remap + g<letter> mnemonic dispatch ─
+// ── Numeric remap + g<letter> mnemonic dispatch ───────────────────
 
 #[cfg(test)]
 #[path = "tests/hotkey_t3_tests.rs"]
 mod hotkey_t3_tests;
 
-/// Sprint 45 T4 mini-patch: T3's global `g` mnemonic prefix swallowed
+/// The global `g` mnemonic prefix swallows
 /// every lowercase `g` BEFORE per-tab dispatch. That made two existing
 /// per-tab handlers unreachable: `KeyCode::Char('g')` on Devices
 /// (group-by cycle) and `KeyCode::Char('g')` on Query Log (jump-to-top).
-/// The mini-patch removed the dead Query Log handler outright (cursor
+/// The dead Query Log handler was removed outright (cursor
 /// jump-to-top is now uncovered — operator scrolls with `Up`) and
-/// remapped the Devices group-by binding from `g` to `G`. These tests
+/// the Devices group-by binding remapped from `g` to `G`. These tests
 /// pin the contract end-to-end so a future revert can't silently
 /// re-break it.
 #[cfg(test)]
 #[path = "tests/mini_patch_devices_groupby_tests.rs"]
 mod mini_patch_devices_groupby_tests;
 
-// ── Sprint 47 T2 — Enter rewire on Query Log + a/d retired ───────────
+// ── Enter rewire on Query Log + a/d retired ──────────────────────────
 //
-// These tests pin the new Enter-driven entry surface and the deletion
-// of the legacy `a` / `d` keybindings. Status mapping is owned by
-// `scope_modal::inferred_action` (covered by its own unit tests in
-// `scope_modal.rs`) — these tests cover the wiring: that pressing
-// Enter on a Query Log row goes through `build_scope_modal_for_query_row`
-// and lands the right `Action` on the modal, that non-actionable
-// statuses surface a footer message instead of opening the modal, and
-// that `a` / `d` are inert on the Query Log tab.
+// These tests pin the Enter-driven entry surface and the absence of the
+// legacy `a` / `d` keybindings. Status mapping is owned by
+// `query_log_rule_modal::inferred_action` (covered by its own unit tests
+// in `query_log_rule_modal.rs`) — these tests cover the wiring: that
+// pressing Enter on a Query Log row goes through
+// `build_query_log_rule_modal` and lands the right `Action` on the modal,
+// that non-actionable statuses surface a footer message instead of
+// opening the modal, and that `a` / `d` are inert on the Query Log tab.
 //
 // IPC poller policy mirrors `hotkey_t3_tests`: the dummy poller points
 // at a nonexistent socket; the tab-change poll fires on first dispatch
@@ -11488,7 +11841,7 @@ mod mini_patch_devices_groupby_tests;
 #[path = "tests/s47_t2_tests.rs"]
 mod s47_t2_tests;
 
-// ── Sprint 53 — list edit modal save / delete pipeline tests ────────
+// ── List edit modal save / delete pipeline tests ──────────────────
 
 #[cfg(test)]
 #[path = "tests/s53_tests.rs"]
@@ -11507,7 +11860,7 @@ mod stale_data_indicator_tests;
 #[path = "tests/backup_modal_tests.rs"]
 mod backup_modal_tests;
 
-/// rev-2607 — the operator's table selection must survive a data refresh.
+/// The operator's table selection must survive a data refresh.
 ///
 /// Lists and Rules keyed their cursor on a bare positional index that was
 /// clamped only on a *filter keypress*. Both row sets also change on a
@@ -11528,14 +11881,13 @@ mod backup_modal_tests;
 #[path = "tests/rev2607_cursor_refresh_tests.rs"]
 mod rev2607_cursor_refresh_tests;
 
-/// Regression cover for the Lists edit/add modal's **save payload**
-/// (`s-tui-lists-edit-save-rejected`).
+/// Regression cover for the Lists edit/add modal's **save payload**.
 ///
 /// `build_blocklist_value` hand-rolls the TOML row the modal writes, and
-/// for every enum field it hand-rolled the wire string too. When Sprint A
-/// of `lists_categories_v2` renamed `BlocklistBase::Block` to `Deny` — and
+/// for every enum field it hand-rolled the wire string too. When the schema
+/// renamed `BlocklistBase::Block` to `Deny` — and
 /// with it the wire token `"block"` → `"deny"`, deliberately without a
-/// serde alias (D15) — the modal's copy of that map was missed. Every save
+/// serde alias — the modal's copy of that map was missed. Every save
 /// of a `base = deny` list (i.e. nearly every list) therefore wrote
 /// `kind = "block"`, which the loader refused with `unknown variant`, so
 /// the modal could never write anything.
@@ -11550,10 +11902,10 @@ mod rev2607_cursor_refresh_tests;
 #[path = "tests/lists_save_payload_wire_format_tests.rs"]
 mod lists_save_payload_wire_format_tests;
 
-// ── §4.63-s3b — one navigation grammar for every modal form ──────────
+// ── One navigation grammar for every modal form ───────────────────────
 //
 // Up/Down move focus, Left/Right cycle the focused field's value, in
-// EVERY form modal. Before this sprint four handlers did that and three
+// EVERY form modal. Before this, four handlers did that and three
 // inverted it (arrows changed the value, only Tab moved focus).
 //
 // These tests drive real `KeyCode`s through the production handlers
@@ -11569,8 +11921,8 @@ mod nav_grammar_tests;
 /// through the **real** key handler and the assertion is made on the
 /// **rendered buffer**.
 ///
-/// Both halves are deliberate. The precedent for this fix (`ff9fd35`,
-/// scope modal) put every test next to the modal's own state, leaving the
+/// Both halves are deliberate. The precedent for this fix — the
+/// scope modal — put every test next to the modal's own state, leaving the
 /// one-line `mod.rs` wiring uncovered — so the arm could be reverted to
 /// its silent form and the suite would stay green. And a refusal that
 /// only reaches `RemoveConfirm::error` is exactly the defect: the whole
@@ -11579,7 +11931,7 @@ mod nav_grammar_tests;
 #[path = "tests/local_dns_typed_confirm_tests.rs"]
 mod local_dns_typed_confirm_tests;
 
-// `plp-s5d` removed `mod tags_verb_status_tests` with the Tags tab.
+// `mod tags_verb_status_tests` is gone along with the Tags tab.
 //
 // It pinned that the Rename and Delete verbs did not report success on a
 // failure — `run_rename` / `run_delete` returned `Ok(())` for a refusal,
@@ -11592,7 +11944,7 @@ mod local_dns_typed_confirm_tests;
 // it. Assert the state only reachable through the success arm, then assert
 // what it said.
 
-// ── §4.65 UX2 follow-up — RETIRED by `plp-s5d` ───────────────────────
+// ── The tag valve loss tests, RETIRED ───────────────────────────────
 //
 // `mod armed_tag_valve_loss_tests` stood here: five tests over the Lists
 // edit modal's attach-only tag valve. The valve armed on the first
@@ -11608,10 +11960,10 @@ mod local_dns_typed_confirm_tests;
 // declared 80x24 floor. The in-house precedent for that mistake is the
 // `ui.rs` test that asserts the footer *contains* the chord string — i.e.
 // that the chord is advertised, not that it works — which stayed green
-// through a `Ctrl+S` that was broken in the Devices form (§4.65 UX3).
+// through a `Ctrl+S` that was broken in the Devices form.
 //
 // All five drove the tag picker and the `dropped_tag_leads` notice, both
-// of which this lane removed; there is no slug to drop and no notice to
+// of which are now gone; there is no slug to drop and no notice to
 // paint. The retired tests:
 //
 //   `ctrl_s_with_the_valve_armed_names_the_slug_it_dropped`
@@ -11620,7 +11972,7 @@ mod local_dns_typed_confirm_tests;
 //   `a_save_with_no_armed_slug_says_nothing_about_tags`
 //   `a_confirmed_slug_attaches_and_is_not_reported_as_dropped`
 //
-// **N14 — that `Ctrl+S` reaches the submit path at all — is a separate
+// **That `Ctrl+S` reaches the submit path at all — is a separate
 // guarantee and is NOT retired.** It keeps its own coverage: the Lists
 // modal's chord is exercised by the consent-stage tests above, and the
 // Subnets / Groups / Profiles twins are asserted in
@@ -11632,8 +11984,7 @@ mod local_dns_typed_confirm_tests;
 
 // ── The same valve, the other three modals that carry it ─────────────
 //
-// **The trip-wire fired, and this is the far side of it. 2026-08-24,
-// N14.**
+// **The trip-wire fired, and this is the far side of it.**
 //
 // What stood here — kept, because it is the record and not merely an
 // outdated paragraph — was a measurement: `tags_pending_new` also lives
@@ -11645,13 +11996,14 @@ mod local_dns_typed_confirm_tests;
 // appearance only.
 //
 // What was built instead was a trip-wire, on the stated expectation that
-// "D7′ and the Devices form both invite someone to wire `Ctrl+S` here
+// "the keying-preserved contract and the Devices form both invite someone
+// to wire `Ctrl+S` here
 // next. The day they do, these go red at the exact line that would
 // reintroduce the silent loss, and whoever wired it has to carry the
 // notice across."
 //
-// That day is N14 (§10b.2: `Ctrl+s` saves from anywhere on **every**
-// Archetype-F form). The chord is bound on all five form modals, so the
+// That day came: `Ctrl+s` saves from anywhere on **every**
+// Archetype-F form. The chord is bound on all five form modals, so the
 // three tests below were **inverted, not deleted** — the property they
 // defend is unchanged, only its precondition moved. Each now asserts the
 // chord DOES save AND that the dropped slug is announced. An inverted
@@ -11674,13 +12026,13 @@ mod local_dns_typed_confirm_tests;
 //    early-return for exactly that reason — the existing control flow
 //    already encodes "was the form destroyed?".
 //
-// Also settled by N14: `Ctrl+S` used to fall through to the
+// Also settled by that change: `Ctrl+S` used to fall through to the
 // `KeyCode::Char(c)` arm and append a literal `s` to the tag buffer.
 #[cfg(test)]
 #[path = "tests/armed_tag_valve_other_modals_tests.rs"]
 mod armed_tag_valve_other_modals_tests;
 
-// ── §4.65 UX13 / UX14: paste reach and one confirm convention ─────────
+// ── Paste reach and one confirm convention ────────────────────────────
 //
 // Self-contained (own master + poller + key helpers) so it does not
 // depend on the helper sets in the test modules above.
@@ -11694,41 +12046,41 @@ mod armed_tag_valve_other_modals_tests;
 #[path = "tests/confirm_and_paste_tests.rs"]
 mod confirm_and_paste_tests;
 
-/// N4 (clamp / `Home` / `End` / `PgUp` / `PgDn`) and N5 (Enter = the
-/// focused row's primary action) on the leaves this lane owns.
+/// Clamp / `Home` / `End` / `PgUp` / `PgDn`, and Enter as the
+/// focused row's primary action, on the leaves this module owns.
 ///
 /// Devices and Lists single-step clamping is NOT here: it lives in
-/// `tabs::{devices,lists}::next_selectable_index`, which belong to a
-/// sibling lane this wave (CONTRACT §2). What IS here for those two is the
-/// jump / page path, which this lane built on `is_selectable` precisely so
+/// `tabs::{devices,lists}::next_selectable_index`, owned separately. What
+/// IS here for those two is the
+/// jump / page path, built on `is_selectable` precisely so
 /// it does not inherit the wrap those helpers still have.
 #[cfg(test)]
 #[path = "tests/n4_n5_nav_tests.rs"]
 mod n4_n5_nav_tests;
 
-/// N8 — the `?` overlay is executable.
+/// The `?` overlay is executable.
 ///
 /// Driven through the full `handle_key` dispatcher (not a leaf handler)
 /// because that IS the property: the overlay must reach the same match a
 /// Normal-mode keystroke reaches. A leaf-handler test would pass against a
-/// parallel dispatch table, which is exactly what §9.1 forbids.
+/// parallel dispatch table, which is exactly what this forbids.
 #[cfg(test)]
 #[path = "tests/n8_executable_help_tests.rs"]
 mod n8_executable_help_tests;
 
-/// N9 (Tags `/` onto `InputMode`) and the N14 keying on the two form
+/// Tags `/` onto `InputMode`, and the Ctrl+S keying on the two form
 /// modals that carry no tag valve.
 ///
 /// The three that DO carry one are covered by
 /// `armed_tag_valve_other_modals_tests`, which had to be inverted for
-/// N14; these two have no valve to lose (`label_modal` and
+/// that change; these two have no valve to lose (`label_modal` and
 /// `local_dns_modal` have zero `tags_pending_new` sites), so they need a
 /// plain "the chord saves" pin rather than a trip-wire.
 #[cfg(test)]
 #[path = "tests/n9_n14_key_tests.rs"]
 mod n9_n14_key_tests;
 
-/// N6 — Local DNS is one list.
+/// Local DNS is one list.
 ///
 /// Driven through `handle_key`, never `handle_local_dns_key`: the modal
 /// gate sits ahead of the leaf match, and the reachability claims here
@@ -11740,3 +12092,7 @@ mod n6_local_dns_one_list_tests;
 #[cfg(test)]
 #[path = "tests/logs_tab_key_tests.rs"]
 mod logs_tab_key_tests;
+
+#[cfg(test)]
+#[path = "tests/file_editor_reload_tests.rs"]
+mod file_editor_reload_tests;

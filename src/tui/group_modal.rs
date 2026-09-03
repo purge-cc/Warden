@@ -1,4 +1,4 @@
-//! §4.64 G2 — Groups tab modals (Add / Edit / Delete).
+//! Groups tab modals (Add / Edit / Delete).
 //!
 //! Opens over [`crate::tui::app::Leaf::Groups`] via `a` (Add), `e`
 //! (Edit) or `d` / Delete (Remove). Submits through
@@ -6,7 +6,7 @@
 //! the **sync** inner writers, never the `run_*` verbs: those `println!`
 //! their outcome, and a `println!` on a raw-mode alternate screen
 //! bypasses ratatui's diff buffer and staircases one column per line
-//! (DG2, the v0.29.1 defect).
+//! (a ratatui v0.29.1 defect).
 //!
 //! This module is a transposition of [`crate::tui::subnet_modal`], not a
 //! new design. A subnet and a group carry the same shape — an id, a
@@ -49,8 +49,7 @@
 //! `check_groups` (`config/schema/validator.rs`) refuses a group whose
 //! `devices` names an undefined device or whose `profile` is not
 //! defined. A TUI-side duplicate of that check would be a second place
-//! for the two to disagree. A multi-select membership picker is **G4**,
-//! not this sprint.
+//! for the two to disagree.
 
 use crate::config::schema::Group;
 
@@ -416,15 +415,14 @@ use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, Val
 
 /// Nav-key legend copy — byte-identical to the Subnets modal's.
 ///
-/// N14 stripped the save/cancel clause: the action row now bakes its
-/// own key into each button's label (`[Esc] Discard` / `[Enter] Save`),
-/// so a blanket "Enter save · Esc cancel" here would be a second,
-/// redundant source of the same fact.
+/// The action row bakes its own key into each button's label
+/// (`[Esc] Discard` / `[Enter] Save`), so a blanket "Enter save · Esc
+/// cancel" here would be a second, redundant source of the same fact.
 const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} change";
 
 /// Draw the modal as an overlay anchored on the tab content rect.
 ///
-/// `anchor` is the tab content area (D18), never `f.area()`: the header,
+/// `anchor` is the tab content area, never `f.area()`: the header,
 /// the menu card and the footer legend stay visible behind the modal.
 /// That costs the interior 10 rows — 12 at the declared 80×24 floor —
 /// which is why every stage is built on a [`modal_form::ScrollBody`] and
@@ -572,16 +570,16 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         field_hint(FormField::Priority),
         chars(&form.priority_input),
     );
-    // N14: Discard left, Save right — the one `Primary` fill sits
-    // right-most on every Archetype-F form (CONTRACT §3.1). The focus
-    // ring still reaches `Submit` before `Cancel`, unchanged — same
-    // precedent as `profile_modal.rs`'s tail.
+    // Discard left, Save right — the one `Primary` fill sits right-most
+    // on every Archetype-F form. The focus ring still reaches `Submit`
+    // before `Cancel`, unchanged — same precedent as `profile_modal.rs`'s
+    // tail.
     //
     // Discard is `Neutral`, not `Destructive`: it closes the form
     // without writing anything, which is what Esc does too. A filled or
     // red Discard next to a filled Save is how an operator loses work
     // they meant to keep — the ecosystem rule reserves red for an
-    // action that actually destroys something (D15).
+    // action that actually destroys something.
     let actions = [
         Action::new(
             "  [Esc] Discard  ",
@@ -1034,7 +1032,7 @@ mod tests {
     // ── The 80×24 floor ──────────────────────────────────────────────
     //
     // `ui.rs` declares MIN_WIDTH 80 × MIN_HEIGHT 24. At that size the tab
-    // content rect this overlay anchors on (D18) is
+    // content rect this overlay anchors on is
     // `24 − 4 header − 5 menu card − 1 footer = 14` rows.
     // `overlay::centered_rect` CLAMPS rather than scrolls, so a body
     // taller than that is silently cut at the bottom while `Tab` still
@@ -1178,8 +1176,8 @@ mod tests {
 
     #[test]
     fn overlay_is_confined_to_the_anchor_rect() {
-        // D18: the anchor is the tab content rect, so the header, the
-        // menu card and the footer legend stay visible behind the modal.
+        // The anchor is the tab content rect, so the header, the menu
+        // card and the footer legend stay visible behind the modal.
         // Anchoring on `f.area()` instead paints over all three.
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;

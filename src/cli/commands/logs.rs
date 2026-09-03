@@ -9,10 +9,10 @@ use crate::ipc::socket_client;
 
 /// Output format for `warden logs`. `Text` is the human-readable default
 /// used for quick tail viewing; `Json` and `Csv` are structured exports.
-/// Sprint 41: `Csv` added so operators can pipe into spreadsheets without
-/// round-tripping through `jq`; `Json` stays pretty-printed to match the
-/// pre-S41 `--json` flag behaviour byte-for-byte (that flag is now an
-/// alias for `--format json`).
+/// `Csv` lets operators pipe into spreadsheets without round-tripping
+/// through `jq`; `Json` stays pretty-printed to match the legacy
+/// `--json` flag behaviour byte-for-byte (that flag is now an alias for
+/// `--format json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LogFormat {
     Text,
@@ -121,8 +121,8 @@ fn print_csv(entries: &[QueryLogDto]) {
     }
 }
 
-/// RFC 4180 field escaping + spreadsheet formula-injection guard
-/// (rev-2606 logs-01). Quote if the field contains `,`, `"`, `\n` or `\r`
+/// RFC 4180 field escaping + spreadsheet formula-injection guard.
+/// Quote if the field contains `,`, `"`, `\n` or `\r`
 /// and double any embedded `"`. Additionally, a field that *begins* with a
 /// formula trigger (`=`, `+`, `-`, `@`, or a leading tab/CR a spreadsheet
 /// folds into one) is prefixed with a single quote and quoted, so a
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn csv_escape_neutralises_formula_injection() {
-        // logs-01: a cell beginning with =/+/-/@ is prefixed with `'` and
+        // A cell beginning with =/+/-/@ is prefixed with `'` and
         // quoted so it imports as text, not an executable formula.
         assert_eq!(
             csv_escape(r#"=HYPERLINK("http://evil")"#),

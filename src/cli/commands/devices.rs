@@ -1,11 +1,10 @@
 //! `warden device` — v1-native CRUD for `[[devices]]` entries.
 //!
-//! Sprint 33 introduced the v1-native flow: every mutation locates the
-//! right `devices.d/*.toml` file (or the master on a single-file layout)
-//! via [`crate::cli::commands::target`] helpers, applies the edit through
-//! a `toml::Value` surgery, runs `loader::load_config`, and reverts on
-//! any validator error. Sprint 34 retired the legacy `warden client`
-//! alias; this module is now the sole device-management surface.
+//! Every mutation locates the right `devices.d/*.toml` file (or the
+//! master on a single-file layout) via [`crate::cli::commands::target`]
+//! helpers, applies the edit through a `toml::Value` surgery, runs
+//! `loader::load_config`, and reverts on any validator error. This
+//! module is the sole device-management surface.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -350,7 +349,7 @@ pub async fn run_add(
         bail!(
             "at least one of --ip or --mac is required — a device without \
              identity is unreachable by the resolver. Examples:\n  \
-             warden device add {id} --ip 192.0.2.42\n  \
+             warden device add {id} --ip 10.10.1.42\n  \
              warden device add {id} --mac AA:BB:CC:DD:EE:FF"
         );
     }
@@ -431,7 +430,6 @@ pub async fn run_add(
 
     println!("added device {id} → {path}", path = target_path.display());
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -466,7 +464,6 @@ pub async fn run_set(
     });
     println!("updated {id}.{field} = {value}");
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -475,9 +472,8 @@ pub async fn run_set(
 
 /// Apply a single field change without printing or reloading. Extracted
 /// so [`run_block`] / [`run_unblock`] can share the mutation logic with
-/// [`run_set`] while emitting a single reload after the compound write
-/// (Sprint 36 HR2: "reload fires ONCE at the end of the compound
-/// mutation, not twice"). Design doc §2 HR2 — atomicity invariant.
+/// [`run_set`] while emitting a single reload after the compound write:
+/// reload fires ONCE at the end of the compound mutation, not twice.
 fn apply_set_inline(
     config_path: &Path,
     id: &str,
@@ -488,7 +484,7 @@ fn apply_set_inline(
     // Locate the file that actually defines the device. With `--into` the
     // operator's explicit choice wins; otherwise resolve the owning file
     // via the include graph so a `set` works even when the device lives in
-    // a non-auto-selected slice (rev2606 target-02).
+    // a non-auto-selected slice.
     let target_path = resolve_existing_target_file(config_path, EntityClass::Devices, id, into)?;
     let (mut doc, _) = read_or_empty(&target_path)?;
 
@@ -532,7 +528,7 @@ pub async fn run_remove(
             referenced_by.join(", ")
         );
     }
-    // verbs-05: also refuse if a schedule still targets this device (e.g. a
+    // Also refuse if a schedule still targets this device (e.g. a
     // `warden device quiet` window). The post-write validator catches it,
     // but with a terser message.
     let sched_refs: Vec<&str> = loaded
@@ -554,7 +550,7 @@ pub async fn run_remove(
     let (mut doc, _) = read_or_empty(&target_path)?;
     let removed = remove_id_keyed(&mut doc, EntityClass::Devices.toml_key(), id)?;
     if !removed {
-        // verbs-02: remove of an absent entity is idempotent (exit 0).
+        // Remove of an absent entity is idempotent (exit 0).
         println!("device \"{id}\" not found — nothing to remove");
         return Ok(());
     }
@@ -571,7 +567,6 @@ pub async fn run_remove(
     });
     println!("removed device {id}");
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -582,8 +577,8 @@ pub async fn run_remove(
 /// profile. Creates `[profiles.blocked]` with `block_all = true` if it
 /// doesn't exist yet. Same semantics as the legacy `warden client block`.
 ///
-/// Sprint 36 HR2: the compound mutation (profile auto-create THEN device
-/// pointer set) emits exactly ONE reload at the end. The up-front
+/// The compound mutation (profile auto-create THEN device pointer set)
+/// emits exactly ONE reload at the end. The up-front
 /// device-exists pre-flight (below) makes the common failure abort before
 /// any write. Residual to be aware of: step 1 writes AND validates the
 /// master before step 2 runs, so a (rare) step-2 failure rolls back only
@@ -597,12 +592,12 @@ pub async fn run_block(
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
     // Pre-flight: confirm the device exists BEFORE touching the profile
-    // file. Sprint 36 panel (Marco, 2026-04-23): without this check, a
-    // `warden device block ghost` call on a master without a `blocked`
-    // profile would auto-create `[profiles.blocked]`, then fail on the
-    // missing device, and leave the half-committed profile on disk.
-    // This check guarantees the compound mutation is all-or-nothing:
-    // either both writes land, or neither does.
+    // file. Without this check, a `warden device block ghost` call on a
+    // master without a `blocked` profile would auto-create
+    // `[profiles.blocked]`, then fail on the missing device, and leave
+    // the half-committed profile on disk. This check guarantees the
+    // compound mutation is all-or-nothing: either both writes land, or
+    // neither does.
     let now = time::OffsetDateTime::now_utc();
     let loaded = load_config(config_path, now).map_err(format_config_errors)?;
     if !loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
@@ -616,17 +611,16 @@ pub async fn run_block(
     // MASTER file because profiles are rarely split; keeping them
     // centralised matches operator intuition. Operators who split
     // profiles can override via --into on a subsequent `warden profile`
-    // mutation — out of scope for S33 MVP.
+    // mutation.
     //
-    // cli-h4: this asked the MASTER's raw TOML whether `blocked` existed,
-    // while `run_quiet` — the same auto-create, four hundred lines down —
-    // asked the merged view. On a split layout with `[profiles.blocked]`
-    // in `profiles.d/`, the raw probe said "absent", so `device block`
-    // upserted a SECOND `blocked` into the master and the loader's
-    // named-map duplicate-key detection refused the write. The verb was
-    // unusable on exactly the layout `warden migrate` produces by default.
-    // Existence questions go to the merged view; only the write target
-    // stays the master.
+    // Existence is checked against the MERGED view, not the master's raw
+    // TOML: on a split layout with `[profiles.blocked]` in
+    // `profiles.d/`, a raw probe of the master alone would say "absent",
+    // so `device block` would upsert a SECOND `blocked` into the master
+    // and the loader's named-map duplicate-key detection would refuse
+    // the write — unusable on exactly the layout `warden migrate`
+    // produces by default. Existence questions go to the merged view;
+    // only the write target stays the master.
     let (mut master_doc, _) = read_or_empty(config_path)?;
     let blocked_existed = loaded.config.profiles.contains_key("blocked");
     if !blocked_existed {
@@ -659,8 +653,8 @@ block_all = true
     println!("blocked device {id}");
     println!("to unblock: warden device unblock {id} --profile <original>");
 
-    // Sprint 36 HR2: post-compound reload — one per `warden device
-    // block`, regardless of whether the blocked profile was auto-created.
+    // Post-compound reload — one per `warden device block`, regardless
+    // of whether the blocked profile was auto-created.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -689,7 +683,6 @@ pub async fn run_unblock(
     });
     println!("updated {id}.profile = {profile}");
 
-    // Sprint 36 HR2: post-write hot reload via the shared helper.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -736,7 +729,7 @@ fn build_device_value(
         tbl.insert("owner".into(), Value::String(v.to_string()));
     }
     if let Some(v) = device_field {
-        // devices-04: write the canonical `device_type` key (the legacy
+        // Write the canonical `device_type` key (the legacy
         // `device` name still loads via the serde alias on the struct).
         tbl.insert("device_type".into(), Value::String(v.to_string()));
     }
@@ -786,7 +779,7 @@ fn apply_device_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Re
             table.insert("display_name".into(), Value::String(value.to_string()));
         }
         "device" | "device_type" => {
-            // devices-04: accept both the canonical `device_type` and the
+            // Accept both the canonical `device_type` and the
             // legacy `device` spelling, but always write the canonical key
             // (and clear any legacy key) so on-disk vocabulary converges.
             table.remove("device");
@@ -803,17 +796,14 @@ fn apply_device_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Re
                 table.insert(field.into(), Value::String(value.to_string()));
             }
         }
-        // `plp-s5c`: the generic field-setter was the last CLI route that
-        // still WROTE a device tag, and it wrote one silently.
-        //
-        // `warden device tag add` announced itself as a tag verb and was
-        // refused by `refuse_tag_writes` at the plp-s3 cutover. This arm
-        // reaches the same `tags` array through a field name, so that
-        // refusal never covered it: `warden device set laptop tags work`
-        // validated, persisted, reloaded and reported success, for a value
-        // that has decided nothing since S3. Operator intent accepted and
-        // dropped on the floor — the exact failure mode the tag model was
-        // retired for.
+        // The generic field-setter is a route to the `tags` array that
+        // `refuse_tag_writes` does not cover — `refuse_tag_writes` guards
+        // `warden device tag add`, a verb that announces itself as a tag
+        // verb, but this arm reaches the same array through a field
+        // name. Left unguarded, `warden device set laptop tags work`
+        // would validate, persist, reload and report success for a value
+        // that decides nothing — operator intent accepted and dropped on
+        // the floor.
         //
         // Refused by name rather than left to the `other` arm below,
         // because "unknown field: tags" would be false: the field exists,
@@ -857,10 +847,11 @@ fn apply_device_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Re
     Ok(())
 }
 
-// ── Sprint C of `lists_categories_v2` (T7-Grp4): set-unfiltered verb
-//    frozen strings + handler. Setting `unfiltered = true` also clears
-//    the `tags` array (D14 mutual exclusion enforced at write time so
-//    the operator can't tell-then-bail-on-validate).
+// ── set-unfiltered verb — frozen strings + handler ─────────────────────
+//
+// Setting `unfiltered = true` also clears the `tags` array — mutual
+// exclusion enforced at write time so the operator can't
+// tell-then-bail-on-validate.
 
 pub const DEVICE_SET_UNFILTERED_OK: &str = "Device '{id}' unfiltered={value}.";
 
@@ -881,7 +872,7 @@ pub fn format_device_set_unfiltered_noop(id: &str, value: bool) -> String {
 /// Operator-facing warning emitted only when `set-unfiltered` flips a
 /// device to `true`. Frozen by the inline pin below — wording chosen to
 /// remind the operator that DNS resolution + query log + stats remain
-/// active so the device is observable, just not filtered (D14).
+/// active so the device is observable, just not filtered.
 pub const DEVICE_SET_UNFILTERED_WARN: &str = "device '{id}' not filtered. Monitoring stays active.";
 
 pub fn format_device_set_unfiltered_warn(id: &str) -> String {
@@ -890,7 +881,7 @@ pub fn format_device_set_unfiltered_warn(id: &str) -> String {
 
 /// `warden devices set-unfiltered <id> <true|false>`. Idempotent. When
 /// `value = true`, also clears the `tags` array in the same write to
-/// preserve D14 mutual exclusion. Emits [`DEVICE_SET_UNFILTERED_WARN`]
+/// preserve the unfiltered/tags mutual exclusion. Emits [`DEVICE_SET_UNFILTERED_WARN`]
 /// in addition to the OK message when the new value is `true`.
 pub async fn run_set_unfiltered(
     config_path: &Path,
@@ -908,10 +899,8 @@ pub async fn run_set_unfiltered(
         .find(|d| d.id.as_str() == id)
         .with_context(|| format!("device '{id}' not found"))?;
 
-    // The no-op test used to have a second half: `unfiltered = true` also
-    // had to clear the device's `tags`, so an already-true device with tags
-    // still had work to do. `plp-s5a` removed the field, so the flag is the
-    // whole state this verb writes.
+    // The flag is the whole state this verb writes, so a device already
+    // at the target value has nothing left to do.
     if dev.unfiltered == value {
         println!("{}", format_device_set_unfiltered_noop(id, value));
         return Ok(());
@@ -926,7 +915,7 @@ pub async fn run_set_unfiltered(
         .ok_or_else(|| anyhow::anyhow!("device entry is not a TOML table"))?;
     tbl.insert("unfiltered".into(), Value::Boolean(value));
     if value {
-        // D14: clear tags atomically so the post-write state is consistent.
+        // Clear tags atomically so the post-write state is consistent.
         tbl.insert("tags".into(), Value::Array(toml::value::Array::new()));
     }
     write_value_validated(config_path, &target_path, &doc)?;
@@ -1058,8 +1047,8 @@ pub fn parse_quiet_duration(
 /// until `now + duration` (or `--until <rfc3339>`). Mirrors the legacy
 /// `warden client quiet` semantics on the v1 schedule shape.
 ///
-/// Sprint 36 HR2: compound mutation (blocked profile + schedule append)
-/// emits ONE reload at the end.
+/// Compound mutation (blocked profile + schedule append) emits ONE
+/// reload at the end.
 pub async fn run_quiet(
     config_path: &Path,
     socket_path: &Path,
@@ -1130,9 +1119,9 @@ block_all = true
             .collect::<String>()
     );
     // `00:00-00:00` is the engine's canonical always-on form (midnight
-    // wrap). NOT `00:00-23:59`: window matching is end-exclusive, which
-    // left the quieted device unfiltered for the 23:59 minute every day
-    // (rev-2606 devices-01).
+    // wrap). NOT `00:00-23:59`: window matching is end-exclusive, so
+    // that form would leave the quieted device unfiltered for the
+    // 23:59 minute every day.
     let sched_entry: Value = toml::from_str(&format!(
         r#"id = "{sched_id}"
 display_name = "Quiet device {id}"
@@ -1180,7 +1169,7 @@ expires_at = "{ts}"
     }
     println!("quieted device {id} until {expires_rfc3339}");
 
-    // Sprint 36 HR2: post-compound reload.
+    // Post-compound reload.
     let outcome = ipc_reload::attempt_reload(socket_path).await;
     ipc_reload::report_reload_outcome(&outcome);
 
@@ -1217,26 +1206,25 @@ servers = ["192.0.2.1:53"]
     }
 
     /// Socket path that definitely does not exist → attempt_reload lands
-    /// on `DaemonUnreachable`, the benign outcome. Sprint 36 HR2 wiring
-    /// is agnostic to the reload outcome for the "change lands on disk"
-    /// assertions below; the reload-triggers tests live further down in
-    /// dedicated `hot_reload` modules.
+    /// on `DaemonUnreachable`, the benign outcome. The "change lands on
+    /// disk" assertions below are agnostic to the reload outcome; the
+    /// reload-triggers tests live further down in dedicated
+    /// `hot_reload` modules.
     fn fake_socket(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("ghost.sock")
     }
 
-    /// cli-h4: `device block` asked the MASTER's raw TOML whether the
-    /// `blocked` profile existed, while `device quiet` — same auto-create,
-    /// same file — asked the merged view. With `[profiles.blocked]` in a
-    /// `profiles.d/` slice the raw probe answered "absent", so block
-    /// upserted a second `blocked` into the master and the loader's
-    /// named-map duplicate-key detection refused the whole write.
+    /// `device block` must check the MERGED view for whether the
+    /// `blocked` profile exists, not the master's raw TOML: with
+    /// `[profiles.blocked]` in a `profiles.d/` slice, a raw probe of the
+    /// master alone would answer "absent", so block would upsert a
+    /// second `blocked` into the master and the loader's named-map
+    /// duplicate-key detection would refuse the whole write.
     ///
-    /// This is the layout `warden migrate v0-to-v1` produces by default,
-    /// so the verb was broken on the normal case and working on the
-    /// single-file one. The fixture puts `blocked` ONLY in the slice: a
-    /// probe that reads the master cannot see it, and the pre-fix code
-    /// fails on the duplicate rather than passing by luck.
+    /// This is the layout `warden migrate v0-to-v1` produces by default.
+    /// The fixture puts `blocked` ONLY in the slice: a probe that reads
+    /// the master cannot see it, so a regression fails on the duplicate
+    /// rather than passing by luck.
     #[tokio::test]
     async fn block_finds_an_existing_blocked_profile_in_an_include_slice() {
         let dir = tempfile::tempdir().unwrap();
@@ -1666,14 +1654,14 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let master = mk_minimal(&dir);
         let sock = fake_socket(&dir);
-        // verbs-02: remove of an absent device returns Ok (exit 0), not an error.
+        // Remove of an absent device returns Ok (exit 0), not an error.
         assert!(run_remove(&master, &sock, "ghost", None).await.is_ok());
     }
 
     #[tokio::test]
     async fn remove_device_with_schedule_ref_refuses() {
-        // verbs-05: a device still targeted by a schedule (e.g. a quiet
-        // window) is refused with a friendly message naming the schedule.
+        // A device still targeted by a schedule (e.g. a quiet window)
+        // is refused with a friendly message naming the schedule.
         let dir = tempfile::tempdir().unwrap();
         let master = dir.path().join("config.toml");
         std::fs::write(
@@ -1719,7 +1707,7 @@ servers = ["192.0.2.1:53"]
 
     #[test]
     fn apply_device_field_accepts_both_device_spellings_and_writes_canonical() {
-        // devices-04: `set device_type` and the legacy `set device` both write
+        // `set device_type` and the legacy `set device` both write
         // the canonical `device_type` key and clear any legacy `device` key.
         let mut entry = Value::Table(toml::map::Map::new());
         apply_device_field(&mut entry, "device_type", "iPad").unwrap();
@@ -1770,7 +1758,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// `plp-s5c`: `device set <id> tags …` must refuse, not write.
+    /// `device set <id> tags …` must refuse, not write.
     ///
     /// The regression this pins is a **silent success**, so the assertion
     /// that carries the weight is the second one: an error alone would
@@ -1890,7 +1878,7 @@ servers = ["192.0.2.1:53"]
             Some("AA:BB:CC:DD:EE:01"),
             Some("default"),
             &[],
-            Some("Alex"),
+            Some("Operator"),
             Some("phone"),
             Some("home"),
             Some("a note"),
@@ -1935,7 +1923,7 @@ servers = ["192.0.2.1:53"]
         assert_eq!(mac.as_deref(), Some("AA:BB:CC:DD:EE:01"));
         assert_eq!(profile.as_ref().map(|p| p.as_str()), Some("default"));
         assert!(groups.is_empty(), "none were passed");
-        assert_eq!(owner.as_deref(), Some("Alex"));
+        assert_eq!(owner.as_deref(), Some("Operator"));
         assert_eq!(device_type.as_deref(), Some("phone"));
         assert_eq!(department.as_deref(), Some("home"));
         assert_eq!(notes.as_deref(), Some("a note"));
@@ -2090,10 +2078,10 @@ servers = ["192.0.2.1:53"]
 
     #[tokio::test]
     async fn cli_mutation_succeeds_with_expired_schedule_on_disk() {
-        // rev-2606 schema-validator-01 regression: before the fix, every
-        // entity verb ended in validate_or_revert → load_config → hard
-        // error about the unrelated expired schedule, so `warden device
-        // add` (and everything else) was bricked until a hand-edit.
+        // Every entity verb ends in validate_or_revert → load_config, so
+        // an unrelated expired schedule on disk must not hard-error
+        // there — that would brick `warden device add` (and everything
+        // else) until a hand-edit.
         let dir = tempfile::tempdir().unwrap();
         let master = mk_with_expired_quiet(&dir);
         let sock = fake_socket(&dir);
@@ -2151,16 +2139,16 @@ servers = ["192.0.2.1:53"]
                 .is_some_and(|exp| exp > time::OffsetDateTime::now_utc()),
             "fresh quiet row expires in the future"
         );
-        // rev-2606 devices-01: the quiet window must be the canonical
-        // always-on form — `00:00-23:59` is end-exclusive and left the
-        // device unfiltered for one minute nightly.
+        // The quiet window must be the canonical always-on form —
+        // `00:00-23:59` is end-exclusive and would leave the device
+        // unfiltered for one minute nightly.
         assert_eq!(
             loaded.config.schedules[0].hours, "00:00-00:00",
             "quiet writes the gap-free all-day window"
         );
     }
 
-    // ── Sprint 36 HR2: hot-reload wiring ───────────────────────────────
+    // ── Hot-reload wiring ────────────────────────────────────────────────
 
     use super::super::hr2_test_support::{
         assert_single_reload_with_resolved_token, env_home, seed_token_for_test, stub_reload_ok,
@@ -2202,9 +2190,8 @@ servers = ["192.0.2.1:53"]
         // With no stub listening and no token file, the operation must
         // succeed on disk and the reload attempt must degrade to
         // DaemonUnreachable + NoToken (both benign). The CLI exit code
-        // stays 0; the mutation is visible in the TOML file. This is
-        // the Sprint 36 HR2 "post-write reload never fails the command"
-        // invariant.
+        // stays 0; the mutation is visible in the TOML file — a
+        // post-write reload failure never fails the command.
         let dir = tempfile::tempdir().unwrap();
         let master = mk_minimal(&dir);
         let sock = fake_socket(&dir);
@@ -2231,8 +2218,8 @@ servers = ["192.0.2.1:53"]
 
     #[tokio::test]
     async fn block_device_reverts_when_device_not_found() {
-        // Panel refinement (review 2026-04-23, Marco): compound mutation
-        // atomicity. `run_block` first auto-creates the `blocked` profile
+        // Compound mutation atomicity. `run_block` first auto-creates
+        // the `blocked` profile
         // (if missing), then sets the device's profile pointer. If the
         // second step fails (e.g. device id unknown), the profile insert
         // must NOT survive on disk — the compound mutation is all-or-
@@ -2260,7 +2247,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    // ── Sprint C T7-Grp4: device set-unfiltered verb ───────────────────
+    // ── device set-unfiltered verb ──────────────────────────────────────
 
     #[test]
     fn lc2_c_t7_grp4_device_set_unfiltered_ok_const_pinned() {
@@ -2305,19 +2292,17 @@ servers = ["192.0.2.1:53"]
         assert!(err.to_string().contains("ghost"), "got: {err}");
     }
 
-    // ── cli-h10: `device show` prints the state that changes filtering ──
+    // ── `device show` prints the state that changes filtering ────────────
     //
     // `unfiltered`, `allow_rules`, `deny_rules` and `override_profile_deny`
-    // all change what the resolver does to a device's queries, and none of
-    // them appeared in the detail view. So after
-    // `warden device set-unfiltered iot-fridge true` — a verb this repo
-    // ships — no command in the product would tell you the fridge had
-    // stopped being filtered.
+    // all change what the resolver does to a device's queries, so all
+    // must appear in the detail view — otherwise, after
+    // `warden device set-unfiltered iot-fridge true`, no command in the
+    // product would tell you the fridge had stopped being filtered.
     //
     // The first three are printed UNCONDITIONALLY. A field that appears
     // only when true teaches the operator that absence means false, which
-    // is indistinguishable from "this build does not show that field" —
-    // exactly the class of defect this sprint exists to kill.
+    // is indistinguishable from "this build does not show that field".
 
     fn device_from_toml(src: &str) -> Device {
         toml::from_str(src).expect("fixture device must deserialise")

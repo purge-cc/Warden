@@ -5,7 +5,7 @@
 //!
 //! ## Archetypes — pick one, they are the whole contract
 //!
-//! §4.61 D11 (revised) says there are exactly **two** shapes. Which one a
+//! There are exactly **two** shapes. Which one a
 //! surface is decides which functions it calls; there is no third option
 //! and no "mostly a form".
 //!
@@ -28,8 +28,8 @@
 //! with room the output is identical to a fixed body — what scrolling adds
 //! is that the **tail is allocated first**, so the action row survives even
 //! when the space does not. Choosing a fixed body buys nothing and
-//! re-opens `lists-modal-min-height-clip`, a defect this repo has paid for
-//! twice.
+//! re-opens the min-height clipping defect this repo has paid for
+//! more than once.
 //!
 //! Reference implementation: `tabs/lists.rs::render_edit_modal` — the
 //! operator-validated surface every other form is measured against.
@@ -42,7 +42,7 @@
 //! [`choice_rows`], then the same [`render_modal`].
 //!
 //! Its row budget is the tightest in the ecosystem — **12** interior rows
-//! at the D18 floor, of which the head takes 2 and the tail
+//! at the minimum-terminal floor, of which the head takes 2 and the tail
 //! `hint_rows + keys + actions`. Three things follow, and a new consumer
 //! that gets them wrong fails silently:
 //!
@@ -58,9 +58,6 @@
 //!   ([`ScrollBody::scrollable`]) — such a body must be sized to fit,
 //!   because overflow is cut with no affordance saying so.
 //!
-//! The frozen contract, with a worked disabled-option example and the
-//! numbers behind the budget, is
-//! `_docs/features/tui_modal_contract_v1.md`.
 //!
 //! ## Colour rule (frozen — do not re-derive per surface)
 //!
@@ -69,7 +66,7 @@
 //! single live focus and nothing else. Category colour
 //! (`scope_privacy` / `scope_security` / `scope_content`) appears **only**
 //! on tag chips — on data, never on chrome. `brand_red` is the title-band
-//! tick and destructive copy, and **never a border** (D15). Exactly one
+//! tick and destructive copy, and **never a border**. Exactly one
 //! filled action per modal: the [`ActionKind::Primary`] one, `warden_teal`
 //! fill with a `text_inverse` label.
 //!
@@ -79,22 +76,22 @@
 //! returns the moment focus leaves. See
 //! `theme::tests::focus_bar_admits_only_high_contrast_foregrounds`.
 //!
-//! New colour pairs are measured against **`bg_elevated` #262626** (D14),
+//! New colour pairs are measured against **`bg_elevated` #262626**,
 //! not against a nominal dark background — the modal never paints one.
 //!
 //! ## Input contract
 //!
-//! A surface keeps its **own keying** across migration (D7′): real
+//! A surface keeps its **own keying** across migration: real
 //! terminal cursor, `Ctrl+S`, `Enter`-submits, popup pickers. Only chrome,
 //! layout and colour are shared. Muscle memory is not part of the
 //! redesign, which is why [`nav_keys_line`] takes the caller's copy rather
 //! than advertising a fixed legend.
 //!
-//! ## Legacy layering — gone as of §4.63 S2c
+//! ## Legacy layering — gone
 //!
 //! An older grey `Field │ Value` grid survived here for as long as
-//! `tabs/devices` was unmigrated. §4.63 S2c migrated it to Archetype F,
-//! which orphaned the layer outright, and it was **deleted**: `FieldKind`,
+//! `tabs/devices` was unmigrated. Migrating it to Archetype F
+//! orphaned the layer outright, and it was **deleted**: `FieldKind`,
 //! `FieldRow` (+ its constructors), `Button`, `button_row`, `button_span`,
 //! `section_lines`, `grid_row`, `grid_rule`, `decorate`, `value_color` and
 //! `GRID_RULE_COL` — about 430 lines with their tests.
@@ -131,8 +128,8 @@ pub const GRID_LABEL_W: usize = 18;
 /// on the elevated surface, and return the inner rect for the body.
 ///
 /// This is the only chrome entry point: the full-frame variant it used to
-/// extend was retired with §4.61 Wave 2 (D18 makes the tab content rect
-/// the anchor, never `f.area()`).
+/// extend is retired — the tab content rect is always
+/// the anchor, never `f.area()`.
 ///
 /// `anchor` is the rect to centre within. Pass a sub-rect when the modal
 /// must deliberately not cover the whole frame — the Devices client form
@@ -170,8 +167,8 @@ pub fn render_chrome_in(
 }
 
 /// Render a body whose rows are already laid out to exactly fill the
-/// modal — no wrapping. The only body renderer; the wrapping one was
-/// retired with §4.61 Wave 2.
+/// modal — no wrapping. The only body renderer; the wrapping one is
+/// retired.
 ///
 /// Wrapping is actively harmful for such a body. Under `Wrap { trim: false }`
 /// a line costs a second rendered row when it is **over-width** or
@@ -282,8 +279,9 @@ pub fn scroll_layout(
 /// whether a scrollbar column will be claimed.
 ///
 /// **Not a consumer-facing entry point.** A surface that asks this by hand
-/// then has to remember to rebuild its rows one column narrower, and twelve
-/// surfaces each remembering that is the drift §4.61 Wave 1 exists to end.
+/// then has to remember to rebuild its rows one column narrower, and every
+/// surface each remembering that is exactly the drift this ecosystem
+/// exists to end.
 /// Call [`render_modal`], which resolves the width internally. This
 /// stays public only so the allocation rule can be asserted directly.
 pub fn will_scroll(avail: usize, head: usize, fields: usize, tail: usize) -> bool {
@@ -471,8 +469,7 @@ pub fn title_band(title: &str, width: u16) -> Line<'static> {
 /// Teal, not grey: the description is *static info*, which the ecosystem
 /// colour rule paints teal. This is the Lists pilot's `edit_desc_band`
 /// promoted; the grey-on-`bg_surface` variant it replaced was never
-/// measured against `bg_elevated` (D14), whereas teal was, in the v0.24.4
-/// palette pass.
+/// measured against `bg_elevated`, whereas teal was.
 ///
 /// ## No background here — and the reason is narrower than it used to be
 ///
@@ -488,8 +485,7 @@ pub fn title_band(title: &str, width: u16) -> Line<'static> {
 /// - **a strip of its own, in a different tone**, is a heading with two
 ///   registers rather than two selections. The description then reads as
 ///   part of the heading rather than as the first line of the body, which
-///   is what the operator asked for on 2026-08-07 after living with §4.65
-///   UX1's per-section blurbs.
+///   is what the operator asked for after living with per-section blurbs.
 ///
 /// So this single-line, surface-coloured variant **stays**, and stays the
 /// default: [`notice_body`] builds every Archetype-C head from it, where
@@ -541,7 +537,7 @@ pub fn desc_band(text: &str, width: u16) -> Line<'static> {
 ///
 /// The obvious edit here is to reuse [`title_band`]'s `bg_highlight`, so
 /// the heading is one unbroken strip. It was written that way first, and
-/// it was **measured and rejected on 2026-08-07**:
+/// it was **measured and rejected**:
 ///
 /// | pair | ratio | verdict |
 /// |---|---|---|
@@ -730,7 +726,7 @@ pub(crate) mod desc_band2_assert {
             }
         }
 
-        // §4.63 S2a+S2c: a form can lose its action row to a head that grew
+        // A form can lose its action row to a head that grew
         // and still look complete, while the focus ring keeps reaching the
         // buttons that are no longer drawn.
         for a in actions {
@@ -764,9 +760,8 @@ pub(crate) mod desc_band2_assert {
 pub const VALUE_COL: usize = 2 + GRID_LABEL_W + 2;
 
 /// What a row's value *is* — the sole input to its colour, per the palette
-/// spec §3. No caller passes a `Color`, so a value's meaning can never be
-/// decided by where the widget sits or how deeply it nests (spec §8
-/// acceptance check 3).
+/// spec. No caller passes a `Color`, so a value's meaning can never be
+/// decided by where the widget sits or how deeply it nests.
 ///
 /// Colours here are resting colours. On the focus bar every kind renders
 /// `text_primary` instead: `bg_highlight` is the lightest surface the theme
@@ -792,7 +787,7 @@ impl ValueKind {
     pub fn color(self) -> Color {
         match self {
             // Editable text recedes at rest and comes to full strength
-            // under focus (spec §3: `text_muted_hi` → `text`), so the
+            // under focus (`text_muted_hi` → `text`), so the
             // value itself carries a focus signal beyond the bar.
             ValueKind::Editable => T.text_secondary,
             ValueKind::Identity => T.scope_privacy,
@@ -832,8 +827,7 @@ pub fn section_band(label: &str, width: u16) -> [Line<'static>; 2] {
 /// becomes a full-width `bg_highlight` bar led by an emerald `▌` rule and
 /// closed by a `◀` marker, and the value drops to `text_primary`. That is
 /// three "you are here" signals — rule, bar, marker — of which only one is
-/// colour, so focus stays locatable with colour vision disabled (spec §8
-/// acceptance check 6).
+/// colour, so focus stays locatable with colour vision disabled.
 ///
 /// `placeholder` shows when a text value is empty and unfocused.
 ///
@@ -949,7 +943,7 @@ pub fn selector_row(label: &str, value: &str, focused: bool, width: u16) -> Line
 /// *means* via its [`ValueKind`], so `nature` reads red on Block and sage on
 /// Allow without the renderer knowing either word.
 ///
-/// A glyph alone is too weak at terminal sizes (spec §3), so the selected
+/// A glyph alone is too weak at terminal sizes, so the selected
 /// side carries both the filled `●` and full-strength colour while the
 /// unselected side drops to `text_disabled` — genuinely inactive content,
 /// the one place the sub-threshold grey belongs.
@@ -1088,7 +1082,7 @@ pub fn collapse_row(
 /// optional plain-language `note` explaining it. Never focusable — this is
 /// something the operator can see but not change from here.
 ///
-/// Colour *and* copy change together (spec §8 acceptance check 4): pass a
+/// Colour *and* copy change together: pass a
 /// `note` for the states that need explaining and `""` for the ones that do
 /// not. Colour alone would leave an operator who does not know the palette
 /// none the wiser.
@@ -1179,7 +1173,7 @@ impl Action {
 /// Right-aligned action row for the ecosystem modals.
 ///
 /// Diverges from `button_row` — still used by the older grid forms — on
-/// spec §4's rule: **exactly one filled button per modal**. The
+/// the rule: **exactly one filled button per modal**. The
 /// [`ActionKind::Primary`] action takes the solid `warden_teal` fill with
 /// an inverse label (4.79:1, the only fill in the modal that clears AA);
 /// destructive and neutral actions are colour-only. A filled red sitting
@@ -1282,17 +1276,18 @@ impl FormRows {
     /// call sites build a form, and seven of them are surfaces this change
     /// does not own (`group_modal`, `local_dns_modal`, `subnet_modal`,
     /// `tabs/devices`, `tabs/tags` ×3). Changing `new`'s signature would
-    /// have made every one of them re-derive its own D18 floor budget to
-    /// stay honest — the blast radius that cost the Devices form its
-    /// `Save`, `Cancel` and 9 of 13 fields under §4.63 S2a+S2c, and the
+    /// have made every one of them re-derive its own row-budget floor to
+    /// stay honest — the same blast radius that once cost the Devices form
+    /// its `Save`, `Cancel` and 9 of 13 fields when its head grew without
+    /// re-deriving that budget, and the
     /// same reasoning that made [`TailNote`] a per-call value instead of an
     /// edit to [`HINT_ROWS`].
     ///
     /// ## The row it costs, and where it comes from
     ///
     /// The head goes from 3 rows to **4**. [`scroll_layout`] serves the
-    /// tail first and the head second, so at the D18 floor's 12 interior
-    /// rows that row comes straight out of the **field viewport**:
+    /// tail first and the head second, so at the minimum-terminal floor's
+    /// 12 interior rows that row comes straight out of the **field viewport**:
     /// a default-tail surface goes 4 visible field rows → 3, and one
     /// declaring `TailNote { rows: 3, .. }` goes 3 → 2.
     ///
@@ -1330,7 +1325,7 @@ impl FormRows {
         self.lines.extend(section_band(label, self.width));
     }
 
-    // `section_with_blurb` lived here from §4.65 UX1(c) until 2026-08-07:
+    // `section_with_blurb` used to live here:
     // `section()` plus two `text_secondary` rows of per-section prose. It
     // is **deleted**, not deprecated — `profile_modal` was its only
     // consumer, and a `pub` item with no non-test caller fails
@@ -1340,8 +1335,8 @@ impl FormRows {
     //
     // What replaced it is [`FormRows::new_desc2`]: the same explanatory job
     // done **once, in the heading**, instead of once per section. The
-    // operator's report after using §4.65 UX1 was that five two-row blurbs
-    // read as five interruptions of a form they had already understood.
+    // operator's report after using the old approach was that five two-row
+    // blurbs read as five interruptions of a form they had already understood.
     // The trade in rows is worth stating, because it is not the obvious
     // direction: the blurbs cost 10 rows of `fields` (scrolling, cheap),
     // the band costs 1 row of `head` (pinned, and taken straight out of the
@@ -1435,14 +1430,15 @@ pub fn form_tail(
     form_tail_with_status(rows, None, error, fallback, keys, actions)
 }
 
-/// How a surface wants its tail's note region drawn (§4.65 UX1(c)).
+/// How a surface wants its tail's note region drawn.
 ///
 /// This exists as a **per-call** value rather than as an edit to
 /// [`HINT_ROWS`]. Bumping the constant to give one modal a taller help
 /// region resizes the region on every Archetype-F modal in `src/tui/` at
-/// once, each of which then needs its D18 floor re-verified — the exact
-/// blast radius that cost the Devices form its `Save`, `Cancel` and 9 of
-/// 13 fields under §4.63 S2a+S2c. `Default` reproduces the shared
+/// once, each of which then needs its own row-budget floor re-verified —
+/// the exact blast radius that once cost the Devices form its `Save`,
+/// `Cancel` and 9 of 13 fields when its head grew without re-deriving
+/// that budget. `Default` reproduces the shared
 /// behaviour byte for byte, so a surface that says nothing keeps it.
 #[derive(Clone, Copy, Debug)]
 pub struct TailNote {
@@ -1484,8 +1480,8 @@ pub fn form_tail_with_note(
 /// Archetype F's tail used to offer exactly two states — `error`
 /// (`⚠` + error colour) and `hint` (muted italic) — so both Rules modals
 /// shipped their `adding…` / `saving…` through the hint, by handing the
-/// status to *every* row in place of its own guidance
-/// (`s4-63-form-transient-status-slot`). Two silent losses: the status
+/// status to *every* row in place of its own guidance.
+/// Two silent losses: the status
 /// wore the hint's muted italic instead of a status colour, and the
 /// guidance for the field the operator is standing on vanished for the
 /// duration of the submit.
@@ -1620,8 +1616,6 @@ fn note_rows(
 // Shipped consumers: `scope_modal` (menu + all four confirm stages),
 // `resolver_modal`, and the remove-confirm / outcome stages of
 // `subnet_modal`, `local_dns_modal`, `profile_modal` and `tabs/rules`.
-// The frozen contract every new one builds against is
-// `_docs/features/tui_modal_contract_v1.md`.
 
 /// A paragraph row of an Archetype-C body: 2-cell indent.
 ///
@@ -1780,7 +1774,7 @@ fn prose_style(row: &ProseRow) -> Style {
 /// is **ellipsised, never dropped**, when the row cannot hold it whole.
 ///
 /// That inverts the original rule ("half an explanation is worth less
-/// than a clean row"), which shipped as `s4-63-g4-choicerow-detail-truncated`:
+/// than a clean row"):
 /// at the real 62-column interior a label plus any useful sentence runs
 /// past the width, so *every* detail was silently discarded and nothing on
 /// screen distinguished "this option has no explanation" from "its
@@ -1804,25 +1798,24 @@ pub struct ChoiceRow {
     /// The variant decides whether the option is also **unselectable** —
     /// one field rather than a `disabled: bool` beside a reason string,
     /// because "disabled and silent about it" is exactly the state
-    /// `s4-63-g5-disabled-option-reason` was filed against, and the type
-    /// should not be able to express it.
+    /// this type should not be able to express.
     ///
     /// Named `note`, not `reason`, because it holds **two different things**
     /// and only one of them is a reason: [`ChoiceNote::Blocked`] says *why
     /// the option cannot be chosen*, while [`ChoiceNote::Detail`] — which
-    /// §4.65 UX1 gave to choosable options — says *what the option does*.
+    /// choosable options also carry — says *what the option does*.
     /// The field was named for the disabled case it started as; once
     /// choosable entries took the same row, "reason" described the minority
-    /// of its contents (`s465-ux6-choicerow-reason-misnomer`).
+    /// of its contents.
     pub note: Option<ChoiceNote>,
 }
 
 /// The text under a [`ChoiceRow`], and what it says about the option.
 ///
-/// §4.65 UX1(a) widened this from a bare reason string to a two-variant
+/// This widened from a bare reason string to a two-variant
 /// note. The **mechanism** — a guaranteed, indented row that never has to
 /// win a fight with the label for the width — is unchanged and is the whole
-/// point of reusing it: `s4-63-g4-choicerow-detail-truncated` closed the
+/// point of reusing it: it closed the
 /// "detail silently dropped" failure mode by ellipsising inline instead,
 /// and shipped the remainder the operator hit next — at a 62-column
 /// interior a real label plus a real sentence leaves the sentence about 27
@@ -1832,12 +1825,20 @@ pub struct ChoiceRow {
 /// So a choosable option now takes the same row a disabled one always had.
 /// What it must **not** take is a row whose presence depends on whether the
 /// text happened to fit — that is the width-dependent row count
-/// [`choice_rows`]'s doc forbids, and the design g4 explicitly rejected.
+/// [`choice_rows`]'s doc forbids.
 #[derive(Clone, Debug)]
 pub enum ChoiceNote {
     /// What this option *means*. The option stays choosable.
     Detail(String),
     /// Why this option **cannot** be chosen. Also recesses the label.
+    ///
+    /// No consumer builds one today. Kept because it is half of the
+    /// mechanism [`choice_rows`] documents — a reason is the only thing
+    /// on screen that explains an option the operator can see but cannot
+    /// pick — and dropping it would take `blocks()` and the label
+    /// recession with it, leaving the next picker with an unselectable
+    /// option to express and nothing to express it with.
+    #[allow(dead_code)]
     Blocked(String),
 }
 
@@ -1895,7 +1896,7 @@ fn choice_row_count(row: &ChoiceRow) -> usize {
 ///
 /// ## Why an option's explanation gets a whole row
 ///
-/// It started as the disabled case (`s4-63-g5-disabled-option-reason`): a
+/// It started as the disabled case: a
 /// reason is the only thing on screen that explains an entry the operator
 /// can see but cannot pick, and both affordances that cover a *choosable*
 /// option structurally miss it — an inline detail is ellipsised at the
@@ -1903,7 +1904,7 @@ fn choice_row_count(row: &ChoiceRow) -> usize {
 /// 62), and the tail's hint row only ever shows the FOCUSED option's copy,
 /// while every consumer's cursor skips disabled entries.
 ///
-/// §4.65 UX1(a) found the second half of the same argument: the hint row
+/// The second half of the same argument: the hint row
 /// covers exactly *one* choosable option, so every other one is reading a
 /// stub. A picker's whole job is to let the operator compare options they
 /// are **not** standing on. So a `ChoiceNote::Detail` buys the same row —
@@ -2049,7 +2050,7 @@ pub struct NoticeSpec {
 /// and options share the scrolling region, prose first.
 ///
 /// Prose is caller-controlled and unbounded, so pinning it would let it
-/// compete with the options for the 12 interior rows the D18 anchor leaves
+/// compete with the options for the 12 interior rows the anchor leaves
 /// at the 80×24 floor — and [`scroll_layout`] serves the head before the
 /// fields, so three prose rows would render **zero** options while
 /// `focus_row` still pointed at one. That failure is silent by
@@ -2058,13 +2059,14 @@ pub struct NoticeSpec {
 /// delete confirm with a two-sentence warning and a blank line is three
 /// prose rows. See `notice_body_never_starves_the_option_list_at_the_floor`.
 ///
-/// ## The row budget (§4.63 S1)
+/// ## The row budget
 ///
-/// At the D18 floor the interior is **12 rows**, and Archetype C used to
-/// spend **8** of them on chrome: a 3-row head and a 5-row tail whose hint
+/// At the minimum-terminal floor the interior is **12 rows**, and
+/// Archetype C used to spend **8** of them on chrome: a 3-row head and a
+/// 5-row tail whose hint
 /// region was fixed at [`HINT_ROWS`] whether or not the surface had
 /// anything to put in it. Two structurally blank rows and a spacer, on the
-/// tightest budget in the ecosystem — filed as `s-modalform-c-tail-budget`.
+/// tightest budget in the ecosystem.
 ///
 /// It now costs **2 + tail**:
 ///
@@ -2202,8 +2204,7 @@ impl<C> ModalRender<C> {
 /// get it wrong, silently, in a way only a real terminal shows.
 ///
 /// The border accent is not a parameter: chrome stays neutral grey under
-/// the ecosystem colour rule, and `brand_red` never becomes a modal border
-/// (D15).
+/// the ecosystem colour rule, and `brand_red` never becomes a modal border.
 pub fn render_modal<C>(
     f: &mut Frame,
     anchor: Rect,
@@ -2288,8 +2289,8 @@ fn push_row_lead(spans: &mut Vec<Span<'static>>, focused: bool, label: &str, lab
 /// `width` cells and padded out to exactly that many rows.
 ///
 /// Two properties a single-line validation row cannot give a non-wrapping
-/// body — and the reason the single-line variant was retired with §4.61
-/// Wave 2: an error longer than one row stays readable instead of being
+/// body — and the reason the single-line variant is retired: an error
+/// longer than one row stays readable instead of being
 /// silently cut mid-word, and the row count is constant, so the rest of
 /// the modal never shifts when an error appears.
 ///
@@ -2439,7 +2440,7 @@ pub fn hint_or_error_rows(
             // "something was cut" and leaves the operator with no way to
             // judge whether the part they need is in the missing piece —
             // for this refusal the missing piece is both recovery
-            // commands. §4.64 G2 set the precedent: a fixed region with
+            // commands. A fixed region with
             // the remainder named rather than hidden.
             let dropped = wrapped.len() - i;
             // Names a way OUT, not just a fact. An operator who cannot see
@@ -2608,7 +2609,7 @@ mod tests {
         assert_eq!(line.spans[0].style.fg, Some(T.warden_teal));
     }
 
-    // ── desc_band2 — the twins (§4.68, 2026-08-07) ────────────────────
+    // ── desc_band2 — the twins ────────────────────────────────────────
     //
     // `desc_band` keeps all three tests above unchanged, including the one
     // pinning the ABSENCE of a background: it did not change, and the three
@@ -2626,7 +2627,7 @@ mod tests {
     /// `bg_highlight` would make the heading one unbroken strip and put
     /// teal at 3.37:1 against a 4.5:1 prose bar, which
     /// `theme::contrast_gate_holds_for_every_text_pair` cannot see because
-    /// it does not enumerate that background. Measured 2026-08-07; the
+    /// it does not enumerate that background. The
     /// reasoning is on `desc_band2`.
     #[test]
     fn desc_band2_paints_its_own_bg_main_strip_across_both_full_rows() {
@@ -2709,7 +2710,7 @@ mod tests {
 
     /// The one row this costs, pinned where it is spent. `scroll_layout`
     /// serves the head before the fields, so a fourth head row comes
-    /// straight out of the field viewport at the D18 floor.
+    /// straight out of the field viewport at the minimum-terminal floor.
     #[test]
     fn new_desc2_head_is_one_row_taller_than_new() {
         let plain = FormRows::new("EDIT", "d", 60).finish(vec![]).0;
@@ -2732,17 +2733,14 @@ mod tests {
         );
     }
 
-    /// Every modal centres on the **anchor**, not the frame — decision D18.
+    /// Every modal centres on the **anchor**, not the frame.
     /// The anchor is the tab content area, so the header, the menu card and
     /// the footer legend all stay visible beneath an open modal; centring on
-    /// `f.area()` would occlude them, which §4.62 **N1** independently
-    /// forbids.
+    /// `f.area()` would occlude them.
     ///
-    /// *(Rationale corrected in §4.63 S2c: this used to justify itself by
-    /// the Devices form being anchored over the list column. Devices no
-    /// longer calls `render_chrome_in` at all — [`render_modal`] is now its
-    /// only caller, so the property is the ecosystem-wide one, not one
-    /// surface's.)*
+    /// *(This is an ecosystem-wide property, not one surface's: the
+    /// Devices form no longer anchors `render_chrome_in` over the list
+    /// column specifically — [`render_modal`] is now its only caller.)*
     #[test]
     fn render_chrome_in_centres_on_the_anchor_not_the_frame() {
         use ratatui::backend::TestBackend;
@@ -2811,9 +2809,9 @@ mod tests {
         assert_eq!(banded, titled);
     }
 
-    // ── §4.61 Wave 1: the form builder ────────────────────────────────
+    // ── The form builder ─────────────────────────────────────────────
 
-    /// R3, the load-bearing one: a scrolling body must be REBUILT one
+    /// The load-bearing invariant: a scrolling body must be REBUILT one
     /// column narrower, because the scrollbar paints over the last column
     /// either way. This used to be an instruction in `will_scroll`'s doc
     /// that every caller had to remember.
@@ -2934,7 +2932,7 @@ mod tests {
         assert!(!text.contains("fallback"), "{text}");
     }
 
-    // ── §4.61 Wave 1: Archetype C ─────────────────────────────────────
+    // ── Archetype C ──────────────────────────────────────────────────
 
     fn choice(label: &str, detail: Option<&str>, focused: bool) -> ChoiceRow {
         ChoiceRow {
@@ -3008,9 +3006,9 @@ mod tests {
             flatten(&body.fields).contains("some context"),
             "prose leads the scrolling region, it is not pinned"
         );
-        // Two, not three: §4.63 S1 gave the blank row back to the field
-        // region. It belongs to Archetype F, where it separates the bands
-        // from the first section band, and C has no sections.
+        // Two, not three: the blank row belongs to Archetype F, where it
+        // separates the bands from the first section band, and C has no
+        // sections.
         assert_eq!(body.head.len(), 2, "only title + desc are pinned");
 
         let read_only = notice_body(&base, 60);
@@ -3054,8 +3052,7 @@ mod tests {
     }
 
     /// Was `choice_detail_is_dropped_not_clipped_when_it_does_not_fit`,
-    /// which pinned the behaviour `s4-63-g4-choicerow-detail-truncated`
-    /// was filed against. The body still does not wrap — the detail is
+    /// pinning the opposite behaviour. The body still does not wrap — the detail is
     /// ellipsised into the row instead, which is what every other row
     /// vocabulary in this module does and the only variant that tells the
     /// operator something was cut.
@@ -3114,7 +3111,7 @@ mod tests {
 
     /// Prose is caller-controlled and unbounded. Pinned in the head it
     /// would compete with the options for the same 12 interior rows the
-    /// D18 anchor leaves at 80x24 — and `scroll_layout` serves head before
+    /// anchor leaves at 80x24 — and `scroll_layout` serves head before
     /// fields, so three prose rows render ZERO options while `focus_row`
     /// still points at one. No panic, and `will_scroll` reports false
     /// (it needs `view_h > 0`), so not even a scrollbar hints at it.
@@ -3161,7 +3158,7 @@ mod tests {
         );
     }
 
-    // ── §4.63 S1: the Archetype-C row budget ──────────────────────────
+    // ── The Archetype-C row budget ──────────────────────────────────────
 
     /// A five-option picker with a one-line hint, the shape
     /// `scope_modal::menu_notice` actually builds — including its
@@ -3184,11 +3181,9 @@ mod tests {
         }
     }
 
-    /// Pins `s-modalform-c-tail-budget`.
-    ///
     /// Archetype C's tail used to be Archetype F's: a spacer, a FIXED
     /// two-row hint region and the two control rows — five of the twelve
-    /// interior rows the D18 anchor leaves at the 80×24 floor, two of them
+    /// interior rows the anchor leaves at the 80×24 floor, two of them
     /// structurally blank. F pins that region because a form must not
     /// shift under the operator's cursor when an error appears; C has no
     /// such body, so it pays for what it writes and nothing else.
@@ -3212,8 +3207,8 @@ mod tests {
     }
 
     /// The same budget, spent: five options and a hint on screen together
-    /// at the D18 floor. Asserted on the rendered buffer, because the line
-    /// vector was correct every previous time this class of defect shipped.
+    /// at the minimum-terminal floor. Asserted on the rendered buffer,
+    /// because the line vector can be correct while the render is wrong.
     #[test]
     fn c_option_list_keeps_every_option_on_screen_at_the_d18_floor() {
         let spec = picker_spec("affects only this device");
@@ -3293,8 +3288,7 @@ mod tests {
             .collect()
     }
 
-    /// Second half of `s-modalform-c-tail-budget`: a prose-only C body
-    /// drew a scrollbar nothing could move.
+    /// A prose-only C body used to draw a scrollbar nothing could move.
     ///
     /// Prose carries no focus, so `focus_row` is `None`, so
     /// `render_scroll_body`'s offset is pinned at 0 — but the bar still
@@ -3321,11 +3315,9 @@ mod tests {
         );
     }
 
-    // ── §4.63 S1: G4 / G5 — an option's explanation must survive ──────
+    // ── An option's explanation must survive ────────────────────────────
 
-    /// Pins `s4-63-g4-choicerow-detail-truncated`.
-    ///
-    /// `choice_row` dropped a detail it could not fit whole. At the real
+    /// `choice_row` used to drop a detail it could not fit whole. At the real
     /// 62-column interior that is every non-trivial one — all five of the
     /// scope modal's descriptions vanished, and nothing on screen said so.
     /// Everything else in this module ellipsises (`fit`, `desc_band`,
@@ -3516,11 +3508,11 @@ mod tests {
         );
     }
 
-    /// The sibling invariant on [`choice_rows`]. Its doc has named this
-    /// test since §4.61 Wave 1; it had never been written.
+    /// The sibling invariant on [`choice_rows`]. Its doc has long named
+    /// this test; only now does it exist.
     #[test]
     fn choice_rows_row_count_never_varies_with_width() {
-        // §4.65 UX1(a): both `ChoiceNote` variants, and a note long
+        // Both `ChoiceNote` variants, and a note long
         // enough to spill past one `NOTE_WRAP` chunk. Exercising only the
         // one-chunk case would leave the spill path — the only part of
         // this function that computes a count at all — unpinned, and the
@@ -3557,23 +3549,16 @@ mod tests {
         }
     }
 
-    // ── §4.65 UX2 — the suggestions row scrolls instead of being cut ──
-    //
-    // Deliberately NOT a "returns one line" test: `chip_suggestions_row`
-    // returns a `Line`, so that assertion cannot fail and would be a
-    // green light over any defect. What the window actually has to buy is
-    // below — the row fits, and the chip the operator is standing on is
-    // inside it.
-
-    // `plp-s5d` removed the four suggestion-window tests
+    // The four suggestion-window tests
     // (`the_suggestions_row_fits_its_width_at_every_focus`,
     // `the_focused_suggestion_is_always_inside_the_window`,
     // `the_overflow_markers_account_for_every_hidden_suggestion`,
-    // `a_suggestion_list_that_fits_carries_no_overflow_marker`) along with
+    // `a_suggestion_list_that_fits_carries_no_overflow_marker`) are gone,
+    // along with
     // `suggestion_window` / `chip_suggestions_row` / `chip_picker_row` /
     // `chip_cells` / `tag_chip_color`, the primitives they tested.
     //
-    // No substitute: these were §4.65 UX2 guarantees about the tag chip
+    // No substitute: these were guarantees about the tag chip
     // picker's scrolling suggestion row, and no surviving modal_form widget
     // has a windowed row. The guarantees leave with the widget.
     // `the_suggestions_label_names_its_navigation_key` went with them.
@@ -3636,7 +3621,7 @@ mod tests {
                 )],
                 ..NoticeSpec::default()
             };
-            // 14 rows is the D18 content rect at the declared 80×24 floor.
+            // 14 rows is the anchor's content rect at the declared 80×24 floor.
             let out = render_notice_in(&spec, 80, 14);
             // Nothing else in this fixture is long enough to ellipsise, so
             // a `…` anywhere in the frame is the id being cut.

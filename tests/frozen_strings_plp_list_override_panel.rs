@@ -121,7 +121,7 @@ fn the_armed_confirm_states_the_consequence_and_names_the_list() {
 /// `target == Allow`. The common case this panel creates is an `allow`
 /// override on a list that stays `base = deny` globally, so pointing at
 /// the Lists tab would point somewhere that cannot do it — the
-/// unsatisfiable refusal project rules §Neutrality records this repo already
+/// unsatisfiable refusal CLAUDE.md §Neutrality records this repo already
 /// paying for once, in this very modal ecosystem.
 ///
 /// `run_set_trust` writes the declaration whenever the flag is passed,

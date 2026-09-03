@@ -14,11 +14,12 @@
 
 use purge_warden::config::schema::validator::format_security_tunneling_exempt_broad;
 use purge_warden::config::schema::validator::{
-    format_cache_prefetch_threshold_invalid, format_cache_stale_buffer_too_large,
-    format_cache_ttl_bounds_inverted, format_dnssec_cap_zero, format_local_dns_ttl_out_of_range,
-    format_security_rrl_window_out_of_range, format_security_tunneling_entropy_invalid,
-    CACHE_PREFETCH_THRESHOLD_INVALID, CACHE_STALE_BUFFER_TOO_LARGE, CACHE_TTL_BOUNDS_INVERTED,
-    DNSSEC_CAP_ZERO, LISTS_MAX_BODY_BYTES_ZERO, LISTS_MAX_ENTRIES_ZERO,
+    format_cache_cname_max_depth_above_cap, format_cache_prefetch_threshold_invalid,
+    format_cache_stale_buffer_too_large, format_cache_ttl_bounds_inverted, format_dnssec_cap_zero,
+    format_local_dns_ttl_out_of_range, format_security_rrl_window_out_of_range,
+    format_security_tunneling_entropy_invalid, CACHE_CNAME_MAX_DEPTH_ABOVE_CAP,
+    CACHE_CNAME_MAX_DEPTH_ZERO, CACHE_PREFETCH_THRESHOLD_INVALID, CACHE_STALE_BUFFER_TOO_LARGE,
+    CACHE_TTL_BOUNDS_INVERTED, DNSSEC_CAP_ZERO, LISTS_MAX_BODY_BYTES_ZERO, LISTS_MAX_ENTRIES_ZERO,
     LISTS_SHRINK_GUARD_PCT_INVALID, LISTS_UPDATE_INTERVAL_ZERO, LOCAL_DNS_TTL_OUT_OF_RANGE,
     SECURITY_RATE_LIMIT_BURST_ZERO, SECURITY_RATE_LIMIT_QPS_ZERO, SECURITY_RRL_RPS_ZERO,
     SECURITY_RRL_WINDOW_OUT_OF_RANGE, SECURITY_TUNNELING_ENTROPY_INVALID,
@@ -42,7 +43,7 @@ fn lists_max_entries_zero_const_is_frozen() {
     assert_eq!(
         LISTS_MAX_ENTRIES_ZERO,
         "lists: `max_entries` must be >= 1 — 0 truncates every list to zero \
-         domains, silently disabling filtering. The default is 5000000; raise \
+         domains, silently disabling filtering. The default is 20000000; raise \
          the value instead of using 0 for \"unlimited\"."
     );
 }
@@ -52,7 +53,7 @@ fn lists_max_body_bytes_zero_const_is_frozen() {
     assert_eq!(
         LISTS_MAX_BODY_BYTES_ZERO,
         "lists: `max_body_bytes` must be >= 1 — 0 refuses every list download. \
-         The default is 209715200 (200 MB)."
+         The default is 536870912 (512 MB)."
     );
 }
 
@@ -285,6 +286,34 @@ fn cache_stale_buffer_too_large_const_is_frozen() {
 fn cache_stale_buffer_format_helper_substitutes() {
     let got = format_cache_stale_buffer_too_large(99999);
     assert!(got.contains("got 99999"));
+    assert!(!got.contains("{n}"));
+}
+
+#[test]
+fn cache_cname_max_depth_zero_const_is_frozen() {
+    assert_eq!(
+        CACHE_CNAME_MAX_DEPTH_ZERO,
+        "cache: `cname_max_depth` must be >= 1 — at 0 the first CNAME record \
+         already exceeds the cap, and a chain past the cap counts as blocked, so \
+         every CNAME'd name stops resolving. It is a depth limit, not an on/off \
+         switch. The default is 16."
+    );
+}
+
+#[test]
+fn cache_cname_max_depth_above_cap_const_is_frozen() {
+    assert_eq!(
+        CACHE_CNAME_MAX_DEPTH_ABOVE_CAP,
+        "cache: `cname_max_depth` is {n}, but both CNAME chain walkers clamp to \
+         16 hops, so the extra depth is never followed. Set it to 16 or lower so \
+         the config says what warden does."
+    );
+}
+
+#[test]
+fn cache_cname_max_depth_above_cap_format_helper_substitutes() {
+    let got = format_cache_cname_max_depth_above_cap(64);
+    assert!(got.contains("is 64,"));
     assert!(!got.contains("{n}"));
 }
 

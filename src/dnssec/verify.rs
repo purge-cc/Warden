@@ -1,9 +1,9 @@
 //! RRSIG signature verification — authenticate one RRset against one DNSKEY.
 //!
-//! This is the §4.10-2 verification *engine*. It is **not** wired into the live
-//! query path (that is §4.10-4); callers in later sprints invoke it per-RRset
-//! while walking a chain (§4.10-3) and act on the [`Verdict`] (set the AD bit,
-//! SERVFAIL on bogus, pass through insecure).
+//! This is the verification *engine*. It is **not** wired into the live query
+//! path; a chain walk invokes it per-RRset while walking from a trust anchor
+//! and acts on the [`Verdict`] (set the AD bit, SERVFAIL on bogus, pass
+//! through insecure).
 //!
 //! ## Canonicalization is delegated to hickory — by design
 //!
@@ -35,8 +35,7 @@ pub enum Verdict {
     /// validity period: the RRset is authenticated by this key.
     Secure,
     /// The signature could not be validated because the algorithm is outside
-    /// this validator's §4.10 scope — not a failure, just "cannot assert
-    /// security". A later sprint maps this onto downgrade-safe handling.
+    /// this validator's scope — not a failure, just "cannot assert security".
     Insecure(InsecureReason),
     /// The signature is present but failed validation: the response is forged,
     /// stale, or otherwise must not be trusted.
@@ -45,16 +44,16 @@ pub enum Verdict {
 
 /// Why a [`Verdict::Insecure`] result could not be validated, or why a chain is
 /// provably unsigned. [`verify_rrset`] only ever yields `OutOfScopeAlgorithm`;
-/// the chain walk (§4.10-3) adds the denial-of-existence-proven cause.
+/// the chain walk adds the denial-of-existence-proven cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsecureReason {
-    /// The RRSIG's signing algorithm is recognised but outside the §4.10
-    /// validation scope (RSASHA256 / ECDSAP256SHA256).
+    /// The RRSIG's signing algorithm is recognised but outside this
+    /// validator's scope (RSASHA256 / ECDSAP256SHA256).
     OutOfScopeAlgorithm,
     /// A delegation has no DS RRset and the parent served an *authenticated*
     /// NSEC/NSEC3 proof that no DS exists there (RFC 4035 §5.2) — the child zone
     /// is legitimately unsigned, not a stripped-DS downgrade. Produced only by
-    /// the chain walk (§4.10-3b), never by [`verify_rrset`].
+    /// the chain walk, never by [`verify_rrset`].
     UnsignedDelegation,
 }
 
@@ -101,7 +100,7 @@ pub fn verify_rrset(
     records: &[Record],
     now: u32,
 ) -> Verdict {
-    // 1. The signing algorithm must be within this validator's §4.10 scope.
+    // 1. The signing algorithm must be within this validator's scope.
     if SupportedAlgorithm::from_algorithm(rrsig.input().algorithm).is_none() {
         return Verdict::Insecure(InsecureReason::OutOfScopeAlgorithm);
     }

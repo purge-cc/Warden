@@ -1,9 +1,9 @@
 //! File tab — the master config file as a *document*: read-only,
 //! syntax-coloured TOML with an on-demand `/` section jump.
 //!
-//! §4.67-b MN3 split this out of `tabs/settings.rs`, which had been
-//! rendering **either** the Tracking form **or** this viewer from one
-//! 854-line module. The two are different jobs and the split says so:
+//! Split out of `tabs/settings.rs`, which had been rendering **either**
+//! the Tracking form **or** this viewer from one module. The two are
+//! different jobs and the split says so:
 //!
 //! - **Settings** administers the configuration — tracking knobs, backup,
 //!   restore, and the auto-backup status those verbs produce.
@@ -21,6 +21,12 @@
 //!   ...
 //!   [/] jump to section
 //! ```
+//!
+//! ## Not here
+//! - Keys:  `mod.rs::handle_file_key` (`/` opens the section-jump popup)
+//! - Form:  none — the popup above is built and rendered entirely in this file
+//! - State: `app::FileState` (`config_text`, `sections`, `scroll_offset`, `section_jump`)
+//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -33,20 +39,14 @@ use crate::tui::modal_form::{self, ChoiceRow, NoticeSpec, ProseRow, ValueKind};
 use crate::tui::theme::T;
 use crate::tui::ui::render_section_chrome;
 
-// tui-wave1/settings-sidebar: frozen strings for the `/` section-jump
-// popup that replaced the permanent left "Sections" sidebar. Pinned by
+// Frozen strings for the `/` section-jump popup that replaced the
+// permanent left "Sections" sidebar. Pinned by
 // `tests/frozen_strings_tui_file_viewer.rs`.
-//
-// §4.67-b MN3: carried here verbatim with the popup they belong to. The
-// strings did NOT change — only the module that owns them — so the
-// frozen-string test moved its `include_str!` target rather than its
-// expectations.
 pub const SECTION_JUMP_TITLE: &str = " Jump to section ";
 pub const SECTION_JUMP_HINT: &str = "Enter: jump · Esc: cancel";
 
-/// Ecosystem modal width (§4.61 Archetype C). The popup used to be 50,
-/// which is precisely the "looks wrong next to twelve migrated siblings"
-/// this sweep exists to fix.
+/// Ecosystem modal width (Archetype C). Must match the width every other
+/// migrated modal uses, or the popup looks wrong next to its siblings.
 const SECTION_JUMP_W: u16 = 64;
 
 /// The filter row's prompt. `prose_row` prepends a 2-cell indent, so the
@@ -55,15 +55,30 @@ const SECTION_JUMP_W: u16 = 64;
 const FILTER_PROMPT: &str = "/ ";
 const FILTER_COL: usize = 2 + FILTER_PROMPT.len();
 
-/// Shown in place of the document when nothing could be read from disk.
+/// Shown in place of the document when the config read cleanly but is
+/// empty. A read *failure* is a different fact and renders separately —
+/// see [`CONFIG_READ_ERROR_MARK`].
 pub const NO_CONFIG_LOADED: &str = "  (no config loaded)";
 
+/// Marks `config_text` as an I/O failure rather than document content.
+///
+/// `FileState::config_text` is a plain `String`, read and written at two
+/// call sites in `mod.rs` that assign `load_config`'s result straight
+/// through with no branching — widening it to `Result<String, String>`
+/// would change a type this module does not own. A leading U+FFFF is the
+/// channel instead: it is a Unicode noncharacter, reserved by the
+/// standard for internal use and never legitimate interchange, so no
+/// config file `read_to_string` returns can produce one as real content.
+/// `load_config` is the only producer and `render_document` the only
+/// consumer.
+const CONFIG_READ_ERROR_MARK: char = '\u{FFFF}';
+
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    // §4.67-b MN3: the card is titled after its LEAF, which is what every
-    // other tab does (Devices → "Devices", Lists → "Lists", …). The module
-    // this was split from was the single exception — it titled its card
-    // "Configuration" while its leaf said "Settings" — and that outlier is
-    // fixed in the same commit rather than inherited.
+    // The card is titled after its LEAF, which is what every other tab
+    // does (Devices → "Devices", Lists → "Lists", …). The module this
+    // was split from was the single exception — it titled its card
+    // "Configuration" while its leaf said "Settings" — and that outlier
+    // is not inherited here.
     let content = render_section_chrome(f, area, "File", T.text_secondary);
     render_document(f, content, app);
 
@@ -72,9 +87,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// The document body: syntax-coloured TOML from `scroll_offset` down, or
-/// the empty-state line when nothing was read.
+/// The document body: syntax-coloured TOML from `scroll_offset` down, the
+/// empty-state line when nothing was read, or the read-error state when
+/// the config could not be read at all.
 fn render_document(f: &mut Frame, content: Rect, app: &App) {
+    if let Some(err) = app.file.config_text.strip_prefix(CONFIG_READ_ERROR_MARK) {
+        f.render_widget(Paragraph::new(read_error_lines(err)), content);
+        return;
+    }
+
     if app.file.config_text.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -104,13 +125,24 @@ fn render_document(f: &mut Frame, content: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
 }
 
-/// tui-wave1/settings-sidebar: the `/` section-jump popup. Lists the
+/// The dedicated read-error state: styled in `T.error` so an I/O failure
+/// cannot be mistaken for a line of the operator's TOML, the way a plain
+/// `Paragraph` of the raw message fed through [`colorize_toml_line`]
+/// would be.
+fn read_error_lines(err: &str) -> Vec<Line<'static>> {
+    vec![Line::from(Span::styled(
+        format!("  {err}"),
+        Style::default().fg(T.error),
+    ))]
+}
+
+/// The `/` section-jump popup. Lists the
 /// TOML section names, filtered by substring (case-insensitive) as the
 /// operator types; the first match is highlighted — that is the row
 /// `Enter` jumps to (see [`filter_and_jump_target`]).
 ///
-/// §4.63 S2b migrated it to **Archetype C**. `area` is the tab content
-/// rect, so **D18** holds: the popup anchors over the tab, not the frame.
+/// Rendered as **Archetype C**. `area` is the tab content rect, so the
+/// popup anchors over the tab, not the frame.
 fn render_section_jump_popup(f: &mut Frame, area: Rect, app: &App, filter: &str) {
     let (filtered, _) = filter_and_jump_target(&app.file.config_text, &app.file.sections, filter);
     let spec = section_jump_notice(filter, &filtered);
@@ -180,8 +212,9 @@ fn section_jump_notice(filter: &str, filtered: &[String]) -> NoticeSpec {
 /// Pure filter + jump-target resolver for the section-jump popup. Filters
 /// `sections` by case-insensitive substring match on `filter` (preserving
 /// original order), and resolves the `scroll_offset` `Enter` should jump
-/// to — the first filtered match, or `None` when nothing matches (Enter is
-/// then a no-op in the caller).
+/// to — the first filtered match, or `None` when nothing matches *or* when
+/// that match's own name does not resolve to a line. Either way Enter is
+/// then a no-op in the caller.
 pub fn filter_and_jump_target(
     config_text: &str,
     sections: &[String],
@@ -193,7 +226,9 @@ pub fn filter_and_jump_target(
         .filter(|s| s.to_lowercase().contains(&needle))
         .cloned()
         .collect();
-    let target = filtered.first().map(|s| section_offset(config_text, s));
+    let target = filtered
+        .first()
+        .and_then(|s| section_offset(config_text, s));
     (filtered, target)
 }
 
@@ -248,29 +283,53 @@ fn colorize_toml_line(line: &str) -> Line<'static> {
     Line::from(Span::raw(line.to_string()))
 }
 
+/// The name inside a top-level `[section]` header line, or `None` if
+/// `trimmed` is not one. Cuts at the first `]` rather than the last: TOML
+/// allows a trailing comment after a header (`[server] # the DNS
+/// listener`), and matching the whole line instead would make a header
+/// that carries one unfindable to every caller below.
+///
+/// Shared by [`parse_sections`] and [`section_offset`] so the two agree
+/// by construction on what counts as a header and where its name ends —
+/// two independent bracket-cutters is how a picker row that `load_config`
+/// lists becomes one `section_offset` can never resolve.
+fn header_name(trimmed: &str) -> Option<&str> {
+    if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
+        return None;
+    }
+    let close = trimmed.find(']')?;
+    Some(&trimmed[1..close])
+}
+
+/// Top-level `[section]` table names in `text`, in file order.
+fn parse_sections(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| header_name(line.trim()))
+        .map(|name| name.to_string())
+        .collect()
+}
+
 /// Load config sections and full text from a TOML file.
+///
+/// A read failure returns the error prefixed with [`CONFIG_READ_ERROR_MARK`]
+/// in the text slot rather than the document — see that constant's doc.
 pub fn load_config(path: &std::path::Path) -> (Vec<String>, String) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) => return (vec![], format!("error reading config: {e}")),
+        Err(e) => {
+            return (
+                vec![],
+                format!("{CONFIG_READ_ERROR_MARK}error reading config: {e}"),
+            )
+        }
     };
 
-    let mut sections = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            let name = trimmed
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string();
-            sections.push(name);
-        }
-    }
-
-    (sections, text)
+    (parse_sections(&text), text)
 }
 
-/// Get the line offset for a given section name within the config text.
+/// The line offset of `section`'s header within `config_text`, or `None`
+/// if no header names it — a name the caller can never resolve is a
+/// defect one level up (see [`parse_sections`]), not a jump to line 0.
 ///
 /// Saturates at `u16::MAX` rather than truncating: `scroll_offset` is a
 /// `u16` (ratatui's own type), and a bare `as` on a config past 65 535 lines
@@ -278,14 +337,12 @@ pub fn load_config(path: &std::path::Path) -> (Vec<String>, String) {
 /// Enter on a section and land somewhere arbitrary, with nothing to
 /// indicate why. Saturating lands at the end instead, which is wrong in a
 /// way the operator can see.
-pub fn section_offset(config_text: &str, section: &str) -> u16 {
-    let target = format!("[{section}]");
-    for (i, line) in config_text.lines().enumerate() {
-        if line.trim() == target {
-            return u16::try_from(i).unwrap_or(u16::MAX);
-        }
-    }
-    0
+pub fn section_offset(config_text: &str, section: &str) -> Option<u16> {
+    config_text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| header_name(line.trim()) == Some(section))
+        .map(|(i, _)| u16::try_from(i).unwrap_or(u16::MAX))
 }
 
 #[cfg(test)]
@@ -310,7 +367,7 @@ mod tests {
     #[test]
     fn section_offset_finds_the_header_line() {
         let text = "[a]\nx = 1\n[b]\ny = 2\n";
-        assert_eq!(section_offset(text, "b"), 2);
+        assert_eq!(section_offset(text, "b"), Some(2));
     }
 
     #[test]
@@ -326,14 +383,58 @@ mod tests {
         text.push_str("[deep]\n");
         assert_eq!(
             section_offset(&text, "deep"),
-            u16::MAX,
+            Some(u16::MAX),
             "must saturate, not wrap"
         );
     }
 
     #[test]
-    fn section_offset_falls_back_to_zero_for_an_unknown_section() {
-        assert_eq!(section_offset("[a]\n", "nope"), 0);
+    fn section_offset_returns_none_for_an_unknown_section() {
+        assert_eq!(section_offset("[a]\n", "nope"), None);
+    }
+
+    #[test]
+    fn parse_sections_cuts_a_header_at_its_trailing_comment() {
+        assert_eq!(
+            parse_sections("[server] # the DNS listener\nlisten = \"0.0.0.0:53\"\n"),
+            vec!["server".to_string()]
+        );
+    }
+
+    /// `section_offset` must resolve the exact header `parse_sections` cut
+    /// the name from, comment and all — matching only the clean `[name]`
+    /// would regress into the "picker row Enter cannot reach" bug with the
+    /// name-extraction half fixed and the lookup half not.
+    #[test]
+    fn section_offset_finds_a_header_that_carries_a_trailing_comment() {
+        let text = "[server] # the DNS listener\nlisten = \"0.0.0.0:53\"\n";
+        assert_eq!(section_offset(text, "server"), Some(0));
+    }
+
+    #[test]
+    fn parse_sections_still_skips_array_of_tables() {
+        assert_eq!(
+            parse_sections("[[clients]] # a device entry\nmac = \"aa:bb\"\n[server]\n"),
+            vec!["server".to_string()]
+        );
+    }
+
+    /// The property that actually matters: every name `parse_sections`
+    /// yields must resolve through `section_offset`, or a picker row
+    /// exists that Enter can never jump to. Covers this bug and any
+    /// future drift between the two parsers.
+    #[test]
+    fn every_parsed_section_name_resolves_via_section_offset() {
+        let text = "[server] # the DNS listener\nlisten = \"0.0.0.0:53\"\n\n\
+                     [tracking] # knobs\nenabled = true\n\n[[clients]]\nmac = \"aa:bb\"\n";
+        for name in parse_sections(text) {
+            assert!(
+                section_offset(text, &name).is_some(),
+                "{name:?} must resolve to a real line — a name load_config \
+                 returns that section_offset cannot find becomes a picker \
+                 row that silently jumps to line 0"
+            );
+        }
     }
 
     /// The empty document must render the empty-state line, not a blank
@@ -352,6 +453,49 @@ mod tests {
         assert!(
             dump.contains("(no config loaded)"),
             "empty document must say so; got:\n{dump}"
+        );
+    }
+
+    /// A config that fails to read must render as an error, not as if the
+    /// I/O message were a line of the operator's TOML.
+    #[test]
+    fn a_read_failure_renders_as_an_error_not_as_document_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::default();
+        app.file.config_text =
+            format!("{CONFIG_READ_ERROR_MARK}error reading config: permission denied");
+        let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        term.draw(|f| render_document(f, f.area(), &app)).unwrap();
+        let dump = term.backend().to_string();
+        assert!(
+            dump.contains("error reading config: permission denied"),
+            "the read failure must stay visible; got:\n{dump}"
+        );
+        assert!(
+            !dump.contains(CONFIG_READ_ERROR_MARK),
+            "the sentinel itself must never reach the screen; got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn read_error_lines_render_in_the_error_colour() {
+        let lines = read_error_lines("error reading config: permission denied");
+        assert_eq!(lines[0].spans[0].style.fg, Some(T.error));
+        assert!(lines[0].spans[0].content.contains("permission denied"));
+    }
+
+    #[test]
+    fn load_config_marks_a_read_failure_instead_of_returning_it_as_document_text() {
+        let (sections, text) = load_config(std::path::Path::new(
+            "/nonexistent/purge-warden-test-config.toml",
+        ));
+        assert!(sections.is_empty());
+        assert!(
+            text.starts_with(CONFIG_READ_ERROR_MARK),
+            "a read failure must be marked, not handed to the caller as \
+             plain document text; got: {text:?}"
         );
     }
 
@@ -375,7 +519,6 @@ mod tests {
             "a stale offset must clamp to the last line, not blank the view; got:\n{dump}"
         );
     }
-    // tui-wave1/settings-sidebar: section-jump popup pure fn.
     const FIXTURE_CONFIG: &str = "[server]\nx = 1\n\n[filter]\ny = 2\n\n[api]\nz = 3\n";
 
     fn fixture_sections() -> Vec<String> {
@@ -418,7 +561,7 @@ mod tests {
         assert_eq!(target, None);
     }
 
-    // ---- §4.63 S2b — the section-jump popup as Archetype C -------------
+    // ---- The section-jump popup as Archetype C --------------------------
     //
     // The anchor a Settings overlay actually receives at the declared
     // 80×24 floor: `ui::layout_chunks` hands the content region
@@ -558,15 +701,16 @@ mod tests {
         );
     }
 
-    /// D15 / D13, as a test rather than a claim in a commit message.
-    /// Needles are split with `concat!` so this assertion cannot match
-    /// itself — the house pattern, see `scope_modal`.
+    /// The no-hand-rolled-chrome rule, as a test rather than a claim in
+    /// a commit message. Needles are split with `concat!` so this
+    /// assertion cannot match itself — the house pattern, see
+    /// `scope_modal`.
     ///
     /// Scoped to *chrome*: the two surviving `T.brand_red` spans in this
     /// file style the TOML section-header syntax highlight and the
     /// Tracking form's focused value. Both are copy, not borders, and
-    /// D15 governs borders. With no border built here at all, the popup's
-    /// red frame is structurally gone.
+    /// the red-border rule only governs borders. With no border built
+    /// here at all, the popup's red frame is structurally gone.
     #[test]
     fn section_jump_popup_builds_no_chrome_of_its_own() {
         let src = include_str!("settings.rs");
@@ -582,7 +726,7 @@ mod tests {
         }
     }
 
-    // ---- D18 / §4.62 N1 -------------------------------------------------
+    // ---- Anchor-rect row budget ------------------------------------------
     //
     // Header 4 (rows 0..=3) · menu card 3 (rows 4..=6) · content 16
     // (rows 7..=22) · footer 1 (row 23) at the 80×24 floor.
@@ -602,15 +746,15 @@ mod tests {
         use ratatui::Terminal;
         let mut app = app_with_sections(fixture_sections());
 
-        let frame = |app: &App| {
+        let frame = |app: &mut App| {
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             term.draw(|f| crate::tui::ui::render(f, app)).unwrap();
             dump_buffer(term.backend().buffer())
         };
 
-        let before = frame(&app);
+        let before = frame(&mut app);
         app.file.section_jump = Some("se".to_string());
-        let after = frame(&app);
+        let after = frame(&mut app);
 
         let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
         for (y, (bl, al)) in b.iter().zip(a.iter()).enumerate() {

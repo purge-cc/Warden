@@ -137,7 +137,7 @@ fn wildcard_global_record_lints_clean_and_resolves_descendant() {
 [[local_dns.records]]
 domain = "example.test"
 type = "A"
-value = "192.0.2.50"
+value = "10.10.1.50"
 match_subdomains = true
 "#,
     );
@@ -148,7 +148,7 @@ match_subdomains = true
         .expect("a lint-clean global wildcard must resolve its descendants");
     assert_eq!(records.len(), 1);
     match records[0].data {
-        RData::A(ref a) => assert_eq!(a.0, std::net::Ipv4Addr::new(192, 0, 2, 50)),
+        RData::A(ref a) => assert_eq!(a.0, std::net::Ipv4Addr::new(10, 10, 1, 50)),
         _ => panic!("expected A record"),
     }
 }

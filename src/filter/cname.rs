@@ -1,4 +1,4 @@
-//! CNAME chain inspection — §4.5 Sprint 1/2 foundation.
+//! CNAME chain inspection.
 //!
 //! [`walk_response`] follows the CNAME chain returned by upstream and
 //! decides whether any hop in the chain matches the active profile's
@@ -6,13 +6,8 @@
 //! function is profile-aware and stack-only for loop detection up to a
 //! 16-hop cap. Each hop materialises its target into a `CompactString`:
 //! inline (no heap) for targets ≤24 bytes, but heap-allocating for longer
-//! names — long CDN-flatten chains routinely exceed 24 bytes (rev-2606
-//! cname-02) — so the happy path is allocation-light, not allocation-free.
-//!
-//! Sprint 1/2 ships the pure function + tests in isolation. Sprint 2/2
-//! wires it into [`crate::dns::handler`] post-upstream-response, adds
-//! the audit log `cname_block` event, the TUI Query Log badge, and a
-//! CT smoke test against a live CNAME-cloaked tracker.
+//! names — long CDN-flatten chains routinely exceed 24 bytes — so the
+//! happy path is allocation-light, not allocation-free.
 
 use std::fmt::Write as _;
 
@@ -25,20 +20,19 @@ use crate::profiles::profile::{DeviceOverlay, ResolvedProfile};
 /// Why a CNAME hop in the chain caused a block.
 ///
 /// The dynamic variants ([`BlockSource::List`], [`BlockSource::Rule`])
-/// carry just enough payload to populate the §4.5 Sprint 2 audit log
-/// and TUI badge without a second filter probe at log time. The
+/// carry just enough payload to populate the audit log and TUI badge
+/// without a second filter probe at log time. The
 /// built-in variants ([`BlockSource::CnameLoop`],
 /// [`BlockSource::CnameDepthExceeded`]) are emitted by the walker
 /// itself when the chain shape is the threat — neither hop sits in any
 /// blocklist, but the chain is malformed (cycle) or unbounded
 /// (depth cap exceeded).
 ///
-/// Attribution is **authoritative** as of Sprint 55: the engine emits
-/// the `BlockSource` in the same pass that decides the verdict, via
+/// Attribution is **authoritative**: the engine emits the `BlockSource`
+/// in the same pass that decides the verdict, via
 /// [`FilterEngine::evaluate_attributed`]. The walker passes the source
-/// through unchanged. The pre-Sprint-55 heuristic that re-walked the
-/// domain in a second pass (`attribute_block_source`, with a "defensive
-/// AdminBlock" fallback when no layer claimed responsibility) is gone.
+/// through unchanged — there is no second pass that re-walks the domain
+/// to guess attribution after the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockSource {
     /// Tier 1 blocklist (per-list bitmask) hit. The `u8` is the bit
@@ -138,14 +132,14 @@ pub enum Verdict {
 ///
 /// # Why this is not a `bool`
 ///
-/// F5 (incident 2026-07-27): four sites decide "is this allowed?" and
-/// each sees less of the operator's policy than the one before it —
-/// site 1 ([`crate::dns::handler`]'s `evaluate_with_overlay`) sees both
-/// the profile's and the device's allow sets, the CNAME walker used to
-/// see only the profile's, the response-IP filter neither. Handing the
-/// response path a two-state "explicitly allowed / not" verdict closes
-/// the reported incident but opens a worse one: it erases *which layer*
-/// granted the allow, and the layers are not interchangeable.
+/// Four sites decide "is this allowed?" and each sees less of the
+/// operator's policy than the one before it — site 1
+/// ([`crate::dns::handler`]'s `evaluate_with_overlay`) sees both the
+/// profile's and the device's allow sets, the CNAME walker used to see
+/// only the profile's, the response-IP filter neither. Handing the
+/// response path a two-state "explicitly allowed / not" verdict is
+/// simpler but erases *which layer* granted the allow, and the layers
+/// are not interchangeable.
 ///
 /// `profiles::resolver::apply_overlay` row 6 refuses to let a
 /// device-scoped allow beat a profile-scoped deny unless the device
@@ -187,7 +181,7 @@ pub enum NamePolicy {
     ProfileAllow,
     /// A device-scoped `@@||domain^` matched the queried name —
     /// `DeviceOverlay::allow`, i.e. a rule referenced from
-    /// `[[devices]].allow_rules`. Carries the device's D3
+    /// `[[devices]].allow_rules`. Carries the device's
     /// `override_profile_deny` flag because that flag is what decides
     /// whether this allow may beat a profile-level deny.
     DeviceAllow { override_profile_deny: bool },
@@ -196,8 +190,8 @@ pub enum NamePolicy {
 impl NamePolicy {
     /// Resolve the operator's allow verdict for `name`.
     ///
-    /// `name` is the name the *client* asked for, after any §4.12 /
-    /// §4.53 rewrite — it must be the same string the response-path
+    /// `name` is the name the *client* asked for, after any name
+    /// rewrite — it must be the same string the response-path
     /// consumers will filter against, lowercase and without the
     /// trailing dot (the invariant [`domain_matches_set`]
     /// `debug_assert!`s).
@@ -250,14 +244,14 @@ impl NamePolicy {
     /// | `DeviceAllow { override_profile_deny: false }` | yes | **no** | **no** |
     /// | `DeviceAllow { override_profile_deny: true }` | yes | yes | **no** |
     ///
-    /// - **`List`** is an external blocklist hit — the incident's actual
-    ///   shape (`fts.rbxcdn.com` flattening onto a CDN target that sits
-    ///   on a subscribed list). Design rule 4 forbids external lists
-    ///   from granting an allow; nothing forbids an operator allow from
-    ///   beating one. Both allow layers win.
+    /// - **`List`** is an external blocklist hit — e.g. a queried name
+    ///   flattening via CNAME onto a CDN target that sits on a
+    ///   subscribed list. External lists are forbidden from granting an
+    ///   allow; nothing forbids an operator allow from beating one. Both
+    ///   allow layers win.
     /// - **`Rule` / `AdminBlock`** is the operator's own profile-level
-    ///   deny. `ProfileAllow` is same-layer, so it wins (the semantics
-    ///   frozen by the Lane A fix). `DeviceAllow` is the weaker layer
+    ///   deny. `ProfileAllow` is same-layer, so it wins. `DeviceAllow` is
+    ///   the weaker layer
     ///   and loses unless the device carries `override_profile_deny` —
     ///   the same answer `apply_overlay` rows 6/7 give for the queried
     ///   name, so the two cannot disagree.
@@ -327,7 +321,7 @@ const VISITED_CAPACITY: usize = MAX_HOPS + 1;
 /// The head of a CNAME chain: the index of the CNAME record whose owner is not
 /// the target of any *other* CNAME in the answer.
 ///
-/// **M3** A DNS answer's answer-section is a *set*; nothing in RFC 1034 §3.6.2
+/// A DNS answer's answer-section is a *set*; nothing in RFC 1034 §3.6.2
 /// obliges a server to emit a CNAME chain in traversal order, and resolvers do
 /// reorder. Picking the head explicitly is what lets [`walk_response`] thread
 /// `a → b → c` out of the wire order `[b → c, a → b]`.
@@ -349,7 +343,7 @@ fn chain_head(records: &[Record]) -> Option<usize> {
         // enters at a single chosen record instead of iterating all of them —
         // if that invariant ever changed, a type-only match could select a
         // record with no followable target, and the walk would return `Allow`
-        // while a real chain sat unexamined in the same answer. The pre-[M3]
+        // while a real chain sat unexamined in the same answer. The previous
         // loop `continue`d past such records; this preserves that, and no test
         // pins it because the case cannot be constructed to fail.
         if !is_cname_link(rec) {
@@ -395,11 +389,10 @@ fn is_cname_link(rec: &Record) -> bool {
 /// It receives one that [`NamePolicy::resolve`] built at the single
 /// point where the whole of the operator's policy is in scope: the
 /// profile's allow set *and* the resolved device's overlay, keyed on
-/// the name the client asked for after any rewrite. F5 (incident
-/// 2026-07-27) is what happens when each response-path site re-derives
-/// this from whatever data it happens to hold — the walker only ever
-/// had the profile's set, so an allow the operator had attached to a
-/// device could not take effect here.
+/// the name the client asked for after any rewrite. Each response-path
+/// site re-deriving this from whatever data it happens to hold is what
+/// breaks it — the walker only ever had the profile's set, so an allow
+/// the operator had attached to a device could not take effect here.
 ///
 /// The consumption rule and the reason it is layer-aware rather than
 /// boolean live on [`NamePolicy::outranks`]; the anti-spoof reason the
@@ -431,7 +424,7 @@ pub fn walk_response(
     let mut slots_used = 0usize;
     let mut hops = 0usize;
 
-    // [M3] Enter the chain at its head, not at whichever CNAME the server
+    // Enter the chain at its head, not at whichever CNAME the server
     // happened to serialise first. `chain_head` returns `None` both for "no
     // CNAMEs" (return Allow — nothing to walk) and for "every owner is also a
     // target", which is a closed cycle; for the cycle we deliberately fall back
@@ -503,14 +496,12 @@ pub fn walk_response(
         match verdict {
             FilterResult::Forward => {}
             FilterResult::Block => {
-                // F1 / F5 (incident 2026-07-27): the operator's own
-                // `@@||domain^` on the *queried* name wins the chain when
-                // it outranks the block's attribution. Before this check
-                // the walker only ever tested the CNAME *target* against
-                // `allow_domains`, so an operator who whitelisted the name
-                // they actually query (`fts.rbxcdn.com`) could never take
-                // effect — the only name consulted was a CDN target they
-                // never see.
+                // The operator's own `@@||domain^` on the *queried* name
+                // wins the chain when it outranks the block's attribution.
+                // Testing only the CNAME *target* against `allow_domains`
+                // would mean an operator who whitelisted the name they
+                // actually query could never take effect — the only name
+                // consulted would be a CDN target they never see.
                 //
                 // Two properties this placement buys, both load-bearing:
                 //
@@ -536,15 +527,14 @@ pub fn walk_response(
                 // pinned by `evaluate_and_evaluate_attributed_agree_on_verdict`
                 // proptest plus the four `evaluate_attributed_returns_*` unit
                 // tests — so this `unwrap_or_else` is unreachable today. The
-                // `debug_assert!` keeps Sprint 55's drift-surfacing intent (a
-                // future kernel edit that drops a source trips every test /
-                // proptest run); release builds fail closed — block as
-                // AdminBlock — rather than abort the query's task with a panic
-                // on a network-driven path (rev-2606 cname-01). This is NOT the
-                // pre-Sprint-55 "defensive AdminBlock" heuristic that masked
-                // drift silently: drift still fails the suite. `AdminBlock` is
-                // also the least permissive input to the policy comparison
-                // below, so failing closed here fails closed there too.
+                // `debug_assert!` surfaces drift immediately (a future kernel
+                // edit that drops a source trips every test / proptest run);
+                // release builds fail closed — block as AdminBlock — rather
+                // than abort the query's task with a panic on a
+                // network-driven path. Drift still fails the suite; only the
+                // release-build fallback is silent. `AdminBlock` is also the
+                // least permissive input to the policy comparison below, so
+                // failing closed here fails closed there too.
                 let source = source.unwrap_or_else(|| {
                     debug_assert!(false, "evaluate_attributed must emit a source on Block");
                     BlockSource::AdminBlock
@@ -563,7 +553,7 @@ pub fn walk_response(
         slots_used += 1;
         hops += 1;
 
-        // [M3] The next hop is the CNAME whose OWNER is this hop's target.
+        // The next hop is the CNAME whose OWNER is this hop's target.
         // Wire position is irrelevant — that assumption is the whole defect
         // this replaces. `None` ends the chain (the target resolved to an
         // address, or the answer is truncated), which is `Allow`.
@@ -615,7 +605,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    // ── §4.2 G1a: BlockSource::describe (on-demand query attribution) ──
+    // ── BlockSource::describe (on-demand query attribution) ──────────
 
     #[test]
     fn describe_list_resolves_label_name() {
@@ -675,24 +665,19 @@ mod tests {
         engine
     }
 
-    /// A profile that filters on list bit 0, subscribed on `engine`.
-    ///
-    /// `plp-s3`: the subscription lives beside the corpus now, so the
-    /// fixture has to tell the engine — and `permissive_default()` is
-    /// `unfiltered`, which skips the list layer outright, so that has to be
-    /// cleared too. Both were one `list_bitmask = 1` before.
-    /// [`ResolvedProfile::permissive_default`] with the `unfiltered` opt-out
-    /// cleared, and no subscription anywhere.
-    ///
-    /// For the `NamePolicy::resolve` fixtures, which never touch a
-    /// [`FilterEngine`] — the `list_bitmask = 1` they used to set was inert
-    /// for them even before `plp-s3`.
+    /// [`ResolvedProfile::permissive_default`] with the `unfiltered`
+    /// opt-out cleared, and no subscription anywhere. The `unfiltered`
+    /// flag skips the list layer outright, so it must be cleared for a
+    /// filtered-profile fixture even when no list is subscribed.
     fn permissive_filtered() -> ResolvedProfile {
         let mut p = ResolvedProfile::permissive_default();
         p.unfiltered = false;
         p
     }
 
+    /// A profile that filters on list bit 0, subscribed on `engine`.
+    /// The subscription lives beside the corpus, so the fixture has to
+    /// tell the engine explicitly.
     fn permissive_with_bit0(engine: &FilterEngine) -> ResolvedProfile {
         let mut p = ResolvedProfile::permissive_default();
         p.unfiltered = false;
@@ -714,13 +699,11 @@ mod tests {
         );
     }
 
-    /// M3 The defect this fix exists for.
-    ///
     /// Wire order `[b→c, a→b]` is a legitimate serialisation of the chain
     /// `a → b → c`; nothing obliges a server to emit CNAMEs in traversal
-    /// order. The old walker seeded `visited[0]` from the *first record's*
-    /// owner — `b` — then reached hop 2 whose target is also `b`, and reported
-    /// `CnameLoop`. A clean chain came back BLOCKED.
+    /// order. An implementation that seeds `visited[0]` from the *first
+    /// record's* owner — `b` — then reaches hop 2 whose target is also
+    /// `b`, and reports `CnameLoop`. A clean chain would come back BLOCKED.
     ///
     /// The in-order arm below is the control: identical records, identical
     /// expectation, only the wire order differs. If the two ever disagree
@@ -747,12 +730,12 @@ mod tests {
         assert_eq!(
             walk_response(&reversed, &engine, &profile, NamePolicy::Neutral, 16),
             Verdict::Allow,
-            "same chain, reversed on the wire — a false CnameLoop here is the M3 defect"
+            "same chain, reversed on the wire — a false CnameLoop here means ordering crept into the walk"
         );
     }
 
-    /// M3 Out-of-order records must still reach a block at the tail, so the
-    /// fix cannot be mistaken for "stop walking on reorder".
+    /// Out-of-order records must still reach a block at the tail, so
+    /// head-selection cannot be mistaken for "stop walking on reorder".
     ///
     /// Wire order is `[b→evil, a→b]`; the walker must enter at `a`, thread to
     /// `b`, then to `evil.com`, and block there.
@@ -774,8 +757,8 @@ mod tests {
         );
     }
 
-    /// M3 A genuine cycle must still be caught after the rewrite — the
-    /// head-detection fallback exists precisely so a closed cycle (where every
+    /// A genuine cycle must still be caught — the head-detection fallback
+    /// exists precisely so a closed cycle (where every
     /// owner is also a target, so there is no head) still enters the walk and
     /// trips the visited-set check instead of short-circuiting to `Allow`.
     #[test]
@@ -797,7 +780,7 @@ mod tests {
         }
     }
 
-    /// M3 `owner_matches` is the zero-alloc comparison the threading rests
+    /// `owner_matches` is the zero-alloc comparison the threading rests
     /// on. It must be case-insensitive (DNS-0x20 randomises owner case) and
     /// must not accept a prefix — `a` is not `a.b`.
     #[test]
@@ -980,7 +963,7 @@ mod tests {
     fn walk_response_returns_offending_name_byte_identical() {
         // Upstream returns a mixed-case target; the walker must
         // case-normalise before lookup AND in the `offending` field
-        // (Sprint 2 audit log + TUI badge consume this directly).
+        // (the audit log + TUI badge consume this directly).
         let records = [cname_record("a.example.com", "EVIL.COM")];
         let engine = engine_blocking(&["evil.com"]);
         let profile = permissive_with_bit0(&engine);
@@ -1087,14 +1070,14 @@ mod tests {
         }
     }
 
-    // ── F1 / F5 (incident 2026-07-27): the pre-resolved NamePolicy ──
+    // ── the pre-resolved NamePolicy ──────────────────────────────────
     //
-    // These pin "`@@||fts.rbxcdn.com^` is in the operator's admin rules,
-    // the device references it, and the name is blocked anyway". Pre-fix
-    // the walker only ever tested the CNAME *target* against
-    // `allow_domains`, so the only name that could win the chain was a CDN
-    // target the operator never sees — and even after the Lane A fix, an
-    // allow attached to a *device* could not reach this site at all.
+    // These pin "an allow rule is in the operator's admin rules, the
+    // device references it, and the name is blocked anyway". Testing
+    // only the CNAME *target* against `allow_domains` would mean the
+    // only name that could win the chain is a CDN target the operator
+    // never sees — and an allow attached to a *device* could not reach
+    // this site at all.
     //
     // Every test below leaves `profile.allow_domains` EMPTY unless it is
     // specifically exercising the target short-circuit. That is deliberate:
@@ -1159,7 +1142,7 @@ mod tests {
         );
     }
 
-    /// The incident's actual shape: the operator attached the rule to the
+    /// The operator attached the rule to the
     /// **device** (`[[devices]].allow_rules`), which lands in
     /// `DeviceOverlay.allow` — a set structurally distinct from
     /// `ResolvedProfile.allow_domains`.
@@ -1332,7 +1315,7 @@ mod tests {
         }
     }
 
-    /// Lane A non-regression: a *profile*-scoped allow on the queried name
+    /// Non-regression: a *profile*-scoped allow on the queried name
     /// wins a chain that flattens onto a subscribed list.
     #[test]
     fn walk_response_profile_allow_wins_an_external_list_block() {
@@ -1348,10 +1331,10 @@ mod tests {
         );
     }
 
-    /// **The reported incident.** Operator allow attached to the device;
-    /// the chain flattens onto a CDN target sitting on a subscribed list.
-    /// Design rule 4 forbids an external list from granting an allow — it
-    /// says nothing about an operator allow beating one.
+    /// Operator allow attached to the device; the chain flattens onto a
+    /// CDN target sitting on a subscribed list. An external list is
+    /// forbidden from granting an allow — that says nothing about an
+    /// operator allow beating one.
     #[test]
     fn walk_response_device_allow_wins_an_external_list_block() {
         let records = [cname_record(
@@ -1371,7 +1354,7 @@ mod tests {
                 16
             ),
             Verdict::Allow,
-            "the incident case: a device-scoped allow must beat an external blocklist"
+            "a device-scoped allow must beat an external blocklist"
         );
     }
 
@@ -1455,7 +1438,7 @@ mod tests {
     }
 
     /// A *profile* allow and a profile deny are the same layer, so the
-    /// allow wins — the semantics frozen by the Lane A fix.
+    /// allow wins.
     #[test]
     fn walk_response_profile_allow_wins_a_profile_deny() {
         let records = [cname_record("app.example", "cdn.evil.example")];

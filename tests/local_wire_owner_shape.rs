@@ -73,7 +73,7 @@ const WILDCARD_CHILD: &str = "app.example.test";
 /// Two labels below the apex — a one-label descendant can pass a suffix walk
 /// that stops too early, so the deep name is what actually exercises it.
 const WILDCARD_DEEP_CHILD: &str = "api.v2.app.example.test";
-const WILDCARD_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
+const WILDCARD_IP: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 60);
 const V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
 
 // ── mock upstream ───────────────────────────────────────────────────────────
@@ -478,7 +478,7 @@ async fn profile_scope_wildcard_descendant_a_is_owned_by_the_qname_not_the_apex(
         vec![rec(
             WILDCARD_APEX,
             LocalDnsRecordType::A,
-            "192.0.2.60",
+            "10.10.1.60",
             true,
         )],
         vec![],
@@ -586,7 +586,7 @@ async fn global_scope_wildcard_descendant_a_is_owned_by_the_qname_not_the_apex()
         vec![rec(
             WILDCARD_APEX,
             LocalDnsRecordType::A,
-            "192.0.2.60",
+            "10.10.1.60",
             true,
         )],
         upstream.clone(),

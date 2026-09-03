@@ -75,6 +75,31 @@ pub async fn run_status(
     }
 }
 
+/// Build the `warden status` upstream line from the per-server list:
+/// distinct kinds in first-seen order, each rendered `kind · addr, addr`,
+/// groups joined by ` | `. No truncation — the terminal is wide, unlike
+/// the TUI's narrow KPI column.
+fn format_upstream_status_line(servers: &[crate::ipc::protocol::UpstreamServerInfo]) -> String {
+    let mut kinds: Vec<&str> = Vec::new();
+    for s in servers {
+        if !kinds.contains(&s.kind.as_str()) {
+            kinds.push(s.kind.as_str());
+        }
+    }
+    kinds
+        .iter()
+        .map(|k| {
+            let addrs: Vec<&str> = servers
+                .iter()
+                .filter(|s| s.kind.as_str() == *k)
+                .map(|s| s.address.as_str())
+                .collect();
+            format!("{k} \u{b7} {}", addrs.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn print_live_status(
     config_path: &Path,
     resp: IpcResponse,
@@ -98,6 +123,7 @@ fn print_live_status(
             lists_total,
             lists_truncated,
             lists_corpus_refusal,
+            lists_corpus_freeze,
             // Not printed here, and that is the right call: this summary
             // already renders `CORPUS REFUSED — NOT INSTALLED` off
             // `lists_corpus_refusal`, which is the fact an operator reading
@@ -107,14 +133,14 @@ fn print_live_status(
             // pattern exhaustive.
             lists_cycle: _,
             lc2_list_diagnostics,
-            // §4.13 — resource_budget is surfaced through the TUI
-            // Dashboard, not the text CLI summary; the field is
-            // destructured here to keep the pattern exhaustive but
-            // intentionally not printed.
+            // resource_budget is surfaced through the TUI Dashboard, not
+            // the text CLI summary; the field is destructured here to
+            // keep the pattern exhaustive but intentionally not printed.
             resource_budget: _,
+            upstream_servers,
         } => {
-            // §4.19: surface the daemon binary version in the header
-            // line when it's reported (pre-§4.19 daemons send "").
+            // Surface the daemon binary version in the header line when
+            // it's reported (a daemon that predates this field sends "").
             if version.is_empty() {
                 println!("purge-warden is running (PID {pid})");
             } else {
@@ -122,26 +148,35 @@ fn print_live_status(
             }
             println!();
             println!("listen:     {listen}");
-            println!("upstream:   {upstream_mode} ({upstream_count} servers)");
-            // §4.19: render `active/total` when the registry-derived
-            // counters are populated; fall back to the legacy
-            // `list_count` scalar so pre-§4.19 daemons keep the same
-            // single-number output.
+            // List the literal resolver addresses, kind-led and grouped,
+            // when the daemon reports them; fall back to the legacy
+            // `mode (N servers)` collapse for a daemon that does not.
+            if upstream_servers.is_empty() {
+                println!("upstream:   {upstream_mode} ({upstream_count} servers)");
+            } else {
+                println!(
+                    "upstream:   {}",
+                    format_upstream_status_line(&upstream_servers)
+                );
+            }
+            // Render `active/total` when the registry-derived counters
+            // are populated; fall back to the legacy `list_count` scalar
+            // so an older daemon keeps the same single-number output.
             if lists_total > 0 {
                 for line in format_lists_lines(
                     lists_active,
                     lists_total,
                     lists_truncated,
                     lists_corpus_refusal.as_ref(),
+                    lists_corpus_freeze.as_ref(),
                 ) {
                     println!("{line}");
                 }
             } else {
                 println!("lists:      {list_count} sources");
             }
-            // `tag_model_consolidation` §3.3: a list can be active AND
-            // filter nothing. The counters above cannot show that —
-            // they count fetches, not reach.
+            // A list can be active AND filter nothing. The counters
+            // above cannot show that — they count fetches, not reach.
             for line in inert_list_lines(config_path) {
                 println!("{line}");
             }
@@ -149,20 +184,20 @@ fn print_live_status(
                 "{}",
                 format_domains_line(domain_count, lists_corpus_refusal.as_ref())
             );
-            // mem2608-s3 / F-E: `cache_cap` is a moka *weight* ceiling,
-            // not an entry count (see `format_cache_line`), so the pair
-            // printed must be weight-vs-weight, not count-vs-weight.
+            // `cache_cap` is a moka *weight* ceiling, not an entry count
+            // (see `format_cache_line`), so the pair printed must be
+            // weight-vs-weight, not count-vs-weight.
             println!(
                 "{}",
                 format_cache_line(cache_entries, cache_weighted_size, cache_cap)
             );
             println!("uptime:     {}", format_uptime(uptime_secs));
 
-            // T2.9 / H-20: surface query-log silent-drop counters so the
-            // operator has a signal that logging is degraded before the
-            // file ends up incomplete. Skip the line when the writer
-            // isn't attached — "logging disabled" is its own state and
-            // shouldn't render misleading zeros.
+            // Surface query-log silent-drop counters so the operator has
+            // a signal that logging is degraded before the file ends up
+            // incomplete. Skip the line when the writer isn't attached —
+            // "logging disabled" is its own state and shouldn't render
+            // misleading zeros.
             if let Some(drops) = query_log_drops {
                 println!(
                     "qlog drops: channel_full={} flush_open_errors={} flush_write_errors={}",
@@ -170,12 +205,11 @@ fn print_live_status(
                 );
             }
 
-            // Sprint C T3 of `lists_categories_v2` (§5.4 / §8.5):
-            // surface the retry state machine's per-state counts so
-            // the operator can spot blocklist health on a glance.
-            // Skipped entirely when no list_state is wired (zeros
-            // across the board) — keeps the section meaningful only
-            // when there's signal to show.
+            // Surface the retry state machine's per-state counts so the
+            // operator can spot blocklist health on a glance. Skipped
+            // entirely when no list_state is wired (zeros across the
+            // board) — keeps the section meaningful only when there's
+            // signal to show.
             for line in format_lc2_list_diagnostics(&lc2_list_diagnostics) {
                 println!("{line}");
             }
@@ -200,11 +234,11 @@ fn print_live_status(
                 );
                 println!("blocked:    {blocked_total}");
                 println!("cache rate: {cache_hit_rate:.1}%");
-                // Sprint §4.4 P1 — surface the prefetch hit-tracker so
-                // operators can watch the pool fill on a live deploy.
-                // Only print when the tracker has observed at least one
-                // promotion (avoids three zero-lines on disabled
-                // tracker, the Phase 1 default).
+                // Surface the prefetch hit-tracker so operators can
+                // watch the pool fill on a live deploy. Only print when
+                // the tracker has observed at least one promotion
+                // (avoids three zero-lines when the tracker is disabled,
+                // the default).
                 if prefetch_promotions_total > 0 || prefetch_pool_size > 0 {
                     println!(
                         "prefetch:   pool_size={prefetch_pool_size} \
@@ -264,10 +298,10 @@ fn print_live_status_json(
         map.insert("daemon_error".into(), msg.into());
     }
 
-    // `tag_model_consolidation` §3.3: same signal as the text form, so a
-    // script watching for inert lists does not have to scrape stdout.
-    // Additive — absent-when-empty would make consumers special-case the
-    // key, so it is always present (possibly an empty array).
+    // Same signal as the text form, so a script watching for inert lists
+    // does not have to scrape stdout. Additive — absent-when-empty would
+    // make consumers special-case the key, so it is always present
+    // (possibly an empty array).
     let now = time::OffsetDateTime::now_utc();
     let inert: Vec<serde_json::Value> = match load_config(config_path, now) {
         Ok(loaded) => inert_blocklists(&loaded.config)
@@ -296,8 +330,10 @@ fn print_live_status_json(
         lists_truncated,
         lists_corpus_refusal,
         lists_cycle,
+        lists_corpus_freeze,
         lc2_list_diagnostics,
         resource_budget,
+        upstream_servers,
     } = resp
     {
         map.insert("pid".into(), pid.into());
@@ -308,19 +344,19 @@ fn print_live_status_json(
         map.insert("cache_entries".into(), cache_entries.into());
         map.insert("list_count".into(), list_count.into());
         map.insert("uptime_secs".into(), uptime_secs.into());
-        // T2.9 / H-20: only emit the counters when the writer is
-        // attached, so JSON consumers can distinguish "logging
-        // disabled" (`null`) from "zero drops".
+        // Only emit the counters when the writer is attached, so JSON
+        // consumers can distinguish "logging disabled" (`null`) from
+        // "zero drops".
         map.insert(
             "query_log_drops".into(),
             serde_json::to_value(query_log_drops).unwrap_or(serde_json::Value::Null),
         );
-        // §4.19: always emit the new fields — defaults (empty string,
-        // 0) are themselves a meaningful "pre-§4.19 daemon" signal.
+        // Always emit these fields — defaults (empty string, 0) are
+        // themselves a meaningful "older daemon" signal.
         map.insert("version".into(), version.into());
         map.insert("cache_cap".into(), cache_cap.into());
-        // mem2608-s3 / F-E: the weight-unit counterpart to `cache_entries`
-        // — see `format_cache_line`'s doc comment for why the two are not
+        // The weight-unit counterpart to `cache_entries` — see
+        // `format_cache_line`'s doc comment for why the two are not
         // directly comparable and this field is.
         map.insert("cache_weighted_size".into(), cache_weighted_size.into());
         map.insert("lists_active".into(), lists_active.into());
@@ -342,21 +378,37 @@ fn print_live_status_json(
             "lists_cycle".into(),
             serde_json::to_value(lists_cycle).unwrap_or(serde_json::Value::Null),
         );
-        // Sprint C T3 — emit the four per-state counts even when zero,
-        // so JSON consumers always see the canonical shape and can
-        // distinguish "section absent" (pre-Sprint-C daemon, no field)
-        // from "all zeros" (Sprint-C daemon, no list_state wired).
+        // Unconditional too, and it can be non-`null` while
+        // `lists_corpus_refusal` is `null`: the arms that fail to install
+        // without refusing leave the previous generation serving, so the
+        // corpus is still frozen. A scraper alerting on age reads this one.
+        map.insert(
+            "lists_corpus_freeze".into(),
+            serde_json::to_value(&lists_corpus_freeze).unwrap_or(serde_json::Value::Null),
+        );
+        // Emit the four per-state counts even when zero, so JSON
+        // consumers always see the canonical shape and can distinguish
+        // "section absent" (older daemon, no field) from "all zeros"
+        // (no list_state wired).
         map.insert(
             "lc2_list_diagnostics".into(),
             serde_json::to_value(&lc2_list_diagnostics).unwrap_or(serde_json::Value::Null),
         );
-        // §4.13 — surface the resource-budget sample so JSON consumers
+        // Surface the resource-budget sample so JSON consumers
         // (Prometheus scrapers, monitoring dashboards) can ingest RSS /
         // CPU / fd counts without spawning the TUI. `null` distinguishes
         // "no sample yet / non-Linux daemon" from a real reading.
         map.insert(
             "resource_budget".into(),
             serde_json::to_value(resource_budget).unwrap_or(serde_json::Value::Null),
+        );
+        // Emit the per-server upstream list (empty array for a
+        // older daemon — `upstream_mode`/`upstream_count` above remain
+        // the legacy signal). Addresses are the operator's own resolvers,
+        // not secrets.
+        map.insert(
+            "upstream_servers".into(),
+            serde_json::to_value(&upstream_servers).unwrap_or_default(),
         );
     }
 
@@ -475,9 +527,8 @@ fn print_offline_status(
         }
     }
 
-    // §4.41: v1 loader replaces the v0 `Settings::from_file`. The
-    // printed fields are pass-through sections on `ConfigV1`
-    // (`server`/`upstream`/`lists`/`cache`) so field access is unchanged.
+    // The printed fields are pass-through sections on `ConfigV1`
+    // (`server`/`upstream`/`lists`/`cache`).
     let now = time::OffsetDateTime::now_utc();
     let loaded = match load_config(config_path, now) {
         Ok(l) => l,
@@ -516,8 +567,8 @@ fn print_offline_status(
     ) {
         println!("{line}");
     }
-    // `tag_model_consolidation` §3.3 — the config is already loaded
-    // here, so this path reads it directly instead of re-loading.
+    // The config is already loaded here, so this path reads it directly
+    // instead of re-loading.
     for line in format_inert_lists(&inert_blocklists(cfg)) {
         println!("{line}");
     }
@@ -619,8 +670,8 @@ fn print_offline_status_json(
     code
 }
 
-/// `tag_model_consolidation` §3.3: render the inert-list section — a
-/// count plus one line per list explaining why it filters nothing.
+/// Render the inert-list section — a count plus one line per list
+/// explaining why it filters nothing.
 ///
 /// Zero inert lists renders **nothing at all**, not `inert: 0`: the
 /// section exists to be noticed, and a permanent zero row trains the
@@ -656,15 +707,20 @@ fn inert_list_lines(config_path: &Path) -> Vec<String> {
     format_inert_lists(&inert_blocklists(&loaded.config))
 }
 
-/// Sprint C T3 of `lists_categories_v2` (§5.4 / §8.5): render the
-/// list state machine diagnostics as a leading blank line + 4
-/// labelled count rows, OR an empty `Vec` when there's no signal to
-/// show (no `list_state` wired, or every count zero).
+/// Format a freeze's start as RFC3339, or `None` when it has none.
 ///
-/// Frozen-string output: the 5 labels (`""`, `"Lists:"`, `"  Active:"`,
-/// `"  Pending:"`, `"  Failed:"`, `"  Stale > 7d:"`) are byte-pinned
-/// per RR3. Renaming any of them is a deliberate operator-visible
-/// change; the test below catches accidental drift.
+/// `since` is `Option` only so the wire type can reuse one serde helper;
+/// every value this daemon publishes carries it. A hand-built payload
+/// that does not gets no line at all rather than a line reading
+/// "FROZEN since unknown", which states less than silence and reads like
+/// a bug in the daemon rather than in the payload.
+pub(crate) fn format_frozen_since(freeze: &crate::lists::status::CorpusFreeze) -> Option<String> {
+    freeze.since.and_then(|t| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    })
+}
+
 /// Render the `lists:` summary — three states, not two.
 ///
 /// A truncated source is still an *active* source, so the `active/total`
@@ -685,6 +741,7 @@ fn format_lists_lines(
     lists_total: u32,
     lists_truncated: u32,
     refusal: Option<&crate::lists::status::CorpusRefusal>,
+    freeze: Option<&crate::lists::status::CorpusFreeze>,
 ) -> Vec<String> {
     let Some(r) = refusal else {
         let line = if lists_truncated > 0 {
@@ -698,17 +755,29 @@ fn format_lists_lines(
         return vec![line];
     };
 
-    let mut lines = vec![
-        format!(
-            "lists:      {lists_active}/{lists_total} sources fetched, CORPUS REFUSED \
-             — NOT INSTALLED"
-        ),
-        format!(
-            "            {} unique domains exceeds max_total_domains {}; \
-             serving the previous generation",
-            r.unique, r.ceiling
-        ),
-    ];
+    let mut lines = vec![format!(
+        "lists:      {lists_active}/{lists_total} sources fetched, CORPUS REFUSED \
+         — NOT INSTALLED"
+    )];
+    // Directly under the headline, because it is the line that separates a
+    // blip from an outage. A refusal that started this morning may clear
+    // itself when a list shrinks; one standing for a fortnight is a host
+    // that stopped tracking upstream, and the refusal payload alone reads
+    // the same either way. The horizon is stated rather than implied — the
+    // streak lives on the registry, so a restart resets it, and a count
+    // presented as all-time would understate a recurring freeze.
+    if let Some((f, since)) = freeze.and_then(|f| Some((f, format_frozen_since(f)?))) {
+        lines.push(format!(
+            "            FROZEN since {since} ({} refused cycles, counted since this daemon \
+             started)",
+            f.consecutive
+        ));
+    }
+    lines.push(format!(
+        "            {} unique domains exceeds max_total_domains {}; \
+         serving the previous generation",
+        r.unique, r.ceiling
+    ));
     if let Some((source, novel)) = r.novel_by_source.first() {
         lines.push(format!(
             "            largest contributor: {source} (+{novel} domains no other list \
@@ -754,12 +823,11 @@ fn format_domains_line(
     }
 }
 
-/// Render the `cache:` line, with both printed numbers in the same unit
-/// (mem2608-s3 / F-E).
+/// Render the `cache:` line, with both printed numbers in the same unit.
 ///
 /// `[cache] max_entries` is a moka *weight* ceiling
 /// (`dns/cache.rs::DnsCache::new`: a positive entry costs 10 units, a
-/// negative costs 1 — SEC-1, so an NXDOMAIN flood cannot evict real
+/// negative costs 1, so an NXDOMAIN flood cannot evict real
 /// answers), not an entry count. Printing `cache_entries` — a raw count —
 /// against `cache_cap` — a weight — silently compared two different
 /// units, which is how a live, actively-hit cache read as "0 / 10000
@@ -770,9 +838,9 @@ fn format_domains_line(
 /// more than `cap/10` raw entries). `cache_entries` is kept as an
 /// informational aside for the "how many answers" intuition.
 ///
-/// `cache_cap == 0` is the existing pre-§4.19 fallback signal (a daemon
-/// that predates weighted reporting entirely) and reproduces that
-/// fallback's exact byte-for-byte text; `cache_weighted_size` defaulting
+/// `cache_cap == 0` is the fallback signal for a daemon that predates
+/// weighted reporting entirely, and reproduces that fallback's exact
+/// byte-for-byte text; `cache_weighted_size` defaulting
 /// to 0 on an old daemon reads the same as a genuinely empty cache; that
 /// is an already-established ambiguity (see `cache_cap`'s own doc
 /// comment in `ipc/protocol.rs`), not a new one introduced here.
@@ -790,13 +858,12 @@ fn format_cache_line(cache_entries: u64, cache_weighted_size: u64, cache_cap: u6
 /// Render the `lists:` line on the **daemon-unreachable** path, from the
 /// config file alone.
 ///
-/// This used to test `cfg.lists.sources.is_empty()` and nothing else —
-/// the legacy `[lists].sources` array. Lists have been `[[blocklists]]`
-/// entities since the v1 schema, so on a pure-v1 config the array is
-/// empty by construction and this printed `lists:      (none)`
-/// **unconditionally**, healthy or not. During the 2026-08-05 corpus
-/// incident that line was read as evidence the lists had failed to load,
-/// and cost twenty minutes on a config with thirteen of them.
+/// Checking only the legacy `[lists].sources` array is not enough:
+/// lists are `[[blocklists]]` entities under the v1 schema, so on a
+/// pure-v1 config that array is empty by construction, and a check
+/// against it alone would print `lists:      (none)`
+/// **unconditionally**, healthy or not — reading as evidence the lists
+/// had failed to load on a config that has plenty of them.
 ///
 /// The wording is `configured`, deliberately not `active`: this path
 /// cannot reach the daemon, so it knows what the operator asked for and
@@ -839,6 +906,14 @@ fn format_config_lists_lines(enabled: usize, configured: usize, legacy: &[String
     out
 }
 
+/// Render the list state machine diagnostics as a leading blank line +
+/// 4 labelled count rows, OR an empty `Vec` when there's no signal to
+/// show (no `list_state` wired, or every count zero).
+///
+/// Frozen-string output: the 5 labels (`""`, `"Lists:"`, `"  Active:"`,
+/// `"  Pending:"`, `"  Failed:"`, `"  Stale > 7d:"`) are byte-pinned.
+/// Renaming any of them is a deliberate operator-visible change; the
+/// test below catches accidental drift.
 fn format_lc2_list_diagnostics(diagnostics: &crate::ipc::protocol::ListDiagnostics) -> Vec<String> {
     let total = diagnostics.active + diagnostics.pending + diagnostics.failed;
     if total == 0 {
@@ -870,18 +945,17 @@ fn format_uptime(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lists::status::CorpusRefusal;
+    use crate::lists::status::{CorpusFreeze, CorpusRefusal};
+    use time::macros::datetime;
 
     // ── the daemon-unreachable `lists:` line ─────────────────────────
 
     /// A v1 config with `[[blocklists]]` and no legacy array must not be
     /// reported as having no lists.
     ///
-    /// The old test was `cfg.lists.sources.is_empty()`, so this printed
-    /// `(none)` for every pure-v1 config that has ever existed. On
-    /// 2026-08-05 it was read as evidence that thirteen lists had failed
-    /// to load, and sent the investigation the wrong way for twenty
-    /// minutes.
+    /// Checking only `cfg.lists.sources.is_empty()` would print `(none)`
+    /// for every pure-v1 config, misreading a healthy config's lists as
+    /// having failed to load.
     #[test]
     fn v1_blocklists_are_not_reported_as_no_lists() {
         let lines = format_config_lists_lines(13, 13, &[]).join("\n");
@@ -981,10 +1055,10 @@ mod tests {
 
     // ── the `cache:` line ────────────────────────────────────────────
 
-    /// mem2608-s3 / F-E: the modern pair printed is weight-vs-weight
+    /// The modern pair printed is weight-vs-weight
     /// (`cache_weighted_size`/`cache_cap`), not count-vs-weight. Guards
     /// against reverting to printing `cache_entries` against `cache_cap`
-    /// directly, which is the defect this task exists to fix.
+    /// directly.
     #[test]
     fn the_modern_cache_line_compares_weight_against_weight() {
         let line = format_cache_line(741, 8_234, 10_000);
@@ -1009,10 +1083,10 @@ mod tests {
         assert_eq!(line, "cache:      10000/10000 weight (9100 entries; positive=10, negative=1 per [cache] max_entries)");
     }
 
-    /// A pre-§4.19 daemon (`cache_cap == 0`) must still render byte-for-
-    /// byte identically to the original single-number fallback — the new
-    /// weighted format must not leak into the path that has no cap to
-    /// compare against.
+    /// A daemon predating weighted reporting (`cache_cap == 0`) must
+    /// still render byte-for-byte identically to the original
+    /// single-number fallback — the weighted format must not leak into
+    /// the path that has no cap to compare against.
     #[test]
     fn the_legacy_fallback_cache_line_is_unchanged() {
         assert_eq!(format_cache_line(1234, 0, 0), "cache:      1234 entries");
@@ -1192,7 +1266,7 @@ mod tests {
         assert_eq!(format_uptime(300), "5m");
     }
 
-    /// The recurring P1 of this whole workstream, in its newest clothes.
+    /// The recurring defect class of this whole workstream, in its newest clothes.
     ///
     /// `active` conflates *downloaded and parsed* with *installed and
     /// serving*. That is what let `8/8 sources active` print while
@@ -1212,7 +1286,7 @@ mod tests {
             ],
         };
 
-        let refused = format_lists_lines(8, 8, 0, Some(&refusal)).join("\n");
+        let refused = format_lists_lines(8, 8, 0, Some(&refusal), None).join("\n");
         assert!(
             !refused.contains("active"),
             "a refused cycle still described its sources as active:\n{refused}"
@@ -1241,7 +1315,7 @@ mod tests {
         // Control arm: without a refusal the line is unchanged, so the
         // assertions above are about the refused state and not about some
         // blanket rewording of the line.
-        let healthy = format_lists_lines(8, 8, 0, None).join("\n");
+        let healthy = format_lists_lines(8, 8, 0, None, None).join("\n");
         assert!(
             healthy.contains("8/8 sources active"),
             "the healthy line changed:\n{healthy}"
@@ -1250,8 +1324,118 @@ mod tests {
 
         // And the pre-existing truncation suffix still works, refusal or
         // not — this line has three states now, not two.
-        let truncated = format_lists_lines(8, 8, 2, None).join("\n");
+        let truncated = format_lists_lines(8, 8, 2, None, None).join("\n");
         assert!(truncated.contains("2 TRUNCATED"), "{truncated}");
+    }
+
+    /// A refusal that does not say *when* reads the same on day one and
+    /// on day fourteen — proxmox served a frozen corpus for two weeks and
+    /// nine cycles with `warden status` printing the identical block every
+    /// time. The line is byte-pinned because an operator greps it and a
+    /// scraper matches it.
+    #[test]
+    fn a_standing_freeze_states_its_age_and_its_horizon() {
+        let refusal = CorpusRefusal {
+            unique: 15_012_024,
+            ceiling: 14_000_000,
+            novel_by_source: vec![("security/malicious".to_string(), 4_000_000)],
+        };
+        let freeze = CorpusFreeze {
+            since: Some(datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 9,
+        };
+
+        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        assert!(
+            out.contains(
+                "            FROZEN since 2026-08-04T03:00:00Z (9 refused cycles, \
+                 counted since this daemon started)"
+            ),
+            "the frozen line drifted:\n{out}"
+        );
+        // Directly under the headline: the age is what separates a blip
+        // from an outage, so it must not sit below the detail lines an
+        // operator scans past.
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("CORPUS REFUSED"), "{out}");
+        assert!(lines[1].contains("FROZEN since"), "{out}");
+
+        // The horizon is stated, not implied. Without it "9 refused
+        // cycles" reads as an all-time total, and a daemon restarted
+        // mid-freeze would understate a recurring outage.
+        assert!(
+            out.contains("since this daemon started"),
+            "the count is presented as if it were all-time:\n{out}"
+        );
+
+        // Control arm: a refusal with no freeze reported (an older daemon)
+        // still renders every pre-existing line, and adds nothing.
+        let no_freeze = format_lists_lines(8, 8, 0, Some(&refusal), None).join("\n");
+        assert!(no_freeze.contains("CORPUS REFUSED"), "{no_freeze}");
+        assert!(
+            !no_freeze.contains("FROZEN since"),
+            "a daemon that cannot report the freeze must not have one invented \
+             for it:\n{no_freeze}"
+        );
+
+        // ...and a healthy daemon never sees the line, freeze or not.
+        let healthy = format_lists_lines(8, 8, 0, None, Some(&freeze)).join("\n");
+        assert!(!healthy.contains("FROZEN"), "{healthy}");
+    }
+
+    /// The worst state the daemon has — refused, with no previous
+    /// generation to fall back on — still gets the age, and the pairing is
+    /// a decision rather than an oversight.
+    ///
+    /// The word "FROZEN" is loose there: nothing is being served, so
+    /// nothing is frozen. It is printed anyway because "9 refused cycles
+    /// since <t>" is exactly true and is the most actionable fact an
+    /// operator has in that state, and because the sharp version of the
+    /// truth arrives one line further down, from `format_domains_line`,
+    /// which is the function that knows the domain count. Suppressing the
+    /// age here would withhold it precisely where it matters most.
+    #[test]
+    fn a_refusal_with_nothing_installed_still_states_its_age() {
+        let refusal = CorpusRefusal {
+            unique: 30_000_000,
+            ceiling: 14_000_000,
+            novel_by_source: vec![],
+        };
+        let freeze = CorpusFreeze {
+            since: Some(datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 9,
+        };
+        let lists = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        assert!(
+            lists.contains("FROZEN since 2026-08-04T03:00:00Z"),
+            "{lists}"
+        );
+        assert!(lists.contains("9 refused cycles"), "{lists}");
+
+        // The line that does know: unfiltered is stated where the count is.
+        let domains = format_domains_line(0, Some(&refusal));
+        assert!(domains.contains("NOTHING IS INSTALLED"), "{domains}");
+        assert!(domains.contains("UNFILTERED"), "{domains}");
+    }
+
+    /// `since` carries the `Option` only to reuse a serde helper. A value
+    /// that somehow lacks it must drop the line rather than print
+    /// "FROZEN since unknown", which reads as a daemon bug.
+    #[test]
+    fn a_freeze_without_a_start_prints_no_line() {
+        let refusal = CorpusRefusal {
+            unique: 15_012_024,
+            ceiling: 14_000_000,
+            novel_by_source: vec![],
+        };
+        let freeze = CorpusFreeze {
+            since: None,
+            consecutive: 4,
+        };
+        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        assert!(!out.contains("FROZEN"), "{out}");
+        assert!(!out.contains("unknown"), "{out}");
+        assert!(out.contains("CORPUS REFUSED"), "{out}");
     }
 
     #[test]
@@ -1264,11 +1448,10 @@ mod tests {
         assert_eq!(format_uptime(90061), "1d 1h 1m");
     }
 
-    /// Sprint C T3 of `lists_categories_v2` (§5.4 / §8.5, RR3
-    /// frozen-strings): the 5 labels emitted by the diagnostics
-    /// section MUST stay byte-pinned. Rename any of them and this
-    /// test catches it. Operators read these strings — drift is
-    /// operator-visible churn we want to gate intentionally.
+    /// The 5 labels emitted by the diagnostics section MUST stay
+    /// byte-pinned. Rename any of them and this test catches it.
+    /// Operators read these strings — drift is operator-visible churn
+    /// we want to gate intentionally.
     #[test]
     fn format_lc2_list_diagnostics_frozen_string_labels() {
         let d = crate::ipc::protocol::ListDiagnostics {
@@ -1291,7 +1474,7 @@ mod tests {
         );
     }
 
-    // ── tag_model_consolidation §3.3 — inert list section ───────────
+    // ── Inert list section ───────────────────────────────────────────
 
     /// Zero inert lists must print NOTHING — not `inert: 0`. A row that
     /// is always there is a row the operator stops reading, which is
@@ -1312,10 +1495,8 @@ mod tests {
     /// a renderer that formatted the first row twice is caught too.
     ///
     /// Both rows are `BaseIgnore` because it is the only variant
-    /// `inert_blocklists` produces. They used to be `AllowListNoTags` and
-    /// `TagsMatchNothing`, which `plp-s5f` removed as unproduced — this
-    /// test was the last thing naming them, and it was rendering two
-    /// operator sentences the daemon had no way to reach.
+    /// `inert_blocklists` produces — using two distinct reasons here
+    /// would render operator sentences the daemon has no way to reach.
     #[test]
     fn tmc_inert_lists_render_count_then_one_reason_per_list() {
         let rows = [
@@ -1387,9 +1568,7 @@ servers = ["192.0.2.1:53"]
         let lines = inert_list_lines(&path);
         assert_eq!(lines.len(), 2, "count line + one reason: {lines:?}");
         assert_eq!(lines[0], "inert:      1");
-        // `base = "ignore"` is the ONLY inert reason after `plp-s5b`. This
-        // fixture used to expect `mycompany` here, on the retired premise
-        // that an untagged allow-list applies to nobody.
+        // `base = "ignore"` is the ONLY inert reason.
         assert!(lines[1].contains("shelved"), "{lines:?}");
         // Two control arms, both pinning a premise that is GONE — they are
         // the point of the test, not decoration. If either reason comes
@@ -1401,18 +1580,15 @@ servers = ["192.0.2.1:53"]
         // false positive on a security-relevant direction, and it invited
         // the operator to "fix" it with a tag verb that no longer exists.
         assert!(!lines[1].contains("mycompany"), "{lines:?}");
-        // `working`: a deny list is not inert either. The old comment here
-        // credited the default profile's `uncategorized` tag for that, which
-        // stopped deciding anything at the `plp-s3` cutover — it is `base`
-        // that reaches every profile now.
+        // `working`: a deny list is not inert either — it is `base` that
+        // reaches every profile, not a tag.
         assert!(!lines[1].contains("working"), "{lines:?}");
     }
 
-    /// Sprint C T3: zero-everywhere diagnostics emit no output —
-    /// the operator only sees the section when there's signal to
-    /// show. Pre-Sprint-C daemons send default-empty
-    /// `ListDiagnostics`, and we don't want to clutter the status
-    /// page with empty health blocks for those.
+    /// Zero-everywhere diagnostics emit no output — the operator only
+    /// sees the section when there's signal to show. An older daemon
+    /// sends default-empty `ListDiagnostics`, and we don't want to
+    /// clutter the status page with empty health blocks for those.
     #[test]
     fn format_lc2_list_diagnostics_no_signal_omits_section() {
         let d = crate::ipc::protocol::ListDiagnostics::default();

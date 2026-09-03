@@ -1,29 +1,26 @@
-//! Sprint 44 T3 — Local DNS Scoping v2 CLI surface.
+//! Local DNS Scoping CLI surface.
 //!
 //! Four verbs (`add` / `remove` / `list` / `show`) under `warden local-dns`,
 //! each driving the `[[local_dns.records]]` global table OR a profile's
-//! `Profile.local_records` array depending on `--profile <id>`. R7
-//! single-seat: [`add_inner`] / [`remove_inner`] are the only paths that
-//! mutate either slice — clap dispatches and the future TUI tab modal
-//! both call them.
+//! `Profile.local_records` array depending on `--profile <id>`. Single
+//! seat: [`add_inner`] / [`remove_inner`] are the only paths that mutate
+//! either slice — clap dispatches and the TUI tab modal both call them.
 //!
-//! Mutation flow per CS2 + HR2 (R2):
+//! Mutation flow:
 //!   1. Validator pre-flight against the merged `[existing..., new]`
-//!      slice via `validate_local_records_v2` (T1 helper).
-//!   2. TOML mutation via
-//!      [`super::target::write_value_validated`] (CS2 atomic): the full
-//!      v1 loader runs against the STAGED bytes before the rename, so a
-//!      tree the loader would reject never lands on disk.
-//!   3. `super::ipc_reload::attempt_reload` fires the HR2 frozen-string
-//!      reload feedback.
-//!   4. Audit emit via `AuditWriter::append_cli_mutation` (R4) inside
-//!      the inner helpers, NOT the outer `run_*` — single-seat means
-//!      single audit emission.
+//!      slice via `validate_local_records_v2`.
+//!   2. TOML mutation via [`super::target::write_value_validated`]: the
+//!      full v1 loader runs against the STAGED bytes before the rename,
+//!      so a tree the loader would reject never lands on disk.
+//!   3. `super::ipc_reload::attempt_reload` fires the reload feedback.
+//!   4. Audit emit via `AuditWriter::append_cli_mutation` inside the
+//!      inner helpers, NOT the outer `run_*` — single-seat means single
+//!      audit emission.
 //!
 //! Idempotent silent no-op: `add` of a record with the SAME
 //! `(domain, type, value, match_subdomains, ttl_secs)` in the same scope
-//! returns [`AddOutcome::NoOp`] — no write, no reload, no audit. Mirrors
-//! Sprint 43 T3 `apply_blocklists_change_inline`.
+//! returns [`AddOutcome::NoOp`] — no write, no reload, no audit, mirroring
+//! `apply_blocklists_change_inline`.
 
 use std::path::{Path, PathBuf};
 
@@ -44,7 +41,7 @@ use self::profile_scoped::{
     find_profile_target_file, load_for_resolution,
 };
 
-// ── Frozen strings T3 owns (T4 will pin byte-for-byte) ────────────────
+// ── Frozen strings ─────────────────────────────────────────────────────
 
 /// Profile referenced by `--profile <id>` does not exist.
 pub const LOCAL_RECORDS_PROFILE_NOT_FOUND: &str =
@@ -152,7 +149,7 @@ impl LocalRecordScope {
     }
 
     /// Validator scope label (`"local_dns"` for global, `"profiles.<id>.local_records"` per-profile)
-    /// matching T1 [`validate_local_records_v2`] expectations.
+    /// matching [`validate_local_records_v2`] expectations.
     fn validator_label(&self) -> String {
         match self {
             Self::Global => "local_dns".to_string(),
@@ -205,9 +202,8 @@ impl LocalRecordSpec {
 /// (record already present byte-identical); the caller skips the reload
 /// + audit on a true no-op.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `file` is consumed by the future TUI tab modal +
-                    // tests; the dead-code lint flags only the production
-                    // CLI dispatch which doesn't read it directly.
+#[allow(dead_code)] // `file` is read only by tests; production callers
+                    // (CLI dispatch, TUI submit handler) ignore it.
 pub(crate) enum AddOutcome {
     Applied {
         file: PathBuf,
@@ -220,27 +216,27 @@ pub(crate) enum AddOutcome {
 /// "operator typed a non-existent record" from "removal succeeded".
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Same as `AddOutcome`: `file` + `n_dropped` are
-                    // consumed by the TUI tab + tests.
+                    // read only by tests.
 pub(crate) enum RemoveOutcome {
     Removed { file: PathBuf, n_dropped: usize },
     NotFound,
 }
 
-// ── add_inner / remove_inner — R7 single seat ─────────────────────────
+// ── add_inner / remove_inner — single seat ─────────────────────────
 
-/// Single-seat `add` mutation. Called by the CLI dispatch and (in T3+)
-/// by the TUI Local DNS tab's submit handler. Sync — caller fires the
-/// HR2 reload + the success message.
+/// Single-seat `add` mutation. Called by the CLI dispatch and by the
+/// TUI Local DNS tab's submit handler. Sync — caller fires the reload +
+/// the success message.
 ///
 /// Validator pre-flight: builds the merged
-/// `[existing_records..., new_spec]` slice and runs T1's
+/// `[existing_records..., new_spec]` slice and runs
 /// [`validate_local_records_v2`] against it. Errors → bail without
-/// touching disk. Catches every locked-decision check:
-///   - DR8 per-scope duplicate detection.
-///   - DR9 PSL refusal on `match_subdomains: true` over public suffixes.
-///   - DR10 root-subdomain refusal.
-///   - DR16 reserved-IP target refusal (0.0.0.0, 127/8, 224/4, etc.).
-///   - DR5 TTL out-of-range.
+/// touching disk. Catches every locked check:
+///   - per-scope duplicate detection.
+///   - PSL refusal on `match_subdomains: true` over public suffixes.
+///   - root-subdomain refusal.
+///   - reserved-IP target refusal (0.0.0.0, 127/8, 224/4, etc.).
+///   - TTL out-of-range.
 ///   - CNAME loop detection.
 ///   - A+CNAME conflict per scope.
 pub(crate) fn add_inner(
@@ -301,14 +297,13 @@ pub(crate) fn add_inner(
     }
     write_value_validated(config_path, &target_path, &doc)?;
 
-    // 7. Audit emit (R4 single-seat). Best-effort — never bubbles.
-    //    Post `s44-audit-extra-fields` (2026-05-05) the record `value` /
-    //    `match_subdomains` / `ttl_secs` are persisted natively on the
-    //    audit record so the TUI side-card can render the full mutation
-    //    state without cross-referencing the master TOML. The dev
-    //    `tracing::debug!` line below mirrors the same fields onto the
-    //    journald channel — kept for parity with pre-followup
-    //    operators who already grep on `target: "audit"`.
+    // 7. Audit emit (single-seat). Best-effort — never bubbles. The
+    //    record `value` / `match_subdomains` / `ttl_secs` are persisted
+    //    natively on the audit record so the TUI side-card can render
+    //    the full mutation state without cross-referencing the master
+    //    TOML. The `tracing::debug!` line below mirrors the same fields
+    //    onto the journald channel for operators who grep on
+    //    `target: "audit"`.
     tracing::debug!(
         target: "audit",
         scope = scope.as_tag(),
@@ -355,7 +350,7 @@ pub(crate) fn add_inner(
 
 /// Single-seat `remove` mutation. Drops every record matching `domain`
 /// in the requested scope, optionally filtered by `record_type`. Sync —
-/// caller fires the HR2 reload + the success message.
+/// caller fires the shared reload + the success message.
 pub(crate) fn remove_inner(
     config_path: &Path,
     scope: &LocalRecordScope,
@@ -377,11 +372,10 @@ pub(crate) fn remove_inner(
     };
 
     // Snapshot the matching record(s) before mutation so the audit
-    // entry can carry value / match_subdomains / ttl_secs (s44 follow-up
-    // schema growth). When exactly one record matches we have enough
-    // signal to populate every field; on a multi-match remove we leave
-    // them empty so the audit panel doesn't claim a single value
-    // covered all dropped rows.
+    // entry can carry value / match_subdomains / ttl_secs. When exactly
+    // one record matches we have enough signal to populate every field;
+    // on a multi-match remove we leave them empty so the audit panel
+    // doesn't claim a single value covered all dropped rows.
     let pre_removal: Vec<LocalDnsRecord> = load_scope_records(config_path, scope)
         .unwrap_or_default()
         .into_iter()
@@ -438,7 +432,7 @@ pub(crate) fn remove_inner(
     })
 }
 
-// ── Public CLI handlers (HR2 wrappers) ────────────────────────────────
+// ── Public CLI handlers ────────────────────────────────
 
 /// `warden local-dns add <domain> <type> <value> [--profile ...] ...`
 #[allow(clippy::too_many_arguments)]
@@ -654,7 +648,7 @@ pub fn run_show(config_path: &Path, domain: &str, profile: Option<&str>) -> anyh
     if let Some(id) = profile {
         // Single lookup that is also the existence gate — no separate
         // `ensure_*` + re-find + `unreachable!()` for a future edit to trip
-        // on. Same not-found message as `ensure_profile_exists_in`. cli §9 #11.
+        // on. Same not-found message as `ensure_profile_exists_in`.
         let Some((_, p)) = cfg.profiles.iter().find(|(k, _)| k.as_str() == id) else {
             let known: Vec<&str> = cfg.profiles.keys().map(|k| k.as_str()).collect();
             bail!("{}", format_local_records_profile_not_found(id, &known));
@@ -1181,7 +1175,7 @@ servers = ["192.0.2.1:53"]
         assert!(s.contains("192.168.1.50"));
         assert!(s.starts_with("Added global local DNS record"));
 
-        let s = format_local_records_added_profile("example.test", "A", "192.0.2.50", "kids", 3);
+        let s = format_local_records_added_profile("example.test", "A", "10.10.1.50", "kids", 3);
         assert!(s.contains("example.test"));
         assert!(s.contains("kids"));
         assert!(s.contains("3 device"));
@@ -1189,8 +1183,8 @@ servers = ["192.0.2.1:53"]
         let s = format_local_records_removed("media.home", "global");
         assert!(s.contains("media.home"));
         assert!(s.contains("global"));
-        // verbs-04: the success string states only the durable fact; the
-        // reload outcome is printed separately by report_reload_outcome.
+        // The success string states only the durable fact; the reload
+        // outcome is printed separately by report_reload_outcome.
         assert!(!s.contains("Reload triggered"));
 
         let s = format_local_records_remove_not_found("ghost.home", "profile 'kids'");
@@ -1263,7 +1257,7 @@ servers = ["192.0.2.1:53"]
     fn t3_add_inner_profile_appends_record_in_master() {
         let master = temp_master(v1_master_with_default_profile());
         let scope = LocalRecordScope::Profile("kids".into());
-        let spec = make_spec_a("example.test", "192.0.2.50");
+        let spec = make_spec_a("example.test", "10.10.1.50");
         let outcome = add_inner(&master, &scope, &spec, None).unwrap();
         assert!(matches!(outcome, AddOutcome::Applied { .. }));
 
@@ -1277,7 +1271,7 @@ servers = ["192.0.2.1:53"]
         assert!(kids
             .local_records
             .iter()
-            .any(|r| r.domain == "example.test" && r.value == "192.0.2.50"));
+            .any(|r| r.domain == "example.test" && r.value == "10.10.1.50"));
         std::fs::remove_file(&master).ok();
     }
 
@@ -1379,7 +1373,7 @@ servers = ["192.0.2.1:53"]
         let spec = LocalRecordSpec {
             domain: "example.test".into(),
             record_type: LocalDnsRecordType::A,
-            value: "192.0.2.50".into(),
+            value: "10.10.1.50".into(),
             match_subdomains: true,
             ttl_secs: Some(7200),
         };
@@ -1475,7 +1469,7 @@ servers = ["192.0.2.1:53"]
         let master = temp_master(v1_master_with_default_profile());
         let scope_kids = LocalRecordScope::Profile("kids".into());
         let scope_default = LocalRecordScope::Profile("default".into());
-        let spec = make_spec_a("example.test", "192.0.2.50");
+        let spec = make_spec_a("example.test", "10.10.1.50");
         let _ = add_inner(&master, &scope_kids, &spec, None).unwrap();
         let _ = add_inner(&master, &scope_default, &spec, None).unwrap();
 
@@ -1553,7 +1547,7 @@ servers = ["192.0.2.1:53"]
         let spec = LocalRecordSpec {
             domain: "example.test".into(),
             record_type: LocalDnsRecordType::A,
-            value: "192.0.2.50".into(),
+            value: "10.10.1.50".into(),
             match_subdomains: true,
             ttl_secs: Some(3600),
         };

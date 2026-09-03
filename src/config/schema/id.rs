@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn ok_with_dashes_and_digits() {
-        assert!(Id::new("alex-iphone-01").is_ok());
+        assert!(Id::new("operator-iphone-01").is_ok());
     }
 
     #[test]

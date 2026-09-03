@@ -1,4 +1,4 @@
-//! Hardened HTTP client for blocklist and catalog downloads (P0-1).
+//! Hardened HTTP client for blocklist and catalog downloads.
 //!
 //! This module builds the `reqwest::Client` used to fetch external lists and
 //! the catalog. It enforces a strict SSRF policy:
@@ -63,7 +63,7 @@ pub enum UrlGuardError {
     MissingHost,
     #[error("URL host {0} is a disallowed address (loopback/private/link-local/ULA)")]
     DisallowedHost(String),
-    /// rev-2606 §06 `manager-04b`: the URL carries embedded credentials
+    /// The URL carries embedded credentials
     /// (`user:pass@host`). Refused so the password never reaches a stored
     /// failure reason or log. `{0}` is the **redacted** URL (userinfo
     /// stripped) so the operator can still identify which source to fix.
@@ -73,7 +73,7 @@ pub enum UrlGuardError {
     ParseError(String),
 }
 
-/// rev-2606 §06 `manager-04b`: return `url_str` with any userinfo
+/// Return `url_str` with any userinfo
 /// (`user:pass@`) stripped, so a credential embedded in a list URL never
 /// reaches an operator-facing error string, status reason, or log.
 ///
@@ -253,7 +253,7 @@ pub fn validate_list_url(url_str: &str) -> Result<(), UrlGuardError> {
         return Err(UrlGuardError::MissingHost);
     }
 
-    // rev-2606 §06 manager-04b: refuse embedded credentials. The supported
+    // Refuse embedded credentials. The supported
     // path for an authenticated list is `auth_token_ref` (Bearer token from
     // secrets.toml), not a password baked into the URL where it would land
     // in stored failure reasons, IPC status, and logs.
@@ -576,8 +576,8 @@ mod tests {
     // — `reqwest` exposes no getter for its configured timeouts — so the
     // only honest assertion is behavioural, against a real socket.
     //
-    // Verified by mutation on 2026-08-11, because a green test that cannot
-    // go red is decoration:
+    // Verified by mutation, because a green test that cannot go red is
+    // decoration:
     //
     // | removed from the builder | caught by |
     // |---|---|
@@ -736,7 +736,7 @@ mod tests {
         );
     }
 
-    // ── rev-2606 §06 manager-04b: userinfo refusal + redaction ────
+    // ── userinfo refusal + redaction ──────────────────────────────
 
     #[test]
     fn rejects_url_with_embedded_credentials() {

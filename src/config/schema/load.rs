@@ -2,11 +2,10 @@
 //! string, categorises any [`toml::de::Error`] into the appropriate
 //! [`ConfigError`] variant, and runs the semantic validator.
 //!
-//! Sprint 29 replaces this with a full multi-file loader (globs, includes,
-//! path security, cycle detection, load limits). For Sprint 28 this
-//! surface is enough to drive the `tests/fixtures/broken-v1/` regression
-//! suite: it gives every `ConfigError` variant a natural production path,
-//! and will be reused as the single-file fast-path inside the S29 loader.
+//! Reused as the single-file fast path inside the multi-file loader
+//! (globs, includes, path security, cycle detection, load limits). Also
+//! drives the `tests/fixtures/broken-v1/` regression suite: it gives every
+//! `ConfigError` variant a natural production path.
 
 use std::path::Path;
 
@@ -42,7 +41,7 @@ pub fn load_from_str(
 /// [`AuditWarnings`] collector, and can carry the secrets table + provenance
 /// map the full validator wants.
 ///
-/// `s1-followup-load-from-str-collect`. The loader's single-file fast path —
+/// The loader's single-file fast path —
 /// which is the *shipped* layout, and the one both the reference fixture and
 /// every lint fixture take — used to validate **twice**: once through
 /// `load_from_str` (emitting to `tracing`, but unable to accept a collector)
@@ -74,8 +73,8 @@ pub fn load_from_str_collect(
 /// Deserialise a [`ConfigV1`], stripping retired schema keys first when
 /// the source still carries any.
 ///
-/// **`plp-s5a` F1 — this is the half of the `tags` removal that keeps the
-/// daemon starting.** All five entity structs are
+/// **This is the half of the `tags` removal that keeps the daemon
+/// starting.** All five entity structs are
 /// `#[serde(deny_unknown_fields)]`, so a config still carrying
 /// `tags = [...]` is *refused*, not ignored, the moment the field goes.
 /// Both shipped hosts were measured carrying the key, and a config that
@@ -111,7 +110,7 @@ fn parse_v1(src: &str, file: Option<&Path>) -> Result<ConfigV1, ConfigError> {
 }
 
 /// Convenience wrapper reading from disk. Used by the fixture-based
-/// tests; the production loader in S29 will supersede this.
+/// tests.
 pub fn load_from_path(path: &Path, now: OffsetDateTime) -> Result<ConfigV1, Vec<ConfigError>> {
     let src = std::fs::read_to_string(path).map_err(|io_err| {
         vec![ConfigError::Parse(
@@ -122,9 +121,9 @@ pub fn load_from_path(path: &Path, now: OffsetDateTime) -> Result<ConfigV1, Vec<
     load_from_str(&src, Some(path), now)
 }
 
-/// s4 config-m4: `pub(crate)` so the loader's single-file fast path can
-/// attribute the `auth_token_ref` cross-check errors it now surfaces to the
-/// master file, exactly as [`load_from_str`] does for its own.
+/// `pub(crate)` so the loader's single-file fast path can attribute the
+/// `auth_token_ref` cross-check errors it surfaces to the master file,
+/// exactly as [`load_from_str`] does for its own.
 pub(crate) fn attach_file(mut err: ConfigError, file: Option<&Path>) -> ConfigError {
     if err.context().file.is_none() {
         if let Some(p) = file {
@@ -149,7 +148,7 @@ pub(crate) fn attach_file(mut err: ConfigError, file: Option<&Path>) -> ConfigEr
 fn classify_toml_error(err: toml::de::Error, src: &str, file: Option<&Path>) -> ConfigError {
     let msg = err.to_string();
     let line = err.span().map(|s| line_of(src, s.start));
-    // error-01: bound the stored reason (toml can excerpt a multi-MB line);
+    // Bound the stored reason (toml can excerpt a multi-MB line);
     // classification still matches on the full `msg`.
     let mut ctx = ErrorContext::new(super::super::error::truncate_for_error(&msg).into_owned());
     if let Some(p) = file {
@@ -158,7 +157,7 @@ fn classify_toml_error(err: toml::de::Error, src: &str, file: Option<&Path>) -> 
     if let Some(l) = line {
         ctx = ctx.with_line(l);
     }
-    // loader-12: one shared, drift-proof classifier for both the single-file
+    // One shared, drift-proof classifier for both the single-file
     // and merged paths; matches against the user-content-masked skeleton.
     super::super::error::classify_config_error(&msg, ctx)
 }
@@ -318,9 +317,8 @@ mod tests {
 
     #[test]
     fn broken_admin_rule_unparseable() {
-        // rev-2606 schema-validator-05 poster child: an unclosed regex
-        // group in [[admin_rules]].rule is a load error, not a silently
-        // inert rule.
+        // An unclosed regex group in [[admin_rules]].rule is a load
+        // error, not a silently inert rule.
         broken_case(
             "admin_rule_unparseable",
             "validation_failed",

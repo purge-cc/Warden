@@ -353,8 +353,8 @@ fn v1_to_v3_refuses_a_v2_config_instead_of_writing_ignore_everywhere() {
 
 // ── The migration must leave the household still filtering ────────────
 
-const ZIMA: &str = include_str!("fixtures/plp_v2_site_a.toml");
-const PROXMOX: &str = include_str!("fixtures/plp_v2_site_b.toml");
+const ZIMA: &str = include_str!("fixtures/plp_v2_node_a.toml");
+const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
 
 /// **The check the rest of this workstream does not make.**
 ///

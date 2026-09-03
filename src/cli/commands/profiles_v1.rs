@@ -15,6 +15,7 @@ use anyhow::{bail, Result};
 use clap::Subcommand;
 use time::OffsetDateTime;
 
+use super::format_config_errors;
 use crate::config::loader::load_config;
 use crate::config::schema::blocklist::{effective_direction, Blocklist, ListPolicy};
 use crate::config::schema::profile::{BlockResponseV1, Profile};
@@ -29,8 +30,7 @@ use crate::ipc::socket_client;
 /// `warden profile list` — tabulate every v1 profile with summary stats.
 pub fn run_list(config_path: &Path) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded =
-        load_config(config_path, now).map_err(|errs| anyhow::anyhow!(format_load_errors(&errs)))?;
+    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
 
     if loaded.config.profiles.is_empty() {
         println!("no profiles configured");
@@ -79,8 +79,7 @@ pub fn run_list(config_path: &Path) -> Result<()> {
 /// `warden profile show <id>` — dump every v1 field for one profile.
 pub fn run_show(config_path: &Path, id: &str) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded =
-        load_config(config_path, now).map_err(|errs| anyhow::anyhow!(format_load_errors(&errs)))?;
+    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
 
     let prof = loaded
         .config
@@ -764,8 +763,7 @@ pub async fn run_list_policy_clear(socket_path: &Path, id: &str, list_id: &str) 
 /// applies, per list, and where each direction came from.
 pub fn run_list_policy_show(config_path: &Path, id: &str) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded =
-        load_config(config_path, now).map_err(|errs| anyhow::anyhow!(format_load_errors(&errs)))?;
+    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
 
     let prof = loaded
         .config
@@ -817,15 +815,6 @@ async fn send_and_print(socket_path: &Path, cmd: IpcCommand) -> Result<()> {
             );
         }
     }
-}
-
-fn format_load_errors(errs: &[crate::config::error::ConfigError]) -> String {
-    let mut s = String::new();
-    for e in errs {
-        s.push_str(&e.to_string());
-        s.push('\n');
-    }
-    s
 }
 
 #[cfg(test)]
@@ -1036,6 +1025,39 @@ mod tests {
             Some("Kids".into())
         );
     }
+    // ── every read verb reports a broken config in one voice ────────
+
+    /// The three read verbs collapse the loader's error list through the
+    /// shared CLI seat, so a broken config reads identically whichever
+    /// verb hit it. Their own collapser emitted a bare newline-joined
+    /// list — no error count, no bullets — which is a different product
+    /// speaking to the operator depending on which command they ran.
+    #[test]
+    fn read_verbs_report_a_broken_config_in_the_shared_wording() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        std::fs::write(&master, "server = { listen = \"not-an-address\" }\n").unwrap();
+
+        for (verb, err) in [
+            ("profile list", run_list(&master).unwrap_err()),
+            ("profile show", run_show(&master, "default").unwrap_err()),
+            (
+                "profile list-policy show",
+                run_list_policy_show(&master, "default").unwrap_err(),
+            ),
+        ] {
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("cannot load config ("),
+                "`warden {verb}` must use the shared header: {msg}"
+            );
+            assert!(
+                msg.contains("\n  - "),
+                "`warden {verb}` must bullet each loader error: {msg}"
+            );
+        }
+    }
+
     // ── `profile show` dumps EVERY field, and stays that way ─────────
 
     /// The doc on `run_show` promises "every v1 field", and prose does

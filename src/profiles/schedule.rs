@@ -18,8 +18,7 @@ pub struct ParsedSchedule {
     end_hour: u8,
     end_min: u8,
     wraps_midnight: bool,
-    /// Sprint 23 s23-schedule-expires-at: optional one-shot expiry.
-    /// `None` for recurring schedules (existing behavior). When `Some`,
+    /// Optional one-shot expiry. `None` for recurring schedules. When `Some`,
     /// `is_active` returns false once `expires_at <= now_utc` REGARDLESS
     /// of the day/hour window — a one-shot schedule is dead the moment
     /// its expiry passes, even mid-window.
@@ -34,15 +33,15 @@ impl ParsedSchedule {
         let start_total = start_hour as u16 * 60 + start_min as u16;
         let end_total = end_hour as u16 * 60 + end_min as u16;
         let wraps_midnight = start_total >= end_total;
-        // res-13: reject a zero-length window (start == end), which the
-        // wrap logic above would otherwise treat as permanently active.
-        // The sole exception is 00:00-00:00 (midnight-to-midnight = the
-        // whole day), the canonical always-on form the resolver fixtures
-        // and `full_day_range` rely on. Any other equal pair (e.g.
-        // 09:00-09:00) is almost certainly an operator typo. Mirrors the
-        // schema validator's `check_schedules` carve-out (rev-2606
-        // schema-validator-06), so the invariant holds even on a
-        // parse-without-validate path (`build_resolver_map` → `parse_v1`).
+        // Reject a zero-length window (start == end), which the wrap logic
+        // above would otherwise treat as permanently active. The sole
+        // exception is 00:00-00:00 (midnight-to-midnight = the whole day),
+        // the canonical always-on form the resolver fixtures and
+        // `full_day_range` rely on. Any other equal pair (e.g. 09:00-09:00)
+        // is almost certainly an operator typo. Mirrors the schema
+        // validator's `check_schedules` carve-out, so the invariant holds
+        // even on a parse-without-validate path (`build_resolver_map` →
+        // `parse_v1`).
         if start_total == end_total && start_total != 0 {
             return None;
         }
@@ -72,8 +71,8 @@ impl ParsedSchedule {
         let start_total = start_hour as u16 * 60 + start_min as u16;
         let end_total = end_hour as u16 * 60 + end_min as u16;
         let wraps_midnight = start_total >= end_total;
-        // res-13: reject zero-length windows except 00:00-00:00 — same
-        // guard as `parse` above. The v1 build path parses directly via
+        // Reject zero-length windows except 00:00-00:00 — same guard as
+        // `parse` above. The v1 build path parses directly via
         // `build_resolver_map` without a validator pass, so the check
         // cannot live only in `check_schedules`.
         if start_total == end_total && start_total != 0 {
@@ -167,13 +166,13 @@ pub fn local_now() -> (u8, u8, u8) {
 /// without forging a real `localtime_r` failure (near-impossible for a valid
 /// `time_t`).
 ///
-/// rev-2606 schedule-02: on a NULL return `localtime_r` leaves `*tm`
-/// unspecified — here it stays all-zero from `mem::zeroed`, which
-/// `convert_libc_tm_components` would silently read as "Sunday 00:00". Surface
-/// the failure with a `warn!` and fall back to the documented `(Monday, 0, 0)`
-/// this module already uses for out-of-range components, rather than a silent
-/// wrong-time schedule evaluation. `ret` is only inspected for nullness, never
-/// dereferenced; the validated read goes through the `&tm` we own.
+/// On a NULL return `localtime_r` leaves `*tm` unspecified — here it stays
+/// all-zero from `mem::zeroed`, which `convert_libc_tm_components` would
+/// silently read as "Sunday 00:00". Surface the failure with a `warn!` and
+/// fall back to the documented `(Monday, 0, 0)` this module already uses
+/// for out-of-range components, rather than a silent wrong-time schedule
+/// evaluation. `ret` is only inspected for nullness, never dereferenced;
+/// the validated read goes through the `&tm` we own.
 fn components_from_localtime(ret: *const libc::tm, tm: &libc::tm, epoch: u64) -> (u8, u8, u8) {
     if ret.is_null() {
         tracing::warn!(
@@ -283,16 +282,6 @@ fn parse_time(s: &str) -> Option<(u8, u8)> {
     }
     Some((h, m))
 }
-
-// NOTE (rev-2606 schema-validator-06): a legacy `validate_schedule` helper
-// lived here until 2026-06-12. It had zero production callers (the v0
-// schedule CRUD it served was retired in §4.27-B), and its equal-times
-// branch had drifted from the engine: it rejected `00:00-00:00` — the
-// canonical always-on form `parse`/`parse_v1` accept — and suggested
-// `00:00-23:59`, which is end-exclusive and leaves minute 23:59 uncovered.
-// The live validation lives in `config::schema::validator::check_schedules`
-// (carve-out landed in commit d21df81); keeping a third copy of the logic
-// here was pure drift surface, so it was deleted rather than re-aligned.
 
 /// Find the active schedule for a given client name at the current time.
 /// Returns the profile name to use, or None if no schedule matches.
@@ -483,8 +472,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_zero_length_window() {
-        // res-13: a non-midnight start == end is a zero-length window the
-        // wrap logic would misread as always-active — reject it.
+        // A non-midnight start == end is a zero-length window the wrap
+        // logic would misread as always-active — reject it.
         assert!(
             ParsedSchedule::parse(&make_schedule("tablet", "p", &["all"], "09:00-09:00")).is_none()
         );
@@ -499,8 +488,8 @@ mod tests {
 
     #[test]
     fn parse_v1_rejects_zero_length_window() {
-        // res-13: the v1 build path (`build_resolver_map` → `parse_v1`)
-        // bypasses `validate_schedule`, so the same guard must hold here.
+        // The v1 build path (`build_resolver_map` → `parse_v1`) bypasses
+        // `validate_schedule`, so the same guard must hold here.
         use crate::config::schema::{Id, Schedule, ScheduleTargetType};
         let mk = |hours: &str| Schedule {
             id: Id::new("sched").unwrap(),
@@ -518,10 +507,10 @@ mod tests {
 
     #[test]
     fn parse_v1_quiet_window_covers_2359() {
-        // rev-2606 devices-01 pin: the window `warden device quiet`
-        // writes (`00:00-00:00`, days=all) must be active at EVERY
-        // minute, including 23:59 — the minute the old `00:00-23:59`
-        // shape left unfiltered (end-exclusive matcher).
+        // The window `warden device quiet` writes (`00:00-00:00`,
+        // days=all) must be active at EVERY minute, including 23:59 — a
+        // `00:00-23:59` shape would leave that minute unfiltered
+        // (end-exclusive matcher).
         use crate::config::schema::{Id, Schedule, ScheduleTargetType};
         let quiet = Schedule {
             id: Id::new("quiet-tablet-001122").unwrap(),
@@ -578,7 +567,7 @@ mod tests {
         assert!(minute <= 59);
     }
 
-    // ── expires_at (Sprint 23 s23-schedule-expires-at) ───────────
+    // ── expires_at ──────────────────────────────────
 
     #[test]
     fn schedule_without_expiry_is_active_normally() {
@@ -666,7 +655,7 @@ mod tests {
         assert!(minute < 60, "minute {minute} out of range");
     }
 
-    // ── M-34: libc tm component validation ─────────
+    // ── libc tm component validation ───────────────
 
     #[test]
     fn convert_libc_tm_in_range_maps_correctly() {
@@ -723,13 +712,13 @@ mod tests {
         assert_eq!(convert_libc_tm_components(3, 14, -1), (2, 14, 0));
     }
 
-    // ── schedule-02: localtime_r NULL-return guard ─────────
+    // ── localtime_r NULL-return guard ───────────────
 
     #[test]
     fn components_from_localtime_null_falls_back_to_monday() {
-        // rev-2606 schedule-02: a NULL localtime_r return (near-impossible
-        // for a valid time_t) must surface as Monday 00:00, not the silent
-        // zeroed "Sunday 00:00" the unchecked path produced.
+        // A NULL localtime_r return (near-impossible for a valid time_t)
+        // must surface as Monday 00:00, not a silently zeroed "Sunday
+        // 00:00".
         let tm = unsafe { std::mem::zeroed::<libc::tm>() };
         assert_eq!(
             components_from_localtime(std::ptr::null(), &tm, 0),

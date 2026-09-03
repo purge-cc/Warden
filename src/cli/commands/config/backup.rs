@@ -1,15 +1,15 @@
 //! `warden config backup` — timestamped tar.gz snapshot of the config tree.
 //!
-//! Per design doc §11.6. The archive captures the master config file
+//! The archive captures the master config file
 //! plus every include the config actually declares, so the backup
 //! contains the full operator-facing state. Writes happen via the system
 //! `tar` binary (present on every production target) to keep the Rust
 //! crate footprint small; the archive format is the standard gzipped tar
 //! understood by `warden config restore`.
 //!
-//! # Coverage is derived, never guessed (cli-h4)
+//! # Coverage is derived, never guessed
 //!
-//! Until cli-h4 a seven-name `KNOWN_INCLUDE_DIRS` list — declared here
+//! Previously a seven-name `KNOWN_INCLUDE_DIRS` list — declared here
 //! AND again in `restore.rs` — decided what got captured. A config with
 //! `includes = ["custom/*.toml"]` produced a backup that silently omitted
 //! it, and the operator found out at restore time, which is the worst
@@ -53,7 +53,7 @@ use crate::config::atomic_write::{hardened_atomic_write, AtomicWriteOpts};
 use super::TIMESTAMP_FORMAT;
 
 // ────────────────────────────────────────────────────────────────────
-// Sprint 4 (v0.20.0-auto-backup-cli) — scheduler engine constants.
+// Scheduler engine constants.
 // ────────────────────────────────────────────────────────────────────
 
 /// File name of the concurrency lock under `<backup_dir>`.
@@ -61,7 +61,7 @@ const LOCK_FILE: &str = ".lock";
 /// File name of the persistent auto-backup state under `<backup_dir>`.
 const STATE_FILE: &str = ".auto_state";
 /// Locks older than this are treated as stale (left by a crashed
-/// process) and auto-removed on the next acquire. Q6.
+/// process) and auto-removed on the next acquire.
 const STALE_LOCK_AGE: time::Duration = time::Duration::minutes(5);
 /// POSIX `EX_TEMPFAIL` — exit code returned when another backup is
 /// already in flight.
@@ -196,7 +196,7 @@ pub struct BackupReport {
 /// inventory (MACs, IPs, owner names) and `secrets.toml` were group- and
 /// world-readable. A process that opens the file inside that window keeps
 /// its access after the chmod, because permission is checked at `open(2)`.
-/// This is the same window project rules rules on for `fs::write` on a config
+/// This is the same window CLAUDE.md rules on for `fs::write` on a config
 /// path, reintroduced through a subprocess where
 /// `scripts/check_no_raw_fs_write.sh` cannot see it.
 ///
@@ -252,7 +252,6 @@ pub fn create_backup(config_path: &Path, out: Option<&Path>) -> anyhow::Result<B
     // 0750, not the umask-default 0755: archives capture the master
     // (`api.token_hash`) plus the full `*.d/` tree (device MACs/IPs/owner
     // names), so "other" must not be able to traverse into the backups dir.
-    // cli §9 #4.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o750)
@@ -480,7 +479,7 @@ pub(crate) fn human_bytes(n: u64) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Sprint 4 — scheduler engine: lock + state + retention + orchestrator.
+// Scheduler engine: lock + state + retention + orchestrator.
 // ════════════════════════════════════════════════════════════════════
 
 /// Held lock guard. Drop removes the lock file (best-effort).
@@ -508,7 +507,7 @@ pub enum LockError {
     },
 }
 
-/// Acquire the per-backup-dir concurrency lock. Q6: O_EXCL create with
+/// Acquire the per-backup-dir concurrency lock. O_EXCL create with
 /// 5-minute stale-recovery. Returns a [`LockGuard`] that releases the
 /// lock on drop.
 pub fn acquire_lock(backup_dir: &Path, now: time::OffsetDateTime) -> Result<LockGuard, LockError> {
@@ -572,7 +571,7 @@ fn try_create_lock(path: &Path, body: &[u8]) -> std::io::Result<()> {
 }
 
 /// Persistent auto-backup state. Lives at `<backup_dir>/.auto_state`.
-/// Q5: tracks consecutive failures + last attempt + last outcome +
+/// Tracks consecutive failures + last attempt + last outcome +
 /// disabled latch.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -667,7 +666,7 @@ pub struct PruneReport {
     pub kept: u32,
 }
 
-/// Apply Q3 retention: drop timestamped archives where
+/// Apply retention: drop timestamped archives where
 /// `index >= retention_count` OR `now - mtime > retention_days` (OR'd).
 /// `None` or `Some(0)` on either field ⇒ that axis is unbounded.
 /// Never touches anything outside the `config-<ts>.tar.gz` glob —
@@ -774,7 +773,7 @@ pub(crate) fn run_backup_managed_to(
     };
     // 0750 to match `create_backup` — in the auto-backup flow this is the
     // dir's first creator, so the mode set here is the one that sticks
-    // (a later `create_dir_all` no-ops on the existing dir). cli §9 #4.
+    // (a later `create_dir_all` no-ops on the existing dir).
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o750)
@@ -899,7 +898,7 @@ pub(crate) fn run_backup_managed_to(
 
 /// Mutate `state` for a successful backup outcome. Resets the failure
 /// counter; never touches the `disabled` latch (only an operator
-/// reset can clear it — Sprint 5).
+/// reset can clear it).
 pub(crate) fn apply_success_to_state(state: &mut AutoState, now: time::OffsetDateTime) {
     state.consecutive_failures = 0;
     state.last_outcome = Some(AutoOutcome::Ok);
@@ -909,7 +908,7 @@ pub(crate) fn apply_success_to_state(state: &mut AutoState, now: time::OffsetDat
 /// Mutate `state` for a failed backup outcome. Returns `true` iff this
 /// failure just tripped the auto-disable threshold (so the caller can
 /// log once). Manual mode (`auto_mode = false`) never touches the
-/// counter and never sets `disabled` — per Q5, manual invocation is an
+/// counter and never sets `disabled` — manual invocation is an
 /// operator intent, not a scheduling event.
 pub(crate) fn apply_failure_to_state(
     state: &mut AutoState,
@@ -932,7 +931,7 @@ pub(crate) fn apply_failure_to_state(
 }
 
 /// `warden config backup --reset-auto-failure` — operator recovery from
-/// the Q5 auto-disable latch. Clears the failure counter and the
+/// the auto-disable latch. Clears the failure counter and the
 /// `disabled` flag in `<backup_dir>/.auto_state` so the next timer fire
 /// runs normally again, persisting through the same hardened
 /// [`save_auto_state`] path. Leaves `last_attempt` / `last_outcome`
@@ -1085,7 +1084,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Sprint 4 — scheduler engine tests.
+    // Scheduler engine tests.
     // ════════════════════════════════════════════════════════════════
 
     use time::macros::datetime;
@@ -1643,7 +1642,7 @@ mod tests {
         );
     }
 
-    // ── run_reset_auto_failure (Q5 operator recovery) ──────────────
+    // ── run_reset_auto_failure (operator recovery) ──────────────
 
     #[test]
     fn reset_auto_failure_clears_counter_and_disabled() {

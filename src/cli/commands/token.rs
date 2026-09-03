@@ -1,8 +1,7 @@
 //! Token management — generate/regenerate API authentication tokens.
 //!
-//! Sprint 35 CS3 retires the legacy `Settings::from_file` + `write_config`
-//! pipeline that caused the 2026-04-23 master-corruption incident (see
-//! `_docs/features/config_safety_v11.md`). The new flow is:
+//! The flow avoids the legacy `Settings::from_file` + `write_config`
+//! pipeline, which could corrupt the master config:
 //!
 //! 1. Load the master via [`loader::load_config`] so the current v1 tree
 //!    is validated before anything mutates.
@@ -11,11 +10,10 @@
 //!    `[[blocklists]]`, `[profiles.*]`, `[[devices]]`, etc.) is preserved,
 //!    along with its comments and key order.
 //!
-//!    This step used to say "preserved byte-for-byte" while going through
-//!    `toml::Value` + `toml::to_string_pretty`, which deletes every
-//!    comment in the file and re-sorts it. The master is the most
-//!    comment-dense file on a real install, so the cost landed squarely
-//!    on the operator.
+//!    Format preservation matters here: round-tripping through
+//!    `toml::Value` + `toml::to_string_pretty` deletes every comment in
+//!    the file and re-sorts it, and the master is the most comment-dense
+//!    file on a real install.
 //! 3. Write atomically via
 //!    [`crate::config::atomic_write::atomic_write_and_validate`] with the
 //!    full v1 loader as the validator. If the mutation produces anything
@@ -217,10 +215,10 @@ async fn attempt_ipc_reload(socket_path: &Path, old_plaintext: Option<&str>) -> 
             // an absent socket via anyhow — match on the rendered
             // string, which is stable for UnixStream::connect errors.
             let msg = e.to_string();
-            // Shared classifier with ipc_reload so both reload paths agree —
-            // this also picks up "response timeout", which the old 3-string
-            // chain here silently missed (it would mis-report a read-side
-            // stall as a hard reload failure). cli §9 #7.
+            // Shared classifier with ipc_reload so both reload paths agree
+            // — this also picks up "response timeout", which a bespoke
+            // string match here would otherwise mis-report as a hard
+            // reload failure rather than a read-side stall.
             if crate::cli::commands::ipc_reload::is_unreachable_transport_msg(&msg) {
                 ReloadOutcome::DaemonUnreachable
             } else {
@@ -272,7 +270,7 @@ fn format_load_errs(errs: Vec<ConfigError>) -> anyhow::Error {
     )
 }
 
-fn format_errs_flat(errs: Vec<ConfigError>) -> String {
+pub(crate) fn format_errs_flat(errs: Vec<ConfigError>) -> String {
     let mut s = String::new();
     for (i, e) in errs.iter().enumerate() {
         if i > 0 {
@@ -287,9 +285,9 @@ fn format_errs_flat(errs: Vec<ConfigError>) -> String {
 mod tests {
     use super::*;
 
-    /// Full v1 master covering every section that was silently dropped by
-    /// the pre-S35 v0 writer. The regenerate round-trip must preserve each
-    /// one byte-for-byte on disk.
+    /// Full v1 master covering every section that a legacy writer used to
+    /// silently drop. The regenerate round-trip must preserve each one
+    /// byte-for-byte on disk.
     const FULL_V1_MASTER: &str = r#"schema_version = 3
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
@@ -313,8 +311,8 @@ url = "https://lists.purge.cc/privacy/ads.txt"
 display_name = "Default"
 
 [[devices]]
-id = "alex-laptop"
-display_name = "Alex Laptop"
+id = "edo-laptop"
+display_name = "Operator Laptop"
 ip = "10.0.0.10"
 profile = "default"
 
@@ -337,16 +335,15 @@ servers = ["192.0.2.1:53"]
         path
     }
 
-    // ── CS3 tests — regenerate on ConfigV1 ─────────────────────────────
+    // ── Regenerate on ConfigV1 ─────────────────────────────────────────
 
     #[tokio::test]
     async fn regenerate_preserves_v1_schema() {
-        // Every top-level v1 section that the pre-S35 writer used to
+        // Every top-level v1 section that a legacy writer used to
         // silently drop must survive a regenerate round-trip. We assert
         // semantic preservation via the v1 loader — `toml::to_string_pretty`
-        // reformats whitespace and key order (option A writer, S33
-        // follow-up `toml-edit` tracked separately), but the structured
-        // content is the authoritative comparison.
+        // reformats whitespace and key order, but the structured content
+        // is the authoritative comparison.
         let dir = tmpdir();
         let master = write_master_to(&dir, FULL_V1_MASTER);
         let token_path = dir.path().join("token");
@@ -370,7 +367,7 @@ servers = ["192.0.2.1:53"]
         assert_eq!(cfg.blocklists[0].id.as_str(), "privacy-ads");
         assert!(cfg.profiles.contains_key("default"));
         assert_eq!(cfg.devices.len(), 1);
-        assert_eq!(cfg.devices[0].id.as_str(), "alex-laptop");
+        assert_eq!(cfg.devices[0].id.as_str(), "edo-laptop");
         assert_eq!(cfg.retired.len(), 1);
         assert_eq!(cfg.retired[0].id.as_str(), "legacy-id");
         // And the new token hash landed.
@@ -573,7 +570,7 @@ display_name = "Default"
         assert!(!token_path.exists());
     }
 
-    // ── Pre-S35 contract tests, updated for the v1 path ───────────────
+    // ── Contract tests for the v1 path ────────────────────────────────
 
     #[tokio::test]
     async fn generate_writes_hash_to_v1_master() {

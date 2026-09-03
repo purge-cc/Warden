@@ -23,7 +23,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
-             [[labels]]\nid = \"alex\"\nkind = \"owner\"\ndisplay_name = \"Alex\"\n",
+             [[labels]]\nid = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n",
     )
     .unwrap();
     master

@@ -1,16 +1,16 @@
-//! Sprint 43 T4 (D4): 250 ms debounce window for IPC-triggered reloads.
+//! 250 ms debounce window for IPC-triggered reloads.
 //!
 //! Background: every CLI write (`warden profile blocklists default add …`,
-//! `warden rule add …` post-T5, etc.) ends with `IpcCommand::Reload`. A
-//! script that fires 100 such commands in quick succession used to
-//! schedule 100 actual rebuild passes — 100 `ResolverMap` rebuilds, 100
-//! audit-log lines, 100 reload-loop trips. With the per-device overlay
-//! shipping in T4 the rebuild cost grows, so D4 introduces a coalescing
-//! window: notifications received within 250 ms of the **first** wake
-//! collapse into a single rebuild request.
+//! `warden rule add …`, etc.) ends with `IpcCommand::Reload`. A script
+//! that fires 100 such commands in quick succession used to schedule
+//! 100 actual rebuild passes — 100 `ResolverMap` rebuilds, 100
+//! audit-log lines, 100 reload-loop trips. As the per-device overlay
+//! grows the rebuild cost, a coalescing window keeps this bounded:
+//! notifications received within 250 ms of the **first** wake collapse
+//! into a single rebuild request.
 //!
-//! Acceptance §8: 100 sequential `IpcCommand::Reload` complete in
-//! ≤ 2 × 250 ms (≤ 8 actual rebuilds).
+//! 100 sequential `IpcCommand::Reload` complete in ≤ 2 × 250 ms
+//! (≤ 8 actual rebuilds).
 //!
 //! ## Wire-shape
 //!
@@ -27,8 +27,8 @@
 //!   3. Drains the counter atomically. Sends ONE message on the
 //!      shared `reload_tx` mpsc (the same one SIGHUP uses) carrying
 //!      the LAST peer uid observed in the window.
-//!   4. Emits `RULE_RELOAD_BATCHED` (SN3 frozen) at `tracing::info!`
-//!      with the batched count.
+//!   4. Emits `RULE_RELOAD_BATCHED` (a frozen string) at
+//!      `tracing::info!` with the batched count.
 //!
 //! ## SIGHUP path stays direct
 //!
@@ -56,8 +56,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex, Notify};
 
-/// Sprint 43 T4 (SN3): operator-facing reload-batch summary, byte-for-
-/// byte pinned by `tests/frozen_strings_s43.rs` in T6.
+/// Operator-facing reload-batch summary, byte-for-byte pinned by
+/// `tests/frozen_strings_s43.rs`.
 pub const RULE_RELOAD_BATCHED: &str = "{n} rule changes batched in this reload window.";
 
 /// Substitute `{n}` into [`RULE_RELOAD_BATCHED`].
@@ -65,13 +65,13 @@ pub fn format_rule_reload_batched(n: u64) -> String {
     RULE_RELOAD_BATCHED.replace("{n}", &n.to_string())
 }
 
-/// Default debounce window. Picked per design doc D4 — small enough
-/// to feel instant to the operator, big enough to swallow a script
-/// firing rapid-fire CLI writes.
+/// Default debounce window — small enough to feel instant to the
+/// operator, big enough to swallow a script firing rapid-fire CLI
+/// writes.
 pub const DEFAULT_WINDOW: Duration = Duration::from_millis(250);
 
-/// Sprint 43 T4: coalesces IPC-triggered reload requests within a
-/// debounce window. See module docs for the wire-shape and acceptance.
+/// Coalesces IPC-triggered reload requests within a debounce window.
+/// See module docs for the wire-shape and acceptance.
 pub struct ReloadCoalescer {
     /// Number of `request()` calls observed since the last drain.
     /// Worker resets this to 0 after firing a single reload via
@@ -222,12 +222,12 @@ impl Drop for WorkerAliveGuard {
 mod tests {
     use super::*;
 
-    /// Acceptance §8: 100 sequential requests fired as fast as they
-    /// can be issued must complete within `≤ 2 × window`, with the
-    /// underlying reload channel receiving ≤ 8 batched messages. We
-    /// pick a small window (50 ms here, instead of the 250 ms prod
-    /// default) to keep test runtime tight; the coalescing math is
-    /// proportional to window size.
+    /// 100 sequential requests fired as fast as they can be issued
+    /// must complete within `≤ 2 × window`, with the underlying
+    /// reload channel receiving ≤ 8 batched messages. We pick a small
+    /// window (50 ms here, instead of the 250 ms prod default) to
+    /// keep test runtime tight; the coalescing math is proportional
+    /// to window size.
     #[tokio::test]
     async fn one_hundred_requests_coalesce_into_at_most_eight_rebuilds() {
         let (tx, mut rx) = mpsc::channel::<Option<u32>>(16);
@@ -314,8 +314,7 @@ mod tests {
 
     #[test]
     fn rule_reload_batched_const_is_pinned() {
-        // T6 frozen-strings test will subsume this. Pinning here so
-        // unintentional rewording surfaces during T4 review.
+        // Pinned here so unintentional rewording surfaces during review.
         assert_eq!(
             RULE_RELOAD_BATCHED,
             "{n} rule changes batched in this reload window."

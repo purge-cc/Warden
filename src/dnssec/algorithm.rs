@@ -2,16 +2,16 @@
 //!
 //! This is intentionally distinct from hickory's [`Algorithm::is_supported`],
 //! which reports whether hickory's *compiled crypto backend* can handle an
-//! algorithm (seven algorithms). Here we model the narrower **validation
-//! scope** of the §4.10 workstream, which targets RSASHA256 (IANA 8) and
-//! ECDSAP256SHA256 (IANA 13) — the two algorithms covering the overwhelming
-//! majority of signed zones, including the root KSK (RSASHA256). Other
-//! algorithms are *recognised* but out of scope; a later sprint maps them to an
-//! "insecure / cannot validate" verdict rather than a hard error.
+//! algorithm (seven algorithms). Here we model this validator's narrower
+//! **validation scope**: RSASHA256 (IANA 8) and ECDSAP256SHA256 (IANA 13) —
+//! the two algorithms covering the overwhelming majority of signed zones,
+//! including the root KSK (RSASHA256). Other algorithms are *recognised* but
+//! out of scope; callers should treat them as "insecure / cannot validate"
+//! rather than a hard error.
 
 use hickory_proto::dnssec::Algorithm;
 
-/// A DNSSEC signing algorithm within this validator's §4.10 scope.
+/// A DNSSEC signing algorithm within this validator's supported scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedAlgorithm {
     /// RSA/SHA-256 — IANA algorithm number 8 (RFC 5702). The root zone KSK
@@ -22,7 +22,7 @@ pub enum SupportedAlgorithm {
 }
 
 impl SupportedAlgorithm {
-    /// Identify a hickory [`Algorithm`] as one of the §4.10-supported set, or
+    /// Identify a hickory [`Algorithm`] as one of the supported set, or
     /// `None` if it is out of scope for validation.
     pub fn from_algorithm(algorithm: Algorithm) -> Option<Self> {
         match algorithm {
@@ -46,7 +46,7 @@ impl SupportedAlgorithm {
     }
 }
 
-/// Whether `algorithm` is within this validator's §4.10 scope (RSASHA256 or
+/// Whether `algorithm` is within this validator's scope (RSASHA256 or
 /// ECDSAP256SHA256). Recognised-but-out-of-scope algorithms return `false`.
 pub fn is_supported(algorithm: Algorithm) -> bool {
     SupportedAlgorithm::from_algorithm(algorithm).is_some()
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_scope_algorithms() {
-        // Recognised by hickory but out of §4.10 validation scope. (Deprecated
+        // Recognised by hickory but out of this validator's scope. (Deprecated
         // variants such as RSASHA1 are deliberately omitted to avoid triggering
         // hickory's `#[deprecated]` lint.)
         for alg in [

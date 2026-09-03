@@ -1,5 +1,6 @@
 use super::*;
 use crate::tui::app::{App, Leaf};
+use crate::tui::cfg_scan::{looks_like_test_cfg_attr, strip_test_items};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::{Path, PathBuf};
 
@@ -195,191 +196,6 @@ fn production_source() -> String {
     strip_test_items(include_str!("../mod.rs"))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StripState {
-    Normal,
-    Classifying,
-    SkippingBlock,
-}
-
-/// Splits a line that opens with `#[` into the attribute's own text
-/// (everything between the brackets) and whatever follows the closing
-/// `]` on the same physical line — e.g. `#[cfg(test)]` -> `("cfg(test)",
-/// "")`, `#[cfg(test)] mod tests;` -> `("cfg(test)", "mod tests;")`.
-/// Matches `[`/`]` depth rather than a fixed suffix, with quoted string
-/// contents masked first, so a bracket inside a string value can never
-/// be mistaken for the attribute's own close. Returns `None` if the
-/// line does not start with `#[`, or if the brackets never close on
-/// this physical line — the caller decides what that means.
-fn split_leading_attr(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix('#')?.strip_prefix('[')?;
-    let bytes = rest.as_bytes();
-    let mut depth: i32 = 1;
-    let mut in_string = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'"' => in_string = !in_string,
-            b'[' if !in_string => depth += 1,
-            b']' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&rest[..i], rest[i + 1..].trim_start()));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// `cfg(PREDICATE)` -> `Some("PREDICATE")`; anything else (a non-`cfg`
-/// attribute like `allow(dead_code)`) -> `None`.
-fn cfg_inner_predicate(attr: &str) -> Option<&str> {
-    attr.strip_prefix("cfg(")?.strip_suffix(')')
-}
-
-/// True when `test` appears as a bare predicate token inside a
-/// `cfg(...)` attribute's predicate text — matches `test`,
-/// `all(test, unix)`, `any(test, feature = "x")`. False for
-/// `feature = "test"` (a string value, not an identifier — quotes are
-/// masked before the token search) and for `not(test)` (that predicate
-/// compiles *outside* test builds — the opposite of what stripping
-/// means). Panics on any other combination of `not(` with the `test`
-/// token: a real cfg-expression parser is out of scope, and a loud
-/// failure here beats silently classifying a shape nobody has reasoned
-/// about.
-fn cfg_predicate_names_test(predicate: &str) -> bool {
-    let mut masked = String::with_capacity(predicate.len());
-    let mut in_string = false;
-    for c in predicate.chars() {
-        if c == '"' {
-            in_string = !in_string;
-            masked.push(' ');
-        } else if in_string {
-            masked.push(' ');
-        } else {
-            masked.push(c);
-        }
-    }
-    let no_ws: String = masked.chars().filter(|c| !c.is_whitespace()).collect();
-    if no_ws == "not(test)" {
-        return false;
-    }
-    let has_test_token = masked
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|tok| tok == "test");
-    if !has_test_token {
-        return false;
-    }
-    assert!(
-        !no_ws.contains("not("),
-        "cfg predicate {predicate:?} combines `not(` with a `test` token in \
-             a shape other than exactly `not(test)` — this needs a real \
-             cfg-expression parser to classify correctly, not this heuristic"
-    );
-    true
-}
-
-/// True when `line` is a column-0 marker beginning a `#[cfg(...)]`
-/// attribute whose predicate names the `test` cfg flag. Indented lines
-/// (the one deliberate exception, `TerminalGuard::with_restore`) are
-/// never markers — column 0 is the signal; see `production_source`'s
-/// doc comment above for why brace-depth is not used instead. Returns
-/// the marker line's own tail (what follows the attribute on the same
-/// line), so the caller can tell a bare declaration (`mod tests;`)
-/// apart from a block opener (`mod tests {`).
-fn is_test_cfg_marker(line: &str) -> Option<&str> {
-    if line.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let (attr, tail) = split_leading_attr(line)?;
-    let predicate = cfg_inner_predicate(attr)?;
-    cfg_predicate_names_test(predicate).then_some(tail)
-}
-
-/// Same predicate as `is_test_cfg_marker`, applied without the
-/// column-0 gate — used by `ux14_the_stripper_actually_strips` to
-/// count every surviving test-cfg marker regardless of indentation, so
-/// the strip logic and its self-check share one definition of "looks
-/// like a test marker" instead of two that can drift apart.
-fn looks_like_test_cfg_attr(trimmed_line: &str) -> bool {
-    split_leading_attr(trimmed_line)
-        .and_then(|(attr, _tail)| cfg_inner_predicate(attr))
-        .map(cfg_predicate_names_test)
-        .unwrap_or(false)
-}
-
-fn classify_tail(tail: &str) -> StripState {
-    if tail.is_empty() {
-        StripState::Classifying
-    } else if tail.ends_with('{') {
-        StripState::SkippingBlock
-    } else if tail.ends_with(';') {
-        StripState::Normal
-    } else {
-        StripState::Classifying
-    }
-}
-
-/// The actual strip: a 3-state walk over `src`'s lines. `Normal` looks
-/// for the next test-cfg marker; `Classifying` peeks forward (through
-/// any stacked attributes, or a multi-line item signature) until it
-/// finds out whether the marked item is a bare declaration (skip one
-/// logical item, done) or a brace-delimited block (skip to its
-/// column-0 close); `SkippingBlock` does that skip. Panics rather than
-/// silently mis-stripping if an attribute's brackets never close on
-/// one physical line, or if a marked item's close is never found
-/// before EOF.
-fn strip_test_items(src: &str) -> String {
-    let mut out = String::new();
-    let mut state = StripState::Normal;
-    for line in src.lines() {
-        state = match state {
-            StripState::Normal => {
-                if let Some(tail) = is_test_cfg_marker(line) {
-                    classify_tail(tail)
-                } else {
-                    out.push_str(line);
-                    out.push('\n');
-                    StripState::Normal
-                }
-            }
-            StripState::Classifying => {
-                if line.starts_with("#[") {
-                    match split_leading_attr(line) {
-                        Some((_, tail)) => classify_tail(tail),
-                        None => panic!(
-                            "attribute at {line:?} did not close its brackets \
-                                 on one physical line; strip_test_items cannot \
-                                 classify what follows it — reformat to one line \
-                                 or extend split_leading_attr for multi-line \
-                                 attributes"
-                        ),
-                    }
-                } else {
-                    classify_tail(line.trim_end())
-                }
-            }
-            StripState::SkippingBlock => {
-                if line == "}" {
-                    StripState::Normal
-                } else {
-                    StripState::SkippingBlock
-                }
-            }
-        };
-    }
-    assert_eq!(
-        state,
-        StripState::Normal,
-        "strip_test_items ended in {state:?} at EOF — a test item's \
-             closing brace or semicolon was never found; the walk ran off \
-             the end of the file and silently dropped every line after the \
-             last marker"
-    );
-    out
-}
-
 /// Whitespace-collapsed view, so a rustfmt line-break between the two
 /// halves of an or-pattern neither hides a compliant site nor excuses
 /// a bare one. Both wrapped forms exist in this file today: the scope
@@ -504,33 +320,41 @@ fn ux14_every_single_key_cancel_accepts_both_cases() {
 /// the one an early-terminating walk keeps.
 #[test]
 fn ux14_the_stripper_actually_strips() {
+    let raw = include_str!("../mod.rs");
     let stripped = production_source();
 
     assert!(
         stripped.contains("fn paste_into_group_modal"),
         "production code must survive the strip"
     );
-    assert!(
-        !stripped.contains("ux14_the_stripper_actually_strips"),
-        "this module is `#[cfg(test)]` and must not survive — the scans \
-             would then be reading their own needles"
-    );
-    assert!(
-        !stripped.contains("#[tokio::test]"),
-        "no production item carries a test attribute"
-    );
-    assert!(
-        !stripped.contains("success_exit_returns_none"),
-        "editor_failure_tests is `#[cfg(all(test, unix))]`, not the exact \
-             literal `#[cfg(test)]` — it must be stripped like every other \
-             test module, not leaked through by a spelling the old check missed"
-    );
 
-    // Same predicate the strip logic itself uses (`looks_like_test_cfg_attr`
-    // wraps `split_leading_attr` + `cfg_inner_predicate` +
-    // `cfg_predicate_names_test`), so this count and the strip cannot
-    // silently diverge the way an independent `== "#[cfg(test)]"` check
-    // once did.
+    // Presence in `raw` is asserted before absence in `stripped`. An
+    // absence-only assertion goes silently vacuous the day its needle moves
+    // to another file — it then passes by reading nothing, which is exactly
+    // how three assertions here stopped testing anything.
+    for needle in [
+        // every relocated module's declaration
+        "#[path = \"tests/",
+        // the one marker that is not the plain `#[cfg(test)]` spelling
+        "#[cfg(all(test",
+        // a column-0 standalone test helper, the kept exception
+        "device_update_patch",
+    ] {
+        assert!(
+            raw.contains(needle),
+            "{needle:?} is no longer in mod.rs, so asserting its absence \
+             proves nothing — repoint this at something the file still holds"
+        );
+        assert!(
+            !stripped.contains(needle),
+            "{needle:?} survived the strip — the scans would then be reading \
+             test source as production code"
+        );
+    }
+
+    // Same predicate the strip logic itself uses, so this count and the
+    // strip cannot silently diverge the way an independent
+    // `== "#[cfg(test)]"` check once did.
     let survivors: Vec<&str> = stripped
         .lines()
         .filter(|l| looks_like_test_cfg_attr(l.trim()))
@@ -548,35 +372,12 @@ fn ux14_the_stripper_actually_strips() {
              real test module failed to strip: {:?}",
         survivors[0]
     );
-}
-
-/// Every line in `src` that opens a brace-form `#[cfg(test)] mod { ... }`
-/// block, by line number. Deliberately blind to a `#[cfg(test)] fn`
-/// opener — the 5 standalone helpers (device_update_patch and friends)
-/// also end in `{` and are a kept, accepted exception, not a
-/// regression.
-fn brace_form_test_mod_offenders(src: &str) -> Vec<String> {
-    let lines: Vec<&str> = src.lines().collect();
-    let mut offenders = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let Some(tail) = is_test_cfg_marker(line) else {
-            continue;
-        };
-        // Same-line form (`#[cfg(test)] mod x {`) puts the opener in
-        // `tail`; the far more common next-line form puts it on the
-        // following line.
-        let opener = if tail.is_empty() {
-            lines.get(i + 1).copied().unwrap_or("").trim_end()
-        } else {
-            tail
-        };
-        if classify_tail(opener) == StripState::SkippingBlock
-            && opener.trim_start().starts_with("mod ")
-        {
-            offenders.push(format!("mod.rs:{}: {line}", i + 1));
-        }
-    }
-    offenders
+    assert!(
+        stripped.contains("    #[cfg(test)]\n    fn with_restore"),
+        "the survivor must be `TerminalGuard::with_restore` specifically — a \
+         count of one is also satisfied by an unrelated indented marker while \
+         that one went missing"
+    );
 }
 
 /// Discipline pin for the mod.rs decomposition: every `#[cfg(test)] mod
@@ -590,170 +391,7 @@ fn brace_form_test_mod_offenders(src: &str) -> Vec<String> {
 /// file this axis just cut in half.
 #[test]
 fn no_brace_form_test_module_remains_in_mod_rs() {
-    let offenders = brace_form_test_mod_offenders(include_str!("../mod.rs"));
-    assert!(
-        offenders.is_empty(),
-        "a brace-form #[cfg(test)] mod block is back inline in mod.rs — this \
-         axis moved every one of them to src/tui/tests/<name>.rs via #[path]; \
-         a new test module belongs there too, not inline:\n{}",
-        offenders.join("\n")
-    );
-}
-
-#[test]
-fn brace_form_test_mod_offenders_fires_on_a_mod_block() {
-    let src = "PROD\n#[cfg(test)]\nmod t {\nTEST_BODY\n}\nPROD\n";
-    let offenders = brace_form_test_mod_offenders(src);
-    assert_eq!(
-        offenders.len(),
-        1,
-        "expected exactly one hit: {offenders:?}"
-    );
-}
-
-#[test]
-fn brace_form_test_mod_offenders_ignores_a_standalone_fn() {
-    let src = "PROD\n#[cfg(test)]\nfn h(x: i32) -> i32 {\n    x\n}\nPROD\n";
-    let offenders = brace_form_test_mod_offenders(src);
-    assert!(
-        offenders.is_empty(),
-        "a standalone #[cfg(test)] fn is the accepted exception, not an \
-         offender: {offenders:?}"
-    );
-}
-
-// `strip_test_items` fixture table. Every fixture below is a single-line
-// escaped string, never a `r#"..."#` block — a raw multi-line string
-// would place its own content at real column 0 inside `mod.rs`'s own
-// source, which both this file's `include_str!` self-read AND
-// `labels.rs`'s recursive directory walk would then read as if it were
-// real code.
-
-#[test]
-fn strip_test_items_removes_a_block_form_test_module() {
-    let src = "PROD_BEFORE\n#[cfg(test)]\nmod t {\nTEST_BODY\n}\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("TEST_BODY"));
-}
-
-#[test]
-fn strip_test_items_removes_a_bare_mod_declaration() {
-    // The fix for failure mode #1: a bare declaration has no closing
-    // brace of its own. Before this fix, the old exact-string checker
-    // would keep skipping past PROD_AFTER looking for some unrelated
-    // later `}`.
-    let src = "PROD_BEFORE\n#[cfg(test)]\nmod t;\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE"));
-    assert!(
-        out.contains("PROD_AFTER"),
-        "a bare `mod t;` declaration swallowed real content past itself: {out:?}"
-    );
-    assert!(!out.contains("mod t;"));
-}
-
-#[test]
-fn strip_test_items_removes_a_same_line_bare_declaration() {
-    let src = "PROD_BEFORE\n#[cfg(test)] mod t;\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("mod t;"));
-}
-
-#[test]
-fn strip_test_items_removes_a_cfg_all_test_module() {
-    // The fix for failure mode #2, live today: `editor_failure_tests`
-    // is spelled exactly this way and used to leak through.
-    let src = "PROD_BEFORE\n#[cfg(all(test, unix))]\nmod t {\nTEST_BODY\n}\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("TEST_BODY"));
-}
-
-#[test]
-fn strip_test_items_removes_a_cfg_any_test_module() {
-    let src =
-        "PROD_BEFORE\n#[cfg(any(test, feature = \"x\"))]\nmod t {\nTEST_BODY\n}\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("TEST_BODY"));
-}
-
-#[test]
-fn strip_test_items_keeps_a_cfg_feature_named_test() {
-    // Negative control: a cargo feature literally named "test" is a
-    // string value, not the `test` build-mode identifier.
-    let src = "#[cfg(feature = \"test\")]\nfn real() {\nBODY\n}\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("fn real"));
-    assert!(out.contains("BODY"));
-}
-
-#[test]
-fn strip_test_items_keeps_a_cfg_not_test() {
-    // Negative control: `not(test)` compiles OUTSIDE test builds — the
-    // opposite of what stripping means.
-    let src = "#[cfg(not(test))]\nfn real() {\nBODY\n}\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("fn real"));
-    assert!(out.contains("BODY"));
-}
-
-#[test]
-fn strip_test_items_keeps_a_cfg_attr_test() {
-    // Negative control: `cfg_attr` conditionally decorates an item
-    // that exists in every build — it never gates existence.
-    let src = "#[cfg_attr(test, allow(dead_code))]\nfn real() {\nBODY\n}\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("fn real"));
-    assert!(out.contains("BODY"));
-}
-
-#[test]
-fn strip_test_items_keeps_an_indented_marker() {
-    // The TerminalGuard::with_restore shape: indented, so column 0
-    // never sees it as a marker.
-    let src = "impl X {\n    #[cfg(test)]\n    fn with_restore() {}\n}\n";
-    let out = strip_test_items(src);
-    assert_eq!(
-        out, src,
-        "an indented test-cfg marker must survive verbatim"
-    );
-}
-
-#[test]
-fn strip_test_items_is_not_fooled_by_a_brace_inside_a_string_literal() {
-    // A line containing `}` characters that is not, in its entirety,
-    // the literal line `}` must not be mistaken for the block's close.
-    let src = "PROD_BEFORE\n#[cfg(test)]\nmod t {\n    let s = \"a}b\";\n}\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("a}b"));
-}
-
-#[test]
-fn strip_test_items_keeps_stripping_the_five_standalone_test_fns_correctly() {
-    // The `device_update_patch`-shaped case: a bare `#[cfg(test)] fn`
-    // at column 0, not inside a `mod {}` block.
-    let src = "PROD_BEFORE\n#[cfg(test)]\npub(crate) fn h(x: i32) -> i32 {\n    x\n}\nPROD_AFTER\n";
-    let out = strip_test_items(src);
-    assert!(out.contains("PROD_BEFORE") && out.contains("PROD_AFTER"));
-    assert!(!out.contains("pub(crate) fn h"));
-}
-
-#[test]
-#[should_panic(expected = "did not close its brackets")]
-fn strip_test_items_panics_on_a_multiline_attribute_it_cannot_classify() {
-    let src = "#[cfg(test)]\n#[cfg(\n    unix\n)]\nmod t {\n}\n";
-    strip_test_items(src);
-}
-
-#[test]
-#[should_panic(expected = "ended in")]
-fn strip_test_items_panics_on_an_unclosed_marker_at_eof() {
-    let src = "#[cfg(test)]\nmod t {\nTEST_BODY\n";
-    strip_test_items(src);
+    crate::tui::cfg_scan::assert_no_inline_test_module("mod.rs", include_str!("../mod.rs"));
 }
 
 /// A bare-`y` gate before this change, driven end to end through the

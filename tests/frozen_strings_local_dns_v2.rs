@@ -228,22 +228,19 @@ fn format_added_global_substitutes_domain_type_value() {
 #[test]
 fn format_added_profile_substitutes_domain_type_value_profile_n() {
     // CT smoke 2026-05-01 will emit exactly this string for
-    // `warden local-dns add example.test A 192.0.2.50 --profile default`
+    // `warden local-dns add example.test A 10.10.1.50 --profile default`
     // when the `default` profile resolves 3 devices — pin that shape.
-    let s = format_local_records_added_profile("example.test", "A", "192.0.2.50", "default", 3);
+    let s = format_local_records_added_profile("example.test", "A", "10.10.1.50", "default", 3);
     assert_eq!(
         s,
-        "Added local DNS record 'example.test' A → 192.0.2.50 on profile 'default'. Affects 3 device(s) currently. To remove: warden local-dns remove 'example.test' --profile 'default'"
+        "Added local DNS record 'example.test' A → 10.10.1.50 on profile 'default'. Affects 3 device(s) currently. To remove: warden local-dns remove 'example.test' --profile 'default'"
     );
 }
 
 #[test]
 fn format_removed_substitutes_domain_and_scope() {
     let global = format_local_records_removed("example.test", "global");
-    assert_eq!(
-        global,
-        "Removed local DNS record 'example.test' from global."
-    );
+    assert_eq!(global, "Removed local DNS record 'example.test' from global.");
     let profile = format_local_records_removed("example.test", "profile 'default'");
     assert_eq!(
         profile,

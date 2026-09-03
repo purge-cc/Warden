@@ -16,7 +16,7 @@ use crate::dns::error::DnsError;
 
 struct Zone {
     suffix: CompactString,
-    /// **M1** Always a [`CircuitBreaker`], never a bare transport.
+    /// Always a [`CircuitBreaker`], never a bare transport.
     ///
     /// The type is the concrete `Box<CircuitBreaker>` rather than
     /// `Box<dyn Upstream>` on purpose: it makes the invariant **structural**,
@@ -67,13 +67,13 @@ impl ForwardingRouter {
                 client,
                 dot_pool_size,
                 ecs_enabled,
-                // §4.10: forwarding zones are client-facing — no DO bit.
+                // Forwarding zones are client-facing — no DO bit.
                 false,
             )?;
             built_zones.push(Zone {
-                // [M1] Wrap before storing — see the field doc. The breaker is
-                // atomics-only (no lock), so this adds no lock site to
-                // project rules's enumerated hot-path table.
+                // Wrap before storing — see the field doc. The breaker is
+                // atomics-only (no lock), so this adds no lock site on the
+                // DNS hot path.
                 upstream: Box::new(CircuitBreaker::new(upstream)),
                 suffix: CompactString::new(&suffix),
             });
@@ -107,12 +107,11 @@ impl ForwardingRouter {
 /// before the suffix is a dot. The dot check is what prevents
 /// `notlocal` from matching zone `local`.
 ///
-/// L-13 (rev-2026-05-suffix-empty-guard): empty-suffix early return. The
-/// config validator already rejects an empty suffix on `[[forwarding]]`,
-/// so today's call sites cannot reach this branch — but the helper is
-/// `pub(crate)`-grade and a future caller passing a derived value should
-/// not get a "match every dot-terminated domain" surprise. Pure
-/// contract pin.
+/// Empty-suffix early return. The config validator already rejects an
+/// empty suffix on `[[forwarding]]`, so today's call sites cannot reach
+/// this branch — but the helper is `pub(crate)`-grade and a future
+/// caller passing a derived value should not get a "match every
+/// dot-terminated domain" surprise. Pure contract pin.
 fn is_subzone_of(domain: &str, suffix: &str) -> bool {
     if suffix.is_empty() || domain.len() <= suffix.len() {
         return false;
@@ -130,9 +129,9 @@ impl Upstream for ForwardingRouter {
         ecs: Option<crate::dns::edns::EdnsClientSubnet>,
     ) -> Result<UpstreamResponse, DnsError> {
         // Fallback path for callers that don't have a pre-lowercased domain in
-        // hand (tests mostly). Still allocates to derive it — roundup-01: the DNS
-        // hot path MUST call `lookup_domain` (which takes the already-normalised
-        // domain) and never this `lookup`, so a future caller does not silently
+        // hand (tests mostly). Still allocates to derive it — the DNS hot path
+        // MUST call `lookup_domain` (which takes the already-normalised domain)
+        // and never this `lookup`, so a future caller does not silently
         // reintroduce a per-query allocation here.
         let domain_str = name.to_string();
         let domain = domain_str
@@ -149,8 +148,8 @@ impl Upstream for ForwardingRouter {
         record_type: RecordType,
         ecs: Option<crate::dns::edns::EdnsClientSubnet>,
     ) -> Result<UpstreamResponse, DnsError> {
-        // Hot path: the handler already normalised `domain` at
-        // handler.rs:301, so we can dispatch straight through.
+        // Hot path: the handler already normalised `domain`, so this
+        // dispatches straight through.
         self.route(domain, name, record_type, ecs).await
     }
 }
@@ -230,8 +229,8 @@ mod tests {
             .zip(zone_upstreams)
             .map(|(suffix, upstream)| Zone {
                 suffix: CompactString::new(*suffix),
-                // [M1] The field type forces the wrap here too, so every
-                // routing test below now also proves the breaker is
+                // The field type forces the wrap here too, so every
+                // routing test below also proves the breaker is
                 // transparent on the healthy path.
                 upstream: Box::new(CircuitBreaker::new(Box::new(UpstreamRef(upstream)))),
             })
@@ -380,11 +379,10 @@ mod tests {
 
     #[test]
     fn is_subzone_of_empty_suffix_returns_false() {
-        // L-13 (rev-2026-05-suffix-empty-guard) regression pin: an empty
-        // suffix must not match every dot-terminated domain. Today's
-        // validator rejects empty suffixes on `[[forwarding]]`, so this
-        // is contract pinning against a future caller passing a derived
-        // value.
+        // Regression pin: an empty suffix must not match every
+        // dot-terminated domain. Today's validator rejects empty
+        // suffixes on `[[forwarding]]`, so this is contract pinning
+        // against a future caller passing a derived value.
         assert!(!is_subzone_of("printer.local", ""));
         assert!(!is_subzone_of("a.b.c.", ""));
         assert!(!is_subzone_of("", ""));
@@ -465,7 +463,7 @@ servers = ["vpn-dns.example.com:853"]
         }
     }
 
-    /// M1 A flaky zone upstream must trip its own circuit breaker, exactly as
+    /// A flaky zone upstream must trip its own circuit breaker, exactly as
     /// the default upstream's primary/fallback pair already did.
     ///
     /// The two assertions are separate properties and both matter:

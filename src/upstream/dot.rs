@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hickory_proto::op::Query;
 use hickory_proto::rr::{Name, RecordType};
 use rustls::ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +18,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use super::{
-    build_query_bytes, install_ring_crypto_provider_once, parse_response_bytes, webpki_root_store,
+    build_query, install_ring_crypto_provider_once, parse_response_bytes, webpki_root_store,
     Upstream, UpstreamResponse,
 };
 use crate::dns::edns::EdnsClientSubnet;
@@ -46,9 +47,9 @@ pub struct DotUpstream {
     /// Round-robin pointer per server — `fetch_add % pool_size` picks the
     /// next slot. Contention is irrelevant since we only read/increment.
     next_slot: Vec<AtomicUsize>,
-    /// §4.10: when set, outbound queries carry the EDNS DNSSEC OK (DO) bit.
-    /// Baked at construction (global policy); the client-facing upstream is
-    /// built with `false` → byte-identical wire packets.
+    /// When set, outbound queries carry the EDNS DNSSEC OK (DO) bit. Baked
+    /// at construction (global policy); the client-facing upstream is built
+    /// with `false` → byte-identical wire packets.
     dnssec_ok: bool,
 }
 
@@ -72,10 +73,10 @@ impl DotUpstream {
 
         let mut dot_servers = Vec::with_capacity(servers.len());
         for server in servers {
-            // rev-2606: shared host:port syntax gate (same check `config lint`
-            // runs offline) before the resolve+TLS work — a malformed entry is
+            // Shared host:port syntax gate (same check `config lint` runs
+            // offline) before the resolve+TLS work — a malformed entry is
             // rejected identically at lint and at boot. A syntactically-valid
-            // host that fails to resolve still bails below as before.
+            // host that fails to resolve still bails below.
             crate::upstream::shape::validate_host_port_server(server)
                 .map_err(|e| anyhow::anyhow!("invalid DoT server: {e}"))?;
             // Try parsing as IP:port first (fast path, no DNS needed).
@@ -164,6 +165,7 @@ impl DotUpstream {
     async fn exchange(
         stream: &mut TlsStream<TcpStream>,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         // TCP DNS framing: 2-byte big-endian length prefix + message
         let len: u16 = query_bytes.len().try_into().map_err(|_| {
@@ -206,7 +208,7 @@ impl DotUpstream {
             .await
             .map_err(|e| DnsError::UpstreamRequestFailed(format!("DoT read body: {e}")))?;
 
-        parse_response_bytes(&resp_buf)
+        parse_response_bytes(&resp_buf, expected)
     }
 }
 
@@ -218,11 +220,11 @@ impl Upstream for DotUpstream {
         record_type: RecordType,
         ecs: Option<EdnsClientSubnet>,
     ) -> Result<UpstreamResponse, DnsError> {
-        let query_bytes = build_query_bytes(name, record_type, ecs, self.dnssec_ok)?;
+        let (query_bytes, expected) = build_query(name, record_type, ecs, self.dnssec_ok)?;
 
         let mut last_err = None;
         for (idx, _server) in self.servers.iter().enumerate() {
-            match self.try_server(idx, &query_bytes).await {
+            match self.try_server(idx, &query_bytes, &expected).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     tracing::debug!(
@@ -252,6 +254,7 @@ impl DotUpstream {
         &self,
         idx: usize,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         // Round-robin pick across the per-server pool. Relaxed ordering is
         // fine — `slot` is an advisory index, not a synchronisation handle.
@@ -260,7 +263,9 @@ impl DotUpstream {
 
         // Try existing connection first
         if let Some(stream) = conn_guard.as_mut() {
-            match tokio::time::timeout(self.timeout, Self::exchange(stream, query_bytes)).await {
+            match tokio::time::timeout(self.timeout, Self::exchange(stream, query_bytes, expected))
+                .await
+            {
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, "DoT connection broken, reconnecting");
@@ -283,9 +288,12 @@ impl DotUpstream {
                 ))
             })??;
 
-        let result = tokio::time::timeout(self.timeout, Self::exchange(&mut stream, query_bytes))
-            .await
-            .map_err(|_| DnsError::UpstreamRequestFailed("DoT query timed out".into()))?;
+        let result = tokio::time::timeout(
+            self.timeout,
+            Self::exchange(&mut stream, query_bytes, expected),
+        )
+        .await
+        .map_err(|_| DnsError::UpstreamRequestFailed("DoT query timed out".into()))?;
 
         match result {
             Ok(resp) => {
@@ -347,14 +355,14 @@ mod tests {
 
     #[test]
     fn new_is_idempotent_with_existing_crypto_provider() {
-        // L-11 (rev-2026-04-tls-provider-check) regression pin: the pre-fix
-        // code did `let _ = install_default()`, swallowing every Err. Now
-        // we check `CryptoProvider::get_default()` first and only attempt
-        // install when None, so re-construction (test or operator restart)
-        // takes the well-defined "already installed" branch instead of
-        // pretending to install. Pin that two consecutive `new()` calls
-        // both succeed without panic — the second one MUST hit the
-        // already-installed branch because the first installed the provider.
+        // Regression pin: an earlier version did `let _ = install_default()`,
+        // swallowing every Err. Now `CryptoProvider::get_default()` is checked
+        // first and install is only attempted when None, so re-construction
+        // (test or operator restart) takes the well-defined "already
+        // installed" branch instead of pretending to install. Pins that two
+        // consecutive `new()` calls both succeed without panic — the second
+        // one MUST hit the already-installed branch because the first
+        // installed the provider.
         let _first =
             DotUpstream::new(&["1.1.1.1:853".into()], Duration::from_secs(5), 2, false).unwrap();
         let second =

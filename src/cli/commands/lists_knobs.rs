@@ -126,6 +126,11 @@ fn knob_list() -> String {
 /// `warden lists show` — print the effective `[lists]` settings, plus the
 /// live corpus size measured against the ceiling.
 pub async fn run_show(config_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    // Ahead of the config, and on stderr: an operator who pipes this
+    // command's output somewhere still sees the freeze, and one whose
+    // config no longer loads sees it instead of only a parse error.
+    warn_if_frozen(socket_path).await;
+
     let now = time::OffsetDateTime::now_utc();
     let loaded = load_config(config_path, now).map_err(|errs| {
         anyhow::anyhow!(
@@ -186,6 +191,10 @@ pub(crate) struct LiveCorpus {
     pub(crate) total_sources: u32,
     /// Set when the last refresh cycle was refused by the corpus guard.
     pub(crate) refusal: Option<CorpusRefusal>,
+    /// When the standing refusal streak began and how many cycles it has
+    /// refused, from the same daemon. `None` from a daemon that predates
+    /// the field, or when nothing has been refused since the last install.
+    pub(crate) freeze: Option<crate::lists::status::CorpusFreeze>,
     /// The last completed reload cycle, for callers that need to wait for
     /// one. `None` from a daemon too old to report it — which is NOT the
     /// same as "no cycle has run", and callers must not conflate them.
@@ -194,14 +203,13 @@ pub(crate) struct LiveCorpus {
 
 /// Why the live measurement could not be taken.
 ///
-/// This used to be a bare `None` rendered as *"the daemon is not
-/// running"*, which on 2026-08-05 was simply false: the daemon was up and
-/// serving DNS, and the IPC connection had been refused because `warden`
-/// was run as root and the §4.32 peer-uid gate accepts only the daemon's
-/// own uid. "Not running" and "running but refusing you" call for
-/// opposite actions — start the service, versus re-run as the right user
-/// — so a diagnostic that cannot tell them apart sends the operator the
-/// wrong way, which is exactly what it did.
+/// A bare `None` rendered as *"the daemon is not running"* is misleading
+/// when the daemon is up and serving DNS but the IPC connection was
+/// refused — e.g. `warden` run as root while the peer-uid gate accepts
+/// only the daemon's own uid. "Not running" and "running but refusing
+/// you" call for opposite actions — start the service, versus re-run as
+/// the right user — so a diagnostic that cannot tell them apart sends
+/// the operator the wrong way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unreachable {
     /// No socket file at the path. Nothing has bound it, so the daemon
@@ -232,6 +240,7 @@ pub(crate) async fn fetch_live_corpus(socket_path: &Path) -> Result<LiveCorpus, 
             lists_total,
             lists_truncated,
             lists_corpus_refusal,
+            lists_corpus_freeze,
             lists_cycle,
             ..
         }) => Ok(LiveCorpus {
@@ -239,6 +248,7 @@ pub(crate) async fn fetch_live_corpus(socket_path: &Path) -> Result<LiveCorpus, 
             truncated: lists_truncated,
             total_sources: lists_total,
             refusal: lists_corpus_refusal,
+            freeze: lists_corpus_freeze,
             cycle: lists_cycle,
         }),
         Ok(_) => Err(Unreachable::UnexpectedResponse),
@@ -460,6 +470,18 @@ pub(crate) fn format_corpus_lines(
              previous generation."
                 .to_string(),
         );
+        // The line that separates a blip from an outage; same wording as
+        // `warden status`, so the two surfaces cannot disagree about it.
+        if let Some((f, since)) = live
+            .freeze
+            .as_ref()
+            .and_then(|f| Some((f, super::status::format_frozen_since(f)?)))
+        {
+            out.push(format!(
+                "  FROZEN since {since} ({} refused cycles, counted since this daemon started).",
+                f.consecutive
+            ));
+        }
         if let Some((source, novel)) = r.novel_by_source.first() {
             out.push(format!(
                 "  Largest contributor: {source} (+{novel} domains no other list supplies; \
@@ -479,6 +501,99 @@ pub(crate) fn format_corpus_lines(
     }
 
     out
+}
+
+/// What subscribing to one more list would do to the corpus ceiling.
+///
+/// An upper bound, never a measurement. The catalog records each list's
+/// own size, and warden installs the *union* of every list — overlap
+/// between lists is large in practice, so a list this says "may cross"
+/// the ceiling often does not. The asymmetry is deliberate: a false
+/// warning costs a line of output, a missed one costs a corpus that
+/// silently stops updating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Projection {
+    /// Even the no-overlap upper bound stays inside the ceiling.
+    Fits,
+    /// The upper bound crosses it; `upper_bound` is `installed + entries`.
+    MayCross { upper_bound: u64 },
+    /// No bound can be computed; `reason` names the input that was missing.
+    Unknown { reason: &'static str },
+    /// `max_total_domains = 0` — no ceiling is enforced, so nothing to project.
+    Disabled,
+}
+
+/// Project `installed + entries` against `ceiling`.
+///
+/// `ceiling` is tested first: with the guard disabled there is no
+/// question to answer, so a missing catalog entry is not worth reporting.
+///
+/// `Some(0)` is the catalog's *unknown*, not a list of no domains — the
+/// field is `#[serde(default)]` and an index that omits it deserializes
+/// to zero — so it collapses into the same `Unknown` as an absent entry.
+/// Reading it as a real count would report `Fits` for every list whose
+/// size nobody knows, which is the one answer that cannot be justified.
+pub(crate) fn corpus_projection(installed: u64, ceiling: u64, entries: Option<u64>) -> Projection {
+    if ceiling == 0 {
+        return Projection::Disabled;
+    }
+    let Some(entries) = entries.filter(|n| *n > 0) else {
+        return Projection::Unknown {
+            reason: "no catalog metadata for this list yet",
+        };
+    };
+    // Saturating because both operands are operator-controlled and the
+    // sum is only ever compared against the ceiling, never counted with.
+    let upper_bound = installed.saturating_add(entries);
+    if upper_bound > ceiling {
+        Projection::MayCross { upper_bound }
+    } else {
+        Projection::Fits
+    }
+}
+
+/// The banner for a corpus the daemon has stopped updating, or `None`
+/// when the last cycle installed.
+///
+/// Pure so the wording is pinned without a daemon. On every verb but
+/// `show` this line is the *only* notice a refusal gets, and a refusal
+/// that goes unread is indistinguishable to the operator from a corpus
+/// that is up to date — which is exactly how one survives for weeks.
+///
+/// `<n>` is literal. The operator chooses the new ceiling; any number
+/// warden named here would be a guess at their memory budget.
+pub(crate) fn frozen_banner(live: &LiveCorpus) -> Option<String> {
+    let r = live.refusal.as_ref()?;
+    Some(format!(
+        "warning: CORPUS FROZEN — the last refresh was refused (merged corpus {} > \
+         max_total_domains {}); domains published upstream since then are NOT being \
+         blocked. Run: warden status. Raise with: warden lists set max_total_domains \
+         <n>, or drop a list.",
+        r.unique, r.ceiling
+    ))
+}
+
+/// Print [`frozen_banner`] on stderr when the daemon reports a refusal.
+///
+/// Best-effort, and silent on every failure: the verbs that call this are
+/// doing something else, and an operator who cannot reach the daemon has
+/// already been told so by whatever they ran.
+///
+/// Silence is also the answer when the probe is slow. `send_command`
+/// bounds each phase at five seconds and the unreachability classifier
+/// adds an unbounded `connect`, so a daemon that accepts the connection
+/// and then stops answering could hold a fast verb for far longer than
+/// the verb itself takes. A banner is worth two seconds, not fifteen.
+pub(crate) async fn warn_if_frozen(socket_path: &Path) {
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fetch_live_corpus(socket_path),
+    );
+    if let Ok(Ok(live)) = probe.await {
+        if let Some(banner) = frozen_banner(&live) {
+            eprintln!("{banner}");
+        }
+    }
 }
 
 /// `warden lists set <key> <value>` — edit the TOML, then reload.
@@ -557,6 +672,7 @@ fn parse_value(knob: &Knob, raw: &str) -> anyhow::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::Projection::{Disabled, Fits, MayCross, Unknown};
     use super::*;
 
     #[test]
@@ -672,11 +788,40 @@ mod tests {
             truncated,
             total_sources: total,
             refusal,
+            freeze: None,
             // These tests are about the corpus RENDERER, which never reads
             // the cycle mark — that field exists for `lists refresh`, which
             // has to wait for a cycle to end.
             cycle: None,
         }
+    }
+
+    /// The freeze line rides the refusal block, worded exactly as
+    /// `warden status` words it — one wording per fact, on both surfaces.
+    #[test]
+    fn the_refusal_block_says_since_when_the_corpus_is_frozen() {
+        let refusal = CorpusRefusal {
+            unique: 14_582_846,
+            ceiling: 14_000_000,
+            novel_by_source: vec![],
+        };
+        let mut l = live(14_564_865, 0, 14, Some(refusal));
+        l.freeze = Some(crate::lists::status::CorpusFreeze {
+            since: Some(time::macros::datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 9,
+        });
+        let lines = format_corpus_lines(14_000_000, Ok(&l)).join("\n");
+        assert!(
+            lines.contains(
+                "  FROZEN since 2026-08-04T03:00:00Z (9 refused cycles, counted since this \
+                 daemon started)."
+            ),
+            "{lines}"
+        );
+        // Without a freeze record the block is unchanged — no "since unknown".
+        l.freeze = None;
+        let lines = format_corpus_lines(14_000_000, Ok(&l)).join("\n");
+        assert!(!lines.contains("FROZEN since"), "{lines}");
     }
 
     /// The daemon-down path must print no number at all.
@@ -695,14 +840,11 @@ mod tests {
         );
     }
 
-    /// A refused connection must NOT be reported as an absent daemon.
-    ///
-    /// This is the regression for the twenty minutes lost on 2026-08-05:
-    /// the daemon was up and filtering, `warden` was run as root, the
-    /// peer-uid gate dropped the connection, and the command said the
-    /// daemon was not running. The two states need opposite actions, so
-    /// the assertion is on the *contradiction*, not merely on the new
-    /// wording being present.
+    /// A refused connection must NOT be reported as an absent daemon:
+    /// a live daemon whose peer-uid gate drops the connection (e.g.
+    /// `warden` run as root) is not the same state as no daemon running,
+    /// and the two need opposite actions. The assertion is on the
+    /// *contradiction*, not merely on the new wording being present.
     #[test]
     fn a_refused_connection_is_not_reported_as_a_missing_daemon() {
         let lines = format_corpus_lines(14_000_000, Err(Unreachable::ConnectionRefused)).join("\n");
@@ -876,6 +1018,118 @@ mod tests {
             !lines.contains("  band:"),
             "no band prediction may accompany a refusal: {lines}"
         );
+    }
+
+    /// A list whose no-overlap upper bound still fits says nothing. The
+    /// bound is deliberately the worst case, so `Fits` is the only arm
+    /// that can promise anything, and it must not be reached by rounding.
+    #[test]
+    fn a_list_whose_worst_case_still_fits_is_silent() {
+        assert_eq!(corpus_projection(12_000_000, 14_000_000, Some(1)), Fits);
+        // Exactly at the ceiling fits: the guard refuses on `>`, not `>=`.
+        assert_eq!(
+            corpus_projection(13_000_000, 14_000_000, Some(1_000_000)),
+            Fits
+        );
+    }
+
+    /// The bound reported is `installed + entries` — the sum with no
+    /// overlap assumed, which is what makes it an upper bound and not a
+    /// prediction. An operator comparing it against the ceiling must get
+    /// the same number the note prints.
+    #[test]
+    fn a_crossing_list_reports_the_no_overlap_upper_bound() {
+        assert_eq!(
+            corpus_projection(12_000_000, 14_000_000, Some(3_000_000)),
+            MayCross {
+                upper_bound: 15_000_000
+            }
+        );
+        // One domain over is still over.
+        assert_eq!(
+            corpus_projection(14_000_000, 14_000_000, Some(1)),
+            MayCross {
+                upper_bound: 14_000_001
+            }
+        );
+    }
+
+    /// Both catalog spellings of "we do not know" must reach `Unknown`.
+    ///
+    /// `Some(0)` is the `#[serde(default)]` for an index that omits the
+    /// field, not a list of no domains. Read as a count it would make
+    /// every unmeasured list report `Fits` — a promise from data that
+    /// does not exist. The ceiling here is non-zero on purpose: a zero
+    /// one is checked first and would make both cases pass as `Disabled`.
+    #[test]
+    fn a_list_of_unknown_size_is_not_reported_as_fitting() {
+        let reason = "no catalog metadata for this list yet";
+        assert_eq!(
+            corpus_projection(12_000_000, 14_000_000, None),
+            Unknown { reason }
+        );
+        assert_eq!(
+            corpus_projection(12_000_000, 14_000_000, Some(0)),
+            Unknown { reason }
+        );
+    }
+
+    /// `max_total_domains = 0` turns the guard off, so there is nothing
+    /// to project — including when the list's size is unknown, which is
+    /// why the ceiling is tested before the catalog metadata.
+    #[test]
+    fn a_disabled_ceiling_projects_nothing() {
+        assert_eq!(corpus_projection(12_000_000, 0, Some(9_000_000)), Disabled);
+        assert_eq!(corpus_projection(12_000_000, 0, None), Disabled);
+    }
+
+    /// A ceiling and a list large enough to overflow `u64` addition must
+    /// report the crossing, not wrap into `Fits`. Both operands come
+    /// from operator-editable inputs, and the sibling band tests already
+    /// probe this file at `u64::MAX`.
+    #[test]
+    fn the_upper_bound_does_not_wrap() {
+        assert_eq!(
+            corpus_projection(u64::MAX, u64::MAX - 1, Some(u64::MAX)),
+            MayCross {
+                upper_bound: u64::MAX
+            }
+        );
+    }
+
+    /// The exact line an operator reads on a frozen corpus.
+    ///
+    /// Frozen deliberately: this is the only notice a refusal gets on
+    /// every verb but `show`, so it must say what stopped, what the
+    /// consequence is, and both ways out. `<n>` stays literal — warden
+    /// does not know the operator's memory budget and must not appear to.
+    #[test]
+    fn the_frozen_banner_says_what_stopped_and_both_ways_out() {
+        let l = live(
+            12_000_000,
+            0,
+            8,
+            Some(CorpusRefusal {
+                unique: 15_012_024,
+                ceiling: 14_000_000,
+                novel_by_source: vec![],
+            }),
+        );
+        assert_eq!(
+            frozen_banner(&l).expect("a refusal on record must produce a banner"),
+            "warning: CORPUS FROZEN — the last refresh was refused (merged corpus 15012024 \
+             > max_total_domains 14000000); domains published upstream since then are NOT \
+             being blocked. Run: warden status. Raise with: warden lists set \
+             max_total_domains <n>, or drop a list."
+        );
+    }
+
+    /// No refusal, no banner. The banner is printed by verbs that are
+    /// doing something else entirely, so a healthy daemon must leave
+    /// their output untouched.
+    #[test]
+    fn a_daemon_that_installed_its_last_cycle_prints_no_banner() {
+        assert_eq!(frozen_banner(&live(12_000_000, 0, 8, None)), None);
     }
 
     /// The unknown-key error must hand back the valid keys, annotated.

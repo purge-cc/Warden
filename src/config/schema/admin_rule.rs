@@ -1,19 +1,19 @@
 //! [`AdminRule`] — a single AdGuard-syntax rule authored by the operator
 //! (never sourced from an external blocklist).
 //!
-//! Per design doc §8.7 and project rules rule 4: `@@` allow-overrides and the
-//! `$important` modifier are admin-only. External lists get the sandbox
-//! parser; admin rules get the full AdGuard grammar.
+//! `@@` allow-overrides and the `$important` modifier are admin-only:
+//! external lists get the sandbox parser, admin rules get the full
+//! AdGuard grammar.
 //!
-//! # Sprint 43 T5 — domain validator
+//! # Domain validator
 //!
 //! [`validate_domain`] is the single seat that vets operator-supplied
 //! domain strings before they land in a synthesised `||domain^` or
-//! `@@||domain^` rule. It enforces the §9 acceptance pipeline (LDH ASCII +
-//! length caps + control-char rejection + IDN-as-Punycode requirement)
-//! without taking any new crate dependency. NFKC + Punycode round-trip
-//! collapse to identity on ASCII LDH input; non-ASCII input is rejected
-//! with a friendly hint pointing at the Punycode form (`xn--...`).
+//! `@@||domain^` rule. It enforces LDH ASCII + length caps + control-char
+//! rejection + IDN-as-Punycode requirement without taking any new crate
+//! dependency. NFKC + Punycode round-trip collapse to identity on ASCII
+//! LDH input; non-ASCII input is rejected with a friendly hint pointing
+//! at the Punycode form (`xn--...`).
 
 use serde::{Deserialize, Serialize};
 
@@ -29,8 +29,8 @@ use super::id::Id;
 /// rule = "||tiktok.com^"
 /// ```
 ///
-/// The `rule` string is parse-validated at load time (rev-2606
-/// schema-validator-05): the validator's `check_admin_rules` dry-runs
+/// The `rule` string is parse-validated at load time: the validator's
+/// `check_admin_rules` dry-runs
 /// `filter::rules::parse_rule_checked` — the same parser the filter
 /// engine consumes — so a config only loads if every rule will actually
 /// enforce. Emptiness is checked separately first.
@@ -41,10 +41,10 @@ pub struct AdminRule {
     pub rule: String,
 }
 
-// ── Sprint 43 T5 — domain validation pipeline ─────────────────────────
+// ── domain validation pipeline ──────────────────────────────────────
 
 /// Frozen template for [`format_rule_invalid_domain`]. Pinned by
-/// `tests/frozen_strings_s43.rs` (T6) and the const-pin test below.
+/// `tests/frozen_strings_s43.rs` and the const-pin test below.
 pub const RULE_INVALID_DOMAIN: &str =
     "'{input}' is not a valid domain (got: {reason}). Examples: example.com, mail.google.com";
 
@@ -190,13 +190,13 @@ description = "unexpected"
         assert!(err.to_string().contains("unknown field"));
     }
 
-    // ── Sprint 43 T5 — domain validator ───────────────────────────────
+    // ── domain validator ───────────────────────────────────────────────
 
     #[test]
     fn rule_invalid_domain_const_pinned() {
-        // SN3 freeze — byte-for-byte. T6's `tests/frozen_strings_s43.rs`
-        // re-pins this from outside the module; the in-module pin keeps
-        // the const honest while T6 lands.
+        // Byte-for-byte freeze. `tests/frozen_strings_s43.rs` re-pins
+        // this from outside the module; the in-module pin keeps the
+        // const honest.
         assert_eq!(
             RULE_INVALID_DOMAIN,
             "'{input}' is not a valid domain (got: {reason}). Examples: example.com, mail.google.com"

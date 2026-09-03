@@ -1,13 +1,11 @@
-//! §4.66 L7 — Labels tab modals (Add / Edit / Delete).
+//! Labels tab modals (Add / Edit / Delete).
 //!
 //! Opens over [`crate::tui::app::Leaf::Labels`] via `a` (Add), `e` (Edit)
 //! or `d` / Delete (Remove). Submits through
 //! `cli::commands::labels::{add_inner, set_inner, remove_inner}` — the
 //! **sync** inner writers, never the `run_*` verbs: those `println!` their
 //! outcome, and a `println!` on a raw-mode alternate screen bypasses
-//! ratatui's diff buffer and staircases one column per line (the v0.29.1
-//! defect). That seam exists because `s466-l7a` was split off to build it
-//! ahead of this sprint.
+//! ratatui's diff buffer and staircases one column per line.
 //!
 //! This module is a transposition of [`crate::tui::group_modal`], not a
 //! new design — same three stages, same Archetype-F body, same y/n delete
@@ -92,7 +90,7 @@ pub enum Stage {
     /// Subnets use, and here the argument for it is stronger than
     /// anywhere else in the TUI. LB3 states it: *"cancellare un gruppo
     /// cambia il DNS di casa; cancellare un owner non cambia niente."*
-    /// Removing a label is **inert** — the device's `owner = "Alex"`
+    /// Removing a label is **inert** — the device's `owner = "Operator"`
     /// string survives, it only loses the row that declared it — and
     /// `remove_if_present` refuses outright while any device still
     /// carries the value. A typed-id gate here would price an inert
@@ -253,7 +251,7 @@ impl AddForm {
         let display_trim = self.display_name.trim();
         Ok(ResolvedForm {
             id: id_trim.to_string(),
-            // Same fallback the CLI applies: `warden label add alex
+            // Same fallback the CLI applies: `warden label add operator
             // --kind owner` with no `--display-name` stores the id. The
             // two surfaces must not produce different rows from the same
             // input.
@@ -442,7 +440,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
                 &form.id,
                 f,
                 ValueKind::Identity,
-                Some("e.g. alex or apple-tv"),
+                Some("e.g. operator or apple-tv"),
                 width,
             ),
             f,
@@ -528,10 +526,10 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         chars(&form.description),
     );
 
-    // N14: Discard left, Save right — the one `Primary` fill sits
-    // right-most on every Archetype-F form (CONTRACT §3.1). The focus
-    // ring still reaches `Submit` before `Cancel`, unchanged — same
-    // precedent as `profile_modal.rs`'s tail.
+    // Discard left, Save right — the one `Primary` fill sits right-most
+    // on every Archetype-F form. The focus ring still reaches `Submit`
+    // before `Cancel`, unchanged — same precedent as `profile_modal.rs`'s
+    // tail.
     //
     // Discard is `Neutral`, not `Destructive`: it closes the form
     // without writing anything, which is what Esc does too.
@@ -565,7 +563,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
 ///
 /// **The `id` hint spells the charset, and that is the one hint here that
 /// earns its place by measurement.** The live values on the operator's
-/// boxes are `Alex` and `Apple TV`, and those are exactly what a person
+/// boxes are `Operator` and `Apple TV`, and those are exactly what a person
 /// types into a field labelled *id* — neither passes `Id::validate`.
 /// `add_inner` refuses and names the field, so this is not a correctness
 /// gap; it is the difference between a feature that works on first use and
@@ -578,7 +576,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
 fn field_hint(f: FormField) -> &'static str {
     match f {
         FormField::Id => "lowercase, digits and dashes only (immutable on edit)",
-        FormField::DisplayName => "the value your devices carry, e.g. Alex (blank = the id)",
+        FormField::DisplayName => "the value your devices carry, e.g. Operator (blank = the id)",
         FormField::Description => "free note — nothing reads it, it filters nothing",
         FormField::Submit => "Enter saves the label",
         FormField::Cancel => "discard changes and close (also Esc)",
@@ -765,9 +763,9 @@ mod tests {
 
         // **Exhaustive on purpose, and it is the compiler that enforces
         // this — not the assertion below it.** Adding a `FormField::Kind`
-        // variant is exactly the context-desync design this sprint
-        // rejected, and it would make this `match` non-exhaustive: the
-        // build stops instead of the field quietly becoming a tab stop.
+        // variant is exactly the context-desync this design rejects, and
+        // it would make this `match` non-exhaustive: the build stops
+        // instead of the field quietly becoming a tab stop.
         for f in FormField::ALL {
             match f {
                 FormField::Id
@@ -798,7 +796,7 @@ mod tests {
         let add = render_overlay_in(&LabelModal::open_add(LabelKind::Owner), 100, 30);
         assert!(add.contains("from the selected pane"), "got:\n{add}");
 
-        let l = label("alex", LabelKind::Owner, "Alex", None);
+        let l = label("operator", LabelKind::Owner, "Operator", None);
         let edit = render_overlay_in(&LabelModal::open_edit(&l), 100, 30);
         assert!(
             !edit.contains("from the selected pane"),
@@ -838,7 +836,7 @@ mod tests {
     /// immutable once written and the renderer draws it as a plain row.
     #[test]
     fn edit_never_opens_focused_on_the_immutable_id() {
-        let l = label("alex", LabelKind::Owner, "Alex", None);
+        let l = label("operator", LabelKind::Owner, "Operator", None);
         assert_eq!(AddForm::new_add(LabelKind::Owner).focused, FormField::Id);
         assert_eq!(AddForm::new_edit(&l).focused, FormField::DisplayName);
     }
@@ -849,15 +847,15 @@ mod tests {
     #[test]
     fn a_blank_display_name_resolves_to_the_id() {
         let mut form = AddForm::new_add(LabelKind::Owner);
-        form.id = "  alex  ".to_string();
+        form.id = "  operator  ".to_string();
         let r = form.try_resolve().unwrap();
-        assert_eq!(r.id, "alex", "the id is trimmed");
-        assert_eq!(r.display_name, "alex");
+        assert_eq!(r.id, "operator", "the id is trimmed");
+        assert_eq!(r.display_name, "operator");
     }
 
     /// An empty id is the one pre-flight this form owns. The charset gate
     /// is deliberately NOT duplicated here — `add_inner` runs it — so this
-    /// test also documents the boundary: `Alex` resolves fine and is
+    /// test also documents the boundary: `Operator` resolves fine and is
     /// refused one layer down, by the writer that names the field.
     #[test]
     fn an_empty_id_is_refused_but_the_charset_is_left_to_the_writer() {
@@ -865,7 +863,7 @@ mod tests {
         assert_eq!(form.try_resolve().unwrap_err(), "id is required");
 
         let mut capitalised = AddForm::new_add(LabelKind::Owner);
-        capitalised.id = "Alex".to_string();
+        capitalised.id = "Operator".to_string();
         assert!(
             capitalised.try_resolve().is_ok(),
             "the form does not second-guess `Id::new`; a second copy of \
@@ -874,7 +872,7 @@ mod tests {
     }
 
     /// The `id` hint must spell the constraint, because the values this
-    /// vocabulary exists to adopt (`Alex`, `Apple TV`) are exactly what
+    /// vocabulary exists to adopt (`Operator`, `Apple TV`) are exactly what
     /// an operator types into a field labelled *id*, and neither passes
     /// `Id::validate`. Without this the feature reads as broken on first
     /// use even though it refuses correctly.
@@ -899,7 +897,7 @@ mod tests {
     /// from the screen instead of arriving afterwards.
     #[test]
     fn the_remove_confirm_says_device_values_survive() {
-        let l = label("alex", LabelKind::Owner, "Alex", None);
+        let l = label("operator", LabelKind::Owner, "Operator", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
         assert!(dump.contains("Remove owner"), "got:\n{dump}");
         assert!(dump.contains("untouched"), "got:\n{dump}");
@@ -920,7 +918,7 @@ mod tests {
     /// gate, this test is where the argument is recorded.
     #[test]
     fn the_remove_gate_is_single_keypress() {
-        let l = label("alex", LabelKind::Owner, "Alex", None);
+        let l = label("operator", LabelKind::Owner, "Operator", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
         assert!(
             dump.contains("[y] confirm") && dump.contains("[n / Esc] cancel"),

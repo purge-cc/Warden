@@ -1,35 +1,34 @@
-//! Cluster policy bundle (CS3) — the replicated §3.1 sections of [`ConfigV1`].
+//! Cluster policy bundle — the replicated policy sections of [`ConfigV1`].
 //!
 //! The primary re-serialises only its *policy* sections into a normalised
-//! `cluster-policy.toml`. Every node-local section/field (doc §3.2) is EXCLUDED
+//! `cluster-policy.toml`. Every node-local section/field is EXCLUDED
 //! **by construction**: [`ClusterPolicyBundle`] is a partial-`ConfigV1` mirror
 //! that simply has no field for `listen`, `log_level`, `tcp_timeout_secs`,
 //! `[api]`, `[socket]`, `[cluster]`, `[tracking]`, `[resource_budget]`,
 //! `[backup]`, or `includes` — so a leak is a compile-time impossibility, not a
 //! runtime filter that could silently regress.
 //!
-//! **That guarantee is real and it is only half of the problem — the missing
-//! half cost us `[[labels]]`.** "No field" makes a *leak* (node-local flowing
-//! OUT) impossible. It says nothing about an *omission* (policy failing to flow
-//! out), which is silent by exactly the same mechanism:
-//! [`ClusterPolicyBundle::from_config`] copies field by field, so a section
-//! nobody adds simply never replicates, and every test in this module was
-//! *negative* — asserting node-local sentinels do NOT appear — which can never
-//! observe a positive that is absent.
-//!
-//! `[[labels]]` landed after this struct was written, and the bundle shipped
-//! carrying blocklists, devices and profiles that *reference* tags without the
-//! vocabulary declaring them. The trip-wire for the whole class now lives in
+//! **That guarantee is real and it is only half of the problem.** "No field"
+//! makes a *leak* (node-local flowing OUT) impossible. It says nothing about
+//! an *omission* (policy failing to flow out), which is silent by exactly the
+//! same mechanism: [`ClusterPolicyBundle::from_config`] copies field by field,
+//! so a section nobody adds simply never replicates, and a purely negative
+//! test suite — asserting node-local sentinels do NOT appear — can never
+//! observe a positive that is absent. `[[labels]]` is the field this bit:
+//! a new section landed after this struct was written, and the bundle
+//! shipped carrying blocklists, devices and profiles that *reference* tags
+//! without the vocabulary declaring them. The trip-wire for the whole class
+//! now lives in
 //! `config::schema::tests::every_config_section_is_classified_replicated_or_node_local`
 //! — deliberately **outside** this feature-gated module, so it fires in the
 //! default build where `src/cluster/` does not even compile.
 //!
-//! `[server]` is the one mixed section. [`ClusterServerPolicy`] carries only the
-//! five policy fields (doc §3.1) and never the three identity fields. Field
+//! `[server]` is the one mixed section. [`ClusterServerPolicy`] carries only
+//! the policy fields and never the three identity fields. Field
 //! names + `#[serde(default)]` mirror [`crate::config::schema::ServerGlobals`] exactly so the emitted
 //! `[server]` table reparses straight into a real `ServerGlobals` on the
 //! secondary (the three absent keys fall back to that node's own defaults,
-//! which the §4.11-3 merge then overlays with the node's master).
+//! which the merge step then overlays with the node's master).
 //!
 //! Note: like [`ConfigV1`] itself, this struct cannot derive `PartialEq` — the
 //! pass-through legacy types (`UpstreamConfig`, `CacheConfig`, …) don't
@@ -50,9 +49,9 @@ use crate::config::settings::{
     ListsConfig, LocalDnsConfig, SecurityConfig, UpstreamConfig,
 };
 
-/// The policy-only fields of `ServerGlobals` (doc §3.1). The identity fields
+/// The policy-only fields of `ServerGlobals`. The identity fields
 /// (`listen`, `log_level`, `tcp_timeout_secs`) are intentionally absent — they
-/// are node-local (doc §3.2) and must never cross the wire. Field order matches
+/// are node-local and must never cross the wire. Field order matches
 /// `ServerGlobals` so the TOML key order (and therefore the content hash) is
 /// stable and the scalar-before-table TOML grammar constraint is preserved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +66,7 @@ pub struct ClusterServerPolicy {
     /// `[server]` table silently turned MAC enforcement OFF. The manual
     /// `impl Default` below does say `true`, but serde only consults it when
     /// `[server]` is missing **entirely** — which is why the two disagreed
-    /// without either looking wrong on its own (spec §10).
+    /// without either looking wrong on its own.
     #[serde(default = "crate::config::schema::default_enforce_device_mac")]
     pub enforce_device_mac: bool,
     #[serde(default)]
@@ -80,7 +79,7 @@ pub struct ClusterServerPolicy {
     pub default_blocked_ttl_secs: u32,
 }
 
-/// The replicated §3.1 policy sections of a loaded [`ConfigV1`], serialised to a
+/// The replicated policy sections of a loaded [`ConfigV1`], serialised to a
 /// single normalised `cluster-policy.toml`. Field order follows `ConfigV1` so
 /// the emitted document is `ConfigV1`-shaped (the secondary reparses it as one)
 /// and the content hash is deterministic.
@@ -106,14 +105,15 @@ pub struct ClusterPolicyBundle {
     pub schedules: Vec<Schedule>,
     #[serde(default)]
     pub admin_rules: Vec<AdminRule>,
-    /// §4.66 L1 — the controlled vocabulary for tag slugs and the device
+    /// The controlled vocabulary for tag slugs and the device
     /// metadata fields.
     ///
-    /// **Replicated, and it was not until S2.** The bundle already carries
+    /// **Must be replicated.** The bundle already carries
     /// blocklists, devices and profiles that *reference* tags; without the
     /// declarations the secondary receives references to a vocabulary it does
-    /// not have. The entity landed after this struct was written and nothing
-    /// forced the omission to be noticed — [`ClusterPolicyBundle::from_config`]
+    /// not have. This entity was added after the struct was first written,
+    /// and nothing forced the omission to be noticed —
+    /// [`ClusterPolicyBundle::from_config`]
     /// copies field by field, so a missing field is silent, and every existing
     /// test here is negative (see `the_bundle_replicates_the_label_vocabulary`).
     ///
@@ -154,13 +154,9 @@ impl Default for ClusterServerPolicy {
 }
 
 impl ClusterPolicyBundle {
-    /// Extract the §3.1 policy sections from a loaded config. Clones the
+    /// Extract the policy sections from a loaded config. Clones the
     /// sections (policy is KB–low-MB) — only run on reload, never on the hot
     /// path.
-    ///
-    /// The clause "cheap relative to the separately-shipped domain map" was
-    /// removed with S1: nothing is shipped alongside this any more, so the
-    /// comparison had no second term left.
     #[must_use]
     pub fn from_config(config: &ConfigV1) -> Self {
         let s = &config.server;
@@ -199,7 +195,7 @@ impl ClusterPolicyBundle {
         toml::to_string(self)
     }
 
-    /// SHA-256 (hex) of a serialised bundle — the CS4 config content hash. The
+    /// SHA-256 (hex) of a serialised bundle — the config content hash. The
     /// robust cross-restart change signal (the generation counter resets on
     /// restart; the hash does not).
     #[must_use]
@@ -226,7 +222,7 @@ mod tests {
             ..Default::default()
         };
         // ── policy (must survive) ──
-        c.server.allow_from = vec!["192.0.2.0/24".to_string()];
+        c.server.allow_from = vec!["10.10.1.0/24".to_string()];
         c.server.enforce_device_mac = true;
         c.server.default_blocked_ttl_secs = 90;
         // ── node-local (must NOT appear) ──
@@ -253,7 +249,7 @@ mod tests {
 
     #[test]
     fn bundle_reparses_as_configv1() {
-        // Proves the bundle is ConfigV1-shaped, i.e. the §4.11-3 secondary can
+        // Proves the bundle is ConfigV1-shaped, i.e. a secondary can
         // load it through the normal loader.
         let toml = ClusterPolicyBundle::from_config(&sample_config())
             .to_toml()
@@ -281,7 +277,7 @@ mod tests {
                 "node-local value `{needle}` leaked into bundle:\n{toml}"
             );
         }
-        // No node-local *section headers* leak (CS3 proof, mirrors CT-smoke grep).
+        // No node-local *section headers* leak (mirrors the CT-smoke grep).
         for header in [
             "[api]",
             "[socket]",
@@ -310,7 +306,7 @@ mod tests {
             toml.contains("[server]"),
             "policy [server] missing:\n{toml}"
         );
-        assert!(toml.contains("192.0.2.0/24"), "allow_from lost:\n{toml}");
+        assert!(toml.contains("10.10.1.0/24"), "allow_from lost:\n{toml}");
         assert!(
             toml.contains("enforce_device_mac"),
             "policy field lost:\n{toml}"
@@ -323,7 +319,7 @@ mod tests {
 
     #[test]
     fn fence_rejects_node_local_sections() {
-        // apply-01: the consume-side fence. `deny_unknown_fields` means a
+        // The consume-side fence. `deny_unknown_fields` means a
         // received bundle carrying ANY node-local section/field fails to parse
         // as a ClusterPolicyBundle — so it can never be staged into cluster.d.
         for hostile in [
@@ -361,13 +357,13 @@ mod tests {
         assert_eq!(ClusterPolicyBundle::hash_of(&t).len(), 64);
     }
 
-    /// §4.1 — the vocabulary must ride along with the entities that cite it.
+    /// The vocabulary must ride along with the entities that cite it.
     ///
     /// The bundle already replicates blocklists, devices and profiles that
-    /// **reference** a label vocabulary; before S2 it carried no
+    /// **reference** a label vocabulary; at one point it carried no
     /// `[[labels]]`, so the secondary received the references without the
-    /// declarations. (This test was written against `LabelKind::Tag`, which
-    /// the tag eradication removed; the property is about `labels` being
+    /// declarations. (This test was originally written against a `LabelKind`
+    /// variant later removed; the property is about `labels` being
     /// copied at all, so any surviving variant exercises it.)
     ///
     /// The existing tests in this module could not catch that. They are all
@@ -404,7 +400,7 @@ mod tests {
         assert_eq!(back.labels[0].display_name, "Kids");
     }
 
-    /// §10 — a bundle whose `[server]` table is PRESENT but omits
+    /// A bundle whose `[server]` table is PRESENT but omits
     /// `enforce_device_mac` must default it to **true**, matching the schema.
     ///
     /// The field carried a bare `#[serde(default)]`, i.e. `bool::default()` =

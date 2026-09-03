@@ -5,10 +5,6 @@
 //! fresh bidirectional stream carrying a length-prefixed DNS message
 //! (RFC 9250 §4), reusing the pooled connection.
 //!
-//! - §4.9-1 shipped the QUIC transport + handshake (connect / pool / ALPN).
-//! - §4.9-2 added the `Upstream` impl: message framing, the RFC 9250 §4.2.1
-//!   message-ID-zeroing, and integration into the failover chain.
-//!
 //! Feature-gated behind `doq` (default OFF) so the quinn QUIC stack never
 //! bloats the default or Raspberry Pi binary.
 //!
@@ -27,18 +23,19 @@
 //! intentionally dropped.
 //!
 //! `DoqUpstream::new` builds a `quinn::Endpoint`, which requires a Tokio runtime
-//! context (quinn's tokio runtime supplies the I/O driver). Sprint §4.9-2 wires
-//! this in during async resolver construction.
+//! context (quinn's tokio runtime supplies the I/O driver) — wired in during
+//! async resolver construction.
 
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hickory_proto::op::Query;
 use hickory_proto::rr::{Name, RecordType};
 use rustls::ClientConfig;
 
 use super::{
-    build_query_bytes, install_ring_crypto_provider_once, parse_response_bytes, webpki_root_store,
+    build_query, install_ring_crypto_provider_once, parse_response_bytes, webpki_root_store,
     Upstream, UpstreamResponse,
 };
 use crate::dns::edns::EdnsClientSubnet;
@@ -66,7 +63,7 @@ pub struct DoqUpstream {
     /// multiplexes streams over a single connection, so one connection per
     /// server suffices.
     connections: Vec<tokio::sync::Mutex<Option<quinn::Connection>>>,
-    /// §4.10: when set, outbound queries carry the EDNS DNSSEC OK (DO) bit.
+    /// When set, outbound queries carry the EDNS DNSSEC OK (DO) bit.
     /// Baked at construction (global policy); the client-facing upstream is
     /// built with `false` → byte-identical wire packets.
     dnssec_ok: bool,
@@ -97,7 +94,7 @@ impl DoqUpstream {
 
         let mut out = Vec::with_capacity(servers.len());
         for server in servers {
-            // rev-2606: shared host:port syntax gate (same check `config lint`
+            // Shared host:port syntax gate (same check `config lint`
             // runs offline) before the resolve+TLS work — a malformed entry is
             // rejected identically at lint and at boot.
             crate::upstream::shape::validate_host_port_server(server)
@@ -227,6 +224,7 @@ impl DoqUpstream {
     async fn exchange(
         conn: &quinn::Connection,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         let (mut send, mut recv) = conn
             .open_bi()
@@ -271,7 +269,7 @@ impl DoqUpstream {
             .await
             .map_err(|e| DnsError::UpstreamRequestFailed(format!("DoQ read body: {e}")))?;
 
-        parse_response_bytes(&resp_buf)
+        parse_response_bytes(&resp_buf, expected)
     }
 
     /// Run one query against server `idx`, bounded by `self.timeout`. Uses the
@@ -283,9 +281,11 @@ impl DoqUpstream {
         &self,
         idx: usize,
         query_bytes: &[u8],
+        expected: &Query,
     ) -> Result<UpstreamResponse, DnsError> {
         let conn = self.connection(idx).await?;
-        match tokio::time::timeout(self.timeout, Self::exchange(&conn, query_bytes)).await {
+        match tokio::time::timeout(self.timeout, Self::exchange(&conn, query_bytes, expected)).await
+        {
             Ok(Ok(resp)) => return Ok(resp),
             Ok(Err(e)) => {
                 tracing::debug!(server = %self.servers[idx].addr, error = %e, "DoQ exchange failed, reconnecting");
@@ -298,7 +298,7 @@ impl DoqUpstream {
         // Drop the cached connection so the next checkout reconnects.
         *self.connections[idx].lock().await = None;
         let conn = self.connection(idx).await?;
-        tokio::time::timeout(self.timeout, Self::exchange(&conn, query_bytes))
+        tokio::time::timeout(self.timeout, Self::exchange(&conn, query_bytes, expected))
             .await
             .map_err(|_| DnsError::UpstreamRequestFailed("DoQ query timed out".into()))?
     }
@@ -316,13 +316,13 @@ impl Upstream for DoqUpstream {
         // §4.2.1 requires the ID be 0 on DoQ: correlation is per-stream, not by
         // ID, and a non-zero ID would leak into 0-RTT/connection-reuse handling.
         // The ID is the first two octets of the DNS header, always present.
-        let mut query_bytes = build_query_bytes(name, record_type, ecs, self.dnssec_ok)?;
+        let (mut query_bytes, expected) = build_query(name, record_type, ecs, self.dnssec_ok)?;
         query_bytes[..2].fill(0);
 
         let mut last_err = None;
         for idx in 0..self.servers.len() {
             tracing::debug!(server = %self.servers[idx].addr, domain = %name, "DoQ lookup");
-            match self.try_server(idx, &query_bytes).await {
+            match self.try_server(idx, &query_bytes, &expected).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     tracing::debug!(

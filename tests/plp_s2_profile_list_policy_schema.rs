@@ -41,7 +41,7 @@ fn now() -> OffsetDateTime {
 /// config needs to validate at all.
 ///
 /// The upstream address is RFC 5737 TEST-NET-1 rather than the host's real
-/// one: warden ships no provider defaults (project rules §Neutrality) and a
+/// one: warden ships no provider defaults (CLAUDE.md §Neutrality) and a
 /// fixture is not a place to reintroduce one by habit.
 ///
 /// **The `tags` arrays are gone, and the host's file still has them.** That

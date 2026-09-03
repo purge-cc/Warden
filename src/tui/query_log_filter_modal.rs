@@ -44,11 +44,11 @@ const W: u16 = 66;
 
 const TITLE: &str = "Advanced search";
 const DESC: &str = "narrow the log by client \u{b7} ANDed with Domain / Client / Time";
-const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} include/exclude";
+const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} flip include/exclude";
 
 /// Refused save because the subnet did not parse. Frozen — the operator
 /// reads this to tell a typo from an empty result set.
-pub const QLOG_FILTER_BAD_CIDR: &str = "subnet must be a CIDR like 192.0.2.0/24";
+pub const QLOG_FILTER_BAD_CIDR: &str = "subnet must be a CIDR like 10.10.1.0/24";
 
 /// Focus targets, in Tab order. Each dimension owns a text row and a
 /// polarity row, so the polarity is reachable by the same key that reaches
@@ -159,15 +159,12 @@ impl QueryLogFilterModal {
         }
     }
 
-    /// Flip the focused row's polarity. Returns `true` if it flipped —
-    /// the caller uses that to decide whether the key was consumed.
-    pub fn toggle_polarity(&mut self) -> bool {
-        match self.focus.polarity_of(&mut self.draft) {
-            Some(flag) => {
-                *flag = !*flag;
-                true
-            }
-            None => false,
+    /// Flip the focused row's polarity. A no-op on a text or action row —
+    /// Left/Right is consumed by the handler either way, so there is
+    /// nothing for a caller to branch on.
+    pub fn toggle_polarity(&mut self) {
+        if let Some(flag) = self.focus.polarity_of(&mut self.draft) {
+            *flag = !*flag;
         }
     }
 
@@ -266,7 +263,7 @@ fn form_body(modal: &QueryLogFilterModal, width: u16) -> (ScrollBody, Option<(us
         "Client IP",
         "ip",
         d.ip.as_ref(),
-        "e.g. 192.0.2.* or 1.84",
+        "e.g. 10.10.1.* or 1.84",
         Field::IpPattern,
         Field::IpPolarity,
         d.ip_exclude,
@@ -276,13 +273,13 @@ fn form_body(modal: &QueryLogFilterModal, width: u16) -> (ScrollBody, Option<(us
         "Subnet",
         "cidr",
         d.subnet.as_ref(),
-        "e.g. 192.0.2.0/24",
+        "e.g. 10.10.1.0/24",
         Field::SubnetPattern,
         Field::SubnetPolarity,
         d.subnet_exclude,
     );
 
-    // Neutral Discard, primary Apply — spec §4's one-filled-button rule.
+    // Neutral Discard, primary Apply — one filled button per form.
     // Nothing here destroys saved state, so no red.
     let actions = [
         Action::new(
@@ -365,7 +362,7 @@ mod tests {
     /// from that subnet" — the failure has to be visible as a failure.
     #[test]
     fn a_malformed_subnet_is_refused_and_focuses_the_offending_row() {
-        let mut modal = QueryLogFilterModal::open(&draft(None, None, Some("192.0.2.0/99")));
+        let mut modal = QueryLogFilterModal::open(&draft(None, None, Some("10.10.1.0/99")));
         modal.focus = Field::Apply;
         assert!(modal.try_apply().is_none());
         assert_eq!(modal.error.as_deref(), Some(QLOG_FILTER_BAD_CIDR));
@@ -375,7 +372,7 @@ mod tests {
             "the refusal must land the operator on the row that caused it"
         );
 
-        let mut ok = QueryLogFilterModal::open(&draft(None, None, Some("192.0.2.0/24")));
+        let mut ok = QueryLogFilterModal::open(&draft(None, None, Some("10.10.1.0/24")));
         assert!(ok.try_apply().is_some());
         assert!(ok.error.is_none());
     }
@@ -417,14 +414,14 @@ mod tests {
         assert!(modal.draft.name.is_none());
         assert!(modal.draft.subnet.is_none());
 
+        modal.toggle_polarity();
         assert!(
-            !modal.toggle_polarity(),
+            !modal.draft.ip_exclude,
             "a text row must not consume the polarity key"
         );
-        assert!(!modal.draft.ip_exclude);
 
         modal.focus = Field::IpPolarity;
-        assert!(modal.toggle_polarity());
+        modal.toggle_polarity();
         assert!(modal.draft.ip_exclude);
         modal.push_char('z');
         assert_eq!(

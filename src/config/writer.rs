@@ -1,17 +1,14 @@
 //! Atomic v1 config file writer.
 //!
-//! §4.41 retired the legacy v0 `write_config` path (and its
-//! `WriteConfigError` / `guard_against_v1_master` / `write_err_from_atomic`
-//! helpers) along with the v0 `Settings` struct. The daemon and every
-//! CLI verb now operate exclusively on [`ConfigV1`]; the single writer
-//! left is [`write_config_v1`], used by `warden init` and `config
-//! restore` — both whole-file replacements where flattening is not a
-//! concern (a fresh scaffold / an operator-accepted backup). Per-section
-//! mutations (the schedule-tick prune, the IPC tracking-config handler,
-//! every entity editor) do NOT go through here — they use per-file
-//! `toml::Value` surgery via `cli::commands::target::write_value_validated`
-//! so multi-file include layouts aren't flattened onto the master
-//! (rev-2606 writer-01).
+//! The daemon and every CLI verb operate exclusively on [`ConfigV1`]; the
+//! single writer here is [`write_config_v1`], used by `warden init` and
+//! `config restore` — both whole-file replacements where flattening is
+//! not a concern (a fresh scaffold / an operator-accepted backup).
+//! Per-section mutations (the schedule-tick prune, the IPC
+//! tracking-config handler, every entity editor) do NOT go through here
+//! — they use per-file `toml::Value` surgery via
+//! `cli::commands::target::write_value_validated` so multi-file include
+//! layouts aren't flattened onto the master.
 
 use std::path::Path;
 
@@ -20,22 +17,19 @@ use super::schema::ConfigV1;
 
 /// Serialize a v1 [`ConfigV1`] back to TOML and write atomically.
 ///
-/// Sprint 31 minimum-viable writer (option A per `_docs/features/config_architecture.md`
-/// §16.3 follow-up #1): uses `toml::to_string_pretty` so the output round-trips
-/// semantically but **does not preserve comment layout or field ordering** of
-/// a hand-edited source. Sufficient for:
+/// Uses `toml::to_string_pretty`, so the output round-trips semantically
+/// but **does not preserve comment layout or field ordering** of a
+/// hand-edited source. Sufficient for:
 ///
 /// - `warden init` scaffolding (writing a fresh file).
 /// - `warden config restore` (staged replacement, operator already accepted
 ///   the backup being canonical).
 ///
-/// Not suitable for round-tripping a hand-edited file without churn. A future
-/// sprint can upgrade this to a `toml_edit::Document` path that keeps
-/// comments and ordering intact; the signature stays the same.
+/// Not suitable for round-tripping a hand-edited file without churn.
 pub fn write_config_v1(path: &Path, config: &ConfigV1) -> anyhow::Result<()> {
     let content = toml::to_string_pretty(config)
         .map_err(|e| anyhow::anyhow!("failed to serialize v1 config: {}", e))?;
-    // CS2 atomic write: the validator is the full v1 loader so we
+    // Atomic write: the validator is the full v1 loader so we
     // surface include-graph / cross-reference errors before the rename
     // lands. If the staged bytes would not boot the daemon, the
     // original file on disk stays untouched. Matching loader = same
@@ -62,12 +56,11 @@ pub fn write_config_v1(path: &Path, config: &ConfigV1) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-// §4.31: the legacy `pub(crate) atomic_write(&str)` was removed.
-// All config-mutation call-sites were rewired to
-// [`atomic_write_and_validate`] so the v1 master + every `.d/*.toml`
-// slice gets the CS2 round-trip validator AND §4.31 fsync + mode/owner
-// preservation. The remaining manpage-output caller (man pages are
-// not config) carries its own private helper inside
+// There is no `pub(crate) atomic_write(&str)` here: every config-mutation
+// call-site goes through [`atomic_write_and_validate`] so the v1 master +
+// every `.d/*.toml` slice gets the round-trip validator and fsync +
+// mode/owner preservation. The remaining manpage-output caller (man
+// pages are not config) carries its own private helper inside
 // `cli/commands/manpages.rs`; it still routes through
 // [`hardened_atomic_write`] so even non-config writes get fsync.
 
@@ -139,17 +132,13 @@ servers = ["192.0.2.1:53"]
         assert!(path.exists());
     }
 
-    /// `config-enforce-device-mac-canonical-serde` — the deprecation must be
-    /// **clearable**.
-    ///
-    /// The reported defect was a loader-synthesised value round-tripping back
-    /// into the operator's file: the daemon re-serialised the deprecated
-    /// spelling, so an operator who renamed the key by hand got it reverted on
-    /// the next rewrite and the WARN never went away. The code fix landed in
-    /// S42 T5 (`enforce_device_mac` is the canonical serde name,
-    /// `enforce_client_mac` survives as a read-only alias); what was missing is
-    /// this pin, so nothing stopped a later edit from making the legacy
-    /// spelling canonical again.
+    /// The deprecation must be **clearable**: a loader-synthesised value
+    /// must never round-trip back into the operator's file. `enforce_device_mac`
+    /// is the canonical serde name; `enforce_client_mac` survives as a
+    /// read-only alias. Without this pin, nothing stops a rewrite from
+    /// re-serialising the deprecated spelling, so an operator who renamed
+    /// the key by hand would get it reverted on the next rewrite and the
+    /// WARN would never clear.
     ///
     /// **`false` is load-bearing.** `default_enforce_device_mac()` returns
     /// `true`, so the same test written with `true` passes even if the alias is

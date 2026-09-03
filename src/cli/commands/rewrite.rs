@@ -1,13 +1,12 @@
-//! §4.12 — `warden rewrite` CLI surface.
+//! `warden rewrite` CLI surface.
 //!
 //! Three verbs (`add` / `remove` / `list`) under `warden rewrite`, all
-//! profile-scoped (per DR1 — no global rewrites in §4.12). Mirrors
-//! [`super::local_dns`]'s shape: validator pre-flight on the merged
-//! `[existing..., new]` slice via
-//! [`crate::config::validator::validate_rewrite_rules`], TOML mutation via
-//! [`super::target::write_value_validated`] (full v1 loader run against the
-//! STAGED bytes before the rename, so a rejected tree never lands), HR2
-//! reload feedback, then audit emit (R4 single-seat).
+//! profile-scoped — no global rewrites. Mirrors [`super::local_dns`]'s
+//! shape: validator pre-flight on the merged `[existing..., new]` slice
+//! via [`crate::config::validator::validate_rewrite_rules`], TOML
+//! mutation via [`super::target::write_value_validated`] (full v1 loader
+//! run against the STAGED bytes before the rename, so a rejected tree
+//! never lands), reload feedback, then single-seat audit emit.
 //!
 //! Idempotent silent no-op: `add` of a rule with the SAME `(from, to,
 //! match_subdomains)` returns [`AddOutcome::NoOp`] — no write, no reload,
@@ -125,7 +124,7 @@ pub(crate) enum RemoveOutcome {
     NotFound,
 }
 
-// ── add_inner / remove_inner — R7 single seat ─────────────────────────
+// ── add_inner / remove_inner — single seat ────────────────────────────
 
 pub(crate) fn add_inner(
     config_path: &Path,
@@ -136,7 +135,7 @@ pub(crate) fn add_inner(
     ensure_profile_exists(config_path, profile_id, format_rewrite_profile_not_found)?;
 
     // Snapshot existing rules + local_records (profile + global, for
-    // shadow-warning context — rev-2606 cfg-validator-07).
+    // shadow-warning context).
     let (existing, local_records, global_records) = load_profile_state(config_path, profile_id)?;
 
     // Idempotent silent no-op.

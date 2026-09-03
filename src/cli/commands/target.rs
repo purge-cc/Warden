@@ -1,9 +1,9 @@
 //! Target-file selection + TOML surgery for v1 entity mutations.
 //!
-//! Sprint 33 introduces `warden device` / `group` / `subnet` / `blocklist`
-//! subcommands that must edit the right `*.d/*.toml` slice when the
-//! operator runs a multi-file layout, and fall back to the master config
-//! when no `.d/` directory is present. This module is the shared plumbing.
+//! The `warden device` / `group` / `subnet` / `blocklist` subcommands must
+//! edit the right `*.d/*.toml` slice when the operator runs a multi-file
+//! layout, and fall back to the master config when no `.d/` directory is
+//! present. This module is the shared plumbing.
 //!
 //! # `--into <file>` semantics
 //!
@@ -24,7 +24,7 @@
 //! row by its `id` (or the map key for profiles) → serialise back →
 //! atomic-write.
 //!
-//! # Pre-promote validation (rev2606 target-01)
+//! # Pre-promote validation
 //!
 //! Mutations route through [`write_value_validated`] (single file) or
 //! [`write_values_validated`] (compound multi-file). Both run the full
@@ -55,7 +55,7 @@ use crate::config::schema::{
     REPLICATED_SECTIONS,
 };
 
-/// The entity collections S33 can mutate via CLI. Maps to the v1 schema
+/// The entity collections the CLI can mutate. Maps to the v1 schema
 /// top-level keys + the `<name>.d/` subdirectory convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityClass {
@@ -66,7 +66,7 @@ pub enum EntityClass {
     Profiles,
     Schedules,
     AdminRules,
-    /// §4.66 L1 — the `[[labels]]` vocabulary.
+    /// The `[[labels]]` vocabulary.
     ///
     /// Unlike every class above it, a `Label`'s identity is the pair
     /// `(kind, id)` rather than `id` alone, so the id-keyed helpers in
@@ -141,8 +141,8 @@ pub fn resolve_target_file(
     let class_dir = parent.join(class.dir_name()); // include-dir-ok: creation default
     if !class_dir.is_dir() {
         // No subdirectory exists — fall through to the master file.
-        // This is the pre-S34 CT layout where everything lives in a
-        // monolithic `config.toml`.
+        // This is the layout where everything lives in a monolithic
+        // `config.toml`.
         return Ok(master.to_path_buf());
     }
 
@@ -176,11 +176,11 @@ pub fn resolve_target_file(
 /// when the id is absent, so a genuine not-found still surfaces the
 /// existing error instead of mis-writing.
 ///
-/// rev2606 target-02: previously these verbs used [`resolve_target_file`]'s
-/// directory heuristic, which failed with "not found in <file>, use
-/// `--into`" whenever the entity lived in a file other than the
-/// auto-selected one. (Creation verbs keep [`resolve_target_file`]: the id
-/// must not exist yet, so there is no owner to locate.)
+/// Previously these verbs used [`resolve_target_file`]'s directory
+/// heuristic, which failed with "not found in <file>, use `--into`"
+/// whenever the entity lived in a file other than the auto-selected one.
+/// (Creation verbs keep [`resolve_target_file`]: the id must not exist
+/// yet, so there is no owner to locate.)
 pub fn resolve_existing_target_file(
     master: &Path,
     class: EntityClass,
@@ -249,8 +249,8 @@ fn resolve_explicit_into(parent: &Path, into: &Path) -> anyhow::Result<PathBuf> 
 /// Containment-check an explicit `--into` path for verbs that resolve their
 /// own (non-[`EntityClass`]) target file — the profile-scoped `rewrite` /
 /// `local-dns` inners. Mirrors [`resolve_target_file`]'s `--into` branch so
-/// a caller forwarding operator input (e.g. the R7 TUI) cannot write
-/// outside the config tree (rev-2606 rewrite-01).
+/// a caller forwarding operator input (e.g. the TUI) cannot write outside
+/// the config tree.
 pub(crate) fn resolve_explicit_into_under(master: &Path, into: &Path) -> anyhow::Result<PathBuf> {
     let parent = master.parent().unwrap_or_else(|| Path::new("."));
     resolve_explicit_into(parent, into)
@@ -270,7 +270,7 @@ fn list_toml_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Convert a free-form display name (e.g. `"PC Alex"`) into a valid
+/// Convert a free-form display name (e.g. `"PC Operator"`) into a valid
 /// v1 [`Id`](crate::config::schema::Id) — lowercase ASCII, digits, and
 /// `-` only, with leading / trailing dashes trimmed and runs of
 /// non-id characters collapsed to a single dash.
@@ -306,7 +306,7 @@ pub fn slug_id(name: &str) -> Result<String, String> {
         return Err(format!(
             "the device name {name:?} collapsed to an empty id after slugging. \
              Use ASCII letters, digits, or `-` so a stable v1 id can be derived \
-             (e.g. \"PC Alex\" → \"pc-alex\")."
+             (e.g. \"PC Operator\" → \"pc-operator\")."
         ));
     }
     Ok(out)
@@ -322,8 +322,8 @@ pub fn slug_id(name: &str) -> Result<String, String> {
 /// every "does X exist?" probe (those read the merged view) and invisible
 /// to a convention-derived directory scan. A verb that resolves its write
 /// target by convention therefore passes its existence check and then
-/// misses the file that owns the entity — the SI-2 defect class this
-/// helper closes (cli-h4).
+/// misses the file that owns the entity — the defect class this helper
+/// closes.
 ///
 /// The conventional `<class>.d/*.toml` for each of `convention_classes` is
 /// searched **in addition**, never instead. Two layouts depend on it:
@@ -337,7 +337,7 @@ pub fn slug_id(name: &str) -> Result<String, String> {
 /// `scripts/check_no_hardcoded_include_dirs.sh`.
 ///
 /// The master is always first, so callers keep master-before-slice
-/// precedence (`rule undo` depends on it — rev2606 rules-01). Convention
+/// precedence (`rule undo` depends on it). Convention
 /// hits come next, in the caller's own path spelling and sorted for
 /// determinism; include-graph files the convention did not already cover
 /// are appended in the loader's canonical spelling. Duplicates are
@@ -404,28 +404,16 @@ pub fn owner_candidate_files(master: &Path, convention_classes: &[EntityClass]) 
 /// | AdminRules  | array-of-tables  | `[[admin_rules]]` items by `id` field |
 /// | Profiles    | named-map        | `[profiles.<id>]` sub-table keys     |
 ///
-/// `Profiles` is the only v1 named-map today; §4.27 Resolver Migration may
-/// promote other classes — if a class flips shape, the writer
-/// ([`upsert_id_keyed`] vs [`upsert_profile`]) and the corresponding
-/// match arm here must move together.
+/// `Profiles` is the only v1 named-map today — if another class ever
+/// flips shape, the writer ([`upsert_id_keyed`] vs [`upsert_profile`])
+/// and the corresponding match arm here must move together.
 ///
-/// # History
-///
-/// Sprint §4.26 §1/2 hotfix: prior implementation hard-coded the
-/// array-of-tables shape via `value.get(k).and_then(|v| v.as_array())`,
-/// which silently returned `Ok(None)` for `[profiles.<id>]` named-maps
-/// and broke every Profile mutate IPC handler (`update` / `ecs` /
-/// `remove` / etc.) post-create. The CT smoke step that should have
-/// caught this pre-merge was skipped; the fix here is paired with a
-/// new integration test (`tests/ipc_profile_mutate_roundtrip.rs`) and
-/// a mandatory CT smoke gating step for v1-shape sprints.
-///
-/// cli-h4: the candidate set was `[master] + <class>.d/*.toml`, derived by
-/// convention. An entity in an operator include outside that directory
-/// (`includes = ["custom/*.toml"]`) passed every existence check and then
-/// resolved to `None` here, so `set` / `remove` wrote into the default
-/// creation target instead of the owning file. Candidates now come from
-/// [`owner_candidate_files`], i.e. the include graph the loader merged.
+/// Candidates come from [`owner_candidate_files`], i.e. the include
+/// graph the loader merged — not a `[master] + <class>.d/*.toml`
+/// convention, which would miss an entity living in an operator include
+/// outside that directory (`includes = ["custom/*.toml"]`) and send
+/// `set` / `remove` to the default creation target instead of the
+/// owning file.
 pub fn find_target_for_id(
     master: &Path,
     class: EntityClass,
@@ -582,9 +570,10 @@ pub fn client_to_v1_value(client: &crate::config::settings::ClientConfig, id: &s
 ///
 /// ## Why this is prose and not a lint
 ///
-/// `cli-h4` fenced the sibling rule ("which file owns X?") lexically,
-/// because every violation of it names a `.d` directory and a grep can
-/// find a string. Rule 1 has no such marker: `contains_key` on a merged
+/// `scripts/check_no_hardcoded_include_dirs.sh` fences the sibling rule
+/// ("which file owns X?") lexically, because every violation of it names
+/// a `.d` directory and a grep can find a string. Rule 1 has no such
+/// marker: `contains_key` on a merged
 /// config and `contains_key` on a raw one are the same three tokens. A
 /// sweep of `src/cli` + `src/ipc` found no live violation and ~15 hits
 /// that are all the legitimate shapes above — a detector that flags
@@ -707,8 +696,8 @@ pub fn remove_profile(doc: &mut Value, profile_id: &str) -> anyhow::Result<bool>
 /// for the whole batch, so a TOML round-trip on the restored bytes suffices).
 fn revert(path: &Path, original_content: Option<&str>) -> anyhow::Result<()> {
     match original_content {
-        // §4.31: restore previously-known-good bytes through the
-        // hardened atomic-write helper. The bytes were valid before the
+        // Restore previously-known-good bytes through the hardened
+        // atomic-write helper. The bytes were valid before the
         // edit, so a lightweight `toml::Value` round-trip is sufficient
         // — a full v1 loader pass would re-resolve includes and could
         // spuriously fail mid-revert if a sibling slice changed.
@@ -729,7 +718,7 @@ fn revert(path: &Path, original_content: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
-// ── pre-promote validating writers (rev2606 target-01) ──────────────
+// ── pre-promote validating writers ──────────────
 //
 // `write_value` + `validate_or_revert` promote a slice and THEN run the full
 // loader, leaving a window where a cross-reference-invalid tree is the on-disk
@@ -842,9 +831,10 @@ fn promote_validated_locked(
 ) -> anyhow::Result<()> {
     // 0. Snapshot the pre-edit bytes of every staged path, ONCE.
     //
-    // Two consumers: the CS8 guard below (which needs to know what this write
-    // CHANGES, not merely what the staged file contains) and step 3's rollback
-    // capture. One read means both see the same bytes — the tree as it stood
+    // Two consumers: the cluster-secondary guard below (which needs to know
+    // what this write CHANGES, not merely what the staged file contains)
+    // and step 3's rollback capture. One read means both see the same
+    // bytes — the tree as it stood
     // when the operator's command started — instead of two reads straddling a
     // full config load.
     let pre_edit: Vec<Option<String>> = staged
@@ -861,7 +851,7 @@ fn promote_validated_locked(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // 0b. CS8 — a cluster secondary is read-only for policy.
+    // 0b. A cluster secondary is read-only for policy.
     refuse_policy_write_on_a_cluster_secondary(master, staged, &pre_edit)?;
 
     // 1. Build the overlay.
@@ -888,11 +878,8 @@ fn promote_validated_locked(
         // Errors first, boilerplate last. The TUI renders this string in a
         // fixed 2-row band (~105 usable cells after its own prefixes) and
         // ellipsises the rest, so any preamble is paid for in operator
-        // diagnosis. The old form opened with 74 characters of "config
-        // would be invalid after this change (1 error(s)) — nothing
-        // written:" and the actual complaint — `unknown variant "block"` —
-        // fell off the end of the band. The defect that produced it went
-        // unread for hours as a result (`s-tui-lists-edit-save-rejected`).
+        // diagnosis — a verbose lead-in can push the actual complaint
+        // (e.g. `unknown variant "block"`) past the visible cutoff.
         let mut msg = if let [only] = errs.as_slice() {
             format!("{only} — nothing written")
         } else {
@@ -939,41 +926,39 @@ fn promote_validated_locked(
     Ok(())
 }
 
-// ── CS8: a cluster secondary is read-only for policy ────────────────
+// ── A cluster secondary is read-only for policy ───────────────────────
 //
-// `cluster_sync.md:126-130` promised this refusal and nothing implemented it.
-// What existed was a set of side effects that happen to point the same way —
-// no list refresh, the reload early-return, and S2's loader-level
-// `CLUSTER_SECONDARY_MASTER_CARRIES_POLICY` — not an enforcement at the write
-// path. Measured on this tree before the guard existed:
+// This guard is not redundant with the loader-level
+// `CLUSTER_SECONDARY_MASTER_CARRIES_POLICY` check, which fires only at
+// LOAD time and filters `is_cluster_drop_in` — so policy written INTO
+// the sync-owned drop-in is invisible to it:
 //
-// | write on a secondary        | outcome                                   |
-// |-----------------------------|-------------------------------------------|
-// | `devices.d/tablet.toml`     | refused, by S2's check at LOAD time       |
-// | `cluster.d/01-local.toml`   | **allowed — the file landed**             |
-// | `server.listen` (master)    | allowed (correct — the node's own)        |
+// | write on a secondary        | outcome                                     |
+// |-----------------------------|----------------------------------------------|
+// | `devices.d/tablet.toml`     | refused, by the loader's check at LOAD time |
+// | `cluster.d/01-local.toml`   | allowed — the write validates and lands     |
+// | `server.listen` (master)    | allowed (correct — the node's own)          |
 //
-// Row 2 is why this guard is not redundant with S2. That check filters
-// `is_cluster_drop_in`, so policy written INTO the sync-owned drop-in is
-// invisible to it: the write validates and lands. From there the operator
+// The second row is the gap this guard closes. From there the operator
 // gets one of two silent outcomes, and cannot tell which:
 //
 //   - until the next SUCCESSFUL apply, the stray slice merges with the
-//     bundle on every load — §5.1's silent union, reached through a
-//     different door. On a secondary whose primary is unreachable that is
-//     every boot, indefinitely;
+//     bundle on every load — a silent union reached through a different
+//     door. On a secondary whose primary is unreachable that is every
+//     boot, indefinitely;
 //   - at the next successful apply, `apply::mirror_wipe_cluster_d` deletes
 //     it — the edit the operator watched succeed vanishes with no diagnostic.
 //
 // Neither is a state the write path should be able to produce.
 //
-// Row 1 is why the guard runs BEFORE the load rather than after. S2 refuses
-// at load, so a guard sitting after `load_config_with_overlay` would be
-// shadowed on the commonest case and never speak. It also gives the operator
-// the wrong instruction on a write: they ran `warden device add`, and
-// "move these sections out of the master" describes a file they never opened.
+// This guard runs BEFORE the load rather than after: the loader's check
+// fires at load, so a guard sitting after `load_config_with_overlay`
+// would be shadowed on the commonest case and never speak. It also gives
+// the operator the wrong instruction on a write: they ran
+// `warden device add`, and "move these sections out of the master"
+// describes a file they never opened.
 
-/// The CS8 refusal. Frozen — pinned byte-for-byte by
+/// This refusal. Frozen — pinned byte-for-byte by
 /// `tests/cs8_secondary_policy_guard.rs`. `{peer}` / `{sections}` are
 /// substituted at construction, the same template-const idiom as
 /// `CLUSTER_ALLOW_PEER_INVALID_CIDR`.
@@ -1018,16 +1003,17 @@ pub const CLUSTER_PEER_UNSET: &str = "`cluster.peer` unset";
 ///   fire on every such write, including the node-local ones, and would refuse
 ///   `cluster leave` on a policy-carrying master: the exact verb an operator
 ///   reaches for to rescue a stuck node.
-/// - **`schema_version` and `server` are carved out**, matching S2's
-///   `REPLICATED_BUT_ALLOWED_IN_A_SECONDARY_MASTER` and for its reasons —
-///   every master carries `schema_version`, and the master keeps node-local
-///   `server.listen` while the bundle supplies `server`'s policy fields.
+/// - **`schema_version` and `server` are carved out**, matching the
+///   loader's `REPLICATED_BUT_ALLOWED_IN_A_SECONDARY_MASTER` carve-out and
+///   for the same reasons — every master carries `schema_version`, and the
+///   master keeps node-local `server.listen` while the bundle supplies
+///   `server`'s policy fields.
 ///   *Known residual:* the carve-out is section-granular, so a future verb
 ///   writing `server.<policy-field>` would pass this guard. Cover is partial
 ///   — the loader's sub-key `DuplicateId` fires only when the bundle sets the
-///   same field. Measured 2026-08-15: no verb writes `[server]` through this
-///   path today (the only `get_mut("server")` in the CLI is `migrate.rs`),
-///   so the hole is known and currently unreachable rather than unnoticed.
+///   same field. No verb writes `[server]` through this path today (the
+///   only `get_mut("server")` in the CLI is `migrate.rs`), so the hole is
+///   known and currently unreachable rather than unnoticed.
 fn refuse_policy_write_on_a_cluster_secondary(
     master: &Path,
     staged: &[StagedWrite],
@@ -1076,13 +1062,14 @@ fn refuse_policy_write_on_a_cluster_secondary(
 /// from disk otherwise. `None` when the master is unreadable, unparseable, or
 /// declares no `[cluster]` — in the first two cases the load in
 /// [`promote_validated`] reports the real syntax error a paragraph later, and
-/// a CS8 refusal there would name the wrong cause.
+/// a refusal here would name the wrong cause.
 ///
 /// *Known residual:* a `[cluster]` declared in an INCLUDE rather than the
 /// master is invisible here. Every real path puts it in the master —
 /// `cluster join` / `leave` write `config_path` — and the tree still fails
-/// closed if one did not, because S2's load-time check has the merged config
-/// and refuses a policy-carrying secondary regardless. Resolving it properly
+/// closed if one did not, because the loader's load-time check has the
+/// merged config and refuses a policy-carrying secondary regardless.
+/// Resolving it properly
 /// would mean re-implementing the loader's include walk, and two
 /// implementations of one rule drift.
 fn cluster_section_in_effect(master: &Path, staged: &[StagedWrite]) -> Option<ClusterConfig> {
@@ -1174,13 +1161,13 @@ fn cidr_prefix(c: &Cidr) -> u8 {
 }
 
 /// The profile a device resolves to by the **static** precedence
-/// direct → group → subnet → global-default (rev-2606 verbs-03).
+/// direct → group → subnet → global-default.
 ///
 /// Mirrors [`crate::profiles::resolver::ProfileResolver`]'s levels minus
 /// the time-varying schedule override — a static "affects N devices"
 /// count (and the `device allow/deny` override pre-check) must not depend
 /// on the wall clock. Subnet selection is longest-prefix, ties broken by
-/// `priority` DESC, matching the resolver (SN1). Shared by `warden
+/// `priority` DESC, matching the resolver. Shared by `warden
 /// rewrite` / `local-dns` / `rule` so the three former copies (which all
 /// skipped the subnet level) can't drift again.
 pub fn effective_profile_for_device(cfg: &ConfigV1, device: &Device) -> Option<Id> {
@@ -1237,836 +1224,4 @@ pub fn count_devices_on_profile(config_path: &Path, profile_id: &str) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tmpdir() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
-    }
-
-    #[test]
-    fn resolve_target_file_explicit_into_accepted() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-        let target = dir.path().join("devices.d").join("fam.toml");
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        let out =
-            resolve_target_file(&master, EntityClass::Devices, Some(&target)).expect("accepts");
-        assert_eq!(out, target);
-    }
-
-    #[test]
-    fn resolve_target_file_absent_dir_falls_through_to_master() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-        let out = resolve_target_file(&master, EntityClass::Devices, None).unwrap();
-        assert_eq!(out, master);
-    }
-
-    #[test]
-    fn resolve_target_file_single_candidate_auto_selects() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-        let dd = dir.path().join("devices.d");
-        std::fs::create_dir_all(&dd).unwrap();
-        let only = dd.join("one.toml");
-        std::fs::write(&only, "").unwrap();
-        let out = resolve_target_file(&master, EntityClass::Devices, None).unwrap();
-        assert_eq!(out, only);
-    }
-
-    #[test]
-    fn resolve_target_file_multiple_candidates_error_hints_into() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-        let dd = dir.path().join("devices.d");
-        std::fs::create_dir_all(&dd).unwrap();
-        std::fs::write(dd.join("fam.toml"), "").unwrap();
-        std::fs::write(dd.join("iot.toml"), "").unwrap();
-        let err = resolve_target_file(&master, EntityClass::Devices, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ambiguous"), "got: {msg}");
-        assert!(msg.contains("--into"), "got: {msg}");
-        assert!(
-            msg.contains("fam.toml") && msg.contains("iot.toml"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_target_file_rejects_escape() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-        // Escape attempt via `..`
-        let bogus = Path::new("../../../etc/passwd");
-        let err = resolve_target_file(&master, EntityClass::Devices, Some(bogus)).unwrap_err();
-        assert!(
-            err.to_string().contains("escapes") || err.to_string().contains("must live under"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn upsert_id_keyed_appends_new_entry() {
-        let mut doc: Value = "".parse().unwrap();
-        let entry: Value = toml::from_str(
-            r#"
-id = "iphone"
-display_name = "iPhone"
-"#,
-        )
-        .unwrap();
-        let created = upsert_id_keyed(&mut doc, "devices", "iphone", entry).unwrap();
-        assert!(created);
-        let out = toml::to_string(&doc).unwrap();
-        assert!(out.contains("iphone"));
-    }
-
-    #[test]
-    fn upsert_id_keyed_replaces_existing() {
-        let src = r#"
-[[devices]]
-id = "iphone"
-display_name = "old"
-"#;
-        let mut doc: Value = src.parse().unwrap();
-        let entry: Value = toml::from_str(
-            r#"
-id = "iphone"
-display_name = "new"
-"#,
-        )
-        .unwrap();
-        let created = upsert_id_keyed(&mut doc, "devices", "iphone", entry).unwrap();
-        assert!(!created, "existing id replaced, not appended");
-        let out = toml::to_string(&doc).unwrap();
-        assert!(out.contains("new"));
-        assert!(!out.contains("old"));
-    }
-
-    #[test]
-    fn remove_id_keyed_drops_match() {
-        let src = r#"
-[[devices]]
-id = "a"
-display_name = "A"
-
-[[devices]]
-id = "b"
-display_name = "B"
-"#;
-        let mut doc: Value = src.parse().unwrap();
-        let removed = remove_id_keyed(&mut doc, "devices", "a").unwrap();
-        assert!(removed);
-        let out = toml::to_string(&doc).unwrap();
-        assert!(!out.contains("id = \"a\""));
-        assert!(out.contains("id = \"b\""));
-    }
-
-    #[test]
-    fn remove_id_keyed_missing_returns_false() {
-        let mut doc: Value = "".parse().unwrap();
-        let removed = remove_id_keyed(&mut doc, "devices", "ghost").unwrap();
-        assert!(!removed);
-    }
-
-    #[test]
-    fn upsert_profile_creates_named_map_entry() {
-        let mut doc: Value = "".parse().unwrap();
-        let entry: Value = toml::from_str(
-            r#"
-display_name = "Default"
-"#,
-        )
-        .unwrap();
-        let created = upsert_profile(&mut doc, "default", entry).unwrap();
-        assert!(created);
-        let out = toml::to_string(&doc).unwrap();
-        assert!(out.contains("[profiles.default]"));
-    }
-
-    #[test]
-    fn read_or_empty_missing_returns_empty_table() {
-        let dir = tmpdir();
-        let missing = dir.path().join("nope.toml");
-        let (val, orig) = read_or_empty(&missing).unwrap();
-        assert!(val.as_table().unwrap().is_empty());
-        assert!(orig.is_none());
-    }
-
-    #[test]
-    fn read_or_empty_reads_existing_file() {
-        let dir = tmpdir();
-        let p = dir.path().join("x.toml");
-        std::fs::write(
-            &p,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        let (val, orig) = read_or_empty(&p).unwrap();
-        assert_eq!(val.get("schema_version").unwrap().as_integer(), Some(3));
-        assert_eq!(
-            orig.as_deref(),
-            Some("schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
-        );
-    }
-
-    #[test]
-    fn revert_removes_file_when_original_absent() {
-        // `revert(path, None)` deletes a file that did not exist before the
-        // (now rolled-back) write — the compound-writer mid-sequence rollback
-        // relies on this for a freshly-created slice.
-        let dir = tmpdir();
-        let created = dir.path().join("new.toml");
-        std::fs::write(&created, "whatever").unwrap();
-        let res = revert(&created, None);
-        assert!(res.is_ok());
-        assert!(!created.exists(), "file removed when original was None");
-    }
-
-    // ── §4.26 hotfix: find_target_for_id shape coverage ──────────
-    //
-    // Six tests pinning the dual-shape lookup. The §4.26 §1/2 bug
-    // (mutate verbs broken post-create) was a silent `Ok(None)` from
-    // this function on the v1 named-map `[profiles.<id>]` shape: the
-    // old implementation hard-coded `as_array()` which only handled
-    // `[[profiles]]` array-of-tables. These tests pin both shapes so
-    // a future refactor that drops the named-map branch fails loudly.
-
-    #[test]
-    fn find_target_for_id_hits_array_of_tables_in_master() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"
-[[devices]]
-id = "iphone"
-display_name = "iPhone"
-ip = "10.0.0.1"
-
-[[devices]]
-id = "laptop"
-display_name = "Laptop"
-ip = "10.0.0.2"
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Devices, "laptop").unwrap();
-        assert_eq!(hit, Some(master));
-    }
-
-    #[test]
-    fn find_target_for_id_hits_named_map_profile_in_master() {
-        // Regression for §4.26 §1/2: previously returned Ok(None)
-        // because the implementation called `as_array()` on the
-        // `[profiles]` value, which is a `Value::Table` in v1.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"
-[profiles.default]
-display_name = "Default"
-
-[profiles.kids]
-display_name = "Kids"
-block_all = true
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Profiles, "kids").unwrap();
-        assert_eq!(hit, Some(master));
-    }
-
-    #[test]
-    fn find_target_for_id_named_map_miss_returns_none() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"
-[profiles.default]
-display_name = "Default"
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Profiles, "ghost").unwrap();
-        assert_eq!(hit, None);
-    }
-
-    #[test]
-    fn find_target_for_id_array_of_tables_miss_returns_none() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"
-[[devices]]
-id = "iphone"
-display_name = "iPhone"
-ip = "10.0.0.1"
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Devices, "ghost").unwrap();
-        assert_eq!(hit, None);
-    }
-
-    #[test]
-    fn find_target_for_id_named_map_searches_class_dir() {
-        // Operator put profiles in a sibling `profiles.d/family.toml`
-        // rather than the master — the lookup must still find them.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("profiles.d")).unwrap();
-        let split = dir.path().join("profiles.d").join("family.toml");
-        std::fs::write(
-            &split,
-            r#"
-[profiles.parents]
-display_name = "Parents"
-
-[profiles.kids]
-display_name = "Kids"
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Profiles, "kids").unwrap();
-        assert_eq!(hit, Some(split));
-    }
-
-    /// cli-h4: the owner lives in an include the config declares by a name
-    /// the `<class>.d` convention can never produce. Pre-fix the candidate
-    /// set was `[master] + parent/<class>.d/*.toml`, so this returned
-    /// `None` — and `resolve_existing_target_file` then fell through to the
-    /// creation heuristic, which writes a SECOND `[profiles.kids]` into the
-    /// master. The loader's named-map duplicate-key detection rejects that,
-    /// so the operator's `profile set` failed on a config that is valid.
-    ///
-    /// Both asserts matter: `find_target_for_id` naming the right file, and
-    /// `resolve_existing_target_file` agreeing — the second is what every
-    /// mutating verb actually calls.
-    #[test]
-    fn find_target_for_id_reaches_a_non_conventional_declared_include() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\nincludes = [\"custom/*.toml\"]\n\n\
-             [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("custom")).unwrap();
-        let split = dir.path().join("custom").join("policy.toml");
-        std::fs::write(
-            &split,
-            "[profiles.kids]\ndisplay_name = \"Kids\"\n\n\
-             [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
-             ip = \"10.0.0.5\"\nprofile = \"kids\"\n",
-        )
-        .unwrap();
-
-        // `custom` is not, and cannot be, any EntityClass::dir_name().
-        assert!(
-            !EntityClass::Profiles.dir_name().starts_with("custom"),
-            "fixture must not accidentally match the convention"
-        );
-
-        let hit = find_target_for_id(&master, EntityClass::Profiles, "kids").unwrap();
-        assert_eq!(hit.as_deref(), Some(split.as_path()));
-        let hit = find_target_for_id(&master, EntityClass::Devices, "laptop").unwrap();
-        assert_eq!(hit.as_deref(), Some(split.as_path()));
-
-        // The seat every mutating verb goes through must agree, or the
-        // write still lands in the master and trips duplicate detection.
-        let got =
-            resolve_existing_target_file(&master, EntityClass::Devices, "laptop", None).unwrap();
-        assert_eq!(got, split);
-    }
-
-    /// cli-h4 companion: widening the candidate set must not cost the
-    /// pre-existing coverage of an UNDECLARED `<class>.d/`. Such a tree is
-    /// inert as far as the daemon is concerned, but `set` / `remove` used
-    /// to resolve into it and operators may still be running one. The
-    /// convention is searched as a superset of the declared graph, never
-    /// as a replacement — this pins that.
-    #[test]
-    fn owner_candidate_files_keeps_an_undeclared_class_dir() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        // No `includes` line at all — the loader reads only the master.
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("devices.d")).unwrap();
-        let orphan = dir.path().join("devices.d").join("laptop.toml");
-        std::fs::write(
-            &orphan,
-            "[[devices]]\nid = \"laptop\"\ndisplay_name = \"L\"\nip = \"10.0.0.5\"\n",
-        )
-        .unwrap();
-
-        let files = owner_candidate_files(&master, &[EntityClass::Devices]);
-        assert_eq!(files[0], master, "master must stay first");
-        assert!(
-            files.contains(&orphan),
-            "undeclared devices.d/ dropped from the candidate set: {files:?}"
-        );
-    }
-
-    /// A file reachable both through the convention AND through a declared
-    /// glob is visited once, in the caller's own path spelling. A duplicate
-    /// would make `undo_inner` stage two writes for one file.
-    #[test]
-    fn owner_candidate_files_dedups_a_doubly_reachable_file() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\nincludes = [\"devices.d/*.toml\"]\n\n\
-             [server]\ndefault_profile = \"default\"\n\n\
-             [profiles.default]\ndisplay_name = \"D\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("devices.d")).unwrap();
-        let slice = dir.path().join("devices.d").join("a.toml");
-        std::fs::write(
-            &slice,
-            "[[devices]]\nid = \"a\"\ndisplay_name = \"A\"\nip = \"10.0.0.1\"\n\
-             profile = \"default\"\n",
-        )
-        .unwrap();
-
-        let files = owner_candidate_files(&master, &[EntityClass::Devices]);
-        assert_eq!(files.len(), 2, "master + one slice, not three: {files:?}");
-        assert_eq!(files[0], master);
-        assert_eq!(files[1], slice, "caller's spelling, not the canonical one");
-    }
-
-    #[test]
-    fn find_target_for_id_ignores_cross_shape_class_sections() {
-        // A file that holds Devices (array-of-tables) but NO profiles
-        // section must not yield a false positive when we ask for a
-        // Profile id. Also pins that the shape-detection match arm
-        // for `None` doesn't accidentally fall through.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"
-[[devices]]
-id = "iphone"
-display_name = "iPhone"
-ip = "10.0.0.1"
-"#,
-        )
-        .unwrap();
-        let hit = find_target_for_id(&master, EntityClass::Profiles, "iphone").unwrap();
-        assert_eq!(hit, None);
-    }
-
-    // ── resolve_existing_target_file (rev2606 target-02) ──────────────
-
-    #[test]
-    fn resolve_existing_target_file_locates_owner_in_class_dir() {
-        // A device lives in devices.d/laptop.toml; a decoy slice makes the
-        // directory ambiguous for the heuristic, so only owner-resolution
-        // can pick the right file.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("devices.d")).unwrap();
-        let owner = dir.path().join("devices.d").join("laptop.toml");
-        std::fs::write(
-            &owner,
-            "[[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\nip = \"10.0.0.5\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("devices.d").join("other.toml"),
-            "[[devices]]\nid = \"phone\"\ndisplay_name = \"Phone\"\nip = \"10.0.0.6\"\n",
-        )
-        .unwrap();
-
-        // The heuristic alone would bail "ambiguous" with two files.
-        assert!(resolve_target_file(&master, EntityClass::Devices, None).is_err());
-        // Owner resolution finds the file the id actually lives in.
-        let got =
-            resolve_existing_target_file(&master, EntityClass::Devices, "laptop", None).unwrap();
-        assert_eq!(got, owner);
-    }
-
-    #[test]
-    fn resolve_existing_target_file_explicit_into_wins() {
-        // `--into` is honored verbatim, even if the id lives elsewhere.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        let into = dir.path().join("devices.d").join("explicit.toml");
-        let got =
-            resolve_existing_target_file(&master, EntityClass::Devices, "laptop", Some(&into))
-                .unwrap();
-        assert_eq!(got, into);
-    }
-
-    #[test]
-    fn resolve_existing_target_file_falls_back_to_master_when_absent() {
-        // Unknown id + no class dir → fall back to the master (the pre-fix
-        // default), so a genuine not-found still surfaces downstream rather
-        // than mis-writing.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        let got =
-            resolve_existing_target_file(&master, EntityClass::Devices, "ghost", None).unwrap();
-        assert_eq!(got, master);
-    }
-
-    // ── effective_profile_for_device / count (rev2606 verbs-03) ───────
-    #[test]
-    fn effective_profile_counts_subnet_assigned_device() {
-        // A device with no direct profile and no group, but whose IP falls
-        // in a subnet, resolves to that subnet's profile. The old per-verb
-        // count copies skipped the subnet level and would have returned the
-        // global default instead.
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            r#"schema_version = 3
-
-[server]
-default_profile = "default"
-
-[profiles.default]
-display_name = "Default"
-
-[profiles.kids]
-display_name = "Kids"
-
-[[subnets]]
-id = "lan-kids"
-display_name = "Kids LAN"
-cidrs = ["10.0.5.0/24"]
-profile = "kids"
-
-[[devices]]
-id = "tablet"
-display_name = "Tablet"
-ip = "10.0.5.10"
-
-[upstream]
-servers = ["192.0.2.1:53"]
-"#,
-        )
-        .unwrap();
-        let now = time::OffsetDateTime::now_utc();
-        let cfg = load_config(&master, now).unwrap().config;
-        let dev = cfg
-            .devices
-            .iter()
-            .find(|d| d.id.as_str() == "tablet")
-            .unwrap();
-        assert_eq!(
-            effective_profile_for_device(&cfg, dev).map(|p| p.as_str().to_string()),
-            Some("kids".to_string()),
-        );
-        assert_eq!(count_devices_on_profile(&master, "kids"), 1);
-        assert_eq!(count_devices_on_profile(&master, "default"), 0);
-    }
-
-    // ── resolve_explicit_into_under containment (rev2606 rewrite-01) ──
-    #[test]
-    fn resolve_explicit_into_under_rejects_escapes_accepts_in_tree() {
-        let dir = tmpdir();
-        let master = dir.path().join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        // Absolute path outside the config tree → rejected.
-        assert!(resolve_explicit_into_under(&master, Path::new("/etc/passwd")).is_err());
-        // `..` traversal escaping the tree → rejected.
-        assert!(resolve_explicit_into_under(&master, Path::new("../evil.toml")).is_err());
-        // In-tree relative path → accepted.
-        let ok = resolve_explicit_into_under(&master, Path::new("rules.d/x.toml")).unwrap();
-        assert!(ok.ends_with("rules.d/x.toml"));
-    }
-
-    // ── pre-promote validating writers (rev2606 target-01) ──────────
-
-    /// Minimal valid multi-file tree: master + one device slice (profile
-    /// `default`) + the `default` profile. Returns (tempdir, master, slice).
-    fn valid_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tmpdir();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("devices.d")).unwrap();
-        std::fs::create_dir_all(root.join("profiles.d")).unwrap();
-        std::fs::write(
-            root.join("profiles.d/default.toml"),
-            "[profiles.default]\ndisplay_name = \"Default\"\n",
-        )
-        .unwrap();
-        let dev = root.join("devices.d/dev.toml");
-        std::fs::write(
-            &dev,
-            "[[devices]]\nid = \"dev-one\"\ndisplay_name = \"One\"\nip = \"10.0.0.1\"\nprofile = \"default\"\n",
-        )
-        .unwrap();
-        let master = root.join("config.toml");
-        std::fs::write(
-            &master,
-            "schema_version = 3\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-        )
-        .unwrap();
-        (dir, master, dev)
-    }
-
-    fn device_entry(id: &str, ip: &str, profile: &str) -> Value {
-        toml::from_str(&format!(
-            "id = \"{id}\"\ndisplay_name = \"{id}\"\nip = \"{ip}\"\nprofile = \"{profile}\"\n"
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn write_value_validated_refuses_crossref_invalid() {
-        let (_d, master, dev) = valid_tree();
-        let before = std::fs::read_to_string(&dev).unwrap();
-        let (mut doc, _orig) = read_or_empty(&dev).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "devices",
-            "dev-two",
-            device_entry("dev-two", "10.0.0.2", "ghost"),
-        )
-        .unwrap();
-        let err = write_value_validated(&master, &dev, &doc).unwrap_err();
-        assert!(err.to_string().contains("ghost"), "must cite ghost: {err}");
-        assert_eq!(
-            std::fs::read_to_string(&dev).unwrap(),
-            before,
-            "slice must be byte-identical after a refused write"
-        );
-    }
-
-    /// `s-tui-lists-edit-save-rejected`, message half. A rejected write has
-    /// to say *what* was rejected inside the space the operator can
-    /// actually see. The TUI renders this string in a fixed 2-row band and
-    /// hard-ellipsises the overflow, so a long preamble is not cosmetic —
-    /// it deletes the diagnosis. Two independent regressions are fenced:
-    /// the wrong category ("unknown field" for a bad *value*) and the
-    /// offending value being pushed past the visible budget.
-    #[test]
-    fn refusal_names_the_bad_value_early_and_does_not_call_it_a_bad_field() {
-        // 2 rows x ~60 usable cells, minus the modal's own "⚠ " and
-        // "validator: " prefixes. Anything past this is never read.
-        const MODAL_VISIBLE_BUDGET: usize = 105;
-
-        let (_d, master, _dev) = valid_tree();
-        let (mut doc, _orig) = read_or_empty(&master).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "blocklists",
-            "bad-list",
-            toml::from_str(
-                "id = \"bad-list\"\ndisplay_name = \"Bad\"\n\
-                 url = \"https://lists.purge.cc/privacy/ads.txt\"\nbase = \"block\"\n",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let err = write_value_validated(&master, &master, &doc)
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            !err.contains("unknown field"),
-            "a bad value must not be reported as a bad field: {err}"
-        );
-        let at = err
-            .find("block")
-            .unwrap_or_else(|| panic!("offending value absent entirely: {err}"));
-        assert!(
-            at < MODAL_VISIBLE_BUDGET,
-            "offending value sits at char {at}, past the {MODAL_VISIBLE_BUDGET}-char \
-             band the operator can see — it would be ellipsised away: {err}"
-        );
-    }
-
-    #[test]
-    fn write_value_validated_accepts_and_promotes() {
-        let (_d, master, dev) = valid_tree();
-        let (mut doc, _orig) = read_or_empty(&dev).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "devices",
-            "dev-two",
-            device_entry("dev-two", "10.0.0.2", "default"),
-        )
-        .unwrap();
-        write_value_validated(&master, &dev, &doc).unwrap();
-        assert!(std::fs::read_to_string(&dev).unwrap().contains("dev-two"));
-    }
-
-    /// The seat takes the tree's write lock.
-    ///
-    /// Goes red if the `acquire` at the top of [`promote_validated`] is
-    /// removed, which is the mutation that reopens the rollback-clobbers-a-
-    /// committed-change interleaving described in
-    /// [`crate::config::write_lock`].
-    ///
-    /// **The mutation this test canNOT catch is closed elsewhere, by the type
-    /// system rather than by a test.** Dropping the guard early (`let _ =`)
-    /// leaves the lock file created and every step unprotected, so this
-    /// assertion still passes — measured. That is why
-    /// [`promote_validated_locked`] takes `&ConfigWriteLock`: with the guard as
-    /// a parameter there is no binding left to mutate, and the early-drop shape
-    /// stops compiling instead of stopping protecting.
-    #[test]
-    fn the_promote_seat_takes_the_tree_write_lock() {
-        let (_d, master, dev) = valid_tree();
-        let lock = crate::config::write_lock::lock_path_for(&master);
-        assert!(
-            !lock.exists(),
-            "fixture must start without a lock file, else this proves nothing"
-        );
-
-        let (mut doc, _orig) = read_or_empty(&dev).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "devices",
-            "dev-two",
-            device_entry("dev-two", "10.0.0.2", "default"),
-        )
-        .unwrap();
-        write_value_validated(&master, &dev, &doc).unwrap();
-
-        assert!(
-            lock.exists(),
-            "promote_validated must have taken {} — no lock file means no lock",
-            lock.display()
-        );
-    }
-
-    /// A REFUSED write still went through the lock.
-    ///
-    /// The validation failure path returns before step 3, so a lock taken
-    /// "just before promoting" instead of at the top would leave the snapshot
-    /// and the whole validation unprotected and still pass the test above.
-    /// This one pins that the critical section starts at the function's first
-    /// line.
-    #[test]
-    fn even_a_refused_write_passed_through_the_lock() {
-        let (_d, master, dev) = valid_tree();
-        let lock = crate::config::write_lock::lock_path_for(&master);
-        assert!(!lock.exists());
-
-        // Reuse the existing invalid-cross-reference shape: a device pointing
-        // at a profile that does not exist.
-        let (mut doc, _orig) = read_or_empty(&dev).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "devices",
-            "dev-bad",
-            device_entry("dev-bad", "10.0.0.9", "no-such-profile"),
-        )
-        .unwrap();
-        write_value_validated(&master, &dev, &doc)
-            .expect_err("a dangling profile reference must be refused");
-
-        assert!(
-            lock.exists(),
-            "the lock must be taken before validation, not just before promotion"
-        );
-    }
-
-    /// The killer proof: a mutation the pre-write overlay accepts must load
-    /// clean through the daemon's own (no-overlay) loader afterwards.
-    #[test]
-    fn validate_write_reload_agreement() {
-        let (_d, master, dev) = valid_tree();
-        let (mut doc, _orig) = read_or_empty(&dev).unwrap();
-        upsert_id_keyed(
-            &mut doc,
-            "devices",
-            "dev-two",
-            device_entry("dev-two", "10.0.0.2", "default"),
-        )
-        .unwrap();
-        write_value_validated(&master, &dev, &doc).unwrap();
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc())
-            .expect("post-write daemon load must agree with the pre-write verdict");
-        assert_eq!(loaded.config.devices.len(), 2);
-    }
-
-    #[test]
-    fn write_values_validated_refuses_compound_dup_id() {
-        let (_d, master, _dev) = valid_tree();
-        let root = master.parent().unwrap();
-        let a = root.join("devices.d/a.toml");
-        let b = root.join("devices.d/b.toml");
-        // Both NEW slices declare the same id → the COMBINED tree is invalid,
-        // even though each slice is fine in isolation.
-        let writes = vec![
-            StagedWrite {
-                final_path: a.clone(),
-                content: "[[devices]]\nid = \"dup\"\ndisplay_name = \"A\"\nip = \"10.0.1.1\"\nprofile = \"default\"\n".to_string(),
-            },
-            StagedWrite {
-                final_path: b.clone(),
-                content: "[[devices]]\nid = \"dup\"\ndisplay_name = \"B\"\nip = \"10.0.1.2\"\nprofile = \"default\"\n".to_string(),
-            },
-        ];
-        assert!(write_values_validated(&master, &writes).is_err());
-        assert!(!a.exists() && !b.exists(), "nothing promoted on refusal");
-    }
-
-    #[test]
-    fn write_values_validated_promotes_all_on_success() {
-        let (_d, master, _dev) = valid_tree();
-        let root = master.parent().unwrap();
-        let a = root.join("devices.d/a.toml");
-        let b = root.join("devices.d/b.toml");
-        let writes = vec![
-            StagedWrite {
-                final_path: a.clone(),
-                content: "[[devices]]\nid = \"aa\"\ndisplay_name = \"A\"\nip = \"10.0.1.1\"\nprofile = \"default\"\n".to_string(),
-            },
-            StagedWrite {
-                final_path: b.clone(),
-                content: "[[devices]]\nid = \"bb\"\ndisplay_name = \"B\"\nip = \"10.0.1.2\"\nprofile = \"default\"\n".to_string(),
-            },
-        ];
-        write_values_validated(&master, &writes).unwrap();
-        assert!(a.exists() && b.exists());
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
-        assert_eq!(loaded.config.devices.len(), 3, "dev-one + aa + bb");
-    }
-}
+mod tests;

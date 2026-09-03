@@ -1,19 +1,15 @@
-//! `[cluster]` — primary/secondary replication configuration (§4.11).
+//! `[cluster]` — primary/secondary replication configuration.
 //!
-//! Implements the config surface of `_docs/features/cluster_sync.md` §6.
-//! This is the **foundation** sprint (§4.11-1): the section parses,
-//! validates, and round-trips, but is otherwise **inert** — no poll loop,
-//! no `/api/cluster/*` endpoints, no failover. With the default
-//! `enabled = false` the daemon behaves byte-identically to a standalone
-//! node.
+//! With the default `enabled = false` the daemon behaves byte-identically
+//! to a standalone node.
 //!
-//! Locked decisions reflected at the schema level (logic lands later):
-//! CS1 (pull model — [`ClusterConfig::peer`] is the primary's API base
-//! URL that a secondary will poll), CS2 (cluster bearer token stored as a
-//! SHA-256 hash in [`ClusterConfig::token_hash`]), CS3 (the whole
-//! `[cluster]` section is node-local identity — never replicated), CS8
-//! (the [`ClusterRole`] enum distinguishes the read-only secondary from
-//! the authoritative primary).
+//! Decisions reflected at the schema level: pull model —
+//! [`ClusterConfig::peer`] is the primary's API base URL that a secondary
+//! polls; the cluster bearer token is stored as a SHA-256 hash in
+//! [`ClusterConfig::token_hash`], never the plaintext; the whole
+//! `[cluster]` section is node-local identity and is never replicated;
+//! the [`ClusterRole`] enum distinguishes the read-only secondary from
+//! the authoritative primary.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `role = "primary"` (the default) is the authoritative node that holds
 /// policy and serves it; `role = "secondary"` is a read-only follower
-/// that polls the primary (CS8). Serialises lowercase: `primary` /
+/// that polls the primary. Serialises lowercase: `primary` /
 /// `secondary`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,14 +47,14 @@ pub struct ClusterConfig {
     pub role: ClusterRole,
 
     /// Optional human-readable label for this node, shown in the cluster
-    /// roster / status views (§4.11-4). A secondary advertises it on every
+    /// roster / status views. A secondary advertises it on every
     /// heartbeat; the primary falls back to the peer's source IP when unset.
     /// Free-form (display only) — uniqueness is not enforced. `None` when
     /// unset.
     pub node_name: Option<String>,
 
-    /// Split-brain tiebreak: the lower number wins on primary recovery
-    /// (Phase 2 / CS7). Operator-managed; distinctness from the peer is a
+    /// Split-brain tiebreak: the lower number wins on primary recovery.
+    /// Operator-managed; distinctness from the peer is a
     /// warn-only concern, not enforced here.
     pub priority: u32,
 
@@ -67,14 +63,14 @@ pub struct ClusterConfig {
     /// (validator-enforced); ignored on a primary. `None` when unset.
     pub peer: Option<String>,
 
-    /// SHA-256 hex hash of the cluster bearer token (CS2). Set by
+    /// SHA-256 hex hash of the cluster bearer token. Set by
     /// `warden cluster token` (primary) or `warden cluster join`
     /// (secondary). Required when `enabled = true`. The plaintext is
     /// never stored here. `None` when unset.
     pub token_hash: Option<String>,
 
     /// Path to the PEM certificate the secondary pins for the primary's
-    /// `[api]` TLS listener (§6). Set by
+    /// `[api]` TLS listener. Set by
     /// `warden cluster join --peer-cert <pem>`.
     ///
     /// The poll client trusts **this certificate and no public CA** — see
@@ -91,12 +87,12 @@ pub struct ClusterConfig {
     /// peer's name, which is worse than a loud refusal.
     pub peer_cert: Option<String>,
 
-    /// Secondary heartbeat cadence, seconds (CS1 — convergence target is
-    /// one interval). Default 15.
+    /// Secondary heartbeat cadence, seconds — convergence target is
+    /// one interval. Default 15.
     pub poll_interval_secs: u64,
 
-    /// Consecutive-failure window before a secondary promotes itself
-    /// (Phase 2 / CS7), seconds. Default 45 (three missed 15 s beats).
+    /// Consecutive-failure window before a secondary promotes itself,
+    /// seconds. Default 45 (three missed 15 s beats).
     pub failover_after_secs: u64,
 
     /// Optional defence-in-depth: CIDRs allowed to reach `/api/cluster/*`
@@ -108,11 +104,8 @@ pub struct ClusterConfig {
     /// has not set the field.
     ///
     /// **The runtime gate is LIVE**, in `cluster::routes`'s auth middleware,
-    /// ahead of both the lockout and the token check. This comment used to end
-    /// "the runtime gate is wired in a later phase" — true when written, stale
-    /// since the middleware landed, and the stale half was the harmful one: an
-    /// operator reading it would believe a wrong CIDR here is inert, when it
-    /// locks their secondary out of every poll.
+    /// ahead of both the lockout and the token check: a wrong CIDR here
+    /// locks the secondary out of every poll, it is not inert.
     pub allow_peer: Vec<String>,
 }
 
@@ -133,7 +126,7 @@ impl Default for ClusterConfig {
     }
 }
 
-/// An enabled secondary that polls without a pinned peer certificate (§6).
+/// An enabled secondary that polls without a pinned peer certificate.
 ///
 /// Emitted when the poll client is built, **not** at config load: the pin is
 /// consumed in one place, so refusing there keeps the check adjacent to the
@@ -149,7 +142,102 @@ pub const CLUSTER_SECONDARY_REQUIRES_PEER_CERT: &str =
      Run `warden cluster join --peer <primary-url> --token-file <path> --peer-cert <pem>`, \
      or set peer_cert = \"/etc/purge-warden/primary-cert.pem\" in [cluster].";
 
-/// Validate a cluster `peer_cert` path (§6).
+// ── `warden cluster enable` refusals (S4) ──────────────────────
+//
+// All seven live in this UNGATED module for the reason spelled out on
+// `CLUSTER_SECONDARY_REQUIRES_PEER_CERT` above: a const behind
+// `--features cluster` is unpinned in the build almost everyone runs, so a
+// drift in the operator-facing text would ship unnoticed. Pinned by
+// `tests/frozen_strings_cluster.rs`.
+//
+// Every one of them is emitted BEFORE anything is written — the verb's tests
+// assert the master is byte-identical after each, and assert on the const
+// itself so a test cannot go green on the wrong refusal.
+
+/// R1 — `enable --role secondary`. Frozen.
+///
+/// `EnableRole` deliberately carries a `Secondary` variant it refuses: with
+/// only `primary`, clap's own "invalid value for --role" is what a mistaken
+/// operator sees, and that error cannot name the verb they actually wanted.
+pub const CLUSTER_ENABLE_ROLE_SECONDARY_USE_JOIN: &str =
+    "cluster: `enable --role secondary` is not how a secondary is turned on. A secondary must \
+     also record the primary it follows, the token it authenticates with, and the certificate \
+     it pins — none of which this verb takes. \
+     Run `warden cluster join --peer <primary-url> --token-file <path> --peer-cert <pem>`. \
+     Nothing has been written.";
+
+/// R2 — no `[cluster] token_hash`. Frozen.
+pub const CLUSTER_ENABLE_REQUIRES_TOKEN_HASH: &str =
+    "cluster: `token_hash` is unset, so an enabled primary would reject every secondary's poll. \
+     Run `warden cluster token` first — it mints the bearer credential and prints the plaintext \
+     ONCE, to carry to the secondary. Nothing has been written.";
+
+/// R3 — the resulting `api.listen` is loopback. Frozen.
+///
+/// The default listen IS loopback, so this fires on a node that passed no
+/// `--api-listen` and never set one by hand — which is every fresh node.
+pub const CLUSTER_ENABLE_LISTEN_IS_LOOPBACK: &str =
+    "cluster: a primary whose `api.listen` is a loopback address can serve no remote secondary — \
+     the sync channel is the API server. Pass an address the secondary can reach, e.g. \
+     `--api-listen 192.0.2.10:8053`. Nothing has been written.";
+
+/// R4 — no `[api] token_hash`. Frozen.
+///
+/// Not a nicety: `api.enabled = true` without it is refused by the validator
+/// (`API_ENABLED_REQUIRES_TOKEN_HASH`), so without this check the verb would
+/// build a master the daemon cannot start from and fail late, in the staged
+/// write, naming a temp path the operator can no longer look at.
+pub const CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH: &str =
+    "api: `token_hash` is unset. Enabling clustering turns the API server on — the cluster \
+     routes mount on it — and an API without a token hash is refused at every load. \
+     Run `warden token generate` first. Nothing has been written.";
+
+/// R5 — minting, with no `--san`. Frozen.
+pub const CLUSTER_ENABLE_REQUIRES_SAN: &str =
+    "cluster: this node carries no `api.tls_cert`, so `enable` has to mint one — and a \
+     certificate needs at least one subject alternative name. Pinning does not disable \
+     hostname verification: rustls checks the SAN against the host the secondary dials, so a \
+     certificate minted without it fails every poll while looking perfectly well-formed. \
+     Pass `--san <ADDR>` once per address a secondary will use, e.g. `--san 192.0.2.10`. \
+     Nothing has been written.";
+
+/// R6 — `api.crt` / `api.key` already on disk. `{paths}` substituted by
+/// [`format_cluster_enable_cert_already_exists`]. Frozen.
+///
+/// The paths are not decoration. There is no `--force` in S4, so an operator
+/// who hits this and is not told exactly what to remove has no way forward at
+/// all.
+pub const CLUSTER_ENABLE_CERT_ALREADY_EXISTS: &str =
+    "cluster: TLS material already exists beside the master config, and minting over it would \
+     invalidate the pin of every secondary that has already joined. There is no `--force`: if \
+     replacing the certificate is what you mean to do, remove these files yourself first, then \
+     re-run — {paths}. Nothing has been written.";
+
+/// Substitute `{paths}` into [`CLUSTER_ENABLE_CERT_ALREADY_EXISTS`]. Public so
+/// the frozen-strings test exercises const and helper together — the const
+/// alone would stay green while the substitution dropped a path.
+pub fn format_cluster_enable_cert_already_exists(paths: &[std::path::PathBuf]) -> String {
+    let joined = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    CLUSTER_ENABLE_CERT_ALREADY_EXISTS.replace("{paths}", &joined)
+}
+
+/// R7 — `--san` passed while the config already carries operator TLS
+/// material. Frozen.
+///
+/// Its mirror is deliberately NOT a refusal: an existing `tls_cert` and no
+/// `--san` means "use what I already have", which is a supported way to run a
+/// primary.
+pub const CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT: &str =
+    "cluster: `--san` was passed, but this node already carries its own `api.tls_cert` — a \
+     minted certificate would be written and never used. Drop `--san` to enable clustering \
+     with the certificate you already have, or clear `api.tls_cert` and `api.tls_key` first. \
+     Nothing has been written.";
+
+/// Validate a cluster `peer_cert` path.
 ///
 /// Path-shaped validation only — emptiness and absoluteness. Readability and
 /// PEM well-formedness are deliberately **not** checked here: both are
@@ -223,7 +311,7 @@ pub fn validate_peer_cert_pem(pem: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a cluster `peer` URL (`poll-02` / `schema-validator-12`).
+/// Validate a cluster `peer` URL.
 ///
 /// The secondary sends the plaintext cluster bearer token to this URL on every
 /// poll, so a plaintext `http://` peer leaks the credential in cleartext and

@@ -1,7 +1,6 @@
 //! [`Blocklist`] — external domain / rule list subscription.
 //!
 //! Each blocklist has a stable [`Id`] that profiles reference by name.
-//! Per design doc §8.1.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +8,7 @@ use super::id::Id;
 use super::profile::Profile;
 
 /// Declared wire format of a subscribed list. `Adguard`/`Hosts` **force** the
-/// matching parser (rev-2606 §06 parser-02); `Domains` — the default — defers
+/// matching parser; `Domains` — the default — defers
 /// to content auto-detection (`src/lists/detector.rs`), which itself falls
 /// back to domain-per-line. So an operator can override a misdetected list by
 /// declaring its format, while rows that never set one keep auto-detecting.
@@ -28,15 +27,14 @@ pub enum BlocklistFormat {
 }
 
 /// The direction **every** profile inherits for this list unless it says
-/// otherwise — P1 of `_docs/features/profile_list_policy.md` §2.1.
+/// otherwise.
 ///
 /// The default is [`BlocklistBase::Deny`] — the canonical block-direction
-/// list. The S50 engine added a new evaluation step that honours
-/// [`BlocklistBase::Allow`] matches; admin `$important` deny stays
-/// sovereign (W1.2 from `_docs/features/lists_categories_v1.md`), so an
-/// allow-direction list cannot pierce an admin deny. The schema is
+/// list. The engine honours [`BlocklistBase::Allow`] matches in a
+/// dedicated evaluation step; admin `$important` deny stays sovereign,
+/// so an allow-direction list cannot pierce an admin deny. The schema is
 /// permissive about the combination here; the validator pass enforces
-/// the trust/base compatibility rule (W2.1).
+/// the trust/base compatibility rule.
 ///
 /// **Why "base" and not "the default profile's direction".**
 /// `[server].default_profile` is *optional* — with it unset, unresolved
@@ -45,22 +43,21 @@ pub enum BlocklistFormat {
 /// profile would make it mandatory, which is a resolver semantics change
 /// this workstream does not own.
 ///
-/// **Renamed from `BlocklistKind` / wire `kind` in plp-s3b**, together
+/// **Renamed from `BlocklistKind` / wire `kind`**, together
 /// with the [`SCHEMA_VERSION_V1`](super::SCHEMA_VERSION_V1) bump to `3`.
-/// No serde alias is provided, deliberately: a v2 config accepted under
+/// No serde alias is provided, deliberately: a config accepted under
 /// an alias would load with **no** `profiles.<id>.lists` overrides, so
 /// every list would start applying to every profile — a silent verdict
 /// change on exactly the configs the migration exists to convert. The
 /// loader refuses a `kind` key by name instead
 /// (`config/loader.rs`, `BLOCKLIST_KIND_RENAMED_TO_BASE`).
 ///
-/// Its predecessor carried the same lesson one rename earlier: Sprint A
-/// of `lists_categories_v2` (D15, Q3) renamed the variant `Block` to
-/// `Deny` and wire `kind = "block"` to `kind = "deny"`, and the TUI's
-/// hand-rolled copy of the token mapping was missed — every save was
-/// then refused at load with `unknown variant`
-/// (`s-tui-lists-edit-save-rejected`). That is why [`Self::wire_str`]
-/// exists and why it is walked exhaustively by a test.
+/// This has bitten before: an earlier rename (`Block` → `Deny`, wire
+/// `kind = "block"` → `kind = "deny"`) missed the TUI's hand-rolled copy
+/// of the token mapping, so every save was then refused at load with
+/// `unknown variant` and the Lists modal could not write at all. That is
+/// why [`Self::wire_str`] exists and why it is walked exhaustively by a
+/// test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BlocklistBase {
@@ -76,12 +73,11 @@ pub enum BlocklistBase {
     /// **neither** allow nor deny domains to any profile that does not
     /// override it.
     ///
-    /// **P6 of `profile_list_policy.md` §2.1 — legitimate, never
-    /// silent.** This is the exact shape of the 2026-05-07 incident:
-    /// eight lists added, ~40 minutes of zero-blocking, no error and no
-    /// warning, because an untagged list matched no device. The state
-    /// stays because the operator asked for it; what is forbidden is the
-    /// silence. The validator therefore emits
+    /// **Legitimate, never silent.** An earlier incident hit this exact
+    /// shape: eight lists added, ~40 minutes of zero-blocking, no error
+    /// and no warning, because an untagged list matched no device. The
+    /// state stays because the operator asked for it; what is forbidden
+    /// is the silence. The validator therefore emits
     /// [`BASE_IGNORE_LIST_IS_INERT`](super::validator::BASE_IGNORE_LIST_IS_INERT)
     /// at **every** load, naming the list.
     ///
@@ -128,12 +124,6 @@ pub enum BlocklistBase {
 /// observes the crate boundary only — which is enough here, since
 /// `ListPolicy` is re-exported from `config::schema` and a `Default`
 /// impl would be visible at exactly that boundary.
-///
-/// Per `_docs/features/profile_list_policy.md` §4 the two types converge in
-/// S3, when `BlocklistKind` is renamed to `BlocklistBase` and gains
-/// `Ignore`. They are deliberately kept apart in S2: that rename changes a
-/// wire format and costs a `schema_version` bump, and this sprint is
-/// additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListPolicy {
@@ -174,11 +164,10 @@ impl ListPolicy {
 ///                          = list.base                otherwise
 /// ```
 ///
-/// **One function, N callers, never a second copy.** That is P5 of
-/// `_docs/features/profile_list_policy.md` §2.1, and the reason is D11 of
-/// `tag_model_consolidation`: `effective_tags` was computed in two places
-/// that answered differently, the validator saw a superset, and the "device
-/// not filtered" WARN went silent on devices the resolver really did leave
+/// **One function, N callers, never a second copy.** A related field
+/// (`effective_tags`) was once computed in two places that answered
+/// differently: the validator saw a superset, and the "device not
+/// filtered" WARN went silent on devices the resolver really did leave
 /// uncovered — a **false negative on a security warning**. Every caller here
 /// asks the same question: the publish-time projection
 /// (`lists::source_key::SourceBitMap::project_policy`), the validator's
@@ -201,23 +190,22 @@ pub fn effective_direction(profile: &Profile, list: &Blocklist) -> ListPolicy {
 
 /// Provenance / integrity guarantee on the source of a blocklist.
 ///
-/// Per §2 W2.1 the default is [`BlocklistTrust::RemoteUnsigned`] so the
-/// existing HTTPS lists at `lists.purge.cc` keep their current trust
-/// model. [`BlocklistTrust::Local`] is a file authored by the operator
-/// on disk, and is the only trust level that pairs with
+/// The default is [`BlocklistTrust::RemoteUnsigned`] so the existing
+/// HTTPS lists at `lists.purge.cc` keep their current trust model.
+/// [`BlocklistTrust::Local`] is a file authored by the operator on
+/// disk, and is the only trust level that pairs with
 /// [`BlocklistBase::Allow`] with nothing further to declare — a remote
 /// unsigned allow-list is the canonical bypass vector, so it needs
 /// [`Blocklist::accept_unsigned_allow`]. [`BlocklistTrust::Signed`] is
-/// parked for a future signed-feed sprint (S51+); the validator refuses
-/// it for now with a frozen string, consent or no consent.
+/// parked for a future signed-feed release; the validator refuses it
+/// for now with a frozen string, consent or no consent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BlocklistTrust {
     /// File on disk authored / vetted by the operator.
     Local,
-    /// Future signed-feed support — parked S51+. Validator currently
-    /// rejects this variant with `TRUST_SIGNED_NOT_YET_SUPPORTED`
-    /// (frozen string lands in S50).
+    /// Future signed-feed support. Validator currently rejects this
+    /// variant with `TRUST_SIGNED_NOT_YET_SUPPORTED`.
     Signed,
     /// Default — fetched over HTTPS with no integrity guarantee beyond
     /// TLS. Unremarkable for `base = deny` (the existing model); for
@@ -235,12 +223,10 @@ pub enum BlocklistTrust {
 /// through a `Serializer`. Call sites that assemble a config row by hand —
 /// the TUI's Lists modal, the CLI's `blocklist set-kind` — used to
 /// re-declare the mapping in a local `match`, which is a second source of
-/// truth for a value that has already been renamed once (Sprint A of
-/// `lists_categories_v2`: `Block` → `Deny`, wire `"block"` → `"deny"`, no
-/// alias by D15). The TUI's copy was missed by that rename and kept
-/// writing `kind = "block"`, so every save was refused at load with
-/// `unknown variant` and the Lists modal could not write at all
-/// (`s-tui-lists-edit-save-rejected`).
+/// truth for a value that has already been renamed once (`Block` → `Deny`,
+/// wire `"block"` → `"deny"`, no alias). The TUI's copy was missed by that
+/// rename and kept writing `kind = "block"`, so every save was refused at
+/// load with `unknown variant` and the Lists modal could not write at all.
 ///
 /// `wire_str` moves the token back onto the type. The unit test
 /// `wire_str_round_trips_through_deserialize` walks every variant and
@@ -251,14 +237,12 @@ impl BlocklistBase {
     /// The [`ListPolicy`] a profile inherits when it does **not** override
     /// this list.
     ///
-    /// **The whole point is that there is exactly one of these.** P5 of
-    /// `_docs/features/profile_list_policy.md` §2.1 — one function, N
-    /// callers, never a second copy — and the reason is D11 of
-    /// `tag_model_consolidation`: `effective_tags` was computed in two
-    /// places that answered differently, so the validator saw a superset
-    /// and the "device not filtered" WARN went silent on devices the
-    /// resolver really did leave uncovered. A false negative on a security
-    /// warning.
+    /// **The whole point is that there is exactly one of these** — one
+    /// function, N callers, never a second copy. A related field
+    /// (`effective_tags`) was once computed in two places that answered
+    /// differently, so the validator saw a superset and the "device not
+    /// filtered" WARN went silent on devices the resolver really did
+    /// leave uncovered. A false negative on a security warning.
     ///
     /// Two callers exist today and both are the inheritance rule:
     /// [`effective_direction`]'s fallback arm, and the base-mask loop in
@@ -314,14 +298,18 @@ fn default_update_interval_hours() -> u32 {
 /// Per-`[[blocklists]]` entry cap. Must stay in step with
 /// [`crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES`] and
 /// `settings::default_max_list_entries` — see the former for the measured
-/// rationale behind 10M (largest real list 8.39M). The merged-map doubling
-/// cliff at 14,680,064 that once formed the other half of that rationale was
-/// removed by `mem-t6`; 10M stands on the list-size ground alone.
+/// rationale behind 20M (largest real list 9.03M). Sized against list
+/// size alone, with no merged-map doubling-cliff constraint entangled.
 ///
-/// Raised from 5M on 2026-07-28: 5M sat *below* four of the eight live
-/// sources, so the daemon silently dropped 19% of the corpus.
+/// This value is validated and stored on every `[[blocklists]]` entry,
+/// but not enforced — only the global `[lists] max_entries` reaches the
+/// parser.
+///
+/// A cap sized too low silently drops list content: a 5M cap once sat
+/// *below* four of the eight live sources, so the daemon silently
+/// dropped 19% of the corpus.
 fn default_max_entries() -> u64 {
-    10_000_000
+    20_000_000
 }
 
 fn default_enabled() -> bool {
@@ -358,22 +346,22 @@ pub struct Blocklist {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Optional key in `secrets.toml` that holds the Authorization bearer
-    /// token for authenticated private lists. Resolved at fetch time
-    /// (S32), not at schema load.
+    /// token for authenticated private lists. Resolved at fetch time,
+    /// not at schema load.
     #[serde(default)]
     pub auth_token_ref: Option<String>,
-    /// W1.1 — the direction **every** profile inherits for this list
+    /// The direction **every** profile inherits for this list
     /// unless `profiles.<id>.lists` overrides it. Defaults to
     /// [`BlocklistBase::Deny`]. The engine honours `Allow`-direction
-    /// matches in a dedicated evaluation step (S50); `Ignore` makes the
-    /// list inert everywhere and is WARNed about at every load (P6).
+    /// matches in a dedicated evaluation step; `Ignore` makes the
+    /// list inert everywhere and is WARNed about at every load.
     ///
-    /// Wire name `base` since plp-s3b — `kind` in schema_version 2 and
-    /// earlier. **No serde alias**: see [`BlocklistBase`] for why an
-    /// alias would be a silent verdict change rather than a kindness.
+    /// Wire name `base` — `kind` in schema_version 2 and earlier.
+    /// **No serde alias**: see [`BlocklistBase`] for why an alias would
+    /// be a silent verdict change rather than a kindness.
     #[serde(default)]
     pub base: BlocklistBase,
-    /// W2.1 — provenance / integrity. Defaults to
+    /// Provenance / integrity. Defaults to
     /// [`BlocklistTrust::RemoteUnsigned`] for the HTTPS list model.
     /// Pairing `base = Allow` with a non-`Local` trust requires
     /// [`Blocklist::accept_unsigned_allow`]; without it the validator
@@ -399,9 +387,9 @@ pub struct Blocklist {
     /// keeps emitting a WARN at every load so it cannot be forgotten
     /// once set.
     ///
-    /// **What it does not do.** The allow direction stays *soft*
-    /// (W1.2): it does not pierce `block_all`, and it never beats an
-    /// admin `$important` deny rule. The operator's own config remains
+    /// **What it does not do.** The allow direction stays *soft*: it
+    /// does not pierce `block_all`, and it never beats an admin
+    /// `$important` deny rule. The operator's own config remains
     /// sovereign over any list.
     ///
     /// Ignored unless `base = allow` and `trust` is not `local` — a
@@ -411,13 +399,13 @@ pub struct Blocklist {
     /// would rather own the content than subscribe to it.
     #[serde(default)]
     pub accept_unsigned_allow: bool,
-    /// Sprint B of `lists_categories_v2` (T5, D8): how many
-    /// consecutive refresh failures the manager tolerates before the
-    /// list flips to [`crate::config::list_state::ListStatus::Failed`].
-    /// Default 5. With the default 12h `update_interval_hours`, this
-    /// is ~2.5 days before the list is declared Failed.
+    /// How many consecutive refresh failures the manager tolerates
+    /// before the list flips to
+    /// [`crate::config::list_state::ListStatus::Failed`]. Default 5.
+    /// With the default 12h `update_interval_hours`, this is ~2.5 days
+    /// before the list is declared Failed.
     ///
-    /// **D9 stale-cache fallback.** A list that has succeeded at
+    /// **Stale-cache fallback.** A list that has succeeded at
     /// least once keeps its cache after flipping to Failed; the
     /// resolver continues to apply the stale bytes (badge red but
     /// filtering active). A list that never succeeded ends up with
@@ -437,8 +425,9 @@ fn default_max_consecutive_failures() -> u32 {
 mod tests {
     use super::*;
 
-    /// The fence for `s-tui-lists-edit-save-rejected`: every `wire_str`
-    /// token must deserialise back to the variant that produced it.
+    /// Every `wire_str` token must deserialise back to the variant that
+    /// produced it — the guard against a hand-rolled TUI/CLI token
+    /// mapping drifting from the serde one (see [`BlocklistBase`]).
     ///
     /// Both directions are checked deliberately. Asserting only that the
     /// token *parses* would pass if two variants collapsed onto one token;
@@ -532,13 +521,11 @@ url = "https://lists.purge.cc/privacy/ads.txt"
         assert_eq!(b.id.as_str(), "privacy-ads");
         assert_eq!(b.format, BlocklistFormat::Domains);
         assert_eq!(b.update_interval_hours, 12);
-        // Raised 5M → 10M on 2026-07-28: 5M sat below four of the eight
-        // live sources. Must track `default_max_entries` — if you are here
-        // because this failed, size the new value against the largest real
-        // list plus headroom. The 14,680,064 doubling cliff this comment
-        // used to invoke was removed by `mem-t6` (exact-size sorted shards);
-        // do not reinstate it as a constraint.
-        assert_eq!(b.max_entries, 10_000_000);
+        // Must track `default_max_entries` — if you are here because
+        // this failed, size the new value against the largest real
+        // list plus headroom. A cap sized too low silently drops list
+        // content (see `default_max_entries` doc).
+        assert_eq!(b.max_entries, 20_000_000);
         assert!(b.enabled);
         assert!(b.auth_token_ref.is_none());
     }
@@ -610,13 +597,12 @@ url = "https://example.com/x.txt"
 
     #[test]
     fn legacy_refresh_interval_hours_aliases_to_update_interval_hours() {
-        // S42 T4: operator configs with the pre-rename key still
-        // deserialise into the canonical `update_interval_hours`
-        // field via `#[serde(alias)]`. The loader emits the
-        // deprecation WARN separately (see
-        // `src/config/loader/tests.rs`); this test pins the
-        // struct-level alias so raw `toml::from_str` paths also
-        // honour retro-compat.
+        // Operator configs with the pre-rename key still deserialise
+        // into the canonical `update_interval_hours` field via
+        // `#[serde(alias)]`. The loader emits the deprecation WARN
+        // separately (see `src/config/loader/tests.rs`); this test
+        // pins the struct-level alias so raw `toml::from_str` paths
+        // also honour retro-compat.
         let toml_src = r#"
 id = "legacy-fixture"
 display_name = "Legacy Alias"
@@ -648,10 +634,10 @@ refresh_interval_hours = 6
         assert_eq!(back, b);
     }
 
-    /// Per CONTRACT §1 the new field carries **no**
+    /// `accept_unsigned_allow` carries **no**
     /// `skip_serializing_if` — the struct has none and the symmetry is
-    /// deliberate. So every serialised `Blocklist` now grows one line,
-    /// including lists that never opted in. Pinned because any writer
+    /// deliberate. So every serialised `Blocklist` grows one line for
+    /// it, including lists that never opted in. Pinned because any writer
     /// that round-trips a config through `toml::to_string` (backup,
     /// cluster policy, `import-local`) emits it from now on, and a
     /// later "tidy-up" adding `skip_serializing_if` would silently
@@ -673,11 +659,11 @@ url = "https://lists.purge.cc/privacy/ads.txt"
         );
     }
 
-    // ── S49 T1: kind / trust / category additions (lc2 v2 update) ──
+    // ── kind / trust / category fields ──
 
-    /// A v2 blocklist with no `kind` / `trust` / `tags` fields uses the
-    /// documented defaults. (Pre-v2 the third field was `category`;
-    /// renamed in Sprint A of lists_categories_v2 — see D1 / Q2.)
+    /// A blocklist with no `kind` / `trust` / `tags` fields uses the
+    /// documented defaults. (The third field was previously named
+    /// `category`.)
     #[test]
     fn s49_minimal_blocklist_uses_documented_defaults() {
         let toml_src = r#"
@@ -690,17 +676,15 @@ url = "https://lists.purge.cc/privacy/ads.txt"
         assert_eq!(b.trust, BlocklistTrust::RemoteUnsigned);
     }
 
-    /// NOTE ON THE URL: this fixture used to read
-    /// `file:///var/lib/purge-warden/lists/trusted.txt`, which made it
-    /// look like `file://` is a supported source scheme. It is not —
-    /// `validator.rs:1219` rejects anything that is not `http(s)://`, so
-    /// that config would parse here and then fail to load. This test is
-    /// about `kind` / `trust` deserialising, and its URL should not imply
-    /// a capability the validator refuses.
+    /// NOTE ON THE URL: `file://` is not a supported source scheme —
+    /// `config::validator` rejects anything that is not `http(s)://`, so
+    /// a URL using it would parse here and then fail to load. This test
+    /// is about `kind` / `trust` deserialising, and its URL should not
+    /// imply a capability the validator refuses.
     ///
     /// An operator-authored local list uses the `imported.local` bridge
     /// (`warden blocklist import-local`), which resolves to
-    /// `<config_dir>/lists/<id>.<ext>` and carries the W2.1 trust check.
+    /// `<config_dir>/lists/<id>.<ext>` and carries the trust check.
     /// Widening the validator to real `file://` URLs would route around
     /// that check, so it is deliberately not done here.
     /// `s49_file_url_is_rejected_by_the_validator` pins the refusal.
@@ -739,10 +723,9 @@ trust = "remote-unsigned"
         );
     }
 
-    /// D15 abolishes v1 backwards-compat. `category = "..."` is no
-    /// longer a recognised field and is refused via
-    /// `#[serde(deny_unknown_fields)]`. migrate.rs (T5) handles the
-    /// rename for the live CT config.
+    /// `category = "..."` is no longer a recognised field and is
+    /// refused via `#[serde(deny_unknown_fields)]`. `migrate.rs`
+    /// handles the rename for existing on-disk configs.
     #[test]
     fn lc2_legacy_category_field_rejected() {
         let toml_src = r#"
@@ -789,9 +772,8 @@ trust = "vendor-signed"
         assert_eq!(BlocklistTrust::default(), BlocklistTrust::RemoteUnsigned);
     }
 
-    /// Sprint A of lists_categories_v2 (Q3): wire format is `kind =
-    /// "deny"` (not `"block"`). Pin the kebab-case spelling to catch
-    /// silent rewrites.
+    /// Wire format is `base = "deny"` (not `"block"`). Pin the
+    /// spelling to catch silent rewrites.
     #[test]
     fn lc2_kind_deny_wire_format_pinned() {
         let b: Blocklist = toml::from_str(
@@ -812,7 +794,7 @@ base = "deny"
         );
     }
 
-    // ── W2.1 gate fall — per-list consent for remote allow-lists ──
+    // ── per-list consent for remote allow-lists ──
 
     /// The operator's explicit acceptance of the remote-allow-list risk
     /// deserialises from the wire under its own name. Until the field
@@ -848,7 +830,7 @@ url = "https://lists.purge.cc/privacy/ads.txt"
         );
     }
 
-    /// D15: legacy `kind = "block"` is no longer accepted.
+    /// Legacy `base = "block"` is no longer accepted.
     #[test]
     fn lc2_legacy_kind_block_rejected() {
         let err = toml::from_str::<Blocklist>(

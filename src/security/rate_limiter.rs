@@ -17,7 +17,7 @@ use arc_swap::ArcSwap;
 use super::bounded_map::BoundedMap;
 use crate::config::settings::RateLimitConfig;
 
-/// Hard cap on the number of tracked client IPs (P0-4).
+/// Hard cap on the number of tracked client IPs.
 ///
 /// Prevents memory DoS from a slow-rate flood of unique source IPs. When
 /// the cap is reached, new inserts trigger an approximate-LRU eviction of
@@ -107,7 +107,7 @@ impl Bucket {
 /// Per-client rate limiter. Lock-free on the hot path.
 ///
 /// Backed by a [`BoundedMap`] with a soft cap of [`MAX_TRACKED_CLIENTS`] —
-/// prevents memory DoS from unique-source floods (P0-4). When the cap is
+/// prevents memory DoS from unique-source floods. When the cap is
 /// reached, new inserts evict the bucket with the oldest last-refill
 /// timestamp via sample-8 approximate LRU.
 pub struct RateLimiter {
@@ -161,11 +161,11 @@ impl RateLimiter {
 
     /// Check if a query from this IP is allowed. Returns true if under the limit.
     ///
-    /// L-1 (rev-2026-04-ratelimit-toctou): atomic get-or-insert via
-    /// `BoundedMap::entry_or_insert_with` closes the prior get-then-insert
-    /// race. Two concurrent first queries from the same fresh IP now share
-    /// the same bucket — both call `try_acquire` and the budget remains
-    /// `burst`, not `2 * burst`.
+    /// Atomic get-or-insert via `BoundedMap::entry_or_insert_with` closes
+    /// a get-then-insert race a naive check-then-insert would have. Two
+    /// concurrent first queries from the same fresh IP share the same
+    /// bucket — both call `try_acquire` and the budget stays `burst`,
+    /// not `2 * burst`.
     ///
     /// **Exactly one `params.load()` per call.** A second load could pair
     /// a pre-reload qps with a post-reload burst (or vice versa),
@@ -193,7 +193,7 @@ impl RateLimiter {
     }
 
     /// Current number of tracked client IPs. Exposed so the stats engine
-    /// (and the upcoming /metrics endpoint, P1-13) can publish it.
+    /// can publish it.
     pub fn entry_count(&self) -> usize {
         self.buckets.len()
     }
@@ -353,15 +353,14 @@ mod tests {
 
     #[test]
     fn concurrent_first_queries_share_one_burst_budget() {
-        // L-1 (rev-2026-04-ratelimit-toctou) regression pin: two or more
-        // concurrent first queries from the same fresh IP previously each
-        // passed the get-None check and each inserted a fresh bucket — the
-        // last writer won, but every racing query had already returned true,
-        // giving an effective initial budget of (threads × burst). The fix
-        // replaces get-then-insert with `BoundedMap::entry_or_insert_with`,
-        // which is atomic at the shard level. Pin the new contract: with
-        // qps=0 (no refill) and N threads racing on the same fresh IP,
-        // exactly `burst` succeed.
+        // Regression pin: a naive get-then-insert would let two or more
+        // concurrent first queries from the same fresh IP each pass the
+        // get-None check and each insert a fresh bucket — the last writer
+        // wins, but every racing query would have already returned true,
+        // giving an effective initial budget of (threads × burst).
+        // `BoundedMap::entry_or_insert_with` is atomic at the shard level,
+        // which closes this. Pin the contract: with qps=0 (no refill) and
+        // N threads racing on the same fresh IP, exactly `burst` succeed.
         use std::sync::{Arc, Barrier};
         use std::thread;
 

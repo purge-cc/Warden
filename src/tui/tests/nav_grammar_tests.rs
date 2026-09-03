@@ -119,7 +119,7 @@ async fn devices_form_moves_focus_on_up_down() {
 /// had no `Ctrl+s`/`Ctrl+S` guard at all — `KeyCode::Char(c)` caught
 /// the chord and typed a literal `s` into whichever field held
 /// focus. Measured on the CT via pty-smoke: with the Name field
-/// focused, `Ctrl+S` turned `alex-laptopX` into `alex-laptopXs`.
+/// focused, `Ctrl+S` turned `edo-laptopX` into `edo-laptopXs`.
 ///
 /// This drives the real dispatcher with a genuine `Ctrl+s`/`Ctrl+S`
 /// `KeyEvent` (not `handle_form_picker_key` directly, which would
@@ -139,7 +139,7 @@ async fn devices_form_ctrl_s_saves_instead_of_typing_into_the_focused_field() {
     ] {
         let mut form = DeviceFormState::new_add();
         form.focused = DeviceFormFocus::Field(DeviceFormField::Name);
-        form.name = "alex-laptopX".into();
+        form.name = "edo-laptopX".into();
         let mut app = App::new();
         app.devices.modal = Some(DeviceModal::Form(form));
 
@@ -148,7 +148,7 @@ async fn devices_form_ctrl_s_saves_instead_of_typing_into_the_focused_field() {
         match app.devices.modal.as_ref().expect("stays open on error") {
             DeviceModal::Form(f) => {
                 assert_eq!(
-                    f.name, "alex-laptopX",
+                    f.name, "edo-laptopX",
                     "{ctrl_s:?} must not type into the focused field"
                 );
                 assert!(
@@ -178,7 +178,7 @@ async fn devices_form_ctrl_s_saves_instead_of_typing_into_the_focused_field() {
 async fn g4_space_reaches_the_group_picker_through_the_real_key_router() {
     let mut app = App::new();
     let form = DeviceFormState::new_edit(
-        "alex-laptop".into(),
+        "edo-laptop".into(),
         "192.168.1.42".into(),
         String::new(),
         String::new(),
