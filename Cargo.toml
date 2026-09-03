@@ -1,6 +1,6 @@
 [package]
 name = "purge-warden"
-version = "0.40.0"
+version = "0.40.1"
 edition = "2021"
 # Minimum supported Rust version. cargo enforces this at build time even
 # for a `publish = false` crate, so an outsider on an older toolchain gets a

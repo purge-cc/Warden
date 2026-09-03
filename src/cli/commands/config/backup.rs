@@ -381,40 +381,141 @@ pub struct BackupEntry {
     pub timestamp: time::OffsetDateTime,
     /// Archive size in bytes.
     pub size: u64,
+    /// `Some(reason)` when the archive is on disk but cannot be opened.
+    /// Listed anyway: an archive the caller cannot read is a different
+    /// operator problem from one that is not there, and reporting both as
+    /// absence sends them after the wrong one.
+    pub unreadable: Option<String>,
 }
 
-/// List the backup archives in `dir`, newest first. Recognises only the
-/// `config-<YYYYMMDDThhmmssZ>.tar.gz` names [`create_backup`] writes;
-/// anything else in the directory is ignored. A missing or unreadable
-/// directory yields an empty list — "no backups yet" is not an error.
-pub fn list_backups(dir: &Path) -> Vec<BackupEntry> {
-    let mut entries = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return entries;
+/// A pre-migration rollback copy — the plain master a `warden migrate`
+/// verb sets aside before it rewrites anything, named
+/// `pre-migration-<ts>.toml` (plus a `-N` suffix on a same-second
+/// collision).
+///
+/// Deliberately NOT a [`BackupEntry`]. It is not a `tar` archive, and
+/// every consumer of [`list_backups`] treats what it returns as
+/// restorable: [`latest_archive`] hands the newest entry straight to the
+/// restore path, and [`prune_archives`] deletes from that list by
+/// retention. The rollback copy is the newest thing in the directory in
+/// the minutes after an upgrade — exactly when both would reach for it.
+pub struct MigrationBackup {
+    /// Full path of the `pre-migration-<ts>.toml` copy.
+    pub path: PathBuf,
+    /// Size in bytes.
+    pub size: u64,
+    /// `Some(reason)` when the copy is on disk but cannot be opened.
+    pub unreadable: Option<String>,
+}
+
+/// Everything one backup directory holds, in the two shapes that live
+/// there, plus the reason it could not be read.
+///
+/// The separation that matters is "the directory is not there" (a fresh
+/// install — not an error) from "the directory is there and cannot be
+/// read". Collapsing those into an empty list is what let a rollback copy
+/// that was plainly on disk report as absent.
+pub struct BackupScan {
+    /// `Some` when the directory exists and `read_dir` failed. A missing
+    /// directory leaves this `None` with both lists empty.
+    pub dir_error: Option<std::io::Error>,
+    /// Restorable `config-<ts>.tar.gz` archives, newest first.
+    pub archives: Vec<BackupEntry>,
+    /// Pre-migration rollback copies, newest first.
+    pub migration: Vec<MigrationBackup>,
+}
+
+/// `Some(reason)` when `path` cannot be opened for reading.
+///
+/// A name match says nothing about access. The rollback copy a root
+/// migration writes beside a daemon-owned config matches by name and
+/// fails at `open(2)`, and that is the case the operator needs told
+/// apart from an empty directory.
+fn open_failure(path: &Path) -> Option<String> {
+    std::fs::File::open(path).err().map(|e| e.to_string())
+}
+
+/// True for `pre-migration-<ts>.toml` and for the `-N` variant
+/// `make_unique_path` produces on a same-second collision.
+fn is_migration_backup(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("pre-migration-") else {
+        return false;
+    };
+    let base = rest
+        .rsplit_once('-')
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(rest, |(head, _)| head);
+    base.ends_with(".toml")
+}
+
+/// Read `dir` once and sort what is in it into the two kinds of backup,
+/// annotating each with whether it can actually be opened.
+pub fn scan_backup_dir(dir: &Path) -> BackupScan {
+    let mut scan = BackupScan {
+        dir_error: None,
+        archives: Vec::new(),
+        migration: Vec::new(),
+    };
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return scan,
+        Err(e) => {
+            scan.dir_error = Some(e);
+            return scan;
+        }
     };
     for entry in read_dir.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some(ts_str) = name
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if let Some(ts_str) = name
             .strip_prefix("config-")
             .and_then(|s| s.strip_suffix(".tar.gz"))
-        else {
-            continue;
-        };
-        let Ok(parsed) = time::PrimitiveDateTime::parse(ts_str, &TIMESTAMP_FORMAT) else {
-            continue;
-        };
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        entries.push(BackupEntry {
-            path,
-            timestamp: parsed.assume_utc(),
-            size,
-        });
+        {
+            let Ok(parsed) = time::PrimitiveDateTime::parse(ts_str, &TIMESTAMP_FORMAT) else {
+                continue;
+            };
+            scan.archives.push(BackupEntry {
+                unreadable: open_failure(&path),
+                path,
+                timestamp: parsed.assume_utc(),
+                size,
+            });
+        } else if is_migration_backup(name) {
+            scan.migration.push(MigrationBackup {
+                unreadable: open_failure(&path),
+                path,
+                size,
+            });
+        }
     }
-    entries.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
-    entries
+    scan.archives
+        .sort_by_key(|b| std::cmp::Reverse(b.timestamp));
+    // Sorted by name, not by a parsed timestamp: the migrator's name is
+    // RFC3339 with `:` swapped for `-`, and it may carry a collision
+    // suffix. Lexicographic order over that fixed-width prefix is
+    // chronological to the second, which is all the name records.
+    scan.migration
+        .sort_by(|a, b| b.path.file_name().cmp(&a.path.file_name()));
+    scan
+}
+
+/// List the restorable backup archives in `dir`, newest first.
+///
+/// Recognises only the `config-<YYYYMMDDThhmmssZ>.tar.gz` names
+/// [`create_backup`] writes. That narrowness is load-bearing, not
+/// incidental: [`latest_archive`] unpacks what this returns and
+/// [`prune_archives`] deletes from it. Pre-migration rollback copies are
+/// reported through [`BackupScan::migration`] instead.
+///
+/// A missing directory yields an empty list — "no backups yet" is not an
+/// error. An *unreadable* directory also yields an empty list, because
+/// this signature has no way to say otherwise; callers that must tell the
+/// two apart read [`scan_backup_dir`] directly.
+pub fn list_backups(dir: &Path) -> Vec<BackupEntry> {
+    scan_backup_dir(dir).archives
 }
 
 /// Resolve the backup directory for `config_path` by loading the master
@@ -429,34 +530,146 @@ pub fn resolved_backup_dir(config_path: &Path) -> PathBuf {
 }
 
 /// Resolve the newest archive in `config_path`'s configured backup dir,
-/// for `warden config restore --latest`. Reuses [`list_backups`]
-/// (newest-first), so the operator skips the `--list` + copy-paste
-/// two-step. Errors clearly when the directory holds no recognised
-/// `config-<ts>.tar.gz` archives — the caller surfaces it and performs
-/// no swap.
+/// for `warden config restore --latest`.
+///
+/// "Latest" stays literal: an unreadable newest archive is an error
+/// naming the access failure, never a silent fall-through to an older
+/// one. Each of the three ways this can fail — directory unreadable,
+/// newest archive unreadable, nothing restorable there — says which one
+/// it was, because the operator's next move differs in all three.
 pub fn latest_archive(config_path: &Path) -> anyhow::Result<PathBuf> {
     let dir = resolved_backup_dir(config_path);
-    list_backups(&dir)
-        .into_iter()
-        .next()
-        .map(|entry| entry.path)
-        .ok_or_else(|| anyhow::anyhow!("no backups in {} — nothing to restore", dir.display()))
+    let scan = scan_backup_dir(&dir);
+    if let Some(e) = scan.dir_error {
+        anyhow::bail!("cannot read backup directory {}: {e}", dir.display());
+    }
+    match scan.archives.first() {
+        Some(entry) => match &entry.unreadable {
+            None => Ok(entry.path.clone()),
+            Some(reason) => anyhow::bail!(
+                "newest backup {} cannot be read: {reason} — run as a user that can, \
+                 or pick another with --list",
+                entry.path.display()
+            ),
+        },
+        None if !scan.migration.is_empty() => anyhow::bail!(
+            "no restorable archive in {} — it holds {} pre-migration rollback file(s), \
+             which are plain config files: copy one over the master by hand",
+            dir.display(),
+            scan.migration.len()
+        ),
+        None => anyhow::bail!("no backups in {} — nothing to restore", dir.display()),
+    }
+}
+
+/// Size for the listing, or the reason the file could not be opened.
+fn size_or_reason(size: u64, unreadable: &Option<String>) -> String {
+    match unreadable {
+        Some(reason) => format!("unreadable: {reason}"),
+        None => human_bytes(size),
+    }
+}
+
+/// Append the labelled pre-migration block for `dir`. No-op when there is
+/// nothing to say.
+fn push_migration_block(lines: &mut Vec<String>, dir: &Path, copies: &[MigrationBackup]) {
+    if copies.is_empty() {
+        return;
+    }
+    lines.push(format!(
+        "{} pre-migration rollback file(s) in {}:",
+        copies.len(),
+        dir.display()
+    ));
+    for m in copies {
+        let name = m.path.file_name().unwrap_or_default().to_string_lossy();
+        lines.push(format!(
+            "  {name}  ({})",
+            size_or_reason(m.size, &m.unreadable)
+        ));
+    }
+    lines.push(
+        "  these are plain config files, not archives: restore one by copying it over".to_string(),
+    );
+    lines.push(
+        "  the master config. `warden config restore` unpacks config-<ts>.tar.gz only.".to_string(),
+    );
+}
+
+/// The lines `warden config restore --list` prints for one directory.
+///
+/// Split from the printer so the output is testable without standing up a
+/// loadable master config. Errs — rather than printing an empty list —
+/// when the directory is present and unreadable.
+pub(crate) fn restore_points_lines(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let scan = scan_backup_dir(dir);
+    if let Some(e) = scan.dir_error {
+        anyhow::bail!("cannot read backup directory {}: {e}", dir.display());
+    }
+
+    let mut lines = Vec::new();
+    if scan.archives.is_empty() && scan.migration.is_empty() {
+        lines.push(format!("no backups in {}", dir.display()));
+        return Ok(lines);
+    }
+
+    if scan.archives.is_empty() {
+        lines.push(format!("no restore point in {}", dir.display()));
+    } else {
+        lines.push(format!(
+            "{} restore point(s) in {}:",
+            scan.archives.len(),
+            dir.display()
+        ));
+        for e in &scan.archives {
+            let name = e.path.file_name().unwrap_or_default().to_string_lossy();
+            lines.push(format!(
+                "  {name}  ({})",
+                size_or_reason(e.size, &e.unreadable)
+            ));
+        }
+    }
+
+    push_migration_block(&mut lines, dir, &scan.migration);
+    Ok(lines)
+}
+
+/// Everything `warden config restore --list` prints for `config_path`.
+///
+/// Two directories, not one. The migrator writes its rollback copy to
+/// `<config-parent>/backups` and cannot do otherwise — it runs on a config
+/// the current loader refuses, which is the reason it is running — while
+/// this listing resolves `[backup] dir`. Under a configured backup dir the
+/// two are different places, and listing only the configured one reports a
+/// rollback copy that is plainly on disk as absent: the exact failure this
+/// listing exists to prevent. An unreadable second directory is skipped
+/// silently; it is a fallback location, and the configured one has already
+/// been reported on.
+pub(crate) fn restore_list_lines(config_path: &Path) -> anyhow::Result<Vec<String>> {
+    let dir = resolved_backup_dir(config_path);
+    let mut lines = restore_points_lines(&dir)?;
+
+    let beside_config = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups");
+    if beside_config != dir {
+        push_migration_block(
+            &mut lines,
+            &beside_config,
+            &scan_backup_dir(&beside_config).migration,
+        );
+    }
+    Ok(lines)
 }
 
 /// CLI `warden config restore --list`: print the restore points in the
-/// configured backup dir, newest first (name + size). The TUI restore
-/// picker renders the same [`list_backups`] data with richer formatting.
+/// configured backup dir, newest first (name + size), then any
+/// pre-migration rollback files. The TUI restore picker renders the
+/// [`list_backups`] half with richer formatting.
 pub fn run_list_restore_points(config_path: &Path) -> anyhow::Result<()> {
-    let dir = resolved_backup_dir(config_path);
-    let entries = list_backups(&dir);
-    if entries.is_empty() {
-        println!("no backups in {}", dir.display());
-        return Ok(());
-    }
-    println!("{} restore point(s) in {}:", entries.len(), dir.display());
-    for e in &entries {
-        let name = e.path.file_name().unwrap_or_default().to_string_lossy();
-        println!("  {name}  ({})", human_bytes(e.size));
+    for line in restore_list_lines(config_path)? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1952,5 +2165,237 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // ── pre-migration rollback copies + unreadable-vs-absent ──────
+
+    /// Root ignores file permission bits, so the two tests that make a
+    /// path unreadable can only observe anything as an ordinary user.
+    fn skip_as_root(test: &str) -> bool {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIPPED {test}: root ignores the permission bits it turns on");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn migration_copies_are_scanned_but_never_listed_as_restore_points() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config-20260101T000000Z.tar.gz"), b"old").unwrap();
+        // Newer than the archive, which is the case that matters: right
+        // after an upgrade the rollback copy is the newest thing here.
+        std::fs::write(
+            dir.path().join("pre-migration-2026-08-26T10-30-00Z.toml"),
+            b"schema_version = 2\n",
+        )
+        .unwrap();
+
+        let scan = scan_backup_dir(dir.path());
+        assert_eq!(scan.migration.len(), 1, "the rollback copy is found");
+        assert_eq!(
+            scan.archives.len(),
+            1,
+            "and it is NOT an archive: `latest_archive` unpacks this list and \
+             `prune_archives` deletes from it"
+        );
+        assert!(list_backups(dir.path())
+            .iter()
+            .all(|e| e.path.extension().unwrap() == "gz"));
+    }
+
+    #[test]
+    fn the_same_second_collision_suffix_is_still_a_rollback_copy() {
+        assert!(is_migration_backup(
+            "pre-migration-2026-08-26T10-30-00Z.toml"
+        ));
+        assert!(is_migration_backup(
+            "pre-migration-2026-08-26T10-30-00Z.toml-1"
+        ));
+        assert!(is_migration_backup(
+            "pre-migration-2026-08-26T10-30-00.123456789Z.toml"
+        ));
+        assert!(!is_migration_backup("pre-migration-notes.txt"));
+        assert!(!is_migration_backup("config-20260101T000000Z.tar.gz"));
+        assert!(!is_migration_backup("pre-migration-.toml-x"));
+    }
+
+    #[test]
+    fn restore_list_surfaces_the_pre_migration_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pre-migration-2026-08-26T10-30-00Z.toml"),
+            b"schema_version = 2\n",
+        )
+        .unwrap();
+
+        let lines = restore_points_lines(dir.path()).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("no backups in"),
+            "a directory holding a rollback copy is not empty:\n{joined}"
+        );
+        assert!(
+            joined.contains("pre-migration-2026-08-26T10-30-00Z.toml"),
+            "the rollback copy must be named in the listing:\n{joined}"
+        );
+        assert!(
+            joined.contains("copying it over"),
+            "and the operator must be told it is not a `restore` input:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn restore_list_says_no_backups_only_when_there_is_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            restore_points_lines(dir.path()).unwrap(),
+            vec![format!("no backups in {}", dir.path().display())]
+        );
+        // A directory that is not there is still "no backups yet", not an
+        // error — a fresh install has never made one.
+        let absent = dir.path().join("nope");
+        assert_eq!(
+            restore_points_lines(&absent).unwrap(),
+            vec![format!("no backups in {}", absent.display())]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_backup_dir_is_an_error_not_an_empty_listing() {
+        if skip_as_root("an_unreadable_backup_dir_is_an_error_not_an_empty_listing") {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("backups");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("config-20260101T000000Z.tar.gz"), b"old").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = restore_points_lines(&dir).unwrap_err().to_string();
+
+        // Restore before asserting so a failure still leaves a removable dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.contains("cannot read backup directory"),
+            "an unreadable directory must not report as an empty one: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_archive_is_listed_as_unreadable_not_dropped() {
+        if skip_as_root("an_unreadable_archive_is_listed_as_unreadable_not_dropped") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("config-20260101T000000Z.tar.gz");
+        std::fs::write(&archive, b"old").unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let scan = scan_backup_dir(dir.path());
+        let lines = restore_points_lines(dir.path()).unwrap().join("\n");
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            scan.archives.len(),
+            1,
+            "membership must not change: retention still has to age this out"
+        );
+        assert!(scan.archives[0].unreadable.is_some());
+        assert!(
+            lines.contains("unreadable:"),
+            "the listing must say why, not print a size it never read:\n{lines}"
+        );
+    }
+
+    #[test]
+    fn latest_archive_reports_an_unreadable_newest_rather_than_no_backups() {
+        if skip_as_root("latest_archive_reports_an_unreadable_newest_rather_than_no_backups") {
+            return;
+        }
+        let (_dir, config) = make_single_file_config();
+        let backup_dir = config.parent().unwrap().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = backup_dir.join("config-20260101T000000Z.tar.gz");
+        std::fs::write(&archive, b"old").unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = latest_archive(&config).unwrap_err().to_string();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            err.contains("cannot be read"),
+            "unreadable is not absent: {err}"
+        );
+        assert!(
+            !err.contains("no backups"),
+            "and must not be phrased as absence: {err}"
+        );
+    }
+
+    #[test]
+    fn latest_archive_points_at_the_rollback_copy_when_that_is_all_there_is() {
+        let (_dir, config) = make_single_file_config();
+        let backup_dir = config.parent().unwrap().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        std::fs::write(
+            backup_dir.join("pre-migration-2026-08-26T10-30-00Z.toml"),
+            b"schema_version = 2\n",
+        )
+        .unwrap();
+
+        let err = latest_archive(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("pre-migration rollback file"),
+            "the operator has something to roll back to; say so: {err}"
+        );
+    }
+
+    /// `backup_legacy` writes beside the config it is migrating and cannot
+    /// do otherwise — it runs on a config the loader refuses. A configured
+    /// `[backup] dir` therefore points the listing at a different directory
+    /// entirely, and reading only that one reproduces the original symptom
+    /// on every host that sets the field.
+    #[test]
+    fn a_configured_backup_dir_does_not_hide_the_migrators_rollback_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+                 [backup]\ndir = \"{}\"\n",
+                elsewhere.path().display()
+            ),
+        )
+        .unwrap();
+        // Without this the fixture is vacuous: an unloadable master falls
+        // back to `<config-parent>/backups`, which is the directory the
+        // rollback copy is already in.
+        assert_eq!(
+            resolved_backup_dir(&config),
+            elsewhere.path(),
+            "fixture cannot discriminate: the master did not load"
+        );
+
+        let beside = home.path().join("backups");
+        std::fs::create_dir(&beside).unwrap();
+        std::fs::write(
+            beside.join("pre-migration-2026-08-26T10-30-00Z.toml"),
+            b"schema_version = 2\n",
+        )
+        .unwrap();
+
+        let joined = restore_list_lines(&config).unwrap().join("\n");
+        assert!(
+            joined.contains("pre-migration-2026-08-26T10-30-00Z.toml"),
+            "the rollback copy must be listed wherever the migrator put it:\n{joined}"
+        );
+        assert!(
+            joined.contains(&beside.display().to_string()),
+            "and the listing must name that directory:\n{joined}"
+        );
     }
 }

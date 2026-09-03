@@ -77,6 +77,9 @@ OPTIONS:
 EOF
 }
 
+# Returns 1 for BOTH "the operator declined" and "the read failed". Callers
+# cannot tell those apart, so every caller must establish that /dev/tty is
+# openable before getting here.
 confirm() {
 	local prompt="$1" ans
 	printf '%s [y/N] ' "$prompt"
@@ -143,6 +146,23 @@ main() {
 	printf '\n'
 
 	if [[ $YES != "true" && $DRY_RUN != "true" ]]; then
+		# confirm() reads /dev/tty, which exists as a mode-0666 node even where
+		# the process has no controlling terminal — so `[[ -r /dev/tty ]]`
+		# would answer true and the read would then fail with ENXIO. Attempt
+		# the open instead, and refuse rather than proceed: this removes a
+		# resolver, and consent that could not be given must not be assumed.
+		#
+		# Non-zero, not `exit 0`. An uninstall that removed nothing and
+		# reported success is indistinguishable from one that worked, and a
+		# script driving this would carry on as though the box were clean.
+		if ! (: </dev/tty) 2>/dev/null; then
+			err "no terminal available to confirm the uninstall, and --yes was
+    not given. Nothing has been removed.
+
+    Re-run non-interactively:
+      sudo $0 --yes"
+			exit 1
+		fi
 		confirm "Proceed with uninstall?" || {
 			log "aborted"
 			exit 0

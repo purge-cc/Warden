@@ -2058,13 +2058,90 @@ fn write_profiles(target_dir: &Path, profiles: &BTreeMap<String, Profile>) -> an
 
 // ── backup ────────────────────────────────────────────────────────────
 
+/// Give `path` `want_mode` and the owner of `src_meta`.
+///
+/// `std::fs::copy` carries the source's mode but stamps the copy with the
+/// *calling* process's identity, and there is nothing for a fresh path to
+/// inherit — unlike `hardened_atomic_write`, which preserves uid/gid only
+/// because it writes over an existing target. An upgrade run as root
+/// therefore leaves the rollback copy `root:root` beside a config the
+/// daemon user owns, and the daemon cannot read the one file it could be
+/// rolled back to.
+///
+/// Both calls are skipped when the metadata already matches — the steady
+/// state for an operator migrating their own files — so no ordinary run
+/// issues a `chown` at all.
+fn mirror_ownership(
+    path: &Path,
+    src_meta: &std::fs::Metadata,
+    want_mode: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let current = std::fs::symlink_metadata(path)?;
+    if current.mode() & 0o7777 != want_mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(want_mode))?;
+    }
+    if (current.uid(), current.gid()) != (src_meta.uid(), src_meta.gid()) {
+        std::os::unix::fs::lchown(path, Some(src_meta.uid()), Some(src_meta.gid()))?;
+    }
+    Ok(())
+}
+
+/// [`mirror_ownership`], downgraded to a warning.
+///
+/// A rollback copy with the wrong owner is worth shouting about but is not
+/// worth aborting an upgrade over: the bytes are correct and the operator
+/// running the migration can still read them. stderr, not `tracing` — no
+/// CLI dispatch installs a subscriber, and under the upgrade script stderr
+/// is the operator's terminal.
+fn mirror_ownership_or_warn(path: &Path, src_meta: &std::fs::Metadata, want_mode: u32) {
+    use std::os::unix::fs::MetadataExt;
+    if let Err(e) = mirror_ownership(path, src_meta, want_mode) {
+        eprintln!(
+            "warning: cannot give {} mode {:o} and owner {}:{}: {e} \
+             (the daemon user may not be able to read this rollback copy)",
+            path.display(),
+            want_mode,
+            src_meta.uid(),
+            src_meta.gid()
+        );
+    }
+}
+
 fn backup_legacy(legacy_config: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
     let parent = legacy_config
         .parent()
         .ok_or_else(|| anyhow!("legacy config path has no parent directory"))?;
+    // The reference for everything below: whoever can read the config can
+    // read its rollback copy.
+    let src_meta = std::fs::metadata(legacy_config)
+        .with_context(|| format!("cannot stat {}", legacy_config.display()))?;
+
     let backup_dir = parent.join("backups");
-    std::fs::create_dir_all(&backup_dir)
-        .with_context(|| format!("cannot create {}", backup_dir.display()))?;
+    // Only a directory we create is ours to mode and own; an existing one
+    // carries the operator's choices. 0o750 and not the config's own mode:
+    // a directory without the execute bit cannot be traversed at all.
+    match std::fs::DirBuilder::new().mode(0o750).create(&backup_dir) {
+        Ok(()) => mirror_ownership_or_warn(&backup_dir, &src_meta, 0o750),
+        // An existing *file* on that path would otherwise be swallowed here
+        // and resurface as a confusing copy failure one line down.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !backup_dir.is_dir() {
+                return Err(anyhow!(
+                    "{} exists and is not a directory",
+                    backup_dir.display()
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("cannot create {}", backup_dir.display()))
+            )
+        }
+    }
+
     let ts = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown-time".to_string())
@@ -2080,6 +2157,7 @@ fn backup_legacy(legacy_config: &Path) -> anyhow::Result<PathBuf> {
             path.display()
         )
     })?;
+    mirror_ownership_or_warn(&path, &src_meta, src_meta.mode() & 0o7777);
     Ok(path)
 }
 
@@ -3060,6 +3138,130 @@ servers = ["192.0.2.1:53"]
             std::fs::read_to_string(&target).unwrap(),
             "pre-existing",
             "target must have been overwritten under --force"
+        );
+    }
+
+    // ── rollback-copy ownership + directory mode ──────────────────
+
+    /// A gid this process is allowed to hand to a file it owns, distinct
+    /// from its own effective gid. Root may set any; an ordinary user only
+    /// one of its supplementary groups. `None` ⇒ the caller cannot build a
+    /// fixture that discriminates and must skip.
+    fn foreign_gid_we_may_set() -> Option<u32> {
+        // SAFETY: geteuid/getegid take no arguments and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if euid == 0 {
+            return Some(if egid == 0 { 1 } else { 0 });
+        }
+        // SAFETY: the size query form of getgroups; a null buffer is what
+        // a zero count means.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if n <= 0 {
+            return None;
+        }
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        // SAFETY: `buf` has room for the `n` gids getgroups just reported.
+        let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+        if got < 0 {
+            return None;
+        }
+        buf.truncate(got as usize);
+        buf.into_iter().find(|g| *g != egid)
+    }
+
+    /// The rollback copy must be readable by whoever reads the config it
+    /// was copied from — the daemon user in production. That reduces to
+    /// "the copy carries the source's uid/gid/mode", which is checkable
+    /// without root.
+    ///
+    /// `std::fs::copy` carries the source's *mode* and the calling
+    /// process's *identity*, so only the owner half can be wrong. The
+    /// fixture makes the two disagree by moving the source into a group
+    /// the test user belongs to but does not run under.
+    #[test]
+    fn the_rollback_copy_carries_the_source_files_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tmpdir();
+        let legacy = dir.path().join("config.toml");
+        std::fs::write(&legacy, "# legacy\n").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let Some(gid) = foreign_gid_we_may_set() else {
+            eprintln!(
+                "SKIPPED the_rollback_copy_carries_the_source_files_owner: this user \
+                 has no second group, so a correct and a gutted implementation are \
+                 byte-identical on disk here"
+            );
+            return;
+        };
+        std::os::unix::fs::lchown(&legacy, None, Some(gid)).unwrap();
+
+        let src = std::fs::metadata(&legacy).unwrap();
+        // SAFETY: getegid takes no arguments and cannot fail.
+        assert_ne!(
+            src.gid(),
+            unsafe { libc::getegid() },
+            "fixture cannot discriminate: a fresh file would get this group anyway"
+        );
+
+        let backup = backup_legacy(&legacy).unwrap();
+        let got = std::fs::metadata(&backup).unwrap();
+        assert_eq!(
+            (got.uid(), got.gid()),
+            (src.uid(), src.gid()),
+            "rollback copy must be owned like the config it copied"
+        );
+        assert_eq!(
+            got.mode() & 0o7777,
+            0o640,
+            "rollback copy must not widen the source's mode"
+        );
+    }
+
+    /// The directory half of the same property, and the half that needs no
+    /// uid/gid topology to fail: `create_dir_all` takes the umask default,
+    /// which is world-listable under the usual 022. The filenames alone
+    /// leak nothing, but a `0o700` under a tighter umask locks the daemon
+    /// out of a directory it must traverse.
+    #[test]
+    fn the_backup_dir_is_created_at_0750() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let legacy = dir.path().join("config.toml");
+        std::fs::write(&legacy, "# legacy\n").unwrap();
+        let backup_dir = dir.path().join("backups");
+        assert!(!backup_dir.exists(), "fixture starts without the dir");
+
+        backup_legacy(&legacy).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,
+            0o750,
+            "backup dir must be group-traversable and not world-anything"
+        );
+    }
+
+    /// An existing directory is the operator's, not ours: a re-run must not
+    /// restamp a mode they chose.
+    #[test]
+    fn an_existing_backup_dir_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir();
+        let legacy = dir.path().join("config.toml");
+        std::fs::write(&legacy, "# legacy\n").unwrap();
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        backup_legacy(&legacy).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,
+            0o700,
+            "a directory we did not create is not ours to re-mode"
         );
     }
 }

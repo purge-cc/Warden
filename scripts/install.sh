@@ -244,6 +244,9 @@ EXAMPLES:
 EOF
 }
 
+# Returns 1 for BOTH "the operator declined" and "the read failed". Callers
+# cannot tell those apart, so every caller must establish that /dev/tty is
+# openable before getting here — see the guard in main().
 confirm() {
 	local prompt="$1" ans
 	printf '%s [y/N] ' "$prompt"
@@ -487,6 +490,28 @@ open_dns_in_firewall() {
 	run firewall-cmd --permanent --add-service=dns
 	run firewall-cmd --reload
 	ok "firewalld: opened 53/tcp + 53/udp in the default zone"
+}
+
+# First line of a dig answer that is an ADDRESS rather than dig's prose.
+#
+# Both callers merge stderr into the answer (`2>&1`), so a failed lookup puts
+# ";; connection timed out …" exactly where an address would be — non-empty,
+# and not 0.0.0.0. A caller testing only for emptiness reports a dead
+# resolver as a healthy one.
+#
+# It scans instead of taking line 1 because warnings (";; Truncated, retrying
+# in TCP mode.") and CNAMEs precede the A record. Pinning position would turn
+# a working install into a reported failure, which is the same defect facing
+# the other way.
+first_ipv4() {
+	local line
+	while IFS= read -r line; do
+		if [[ $line =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+			printf '%s' "$line"
+			return 0
+		fi
+	done <<<"$1"
+	return 1
 }
 
 validate_cidr() {
@@ -775,10 +800,22 @@ classify_existing_install() {
 	# script — the bug that made every --dry-run die at Phase 5.4.
 	getent passwd purge-warden >/dev/null 2>&1 && user=true
 
-	if [[ $unit == "true" || $config == "true" || $user == "true" ]]; then
+	# `user` is deliberately NOT in the first condition. A system account on
+	# its own is not an install: `apt-get purge` leaves purge-warden behind
+	# (normal for a sysusers.d account, since files owned by that uid can
+	# outlive the package), so a box that merely tried the .deb once was
+	# classified `full` and refused with a message listing binary, unit and
+	# config as missing — and sent to --upgrade, which creates none of them.
+	#
+	# It also made `half` unreachable in almost every case it was written for:
+	# `warden init` creates the account in Phase 5, so any run dying after
+	# that point set user=true and never reached the branch that repairs it.
+	if [[ $unit == "true" || $config == "true" ]]; then
 		printf 'full'
 	elif [[ $binary == "true" ]]; then
 		printf 'half'
+	elif [[ $user == "true" ]]; then
+		printf 'user-only'
 	else
 		printf 'none'
 	fi
@@ -801,6 +838,14 @@ check_existing_install() {
 
 	case $state in
 	none)
+		return 0
+		;;
+	user-only)
+		# Only the system account exists — a leftover, not an install. Say so
+		# and continue: a fresh install adopts the account it finds.
+		warn "the purge-warden system account exists, but nothing is installed"
+		printf '\n  A previous package or install left the account behind.\n'
+		printf '  Continuing as a FRESH install — the account is reused, not recreated.\n\n'
 		return 0
 		;;
 	half)
@@ -909,7 +954,19 @@ show_plan() {
 	printf '  Config file: %s\n' "$plan_cfg"
 	printf '  LAN CIDR:    %s (→ server.allow_from)\n' "$LAN_CIDR"
 	printf '  Listen on:   %s\n' "$LISTEN"
-	printf '  Upstream:    %s\n' "$UPSTREAM"
+	# An empty field here reads as "none", and the truth is the opposite: with
+	# no --upstream, `warden init` adopts the resolver this machine already
+	# uses. The plan is printed BEFORE the consent prompt, so a blank line let
+	# the operator accept an install without being told where their whole DNS
+	# stream would go. Say what will happen instead of detecting it here --
+	# a second detection implementation in shell is exactly the drift the
+	# comment on the init call warns about.
+	if [[ -n $UPSTREAM ]]; then
+		printf '  Upstream:    %s\n' "$UPSTREAM"
+	else
+		printf '  Upstream:    not specified — warden will adopt this machine'"'"'s\n'
+		printf '               current resolver and print the choice it makes\n'
+	fi
 	printf '  Lists:       %s\n' "$LISTS"
 	printf '  Run user:    purge-warden (system user, created by warden init)\n'
 	printf '\n'
@@ -1777,11 +1834,28 @@ verify() {
 	# log line, which can match a stale entry from a previous run within
 	# the journal time window. We don't care about the answer — only that
 	# something replied (dig returns 9 = "no reply from server" until then).
-	log "waiting for DNS listener to accept queries (up to 30s)"
-	local waited=0 listening=false
-	while ((waited < 30)); do
+	# warden binds AFTER the initial blocklist load, so on a first run the
+	# listener is genuinely absent until the whole corpus has been downloaded
+	# and built. Measured on a datacentre link: 38.6s between "downloading
+	# before the listener binds" and "DNS server listening", and a household
+	# connection is slower. The old 30s ceiling therefore reported failure on
+	# every fresh install it had just performed correctly — and a fresh
+	# install is the only kind `curl … | sh` ever does.
+	#
+	# Bounded by the unit's health, not by patience alone: once the service
+	# stops being active there is nothing left to arrive, so stop waiting
+	# instead of spending the rest of the window on a dead daemon.
+	local ceiling=${PURGE_LISTENER_TIMEOUT:-300}
+	log "waiting for DNS listener to accept queries (up to ${ceiling}s; a first run"
+	log "downloads and builds the blocklists before it binds)"
+	local waited=0 listening=false died=false
+	while ((waited < ceiling)); do
 		if dig @127.0.0.1 +time=1 +tries=1 +norec localhost >/dev/null 2>&1; then
 			listening=true
+			break
+		fi
+		if ! systemctl is-active --quiet purge-warden; then
+			died=true
 			break
 		fi
 		if [[ $IS_TTY == "true" ]]; then
@@ -1793,21 +1867,37 @@ verify() {
 	if [[ $IS_TTY == "true" ]]; then printf '\r\033[K'; fi
 	if [[ $listening == "true" ]]; then
 		ok "DNS listener ready (after ${waited}s)"
+	elif [[ $died == "true" ]]; then
+		warn "purge-warden stopped while starting up — it is not listening.
+    journalctl -u purge-warden -n 50"
 	else
-		warn "DNS listener not ready after 30s — verification may fail"
+		warn "DNS listener not ready after ${ceiling}s. The service is still
+    running, so it is most likely still downloading blocklists on a slow
+    link — watch it finish with:
+      journalctl -u purge-warden -f
+    Raise the wait with PURGE_LISTENER_TIMEOUT=<seconds> if this recurs."
 	fi
 
-	local allow_result
-	allow_result=$(dig @127.0.0.1 google.com +short +time=3 2>&1 | head -1)
-	if [[ -z $allow_result || $allow_result == "0.0.0.0" ]]; then
-		err "google.com did NOT resolve to a real IP (got: '${allow_result:-<empty>}')"
+	# EVERY capture below is protected, and that is the contract of this
+	# function rather than a style choice. dig exits 9 when nothing answers,
+	# `head` does not mask it under pipefail, and a bare assignment carrying
+	# that status meets errexit and kills the installer on the line ABOVE the
+	# diagnostic written for exactly this case — the operator gets status 9
+	# and no explanation, on an install that may be seconds from working. A
+	# CONDITION or an `|| true`, never a bare assignment, as the getent probe
+	# in classify_existing_install also records.
+	local allow_raw="" allow_ip=""
+	allow_raw=$(dig @127.0.0.1 google.com +short +time=3 2>&1) || true
+	allow_ip=$(first_ipv4 "$allow_raw") || true
+	if [[ -z $allow_ip || $allow_ip == "0.0.0.0" ]]; then
+		err "google.com did NOT resolve to a real IP (got: '${allow_raw:-<empty>}')"
 		printf '\n  Upstream resolution is broken. Check:\n'
 		printf '    - Upstream reachability: %sdig @<the address in upstream.servers> example.com%s\n' "$C_D" "$C_R"
 		printf '    - See it with:           %swarden config show%s\n' "$C_D" "$C_R"
 		printf '    - Recent errors:         %sjournalctl -u purge-warden -n 30%s\n\n' "$C_D" "$C_R"
 		exit 5
 	fi
-	ok "google.com → $allow_result (resolved via upstream)"
+	ok "google.com → $allow_ip (resolved via upstream)"
 
 	# rev-2606: the blocked-domain check must POLL, not one-shot. On a
 	# fresh install the first blocklist download (~hundreds of MB for the
@@ -1817,23 +1907,24 @@ verify() {
 	# known-listed domain after the window is a non-filtering install,
 	# which is exactly what this phase exists to catch.
 	log "waiting for first blocklist download + ingest (up to ${BLOCK_VERIFY_TIMEOUT_SECS}s)"
-	local block_result="" block_waited=0 blocked=false
+	local block_raw="" block_ip="" block_waited=0 blocked=false
 	while ((block_waited < BLOCK_VERIFY_TIMEOUT_SECS)); do
-		block_result=$(dig @127.0.0.1 doubleclick.net +short +time=3 2>&1 | head -1)
-		if [[ $block_result == "0.0.0.0" ]]; then
+		block_raw=$(dig @127.0.0.1 doubleclick.net +short +time=3 2>&1) || true
+		block_ip=$(first_ipv4 "$block_raw") || true
+		if [[ $block_ip == "0.0.0.0" ]]; then
 			blocked=true
 			break
 		fi
 		if [[ $IS_TTY == "true" ]]; then
 			printf '\r  %slists downloading…%s %ds (doubleclick.net → %s)' \
-				"$C_D" "$C_R" "$block_waited" "${block_result:-<no answer>}"
+				"$C_D" "$C_R" "$block_waited" "${block_ip:-<no answer>}"
 		fi
 		sleep 5
 		block_waited=$((block_waited + 5))
 	done
 	if [[ $IS_TTY == "true" ]]; then printf '\r\033[K'; fi
 	if [[ $blocked != "true" ]]; then
-		err "doubleclick.net was NOT blocked after ${BLOCK_VERIFY_TIMEOUT_SECS}s (got: '$block_result')"
+		err "doubleclick.net was NOT blocked after ${BLOCK_VERIFY_TIMEOUT_SECS}s (got: '${block_raw:-<no answer>}')"
 		printf '\n  The daemon is up but filtering nothing — this install is NOT protecting you.\n'
 		printf '  Diagnose:\n'
 		printf '    - List download progress: %sjournalctl -u purge-warden -n 50 | grep -i list%s\n' "$C_D" "$C_R"
@@ -2248,7 +2339,16 @@ main() {
 		# can wait on it at exit — otherwise the parent's exit races the
 		# tee subprocess and the last ~20 lines get lost before the FIFO
 		# flushes.
-		exec > >(tee -a "$LOG_FILE") 2>&1
+		#
+		# tee ignores SIGTTIN/SIGTTOU because it shares this script's
+		# process group, and `curl … | sudo sh` can leave that group in the
+		# BACKGROUND of the terminal: the first `read </dev/tty` then makes
+		# the kernel group-stop every member, and sudo resumes only the
+		# command it monitors. A stopped tee never drains the pipe again,
+		# so the install runs to completion with every byte after the first
+		# prompt invisible — on screen AND in this log. tee never reads the
+		# terminal, so ignoring both signals costs it nothing.
+		exec > >(trap '' TTIN TTOU; exec tee -a "$LOG_FILE") 2>&1
 		LOG_TEE_PID=$!
 		log "logging to $LOG_FILE"
 	else
@@ -2261,8 +2361,16 @@ main() {
 
 	# Ask for confirmation unless --yes, --dry-run, or no TTY at all.
 	# /dev/tty lets the prompt work even when stdin is piped (curl | bash).
+	#
+	# The reachability test is an actual OPEN, not `[[ -r /dev/tty ]]`. That
+	# stats the device node, which is mode 0666 even where the process has no
+	# controlling terminal, so it answers true, this branch is skipped, and
+	# `confirm` then fails its read with ENXIO. confirm() cannot distinguish a
+	# failed read from a declined prompt — both are `return 1` — so the install
+	# logs "aborted by user" and exits 0. A piped install on a headless host
+	# would report success and install nothing. Measured, not theorised.
 	if [[ $YES != "true" && $DRY_RUN != "true" ]]; then
-		if [[ ! -t 0 && ! -r /dev/tty ]]; then
+		if [[ ! -t 0 ]] && ! (: </dev/tty) 2>/dev/null; then
 			warn "no TTY detected — proceeding with defaults (use --yes to silence)"
 		elif ! confirm "Accept these terms and proceed with the install?"; then
 			log "aborted by user"
