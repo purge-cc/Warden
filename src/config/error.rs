@@ -28,7 +28,7 @@ pub struct ErrorContext {
     /// underlying error source (e.g. toml crate) did not surface a span.
     pub line: Option<usize>,
     /// The entity `id` (or section name) whose definition triggered the
-    /// error, e.g. `"devices.operator-iphone-01"` or `"profiles.default"`.
+    /// error, e.g. `"devices.dweller-iphone-01"` or `"profiles.default"`.
     pub entity: Option<String>,
     /// Human-readable description of what is wrong. Required.
     pub reason: String,

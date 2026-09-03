@@ -1063,15 +1063,15 @@ fn render_default_config(
          # else is optional.\n\
          #\n\
          # [[devices]]\n\
-         # id           = \"operator-iphone-01\"        # stable key, lowercase-ascii-dashes; never rename\n\
-         # display_name = \"iPhone di Operator\"        # human label shown in TUI / logs\n\
+         # id           = \"dweller-iphone-01\"        # stable key, lowercase-ascii-dashes; never rename\n\
+         # display_name = \"iPhone di Dweller\"        # human label shown in TUI / logs\n\
          # ip           = \"10.10.1.107\"              # optional static IP pin\n\
          # mac          = \"AA:BB:CC:DD:EE:FF\"        # optional primary MAC (uppercase)\n\
          # mac_aliases  = [\"22:33:44:55:66:77\"]      # optional extra MACs (iOS/Android randomisation)\n\
          # profile      = \"default\"                  # optional; wins over group/subnet\n\
          # groups       = [\"famiglia\"]               # optional group memberships (see [[groups]])\n\
          # tags         = [\"mobile\", \"personal\"]     # optional free-form labels (UI filter only)\n\
-         # owner        = \"Operator\"                  # optional; purely descriptive\n\
+         # owner        = \"Dweller\"                  # optional; purely descriptive\n\
          # device       = \"iPhone personale\"         # optional model/type description\n\
          # department   = \"famiglia\"                 # optional zone / department label\n\
          # notes        = \"compleanno gennaio\"       # optional free text\n\
@@ -1442,7 +1442,7 @@ mod tests {
             "0.0.0.0:53",
             &["10.10.1.0/24".to_string()],
             &dir.join("control.sock"),
-            "https://192.0.2.10:8053",
+            "https://10.10.1.94:8053",
         )
     }
 
@@ -1478,7 +1478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = InitLayout::for_config(&dir.path().join("config.toml"));
         let overrides = InitOverrides {
-            cluster_secondary_peer: Some("http://192.0.2.10:8053".to_string()),
+            cluster_secondary_peer: Some("http://10.10.1.94:8053".to_string()),
             ..Default::default()
         };
 
@@ -1486,7 +1486,7 @@ mod tests {
             &layout,
             false,
             "0.0.0.0:53",
-            "http://192.0.2.10:8053",
+            "http://10.10.1.94:8053",
             &overrides,
         )
         .expect_err("a plaintext off-box peer must be refused");
@@ -1522,7 +1522,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let layout = InitLayout::for_config(&dir.path().join("config.toml"));
             let overrides = InitOverrides {
-                cluster_secondary_peer: Some("https://192.0.2.10:8053".to_string()),
+                cluster_secondary_peer: Some("https://10.10.1.94:8053".to_string()),
                 allow_from,
                 ..Default::default()
             };
@@ -1531,7 +1531,7 @@ mod tests {
                 &layout,
                 false,
                 "0.0.0.0:53",
-                "https://192.0.2.10:8053",
+                "https://10.10.1.94:8053",
                 &overrides,
             )
             .expect_err("this ACL must be refused");
@@ -1646,7 +1646,7 @@ mod tests {
         std::fs::write(&tok, "ps_scaffoldsecret\n").unwrap();
         crate::cli::commands::cluster::run_join(
             &master,
-            "https://192.0.2.10:8053",
+            "https://10.10.1.94:8053",
             None,
             Some(&tok),
         )

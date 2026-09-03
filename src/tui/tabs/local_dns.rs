@@ -897,7 +897,11 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let records = vec![rec("example.test", "10.10.1.50")];
         let rows = rows_of(&records, None);
-        let snap = vec![("profile:kids".to_string(), "example.test".to_string(), 99_u64)];
+        let snap = vec![(
+            "profile:kids".to_string(),
+            "example.test".to_string(),
+            99_u64,
+        )];
         let mut state = ratatui::widgets::TableState::default();
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 6);

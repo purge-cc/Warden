@@ -662,7 +662,7 @@ fn list_observed_ips_snapshots_counters() {
     engine.record_query(
         mapped,
         "good.com",
-        Some("casey-ipad"),
+        Some("user2-ipad"),
         Some("kids"),
         RecordType::A,
         false,
@@ -672,7 +672,7 @@ fn list_observed_ips_snapshots_counters() {
     engine.record_query(
         mapped,
         "ads.example",
-        Some("casey-ipad"),
+        Some("user2-ipad"),
         Some("kids"),
         RecordType::A,
         true,
@@ -682,7 +682,7 @@ fn list_observed_ips_snapshots_counters() {
     engine.record_query(
         mapped,
         "good.com",
-        Some("casey-ipad"),
+        Some("user2-ipad"),
         Some("kids"),
         RecordType::A,
         false,
@@ -715,7 +715,7 @@ fn list_observed_ips_snapshots_counters() {
     assert!(unmapped_entry.last_seen > 1_704_067_200);
 
     let mapped_entry = observed.iter().find(|c| c.ip == mapped).unwrap();
-    assert_eq!(mapped_entry.name.as_str(), "casey-ipad");
+    assert_eq!(mapped_entry.name.as_str(), "user2-ipad");
     assert_eq!(mapped_entry.profile.as_str(), "kids");
     assert_eq!(mapped_entry.queries, 3);
     assert_eq!(mapped_entry.blocked, 1);

@@ -71,8 +71,8 @@ pub enum San {
 
 /// Classify one operator-supplied `--san` value.
 ///
-/// Parses as [`IpAddr`] first: `192.0.2.14` becomes [`San::Ip`], never
-/// `San::Dns("192.0.2.14")`. Rejects the empty string and anything carrying a
+/// Parses as [`IpAddr`] first: `100.64.0.24` becomes [`San::Ip`], never
+/// `San::Dns("100.64.0.24")`. Rejects the empty string and anything carrying a
 /// scheme, a port, or a path — the operator passes a bare host, not a URL.
 pub fn classify_san(raw: &str) -> Result<San, String> {
     let s = raw.trim();
@@ -307,8 +307,8 @@ mod tests {
         // arms is the mutation that matters, and a test that only checks for
         // `Ok(_)` stays green through it.
         assert_eq!(
-            classify_san("192.0.2.14").unwrap(),
-            San::Ip("192.0.2.14".parse().unwrap())
+            classify_san("100.64.0.24").unwrap(),
+            San::Ip("100.64.0.24".parse().unwrap())
         );
         assert_eq!(
             classify_san("home-warden").unwrap(),

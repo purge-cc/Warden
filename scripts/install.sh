@@ -502,7 +502,7 @@ validate_cidr() {
 #
 # The list form exists because a dual-homed host is the normal case, not the
 # exotic one — the lab host answers on 10.10.1.5/24 (LAN) and
-# 192.0.2.3/32 (tailnet), and with only the LAN range every query arriving
+# 100.64.0.7/32 (tailnet), and with only the LAN range every query arriving
 # over the VPN is REFUSED. `warden init --allow-from` has always taken a
 # comma-separated list; it was only this flag that could not express one.
 #

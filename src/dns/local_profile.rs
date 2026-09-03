@@ -433,7 +433,12 @@ mod tests {
     fn t2_subdomain_match_apex() {
         // Record `example.test` with match_subdomains=true must match the apex
         // itself via the exact-path fast probe (forward map carries it).
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            true,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         assert!(plr.has_subdomain_records());
         let res = plr.lookup("example.test", RecordType::A).unwrap();
@@ -445,7 +450,12 @@ mod tests {
 
     #[test]
     fn t2_subdomain_match_descendant() {
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            true,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         let res = plr.lookup("app.example.test", RecordType::A).unwrap();
         assert_eq!(res.len(), 1);
@@ -460,9 +470,16 @@ mod tests {
 
     #[test]
     fn t2_subdomain_match_deeper_descendant() {
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            true,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
-        let res = plr.lookup("api.v2.app.example.test", RecordType::A).unwrap();
+        let res = plr
+            .lookup("api.v2.app.example.test", RecordType::A)
+            .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(
             &res[0].name,
@@ -510,7 +527,12 @@ mod tests {
 
     #[test]
     fn t2_subdomain_does_not_match_unrelated_domain() {
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            true,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         assert!(plr.lookup("google.com", RecordType::A).is_none());
         assert!(plr.lookup("evilexample.test", RecordType::A).is_none());
@@ -519,7 +541,12 @@ mod tests {
     #[test]
     fn t2_exact_only_record_does_not_match_descendant() {
         // match_subdomains=false: `example.test` does NOT match `app.example.test`.
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.0.0.1", false)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            false,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         assert!(plr.lookup("example.test", RecordType::A).is_some());
         assert!(plr.lookup("app.example.test", RecordType::A).is_none());
@@ -547,7 +574,12 @@ mod tests {
     fn t2_qtype_mx_bypassed_total() {
         // Non A/AAAA/CNAME qtypes return None even when an A record exists
         // for the domain. The handler then forwards upstream.
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", false)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            false,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         assert!(plr.lookup("example.test", RecordType::MX).is_none());
         assert!(plr.lookup("example.test", RecordType::TXT).is_none());
@@ -559,7 +591,12 @@ mod tests {
 
     #[test]
     fn t2_qtype_aaaa_misses_when_only_a_present() {
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", false)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            false,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         assert!(plr.lookup("example.test", RecordType::AAAA).is_none());
     }
@@ -676,7 +713,12 @@ mod tests {
         // the suffix walk never runs. Behavioural assertion only
         // (non-instrumented): the result is correct AND identical to a
         // pure exact-match-only profile would return.
-        let recs = vec![rec("example.test", LocalDnsRecordType::A, "10.10.1.50", true)];
+        let recs = vec![rec(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.10.1.50",
+            true,
+        )];
         let plr = ProfileLocalRecords::build(&recs, 60);
         let res = plr.lookup("example.test", RecordType::A).unwrap();
         assert_eq!(res.len(), 1);

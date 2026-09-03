@@ -1599,7 +1599,7 @@ servers = ["192.0.2.1:53"]
 default_profile = "default"
 
 [[admin_rules]]
-id = "operator-allow-bank"
+id = "dweller-allow-bank"
 rule = "@@||bank.example^"
 
 [[admin_rules]]
@@ -1614,7 +1614,7 @@ rule = "||nobody-refs-me.example^"
 id = "iphone"
 display_name = "iPhone"
 mac = "aa:bb:cc:dd:ee:ff"
-allow_rules = ["operator-allow-bank"]
+allow_rules = ["dweller-allow-bank"]
 
 [profiles.default]
 display_name = "Default"
@@ -1639,7 +1639,7 @@ admin_rules = ["default-deny-tracker"]
         let rows = build_rule_rows(&app);
         let bank = rows
             .iter()
-            .find(|r| r.id == "operator-allow-bank")
+            .find(|r| r.id == "dweller-allow-bank")
             .expect("bank rule must be in the row vec");
         assert_eq!(bank.action, RuleAction::Allow);
         assert_eq!(bank.domain_label, "bank.example");
@@ -1654,7 +1654,7 @@ admin_rules = ["default-deny-tracker"]
     fn build_rule_rows_resolves_scope_to_device_when_referenced() {
         let app = app_with_three_rules();
         let rows = build_rule_rows(&app);
-        let bank = rows.iter().find(|r| r.id == "operator-allow-bank").unwrap();
+        let bank = rows.iter().find(|r| r.id == "dweller-allow-bank").unwrap();
         match &bank.scope {
             RuleScope::Device(id) => assert_eq!(id, "iphone"),
             other => panic!("expected Device scope, got {other:?}"),

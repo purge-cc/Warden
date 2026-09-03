@@ -15,7 +15,7 @@ fn mk_mapped(name: &str, ip: &str) -> MappedDeviceDto {
         mac: Some("AA:BB:CC:DD:EE:FF".into()),
         mac_aliases: Vec::new(),
         profile: "default".into(),
-        owner: Some("Operator".into()),
+        owner: Some("Dweller".into()),
         device_type: Some("ThinkPad".into()),
         department: Some("home".into()),
         queries: 0,
@@ -207,7 +207,7 @@ fn build_edit_form_pulls_focused_mapped_row_fields() {
     assert_eq!(form.ip, "192.168.1.42");
     assert_eq!(form.mac, "AA:BB:CC:DD:EE:FF");
     assert_eq!(form.profile, "default");
-    assert_eq!(form.owner, "Operator");
+    assert_eq!(form.owner, "Dweller");
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn l3_metadata_fields_are_select_only_once_a_vocabulary_exists() {
     // only where a vocabulary was actually declared. The empty case is
     // the sibling test `l3_empty_vocabulary_leaves_the_field_TYPEABLE`.
     let form = DeviceFormState::new_add().with_label_vocab(
-        vec!["Operator".into()],
+        vec!["Dweller".into()],
         vec!["Laptop".into()],
         vec!["Studio".into()],
     );
@@ -325,7 +325,7 @@ fn l3_metadata_fields_are_select_only_once_a_vocabulary_exists() {
 #[test]
 fn l3_picker_offers_display_names_not_ids() {
     // The constraint that decides this sprint: `Device.owner` is free
-    // text ("Operator") while `Label.id` is an `Id` ("operator"), so the
+    // text ("Dweller") while `Label.id` is an `Id` ("dweller"), so the
     // two sets never intersect. `matches_value` accepts either, and the
     // display name is the one that also reads correctly in the table.
     use crate::config::loader::LoadedConfig;
@@ -333,9 +333,9 @@ fn l3_picker_offers_display_names_not_ids() {
 
     let cfg = ConfigV1 {
         labels: vec![Label {
-            id: Id::new("operator").unwrap(),
+            id: Id::new("dweller").unwrap(),
             kind: LabelKind::Owner,
-            display_name: "Operator".to_string(),
+            display_name: "Dweller".to_string(),
             description: None,
         }],
         ..Default::default()
@@ -351,7 +351,7 @@ fn l3_picker_offers_display_names_not_ids() {
     });
 
     let (owners, types, depts) = device_form_label_vocab(&app);
-    assert_eq!(owners, vec!["Operator".to_string()]);
+    assert_eq!(owners, vec!["Dweller".to_string()]);
     assert!(types.is_empty(), "a kind with no vocabulary stays empty");
     assert!(depts.is_empty());
 }
@@ -399,12 +399,12 @@ fn l3_the_metadata_picker_offers_a_way_to_clear() {
     // emptying the field. Without this the operator can set an owner and
     // never unset it.
     let mut form = DeviceFormState::new_add().with_label_vocab(
-        vec!["Operator".into(), "Member".into()],
+        vec!["Dweller".into(), "Dweller2".into()],
         Vec::new(),
         Vec::new(),
     );
     form.focused = DeviceFormFocus::Field(DeviceFormField::Owner);
-    form.owner = "Operator".into();
+    form.owner = "Dweller".into();
     open_field_picker(&mut form);
     let picker = form.picker.as_ref().expect("vocabulary is non-empty");
     assert_eq!(
@@ -415,7 +415,7 @@ fn l3_the_metadata_picker_offers_a_way_to_clear() {
     assert_eq!(picker.options.len(), 3, "clear + the two declared owners");
     // The cursor must land on the CURRENT value, not on the clear row —
     // otherwise Enter-without-thinking wipes the field.
-    assert_eq!(picker.options[picker.cursor], "Operator");
+    assert_eq!(picker.options[picker.cursor], "Dweller");
 }
 
 #[test]
@@ -431,7 +431,7 @@ fn l3_a_declared_vocabulary_flips_the_field_to_picker_driven() {
     // select-only so the operator picks instead of retyping. Per-kind,
     // not all-or-nothing — declaring owners must not freeze departments.
     let form =
-        DeviceFormState::new_add().with_label_vocab(vec!["Operator".into()], Vec::new(), Vec::new());
+        DeviceFormState::new_add().with_label_vocab(vec!["Dweller".into()], Vec::new(), Vec::new());
     assert!(is_select_only_field(&form, DeviceFormField::Owner));
     assert!(
         !is_select_only_field(&form, DeviceFormField::Department),
@@ -633,7 +633,7 @@ fn g4_promote_form_cannot_offer_a_group_the_wire_will_not_carry() {
 #[test]
 fn g4_edit_patch_carries_the_whole_membership_list() {
     let mut form = edit_form_from(&mk_mapped_with_groups(vec!["phones", "kids"]));
-    form.name = "work-thinkpad".into();
+    form.name = "dwe-thinkpad".into();
     let patch = device_update_patch(&form).expect("form parses");
     assert_eq!(
         patch.groups,
@@ -738,12 +738,12 @@ fn parse_form_happy_path_returns_typed_values() {
     form.ip = "192.168.1.42".into();
     form.profile = "default".into();
     form.mac_aliases = "AA:BB:CC:DD:EE:01,AA:BB:CC:DD:EE:02".into();
-    form.owner = "Operator".into();
+    form.owner = "Dweller".into();
     let p = parse_form(&form).unwrap();
     assert_eq!(p.name, "edo-laptop");
     assert_eq!(p.ip.to_string(), "192.168.1.42");
     assert_eq!(p.mac_aliases.len(), 2);
-    assert_eq!(p.owner.as_deref(), Some("Operator"));
+    assert_eq!(p.owner.as_deref(), Some("Dweller"));
 }
 
 #[test]

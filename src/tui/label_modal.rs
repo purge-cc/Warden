@@ -90,7 +90,7 @@ pub enum Stage {
     /// Subnets use, and here the argument for it is stronger than
     /// anywhere else in the TUI. LB3 states it: *"cancellare un gruppo
     /// cambia il DNS di casa; cancellare un owner non cambia niente."*
-    /// Removing a label is **inert** — the device's `owner = "Operator"`
+    /// Removing a label is **inert** — the device's `owner = "Dweller"`
     /// string survives, it only loses the row that declared it — and
     /// `remove_if_present` refuses outright while any device still
     /// carries the value. A typed-id gate here would price an inert
@@ -251,7 +251,7 @@ impl AddForm {
         let display_trim = self.display_name.trim();
         Ok(ResolvedForm {
             id: id_trim.to_string(),
-            // Same fallback the CLI applies: `warden label add operator
+            // Same fallback the CLI applies: `warden label add dweller
             // --kind owner` with no `--display-name` stores the id. The
             // two surfaces must not produce different rows from the same
             // input.
@@ -440,7 +440,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
                 &form.id,
                 f,
                 ValueKind::Identity,
-                Some("e.g. operator or apple-tv"),
+                Some("e.g. dweller or apple-tv"),
                 width,
             ),
             f,
@@ -563,7 +563,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
 ///
 /// **The `id` hint spells the charset, and that is the one hint here that
 /// earns its place by measurement.** The live values on the operator's
-/// boxes are `Operator` and `Apple TV`, and those are exactly what a person
+/// boxes are `Dweller` and `Apple TV`, and those are exactly what a person
 /// types into a field labelled *id* — neither passes `Id::validate`.
 /// `add_inner` refuses and names the field, so this is not a correctness
 /// gap; it is the difference between a feature that works on first use and
@@ -576,7 +576,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
 fn field_hint(f: FormField) -> &'static str {
     match f {
         FormField::Id => "lowercase, digits and dashes only (immutable on edit)",
-        FormField::DisplayName => "the value your devices carry, e.g. Operator (blank = the id)",
+        FormField::DisplayName => "the value your devices carry, e.g. Dweller (blank = the id)",
         FormField::Description => "free note — nothing reads it, it filters nothing",
         FormField::Submit => "Enter saves the label",
         FormField::Cancel => "discard changes and close (also Esc)",
@@ -796,7 +796,7 @@ mod tests {
         let add = render_overlay_in(&LabelModal::open_add(LabelKind::Owner), 100, 30);
         assert!(add.contains("from the selected pane"), "got:\n{add}");
 
-        let l = label("operator", LabelKind::Owner, "Operator", None);
+        let l = label("dweller", LabelKind::Owner, "Dweller", None);
         let edit = render_overlay_in(&LabelModal::open_edit(&l), 100, 30);
         assert!(
             !edit.contains("from the selected pane"),
@@ -836,7 +836,7 @@ mod tests {
     /// immutable once written and the renderer draws it as a plain row.
     #[test]
     fn edit_never_opens_focused_on_the_immutable_id() {
-        let l = label("operator", LabelKind::Owner, "Operator", None);
+        let l = label("dweller", LabelKind::Owner, "Dweller", None);
         assert_eq!(AddForm::new_add(LabelKind::Owner).focused, FormField::Id);
         assert_eq!(AddForm::new_edit(&l).focused, FormField::DisplayName);
     }
@@ -847,15 +847,15 @@ mod tests {
     #[test]
     fn a_blank_display_name_resolves_to_the_id() {
         let mut form = AddForm::new_add(LabelKind::Owner);
-        form.id = "  operator  ".to_string();
+        form.id = "  dweller  ".to_string();
         let r = form.try_resolve().unwrap();
-        assert_eq!(r.id, "operator", "the id is trimmed");
-        assert_eq!(r.display_name, "operator");
+        assert_eq!(r.id, "dweller", "the id is trimmed");
+        assert_eq!(r.display_name, "dweller");
     }
 
     /// An empty id is the one pre-flight this form owns. The charset gate
     /// is deliberately NOT duplicated here — `add_inner` runs it — so this
-    /// test also documents the boundary: `Operator` resolves fine and is
+    /// test also documents the boundary: `Dweller` resolves fine and is
     /// refused one layer down, by the writer that names the field.
     #[test]
     fn an_empty_id_is_refused_but_the_charset_is_left_to_the_writer() {
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(form.try_resolve().unwrap_err(), "id is required");
 
         let mut capitalised = AddForm::new_add(LabelKind::Owner);
-        capitalised.id = "Operator".to_string();
+        capitalised.id = "Dweller".to_string();
         assert!(
             capitalised.try_resolve().is_ok(),
             "the form does not second-guess `Id::new`; a second copy of \
@@ -872,7 +872,7 @@ mod tests {
     }
 
     /// The `id` hint must spell the constraint, because the values this
-    /// vocabulary exists to adopt (`Operator`, `Apple TV`) are exactly what
+    /// vocabulary exists to adopt (`Dweller`, `Apple TV`) are exactly what
     /// an operator types into a field labelled *id*, and neither passes
     /// `Id::validate`. Without this the feature reads as broken on first
     /// use even though it refuses correctly.
@@ -897,7 +897,7 @@ mod tests {
     /// from the screen instead of arriving afterwards.
     #[test]
     fn the_remove_confirm_says_device_values_survive() {
-        let l = label("operator", LabelKind::Owner, "Operator", None);
+        let l = label("dweller", LabelKind::Owner, "Dweller", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
         assert!(dump.contains("Remove owner"), "got:\n{dump}");
         assert!(dump.contains("untouched"), "got:\n{dump}");
@@ -918,7 +918,7 @@ mod tests {
     /// gate, this test is where the argument is recorded.
     #[test]
     fn the_remove_gate_is_single_keypress() {
-        let l = label("operator", LabelKind::Owner, "Operator", None);
+        let l = label("dweller", LabelKind::Owner, "Dweller", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
         assert!(
             dump.contains("[y] confirm") && dump.contains("[n / Esc] cancel"),

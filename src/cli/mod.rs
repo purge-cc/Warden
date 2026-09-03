@@ -182,7 +182,7 @@ pub enum Commands {
             conflicts_with_all = ["upstream", "lists", "upstream_catalog"]
         )]
         cluster_secondary: bool,
-        /// The primary's API base URL, e.g. `https://192.0.2.10:8053`.
+        /// The primary's API base URL, e.g. `https://10.10.1.94:8053`.
         /// Only meaningful with `--cluster-secondary`.
         #[arg(long, requires = "cluster_secondary")]
         peer: Option<String>,
@@ -928,7 +928,7 @@ pub enum DeviceAction {
         /// Group memberships (comma-separated ids).
         #[arg(long, value_delimiter = ',')]
         groups: Vec<String>,
-        /// Optional human owner ("Operator", "Casey")
+        /// Optional human owner ("Dweller", "User2")
         #[arg(long)]
         owner: Option<String>,
         /// Optional device label ("iPad personale")
@@ -1482,7 +1482,7 @@ pub enum ClusterAction {
     /// the primary is reachable or the token correct — the first sync does.
     /// Undo with `warden cluster leave`.
     Join {
-        /// The primary's API base URL, e.g. https://192.0.2.10:8053
+        /// The primary's API base URL, e.g. https://10.10.1.94:8053
         #[arg(long)]
         peer: String,
         /// Read the cluster bearer token from this file (0600). Preferred —

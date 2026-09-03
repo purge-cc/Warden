@@ -1664,7 +1664,7 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
         mac_aliases: vec![],
         profile: Some(Id::new("default").unwrap()),
         groups: vec![],
-        owner: Some("Operator".into()),
+        owner: Some("Dweller".into()),
         device_type: Some("ThinkPad T14".into()),
         department: Some("home".into()),
         notes: None,
@@ -1756,7 +1756,7 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
             let m = &view.mapped[0];
             assert_eq!(m.name, "edo-laptop");
             assert_eq!(m.ip, "192.168.1.42");
-            assert_eq!(m.owner.as_deref(), Some("Operator"));
+            assert_eq!(m.owner.as_deref(), Some("Dweller"));
             assert_eq!(m.device_type.as_deref(), Some("ThinkPad T14"));
             assert_eq!(m.department.as_deref(), Some("home"));
             assert_eq!(m.queries, 2);
@@ -1866,7 +1866,7 @@ servers = ["192.0.2.1:53"]
         mac: None,
         mac_aliases: Vec::new(),
         profile: "default".into(),
-        owner: Some("Operator".into()),
+        owner: Some("Dweller".into()),
         device_type: Some("ThinkPad".into()),
         department: None,
         group: None,
@@ -1889,7 +1889,7 @@ servers = ["192.0.2.1:53"]
     let devices = load_devices(&path);
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].id.as_str(), "edo-laptop");
-    assert_eq!(devices[0].owner.as_deref(), Some("Operator"));
+    assert_eq!(devices[0].owner.as_deref(), Some("Dweller"));
 
     // Verify the reload signal fired (drains the channel).
     assert!(reload_rx.try_recv().is_ok(), "reload signal must be sent");
@@ -2166,7 +2166,7 @@ display_name = "edo-laptop"
 ip = "192.168.1.42"
 mac = "AA:BB:CC:DD:EE:FF"
 profile = "default"
-owner = "Operator"
+owner = "Dweller"
 device_type = "ThinkPad"
 department = "home"
 tags = ["trusted"]
@@ -2180,7 +2180,7 @@ servers = ["192.0.2.1:53"]
 
     // Patch only `owner` and leave everything else alone.
     let patch = super::super::protocol::DevicePatch {
-        owner: Some(Some("Casey".into())),
+        owner: Some(Some("User2".into())),
         ..Default::default()
     };
     let cmd = IpcCommand::DeviceUpdate {
@@ -2205,7 +2205,7 @@ servers = ["192.0.2.1:53"]
         Some("default"),
         "profile unchanged"
     );
-    assert_eq!(d.owner.as_deref(), Some("Casey"), "owner patched");
+    assert_eq!(d.owner.as_deref(), Some("User2"), "owner patched");
     assert_eq!(
         d.device_type.as_deref(),
         Some("ThinkPad"),
@@ -2342,7 +2342,7 @@ servers = ["192.0.2.1:53"]
     // JSON on purpose: the whole point is that `tags` is a key the struct
     // no longer has, so it cannot be expressed as a struct literal.
     let patch: super::super::protocol::DevicePatch =
-        serde_json::from_str(r#"{"tags":["kids"],"new_name":"work-thinkpad","owner":"Casey"}"#)
+        serde_json::from_str(r#"{"tags":["kids"],"new_name":"dwe-thinkpad","owner":"User2"}"#)
             .expect("a pre-S5 payload carrying `tags` must still deserialize");
 
     // The retired key is CAPTURED, not dropped. Without this the daemon
@@ -2377,12 +2377,12 @@ servers = ["192.0.2.1:53"]
     let row = raw_device(&path, "edo-laptop");
     assert_eq!(
         row.get("display_name").and_then(|v| v.as_str()),
-        Some("work-thinkpad"),
+        Some("dwe-thinkpad"),
         "the rename must land"
     );
     assert_eq!(
         row.get("owner").and_then(|v| v.as_str()),
-        Some("Casey"),
+        Some("User2"),
         "the scalar edit must land"
     );
     // Weaker by construction — no code path can write `tags` any more — but
@@ -2420,7 +2420,7 @@ servers = ["192.0.2.1:53"]
 
     // network_name omitted from the patch entirely (outer None).
     let patch = super::super::protocol::DevicePatch {
-        owner: Some(Some("Casey".into())),
+        owner: Some(Some("User2".into())),
         ..Default::default()
     };
     let cmd = IpcCommand::DeviceUpdate {
@@ -2600,7 +2600,7 @@ async fn tui_edit_of_a_two_group_device_keeps_both_memberships_in_the_file() {
     // Open the modal on the device, change the NAME and nothing
     // else, save.
     let mut form = crate::tui::edit_form_from(&two_group_dto());
-    form.name = "work-thinkpad".into();
+    form.name = "dwe-thinkpad".into();
     let patch = crate::tui::device_update_patch(&form).expect("form must parse");
 
     let cmd = IpcCommand::DeviceUpdate {
@@ -2625,7 +2625,7 @@ async fn tui_edit_of_a_two_group_device_keeps_both_memberships_in_the_file() {
     );
     assert_eq!(
         row.get("display_name").and_then(|v| v.as_str()),
-        Some("work-thinkpad"),
+        Some("dwe-thinkpad"),
         "the one field the operator DID touch must have landed"
     );
     assert!(reload_rx.try_recv().is_ok());
@@ -2648,7 +2648,7 @@ display_name = "tablet"
 ip = "192.168.1.50"
 mac = "AA:BB:CC:DD:EE:01"
 profile = "default"
-owner = "Operator"
+owner = "Dweller"
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -3055,7 +3055,7 @@ servers = ["192.0.2.1:53"]
         ip: unmapped,
         name: "phone".into(),
         profile: "default".into(),
-        owner: Some("Casey".into()),
+        owner: Some("User2".into()),
         device_type: Some("iPhone".into()),
         department: None,
         token: Some("tok-prom".into()),

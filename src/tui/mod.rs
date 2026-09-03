@@ -7878,7 +7878,7 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
     //
     // **Paste matters more here than on most forms.** The values this
     // vocabulary exists to adopt are the ones already on the operator's
-    // devices — `Apple TV`, `Operator` — and the way you get them exactly
+    // devices — `Apple TV`, `Dweller` — and the way you get them exactly
     // right is to copy them from the Devices tab rather than retype them
     // and introduce the very near-duplicate the vocabulary is meant to
     // prevent. Without this arm the paste was inert **and silent**.

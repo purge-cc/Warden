@@ -40,7 +40,7 @@
 //! ## The USED column counts two different things
 //!
 //! For the three metadata kinds: `Device.owner` is free text
-//! (`"Operator"`); `Label.id` is an `Id` (`"operator"`). They can never be
+//! (`"Dweller"`); `Label.id` is an `Id` (`"dweller"`). They can never be
 //! equal, so the count goes through [`Label::matches_value`], which
 //! accepts **id or display_name**.
 //!
@@ -56,8 +56,8 @@
 //! ```text
 //! Labels (3)                       (focus on the kind menu)
 //!   KIND            │   ID          NAME        DESCRIPTION      USED
-//!   ▸ Owners      2 │ · operator     Operator     Personal kit        4
-//!     Device types 1│   member    Member    —                   2
+//!   ▸ Owners      2 │ · dweller     Dweller     Personal kit        4
+//!     Device types 1│   dweller2    Dweller2    —                   2
 //!     Departments  0│
 //! ```
 //!
@@ -516,12 +516,12 @@ mod tests {
     /// would report 0 for a label that is in use everywhere.
     #[test]
     fn usage_counts_by_display_name_not_only_by_id() {
-        let l = label("operator", LabelKind::Owner, "Operator");
+        let l = label("dweller", LabelKind::Owner, "Dweller");
         let lc = loaded(
             vec![l.clone()],
             vec![
-                device("a", Some("Operator"), LabelKind::Owner),
-                device("b", Some("Operator"), LabelKind::Owner),
+                device("a", Some("Dweller"), LabelKind::Owner),
+                device("b", Some("Dweller"), LabelKind::Owner),
             ],
         );
         assert_eq!(
@@ -533,10 +533,10 @@ mod tests {
 
     #[test]
     fn usage_counts_the_id_form_too() {
-        let l = label("operator", LabelKind::Owner, "Operator");
+        let l = label("dweller", LabelKind::Owner, "Dweller");
         let lc = loaded(
             vec![l.clone()],
-            vec![device("a", Some("operator"), LabelKind::Owner)],
+            vec![device("a", Some("dweller"), LabelKind::Owner)],
         );
         assert_eq!(usage_count(&lc, &l), 1);
     }
@@ -665,7 +665,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let labels = vec![label("operator", LabelKind::Owner, "Operator")];
+        let labels = vec![label("dweller", LabelKind::Owner, "Dweller")];
         let mut app = App::new();
         app.loaded_config = Some(loaded(labels.clone(), Vec::new()));
 
@@ -702,13 +702,13 @@ mod tests {
         let mut app = App::new();
         app.loaded_config = Some(loaded(
             vec![
-                label("operator", LabelKind::Owner, "Operator"),
-                label("member", LabelKind::Owner, "Member"),
+                label("dweller", LabelKind::Owner, "Dweller"),
+                label("dweller2", LabelKind::Owner, "Dweller2"),
             ],
             Vec::new(),
         ));
         app.labels.focus = focus;
-        app.labels.selected_id = Some("operator".to_string());
+        app.labels.selected_id = Some("dweller".to_string());
         app
     }
 
@@ -761,7 +761,7 @@ mod tests {
         let term = draw(&mut focus_app(LabelsFocus::Entries), 100, 24);
         assert_eq!(
             span_at(&term, TABLE_MARK_X, 3, 10),
-            "\u{25b8} operator ",
+            "\u{25b8} dweller ",
             "the focused pane's cursor is the filled marker"
         );
         assert_eq!(
@@ -794,11 +794,11 @@ mod tests {
             "below NARROW_THRESHOLD the kind menu is not painted:\n{dump}"
         );
         assert!(
-            dump.contains("operator"),
+            dump.contains("dweller"),
             "the entry table is the pane that survives the collapse:\n{dump}"
         );
         assert!(
-            dump.contains("\u{25b8} operator"),
+            dump.contains("\u{25b8} dweller"),
             "the surviving pane carries the live cursor, not the resting \
              one — at this width there is nothing else it could be:\n{dump}"
         );

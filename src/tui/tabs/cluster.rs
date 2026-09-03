@@ -540,7 +540,7 @@ mod tests {
         ClusterStatusDto {
             enabled: true,
             role: "secondary".to_string(),
-            peer: Some("192.0.2.10:53".to_string()),
+            peer: Some("10.10.1.94:53".to_string()),
             config_generation: 0,
             config_hash: config_hash.to_string(),
             last_sync_secs: Some(12),

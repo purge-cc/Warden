@@ -63,7 +63,7 @@ fn secondary_requires_peer_byte_for_byte() {
     assert_eq!(
         CLUSTER_SECONDARY_REQUIRES_PEER,
         "cluster: `peer` is required when `role = \"secondary\"`. \
-         Set it to the primary's API base URL, e.g. peer = \"https://192.0.2.10:8053\"."
+         Set it to the primary's API base URL, e.g. peer = \"https://10.10.1.94:8053\"."
     );
 }
 
@@ -93,7 +93,7 @@ fn allow_peer_invalid_cidr_byte_for_byte() {
     assert_eq!(
         CLUSTER_ALLOW_PEER_INVALID_CIDR,
         "cluster: `allow_peer` entry '{entry}' is not a valid CIDR ({reason}). \
-         Use forms like 192.0.2.10/32 or 10.10.1.0/24."
+         Use forms like 10.10.1.94/32 or 10.10.1.0/24."
     );
 }
 
@@ -102,7 +102,7 @@ fn secondary_peer_invalid_byte_for_byte() {
     assert_eq!(
         CLUSTER_SECONDARY_PEER_INVALID,
         "cluster: `peer` '{peer}' is not a valid URL ({reason}). \
-         Use the primary's https:// API base URL, e.g. peer = \"https://192.0.2.10:8053\"."
+         Use the primary's https:// API base URL, e.g. peer = \"https://10.10.1.94:8053\"."
     );
 }
 

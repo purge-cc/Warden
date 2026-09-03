@@ -1,7 +1,7 @@
 # Live-traffic regression corpus for the tunneling shape gate.
 #
 # Every line is a domain the SHIPPED-BEFORE predicate refused, measured over
-# 8 days on a production purge-warden instance (CT 192.0.2.10, 2026-07-28..08-04).
+# 8 days on a production purge-warden instance (CT 10.10.1.94, 2026-07-28..08-04).
 # The expected column is the verdict under the CURRENT predicate.
 #
 # Generated, not curated. Do not hand-prune: an earlier design doc derived its
@@ -84,7 +84,7 @@ CLEAN	deac-riga.dl.sourceforge.net.home.local
 CLEAN	developer.download.nvidia.com.home.local
 CLEAN	distrib-coffee.ipsl.jussieu.fr
 CLEAN	documents.storage5.infomaniak.com
-CLEAN	operator-piccolottofixd.kchat.infomaniak.com
+CLEAN	dweller-piccolottofixd.kchat.infomaniak.com
 CLEAN	egs-platform-service.store.epicgames.com
 CLEAN	eligibility-panelresearch.googlevideo.com
 CLEAN	ephemeralcounters.api.roblox.com

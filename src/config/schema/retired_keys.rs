@@ -348,9 +348,9 @@ lists = { social = "allow" }
         let mut t = table_of(
             r#"
 [[labels]]
-id = "operator"
+id = "dweller"
 kind = "owner"
-display_name = "Operator"
+display_name = "Dweller"
 
 [[labels]]
 id = "ads"
@@ -370,7 +370,7 @@ display_name = "Famiglia"
             rows.iter()
                 .map(|r| r["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["operator", "famiglia"],
+            vec!["dweller", "famiglia"],
             "the surrounding vocabulary must survive intact"
         );
     }

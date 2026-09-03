@@ -59,7 +59,7 @@ pub struct ClusterConfig {
     pub priority: u32,
 
     /// The primary's API base URL a secondary polls, e.g.
-    /// `https://192.0.2.10:8053`. Required when `role = "secondary"`
+    /// `https://10.10.1.94:8053`. Required when `role = "secondary"`
     /// (validator-enforced); ignored on a primary. `None` when unset.
     pub peer: Option<String>,
 
@@ -415,12 +415,12 @@ mod tests {
             role: ClusterRole::Secondary,
             node_name: Some("rpi-livingroom".into()),
             priority: 2,
-            peer: Some("https://192.0.2.10:8053".into()),
+            peer: Some("https://10.10.1.94:8053".into()),
             token_hash: Some("a".repeat(64)),
             peer_cert: Some("/etc/purge-warden/primary-cert.pem".into()),
             poll_interval_secs: 20,
             failover_after_secs: 60,
-            allow_peer: vec!["192.0.2.10/32".into()],
+            allow_peer: vec!["10.10.1.94/32".into()],
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: ClusterConfig = toml::from_str(&s).unwrap();
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn peer_url_accepts_https_and_loopback_http() {
         for ok in [
-            "https://192.0.2.10:8053",
+            "https://10.10.1.94:8053",
             "https://primary.lan",
             "http://127.0.0.1:18080",
             "http://[::1]:8053",
@@ -501,10 +501,10 @@ mod tests {
     #[test]
     fn peer_url_rejects_plaintext_offbox_and_garbage() {
         for bad in [
-            "http://192.0.2.10:8053", // plaintext off-loopback — token disclosure
+            "http://10.10.1.94:8053", // plaintext off-loopback — token disclosure
             "http://primary.lan",
-            "ftp://192.0.2.10",
-            "192.0.2.10:8053", // no scheme
+            "ftp://10.10.1.94",
+            "10.10.1.94:8053", // no scheme
             "not a url",
             "",
             "   ",

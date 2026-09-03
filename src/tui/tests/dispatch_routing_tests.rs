@@ -265,14 +265,14 @@ default_profile = "default"
 display_name = "Default"
 
 [[labels]]
-id = "operator"
+id = "dweller"
 kind = "owner"
-display_name = "Operator"
+display_name = "Dweller"
 
 [[labels]]
-id = "member"
+id = "dweller2"
 kind = "owner"
-display_name = "Member"
+display_name = "Dweller2"
 
 [[labels]]
 id = "laptop"
@@ -438,7 +438,7 @@ async fn ux8_down_walks_the_entries_while_they_have_focus() {
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("member"),
+        Some("dweller2"),
         "with the entries focused the vertical key walks rows"
     );
     assert_eq!(
@@ -460,7 +460,7 @@ async fn ux8_j_and_k_are_no_longer_bound_on_labels() {
     handle_key(&mut app, key(KeyCode::Char('j')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("operator"),
+        Some("dweller"),
         "`j` is unbound \u{2014} the cursor stays on row 0. (It is not `None`: \
              `handle_labels_key` seeds the anchor before the match, for ANY \
              key \u{2014} see `ux8_the_row_anchor_is_seeded_on_the_first_keystroke`. \
@@ -470,13 +470,13 @@ async fn ux8_j_and_k_are_no_longer_bound_on_labels() {
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("member"),
+        Some("dweller2"),
         "the real binding still walks rows"
     );
     handle_key(&mut app, key(KeyCode::Char('k')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("member"),
+        Some("dweller2"),
         "`k` is unbound \u{2014} the cursor stays put"
     );
 }
@@ -497,7 +497,7 @@ async fn ux8_the_row_anchor_is_seeded_on_the_first_keystroke() {
     handle_key(&mut app, key(KeyCode::Char('z')), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("operator"),
+        Some("dweller"),
         "the anchor agrees with the row the renderer already paints"
     );
 }
@@ -590,14 +590,14 @@ async fn ux8_a_failed_load_does_not_wipe_the_anchor() {
     let mut app = labels_app(&master);
     handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
-    assert_eq!(app.labels.selected_id.as_deref(), Some("member"));
+    assert_eq!(app.labels.selected_id.as_deref(), Some("dweller2"));
 
     // What a parse failure leaves behind.
     app.loaded_config = None;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("member"),
+        Some("dweller2"),
         "the anchor must survive a failed load, not be reset by it"
     );
 
@@ -608,7 +608,7 @@ async fn ux8_a_failed_load_does_not_wipe_the_anchor() {
     reconcile_active_leaf_selection(&mut app);
     assert_eq!(
         app.labels.selected_id.as_deref(),
-        Some("member"),
+        Some("dweller2"),
         "the render-time reconcile must not reset it either"
     );
 }
@@ -841,23 +841,23 @@ async fn l7_add_writes_the_row_to_disk_and_the_leaf_sees_it() {
     let mut app = labels_app(&master);
 
     handle_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
-    for c in "operator".chars() {
+    for c in "dweller".chars() {
         handle_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
     }
     // Tab past the read-only kind row onto display name, and type the
     // value the devices actually carry — the half that makes
     // `DEVICE_METADATA_UNKNOWN_LABEL` stop firing.
     handle_key(&mut app, key(KeyCode::Tab), &poller, &master).await;
-    for c in "Operator".chars() {
+    for c in "Dweller".chars() {
         handle_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
 
     let on_disk = labels_of(&master);
     assert_eq!(on_disk.len(), 1, "one row on disk; got {on_disk:?}");
-    assert_eq!(on_disk[0].id.as_str(), "operator");
+    assert_eq!(on_disk[0].id.as_str(), "dweller");
     assert_eq!(on_disk[0].kind, LabelKind::Owner);
-    assert_eq!(on_disk[0].display_name, "Operator");
+    assert_eq!(on_disk[0].display_name, "Dweller");
     assert_eq!(
         app.loaded_config.as_ref().unwrap().config.labels.len(),
         1,
@@ -917,7 +917,7 @@ async fn l7_removing_a_row_that_is_already_gone_reports_it() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
     app.labels.focus = app::LabelsFocus::Entries;
-    app.labels.selected_id = Some("operator".to_string());
+    app.labels.selected_id = Some("dweller".to_string());
 
     handle_key(&mut app, key(KeyCode::Char('d')), &poller, &master).await;
     assert!(app.labels.modal.is_some(), "`d` opens the confirm");
@@ -926,7 +926,7 @@ async fn l7_removing_a_row_that_is_already_gone_reports_it() {
     // CLI. The captured snapshot still names it.
     let text = std::fs::read_to_string(&master).unwrap();
     let without = text.replace(
-        "[[labels]]\nid = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n",
+        "[[labels]]\nid = \"dweller\"\nkind = \"owner\"\ndisplay_name = \"Dweller\"\n",
         "",
     );
     assert_ne!(
@@ -976,7 +976,7 @@ async fn l7_a_refused_edit_leaves_the_label_byte_identical_on_disk() {
     let before_labels = labels_of(&master);
     let before = before_labels
         .iter()
-        .find(|l| l.id.as_str() == "operator")
+        .find(|l| l.id.as_str() == "dweller")
         .unwrap();
     let before_display_name = before.display_name.clone();
     let before_description = before.description.clone();
@@ -987,7 +987,7 @@ async fn l7_a_refused_edit_leaves_the_label_byte_identical_on_disk() {
         // `display_name` alone would succeed — the OLD loop's proof that
         // it lands is exactly the bug. One atomic write means it must
         // NOT land either, refused alongside the oversized description.
-        form.display_name = "Operator P".to_string();
+        form.display_name = "Dweller P".to_string();
         form.description = "x".repeat(2000);
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -1007,7 +1007,7 @@ async fn l7_a_refused_edit_leaves_the_label_byte_identical_on_disk() {
     let after_labels = labels_of(&master);
     let after = after_labels
         .iter()
-        .find(|l| l.id.as_str() == "operator")
+        .find(|l| l.id.as_str() == "dweller")
         .unwrap();
     assert_eq!(
         after.display_name, before_display_name,
@@ -1041,12 +1041,12 @@ async fn l7_the_success_message_fits_the_modal_body() {
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "operator")
+            .find(|l| l.id.as_str() == "dweller")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Operator P".to_string();
+        form.display_name = "Dweller P".to_string();
         form.description = "studio".to_string();
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -1057,7 +1057,7 @@ async fn l7_the_success_message_fits_the_modal_body() {
         .unwrap();
     let dump = term.backend().to_string();
     assert!(
-        dump.contains("updated owner operator (display_name, description)"),
+        dump.contains("updated owner dweller (display_name, description)"),
         "the whole message must reach the screen; got:\n{dump}"
     );
     assert!(
@@ -1087,7 +1087,7 @@ async fn l7_each_opener_opens_its_own_stage() {
         (KeyCode::Delete, false, true),
     ] {
         let mut app = labels_app(&master);
-        app.labels.selected_id = Some("operator".to_string());
+        app.labels.selected_id = Some("dweller".to_string());
         handle_key(&mut app, key(k), &poller, &master).await;
         let modal = app
             .labels
@@ -1200,9 +1200,9 @@ async fn l7b_edit_and_delete_follow_the_cursor_to_the_second_row() {
     for k in [KeyCode::Char('e'), KeyCode::Char('d')] {
         let mut app = labels_app(&master);
         app.labels.focus = app::LabelsFocus::Entries;
-        // Walk down one row: operator -> member.
+        // Walk down one row: dweller -> dweller2.
         handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
-        assert_eq!(app.labels.selected_id.as_deref(), Some("member"));
+        assert_eq!(app.labels.selected_id.as_deref(), Some("dweller2"));
 
         handle_key(&mut app, key(k), &poller, &master).await;
         let modal = app.labels.modal.as_ref().expect("modal opens");
@@ -1211,7 +1211,7 @@ async fn l7b_edit_and_delete_follow_the_cursor_to_the_second_row() {
             _ => modal.remove().unwrap().id.clone(),
         };
         assert_eq!(
-            acted_on, "member",
+            acted_on, "dweller2",
             "{k:?} acted on the wrong row — it must follow the cursor"
         );
     }
@@ -1236,13 +1236,13 @@ async fn l7b_a_confirmed_delete_removes_that_row_and_only_that_row() {
     assert!(
         !on_disk
             .iter()
-            .any(|l| l.id.as_str() == "member" && l.kind == LabelKind::Owner),
+            .any(|l| l.id.as_str() == "dweller2" && l.kind == LabelKind::Owner),
         "the confirmed row must be gone; got {on_disk:?}"
     );
     assert!(
         on_disk
             .iter()
-            .any(|l| l.id.as_str() == "operator" && l.kind == LabelKind::Owner),
+            .any(|l| l.id.as_str() == "dweller" && l.kind == LabelKind::Owner),
         "and its neighbour must survive; got {on_disk:?}"
     );
     assert!(
@@ -1266,21 +1266,21 @@ async fn l7b_a_clean_edit_writes_both_fields_to_disk() {
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "operator")
+            .find(|l| l.id.as_str() == "dweller")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Operator P".to_string();
+        form.display_name = "Dweller P".to_string();
         form.description = "studio".to_string();
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
 
     let row = labels_of(&master)
         .into_iter()
-        .find(|l| l.id.as_str() == "operator")
+        .find(|l| l.id.as_str() == "dweller")
         .expect("the row survives an edit");
-    assert_eq!(row.display_name, "Operator P");
+    assert_eq!(row.display_name, "Dweller P");
     assert_eq!(row.description.as_deref(), Some("studio"));
     assert_eq!(row.kind, LabelKind::Owner, "the kind is not touched");
 }
@@ -1305,12 +1305,12 @@ async fn l7b_a_refused_edit_leaves_the_cached_config_and_the_form_snapshot_untou
     app.labels.modal = Some(label_modal::LabelModal::open_edit(
         labels_of(&master)
             .iter()
-            .find(|l| l.id.as_str() == "operator")
+            .find(|l| l.id.as_str() == "dweller")
             .unwrap(),
     ));
     {
         let form = app.labels.modal.as_mut().unwrap().form_mut().unwrap();
-        form.display_name = "Operator P".to_string();
+        form.display_name = "Dweller P".to_string();
         form.description = "x".repeat(2000);
     }
     handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
@@ -1322,12 +1322,12 @@ async fn l7b_a_refused_edit_leaves_the_cached_config_and_the_form_snapshot_untou
         .config
         .labels
         .iter()
-        .find(|l| l.id.as_str() == "operator")
+        .find(|l| l.id.as_str() == "dweller")
         .expect("the row is still there")
         .display_name
         .clone();
     assert_eq!(
-        cached, "Operator",
+        cached, "Dweller",
         "the cached config must not drift ahead of a file nothing was written to"
     );
 
@@ -1342,7 +1342,7 @@ async fn l7b_a_refused_edit_leaves_the_cached_config_and_the_form_snapshot_untou
         .original
         .as_ref()
         .unwrap();
-    assert_eq!(original.display_name, "Operator");
+    assert_eq!(original.display_name, "Dweller");
 }
 
 /// The footer advertises `Ctrl+s` while this form is open. It does not

@@ -771,7 +771,12 @@ mod tests {
     fn wildcard_apex_served_via_exact_path() {
         // A `match_subdomains` record answers its own apex via the exact probe
         // (the apex is also in `forward`), no walk needed.
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
         assert!(local.has_subdomain_records());
         assert_eq!(local.suffix_count(), 1);
@@ -785,9 +790,17 @@ mod tests {
 
     #[test]
     fn wildcard_matches_descendant() {
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
-        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
+        let hit = local
+            .lookup("app.example.test", RecordType::A)
+            .hit()
+            .unwrap();
         assert_eq!(a_ip(&hit), Ipv4Addr::new(10, 0, 0, 1));
         // The wire invariant — a wildcard-descendant answer must be OWNED by
         // the QNAME, not the configured apex, or RFC-conformant stubs (glibc
@@ -828,13 +841,21 @@ mod tests {
             ("app.example.test", LocalDnsRecordType::A, "10.0.0.2", false),
         ]);
         let local = LocalRecords::build(&cfg);
-        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
+        let hit = local
+            .lookup("app.example.test", RecordType::A)
+            .hit()
+            .unwrap();
         assert_eq!(a_ip(&hit), Ipv4Addr::new(10, 0, 0, 2));
     }
 
     #[test]
     fn wildcard_does_not_match_unrelated_name() {
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("google.com", RecordType::A),
@@ -872,7 +893,12 @@ mod tests {
     fn wildcard_descendant_wrong_address_qtype_synthesises_nodata() {
         // Wildcard A-only → an AAAA query for a descendant is anti-leaked as
         // NODATA, same as the exact-match path does for the apex.
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("app.example.test", RecordType::AAAA),
@@ -886,7 +912,12 @@ mod tests {
         // through to upstream (Miss), matching profile-scope behaviour. The
         // exact apex still NODATAs every qtype (covered by the exact-path
         // tests).
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
         assert!(matches!(
             local.lookup("app.example.test", RecordType::MX),
@@ -904,7 +935,10 @@ mod tests {
         )]);
         let local = LocalRecords::build(&cfg);
         // A query on a descendant → CNAME only (external target).
-        let hit = local.lookup("api.example.test", RecordType::A).hit().unwrap();
+        let hit = local
+            .lookup("api.example.test", RecordType::A)
+            .hit()
+            .unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].record_type(), RecordType::CNAME);
         // The wildcard CNAME RR is owned by the QNAME, not the apex. (Its
@@ -924,7 +958,10 @@ mod tests {
             ("nas.home", LocalDnsRecordType::A, "192.168.1.50", false),
         ]);
         let local = LocalRecords::build(&cfg);
-        let hit = local.lookup("app.example.test", RecordType::A).hit().unwrap();
+        let hit = local
+            .lookup("app.example.test", RecordType::A)
+            .hit()
+            .unwrap();
         assert_eq!(hit.len(), 2);
         assert_eq!(hit[0].record_type(), RecordType::CNAME);
         assert_eq!(
@@ -973,7 +1010,12 @@ mod tests {
         // wildcard flood.
         use crate::tracking::{LocalRecordsHits, LocalRecordsScopeKey};
 
-        let cfg = config_with_flags(vec![("example.test", LocalDnsRecordType::A, "10.0.0.1", true)]);
+        let cfg = config_with_flags(vec![(
+            "example.test",
+            LocalDnsRecordType::A,
+            "10.0.0.1",
+            true,
+        )]);
         let local = LocalRecords::build(&cfg);
         let hits = LocalRecordsHits::new();
 

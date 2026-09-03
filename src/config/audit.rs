@@ -1264,7 +1264,7 @@ mod tests {
             .with_target_id("kids")
             .with_domain("blocked.example")
             .with_rule_action("A")
-            .with_record_value("192.0.2.99")
+            .with_record_value("10.10.1.99")
             .with_match_subdomains(true)
             .with_ttl_secs(7200);
         w.append_cli_mutation(&rec).unwrap();
@@ -1275,7 +1275,7 @@ mod tests {
         assert_eq!(parsed.action.as_deref(), Some("local_records.add"));
         assert_eq!(parsed.scope.as_deref(), Some("profile"));
         assert_eq!(parsed.target_id.as_deref(), Some("kids"));
-        assert_eq!(parsed.record_value.as_deref(), Some("192.0.2.99"));
+        assert_eq!(parsed.record_value.as_deref(), Some("10.10.1.99"));
         assert_eq!(parsed.match_subdomains, Some(true));
         assert_eq!(parsed.ttl_secs, Some(7200));
 
@@ -1283,7 +1283,7 @@ mod tests {
         // field names exactly so external readers (jq scripts, log
         // shippers) can grep for them.
         let raw = &got[0].0;
-        assert!(raw.contains("\"record_value\":\"192.0.2.99\""));
+        assert!(raw.contains("\"record_value\":\"10.10.1.99\""));
         assert!(raw.contains("\"match_subdomains\":true"));
         assert!(raw.contains("\"ttl_secs\":7200"));
 

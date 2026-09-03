@@ -130,7 +130,7 @@ impl EdnsClientSubnet {
     ///
     /// For non-anonymous forms the masked address + prefix together
     /// define the cache-bucket dimension. Two clients on the same
-    /// `/24` (`10.10.1.50` and `192.0.2.99` under Coarse mode) collapse
+    /// `/24` (`10.10.1.50` and `10.10.1.99` under Coarse mode) collapse
     /// to the same `EcsPrefix` and share the upstream's answer; clients
     /// on different `/24`s get distinct slots so a CDN's
     /// geo-specialised response for `/24=10.10.1` does not poison the
@@ -402,7 +402,7 @@ mod tests {
             .unwrap()
             .as_cache_prefix()
             .unwrap();
-        let b = EdnsClientSubnet::new("192.0.2.99".parse().unwrap(), 24)
+        let b = EdnsClientSubnet::new("10.10.1.99".parse().unwrap(), 24)
             .unwrap()
             .as_cache_prefix()
             .unwrap();

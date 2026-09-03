@@ -1399,21 +1399,21 @@ pub const CLUSTER_SECONDARY_NOT_YET_JOINED: &str =
 /// `role = "secondary"` but no `peer` set. Frozen.
 pub const CLUSTER_SECONDARY_REQUIRES_PEER: &str =
     "cluster: `peer` is required when `role = \"secondary\"`. \
-     Set it to the primary's API base URL, e.g. peer = \"https://192.0.2.10:8053\".";
+     Set it to the primary's API base URL, e.g. peer = \"https://10.10.1.94:8053\".";
 
 /// An `allow_peer` entry is not a valid CIDR. `{entry}`/`{reason}` are
 /// substituted at error-construction time. Frozen (the template, not the
 /// substituted result).
 pub const CLUSTER_ALLOW_PEER_INVALID_CIDR: &str =
     "cluster: `allow_peer` entry '{entry}' is not a valid CIDR ({reason}). \
-     Use forms like 192.0.2.10/32 or 10.10.1.0/24.";
+     Use forms like 10.10.1.94/32 or 10.10.1.0/24.";
 
 /// `role = "secondary"` but `peer` is not an acceptable URL.
 /// `{peer}`/`{reason}` substituted at construction.
 /// Frozen (the template).
 pub const CLUSTER_SECONDARY_PEER_INVALID: &str =
     "cluster: `peer` '{peer}' is not a valid URL ({reason}). \
-     Use the primary's https:// API base URL, e.g. peer = \"https://192.0.2.10:8053\".";
+     Use the primary's https:// API base URL, e.g. peer = \"https://10.10.1.94:8053\".";
 
 /// `enabled = true` with `poll_interval_secs = 0`. A zero period
 /// panics the secondary poll ticker, so the node never syncs. Frozen.

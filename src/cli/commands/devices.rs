@@ -1878,7 +1878,7 @@ servers = ["192.0.2.1:53"]
             Some("AA:BB:CC:DD:EE:01"),
             Some("default"),
             &[],
-            Some("Operator"),
+            Some("Dweller"),
             Some("phone"),
             Some("home"),
             Some("a note"),
@@ -1923,7 +1923,7 @@ servers = ["192.0.2.1:53"]
         assert_eq!(mac.as_deref(), Some("AA:BB:CC:DD:EE:01"));
         assert_eq!(profile.as_ref().map(|p| p.as_str()), Some("default"));
         assert!(groups.is_empty(), "none were passed");
-        assert_eq!(owner.as_deref(), Some("Operator"));
+        assert_eq!(owner.as_deref(), Some("Dweller"));
         assert_eq!(device_type.as_deref(), Some("phone"));
         assert_eq!(department.as_deref(), Some("home"));
         assert_eq!(notes.as_deref(), Some("a note"));

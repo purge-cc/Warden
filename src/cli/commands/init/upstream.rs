@@ -437,11 +437,11 @@ mod tests {
     /// warden's own address.
     #[test]
     fn parses_nameserver_lines_in_order() {
-        let body = "domain home.local\nsearch home.local\nnameserver 192.0.2.10\nnameserver 149.112.112.112\n";
+        let body = "domain home.local\nsearch home.local\nnameserver 10.10.1.94\nnameserver 149.112.112.112\n";
         assert_eq!(
             parse_resolv_conf(body),
             vec![
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "10.10.1.94".parse::<IpAddr>().unwrap(),
                 "149.112.112.112".parse::<IpAddr>().unwrap(),
             ]
         );
@@ -509,7 +509,7 @@ mod tests {
     /// address, so a candidate on port 53 that IS one of ours self-loops.
     #[test]
     fn drops_our_own_address_under_unspecified_bind() {
-        let ours: IpAddr = "192.0.2.10".parse().unwrap();
+        let ours: IpAddr = "10.10.1.94".parse().unwrap();
         let got = filter_candidates(
             vec![ours, "192.0.2.1".parse().unwrap()],
             "0.0.0.0:53",
@@ -523,20 +523,20 @@ mod tests {
     /// candidate must survive.
     #[test]
     fn keeps_a_local_address_when_the_listen_port_differs() {
-        let ours: IpAddr = "192.0.2.10".parse().unwrap();
+        let ours: IpAddr = "10.10.1.94".parse().unwrap();
         let got = filter_candidates(vec![ours], "0.0.0.0:15353", &|ip| ip == ours);
-        assert_eq!(got, vec!["192.0.2.10:53".to_string()]);
+        assert_eq!(got, vec!["10.10.1.94:53".to_string()]);
     }
 
     /// A specific bind drops only that exact address, not every local one.
     #[test]
     fn specific_bind_drops_only_that_address() {
         let got = filter_candidates(
-            vec!["192.0.2.10".parse().unwrap(), "192.0.2.11".parse().unwrap()],
-            "192.0.2.10:53",
+            vec!["10.10.1.94".parse().unwrap(), "10.10.1.95".parse().unwrap()],
+            "10.10.1.94:53",
             &|_| true,
         );
-        assert_eq!(got, vec!["192.0.2.11:53".to_string()]);
+        assert_eq!(got, vec!["10.10.1.95:53".to_string()]);
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
     /// total loss of DNS, shaped like "warden is broken".
     #[test]
     fn an_ipv4_mapped_wildcard_listen_still_drops_our_own_address() {
-        let ours: IpAddr = "192.0.2.10".parse().unwrap();
+        let ours: IpAddr = "10.10.1.94".parse().unwrap();
         let got = filter_candidates(
             vec![ours, "192.0.2.1".parse().unwrap()],
             "[::ffff:0.0.0.0]:53",
@@ -604,14 +604,14 @@ mod tests {
     #[test]
     fn an_ipv4_mapped_specific_listen_matches_its_plain_form() {
         let got = filter_candidates(
-            vec!["192.0.2.10".parse().unwrap(), "192.0.2.1".parse().unwrap()],
-            "[::ffff:192.0.2.10]:53",
+            vec!["10.10.1.94".parse().unwrap(), "192.0.2.1".parse().unwrap()],
+            "[::ffff:10.10.1.94]:53",
             &|_| false,
         );
         assert_eq!(
             got,
             vec!["192.0.2.1:53".to_string()],
-            "[::ffff:192.0.2.10] and 192.0.2.10 are the same address"
+            "[::ffff:10.10.1.94] and 10.10.1.94 are the same address"
         );
     }
 
@@ -874,7 +874,7 @@ servers = ["192.0.2.1:53", "192.0.2.2:53"]
     fn yes_says_so_when_every_resolver_this_host_uses_is_warden_itself() {
         let detection = Detection {
             usable: vec![],
-            seen: vec!["192.0.2.10".parse().unwrap()],
+            seen: vec!["10.10.1.94".parse().unwrap()],
         };
         let err = choose_non_interactive(detection).unwrap_err();
         let msg = err.to_string();
@@ -884,7 +884,7 @@ servers = ["192.0.2.1:53", "192.0.2.2:53"]
             "the two empty states must not share one message"
         );
         assert!(
-            msg.contains("192.0.2.10"),
+            msg.contains("10.10.1.94"),
             "the message must name what it found and rejected, or the \
              operator cannot tell which state they are in: {msg}"
         );
@@ -901,7 +901,7 @@ servers = ["192.0.2.1:53", "192.0.2.2:53"]
         let detection = Detection {
             usable: vec!["149.112.112.112:53".to_string()],
             seen: vec![
-                "192.0.2.10".parse().unwrap(),
+                "10.10.1.94".parse().unwrap(),
                 "149.112.112.112".parse().unwrap(),
             ],
         };

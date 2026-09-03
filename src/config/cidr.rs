@@ -83,7 +83,7 @@ impl Cidr {
         }
     }
 
-    /// True if `s` carries host bits below its prefix — e.g. `192.0.2.10/8`,
+    /// True if `s` carries host bits below its prefix — e.g. `10.10.1.94/8`,
     /// where [`Cidr::parse`] silently masks the `.1.94` host part away.
     /// ACL validation WARNs on this (cidr-02): a `/8` where the operator
     /// meant `/32` widens an allow-list by 24 bits with no diagnostic.
@@ -395,12 +395,12 @@ mod tests {
     #[test]
     fn input_has_host_bits_detects_unaligned_acl() {
         // cidr-02
-        assert!(Cidr::input_has_host_bits("192.0.2.10/8")); // operator meant /32?
+        assert!(Cidr::input_has_host_bits("10.10.1.94/8")); // operator meant /32?
         assert!(Cidr::input_has_host_bits("192.168.1.5/24"));
         assert!(Cidr::input_has_host_bits("2001:db8::1/32"));
         assert!(!Cidr::input_has_host_bits("10.0.0.0/8")); // aligned network
-        assert!(!Cidr::input_has_host_bits("192.0.2.10")); // bare = /32, no host bits
-        assert!(!Cidr::input_has_host_bits("192.0.2.10/32"));
+        assert!(!Cidr::input_has_host_bits("10.10.1.94")); // bare = /32, no host bits
+        assert!(!Cidr::input_has_host_bits("10.10.1.94/32"));
         assert!(!Cidr::input_has_host_bits("2001:db8::/32"));
         assert!(!Cidr::input_has_host_bits("garbage")); // unparseable → false
     }

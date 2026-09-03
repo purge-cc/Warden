@@ -2315,7 +2315,7 @@ tags = ["general", "kids-only"]
         assert_eq!(sanitize_id("__weird__"), "weird");
         // Accented chars are dropped entirely (charset is ASCII lowercase).
         assert_eq!(sanitize_id("caffè"), "caff");
-        assert_eq!(sanitize_id("Operator iPhone"), "operator-iphone");
+        assert_eq!(sanitize_id("Dweller iPhone"), "dweller-iphone");
     }
 
     #[test]

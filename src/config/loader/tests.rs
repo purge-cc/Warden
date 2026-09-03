@@ -52,7 +52,7 @@ fn single_file_no_includes_uses_fast_path() {
     // Fast-path populates provenance too (so downstream error
     // enrichment still has top-level keys available).
     assert!(loaded.provenance.contains_key("server"));
-    assert!(loaded.provenance.contains_key("devices.operator-iphone"));
+    assert!(loaded.provenance.contains_key("devices.dweller-iphone"));
 }
 
 // ── 2. happy-path multi-file (committed full-v1 fixture) ────────────
@@ -79,11 +79,11 @@ fn full_v1_fixture_provenance_points_at_the_actual_files() {
     let loaded = load_config(&master, now()).expect("load");
     let (file, _line) = loaded
         .provenance
-        .get("devices.operator-iphone")
+        .get("devices.dweller-iphone")
         .expect("entity provenance must be recorded");
     assert!(
-        file.ends_with("devices.d/operator.toml"),
-        "expected operator.toml, got {}",
+        file.ends_with("devices.d/dweller.toml"),
+        "expected dweller.toml, got {}",
         file.display()
     );
     let (server_file, _) = loaded.provenance.get("server").expect("server provenance");
@@ -2224,7 +2224,7 @@ fn secondary_master_with(tmp: &Path, body: &str) -> PathBuf {
              [cluster]\n\
              enabled = true\n\
              role = \"secondary\"\n\
-             peer = \"https://192.0.2.10:8053\"\n\
+             peer = \"https://10.10.1.94:8053\"\n\
              token_hash = \"{}\"\n\n{body}",
             "00".repeat(32),
         ),

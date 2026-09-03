@@ -3,4 +3,4 @@ id = "famiglia"
 display_name = "Famiglia"
 profile = "default"
 priority = 5
-devices = ["operator-iphone"]
+devices = ["dweller-iphone"]

@@ -302,7 +302,7 @@ fn render_tab_at(w: u16, h: u16, modal: DeviceModal) -> String {
     use ratatui::Terminal;
     let mut app = App::new();
     app.device_view = Some(DeviceViewDto {
-        mapped: vec![mk_mapped("kitchen-tv", "10.10.1.50", Some("operator"))],
+        mapped: vec![mk_mapped("kitchen-tv", "10.10.1.50", Some("dweller"))],
         unmapped: vec![mk_unmapped("10.10.1.77")],
     });
     app.devices.modal = Some(modal);
@@ -395,7 +395,7 @@ fn the_tab_itself_still_renders_card_grouping_and_the_promote_path() {
     let mut app = App::new();
     app.device_view = Some(DeviceViewDto {
         mapped: vec![
-            mk_mapped("kitchen-tv", "10.10.1.50", Some("operator")),
+            mk_mapped("kitchen-tv", "10.10.1.50", Some("dweller")),
             mk_mapped("study-pi", "10.10.1.51", Some("ada")),
         ],
         unmapped: vec![mk_unmapped("10.10.1.77")],
@@ -413,7 +413,7 @@ fn the_tab_itself_still_renders_card_grouping_and_the_promote_path() {
         "group-by in the title:\n{out}"
     );
     assert!(
-        out.contains("Owner: ada") && out.contains("Owner: operator"),
+        out.contains("Owner: ada") && out.contains("Owner: dweller"),
         "grouping must insert one header row per owner:\n{out}"
     );
     // The card renders the highlighted row's full field set; `Status` is
@@ -864,7 +864,7 @@ fn edit_form(name: &str, original_id: Option<&str>) -> DeviceFormState {
         String::new(),
         "kids".to_string(),
         "living-room".to_string(),
-        "operator".to_string(),
+        "dweller".to_string(),
         "tv".to_string(),
         String::new(),
         String::new(),
@@ -1216,7 +1216,7 @@ fn cursor_lands_on_the_focused_value_tail_in_the_second_section() {
     use ratatui::Terminal;
     let mut form = edit_form("Kitchen TV", Some("kitchen-tv"));
     form.focused = DeviceFormFocus::Field(DeviceFormField::Owner);
-    form.owner = "operator".to_string();
+    form.owner = "dweller".to_string();
     let mut app = App::new();
     app.devices.modal = Some(DeviceModal::Form(form));
     let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -1233,7 +1233,7 @@ fn cursor_lands_on_the_focused_value_tail_in_the_second_section() {
     //
     // x: the ecosystem rows carry no `│` rule, so the value column is
     // VALUE_COL = 2 lead + GRID_LABEL_W 18 + 2 gap = 22 — one cell left
-    // of the retired grid's GRID_RULE_COL + 2 = 23. "operator" is 7
+    // of the retired grid's GRID_RULE_COL + 2 = 23. "dweller" is 7
     // chars → 11 + 22 + 7 = 40.
     assert_eq!(pos.x, 40, "cursor sits at the value tail");
     // y: `place_cursor` works in FIELD-REGION coordinates and adds the
@@ -1324,13 +1324,13 @@ fn build_rows_owner_grouping_inserts_owner_headers() {
     let view = DeviceViewDto {
         mapped: vec![
             mk_mapped("phone", "10.0.0.2", Some("Family")),
-            mk_mapped("laptop", "10.0.0.1", Some("Operator")),
+            mk_mapped("laptop", "10.0.0.1", Some("Dweller")),
         ],
         unmapped: vec![],
     };
     let rows = build_rows(&view, DeviceGroupBy::Owner);
     assert_eq!(rows.len(), 4);
-    assert!(matches!(&rows[0], DeviceRow::GroupHeader(h) if h == "Owner: Operator"));
+    assert!(matches!(&rows[0], DeviceRow::GroupHeader(h) if h == "Owner: Dweller"));
     assert!(matches!(&rows[1], DeviceRow::Mapped(m) if m.name == "laptop"));
     assert!(matches!(&rows[2], DeviceRow::GroupHeader(h) if h == "Owner: Family"));
     assert!(matches!(&rows[3], DeviceRow::Mapped(m) if m.name == "phone"));
@@ -1379,7 +1379,7 @@ fn unified_list_walk_visits_all_selectable_rows_no_headers() {
     let view = DeviceViewDto {
         mapped: vec![
             mk_mapped("phone", "10.0.0.1", Some("Family")),
-            mk_mapped("laptop", "10.0.0.2", Some("Operator")),
+            mk_mapped("laptop", "10.0.0.2", Some("Dweller")),
         ],
         unmapped: vec![mk_unmapped("10.0.0.99")],
     };

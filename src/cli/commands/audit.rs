@@ -356,13 +356,13 @@ mod tests {
             .with_target_id("kids")
             .with_rule_action("A")
             .with_domain("blocked.example")
-            .with_record_value("192.0.2.99")
+            .with_record_value("10.10.1.99")
             .with_match_subdomains(true)
             .with_ttl_secs(7200);
         let detail = format_detail(&rec);
         assert!(detail.contains("local_records.add"), "detail: {detail}");
         assert!(detail.contains("scope=profile:kids"), "detail: {detail}");
-        assert!(detail.contains("\u{2192} 192.0.2.99"), "detail: {detail}");
+        assert!(detail.contains("\u{2192} 10.10.1.99"), "detail: {detail}");
         assert!(detail.contains("match_subdomains"), "detail: {detail}");
         assert!(detail.contains("ttl=7200"), "detail: {detail}");
     }

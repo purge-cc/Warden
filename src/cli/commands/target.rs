@@ -270,7 +270,7 @@ fn list_toml_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Convert a free-form display name (e.g. `"PC Operator"`) into a valid
+/// Convert a free-form display name (e.g. `"PC Dweller"`) into a valid
 /// v1 [`Id`](crate::config::schema::Id) — lowercase ASCII, digits, and
 /// `-` only, with leading / trailing dashes trimmed and runs of
 /// non-id characters collapsed to a single dash.
@@ -306,7 +306,7 @@ pub fn slug_id(name: &str) -> Result<String, String> {
         return Err(format!(
             "the device name {name:?} collapsed to an empty id after slugging. \
              Use ASCII letters, digits, or `-` so a stable v1 id can be derived \
-             (e.g. \"PC Operator\" → \"pc-operator\")."
+             (e.g. \"PC Dweller\" → \"pc-dweller\")."
         ));
     }
     Ok(out)

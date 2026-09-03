@@ -12,15 +12,15 @@ use super::id::Id;
 
 /// ```toml
 /// [[devices]]
-/// id = "operator-iphone-01"
-/// display_name = "iPhone di Operator"
+/// id = "dweller-iphone-01"
+/// display_name = "iPhone di Dweller"
 /// ip = "10.10.1.107"
 /// mac = "AA:BB:CC:DD:EE:FF"
 /// mac_aliases = ["22:33:44:55:66:77"]
 /// profile = "default"
 /// groups = ["famiglia"]
-/// allow_rules = ["operator-allow-bank"]
-/// deny_rules = ["operator-deny-tiktok"]
+/// allow_rules = ["dweller-allow-bank"]
+/// deny_rules = ["dweller-deny-tiktok"]
 /// override_profile_deny = false
 /// ```
 ///
@@ -135,14 +135,14 @@ ip = "10.10.1.107"
     #[test]
     fn full_device_deserialises() {
         let toml_src = r#"
-id = "operator-iphone-01"
-display_name = "iPhone di Operator"
+id = "dweller-iphone-01"
+display_name = "iPhone di Dweller"
 ip = "10.10.1.107"
 mac = "AA:BB:CC:DD:EE:FF"
 mac_aliases = ["22:33:44:55:66:77", "33:44:55:66:77:88"]
 profile = "default"
 groups = ["famiglia", "iot-lite"]
-owner = "Operator"
+owner = "Dweller"
 device_type = "iPhone personale"
 department = "famiglia"
 notes = "compleanno gennaio"
@@ -150,7 +150,7 @@ notes = "compleanno gennaio"
         let d: Device = toml::from_str(toml_src).unwrap();
         assert_eq!(d.mac_aliases.len(), 2);
         assert_eq!(d.groups.len(), 2);
-        assert_eq!(d.owner.as_deref(), Some("Operator"));
+        assert_eq!(d.owner.as_deref(), Some("Dweller"));
         assert_eq!(d.device_type.as_deref(), Some("iPhone personale"));
         assert_eq!(d.profile.as_ref().unwrap().as_str(), "default");
     }
@@ -259,19 +259,19 @@ ip = "10.10.1.107"
     #[test]
     fn t4_device_overlay_fields_roundtrip() {
         let toml_src = r#"
-id = "operator-iphone"
-display_name = "iPhone di Operator"
+id = "dweller-iphone"
+display_name = "iPhone di Dweller"
 ip = "10.10.1.107"
-allow_rules = ["operator-allow-bank", "operator-allow-airbnb"]
-deny_rules = ["operator-deny-tiktok"]
+allow_rules = ["dweller-allow-bank", "dweller-allow-airbnb"]
+deny_rules = ["dweller-deny-tiktok"]
 override_profile_deny = true
 "#;
         let d: Device = toml::from_str(toml_src).unwrap();
         assert_eq!(d.allow_rules.len(), 2);
-        assert_eq!(d.allow_rules[0].as_str(), "operator-allow-bank");
-        assert_eq!(d.allow_rules[1].as_str(), "operator-allow-airbnb");
+        assert_eq!(d.allow_rules[0].as_str(), "dweller-allow-bank");
+        assert_eq!(d.allow_rules[1].as_str(), "dweller-allow-airbnb");
         assert_eq!(d.deny_rules.len(), 1);
-        assert_eq!(d.deny_rules[0].as_str(), "operator-deny-tiktok");
+        assert_eq!(d.deny_rules[0].as_str(), "dweller-deny-tiktok");
         assert!(d.override_profile_deny);
     }
 

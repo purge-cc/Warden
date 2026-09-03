@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn an_empty_allow_peer_bars_nobody() {
         let none = cidrs(&[]);
-        for ip in ["192.0.2.10", "203.0.113.7", "::1"] {
+        for ip in ["10.10.1.94", "203.0.113.7", "::1"] {
             assert!(
                 !source_ip_is_barred(&none, ip.parse().unwrap()),
                 "{ip} must reach the token check when allow_peer is unset"
@@ -362,7 +362,7 @@ mod tests {
     fn an_ipv4_mapped_source_is_matched_against_an_ipv4_cidr() {
         let allow = cidrs(&["100.64.0.0/10"]);
         assert!(
-            !source_ip_is_barred(&allow, "::ffff:192.0.2.3".parse().unwrap()),
+            !source_ip_is_barred(&allow, "::ffff:100.64.0.7".parse().unwrap()),
             "a mapped form of a listed address must reach the token check"
         );
         assert!(
@@ -379,8 +379,8 @@ mod tests {
     #[test]
     fn a_configured_allow_peer_is_enforced_both_ways() {
         let allow = cidrs(&["10.10.1.0/24", "100.64.0.0/10"]);
-        assert!(!source_ip_is_barred(&allow, "192.0.2.10".parse().unwrap()));
-        assert!(!source_ip_is_barred(&allow, "192.0.2.3".parse().unwrap()));
+        assert!(!source_ip_is_barred(&allow, "10.10.1.94".parse().unwrap()));
+        assert!(!source_ip_is_barred(&allow, "100.64.0.7".parse().unwrap()));
         assert!(source_ip_is_barred(&allow, "203.0.113.7".parse().unwrap()));
         assert!(
             source_ip_is_barred(&allow, "10.10.2.1".parse().unwrap()),

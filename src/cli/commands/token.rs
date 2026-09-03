@@ -312,7 +312,7 @@ display_name = "Default"
 
 [[devices]]
 id = "edo-laptop"
-display_name = "Operator Laptop"
+display_name = "Dweller Laptop"
 ip = "10.0.0.10"
 profile = "default"
 

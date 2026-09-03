@@ -4,7 +4,7 @@
 //! transformation layer surfaces immediately.
 //!
 //! The CT-known v1 fixture below mirrors `/etc/purge-warden/config.toml`
-//! on `the lab host` (192.0.2.10) post the 2026-05-07 incident manual
+//! on `the lab host` (10.10.1.94) post the 2026-05-07 incident manual
 //! restore: `mycompany` allow-list, three deny lists pulled from
 //! `lists.purge.cc`, the default profile carrying a `blocklists = [...]`
 //! array, and one device. The expected v2 output mirrors the §7 mapping
@@ -76,8 +76,8 @@ display_name = "Default household profile"
 blocklists = ["mycompany", "privacy-ads", "privacy-tracking", "security-malicious"]
 
 [[devices]]
-id = "operator-iphone"
-display_name = "iPhone di Operator"
+id = "dweller-iphone"
+display_name = "iPhone di Dweller"
 ip = "10.10.1.107"
 profile = "default"
 
@@ -115,7 +115,7 @@ fn migrate_v1_to_v3_ct_live_config_byte_pinned() {
     // four pairs are kept and none is written `ignore`. This is the
     // measurement that separates the direct route from the v1→v2→v3
     // chain: the chain would have REFUSED this fixture outright (its own
-    // step 4 tags `operator-iphone`, and `tagged_sub_profile_entities`
+    // step 4 tags `dweller-iphone`, and `tagged_sub_profile_entities`
     // refuses tagged devices), and with that refusal suppressed it would
     // have written `ignore` for all four — a config that loads, lints
     // clean, and filters nothing.
@@ -209,8 +209,8 @@ fn migrate_v1_to_v3_ct_live_config_byte_pinned() {
         .config
         .devices
         .iter()
-        .find(|d| d.id.as_str() == "operator-iphone")
-        .expect("operator-iphone device must survive");
+        .find(|d| d.id.as_str() == "dweller-iphone")
+        .expect("dweller-iphone device must survive");
     assert!(!dev.unfiltered);
 }
 

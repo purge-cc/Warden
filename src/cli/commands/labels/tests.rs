@@ -16,7 +16,7 @@ display_name = "Default"
 id = "iphone"
 display_name = "iPhone"
 mac = "AA:BB:CC:DD:EE:01"
-owner = "Operator"
+owner = "Dweller"
 
 [[devices]]
 id = "tv"
@@ -52,9 +52,9 @@ async fn add_label_succeeds() {
     run_add(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "owner",
-        Some("Operator"),
+        Some("Dweller"),
         Some("Dispositivi personali"),
         None,
     )
@@ -63,7 +63,7 @@ async fn add_label_succeeds() {
     let labels = labels_of(&master);
     assert_eq!(labels.len(), 1);
     assert_eq!(labels[0].kind, LabelKind::Owner);
-    assert_eq!(labels[0].display_name, "Operator");
+    assert_eq!(labels[0].display_name, "Dweller");
     assert_eq!(
         labels[0].description.as_deref(),
         Some("Dispositivi personali")
@@ -157,20 +157,20 @@ async fn set_kind_refuses_while_a_device_still_reads_the_old_kind() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    // `iphone` carries `owner = "Operator"`, which this label declares.
+    // `iphone` carries `owner = "Dweller"`, which this label declares.
     run_add(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "owner",
-        Some("Operator"),
+        Some("Dweller"),
         None,
         None,
     )
     .await
     .unwrap();
 
-    let err = run_set(&master, &sock, "operator", "kind", "department", None, None)
+    let err = run_set(&master, &sock, "dweller", "kind", "department", None, None)
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -227,9 +227,9 @@ async fn every_label_field_is_considered_by_the_row_builder() {
     run_add(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "owner",
-        Some("Operator"),
+        Some("Dweller"),
         Some("primary account"),
         None,
     )
@@ -239,7 +239,7 @@ async fn every_label_field_is_considered_by_the_row_builder() {
     let labels = labels_of(&master);
     let l = labels
         .iter()
-        .find(|l| l.id.as_str() == "operator")
+        .find(|l| l.id.as_str() == "dweller")
         .expect("label present after add");
 
     // Exhaustive. Adding a field to `Label` breaks THIS LINE first.
@@ -250,9 +250,9 @@ async fn every_label_field_is_considered_by_the_row_builder() {
         description,
     } = l;
 
-    assert_eq!(id.as_str(), "operator");
+    assert_eq!(id.as_str(), "dweller");
     assert_eq!(*kind, LabelKind::Owner);
-    assert_eq!(display_name, "Operator");
+    assert_eq!(display_name, "Dweller");
     assert_eq!(description.as_deref(), Some("primary account"));
 }
 
@@ -261,10 +261,10 @@ async fn add_refuses_duplicate_pair() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    run_add(&master, &sock, "operator", "owner", None, None, None)
+    run_add(&master, &sock, "dweller", "owner", None, None, None)
         .await
         .unwrap();
-    let err = run_add(&master, &sock, "operator", "owner", None, None, None)
+    let err = run_add(&master, &sock, "dweller", "owner", None, None, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already exists"), "got: {err}");
@@ -275,25 +275,25 @@ async fn set_display_name_and_clear_description() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    run_add(&master, &sock, "operator", "owner", None, Some("note"), None)
+    run_add(&master, &sock, "dweller", "owner", None, Some("note"), None)
         .await
         .unwrap();
     run_set(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "display_name",
-        "Operator",
+        "Dweller",
         None,
         None,
     )
     .await
     .unwrap();
-    run_set(&master, &sock, "operator", "description", "", None, None)
+    run_set(&master, &sock, "dweller", "description", "", None, None)
         .await
         .unwrap();
     let labels = labels_of(&master);
-    assert_eq!(labels[0].display_name, "Operator");
+    assert_eq!(labels[0].display_name, "Dweller");
     assert!(labels[0].description.is_none());
 }
 
@@ -384,10 +384,10 @@ async fn set_unknown_field_refused() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    run_add(&master, &sock, "operator", "owner", None, None, None)
+    run_add(&master, &sock, "dweller", "owner", None, None, None)
         .await
         .unwrap();
-    let err = run_set(&master, &sock, "operator", "colour", "red", None, None)
+    let err = run_set(&master, &sock, "dweller", "colour", "red", None, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unknown field"), "got: {err}");
@@ -424,20 +424,20 @@ async fn remove_refuses_while_a_device_uses_it() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    // The fixture device carries `owner = "Operator"`, matched by
+    // The fixture device carries `owner = "Dweller"`, matched by
     // this label's display_name.
     run_add(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "owner",
-        Some("Operator"),
+        Some("Dweller"),
         None,
         None,
     )
     .await
     .unwrap();
-    let err = run_remove(&master, &sock, "operator", None, None)
+    let err = run_remove(&master, &sock, "dweller", None, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("iphone"), "got: {err}");
@@ -487,15 +487,15 @@ async fn add_targets_the_labels_d_slice() {
     std::fs::write(&slice, "").unwrap();
     let sock = fake_socket(&dir);
 
-    run_add(&master, &sock, "operator", "owner", None, None, None)
+    run_add(&master, &sock, "dweller", "owner", None, None, None)
         .await
         .unwrap();
 
     let slice_src = std::fs::read_to_string(&slice).unwrap();
-    assert!(slice_src.contains("operator"), "got slice:\n{slice_src}");
+    assert!(slice_src.contains("dweller"), "got slice:\n{slice_src}");
     let master_src = std::fs::read_to_string(&master).unwrap();
     assert!(
-        !master_src.contains("operator"),
+        !master_src.contains("dweller"),
         "the master must be untouched. got:\n{master_src}"
     );
     assert_eq!(labels_of(&master).len(), 1, "and the merged view sees it");
@@ -513,7 +513,7 @@ async fn set_edits_the_owning_slice_not_the_master() {
     let slice = dir.path().join("labels.d").join("vocab.toml");
     std::fs::write(
         &slice,
-        "[[labels]]\nid = \"operator\"\nkind = \"owner\"\ndisplay_name = \"operator\"\n",
+        "[[labels]]\nid = \"dweller\"\nkind = \"owner\"\ndisplay_name = \"dweller\"\n",
     )
     .unwrap();
     let sock = fake_socket(&dir);
@@ -521,9 +521,9 @@ async fn set_edits_the_owning_slice_not_the_master() {
     run_set(
         &master,
         &sock,
-        "operator",
+        "dweller",
         "display_name",
-        "Operator",
+        "Dweller",
         None,
         None,
     )
@@ -532,7 +532,7 @@ async fn set_edits_the_owning_slice_not_the_master() {
 
     let slice_src = std::fs::read_to_string(&slice).unwrap();
     assert!(
-        slice_src.contains("Operator"),
+        slice_src.contains("Dweller"),
         "the edit must land in the owning slice. got:\n{slice_src}"
     );
     let master_src = std::fs::read_to_string(&master).unwrap();
@@ -553,13 +553,13 @@ async fn remove_deletes_from_the_owning_slice() {
     let slice = dir.path().join("labels.d").join("vocab.toml");
     std::fs::write(
         &slice,
-        "[[labels]]\nid = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n\
+        "[[labels]]\nid = \"dweller\"\nkind = \"owner\"\ndisplay_name = \"Dweller\"\n\
          \n[[labels]]\nid = \"laptop\"\nkind = \"device-type\"\ndisplay_name = \"Laptop\"\n",
     )
     .unwrap();
     let sock = fake_socket(&dir);
 
-    run_remove(&master, &sock, "operator", None, None)
+    run_remove(&master, &sock, "dweller", None, None)
         .await
         .unwrap();
 
@@ -567,7 +567,7 @@ async fn remove_deletes_from_the_owning_slice() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id.as_str(), "laptop");
     let slice_src = std::fs::read_to_string(&slice).unwrap();
-    assert!(!slice_src.contains("operator"), "got slice:\n{slice_src}");
+    assert!(!slice_src.contains("dweller"), "got slice:\n{slice_src}");
 }
 
 /// The homonym across two DIFFERENT slices: `find_label_file` must
@@ -619,7 +619,7 @@ async fn set_picks_the_slice_holding_the_pair_not_the_id() {
 #[test]
 fn show_renders_every_field() {
     let l: Label = toml::from_str(
-        "id = \"operator\"\nkind = \"owner\"\ndisplay_name = \"Operator\"\n\
+        "id = \"dweller\"\nkind = \"owner\"\ndisplay_name = \"Dweller\"\n\
          description = \"Dispositivi personali\"\n",
     )
     .unwrap();
@@ -764,15 +764,15 @@ fn add_inner_writes_the_row_and_reports_where() {
 
     let report = add_inner(
         &master,
-        "operator",
+        "dweller",
         LabelKind::Owner,
-        Some("Operator"),
+        Some("Dweller"),
         Some("Dispositivi personali"),
         None,
     )
     .expect("the seam writes with no runtime and no socket");
 
-    assert_eq!(report.id, "operator");
+    assert_eq!(report.id, "dweller");
     assert_eq!(
         report.target_path, master,
         "single-file tree: the master is the target"
@@ -780,8 +780,8 @@ fn add_inner_writes_the_row_and_reports_where() {
 
     let rows = rows_on_disk(&master);
     assert_eq!(rows.len(), 1, "got: {rows:?}");
-    let row = row_of(&rows, "owner", "operator").expect("the pair must be on disk");
-    assert_eq!(field_of(row, "display_name").as_deref(), Some("Operator"));
+    let row = row_of(&rows, "owner", "dweller").expect("the pair must be on disk");
+    assert_eq!(field_of(row, "display_name").as_deref(), Some("Dweller"));
     assert_eq!(
         field_of(row, "description").as_deref(),
         Some("Dispositivi personali")
@@ -941,22 +941,22 @@ fn remove_inner_deletes_only_the_named_pair_from_the_file() {
 fn remove_inner_refuses_while_a_device_uses_it() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
-    // The fixture device carries `owner = "Operator"`, matched by this
+    // The fixture device carries `owner = "Dweller"`, matched by this
     // label's display_name.
     add_inner(
         &master,
-        "operator",
+        "dweller",
         LabelKind::Owner,
-        Some("Operator"),
+        Some("Dweller"),
         None,
         None,
     )
     .unwrap();
 
-    let err = remove_inner(&master, "operator", None, None).unwrap_err();
+    let err = remove_inner(&master, "dweller", None, None).unwrap_err();
     assert!(err.to_string().contains("iphone"), "got: {err}");
     assert!(
-        row_of(&rows_on_disk(&master), "owner", "operator").is_some(),
+        row_of(&rows_on_disk(&master), "owner", "dweller").is_some(),
         "nothing may be removed"
     );
 }

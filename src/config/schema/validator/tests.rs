@@ -367,7 +367,7 @@ fn cluster_secondary_without_peer_errors() {
 fn cluster_secondary_with_peer_ok() {
     let mut c = ConfigV1::test_scaffold();
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
     let mut errs = Vec::new();
     check_cluster(&c, &mut errs);
     assert!(errs.is_empty(), "{errs:?}");
@@ -389,9 +389,9 @@ fn cluster_valid_secondary_config_validates() {
     let mut c = basic_config();
     c.cluster.enabled = true;
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
     c.cluster.token_hash = Some("b".repeat(64));
-    c.cluster.allow_peer = vec!["192.0.2.10/32".into()];
+    c.cluster.allow_peer = vec!["10.10.1.94/32".into()];
     assert!(validate(&c, now()).is_ok(), "{:?}", validate(&c, now()));
 }
 
@@ -401,7 +401,7 @@ fn cluster_secondary_plaintext_offbox_peer_errors() {
     // would leak the bearer token; rejected at lint.
     let mut c = ConfigV1::test_scaffold();
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("http://192.0.2.10:8053".into());
+    c.cluster.peer = Some("http://10.10.1.94:8053".into());
     let mut errs = Vec::new();
     check_cluster(&c, &mut errs);
     assert_eq!(errs.len(), 1, "{errs:?}");
@@ -443,7 +443,7 @@ fn a_policy_free_secondary_master_validates_before_its_first_sync() {
     c.upstream.servers.clear();
     c.cluster.enabled = true;
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
     c.cluster.token_hash = Some("00".repeat(32));
 
     validate(&c, now())
@@ -462,7 +462,7 @@ fn the_secondary_exemption_does_not_excuse_a_malformed_upstream() {
     c.upstream.servers = vec!["not a resolver at all".into()];
     c.cluster.enabled = true;
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
     c.cluster.token_hash = Some("00".repeat(32));
 
     assert!(
@@ -490,7 +490,7 @@ fn the_secondary_exemption_does_not_cover_an_empty_upstream_fallback() {
     });
     c.cluster.enabled = true;
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
     c.cluster.token_hash = Some("00".repeat(32));
 
     let errs = validate(&c, now())
@@ -531,7 +531,7 @@ fn an_unjoined_secondary_gets_no_exemption() {
     c.upstream.servers.clear();
     c.cluster.enabled = false;
     c.cluster.role = ClusterRole::Secondary;
-    c.cluster.peer = Some("https://192.0.2.10:8053".into());
+    c.cluster.peer = Some("https://10.10.1.94:8053".into());
 
     assert!(
         validate(&c, now()).is_err(),
@@ -2516,10 +2516,10 @@ fn list_prune_warn_const_is_pinned() {
 
 #[test]
 fn list_prune_warn_format_helper_substitutes() {
-    let s = format_list_prune_warn("operator-iphone", 70);
-    assert!(s.contains("'operator-iphone'"));
+    let s = format_list_prune_warn("dweller-iphone", 70);
+    assert!(s.contains("'dweller-iphone'"));
     assert!(s.contains("70 rules"));
-    assert!(s.contains("warden device rules operator-iphone prune"));
+    assert!(s.contains("warden device rules dweller-iphone prune"));
 }
 
 #[test]
@@ -2681,7 +2681,7 @@ fn blocklist_url_policy_agrees_with_the_fetcher() {
         "https://172.16.0.1/ads.txt",
         "https://127.0.0.1/ads.txt",
         "https://169.254.1.1/ads.txt",
-        "https://192.0.2.1/ads.txt",
+        "https://100.64.0.9/ads.txt",
         "https://0.0.0.0/ads.txt",
         "https://[::1]/ads.txt",
         "https://[fc00::1]/ads.txt",
@@ -3480,11 +3480,11 @@ fn labels_warn_on_a_value_outside_the_vocabulary() {
 #[test]
 fn labels_accept_the_id_as_well_as_the_display_name() {
     let mut c = basic_config();
-    c.labels = vec![label("operator", LabelKind::Owner, "Operator")];
+    c.labels = vec![label("dweller", LabelKind::Owner, "Dweller")];
     let mut by_id = device("a", "10.0.0.1", None);
-    by_id.owner = Some("operator".into());
+    by_id.owner = Some("dweller".into());
     let mut by_name = device("b", "10.0.0.2", None);
-    by_name.owner = Some("Operator".into());
+    by_name.owner = Some("Dweller".into());
     c.devices = vec![by_id, by_name];
 
     let (_, warns) = validate_rows(&c);
@@ -3504,7 +3504,7 @@ fn labels_accept_the_id_as_well_as_the_display_name() {
 fn labels_empty_vocabulary_warns_about_nothing() {
     let mut c = basic_config();
     let mut d = device("a", "10.0.0.1", None);
-    d.owner = Some("Operator".into());
+    d.owner = Some("Dweller".into());
     d.device_type = Some("Apple TV".into());
     d.department = Some("Persona".into());
     c.devices = vec![d];
@@ -3525,9 +3525,9 @@ fn labels_empty_vocabulary_warns_about_nothing() {
 #[test]
 fn labels_one_kinds_vocabulary_does_not_police_another() {
     let mut c = basic_config();
-    c.labels = vec![label("operator", LabelKind::Owner, "Operator")];
+    c.labels = vec![label("dweller", LabelKind::Owner, "Dweller")];
     let mut d = device("a", "10.0.0.1", None);
-    d.owner = Some("Operator".into());
+    d.owner = Some("Dweller".into());
     d.department = Some("Persona".into()); // no department vocabulary
     c.devices = vec![d];
 
@@ -3544,9 +3544,9 @@ fn labels_one_kinds_vocabulary_does_not_police_another() {
 /// must never adopt it itself.
 #[test]
 fn device_metadata_unknown_label_string_is_actionable() {
-    let s = format_device_metadata_unknown_label("iphone", "owner", "Operator", "owner");
+    let s = format_device_metadata_unknown_label("iphone", "owner", "Dweller", "owner");
     assert!(
-        s.contains("device \"iphone\".owner = \"Operator\""),
+        s.contains("device \"iphone\".owner = \"Dweller\""),
         "got: {s}"
     );
     assert!(s.contains("warden label add"), "got: {s}");

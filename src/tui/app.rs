@@ -971,8 +971,8 @@ pub struct DeviceFormState {
     /// one snapshot per kind, taken at modal-open.
     ///
     /// These hold **display names**, not ids, and that is the whole point.
-    /// `Device.owner` is free text (`"Operator"`) while `Label.id` is an `Id`
-    /// (`"operator"`), so the two can never be equal — the intersection is
+    /// `Device.owner` is free text (`"Dweller"`) while `Label.id` is an `Id`
+    /// (`"dweller"`), so the two can never be equal — the intersection is
     /// empty by construction. `Label::matches_value` accepts id **or**
     /// display_name, so writing the display name is what silences the
     /// unknown-value WARN while staying readable in the Devices table.
@@ -3718,11 +3718,11 @@ mod tests {
     #[test]
     fn field_buf_writes_propagate_to_named_field() {
         let mut f = DeviceFormState::new_add();
-        f.field_buf(DeviceFormField::Name).push_str("casey-laptop");
+        f.field_buf(DeviceFormField::Name).push_str("user2-laptop");
         f.field_buf(DeviceFormField::Ip).push_str("192.168.1.42");
         f.field_buf(DeviceFormField::Department)
             .push_str("famiglia");
-        assert_eq!(f.name, "casey-laptop");
+        assert_eq!(f.name, "user2-laptop");
         assert_eq!(f.ip, "192.168.1.42");
         assert_eq!(f.department, "famiglia");
     }
@@ -3751,7 +3751,7 @@ mod tests {
             "AA:BB:CC:DD:EE:01,AA:BB:CC:DD:EE:02".into(),
             "kids".into(),
             "kids-group".into(),
-            "Casey".into(),
+            "User2".into(),
             "iPad".into(),
             "famiglia".into(),
             "compleanno: gennaio".into(),

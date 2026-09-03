@@ -240,7 +240,10 @@ fn format_added_profile_substitutes_domain_type_value_profile_n() {
 #[test]
 fn format_removed_substitutes_domain_and_scope() {
     let global = format_local_records_removed("example.test", "global");
-    assert_eq!(global, "Removed local DNS record 'example.test' from global.");
+    assert_eq!(
+        global,
+        "Removed local DNS record 'example.test' from global."
+    );
     let profile = format_local_records_removed("example.test", "profile 'default'");
     assert_eq!(
         profile,

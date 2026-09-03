@@ -1,9 +1,9 @@
 [[devices]]
-id = "operator-iphone"
-display_name = "iPhone di Operator"
+id = "dweller-iphone"
+display_name = "iPhone di Dweller"
 ip = "10.10.1.107"
 mac = "AA:BB:CC:DD:EE:FF"
 profile = "default"
 groups = ["famiglia"]
 tags = ["mobile", "personal"]
-owner = "Operator"
+owner = "Dweller"

@@ -86,9 +86,9 @@ mod tests {
 
     #[test]
     fn device_attribution_carries_device_id() {
-        let src = RuleSource::Device(Id::new("operator-iphone").unwrap());
+        let src = RuleSource::Device(Id::new("dweller-iphone").unwrap());
         assert_eq!(src.as_label(), "device");
-        assert_eq!(src.entity_id().map(|i| i.as_str()), Some("operator-iphone"));
+        assert_eq!(src.entity_id().map(|i| i.as_str()), Some("dweller-iphone"));
     }
 
     #[test]

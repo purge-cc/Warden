@@ -701,12 +701,12 @@ fn logs_query_accepts_under_cap_domain_and_client() {
     // accidental over-tightening of the helper.
     let body = serde_json::json!({
         "domain": "ads.example.com",
-        "client": "operator-laptop",
+        "client": "dweller-laptop",
         "blocked": true,
     });
     let parsed: LogsQuery = serde_json::from_value(body).unwrap();
     assert_eq!(parsed.domain.as_deref(), Some("ads.example.com"));
-    assert_eq!(parsed.client.as_deref(), Some("operator-laptop"));
+    assert_eq!(parsed.client.as_deref(), Some("dweller-laptop"));
     assert!(parsed.blocked);
 }
 
