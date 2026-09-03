@@ -368,7 +368,7 @@ colour = "red"
         assert!(l.matches_value("Operator"));
         // Case folding is deliberately absent: `Personal` vs `Persona`
         // is the defect being hunted, and no folding would merge those.
-        assert!(!l.matches_value("EDOARDO"));
+        assert!(!l.matches_value("OPERATOR"));
         assert!(!l.matches_value("edoard"));
     }
 
