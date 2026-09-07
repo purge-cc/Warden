@@ -5,8 +5,12 @@ prints at `/stable`. This tree's crate version is in `Cargo.toml`.
 
 ## [Unreleased]
 
-- [List refresh integrity](docs/releases/unreleased.md): safer refreshes, cache
-  publication, recovery, and bounded-memory streaming.
+- No user-visible changes recorded yet.
+
+## [0.41.0](docs/releases/0.41.0.md)
+
+- Safer list refreshes, cache publication, recovery, and bounded-memory
+  streaming.
 
 ## [0.40.1](docs/releases/0.40.1.md)
 
