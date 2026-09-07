@@ -3,7 +3,12 @@
 The installable release is whatever [get.purge.cc](https://get.purge.cc)
 prints at `/stable`. This tree's crate version is in `Cargo.toml`.
 
-## [0.40.1]
+## [Unreleased]
+
+- [List refresh integrity](docs/releases/unreleased.md): safer refreshes, cache
+  publication, recovery, and bounded-memory streaming.
+
+## [0.40.1](docs/releases/0.40.1.md)
 
 Current public source.
 

@@ -22,7 +22,8 @@
   <a href="https://purge.cc">website</a> ·
   <a href="https://lists.purge.cc">lists</a> ·
   <a href="https://get.purge.cc">installer</a> ·
-  <a href="docs/CONFIG_GUIDE.md">config guide</a>
+  <a href="docs/CONFIG_GUIDE.md">config guide</a> ·
+  <a href="CHANGELOG.md">changelog</a>
 </p>
 
 <p align="center">

@@ -5,35 +5,175 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write   # create the GitHub Release + upload binary assets
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  create-release:
-    name: create release
+  verify:
+    name: verify release
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Create the release (idempotent)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.94.0
+          components: clippy, rustfmt
+      - name: Check tag and release notes
+        id: release-version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "purge-warden") | .version')"
+          if [[ -z "$version" || "$version" == "null" || "$version" == *$'\n'* ]]; then
+            printf 'Could not read a single purge-warden package version.\n' >&2
+            exit 1
+          fi
+          if [[ "$TAG" != "v$version" ]]; then
+            printf 'Tag %s does not match Cargo package version v%s.\n' "$TAG" "$version" >&2
+            exit 1
+          fi
+          if [[ ! -f "docs/releases/$version.md" ]]; then
+            printf 'Missing required release notes: docs/releases/%s.md\n' "$version" >&2
+            exit 1
+          fi
+          if [[ "$(head -n 1 "docs/releases/$version.md")" != "# $version" ]]; then
+            printf 'Release notes must start with: # %s\n' "$version" >&2
+            exit 1
+          fi
+          if ! grep -Fq "(docs/releases/$version.md)" CHANGELOG.md; then
+            printf 'CHANGELOG.md does not link docs/releases/%s.md.\n' "$version" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            printf 'Release commit is not contained in public main.\n' >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Run public checks
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          for file in \
+            scripts/install.sh \
+            scripts/get.sh \
+            scripts/uninstall.sh \
+            scripts/upgrade_config_gate.sh \
+            scripts/migrate-shield-to-warden.sh
+          do
+            if [[ ! -x "$file" ]]; then
+              printf 'Missing executable installer dependency: %s\n' "$file" >&2
+              exit 1
+            fi
+          done
+          dash -n scripts/get.sh
+          ./scripts/check_no_raw_fs_write.sh
+          cargo fmt --check
+          cargo clippy --locked --all-targets
+          cargo clippy --locked --all-targets --features dnssec
+          cargo test --locked
+          cargo test --locked --features dnssec
+
+  create-release:
+    name: create draft release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Inspect an existing release
+        id: existing-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag || echo "release already exists"
+        run: |
+          set -euo pipefail
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$state" != "true" ]]; then
+              printf 'Release %s already exists and is not a draft.\n' "$TAG" >&2
+              exit 1
+            fi
+            printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create draft release
+        if: steps.existing-release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: gh release create "$TAG" --title "$TAG" --draft --verify-tag --notes-file "docs/releases/$VERSION.md"
+      - name: Refresh existing draft notes
+        if: steps.existing-release.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: gh release edit "$TAG" --notes-file "docs/releases/$VERSION.md"
 
   binaries:
     name: binary (${{ matrix.target }})
-    needs: create-release
+    needs: [verify, create-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.94.0
       - name: Build and upload ${{ matrix.target }}
-        uses: taiki-e/upload-rust-binary-action@v1
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: warden
           target: ${{ matrix.target }}
           archive: warden-$tag-$target
+          locked: true
+          ref: refs/tags/${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    name: publish release
+    needs: [create-release, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish draft after all assets upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for expected in \
+            "warden-$TAG-x86_64-unknown-linux-gnu.tar.gz" \
+            "warden-$TAG-aarch64-unknown-linux-musl.tar.gz"
+          do
+            if ! grep -Fxq "$expected" <<< "$assets"; then
+              printf 'Draft release is missing required asset: %s\n' "$expected" >&2
+              exit 1
+            fi
+          done
+          gh release edit "$TAG" --draft=false
