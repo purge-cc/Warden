@@ -5128,7 +5128,15 @@ async fn submit_custom_list_modal(
                 } else {
                     let r = match form.mode {
                         FormMode::Add => create_custom_list(config_path, &resolved),
-                        FormMode::Edit => update_custom_list_meta(config_path, &resolved),
+                        FormMode::Edit => form
+                            .original
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "custom-list edit lost its original snapshot".to_string()
+                            })
+                            .and_then(|original| {
+                                update_custom_list_meta(config_path, &resolved, original)
+                            }),
                     };
                     match r {
                         Ok(msg) => SubmitOutcome::Ok(msg),
@@ -5147,13 +5155,15 @@ async fn submit_custom_list_modal(
             // mtime, which the leaf's UPDATED column reports, and spend a
             // daemon reload on a no-op.
             let written = match form.replacing() {
-                None => add_rule_to_pack(app, &form.list_id, form.domain.trim(), form.allow),
+                None => {
+                    add_rule_to_pack(config_path, &form.list_id, form.domain.trim(), form.allow)
+                }
                 Some((line, ..)) if form.is_unchanged() => {
                     wrote = false;
                     Ok(format!("line {line} of {} unchanged", form.list_id))
                 }
                 Some((line, was_domain, was_allow)) => replace_rule_in_pack(
-                    app,
+                    config_path,
                     &form.list_id,
                     line,
                     (was_domain, was_allow),
@@ -5167,7 +5177,7 @@ async fn submit_custom_list_modal(
             }
         }
         Stage::ConfirmingRuleRemove(rc) => {
-            match remove_rule_from_pack(app, &rc.list_id, &rc.domain) {
+            match remove_rule_from_pack(config_path, &rc.list_id, &rc.domain) {
                 Ok(msg) => SubmitOutcome::Ok(msg),
                 Err(msg) => SubmitOutcome::Failed(msg),
             }
@@ -5249,18 +5259,26 @@ async fn submit_custom_list_modal(
 /// cleanly, or "repair" it by deleting every comment and every line the
 /// reader had skipped. A pack in the field carries more comment lines than
 /// rules.
-fn add_rule_to_pack(app: &App, list_id: &str, domain: &str, allow: bool) -> Result<String, String> {
+fn add_rule_to_pack(
+    config_path: &Path,
+    list_id: &str,
+    domain: &str,
+    allow: bool,
+) -> Result<String, String> {
     use crate::config::custom_list::AddOutcome;
 
     if domain.is_empty() {
         return Err("a domain is required".into());
     }
-    let loaded = app
-        .loaded_config
-        .as_ref()
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
+    crate::config::custom_list::normalise_domain(domain).map_err(|error| error.to_string())?;
     let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    match crate::tui::tabs::custom_lists::append_rule(loaded, &id, domain, allow)
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
+        return Err("no longer declared".to_string());
+    }
+    match crate::tui::tabs::custom_lists::append_rule_locked(&guard, &loaded, &id, domain, allow)
         .map_err(|e| e.to_string())?
     {
         AddOutcome::Added => Ok(format!(
@@ -5287,7 +5305,7 @@ fn add_rule_to_pack(app: &App, list_id: &str, domain: &str, allow: bool) -> Resu
 /// when the selection changes or a write lands here, so a write from
 /// anywhere else moves the numbering under it.
 fn replace_rule_in_pack(
-    app: &App,
+    config_path: &Path,
     list_id: &str,
     line: usize,
     expect: (&str, bool),
@@ -5297,24 +5315,35 @@ fn replace_rule_in_pack(
     if domain.is_empty() {
         return Err("a domain is required".into());
     }
-    let loaded = app
-        .loaded_config
-        .as_ref()
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
+    crate::config::custom_list::normalise_domain(domain).map_err(|error| error.to_string())?;
     let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    crate::tui::tabs::custom_lists::replace_rule(loaded, &id, line, expect, domain, allow)
-        .map_err(|e| e.to_string())?;
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
+        return Err("no longer declared".to_string());
+    }
+    crate::tui::tabs::custom_lists::replace_rule_locked(
+        &guard, &loaded, &id, line, expect, domain, allow,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(format!("replaced line {line} of {list_id}"))
 }
 
 /// Drop every rule naming `domain`, **in both directions**.
-fn remove_rule_from_pack(app: &App, list_id: &str, domain: &str) -> Result<String, String> {
-    let loaded = app
-        .loaded_config
-        .as_ref()
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
+fn remove_rule_from_pack(
+    config_path: &Path,
+    list_id: &str,
+    domain: &str,
+) -> Result<String, String> {
     let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    let removed = crate::tui::tabs::custom_lists::delete_rule(loaded, &id, domain)
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
+        return Err("no longer declared".to_string());
+    }
+    let removed = crate::tui::tabs::custom_lists::delete_rule_locked(&guard, &loaded, &id, domain)
         .map_err(|e| e.to_string())?;
     if removed {
         Ok(format!("removed {domain} from {list_id}"))
@@ -5364,103 +5393,101 @@ fn custom_list_value(resolved: &custom_list_modal::ResolvedForm) -> toml::Value 
     toml::Value::Table(tbl)
 }
 
-/// The file that declares `[[custom_lists]]` with this id.
-///
-/// The array is merged by concatenation across the include graph, so an
-/// entry may legitimately live in a fragment. A removal aimed at the master
-/// would no-op while reporting success, and the list would still be there
-/// after the reload.
-///
-/// `Err` is a file in `files_loaded` — the loader's own record of files it
-/// successfully read — that can no longer be read or parsed: a permission
-/// change or a truncated write since load. It must not collapse into
-/// `Ok(None)`: the entity IS declared, and "no file declares it" sends the
-/// operator to look for the wrong thing; `kind_toggle_gate`
-/// already draws exactly this line elsewhere in this same
-/// file.
-fn custom_list_owner_file(
+/// One owner document plus the source text used for preserving rendering.
+struct OwnedConfigDocument {
+    path: PathBuf,
+    value: toml::Value,
+    raw: String,
+}
+
+fn custom_list_owner_document_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
     loaded: &crate::config::loader::LoadedConfig,
     id: &str,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<OwnedConfigDocument>, String> {
+    array_entry_owner_document_locked(guard, master, loaded, "custom_lists", id)
+}
+
+fn blocklist_owner_document_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    loaded: &crate::config::loader::LoadedConfig,
+    id: &str,
+) -> Result<Option<OwnedConfigDocument>, String> {
+    array_entry_owner_document_locked(guard, master, loaded, "blocklists", id)
+}
+
+/// The loaded document that owns an array entry keyed by `id`.
+fn array_entry_owner_document_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    loaded: &crate::config::loader::LoadedConfig,
+    array_key: &str,
+    id: &str,
+) -> Result<Option<OwnedConfigDocument>, String> {
     for path in &loaded.files_loaded {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let value = text
-            .parse::<toml::Value>()
-            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-        let declares_id = value
-            .get("custom_lists")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .any(|item| item.get("id").and_then(|v| v.as_str()) == Some(id))
-            })
-            .unwrap_or(false);
-        if declares_id {
-            return Ok(Some(path.clone()));
+        let (value, raw) = crate::cli::commands::target::read_or_empty_locked(guard, master, path)
+            .map_err(|e| e.to_string())?;
+        if raw.is_none() {
+            return Err(format!(
+                "cannot read {}: file disappeared after config load",
+                path.display()
+            ));
+        }
+        if document_declares_id(&value, array_key, id) {
+            return Ok(Some(OwnedConfigDocument {
+                path: path.clone(),
+                value,
+                raw: raw.expect("the preceding missing-file check found source text"),
+            }));
         }
     }
     Ok(None)
 }
 
-/// Create a custom list: **the file first, then the declaration.**
+fn document_declares_id(doc: &toml::Value, array_key: &str, id: &str) -> bool {
+    doc.get(array_key)
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+        })
+}
+
+/// Create a custom list under one tree guard: publish the create-only pack,
+/// then promote its declaration through that same guard.
 ///
-/// `write_value_validated` runs the whole loader, and `build_store` fails
-/// the entire config on one unreadable pack — so declaring a list whose
-/// file does not exist yet would be refused, and on a daemon reload it
-/// would take every other list down with it.
-///
-/// The id is checked before either step because both are destructive on a
-/// collision: `create_pack` goes through `hardened_atomic_write`, which
-/// OVERWRITES, and `upsert_id_keyed` REPLACES. An `a` on a taken id would
-/// delete that list's rules before the config write was even attempted.
-///
-/// # Why the guard is scoped rather than held across both steps
-///
-/// `write_value_validated` takes the tree lock itself, and `claim_tree`
-/// records why a guard still live here would stall against it. The scope
-/// buys exactly one thing: every pack write in this tree happens under the
-/// lock. It does **not** make the two steps one transaction, and it does
-/// not close the id collision — the existence check above runs unlocked,
-/// so two concurrent creates for one id still both pass it.
+/// The loader cannot validate a declaration whose pack is missing, so pack
+/// publication precedes declaration promotion. A pre-commit or durably
+/// restored declaration failure can roll back only this operation's inode;
+/// an uncertain commit deliberately retains the pack and reports recovery.
 fn create_custom_list(
     config_path: &Path,
     resolved: &custom_list_modal::ResolvedForm,
 ) -> Result<String, String> {
-    use crate::cli::commands::target::{read_or_empty, upsert_id_keyed, write_value_validated};
-    use crate::config::custom_list::{create_pack, pack_dir, pack_path};
+    use crate::cli::commands::target::{
+        commit_prevalidated_single_write, prepare_value_validated_single_locked,
+        read_or_empty_locked, upsert_id_keyed,
+    };
+    use crate::config::custom_list::io::create_pack_with_receipt;
+    use crate::config::custom_list::pack_path;
     use crate::config::schema::Id;
     use crate::tui::tabs::custom_lists;
 
     let id = Id::new(resolved.id.as_str()).map_err(|e| format!("id: {e}"))?;
-    let loaded = load_v1_config(config_path)
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
+    let guard = custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
     if loaded.config.custom_lists.iter().any(|c| c.id == id) {
         return Err(format!(
             "a custom list named {} already exists",
             resolved.id
         ));
     }
-    let root = loaded
-        .master_path
-        .parent()
-        .ok_or_else(|| "the configuration has no parent directory".to_string())?;
-
-    std::fs::create_dir_all(pack_dir(root))
-        .map_err(|e| format!("creating the packs directory: {e}"))?;
-    let path = pack_path(root, &id);
-    {
-        let lock = custom_lists::claim_tree(&loaded).map_err(|e| e.to_string())?;
-        create_pack(
-            &lock,
-            &path,
-            &resolved.display_name,
-            custom_lists::max_pack_bytes(&loaded),
-        )
+    let path = pack_path(&guard.identity().root, &id);
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &loaded.master_path)
         .map_err(|e| e.to_string())?;
-    }
-
-    let (mut doc, _) = read_or_empty(&loaded.master_path).map_err(|e| e.to_string())?;
     upsert_id_keyed(
         &mut doc,
         "custom_lists",
@@ -5468,38 +5495,112 @@ fn create_custom_list(
         custom_list_value(resolved),
     )
     .map_err(|e| e.to_string())?;
-    write_value_validated(config_path, &loaded.master_path, &doc).map_err(|e| {
-        // The file is already down. Say so rather than leaving an orphan
-        // the operator cannot account for.
-        format!(
-            "validator: {e} — {} was created and is not declared; remove it or retry",
-            path.display()
-        )
-    })?;
+    let receipt = create_pack_with_receipt(
+        &guard,
+        &path,
+        &resolved.display_name,
+        custom_lists::max_pack_bytes(&loaded),
+    )
+    .map_err(|e| e.to_string())?;
+    let prepared =
+        match prepare_value_validated_single_locked(&guard, config_path, &loaded.master_path, &doc)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return match receipt.rollback() {
+                    Ok(()) => Err(format!("validator: {error}")),
+                    Err(rollback_error) => Err(format!(
+                        "recovery required: declaration validation failed ({error}); \
+                     could not remove newly created {}: {rollback_error:#}",
+                        path.display()
+                    )),
+                };
+            }
+        };
+    if let Err(commit_error) = commit_prevalidated_single_write(prepared) {
+        return finish_custom_list_declaration_commit_failure(receipt, &path, commit_error);
+    }
     Ok(format!("created custom list {}", resolved.id))
+}
+
+fn finish_custom_list_declaration_commit_failure(
+    receipt: crate::config::custom_list::io::CreatedPack<'_>,
+    path: &Path,
+    commit_error: crate::cli::commands::target::ConfigCommitFailure,
+) -> Result<String, String> {
+    use crate::cli::commands::target::ConfigCommitDisposition;
+
+    match commit_error.disposition() {
+        ConfigCommitDisposition::Untouched | ConfigCommitDisposition::RestoredDurably => {
+            match receipt.rollback() {
+                Ok(()) => Err(format!("validator: {commit_error}")),
+                Err(rollback_error) => Err(format!(
+                    "recovery required: declaration commit failed ({commit_error}); \
+                     could not remove newly created {}: {rollback_error:#}",
+                    path.display()
+                )),
+            }
+        }
+        ConfigCommitDisposition::Uncertain => Err(format!(
+            "recovery required: declaration commit is uncertain ({commit_error}); \
+             retaining newly created {}",
+            path.display()
+        )),
+    }
 }
 
 /// Rewrite an entity's metadata. The pack file is not touched.
 fn update_custom_list_meta(
     config_path: &Path,
     resolved: &custom_list_modal::ResolvedForm,
+    original: &custom_list_modal::OriginalSnapshot,
 ) -> Result<String, String> {
-    use crate::cli::commands::target::{read_or_empty, upsert_id_keyed, write_value_validated};
+    use crate::cli::commands::target::write_value_validated_locked;
 
-    let loaded = load_v1_config(config_path)
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
-    let owner = custom_list_owner_file(&loaded, &resolved.id)?
-        .ok_or_else(|| format!("no file declares custom list '{}'", resolved.id))?;
-    let (mut doc, _) = read_or_empty(&owner).map_err(|e| e.to_string())?;
-    upsert_id_keyed(
-        &mut doc,
-        "custom_lists",
-        &resolved.id,
-        custom_list_value(resolved),
-    )
-    .map_err(|e| e.to_string())?;
-    write_value_validated(config_path, &owner, &doc).map_err(|e| format!("validator: {e}"))?;
+    if resolved.id != original.id {
+        return Err("custom list identity changed — reopen the list".to_string());
+    }
+
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    let mut owner = custom_list_owner_document_locked(&guard, config_path, &loaded, &original.id)?
+        .ok_or_else(|| format!("custom list '{}' no longer declared", original.id))?;
+    patch_custom_list_metadata(&mut owner.value, original, resolved)?;
+    write_value_validated_locked(&guard, config_path, &owner.path, &owner.value)
+        .map_err(|e| format!("validator: {e}"))?;
     Ok(format!("updated custom list {}", resolved.id))
+}
+
+/// Apply only the metadata fields the edit form changed since it opened.
+fn patch_custom_list_metadata(
+    doc: &mut toml::Value,
+    original: &custom_list_modal::OriginalSnapshot,
+    resolved: &custom_list_modal::ResolvedForm,
+) -> Result<(), String> {
+    let lists = doc
+        .get_mut("custom_lists")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| "no [[custom_lists]] entries in the owning file".to_string())?;
+    let live = lists
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(&original.id))
+        .and_then(|entry| entry.as_table_mut())
+        .ok_or_else(|| format!("custom list '{}' no longer declared", original.id))?;
+
+    if resolved.display_name != original.display_name {
+        live.insert(
+            "display_name".to_string(),
+            toml::Value::String(resolved.display_name.clone()),
+        );
+    }
+    if resolved.description != original.description {
+        live.insert(
+            "description".to_string(),
+            toml::Value::String(resolved.description.clone()),
+        );
+    }
+    Ok(())
 }
 
 /// Remove the declaration. **The pack file is left on disk.**
@@ -5510,17 +5611,18 @@ fn update_custom_list_meta(
 /// Leaving the file costs a stale `packs/<id>.txt`; the confirm says so,
 /// and `create_custom_list` refuses a taken id rather than adopting it.
 fn remove_custom_list(config_path: &Path, id: &str) -> Result<String, String> {
-    use crate::cli::commands::target::{read_or_empty, remove_id_keyed, write_value_validated};
+    use crate::cli::commands::target::{remove_id_keyed, write_value_validated_locked};
 
-    let loaded = load_v1_config(config_path)
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
-    let owner = custom_list_owner_file(&loaded, id)?
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    let mut owner = custom_list_owner_document_locked(&guard, config_path, &loaded, id)?
         .ok_or_else(|| format!("no file declares custom list '{id}'"))?;
-    let (mut doc, _) = read_or_empty(&owner).map_err(|e| e.to_string())?;
-    if !remove_id_keyed(&mut doc, "custom_lists", id).map_err(|e| e.to_string())? {
+    if !remove_id_keyed(&mut owner.value, "custom_lists", id).map_err(|e| e.to_string())? {
         return Err(format!("custom list '{id}' not found — already removed?"));
     }
-    write_value_validated(config_path, &owner, &doc).map_err(|e| format!("validator: {e}"))?;
+    write_value_validated_locked(&guard, config_path, &owner.path, &owner.value)
+        .map_err(|e| format!("validator: {e}"))?;
     Ok(format!("removed custom list {id}"))
 }
 
@@ -5628,25 +5730,34 @@ async fn submit_custom_list_mount(app: &mut App, poller: &IpcPoller, config_path
 ///
 /// Walks `files_loaded`, the loader's own record of what it read.
 /// `Err` is a file in `files_loaded` that can no longer be read or parsed —
-/// see [`custom_list_owner_file`], which carries the same rule and the
+/// see [`custom_list_owner_document_locked`], which carries the same rule and the
 /// same reason.
-fn profile_owner_file(
+fn profile_owner_document_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
     loaded: &crate::config::loader::LoadedConfig,
     profile: &str,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<OwnedConfigDocument>, String> {
     for path in &loaded.files_loaded {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let value = text
-            .parse::<toml::Value>()
-            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        let (value, raw) = crate::cli::commands::target::read_or_empty_locked(guard, master, path)
+            .map_err(|e| e.to_string())?;
+        if raw.is_none() {
+            return Err(format!(
+                "cannot read {}: file disappeared after config load",
+                path.display()
+            ));
+        }
         let declares_profile = value
             .get("profiles")
             .and_then(|v| v.as_table())
             .map(|t| t.contains_key(profile))
             .unwrap_or(false);
         if declares_profile {
-            return Ok(Some(path.clone()));
+            return Ok(Some(OwnedConfigDocument {
+                path: path.clone(),
+                value,
+                raw: raw.expect("the preceding missing-file check found source text"),
+            }));
         }
     }
     Ok(None)
@@ -5699,8 +5810,8 @@ fn set_profile_custom_lists(
 
 /// Apply every staged mount in ONE validated promotion.
 ///
-/// Grouped by owning file and promoted together rather than one profile at
-/// a time: `write_value_validated` per profile would run one full
+/// Grouped by owning file and promoted together through one held guard rather
+/// than one profile at a time: separate guarded promotions would run one full
 /// validation and one rename each, so a refusal half-way would leave the
 /// operator's intent partly applied with nothing saying which half landed.
 ///
@@ -5718,24 +5829,31 @@ fn apply_custom_list_mounts(
     list_id: &str,
     changes: &[(String, bool)],
 ) -> Result<String, String> {
-    use crate::cli::commands::target::{read_or_empty, write_values_validated, StagedWrite};
+    use crate::cli::commands::target::{write_values_validated_locked, StagedWrite};
     use crate::cli::commands::toml_write::render_preserving;
 
-    let loaded = load_v1_config(config_path)
-        .ok_or_else(|| "the configuration could not be read".to_string())?;
+    let guard =
+        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    if !loaded
+        .config
+        .custom_lists
+        .iter()
+        .any(|custom_list| custom_list.id.as_str() == list_id)
+    {
+        return Err(format!("custom list '{list_id}' no longer declared"));
+    }
 
     // path -> (original text, edited doc)
     let mut edits: Vec<(PathBuf, String, toml::Value)> = Vec::new();
     for (profile, mount) in changes {
-        let owner = profile_owner_file(&loaded, profile)?
+        let owner = profile_owner_document_locked(&guard, config_path, &loaded, profile)?
             .ok_or_else(|| format!("no file declares profile '{profile}'"))?;
 
-        let slot = match edits.iter().position(|(p, _, _)| *p == owner) {
+        let slot = match edits.iter().position(|(p, _, _)| p == &owner.path) {
             Some(i) => i,
             None => {
-                let original = std::fs::read_to_string(&owner).unwrap_or_default();
-                let (doc, _) = read_or_empty(&owner).map_err(|e| e.to_string())?;
-                edits.push((owner, original, doc));
+                edits.push((owner.path, owner.raw, owner.value));
                 edits.len() - 1
             }
         };
@@ -5764,7 +5882,8 @@ fn apply_custom_list_mounts(
         })
         .collect::<Result<_, String>>()?;
 
-    write_values_validated(&loaded.master_path, &writes).map_err(|e| format!("validator: {e}"))?;
+    write_values_validated_locked(&guard, config_path, &writes)
+        .map_err(|e| format!("validator: {e}"))?;
 
     let mounted = changes.iter().filter(|(_, on)| *on).count();
     let unmounted = changes.len() - mounted;
@@ -7017,129 +7136,353 @@ async fn handle_file_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, confi
             };
         }
         KeyCode::Char('e') => {
-            // Open config in $EDITOR — we need to temporarily leave the
-            // TUI. Capture step-by-step failures into the footer hint
-            // instead of silently swallowing them: when something goes
-            // wrong, the operator needs the exact next command. The first failure
-            // in the chain wins so the operator sees the earliest break;
-            // subsequent steps still run best-effort so the terminal
-            // lands as close to a usable TUI as possible.
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-            let mut step_error: Option<String> = None;
-
-            // Pause the event-reader thread before handing the tty to
-            // $EDITOR. Otherwise it keeps calling event::read() on the same
-            // terminal — racing the editor per byte (dropped chars while editing
-            // the master config) and queuing the bytes it steals as keys that
-            // replay against the TUI on return (a swallowed `q` quits). Wait
-            // (bounded, ~200ms) for the reader to ack `parked` before leaving raw
-            // mode so no in-flight read consumes a byte; proceed best-effort if it
-            // does not park in time (worst case degrades to the old race, no hang).
-            // Resumed after the screen is restored below.
-            app.reader_suspended
-                .store(true, std::sync::atomic::Ordering::Release);
-            for _ in 0..40 {
-                if app.reader_parked.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-
-            if let Err(e) = disable_raw_mode() {
-                step_error.get_or_insert(format!(
-                    "could not leave raw mode before launching $EDITOR ({editor}): {e}. \
-                     Editor output may be garbled. Press 'q' to exit and re-launch the dashboard."
-                ));
-            }
-            if let Err(e) = execute!(std::io::stdout(), LeaveAlternateScreen) {
-                step_error.get_or_insert(format!(
-                    "could not leave alternate screen before launching $EDITOR ({editor}): {e}. \
-                     Press 'q' to exit and re-launch the dashboard."
-                ));
-            }
-
-            // Word-split $EDITOR so multi-token values (`code -w`,
-            // `emacsclient -t`) spawn — first token is the program, the rest
-            // are leading args before the config path. Reuses the CLI
-            // `config edit` splitter so both $EDITOR shell-outs parse alike.
-            // The full `editor` string is kept verbatim for the error messages.
-            let (program, args) =
-                crate::cli::commands::config::edit::split_editor_invocation(&editor);
-            let editor_status = if program.is_empty() {
-                // EDITOR was empty/all-whitespace (the `unwrap_or` above only
-                // covers *unset*) — fall back to vi so `e` still does something.
-                std::process::Command::new("vi").arg(config_path).status()
-            } else {
-                std::process::Command::new(&program)
-                    .args(&args)
-                    .arg(config_path)
-                    .status()
-            };
-            if let Some(msg) = format_editor_failure(&editor, editor_status) {
-                step_error.get_or_insert(msg);
-            }
-
-            if let Err(e) = enable_raw_mode() {
-                step_error.get_or_insert(format!(
-                    "could not re-enter raw mode after $EDITOR ({editor}): {e}. \
-                     TUI input may be unreliable. Press 'q' to exit cleanly."
-                ));
-            }
-            if let Err(e) = execute!(std::io::stdout(), EnterAlternateScreen) {
-                step_error.get_or_insert(format!(
-                    "could not re-enter alternate screen after $EDITOR ({editor}): {e}. \
-                     TUI may render in scrollback. Press 'q' to exit cleanly."
-                ));
-            }
-
-            // The screen is restored — let the reader resume reading the
-            // tty. Any tick it owes for the elapsed editor session fires once on
-            // resume (harmless — it just refreshes the just-edited config view).
-            app.reader_suspended
-                .store(false, std::sync::atomic::Ordering::Release);
-
-            // Always reload config — last-write-wins. Even on a non-zero
-            // editor exit the operator may have saved partial edits, and
-            // the in-memory view must match the on-disk state.
-            let (sections, text) = file::load_config(config_path);
-            app.file.sections = sections;
-            app.file.config_text = text;
-
-            // The edit landed on the master config. Nothing watches it, so
-            // this reload is what makes the operator's edit real; every
-            // other leaf reads `loaded_config`, so that has to move too
-            // — otherwise Subnets/Profiles/Rules/Local DNS/
-            // Labels/Groups/Custom Lists keep rendering, and their modal
-            // openers keep snapshotting, the pre-edit config until a
-            // manual `[r]`/SIGHUP/restart. Invalid TOML makes
-            // `load_v1_config` return `None`, same as `[r]` on a bad edit
-            // today — every consuming tab then shows its own
-            // "config unreadable" hint, which is correct.
-            app.loaded_config = load_v1_config(config_path);
+            let edit = run_file_editor_guarded(app, config_path, &editor);
             refresh_auto_backup_view(app, config_path);
 
             use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
 
-            // The editor's own failure outranks a reload message: it is
-            // why there may be nothing new to reload.
-            if let Some(msg) = step_error {
+            if let Some(msg) = edit.step_error {
                 app.status_err(msg);
                 return;
             }
-            match attempt_reload(poller.socket_path()).await {
-                ReloadOutcome::Reloaded => app.status_ok("config reloaded".into()),
-                ReloadOutcome::DaemonUnreachable => app
-                    .status_err("edit saved — daemon not running, will apply on next start".into()),
-                ReloadOutcome::NoToken { .. } => app.status_err(
-                    "edit saved but no admin token is available to request a reload".into(),
-                ),
-                ReloadOutcome::ReloadFailed(msg) => {
-                    app.status_err(format!("edit saved but daemon rejected reload: {msg}"))
+            if !edit.should_attempt_reload() {
+                if let Some(msg) = edit.edit_error {
+                    app.status_err(msg);
                 }
+                return;
+            }
+            let refresh_error = edit.edit_error;
+            match attempt_reload(poller.socket_path()).await {
+                ReloadOutcome::Reloaded => match refresh_error {
+                    Some(error) => app.status_err(format!("{error}; config reloaded")),
+                    None => app.status_ok("config reloaded".into()),
+                },
+                ReloadOutcome::DaemonUnreachable => app.status_err(match refresh_error {
+                    Some(error) => {
+                        format!("{error}; daemon not running, will apply on next start")
+                    }
+                    None => "edit saved — daemon not running, will apply on next start".into(),
+                }),
+                ReloadOutcome::NoToken { .. } => app.status_err(match refresh_error {
+                    Some(error) => {
+                        format!("{error}; no admin token is available to request a reload")
+                    }
+                    None => "edit saved but no admin token is available to request a reload".into(),
+                }),
+                ReloadOutcome::ReloadFailed(msg) => app.status_err(match refresh_error {
+                    Some(error) => format!("{error}; daemon rejected reload: {msg}"),
+                    None => format!("edit saved but daemon rejected reload: {msg}"),
+                }),
             }
         }
         _ => app.leaf_key_unhandled = true,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileEditorSaveState {
+    Unapplied,
+    Unchanged,
+    Saved,
+    Uncertain,
+}
+
+struct FileEditorOutcome {
+    step_error: Option<String>,
+    edit_error: Option<String>,
+    save_state: FileEditorSaveState,
+}
+
+impl FileEditorOutcome {
+    fn failed(message: String) -> Self {
+        Self {
+            step_error: Some(message),
+            edit_error: None,
+            save_state: FileEditorSaveState::Unapplied,
+        }
+    }
+
+    fn refresh_failed(
+        step_error: Option<String>,
+        save_state: FileEditorSaveState,
+        error: String,
+    ) -> Self {
+        let edit_error = match save_state {
+            FileEditorSaveState::Saved => format!("edit saved, but TUI refresh failed: {error}"),
+            FileEditorSaveState::Unchanged => {
+                format!("config was not changed, but TUI refresh failed: {error}")
+            }
+            FileEditorSaveState::Uncertain => {
+                format!("edit state is uncertain, and TUI refresh failed: {error}")
+            }
+            FileEditorSaveState::Unapplied => {
+                format!("edit not applied: {error} — config is unchanged")
+            }
+        };
+        Self {
+            step_error,
+            edit_error: Some(edit_error),
+            save_state,
+        }
+    }
+
+    fn should_attempt_reload(&self) -> bool {
+        self.step_error.is_none() && self.save_state != FileEditorSaveState::Unapplied
+    }
+}
+
+/// Run `$EDITOR` against a private staged copy while the config tree is held.
+/// An editor hook that starts another cooperative writer waits for this guard
+/// and normally reaches that writer's lock deadline.
+fn run_file_editor_guarded(app: &mut App, config_path: &Path, editor: &str) -> FileEditorOutcome {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::cli::commands::target::{
+        commit_prevalidated_single_write, prepare_raw_validated_single_locked,
+        read_raw_or_empty_locked, ConfigCommitDisposition,
+    };
+
+    let guard = match crate::config::write_lock::acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return FileEditorOutcome::failed(format!(
+                "could not prepare $EDITOR ({editor}): {error}"
+            ));
+        }
+    };
+    let canonical_master = guard.canonical_master().to_path_buf();
+    let original = match read_raw_or_empty_locked(&guard, config_path, &canonical_master) {
+        Ok((Some(raw), _)) => raw,
+        Ok((None, _)) => String::new(),
+        Err(error) => {
+            drop(guard);
+            return FileEditorOutcome::failed(format!(
+                "could not prepare $EDITOR ({editor}): cannot read {}: {error}",
+                canonical_master.display()
+            ));
+        }
+    };
+
+    let mut staging_builder = tempfile::Builder::new();
+    staging_builder
+        .prefix("warden-editor-")
+        .permissions(std::fs::Permissions::from_mode(0o700));
+    let staging_dir = match staging_builder.tempdir() {
+        Ok(staging_dir) => staging_dir,
+        Err(error) => {
+            drop(guard);
+            return FileEditorOutcome::failed(format!(
+                "could not prepare $EDITOR ({editor}): cannot create private staging directory: {error}"
+            ));
+        }
+    };
+    let mut builder = tempfile::Builder::new();
+    builder
+        .suffix(".toml")
+        .permissions(std::fs::Permissions::from_mode(0o600));
+    let mut staged = match builder.tempfile_in(staging_dir.path()) {
+        Ok(staged) => staged,
+        Err(error) => {
+            drop(staging_dir);
+            drop(guard);
+            return FileEditorOutcome::failed(format!(
+                "could not prepare $EDITOR ({editor}): cannot create staged config: {error}"
+            ));
+        }
+    };
+    if let Err(error) = staged
+        .as_file_mut()
+        .write_all(original.as_bytes())
+        .and_then(|()| staged.as_file_mut().sync_all())
+    {
+        drop(staged);
+        drop(staging_dir);
+        drop(guard);
+        return FileEditorOutcome::failed(format!(
+            "could not prepare $EDITOR ({editor}): cannot stage config: {error}"
+        ));
+    }
+    let staged_path = staged.path().to_path_buf();
+
+    // Suspend the reader only after acquisition and staging succeed. Every
+    // post-teardown path below restores the terminal and resumes it.
+    let mut step_error = None;
+    app.reader_suspended
+        .store(true, std::sync::atomic::Ordering::Release);
+    for _ in 0..40 {
+        if app.reader_parked.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if let Err(error) = disable_raw_mode() {
+        step_error.get_or_insert(format!(
+            "could not leave raw mode before launching $EDITOR ({editor}): {error}. \
+             Editor output may be garbled. Press 'q' to exit and re-launch the dashboard."
+        ));
+    }
+    if let Err(error) = execute!(std::io::stdout(), LeaveAlternateScreen) {
+        step_error.get_or_insert(format!(
+            "could not leave alternate screen before launching $EDITOR ({editor}): {error}. \
+             Press 'q' to exit and re-launch the dashboard."
+        ));
+    }
+
+    let (program, args) = crate::cli::commands::config::edit::split_editor_invocation(editor);
+    let editor_status = if program.is_empty() {
+        std::process::Command::new("vi").arg(&staged_path).status()
+    } else {
+        std::process::Command::new(&program)
+            .args(&args)
+            .arg(&staged_path)
+            .status()
+    };
+    if let Some(message) = format_editor_failure(editor, editor_status) {
+        step_error.get_or_insert(message);
+    }
+
+    if let Err(error) = enable_raw_mode() {
+        step_error.get_or_insert(format!(
+            "could not re-enter raw mode after $EDITOR ({editor}): {error}. \
+             TUI input may be unreliable. Press 'q' to exit cleanly."
+        ));
+    }
+    if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
+        step_error.get_or_insert(format!(
+            "could not re-enter alternate screen after $EDITOR ({editor}): {error}. \
+             TUI may render in scrollback. Press 'q' to exit cleanly."
+        ));
+    }
+    app.reader_suspended
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    let edited = match std::fs::read_to_string(&staged_path) {
+        Ok(edited) => edited,
+        Err(error) => {
+            drop(staged);
+            drop(staging_dir);
+            drop(guard);
+            return FileEditorOutcome {
+                step_error,
+                edit_error: Some(format!(
+                    "edit not applied: cannot read staged config: {error} — config is unchanged"
+                )),
+                save_state: FileEditorSaveState::Unapplied,
+            };
+        }
+    };
+    let save_state = if edited != original {
+        let prepared = match prepare_raw_validated_single_locked(
+            &guard,
+            &canonical_master,
+            &canonical_master,
+            edited,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(staged);
+                drop(staging_dir);
+                drop(guard);
+                return FileEditorOutcome {
+                    step_error,
+                    edit_error: Some(format!("edit not applied: {error} — config is unchanged")),
+                    save_state: FileEditorSaveState::Unapplied,
+                };
+            }
+        };
+        match commit_prevalidated_single_write(prepared) {
+            Ok(()) => FileEditorSaveState::Saved,
+            Err(error) => {
+                let (save_state, edit_error) = match error.disposition() {
+                    ConfigCommitDisposition::Uncertain => (
+                        FileEditorSaveState::Uncertain,
+                        format!("edit state is uncertain: {error} — recovery required"),
+                    ),
+                    ConfigCommitDisposition::Untouched
+                    | ConfigCommitDisposition::RestoredDurably => (
+                        FileEditorSaveState::Unapplied,
+                        format!("edit not applied: {error} — config is unchanged"),
+                    ),
+                };
+                drop(staged);
+                drop(staging_dir);
+                drop(guard);
+                return FileEditorOutcome {
+                    step_error,
+                    edit_error: Some(edit_error),
+                    save_state,
+                };
+            }
+        }
+    } else {
+        FileEditorSaveState::Unchanged
+    };
+
+    if let Err(error) = install_file_editor_caches(
+        app,
+        refresh_file_editor_caches_locked(&guard, &canonical_master),
+    ) {
+        drop(staged);
+        drop(staging_dir);
+        drop(guard);
+        return FileEditorOutcome::refresh_failed(step_error, save_state, error);
+    }
+
+    drop(staged);
+    drop(staging_dir);
+    drop(guard);
+    FileEditorOutcome {
+        step_error,
+        edit_error: None,
+        save_state,
+    }
+}
+
+fn refresh_file_editor_caches_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    canonical_master: &Path,
+) -> Result<(crate::config::loader::LoadedConfig, String), String> {
+    let loaded = load_v1_config_locked(guard, canonical_master)?;
+    let live_text = match crate::cli::commands::target::read_raw_or_empty_locked(
+        guard,
+        canonical_master,
+        canonical_master,
+    ) {
+        Ok((Some(raw), _)) => raw,
+        Ok((None, _)) => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot refresh {}: {error}",
+                canonical_master.display()
+            ));
+        }
+    };
+    Ok((loaded, live_text))
+}
+
+fn install_file_editor_caches(
+    app: &mut App,
+    refreshed: Result<(crate::config::loader::LoadedConfig, String), String>,
+) -> Result<(), String> {
+    let (loaded, live_text) = refreshed?;
+    app.loaded_config = Some(loaded);
+    app.file.sections = file_sections_from_raw(&live_text);
+    app.file.config_text = live_text;
+    Ok(())
+}
+
+fn file_sections_from_raw(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
+                return None;
+            }
+            trimmed.find(']').map(|close| trimmed[1..close].to_string())
+        })
+        .collect()
 }
 
 /// Keyboard handler for the Settings → restore picker modal. Gated in
@@ -7227,11 +7570,8 @@ async fn handle_backup_modal_key(app: &mut App, key: KeyEvent, config_path: &Pat
     }
 
     // Running — the background task owns this modal. Swallow every key and
-    // re-stash: a second `y` would race a second `create_backup` against the
-    // same backup dir (and unlike the `run_backup_managed` CLI path, the TUI
-    // call takes no lock, so two archives could collide on the same
-    // second-granularity filename), and letting the operator close the card
-    // would orphan an outcome that is still coming. Mirrors `Restoring`.
+    // re-stash: the output lock serializes owners; this is defense in depth
+    // against duplicate jobs and orphaned outcomes. Mirrors `Restoring`.
     if matches!(modal, BackupModal::Running { .. }) {
         app.settings.backup_modal = Some(modal);
         return;
@@ -8431,6 +8771,25 @@ fn load_v1_config(config_path: &Path) -> Option<crate::config::loader::LoadedCon
     crate::config::loader::load_config(config_path, time::OffsetDateTime::now_utc()).ok()
 }
 
+/// Load the live v1 tree while its writer guard is held.
+///
+/// TUI state is deliberately only a rendering/form snapshot. Any mutation
+/// must obtain its authoritative declaration set, include ownership and
+/// limits through this guarded loader before it makes a decision.
+fn load_v1_config_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+) -> Result<crate::config::loader::LoadedConfig, String> {
+    crate::config::loader::load_config_for_schema_under_guard(
+        guard,
+        master,
+        crate::config::schema::SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(crate::cli::commands::format_config_errors)
+    .map_err(|error| error.to_string())
+}
+
 async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
     match poller.fetch_status().await {
         Ok(status) => {
@@ -8704,12 +9063,11 @@ fn toggle_focused_catalog_row(modal: &mut app::CatalogPickerModal) {
 
 /// Commit every staged catalog row in **one** write and **one** reload.
 ///
-/// Shape mirrors [`submit_edit_modal`]: one `read_or_empty`, an
-/// `upsert_id_keyed` per dirty row, a single `write_value_validated`
-/// (which validates the whole would-be-merged tree before promoting
-/// anything, so a bad row leaves the config untouched), then one
-/// `attempt_reload`. N separate `run_add_silent` calls would mean N
-/// reloads for what the operator experienced as one action.
+/// The synchronous disk core takes one guard, performs a guarded live load,
+/// target resolution/read, every `upsert_id_keyed`, and one locked validated
+/// promotion before this async shell performs one `attempt_reload`. N
+/// separate writes would mean N reloads for what the operator experienced as
+/// one action.
 ///
 /// Three things `run_add_silent` does that this path must not lose:
 ///
@@ -8728,10 +9086,6 @@ fn toggle_focused_catalog_row(modal: &mut app::CatalogPickerModal) {
 /// name. Deletion lives in the Lists edit modal behind its typed-id gate.
 async fn submit_catalog_picker(app: &mut App, poller: &IpcPoller, config_path: &Path) {
     use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use crate::cli::commands::target::{
-        read_or_empty, resolve_target_file, upsert_id_keyed, write_value_validated, EntityClass,
-    };
-    use crate::lists::source_key::canonical_url_key;
 
     let Some(mut modal) = app.lists.catalog_picker.take() else {
         return;
@@ -8760,75 +9114,10 @@ async fn submit_catalog_picker(app: &mut App, poller: &IpcPoller, config_path: &
         }};
     }
 
-    let target_path = match resolve_target_file(config_path, EntityClass::Blocklists, None) {
-        Ok(p) => p,
-        Err(e) => fail!(e.to_string()),
+    let (added, updated) = match apply_catalog_picker_changes(config_path, &dirty) {
+        Ok(counts) => counts,
+        Err(error) => fail!(error),
     };
-    let (mut doc, _) = match read_or_empty(&target_path) {
-        Ok(v) => v,
-        Err(e) => fail!(e.to_string()),
-    };
-
-    // Re-read the config from DISK, not from `app.loaded_config`: that is
-    // the same modal-open snapshot `original` came from, so validating a
-    // stale snapshot against itself would always agree. The two pre-flight
-    // gates below need what is on disk right now.
-    let on_disk = load_v1_config(config_path);
-    let live: Vec<(&str, &str)> = on_disk
-        .as_ref()
-        .map(|lc| {
-            lc.config
-                .blocklists
-                .iter()
-                .map(|b| (b.id.as_str(), b.url.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut added = 0usize;
-    let mut updated = 0usize;
-    for row in &dirty {
-        if !row.original.is_subscribed() {
-            // Gate 2 — dedup on the CANONICAL url key: a list subscribed
-            // from another surface since the modal opened would otherwise
-            // land as a second entry pointing at the same file, i.e. two
-            // registry slots downloading one URL.
-            let key = canonical_url_key(&row.url);
-            if let Some((owner, _)) = live.iter().find(|(_, u)| canonical_url_key(u) == key) {
-                fail!(format!(
-                    "'{}' is already subscribed as \"{owner}\" — reopen the picker",
-                    row.catalog_id
-                ));
-            }
-            // `upsert_id_keyed` keys on the ID and REPLACES what it finds.
-            // A catalog id deriving onto an id the operator already used
-            // for a different URL would silently overwrite that list.
-            if let Some((_, url)) = live.iter().find(|(id, _)| *id == row.canonical_id) {
-                fail!(format!(
-                    "id \"{}\" is already taken by {url} — rename that list first",
-                    row.canonical_id
-                ));
-            }
-        }
-        let value = build_catalog_blocklist_value(row, on_disk.as_ref());
-        if let Err(e) = upsert_id_keyed(
-            &mut doc,
-            EntityClass::Blocklists.toml_key(),
-            &row.canonical_id,
-            value,
-        ) {
-            fail!(e.to_string());
-        }
-        if row.original.is_subscribed() {
-            updated += 1;
-        } else {
-            added += 1;
-        }
-    }
-
-    if let Err(e) = write_value_validated(config_path, &target_path, &doc) {
-        fail!(format!("validator: {e}"));
-    }
 
     for row in &dirty {
         tracing::info!(
@@ -8858,103 +9147,216 @@ async fn submit_catalog_picker(app: &mut App, poller: &IpcPoller, config_path: &
     poll_active_leaf(app, poller).await;
 }
 
-/// The `[[blocklists]]` table a catalog row saves as.
+/// The catalog picker's authoritative disk phase.  It is synchronous so the
+/// tree guard cannot reach the caller's reload/poll awaits.
+fn apply_catalog_picker_changes(
+    config_path: &Path,
+    dirty: &[app::CatalogPickerRow],
+) -> Result<(usize, usize), String> {
+    use crate::cli::commands::target::{
+        read_or_empty_locked, resolve_target_file_locked, upsert_id_keyed,
+        write_values_validated_locked, EntityClass, StagedWrite,
+    };
+    use crate::cli::commands::toml_write::render_preserving;
+    use crate::lists::source_key::canonical_url_key;
+
+    let guard = crate::config::write_lock::acquire_for_write(config_path)
+        .map_err(|error| format!("{error:#}"))?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    // New subscriptions share the conventional creation target. Existing
+    // rows instead locate their owning document below.
+    let creation_target = dirty
+        .iter()
+        .any(|row| !row.original.is_subscribed())
+        .then(|| {
+            resolve_target_file_locked(&guard, config_path, EntityClass::Blocklists, None)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    // Documents are grouped by path so the whole batch is validated and
+    // promoted once, even when its existing rows live in several fragments.
+    let mut edits: Vec<OwnedConfigDocument> = Vec::new();
+    if let Some(path) = creation_target {
+        let (value, raw) =
+            read_or_empty_locked(&guard, config_path, &path).map_err(|error| error.to_string())?;
+        edits.push(OwnedConfigDocument {
+            path,
+            value,
+            raw: raw.unwrap_or_default(),
+        });
+    }
+    // Reserve every live identity, then reserve each accepted new row as it
+    // is validated.  `upsert_id_keyed` replaces by id, so validating every
+    // candidate only against the initial snapshot would let two dirty rows
+    // silently replace one another in this one batch.
+    let mut reserved_ids: std::collections::HashMap<String, String> = loaded
+        .config
+        .blocklists
+        .iter()
+        .map(|blocklist| (blocklist.id.as_str().to_string(), blocklist.url.clone()))
+        .collect();
+    let mut reserved_urls: std::collections::HashMap<String, String> = loaded
+        .config
+        .blocklists
+        .iter()
+        .map(|blocklist| {
+            (
+                canonical_url_key(&blocklist.url),
+                blocklist.id.as_str().to_string(),
+            )
+        })
+        .collect();
+
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    for row in dirty {
+        if row.original.is_subscribed() {
+            let captured_id = row.captured_id.as_deref().ok_or_else(|| {
+                format!(
+                    "'{}' no longer identifies the subscribed catalog row — reopen the picker",
+                    row.catalog_id
+                )
+            })?;
+            let captured_url = row.captured_canonical_url.as_deref().ok_or_else(|| {
+                format!(
+                    "'{}' no longer identifies the subscribed catalog row — reopen the picker",
+                    row.catalog_id
+                )
+            })?;
+            if row.canonical_id != captured_id {
+                return Err(format!(
+                    "'{}' changed identity while the picker was open — reopen the picker",
+                    row.catalog_id
+                ));
+            }
+            let live = loaded
+                .config
+                .blocklists
+                .iter()
+                .find(|blocklist| blocklist.id.as_str() == captured_id)
+                .ok_or_else(|| {
+                    format!(
+                        "'{}' is no longer subscribed as \"{captured_id}\" — reopen the picker",
+                        row.catalog_id
+                    )
+                })?;
+            if canonical_url_key(&live.url) != captured_url {
+                return Err(format!(
+                    "'{}' now names a different live list — reopen the picker",
+                    row.catalog_id
+                ));
+            }
+
+            let owner = array_entry_owner_document_locked(
+                &guard,
+                config_path,
+                &loaded,
+                EntityClass::Blocklists.toml_key(),
+                captured_id,
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "'{}' is no longer subscribed as \"{captured_id}\" — reopen the picker",
+                    row.catalog_id
+                )
+            })?;
+            let slot = match edits.iter().position(|edit| edit.path == owner.path) {
+                Some(index) => index,
+                None => {
+                    edits.push(owner);
+                    edits.len() - 1
+                }
+            };
+            patch_blocklist_enabled(&mut edits[slot].value, captured_id, row.staged_enabled)?;
+            updated += 1;
+        } else {
+            let key = canonical_url_key(&row.url);
+            if let Some(owner) = reserved_urls.get(&key) {
+                return Err(format!(
+                    "'{}' is already subscribed as \"{owner}\" — reopen the picker",
+                    row.catalog_id
+                ));
+            }
+            if let Some(url) = reserved_ids.get(&row.canonical_id) {
+                return Err(format!(
+                    "id \"{}\" is already taken by {url} — rename that list first",
+                    row.canonical_id
+                ));
+            }
+            reserved_ids.insert(row.canonical_id.clone(), row.url.clone());
+            reserved_urls.insert(key, row.canonical_id.clone());
+            let target = edits
+                .first_mut()
+                .expect("a new subscription loaded its creation target");
+            upsert_id_keyed(
+                &mut target.value,
+                EntityClass::Blocklists.toml_key(),
+                &row.canonical_id,
+                build_catalog_blocklist_value(row),
+            )
+            .map_err(|error| error.to_string())?;
+            added += 1;
+        }
+    }
+    let writes: Vec<StagedWrite> = edits
+        .iter()
+        .map(|edit| {
+            render_preserving(&edit.raw, &edit.value)
+                .map(|content| StagedWrite {
+                    final_path: edit.path.clone(),
+                    content,
+                })
+                .map_err(|error| format!("serialise {}: {error}", edit.path.display()))
+        })
+        .collect::<Result<_, String>>()?;
+    write_values_validated_locked(&guard, config_path, &writes)
+        .map_err(|error| format!("validator: {error}"))?;
+    Ok((added, updated))
+}
+
+/// The `[[blocklists]]` table for a fresh catalog subscription.
 ///
-/// An already-subscribed row is **patched, not rebuilt**: only `enabled`
-/// changes, and every other key is copied from the live entry so the
-/// operator's tags, interval, display name and `auth_token_ref` survive a
-/// tick in this modal. A fresh subscription gets the catalog's metadata
-/// and the schema defaults for the rest — no tags, which lets the
-/// validator's auto-promote pass pin `base = deny` to `["uncategorized"]`
-/// at reload, exactly as the old subscribe path did.
+/// Existing rows are patched in place because a catalog toggle owns only
+/// `enabled`; a new row gets catalog metadata and schema defaults.
 /// Every enum token comes from `wire_str()`, never a local `match`. The
 /// TUI already shipped its own copy of this mapping once, missed the
 /// `Block` → `Deny` rename, and wrote `kind = "block"` — which the loader
 /// refused as `unknown variant`, so the Lists modal could not save at all.
-fn build_catalog_blocklist_value(
-    row: &app::CatalogPickerRow,
-    on_disk: Option<&crate::config::loader::LoadedConfig>,
-) -> toml::Value {
+fn build_catalog_blocklist_value(row: &app::CatalogPickerRow) -> toml::Value {
     use toml::Value;
-
-    let existing = on_disk.and_then(|lc| {
-        lc.config
-            .blocklists
-            .iter()
-            .find(|b| b.id.as_str() == row.canonical_id)
-    });
 
     let mut tbl = toml::map::Map::new();
     tbl.insert("id".into(), Value::String(row.canonical_id.clone()));
     tbl.insert(
         "display_name".into(),
-        Value::String(
-            existing
-                .map(|b| b.display_name.clone())
-                .unwrap_or_else(|| row.display_name.clone()),
-        ),
+        Value::String(row.display_name.clone()),
     );
-    tbl.insert(
-        "url".into(),
-        Value::String(
-            existing
-                .map(|b| b.url.clone())
-                .unwrap_or_else(|| row.url.clone()),
-        ),
-    );
+    tbl.insert("url".into(), Value::String(row.url.clone()));
     tbl.insert(
         "format".into(),
-        Value::String(
-            existing
-                .map(|b| b.format)
-                .unwrap_or(row.format)
-                .wire_str()
-                .to_string(),
-        ),
+        Value::String(row.format.wire_str().to_string()),
     );
     tbl.insert("enabled".into(), Value::Boolean(row.staged_enabled));
     tbl.insert(
         "base".into(),
         Value::String(row.staged_kind.wire_str().to_string()),
     );
-    if let Some(b) = existing {
-        // `upsert_id_keyed` REPLACES the entry, so every key the operator
-        // set has to be carried forward explicitly — `trust` above all:
-        // dropping it would silently reset a `local` list to the
-        // `remote-unsigned` default, which for a `base = allow` list is
-        // the exact combination the validator refuses.
-        tbl.insert(
-            "trust".into(),
-            Value::String(b.trust.wire_str().to_string()),
-        );
-        tbl.insert(
-            "update_interval_hours".into(),
-            Value::Integer(b.update_interval_hours as i64),
-        );
-        tbl.insert("max_entries".into(), Value::Integer(b.max_entries as i64));
-        tbl.insert(
-            "max_consecutive_failures".into(),
-            Value::Integer(b.max_consecutive_failures as i64),
-        );
-        // Same contract as the four fields above, and the one that is
-        // load-bearing: dropping it either refuses the whole apply (a
-        // `base = allow`, `trust = remote-unsigned` row loses the consent
-        // that made it legal) or silently erases a security declaration
-        // the operator cannot see to redo. This picker has no consent
-        // affordance — unlike the edit modal's `consent_declared` — so the
-        // only legitimate value is the one the file already carried. Never
-        // defaulted to `true` for a new row: a first-time add through this
-        // picker correctly gets the schema default and lets the validator
-        // refuse if the staged direction needs consent nobody gave.
-        tbl.insert(
-            "accept_unsigned_allow".into(),
-            Value::Boolean(b.accept_unsigned_allow),
-        );
-        if let Some(r) = b.auth_token_ref.as_deref() {
-            tbl.insert("auth_token_ref".into(), Value::String(r.to_string()));
-        }
-    }
     Value::Table(tbl)
+}
+
+/// Toggle one existing TOML row without rebuilding any of its other fields.
+fn patch_blocklist_enabled(doc: &mut toml::Value, id: &str, enabled: bool) -> Result<(), String> {
+    let lists = doc
+        .get_mut("blocklists")
+        .and_then(|value| value.as_array_mut())
+        .ok_or_else(|| "no [[blocklists]] entries in the owning file".to_string())?;
+    let live = lists
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(id))
+        .and_then(|entry| entry.as_table_mut())
+        .ok_or_else(|| format!("list '{id}' no longer exists — reopen the list"))?;
+    live.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    Ok(())
 }
 
 /// Handle keys for the list edit modal. Routes by `mode`:
@@ -8968,14 +9370,14 @@ fn build_catalog_blocklist_value(
 ///   buffer, `Enter` proceeds with the delete only when
 ///   `typed == blocklist_id`, `Esc` falls back to `Edit` (no
 ///   destructive action).
-/// - `ConfirmUnsignedAllow { typed }` — the same typed-id gate, reached
+/// - `ConfirmUnsignedAllow { typed, origin }` — the same typed-id gate, reached
 ///   from `Ctrl+S` when the save would make this an allow-list on a
 ///   source warden cannot verify. `Enter` on a match records the
 ///   consent and re-enters `submit_edit_modal`, so the declaration and
 ///   the write it authorises are one operator action. A mismatch keeps
 ///   the stage (unlike the delete gate — see
-///   `handle_confirm_unsigned_allow_key`); `Esc` returns to `Edit` with
-///   nothing declared.
+///   `handle_confirm_unsigned_allow_key`); `Esc` returns to its originating
+///   Edit, Add, or Promote form with nothing declared.
 /// - `Promote` / `Add` — share the `Edit` state machine for buffer
 ///   editing; the `Enter` on Delete branch and the `Ctrl+S` submit
 ///   path branch on mode (see `handle_edit_mode_key` and
@@ -9009,8 +9411,8 @@ async fn handle_lists_edit_modal_key(
         app::EditModalMode::ConfirmDelete { typed } => {
             handle_confirm_delete_key(app, &mut modal, typed, key, poller, config_path).await
         }
-        app::EditModalMode::ConfirmUnsignedAllow { typed } => {
-            if handle_confirm_unsigned_allow_key(app, &mut modal, typed, key) {
+        app::EditModalMode::ConfirmUnsignedAllow { typed, origin } => {
+            if handle_confirm_unsigned_allow_key(app, &mut modal, typed, origin, key) {
                 submit_edit_modal(app, modal, poller, config_path).await;
             }
         }
@@ -9341,6 +9743,7 @@ fn handle_confirm_unsigned_allow_key(
     app: &mut App,
     modal: &mut app::EditListModal,
     mut typed: String,
+    origin: app::UnsignedAllowOrigin,
     key: KeyEvent,
 ) -> bool {
     match key.code {
@@ -9348,7 +9751,7 @@ fn handle_confirm_unsigned_allow_key(
             // Back to the form with `consent_declared` untouched. A list
             // whose file already consents must come out of here exactly
             // as it went in — this stage grants, it never revokes.
-            modal.mode = app::EditModalMode::Edit;
+            modal.mode = origin.clone().into_mode();
             modal.error_message = None;
             app.lists.edit_modal = Some(modal.clone());
             false
@@ -9356,14 +9759,20 @@ fn handle_confirm_unsigned_allow_key(
         KeyCode::Backspace => {
             typed.pop();
             modal.error_message = None;
-            modal.mode = app::EditModalMode::ConfirmUnsignedAllow { typed };
+            modal.mode = app::EditModalMode::ConfirmUnsignedAllow {
+                typed,
+                origin: origin.clone(),
+            };
             app.lists.edit_modal = Some(modal.clone());
             false
         }
         KeyCode::Char(c) => {
             typed.push(c);
             modal.error_message = None;
-            modal.mode = app::EditModalMode::ConfirmUnsignedAllow { typed };
+            modal.mode = app::EditModalMode::ConfirmUnsignedAllow {
+                typed,
+                origin: origin.clone(),
+            };
             app.lists.edit_modal = Some(modal.clone());
             false
         }
@@ -9371,22 +9780,25 @@ fn handle_confirm_unsigned_allow_key(
             if typed != modal.blocklist_id {
                 modal.error_message =
                     Some(tabs::lists::UNSIGNED_ALLOW_CONFIRM_MISMATCH.to_string());
-                modal.mode = app::EditModalMode::ConfirmUnsignedAllow { typed };
+                modal.mode = app::EditModalMode::ConfirmUnsignedAllow {
+                    typed,
+                    origin: origin.clone(),
+                };
                 app.lists.edit_modal = Some(modal.clone());
                 return false;
             }
-            // Declared. Back to `Edit` and straight into the save the
-            // operator already asked for — the consent and the write it
-            // authorises belong to one action, exactly as
+            // Declared. Back to the originating form and straight into the
+            // save the operator already asked for — the consent and the
+            // write it authorises belong to one action, exactly as
             // `run_set_kind_with_ack` writes both in one document
             // mutation.
             modal.consent_declared = true;
-            modal.mode = app::EditModalMode::Edit;
+            modal.mode = origin.into_mode();
             modal.error_message = None;
             true
         }
         _ => {
-            modal.mode = app::EditModalMode::ConfirmUnsignedAllow { typed };
+            modal.mode = app::EditModalMode::ConfirmUnsignedAllow { typed, origin };
             app.lists.edit_modal = Some(modal.clone());
             false
         }
@@ -9412,20 +9824,28 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
         ));
     }
 
-    let interval_hours: u32 = match modal.interval.hours() {
-        Some(h) => h,
-        None => modal
-            .interval_custom_buf
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| {
-                format!(
-                    "custom interval hours must be a positive integer (got '{}')",
-                    modal.interval_custom_buf
-                )
-            })?,
+    let interval_hours: Option<u32> = match modal.interval {
+        app::IntervalChoice::Inherited => None,
+        app::IntervalChoice::H1 => Some(1),
+        app::IntervalChoice::H2 => Some(2),
+        app::IntervalChoice::H6 => Some(6),
+        app::IntervalChoice::H12 => Some(12),
+        app::IntervalChoice::H24 => Some(24),
+        app::IntervalChoice::H48 => Some(48),
+        app::IntervalChoice::Custom => Some(
+            modal
+                .interval_custom_buf
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| {
+                    format!(
+                        "custom interval hours must be a positive integer (got '{}')",
+                        modal.interval_custom_buf
+                    )
+                })?,
+        ),
     };
-    if interval_hours == 0 {
+    if interval_hours == Some(0) {
         return Err("update interval must be ≥ 1 hour".to_string());
     }
 
@@ -9433,7 +9853,7 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
     // (no meaningful way to choose which entries get truncated). The
     // schema field is preserved at its pre-edit value so existing TOML
     // is not silently rewritten.
-    let max_entries: u64 = modal.original.max_entries;
+    let max_entries = modal.original.max_entries;
 
     // Wire tokens come from the schema enums themselves, never from a
     // local `match`. A previous hand-rolled map here once still said
@@ -9453,11 +9873,14 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
     );
     tbl.insert("url".into(), Value::String(url.to_string()));
     tbl.insert("format".into(), Value::String(format_label.to_string()));
-    tbl.insert(
-        "update_interval_hours".into(),
-        Value::Integer(interval_hours as i64),
-    );
-    tbl.insert("max_entries".into(), Value::Integer(max_entries as i64));
+    if let Some(hours) = interval_hours {
+        tbl.insert("update_interval_hours".into(), Value::Integer(hours as i64));
+    }
+    if let Some(entries) = max_entries {
+        let entries = i64::try_from(entries)
+            .map_err(|_| "max_entries exceeds TOML's signed integer range".to_string())?;
+        tbl.insert("max_entries".into(), Value::Integer(entries));
+    }
     // Same contract as `max_entries`: the modal does not edit this field,
     // and this row REPLACES the whole entry, so omitting it would silently
     // reset an operator-tuned `max_consecutive_failures` to the schema
@@ -9625,9 +10048,6 @@ async fn submit_edit_modal(
 ) {
     use crate::cli::commands::blocklists::{format_list_edit_ok, LIST_EDIT_DAEMON_UNREACHABLE};
     use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use crate::cli::commands::target::{
-        read_or_empty, resolve_target_file, upsert_id_keyed, write_value_validated, EntityClass,
-    };
     use crate::config::schema::Id;
 
     // Promote- and Add-mode pre-flight: id is operator-typed so it has
@@ -9646,21 +10066,6 @@ async fn submit_edit_modal(
             app.lists.edit_modal = Some(modal);
             return;
         }
-        if let Some(loaded) = app.loaded_config.as_ref() {
-            if loaded
-                .config
-                .blocklists
-                .iter()
-                .any(|b| b.id.as_str() == trimmed)
-            {
-                modal.error_message = Some(format!(
-                    "id '{trimmed}' is already used by another [[blocklists]] entry"
-                ));
-                modal.submitting = false;
-                app.lists.edit_modal = Some(modal);
-                return;
-            }
-        }
         modal.blocklist_id = trimmed;
     }
 
@@ -9675,23 +10080,8 @@ async fn submit_edit_modal(
         app::EditModalMode::Add | app::EditModalMode::Promote { .. }
     ) {
         let candidate_url = modal.url.trim().to_string();
-        if let Some(loaded) = app.loaded_config.as_ref() {
-            if let Some(existing) = loaded
-                .config
-                .blocklists
-                .iter()
-                .find(|b| b.url == candidate_url)
-            {
-                modal.error_message = Some(format!(
-                    "list URL already added as \"{}\" — use that id or remove it first",
-                    existing.id.as_str()
-                ));
-                modal.submitting = false;
-                app.lists.edit_modal = Some(modal);
-                return;
-            }
-        }
         if !modal.skip_head_check
+            && modal.head_probe_passed_for.as_deref() != Some(candidate_url.as_str())
             && (candidate_url.starts_with("http://") || candidate_url.starts_with("https://"))
         {
             if let Err(e) =
@@ -9702,6 +10092,11 @@ async fn submit_edit_modal(
                 app.lists.edit_modal = Some(modal);
                 return;
             }
+            // A consent confirmation resumes this same submit. Keep the
+            // successful preflight keyed to the URL, so it cannot cause a
+            // second network probe without turning the persistent skip flag
+            // into an implicit user choice.
+            modal.head_probe_passed_for = Some(candidate_url);
         }
     }
 
@@ -9718,9 +10113,21 @@ async fn submit_edit_modal(
         AllowGateOutcome::NeedsConsent => {
             // Not an error — a question. The stage owns the copy; this
             // clears any stale error so the notice opens clean.
+            let origin = match &modal.mode {
+                app::EditModalMode::Edit => app::UnsignedAllowOrigin::Edit,
+                app::EditModalMode::Promote { source } => app::UnsignedAllowOrigin::Promote {
+                    source: source.clone(),
+                },
+                app::EditModalMode::Add => app::UnsignedAllowOrigin::Add,
+                app::EditModalMode::ConfirmDelete { .. }
+                | app::EditModalMode::ConfirmUnsignedAllow { .. } => {
+                    unreachable!("only an editable form may request unsigned-allow consent")
+                }
+            };
             modal.error_message = None;
             modal.mode = app::EditModalMode::ConfirmUnsignedAllow {
                 typed: String::new(),
+                origin,
             };
             modal.submitting = false;
             app.lists.edit_modal = Some(modal);
@@ -9728,15 +10135,12 @@ async fn submit_edit_modal(
         }
     }
 
-    let value = match build_blocklist_value(&modal) {
-        Ok(v) => v,
-        Err(msg) => {
-            modal.error_message = Some(msg);
-            modal.submitting = false;
-            app.lists.edit_modal = Some(modal);
-            return;
-        }
-    };
+    if let Err(msg) = build_blocklist_value(&modal) {
+        modal.error_message = Some(msg);
+        modal.submitting = false;
+        app.lists.edit_modal = Some(modal);
+        return;
+    }
 
     modal.submitting = true;
     modal.error_message = None;
@@ -9751,47 +10155,28 @@ async fn submit_edit_modal(
         app::EditModalMode::Promote { source } => Some(source.clone()),
         _ => None,
     };
+    let creates_new_entry = matches!(
+        &modal.mode,
+        app::EditModalMode::Promote { .. } | app::EditModalMode::Add
+    );
     app.lists.edit_modal = Some(modal.clone());
 
-    let target_path = match resolve_target_file(config_path, EntityClass::Blocklists, None) {
-        Ok(p) => p,
-        Err(e) => {
-            if let Some(m) = app.lists.edit_modal.as_mut() {
-                m.submitting = false;
-                m.error_message = Some(e.to_string());
-            }
-            return;
-        }
-    };
-    let (mut doc, _) = match read_or_empty(&target_path) {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(m) = app.lists.edit_modal.as_mut() {
-                m.submitting = false;
-                m.error_message = Some(e.to_string());
-            }
-            return;
-        }
-    };
-    if let Err(e) = upsert_id_keyed(
-        &mut doc,
-        EntityClass::Blocklists.toml_key(),
+    let promote_warning = match apply_list_edit(
+        config_path,
+        &modal,
         &blocklist_id,
-        value,
+        creates_new_entry,
+        promote_source.as_deref(),
     ) {
-        if let Some(m) = app.lists.edit_modal.as_mut() {
-            m.submitting = false;
-            m.error_message = Some(e.to_string());
+        Ok(warning) => warning,
+        Err(error) => {
+            if let Some(m) = app.lists.edit_modal.as_mut() {
+                m.submitting = false;
+                m.error_message = Some(error);
+            }
+            return;
         }
-        return;
-    }
-    if let Err(e) = write_value_validated(config_path, &target_path, &doc) {
-        if let Some(m) = app.lists.edit_modal.as_mut() {
-            m.submitting = false;
-            m.error_message = Some(format!("validator: {e}"));
-        }
-        return;
-    }
+    };
 
     tracing::info!(
         target: "audit",
@@ -9801,22 +10186,8 @@ async fn submit_edit_modal(
         "TUI mutation"
     );
 
-    // Promote-mode follow-up: the v1 entry has landed and validated, so
-    // now drop the orphan source line from `[lists].sources` to avoid
-    // the daemon downloading the same URL twice (once per registry slot
-    // — the legacy slug/URL source AND the new [[blocklists]] entry).
-    // Removal failure is non-fatal: the v1 entry is already valid, so
-    // we surface the partial state and continue to the reload.
-    let mut promote_warning: Option<String> = None;
-    if let Some(source) = promote_source.as_deref() {
-        if let Err(e) = remove_source_from_master(config_path, source) {
-            promote_warning = Some(format!(
-                "list saved but could not remove orphan source '{source}': {e}"
-            ));
-        }
-    }
-
-    // Refresh schema cache + reload daemon.
+    // The synchronous core has dropped its tree guard here.  Reload/cache
+    // work below may await the daemon without inverting the IPC lock order.
     app.loaded_config = load_v1_config(config_path);
     let outcome = attempt_reload(poller.socket_path()).await;
     match outcome {
@@ -9850,15 +10221,167 @@ async fn submit_edit_modal(
     poll_active_leaf(app, poller).await;
 }
 
-/// Strip a single source string out of the master config's
-/// `[lists].sources` array. Used by the Promote-orphan flow (after the
-/// v1 entry has landed) and by the modal's "Discard source" Tab focus
-/// (no v1 entry created). Atomic write + validate_or_revert mirrors the
-/// rest of the v1 mutation pipeline; missing array → bail with a clear
-/// error so the caller can surface it in the modal footer.
-fn remove_source_from_master(master_path: &Path, source: &str) -> anyhow::Result<()> {
-    use crate::cli::commands::target::{read_or_empty, write_value_validated};
-    let (mut doc, _) = read_or_empty(master_path)?;
+/// The list modal's guarded commit, including Promote's deliberately
+/// non-fatal source cleanup.  No reference to the guard can escape this
+/// synchronous function.
+fn apply_list_edit(
+    config_path: &Path,
+    modal: &app::EditListModal,
+    blocklist_id: &str,
+    creates_new_entry: bool,
+    promote_source: Option<&str>,
+) -> Result<Option<String>, String> {
+    use crate::cli::commands::target::{
+        read_or_empty_locked, resolve_target_file_locked, upsert_id_keyed,
+        write_value_validated_locked, EntityClass,
+    };
+    use crate::lists::source_key::canonical_url_key;
+
+    let guard = crate::config::write_lock::acquire_for_write(config_path)
+        .map_err(|error| format!("{error:#}"))?;
+    let loaded = load_v1_config_locked(&guard, config_path)?;
+    if creates_new_entry
+        && loaded
+            .config
+            .blocklists
+            .iter()
+            .any(|blocklist| blocklist.id.as_str() == blocklist_id)
+    {
+        return Err(format!(
+            "id '{blocklist_id}' is already used by another [[blocklists]] entry"
+        ));
+    }
+    if !creates_new_entry
+        && !loaded
+            .config
+            .blocklists
+            .iter()
+            .any(|blocklist| blocklist.id.as_str() == blocklist_id)
+    {
+        return Err(format!(
+            "list '{blocklist_id}' no longer exists — reopen the list"
+        ));
+    }
+    // An Edit modal carries the form as it opened, not a patch. Rebase only
+    // fields that actually changed onto the guarded row so an unrelated
+    // concurrent edit survives this save.
+    let rebased_modal = if creates_new_entry {
+        modal.clone()
+    } else {
+        let live = loaded
+            .config
+            .blocklists
+            .iter()
+            .find(|blocklist| blocklist.id.as_str() == blocklist_id)
+            .expect("the preceding guarded existence check found this row");
+        rebase_edit_modal_onto_live(modal, live)
+    };
+    let url_was_edited = creates_new_entry || modal.url != modal.original.url;
+    if url_was_edited {
+        let candidate_url = rebased_modal.url.trim();
+        if let Some(existing) = loaded.config.blocklists.iter().find(|blocklist| {
+            blocklist.id.as_str() != blocklist_id
+                && canonical_url_key(&blocklist.url) == canonical_url_key(candidate_url)
+        }) {
+            return Err(format!(
+                "list URL already added as \"{}\" — use that id or remove it first",
+                existing.id.as_str()
+            ));
+        }
+    }
+    let value = build_blocklist_value(&rebased_modal)?;
+
+    let (target_path, mut doc) = if creates_new_entry {
+        let target = resolve_target_file_locked(&guard, config_path, EntityClass::Blocklists, None)
+            .map_err(|error| error.to_string())?;
+        let (doc, _) = read_or_empty_locked(&guard, config_path, &target)
+            .map_err(|error| error.to_string())?;
+        (target, doc)
+    } else {
+        let owner = blocklist_owner_document_locked(&guard, config_path, &loaded, blocklist_id)?
+            .ok_or_else(|| format!("list '{blocklist_id}' no longer exists — reopen the list"))?;
+        (owner.path, owner.value)
+    };
+    upsert_id_keyed(
+        &mut doc,
+        EntityClass::Blocklists.toml_key(),
+        blocklist_id,
+        value,
+    )
+    .map_err(|error| error.to_string())?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)
+        .map_err(|error| format!("validator: {error}"))?;
+
+    let promote_warning = promote_source.and_then(|source| {
+        remove_source_from_master_locked(&guard, config_path, source)
+            .err()
+            .map(|error| {
+                format!("list saved but could not remove orphan source '{source}': {error}")
+            })
+    });
+    Ok(promote_warning)
+}
+
+/// Apply the modal-open delta, rather than the whole modal snapshot, to a
+/// live row loaded under the tree guard.
+fn rebase_edit_modal_onto_live(
+    modal: &app::EditListModal,
+    live: &crate::config::schema::Blocklist,
+) -> app::EditListModal {
+    let mut rebased = modal.clone();
+    let opened = &modal.original;
+    rebased.original = live.clone();
+
+    if modal.display_name == opened.display_name {
+        rebased.display_name = live.display_name.clone();
+    }
+    if modal.url == opened.url {
+        rebased.url = live.url.clone();
+    }
+    if modal.nature == opened.base {
+        rebased.nature = live.base;
+    }
+    if modal.enabled == opened.enabled {
+        rebased.enabled = live.enabled;
+    }
+    if modal.format == opened.format {
+        rebased.format = live.format;
+    }
+    if modal.auth_token_ref == opened.auth_token_ref.as_deref().unwrap_or_default() {
+        rebased.auth_token_ref = live.auth_token_ref.clone().unwrap_or_default();
+    }
+    if !modal_interval_changed_since_open(modal) {
+        rebased.interval = app::IntervalChoice::from_optional_hours(live.update_interval_hours);
+        rebased.interval_custom_buf = if matches!(rebased.interval, app::IntervalChoice::Custom) {
+            live.update_interval_hours.unwrap_or_default().to_string()
+        } else {
+            String::new()
+        };
+    }
+    rebased
+}
+
+fn modal_interval_changed_since_open(modal: &app::EditListModal) -> bool {
+    let opened_interval =
+        app::IntervalChoice::from_optional_hours(modal.original.update_interval_hours);
+    modal.interval != opened_interval
+        || (matches!(modal.interval, app::IntervalChoice::Custom)
+            && modal.interval_custom_buf.trim()
+                != modal
+                    .original
+                    .update_interval_hours
+                    .unwrap_or_default()
+                    .to_string())
+}
+
+/// Remove one legacy source while the caller retains the live-tree guard.
+fn remove_source_from_master_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master_path: &Path,
+    source: &str,
+) -> anyhow::Result<()> {
+    use crate::cli::commands::target::{read_or_empty_locked, write_value_validated_locked};
+    let (mut doc, _) = read_or_empty_locked(guard, master_path, master_path)?;
     {
         let table = match &mut doc {
             toml::Value::Table(t) => t,
@@ -9873,13 +10396,20 @@ fn remove_source_from_master(master_path: &Path, source: &str) -> anyhow::Result
             .and_then(|v| v.as_array_mut())
             .ok_or_else(|| anyhow::anyhow!("master config has no [lists].sources array"))?;
         let before = sources.len();
-        sources.retain(|s| s.as_str().map(|x| x != source).unwrap_or(true));
+        sources.retain(|value| value.as_str().map(|item| item != source).unwrap_or(true));
         if sources.len() == before {
             anyhow::bail!("source not in [lists].sources: {source}");
         }
     }
-    write_value_validated(master_path, master_path, &doc)?;
+    write_value_validated_locked(guard, master_path, master_path, &doc)?;
     Ok(())
+}
+
+/// Standalone Discard-source route. It owns one guard only for its
+/// synchronous read-modify-write; callers reload after this returns.
+fn remove_source_from_master(master_path: &Path, source: &str) -> anyhow::Result<()> {
+    let guard = crate::config::write_lock::acquire_for_write(master_path)?;
+    remove_source_from_master_locked(&guard, master_path, source)
 }
 
 /// Delete flow: the typed-id ConfirmDelete already passed in the caller.
@@ -10320,13 +10850,10 @@ async fn submit_query_log_new_list(
 
 /// Write the rule into every marked pack, then reload once.
 ///
-/// **One lock, N appends, one reload.** Each append is a
-/// read-modify-write, and taking the guard per list would let another
-/// surface interleave between two of them — leaving a reload able to see
-/// a multi-list write half done. The guard is scoped closed before the
-/// reload for the same reason `create_custom_list` scopes its own: a live
-/// guard in this process stalls a config promotion for the whole lock
-/// deadline.
+/// **One lock, N appends, one reload.** Each append is a read-modify-write,
+/// and taking the guard per list would let another surface interleave between
+/// two of them. The lexical guarded scope ends before audit/reload/poll
+/// awaits.
 ///
 /// Failure is reported **per list**. Three writes out of five do not
 /// collapse into one toast: the modal stays open and names which list
@@ -10338,7 +10865,7 @@ async fn submit_query_log_rule_modal(
     config_path: &Path,
 ) {
     use crate::cli::commands::rules::Action;
-    use crate::config::custom_list::{add_rule, pack_path, AddOutcome};
+    use crate::config::custom_list::AddOutcome;
     use crate::config::schema::Id;
     use crate::tui::tabs::custom_lists;
     use query_log_rule_modal::{RuleOutcome, RuleReport};
@@ -10348,21 +10875,18 @@ async fn submit_query_log_rule_modal(
     let ids = modal.selected_ids();
 
     let reports: Vec<RuleReport> = {
-        let Some(loaded) = app.loaded_config.as_ref() else {
-            app.status_err("the configuration could not be read".into());
-            app.query_log_rule_modal = Some(modal);
-            return;
-        };
-        let Some(root) = loaded.master_path.parent() else {
-            app.status_err("the configuration has no parent directory".into());
-            app.query_log_rule_modal = Some(modal);
-            return;
-        };
-        let max = custom_lists::max_pack_bytes(loaded);
-        let lock = match custom_lists::claim_tree(loaded) {
+        let guard = match custom_lists::claim_tree(config_path) {
             Ok(l) => l,
             Err(e) => {
                 app.status_err(format!("rule: {e}"));
+                app.query_log_rule_modal = Some(modal);
+                return;
+            }
+        };
+        let loaded = match load_v1_config_locked(&guard, config_path) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                app.status_err(error);
                 app.query_log_rule_modal = Some(modal);
                 return;
             }
@@ -10377,7 +10901,9 @@ async fn submit_query_log_rule_modal(
                     Ok(pid) if !loaded.config.custom_lists.iter().any(|c| c.id == pid) => {
                         RuleOutcome::Failed("no longer declared".into())
                     }
-                    Ok(pid) => match add_rule(&lock, &pack_path(root, &pid), &domain, allow, max) {
+                    Ok(pid) => match custom_lists::append_rule_locked(
+                        &guard, &loaded, &pid, &domain, allow,
+                    ) {
                         Ok(AddOutcome::Added) => RuleOutcome::Added,
                         Ok(AddOutcome::AlreadyPresent) => RuleOutcome::AlreadyPresent,
                         Err(e) => RuleOutcome::Failed(e.to_string()),
@@ -10814,12 +11340,109 @@ fn text_field_buf(form: &mut local_dns_modal::AddForm) -> &mut String {
     }
 }
 
+fn submit_local_dns_add_result(
+    scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+    result: anyhow::Result<crate::cli::commands::local_dns::AddOutcome>,
+) -> local_dns_modal::SubmitOutcome {
+    use crate::cli::commands::local_dns::{
+        format_local_records_added_global, format_local_records_added_profile, AddOutcome,
+        LocalRecordScope,
+    };
+    use local_dns_modal::SubmitOutcome;
+
+    match result {
+        Ok(AddOutcome::Applied {
+            devices_affected, ..
+        }) => {
+            let record_type = match spec.record_type {
+                crate::config::settings::LocalDnsRecordType::A => "A",
+                crate::config::settings::LocalDnsRecordType::AAAA => "AAAA",
+                crate::config::settings::LocalDnsRecordType::CNAME => "CNAME",
+            };
+            let message = match scope {
+                LocalRecordScope::Global => {
+                    format_local_records_added_global(&spec.domain, record_type, &spec.value)
+                }
+                LocalRecordScope::Profile(id) => format_local_records_added_profile(
+                    &spec.domain,
+                    record_type,
+                    &spec.value,
+                    id,
+                    devices_affected,
+                ),
+            };
+            SubmitOutcome::Ok(message)
+        }
+        Ok(AddOutcome::NoOp) => {
+            SubmitOutcome::Ok(format!("record '{}' already present — no-op", spec.domain))
+        }
+        Err(error) => SubmitOutcome::Failed(error.to_string()),
+    }
+}
+
+/// Edit a Local DNS row under one guard. This is serialized and compensating,
+/// not crash-atomic: a process crash after the removal can still lose the row.
+fn submit_local_dns_edit(
+    config_path: &Path,
+    old_scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    old_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+    new_scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    new_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+) -> local_dns_modal::SubmitOutcome {
+    use crate::cli::commands::local_dns::{
+        add_inner_locked, remove_inner_locked, AddOutcome, RemoveOutcome,
+    };
+    use local_dns_modal::SubmitOutcome;
+
+    let guard = match crate::config::write_lock::acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(error) => return SubmitOutcome::Failed(format!("edit failed during remove: {error}")),
+    };
+    let outcome = match remove_inner_locked(
+        &guard,
+        config_path,
+        old_scope,
+        &old_spec.domain,
+        Some(old_spec.record_type),
+        None,
+    ) {
+        Err(error) => SubmitOutcome::Failed(format!("edit failed during remove: {error}")),
+        Ok(RemoveOutcome::NotFound) => submit_local_dns_add_result(
+            new_scope,
+            new_spec,
+            add_inner_locked(&guard, config_path, new_scope, new_spec, None),
+        ),
+        Ok(RemoveOutcome::Removed { .. }) => {
+            match add_inner_locked(&guard, config_path, new_scope, new_spec, None) {
+                Ok(AddOutcome::Applied { .. }) | Ok(AddOutcome::NoOp) => {
+                    SubmitOutcome::Ok(format!(
+                        "edited local DNS record '{}' (removed old, added new)",
+                        new_spec.domain
+                    ))
+                }
+                Err(error) => {
+                    let restored =
+                        add_inner_locked(&guard, config_path, old_scope, old_spec, None).is_ok();
+                    let restore_note = if restored {
+                        "; restored the original record"
+                    } else {
+                        "; FAILED to restore original — config may be missing the row"
+                    };
+                    SubmitOutcome::Failed(format!("edit failed during add: {error}{restore_note}"))
+                }
+            }
+        }
+    };
+    drop(guard);
+    outcome
+}
+
 /// Submit path for all three Local DNS modals. Branches on the stage:
 ///
 /// - Add → `add_inner(scope, spec)` once.
-/// - Edit → `remove_inner(original_scope, original_domain, ...)` then
-///   `add_inner(new_scope, new_spec)`. Non-atomic — if the second call
-///   fails, attempts a best-effort restore by re-adding the original.
+/// - Edit → one guard around locked remove, add, and compensating restore.
+///   It is serialized, not crash-atomic.
 /// - Remove → `remove_inner(scope, domain, ...)` once.
 ///
 /// Outcomes flow through `LocalDnsModal::finish` so the renderer
@@ -10834,8 +11457,7 @@ async fn submit_local_dns_modal(
 ) {
     use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
     use crate::cli::commands::local_dns::{
-        add_inner, format_local_records_added_global, format_local_records_added_profile,
-        format_local_records_removed, remove_inner, AddOutcome, LocalRecordScope, RemoveOutcome,
+        add_inner, format_local_records_removed, remove_inner, LocalRecordScope, RemoveOutcome,
     };
     use local_dns_modal::{Stage, SubmitOutcome};
 
@@ -10845,9 +11467,13 @@ async fn submit_local_dns_modal(
             Ok((scope, spec)) => match form.mode {
                 local_dns_modal::FormMode::Add => submit_add(config_path, &scope, &spec),
                 local_dns_modal::FormMode::Edit => match form.original.as_ref() {
-                    Some(original) => {
-                        submit_edit(config_path, &original.scope, &original.spec, &scope, &spec)
-                    }
+                    Some(original) => submit_local_dns_edit(
+                        config_path,
+                        &original.scope,
+                        &original.spec,
+                        &scope,
+                        &spec,
+                    ),
                     // The Add/Edit constructors keep `mode == Edit` and
                     // `original.is_some()` in lock-step; degrade a broken
                     // invariant to a footer error instead of a panic that
@@ -10949,85 +11575,7 @@ async fn submit_local_dns_modal(
         scope: &LocalRecordScope,
         spec: &crate::cli::commands::local_dns::LocalRecordSpec,
     ) -> So {
-        match add_inner(config_path, scope, spec, None) {
-            Ok(AddOutcome::Applied {
-                devices_affected, ..
-            }) => {
-                let rt = match spec.record_type {
-                    crate::config::settings::LocalDnsRecordType::A => "A",
-                    crate::config::settings::LocalDnsRecordType::AAAA => "AAAA",
-                    crate::config::settings::LocalDnsRecordType::CNAME => "CNAME",
-                };
-                let msg = match scope {
-                    LocalRecordScope::Global => {
-                        format_local_records_added_global(&spec.domain, rt, &spec.value)
-                    }
-                    LocalRecordScope::Profile(id) => format_local_records_added_profile(
-                        &spec.domain,
-                        rt,
-                        &spec.value,
-                        id,
-                        devices_affected,
-                    ),
-                };
-                So::Ok(msg)
-            }
-            Ok(AddOutcome::NoOp) => {
-                So::Ok(format!("record '{}' already present — no-op", spec.domain))
-            }
-            Err(e) => So::Failed(e.to_string()),
-        }
-    }
-
-    fn submit_edit(
-        config_path: &std::path::Path,
-        old_scope: &LocalRecordScope,
-        old_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
-        new_scope: &LocalRecordScope,
-        new_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
-    ) -> So {
-        // Two-phase: drop the original first so the duplicate-check on
-        // the validator pre-flight does not refuse the new record on
-        // an unchanged (domain, type, match_subdomains) tuple. The
-        // window between the two writes is small thanks to valid-
-        // ation pre-flight + filesystem atomic-rename + ipc reload
-        // coalescing, but the two operations are NOT atomic — if the
-        // second write fails the modal reports both errors and
-        // attempts a best-effort restore.
-        match remove_inner(
-            config_path,
-            old_scope,
-            &old_spec.domain,
-            Some(old_spec.record_type),
-            None,
-        ) {
-            Err(e) => So::Failed(format!("edit failed during remove: {e}")),
-            Ok(RemoveOutcome::NotFound) => {
-                // Original already gone (concurrent edit?). Try to add
-                // the new record anyway — it may be the operator's
-                // intended state.
-                submit_add(config_path, new_scope, new_spec)
-            }
-            Ok(RemoveOutcome::Removed { .. }) => {
-                match add_inner(config_path, new_scope, new_spec, None) {
-                    Ok(AddOutcome::Applied { .. }) | Ok(AddOutcome::NoOp) => So::Ok(format!(
-                        "edited local DNS record '{}' (removed old, added new)",
-                        new_spec.domain
-                    )),
-                    Err(e) => {
-                        // Best-effort restore — re-add the original.
-                        let restore = add_inner(config_path, old_scope, old_spec, None);
-                        let restored = restore.is_ok();
-                        let restore_note = if restored {
-                            "; restored the original record"
-                        } else {
-                            "; FAILED to restore original — config may be missing the row"
-                        };
-                        So::Failed(format!("edit failed during add: {e}{restore_note}"))
-                    }
-                }
-            }
-        }
+        submit_local_dns_add_result(scope, spec, add_inner(config_path, scope, spec, None))
     }
 }
 

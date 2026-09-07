@@ -17,7 +17,7 @@ fn poller(dir: &Path) -> IpcPoller {
 fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     let mut t = String::from(
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n\n",

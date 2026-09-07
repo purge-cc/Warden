@@ -24,20 +24,687 @@
 //! slash-form catalog ids — the validator at
 //! `src/config/schema/validator.rs` only accepts the two shapes.
 //!
-//! `merge_sources_with_blocklists` returns `(Vec<String>, SourceTrustMap)`,
-//! `build_source_tokens` returns `SourceTokenMap`, and the `ListManager`
-//! struct fields carry the typed shapes throughout.
 
 use std::collections::{BTreeMap, HashMap};
 
 use ahash::RandomState;
 use compact_str::CompactString;
+use sha2::{Digest, Sha256};
 
 use crate::config::schema::id::Id;
 use crate::config::schema::{effective_direction, Blocklist, BlocklistTrust, ListPolicy, Profile};
 use crate::filter::engine::{PolicyMasks, ProfileMasks};
 
+use super::catalog::Catalog;
 use super::manager::{BitMapBuildError, MAX_LIST_SOURCES};
+
+/// Frozen error for aliases that would make one fetched source mean two
+/// different policies.
+pub const LIST_SOURCE_ALIAS_CONFLICT: &str =
+    "list source aliases \"{first}\" and \"{second}\" resolve to \"{url}\" but disagree on {field}; make their effective source settings identical or disable one";
+
+/// Controls whether row-level settings are part of a source's meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowControlMode {
+    /// Historical schemas retain global-only row-control semantics.
+    #[default]
+    InheritAll,
+    /// New schemas honor row controls.
+    HonorOverrides,
+}
+
+impl RowControlMode {
+    pub fn for_schema_version(schema_version: u32) -> Self {
+        if schema_version >= 4 {
+            Self::HonorOverrides
+        } else {
+            Self::InheritAll
+        }
+    }
+}
+
+/// Global values used when a row control is inherited or schema-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowControlDefaults {
+    pub max_entries: usize,
+    pub update_interval_secs: u64,
+}
+
+impl Default for RowControlDefaults {
+    fn default() -> Self {
+        let lists = crate::config::settings::ListsConfig::default();
+        Self {
+            max_entries: lists.max_entries,
+            update_interval_secs: lists.update_interval_secs,
+        }
+    }
+}
+
+pub(crate) type ManagerSourceMaps = (
+    HashMap<String, (Id, u32)>,
+    HashMap<String, crate::lists::detector::ListFormat>,
+    HashMap<String, usize>,
+);
+
+/// Substitute every alias-conflict placeholder.
+pub fn format_list_source_alias_conflict(
+    first: &str,
+    second: &str,
+    canonical_url: &str,
+    field: &str,
+) -> String {
+    LIST_SOURCE_ALIAS_CONFLICT
+        .replace("{first}", first)
+        .replace("{second}", second)
+        .replace("{url}", canonical_url)
+        .replace("{field}", field)
+}
+
+/// The configured fields that must agree before aliases can share a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceAliasConflict {
+    field: String,
+}
+
+impl SourceAliasConflict {
+    pub(crate) fn field(&self) -> &str {
+        &self.field
+    }
+}
+
+/// Compare semantics after profile inheritance has been applied.
+pub(crate) fn blocklist_alias_conflict(
+    first: &Blocklist,
+    second: &Blocklist,
+    profiles: &BTreeMap<String, Profile>,
+    defaults: RowControlDefaults,
+    row_control_mode: RowControlMode,
+) -> Option<SourceAliasConflict> {
+    if first.base != second.base {
+        return Some(SourceAliasConflict {
+            field: "base direction".to_string(),
+        });
+    }
+    for (profile_id, profile) in profiles {
+        if effective_direction(profile, first) != effective_direction(profile, second) {
+            return Some(SourceAliasConflict {
+                field: format!("effective direction for profile \"{profile_id}\""),
+            });
+        }
+    }
+    if first.format != second.format {
+        return Some(SourceAliasConflict {
+            field: "parser format".to_string(),
+        });
+    }
+    if first.trust != second.trust {
+        return Some(SourceAliasConflict {
+            field: "trust mode".to_string(),
+        });
+    }
+    if first.auth_token_ref != second.auth_token_ref {
+        return Some(SourceAliasConflict {
+            field: "auth-token reference".to_string(),
+        });
+    }
+    if effective_max_entries(first.max_entries, defaults.max_entries, row_control_mode)
+        != effective_max_entries(second.max_entries, defaults.max_entries, row_control_mode)
+    {
+        return Some(SourceAliasConflict {
+            field: "effective max-entries cap".to_string(),
+        });
+    }
+    if effective_update_interval_secs(
+        first.update_interval_hours,
+        defaults.update_interval_secs,
+        row_control_mode,
+    ) != effective_update_interval_secs(
+        second.update_interval_hours,
+        defaults.update_interval_secs,
+        row_control_mode,
+    ) {
+        return Some(SourceAliasConflict {
+            field: "effective update interval".to_string(),
+        });
+    }
+    if first.max_consecutive_failures != second.max_consecutive_failures {
+        return Some(SourceAliasConflict {
+            field: "max-consecutive-failures retry ownership".to_string(),
+        });
+    }
+    None
+}
+
+/// A row can only narrow the global safety ceiling. Values wider than this
+/// platform's `usize` are necessarily wider than that ceiling too.
+pub(crate) fn effective_max_entries(
+    row_max_entries: Option<u64>,
+    global_max_entries: usize,
+    row_control_mode: RowControlMode,
+) -> usize {
+    if matches!(row_control_mode, RowControlMode::InheritAll) {
+        return global_max_entries;
+    }
+    row_max_entries
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(global_max_entries)
+        .min(global_max_entries)
+}
+
+/// Resolve the source's cadence after schema compatibility and inheritance.
+pub(crate) fn effective_update_interval_secs(
+    row_update_interval_hours: Option<u32>,
+    global_update_interval_secs: u64,
+    row_control_mode: RowControlMode,
+) -> u64 {
+    let configured = if matches!(row_control_mode, RowControlMode::HonorOverrides) {
+        row_update_interval_hours
+            .map(|hours| u64::from(hours) * 3600)
+            .unwrap_or(global_update_interval_secs)
+    } else {
+        global_update_interval_secs
+    };
+    configured.max(60)
+}
+
+/// One enabled, catalog-resolved source and every configured alias for it.
+#[derive(Debug, Clone)]
+pub struct ResolvedSource {
+    representative: String,
+    fetch_url: String,
+    canonical_url: String,
+    schedule_key: CanonicalSourceScheduleKey,
+    source_aliases: Vec<String>,
+    id_aliases: Vec<Id>,
+    owner: Option<PlannedBlocklist>,
+    effective_max_entries: usize,
+    effective_update_interval_secs: u64,
+}
+
+impl ResolvedSource {
+    /// The first configured spelling. It is the sole cache and status key
+    /// for this canonical URL.
+    pub fn representative(&self) -> &str {
+        &self.representative
+    }
+
+    /// Exact URL selected for this generation's HTTP fetch.
+    pub fn fetch_url(&self) -> &str {
+        &self.fetch_url
+    }
+
+    /// Canonical URL identity after catalog resolution.
+    pub fn canonical_url(&self) -> &str {
+        &self.canonical_url
+    }
+
+    /// Opaque durable scheduling identity computed from the raw fetch URL.
+    pub fn schedule_key(&self) -> &CanonicalSourceScheduleKey {
+        &self.schedule_key
+    }
+
+    fn owner(&self) -> Option<&PlannedBlocklist> {
+        self.owner.as_ref()
+    }
+
+    pub(crate) fn owner_blocklist(&self) -> Option<&Blocklist> {
+        self.owner().map(|owner| &owner.row)
+    }
+
+    /// The cap this canonical source is parsed and digested under.
+    pub fn effective_max_entries(&self) -> usize {
+        self.effective_max_entries
+    }
+
+    /// The cadence modeled for this canonical source.
+    pub fn effective_update_interval_secs(&self) -> u64 {
+        self.effective_update_interval_secs
+    }
+
+    /// All configuration ids sharing this canonical fetch identity.
+    pub(crate) fn id_aliases(&self) -> &[Id] {
+        &self.id_aliases
+    }
+}
+
+/// The first configured row owns source behavior.
+#[derive(Debug, Clone)]
+struct PlannedBlocklist {
+    row: Blocklist,
+}
+
+/// Error raised when aliases would make one downloaded body ambiguous.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolvedSourcePlanError {
+    #[error("{message}")]
+    Conflict { message: String },
+}
+
+/// The single resolved identity plan for one list generation.
+///
+/// A canonical URL owns one representative, bit, cache stem, status slot,
+/// and retry owner. All configured spellings resolve back to that seat.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSourcePlan {
+    sources: Vec<ResolvedSource>,
+    source_to_representative: HashMap<String, String>,
+    canonical_url_to_representative: HashMap<String, String>,
+    id_to_representative: HashMap<Id, String>,
+    primary_id_by_representative: HashMap<String, Id>,
+    row_control_mode: RowControlMode,
+}
+
+impl ResolvedSourcePlan {
+    /// Resolve configured sources through the exact catalog selected for this
+    /// generation, keeping the first configured spelling as representative.
+    pub fn build(
+        catalog: &Catalog,
+        legacy: &[String],
+        blocklists: &[Blocklist],
+        profiles: &BTreeMap<String, Profile>,
+    ) -> Result<Self, ResolvedSourcePlanError> {
+        Self::build_for_schema(
+            catalog,
+            legacy,
+            blocklists,
+            profiles,
+            RowControlDefaults::default(),
+            3,
+        )
+    }
+
+    /// Resolve sources with explicitly selected row-control semantics.
+    pub fn build_with_row_control_defaults(
+        catalog: &Catalog,
+        legacy: &[String],
+        blocklists: &[Blocklist],
+        profiles: &BTreeMap<String, Profile>,
+        defaults: RowControlDefaults,
+        row_control_mode: RowControlMode,
+    ) -> Result<Self, ResolvedSourcePlanError> {
+        Self::build_with_control_mode(
+            catalog,
+            legacy,
+            blocklists,
+            profiles,
+            defaults,
+            row_control_mode,
+        )
+    }
+
+    /// Resolve sources under the compatibility mode selected by config.
+    pub fn build_for_schema(
+        catalog: &Catalog,
+        legacy: &[String],
+        blocklists: &[Blocklist],
+        profiles: &BTreeMap<String, Profile>,
+        defaults: RowControlDefaults,
+        schema_version: u32,
+    ) -> Result<Self, ResolvedSourcePlanError> {
+        Self::build_with_control_mode(
+            catalog,
+            legacy,
+            blocklists,
+            profiles,
+            defaults,
+            RowControlMode::for_schema_version(schema_version),
+        )
+    }
+
+    fn build_with_control_mode(
+        catalog: &Catalog,
+        legacy: &[String],
+        blocklists: &[Blocklist],
+        profiles: &BTreeMap<String, Profile>,
+        defaults: RowControlDefaults,
+        row_control_mode: RowControlMode,
+    ) -> Result<Self, ResolvedSourcePlanError> {
+        let mut plan = Self {
+            row_control_mode,
+            ..Self::default()
+        };
+        let mut by_canonical_url: HashMap<String, usize> = HashMap::new();
+        let enabled_by_id: HashMap<Id, &Blocklist> = blocklists
+            .iter()
+            .filter(|row| row.enabled)
+            .map(|row| (row.id.clone(), row))
+            .collect();
+        let mut catalog_legacy_ids: HashMap<Id, (String, String)> = HashMap::new();
+
+        for source in legacy {
+            let catalog_url = catalog.resolve(source);
+            let legacy_id = (!is_url_source(source))
+                .then(|| Id::new(source.replace('/', "-")))
+                .transpose()
+                .ok()
+                .flatten();
+            let fetch_url = match (&catalog_url, legacy_id.as_ref()) {
+                (Some(url), _) => url.clone(),
+                (None, Some(id)) => match enabled_by_id.get(id) {
+                    Some(row) => row.url.clone(),
+                    None => continue,
+                },
+                (None, None) => continue,
+            };
+            let canonical_url = canonical_url_key(&fetch_url);
+            let index = plan.push_or_get(
+                &mut by_canonical_url,
+                source,
+                fetch_url,
+                canonical_url,
+                defaults,
+            );
+            plan.sources[index].source_aliases.push(source.clone());
+            if let Some(id) = legacy_id {
+                plan.sources[index].id_aliases.push(id.clone());
+                if catalog_url.is_some() {
+                    let resolved_url = plan.sources[index].canonical_url.clone();
+                    if let Some((first_source, first_url)) = catalog_legacy_ids.get(&id) {
+                        if first_url != &resolved_url {
+                            return Err(ResolvedSourcePlanError::Conflict {
+                                message: format_list_source_alias_conflict(
+                                    first_source,
+                                    source,
+                                    first_url,
+                                    "resolved URL",
+                                ),
+                            });
+                        }
+                    } else {
+                        catalog_legacy_ids.insert(id, (source.clone(), resolved_url));
+                    }
+                }
+            }
+        }
+
+        for blocklist in blocklists.iter().filter(|b| b.enabled) {
+            let canonical_url = canonical_url_key(&blocklist.url);
+            if let Some((legacy_source, legacy_url)) = catalog_legacy_ids.get(&blocklist.id) {
+                if legacy_url != &canonical_url {
+                    return Err(ResolvedSourcePlanError::Conflict {
+                        message: format_list_source_alias_conflict(
+                            legacy_source,
+                            blocklist.id.as_str(),
+                            legacy_url,
+                            "resolved URL",
+                        ),
+                    });
+                }
+            }
+
+            let index = plan.push_or_get(
+                &mut by_canonical_url,
+                blocklist.url.as_str(),
+                blocklist.url.clone(),
+                canonical_url.clone(),
+                defaults,
+            );
+            let source = &mut plan.sources[index];
+            source.source_aliases.push(blocklist.url.clone());
+            source.source_aliases.push(blocklist.id.to_string());
+            if let Some(slug) = legacy_slug_for_id(&blocklist.id) {
+                source.source_aliases.push(slug);
+            }
+            source.id_aliases.push(blocklist.id.clone());
+            if let Some(owner) = source.owner.as_ref() {
+                if let Some(conflict) = blocklist_alias_conflict(
+                    &owner.row,
+                    blocklist,
+                    profiles,
+                    defaults,
+                    row_control_mode,
+                ) {
+                    return Err(ResolvedSourcePlanError::Conflict {
+                        message: format_list_source_alias_conflict(
+                            owner.row.id.as_str(),
+                            blocklist.id.as_str(),
+                            &canonical_url,
+                            conflict.field(),
+                        ),
+                    });
+                }
+            } else {
+                source.owner = Some(PlannedBlocklist {
+                    row: blocklist.clone(),
+                });
+                source.effective_max_entries = effective_max_entries(
+                    blocklist.max_entries,
+                    defaults.max_entries,
+                    row_control_mode,
+                );
+                source.effective_update_interval_secs = effective_update_interval_secs(
+                    blocklist.update_interval_hours,
+                    defaults.update_interval_secs,
+                    row_control_mode,
+                );
+            }
+        }
+
+        for source in &plan.sources {
+            for alias in &source.source_aliases {
+                insert_alias(
+                    &mut plan.source_to_representative,
+                    alias,
+                    source,
+                    "resolved URL",
+                )?;
+            }
+            insert_alias(
+                &mut plan.canonical_url_to_representative,
+                &source.canonical_url,
+                source,
+                "resolved URL",
+            )?;
+            for id in &source.id_aliases {
+                if let Some(existing) = plan.id_to_representative.get(id) {
+                    if existing != &source.representative {
+                        return Err(ResolvedSourcePlanError::Conflict {
+                            message: format_list_source_alias_conflict(
+                                existing,
+                                id.as_str(),
+                                &source.canonical_url,
+                                "resolved URL",
+                            ),
+                        });
+                    }
+                } else {
+                    plan.id_to_representative
+                        .insert(id.clone(), source.representative.clone());
+                }
+            }
+            let primary = source
+                .owner()
+                .map(|owner| owner.row.id.clone())
+                .or_else(|| source.id_aliases.first().cloned());
+            if let Some(id) = primary {
+                plan.primary_id_by_representative
+                    .insert(source.representative.clone(), id);
+            }
+        }
+        Ok(plan)
+    }
+
+    fn push_or_get(
+        &mut self,
+        by_canonical_url: &mut HashMap<String, usize>,
+        representative: &str,
+        fetch_url: String,
+        canonical_url: String,
+        defaults: RowControlDefaults,
+    ) -> usize {
+        if let Some(index) = by_canonical_url.get(&canonical_url) {
+            *index
+        } else {
+            let index = self.sources.len();
+            by_canonical_url.insert(canonical_url.clone(), index);
+            self.sources.push(ResolvedSource {
+                representative: representative.to_string(),
+                schedule_key: schedule_key_from_raw_fetch_url(&fetch_url),
+                fetch_url,
+                canonical_url,
+                source_aliases: Vec::new(),
+                id_aliases: Vec::new(),
+                owner: None,
+                effective_max_entries: defaults.max_entries,
+                effective_update_interval_secs: effective_update_interval_secs(
+                    None,
+                    defaults.update_interval_secs,
+                    self.row_control_mode,
+                ),
+            });
+            index
+        }
+    }
+
+    /// Representatives in deterministic declaration order.
+    pub fn representatives(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|source| source.representative.clone())
+            .collect()
+    }
+
+    /// Number of canonical source identities.
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// `true` when no enabled source has a representative.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    pub fn row_control_mode(&self) -> RowControlMode {
+        self.row_control_mode
+    }
+
+    /// Resolve a configured source spelling or canonical-equivalent URL.
+    pub fn representative_for_source(&self, source: &str) -> Option<&str> {
+        self.source_to_representative
+            .get(source)
+            .or_else(|| {
+                self.canonical_url_to_representative
+                    .get(&canonical_url_key(source))
+            })
+            .or_else(|| {
+                Id::new(source)
+                    .ok()
+                    .and_then(|id| self.id_to_representative.get(&id))
+            })
+            .map(String::as_str)
+    }
+
+    /// Resolve any configured list id to its representative.
+    pub fn representative_for_id(&self, id: &Id) -> Option<&str> {
+        self.id_to_representative.get(id).map(String::as_str)
+    }
+
+    /// Resolve an alias to the exact URL this generation fetches.
+    pub fn fetch_url_for_source(&self, source: &str) -> Option<&str> {
+        let representative = self.representative_for_source(source)?;
+        self.sources
+            .iter()
+            .find(|planned| planned.representative == representative)
+            .map(ResolvedSource::fetch_url)
+    }
+
+    /// Deterministic list id displayed for a representative source.
+    pub fn primary_id_for_source(&self, source: &str) -> Option<&Id> {
+        let representative = self.representative_for_source(source)?;
+        self.primary_id_by_representative.get(representative)
+    }
+
+    /// Iterate canonical sources in declaration order.
+    pub fn sources(&self) -> impl Iterator<Item = &ResolvedSource> {
+        self.sources.iter()
+    }
+
+    pub(crate) fn source_aliases(&self) -> &HashMap<String, String> {
+        &self.source_to_representative
+    }
+
+    pub(crate) fn canonical_url_aliases(&self) -> &HashMap<String, String> {
+        &self.canonical_url_to_representative
+    }
+
+    pub(crate) fn id_aliases(&self) -> &HashMap<Id, String> {
+        &self.id_to_representative
+    }
+
+    pub(crate) fn primary_ids(&self) -> &HashMap<String, Id> {
+        &self.primary_id_by_representative
+    }
+
+    pub(crate) fn fetch_urls(&self) -> HashMap<String, String> {
+        self.sources
+            .iter()
+            .map(|source| (source.representative.clone(), source.fetch_url.clone()))
+            .collect()
+    }
+
+    /// Manager lookups for the representatives that can reach its fetch loop.
+    pub(crate) fn manager_source_maps(&self) -> ManagerSourceMaps {
+        let mut source_to_blocklist = HashMap::new();
+        let mut source_to_format = HashMap::new();
+        let mut source_to_max_entries = HashMap::new();
+        for source in &self.sources {
+            for alias in &source.source_aliases {
+                source_to_max_entries.insert(alias.clone(), source.effective_max_entries);
+            }
+            let Some(owner) = source.owner() else {
+                continue;
+            };
+            let format = match owner.row.format {
+                crate::config::schema::BlocklistFormat::Domains => None,
+                crate::config::schema::BlocklistFormat::Hosts => {
+                    Some(crate::lists::detector::ListFormat::Hosts)
+                }
+                crate::config::schema::BlocklistFormat::Adguard => {
+                    Some(crate::lists::detector::ListFormat::AdGuard)
+                }
+            };
+            for alias in &source.source_aliases {
+                source_to_blocklist.insert(
+                    alias.clone(),
+                    (owner.row.id.clone(), owner.row.max_consecutive_failures),
+                );
+                if let Some(format) = format {
+                    source_to_format.insert(alias.clone(), format);
+                }
+            }
+        }
+        (source_to_blocklist, source_to_format, source_to_max_entries)
+    }
+}
+
+fn insert_alias(
+    aliases: &mut HashMap<String, String>,
+    alias: &str,
+    source: &ResolvedSource,
+    field: &str,
+) -> Result<(), ResolvedSourcePlanError> {
+    if let Some(existing) = aliases.get(alias) {
+        if existing != &source.representative {
+            return Err(ResolvedSourcePlanError::Conflict {
+                message: format_list_source_alias_conflict(
+                    existing,
+                    alias,
+                    &source.canonical_url,
+                    field,
+                ),
+            });
+        }
+    } else {
+        aliases.insert(alias.to_string(), source.representative.clone());
+    }
+    Ok(())
+}
+
+fn legacy_slug_for_id(id: &Id) -> Option<String> {
+    let id = id.as_str();
+    let split = id.find('-')?;
+    Some(format!("{}/{}", &id[..split], &id[split + 1..]))
+}
 
 /// Typed facade over the URL ↔ v1-id ↔ legacy-catalog-id source bit map.
 ///
@@ -50,8 +717,10 @@ use super::manager::{BitMapBuildError, MAX_LIST_SOURCES};
 #[derive(Debug, Clone, Default)]
 pub struct SourceBitMap {
     by_url: HashMap<String, u8>,
+    by_canonical_url: HashMap<String, u8>,
     by_v1_id: HashMap<Id, u8>,
     by_legacy_catalog_id: HashMap<String, u8>,
+    representatives: Vec<String>,
 }
 
 impl SourceBitMap {
@@ -59,9 +728,10 @@ impl SourceBitMap {
     /// (`merge_sources_with_blocklists` output) and the v1
     /// `[[blocklists]]` catalogue.
     ///
-    /// **Bit assignment.** Sequential, one bit per `sources` entry.
+    /// **Bit assignment.** Sequential, one bit per canonical URL identity.
     /// Returns [`BitMapBuildError::TooManySources`] when
-    /// `sources.len() > MAX_LIST_SOURCES`. The error message is
+    /// the number of distinct canonical identities exceeds
+    /// `MAX_LIST_SOURCES`. The error message is
     /// preserved verbatim from the legacy `build_source_bit_map` so
     /// frozen-strings tests stay green.
     ///
@@ -89,9 +759,20 @@ impl SourceBitMap {
     /// regardless of source kind — closing the contract gap at the type
     /// level.
     pub fn build(sources: &[String], blocklists: &[Blocklist]) -> Result<Self, BitMapBuildError> {
-        if sources.len() > MAX_LIST_SOURCES {
+        let mut representatives = Vec::with_capacity(sources.len());
+        let mut representative_by_canonical = HashMap::with_capacity(sources.len());
+        for source in sources {
+            let canonical = canonical_url_key(source);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                representative_by_canonical.entry(canonical)
+            {
+                entry.insert(representatives.len());
+                representatives.push(source.clone());
+            }
+        }
+        if representatives.len() > MAX_LIST_SOURCES {
             return Err(BitMapBuildError::TooManySources {
-                got: sources.len(),
+                got: representatives.len(),
                 max: MAX_LIST_SOURCES,
             });
         }
@@ -101,18 +782,26 @@ impl SourceBitMap {
         // blocklists`, the slash-form translation can never exceed
         // `sources`). Avoids one rehash on the typical 64-bit-cap path.
         let mut by_url: HashMap<String, u8> = HashMap::with_capacity(sources.len());
+        let mut by_canonical_url: HashMap<String, u8> =
+            HashMap::with_capacity(representatives.len());
         let mut by_v1_id: HashMap<Id, u8> =
             HashMap::with_capacity(sources.len() + blocklists.len());
         let mut by_legacy_catalog_id: HashMap<String, u8> = HashMap::with_capacity(sources.len());
 
-        for (i, source) in sources.iter().enumerate() {
-            let bit = i as u8;
-            by_url.insert(source.clone(), bit);
+        for source in sources {
+            let bit = *representative_by_canonical
+                .get(&canonical_url_key(source))
+                .expect("each source canonical key has a representative")
+                as u8;
+            by_url.entry(source.clone()).or_insert(bit);
+            by_canonical_url
+                .entry(canonical_url_key(source))
+                .or_insert(bit);
 
             if !is_url_source(source) {
                 by_legacy_catalog_id.insert(source.clone(), bit);
                 if let Ok(id) = Id::new(source.replace('/', "-")) {
-                    by_v1_id.insert(id, bit);
+                    by_v1_id.entry(id).or_insert(bit);
                 }
             }
         }
@@ -121,15 +810,60 @@ impl SourceBitMap {
             if !b.enabled {
                 continue;
             }
-            if let Some(&bit) = by_url.get(b.url.as_str()) {
+            if let Some(&bit) = by_canonical_url.get(&canonical_url_key(&b.url)) {
                 by_v1_id.insert(b.id.clone(), bit);
+                by_canonical_url
+                    .entry(canonical_url_key(&b.url))
+                    .or_insert(bit);
             }
         }
 
         Ok(Self {
             by_url,
+            by_canonical_url,
             by_v1_id,
             by_legacy_catalog_id,
+            representatives,
+        })
+    }
+
+    /// Build every alias lookup from the one resolved source plan.
+    pub fn from_plan(plan: &ResolvedSourcePlan) -> Result<Self, BitMapBuildError> {
+        if plan.len() > MAX_LIST_SOURCES {
+            return Err(BitMapBuildError::TooManySources {
+                got: plan.len(),
+                max: MAX_LIST_SOURCES,
+            });
+        }
+
+        let representatives = plan.representatives();
+        let mut by_url = HashMap::new();
+        let mut by_canonical_url = HashMap::new();
+        let mut by_v1_id = HashMap::new();
+        let mut by_legacy_catalog_id = HashMap::new();
+        for (bit, source) in plan.sources().enumerate() {
+            let bit = bit as u8;
+            for alias in &source.source_aliases {
+                by_url.entry(alias.clone()).or_insert(bit);
+            }
+            by_canonical_url
+                .entry(source.canonical_url.clone())
+                .or_insert(bit);
+            for id in &source.id_aliases {
+                by_v1_id.entry(id.clone()).or_insert(bit);
+            }
+            for alias in &source.source_aliases {
+                if !is_url_source(alias) {
+                    by_legacy_catalog_id.entry(alias.clone()).or_insert(bit);
+                }
+            }
+        }
+        Ok(Self {
+            by_url,
+            by_canonical_url,
+            by_v1_id,
+            by_legacy_catalog_id,
+            representatives,
         })
     }
 
@@ -214,22 +948,7 @@ impl SourceBitMap {
     }
 
     /// The bit this generation gave `b`, or `None` if it holds none.
-    ///
-    /// **Goes through [`Self::bit_for_v1_id`], not `by_url`, deliberately.**
-    /// A config can name a source in two channels: a `[[blocklists]]` row
-    /// (URL-keyed) or a slash-form slug in `[lists].sources` (translated to
-    /// a v1 id). `by_url` only sees the first, so a slug-channel list would
-    /// get no bit here — every profile would come out with an empty mask
-    /// and the daemon would forward everything. `by_v1_id` is seeded from
-    /// **both** channels, which is why the consumer side has collapsed to
-    /// one call.
-    ///
-    /// Caught by `tests/dual_channel_source_dedup.rs`, which builds the
-    /// slug-channel shape and asserts bit identity; the first draft of
-    /// `project_policy` read `by_url` and both of its cases went to zero.
-    ///
-    /// Disabled rows return `None` for free: their URL never reaches the
-    /// merged sources vector, so no channel seeds a bit for them.
+    /// Id aliases preserve one policy bit across URL and legacy spellings.
     fn bit_for_list(&self, b: &Blocklist) -> Option<u8> {
         if !b.enabled {
             return None;
@@ -240,7 +959,10 @@ impl SourceBitMap {
     /// Look up the bit for a fetch URL. Used by the list manager's
     /// download loop.
     pub fn bit_for_url(&self, url: &str) -> Option<u8> {
-        self.by_url.get(url).copied()
+        self.by_url
+            .get(url)
+            .or_else(|| self.by_canonical_url.get(&canonical_url_key(url)))
+            .copied()
     }
 
     /// Look up the bit for a v1 entity [`Id`]. Called by the profile
@@ -260,20 +982,23 @@ impl SourceBitMap {
         self.by_legacy_catalog_id.get(slash_id).copied()
     }
 
-    /// Iterate the URL → bit pairs in arbitrary order. Used by the
-    /// list manager's fetch loop and by debug tooling.
+    /// Iterate representatives in bit order. Used by the list manager's
+    /// fetch loop and debug tooling.
     pub fn iter_urls(&self) -> impl Iterator<Item = (&str, u8)> {
-        self.by_url.iter().map(|(k, v)| (k.as_str(), *v))
+        self.representatives
+            .iter()
+            .enumerate()
+            .map(|(bit, source)| (source.as_str(), bit as u8))
     }
 
     /// Total number of URL keys (one per assigned bit).
     pub fn len(&self) -> usize {
-        self.by_url.len()
+        self.representatives.len()
     }
 
     /// `true` when no source has been seeded.
     pub fn is_empty(&self) -> bool {
-        self.by_url.is_empty()
+        self.representatives.is_empty()
     }
 }
 
@@ -398,6 +1123,140 @@ pub fn canonical_url_key(url: &str) -> String {
     out
 }
 
+const CANONICAL_SOURCE_SCHEDULE_KEY_PREFIX: &str = "canonical-url-v1-sha256-";
+const CANONICAL_SOURCE_SCHEDULE_KEY_HEX_LEN: usize = 64;
+const CANONICAL_SOURCE_SCHEDULE_KEY_DOMAIN: &[u8] = b"warden:list-schedule-key\0v1\0";
+
+/// Validated opaque key for one canonical source's scheduling ledger row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CanonicalSourceScheduleKey(String);
+
+impl CanonicalSourceScheduleKey {
+    /// Stable text used as the sidecar's TOML map key.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_digest(digest: [u8; 32]) -> Self {
+        Self(format!(
+            "{CANONICAL_SOURCE_SCHEDULE_KEY_PREFIX}{}",
+            hex::encode(digest)
+        ))
+    }
+
+    fn validate(value: &str) -> Result<(), &'static str> {
+        let Some(hex) = value.strip_prefix(CANONICAL_SOURCE_SCHEDULE_KEY_PREFIX) else {
+            return Err("schedule key must use the canonical-url-v1-sha256 prefix");
+        };
+        if hex.len() != CANONICAL_SOURCE_SCHEDULE_KEY_HEX_LEN
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("schedule key must end in 64 lowercase hexadecimal characters");
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for CanonicalSourceScheduleKey {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::validate(value)?;
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl serde::Serialize for CanonicalSourceScheduleKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CanonicalSourceScheduleKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::validate(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
+
+/// Frozen v1 source identity for durable scheduling.
+///
+/// Unlike [`canonical_url_key`], this intentionally excludes userinfo:
+/// authentication is not source identity, and Force handles credential rotation.
+fn canonical_schedule_identity_v1(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = url[..scheme_end].to_ascii_lowercase();
+    let rest = &url[scheme_end + 3..];
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let tail = &rest[auth_end..];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let port_sep = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .and_then(|close| host_port[close + 1..].starts_with(':').then_some(close + 1))
+    } else {
+        (host_port.matches(':').count() == 1).then(|| host_port.find(':').unwrap_or(0))
+    };
+    let (host, port) = match port_sep {
+        Some(index) => (&host_port[..index], Some(&host_port[index + 1..])),
+        None => (host_port, None),
+    };
+    let keep_port = match (scheme.as_str(), port) {
+        (_, None) => None,
+        ("http", Some("80")) | ("https", Some("443")) => None,
+        (_, Some(port)) => Some(port),
+    };
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let path = tail[..path_end]
+        .strip_suffix('/')
+        .unwrap_or(&tail[..path_end]);
+    let suffix = &tail[path_end..];
+
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&scheme);
+    out.push_str("://");
+    out.push_str(&host.to_ascii_lowercase());
+    if let Some(port) = keep_port {
+        out.push(':');
+        out.push_str(port);
+    }
+    out.push_str(path);
+    out.push_str(suffix);
+    out
+}
+
+/// Opaque durable-scheduling key for one canonical source identity.
+///
+/// WHY: aliases share a cadence while a versioned hash avoids persisting
+/// credential-bearing URLs in mutable state. The hash is an identifier, not
+/// a secrecy boundary.
+fn schedule_key_from_raw_fetch_url(url: &str) -> CanonicalSourceScheduleKey {
+    let identity = canonical_schedule_identity_v1(url);
+    let mut hasher = Sha256::new();
+    hasher.update(CANONICAL_SOURCE_SCHEDULE_KEY_DOMAIN);
+    hasher.update(
+        u64::try_from(identity.len())
+            .expect("source identity length fits u64")
+            .to_be_bytes(),
+    );
+    hasher.update(identity.as_bytes());
+    CanonicalSourceScheduleKey::from_digest(hasher.finalize().into())
+}
+
 /// Typed facade over the URL ↔ v1-id source → [`BlocklistTrust`] map.
 ///
 /// Replaces a raw `HashMap<String, BlocklistTrust>` that
@@ -429,6 +1288,25 @@ pub struct SourceTrustMap {
 }
 
 impl SourceTrustMap {
+    /// Build trust aliases from the resolved source plan.
+    pub fn from_plan(plan: &ResolvedSourcePlan) -> Self {
+        let mut by_url = HashMap::new();
+        let mut by_v1_id = HashMap::new();
+        for source in plan.sources() {
+            let Some(owner) = source.owner() else {
+                continue;
+            };
+            for alias in &source.source_aliases {
+                by_url.insert(alias.clone(), owner.row.trust);
+            }
+            by_url.insert(source.canonical_url.clone(), owner.row.trust);
+            for id in &source.id_aliases {
+                by_v1_id.insert(id.clone(), owner.row.trust);
+            }
+        }
+        Self { by_url, by_v1_id }
+    }
+
     /// Build the typed trust map from the v1 `[[blocklists]]`
     /// catalogue.
     ///
@@ -442,8 +1320,8 @@ impl SourceTrustMap {
         let mut by_url: HashMap<String, BlocklistTrust> = HashMap::with_capacity(blocklists.len());
         let mut by_v1_id: HashMap<Id, BlocklistTrust> = HashMap::with_capacity(blocklists.len());
         for b in blocklists {
-            by_url.insert(b.url.clone(), b.trust);
-            by_v1_id.insert(b.id.clone(), b.trust);
+            by_url.entry(b.url.clone()).or_insert(b.trust);
+            by_v1_id.entry(b.id.clone()).or_insert(b.trust);
         }
         Self { by_url, by_v1_id }
     }
@@ -451,7 +1329,10 @@ impl SourceTrustMap {
     /// Look up trust by fetch URL. Used by the list manager's
     /// `imported.local` bridge guard at fetch time.
     pub fn trust_for_url(&self, url: &str) -> Option<BlocklistTrust> {
-        self.by_url.get(url).copied()
+        self.by_url
+            .get(url)
+            .or_else(|| self.by_url.get(&canonical_url_key(url)))
+            .copied()
     }
 
     /// Look up trust by canonical v1 entity [`Id`]. Added for symmetry
@@ -481,31 +1362,10 @@ impl SourceTrustMap {
     }
 }
 
-/// Typed facade over the source → bearer-token map used for
-/// `Authorization: Bearer <value>` headers on blocklist fetches.
+/// Typed facade over bearer tokens for list fetches.
 ///
-/// Replaces a raw `HashMap<String, String>` that the start.rs
-/// helper `build_source_tokens` historically returned. The token is
-/// resolved at build time from each `[[blocklists]].auth_token_ref` →
-/// `Secrets` entry; absence (no ref OR ref missing in `secrets.toml`)
-/// leaves the request anonymous (a warn is emitted from build()).
-///
-/// Two internal submaps share the same token values:
-///
-/// - `by_url` — keyed by the **legacy slash-form source-key** produced
-///   by the existing kebab→slash translation (`b.id.replacen('-','/',1)`).
-///   The manager's [`download_list`](crate::lists::manager::ListManager)
-///   path keys exactly on this string. **Latent gap**: pure-v1
-///   configs (`[lists].sources = []`) put URL strings in the manager's
-///   source vector, which never matches a slash-form key — so a
-///   blocklist whose ONLY entry is in `[[blocklists]]` with
-///   `auth_token_ref` set currently fetches anonymously. The
-///   `token_for_v1_id` lookup positions a future fix: the manager's
-///   `source_to_blocklist` reverse-mapping already resolves source →
-///   `Id`, so a follow-up commit can chain `Id → token` via
-///   `token_for_v1_id`.
-/// - `by_v1_id` — lets consumers resolve the token by canonical [`Id`]
-///   without re-deriving the slash-form.
+/// The resolved source plan assigns one token owner to each representative
+/// and exposes the same token through its configured aliases.
 #[derive(Clone, Default)]
 pub struct SourceTokenMap {
     by_url: HashMap<String, String>,
@@ -530,16 +1390,37 @@ impl std::fmt::Debug for SourceTokenMap {
 }
 
 impl SourceTokenMap {
-    /// Build the typed token map from the v1 `[[blocklists]]`
-    /// catalogue and the loaded [`crate::config::secrets::Secrets`].
-    ///
-    /// For each enabled or disabled blocklist row with
-    /// `auth_token_ref` set: resolve the named secret, insert the
-    /// bearer string twice — once under the slash-form source-key
-    /// (matches the manager's `download_list` lookup byte for byte) and
-    /// once under the canonical [`Id`]. Rows whose `auth_token_ref`
-    /// points at a missing secret emit a `tracing::warn!` and are
-    /// skipped — the download proceeds anonymously.
+    /// Resolve one token per planned source owner.
+    pub fn from_plan(plan: &ResolvedSourcePlan, secrets: &crate::config::secrets::Secrets) -> Self {
+        let mut by_url = HashMap::new();
+        let mut by_v1_id = HashMap::new();
+        for source in plan.sources() {
+            let Some(owner) = source.owner() else {
+                continue;
+            };
+            let Some(ref_name) = owner.row.auth_token_ref.as_deref() else {
+                continue;
+            };
+            let Some(value) = secrets.get(ref_name) else {
+                tracing::warn!(
+                    blocklist = %owner.row.id,
+                    auth_token_ref = ref_name,
+                    "blocklist auth_token_ref points at a missing secret; download will \
+                     proceed without an Authorization header"
+                );
+                continue;
+            };
+            for alias in &source.source_aliases {
+                by_url.insert(alias.clone(), value.to_string());
+            }
+            for id in &source.id_aliases {
+                by_v1_id.insert(id.clone(), value.to_string());
+            }
+        }
+        Self { by_url, by_v1_id }
+    }
+
+    /// Build compatibility aliases from blocklist rows.
     pub fn build(
         config: &crate::config::schema::ConfigV1,
         secrets: &crate::config::secrets::Secrets,
@@ -564,25 +1445,22 @@ impl SourceTokenMap {
             // existing `source_tokens.get(source)` lookup at
             // `download_list` continues to hit byte-identically.
             let source_key = b.id.as_str().replacen('-', "/", 1);
-            by_url.insert(source_key, value.to_string());
-            by_v1_id.insert(b.id.clone(), value.to_string());
+            by_url
+                .entry(source_key)
+                .or_insert_with(|| value.to_string());
+            by_v1_id
+                .entry(b.id.clone())
+                .or_insert_with(|| value.to_string());
         }
         Self { by_url, by_v1_id }
     }
 
-    /// Look up the bearer token by the source string used in the
-    /// manager's sources vector (slash-form catalog id for legacy
-    /// configs). Pure-v1 sources (URLs in the vector) do **not** hit
-    /// — see the `by_url` doc-comment on the struct for the latent
-    /// gap rationale.
+    /// Look up a bearer token by source alias.
     pub fn token_for_url(&self, source: &str) -> Option<&str> {
         self.by_url.get(source).map(String::as_str)
     }
 
-    /// Look up the bearer token by canonical v1 entity [`Id`]. Closes
-    /// the URL-vs-id ambiguity at the type level and positions future
-    /// consumers (the manager's `source_to_blocklist` reverse-mapping
-    /// path) to fetch with authentication on pure-v1 configs.
+    /// Look up a bearer token by canonical list id.
     pub fn token_for_v1_id(&self, id: &Id) -> Option<&str> {
         self.by_v1_id.get(id).map(String::as_str)
     }
@@ -618,8 +1496,8 @@ mod tests {
             display_name: id.to_string(),
             url: url.to_string(),
             format: BlocklistFormat::Domains,
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled,
             auth_token_ref: None,
             base: BlocklistBase::Deny,
@@ -627,6 +1505,499 @@ mod tests {
             accept_unsigned_allow: false,
             max_consecutive_failures: 5,
         }
+    }
+
+    fn source_plan(
+        legacy: &[String],
+        blocklists: &[Blocklist],
+        profiles: &BTreeMap<String, Profile>,
+    ) -> Result<ResolvedSourcePlan, ResolvedSourcePlanError> {
+        ResolvedSourcePlan::build(&Catalog::fallback(), legacy, blocklists, profiles)
+    }
+
+    #[test]
+    fn resolved_plan_keeps_distinct_urls_on_distinct_bits() {
+        let blocklists = vec![
+            mk_blocklist("ads", "https://example.test/ads.txt", true),
+            mk_blocklist("tracking", "https://example.test/tracking.txt", true),
+        ];
+        let plan = source_plan(&[], &blocklists, &BTreeMap::new()).unwrap();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+        assert_eq!(plan.representatives().len(), 2);
+        assert_ne!(
+            bits.bit_for_v1_id(&Id::new("ads").unwrap()),
+            bits.bit_for_v1_id(&Id::new("tracking").unwrap())
+        );
+    }
+
+    #[test]
+    fn resolved_plan_allows_identical_aliases_and_explicit_inheritance_equivalence() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let second = mk_blocklist("ads-b", "https://EXAMPLE.test:443/ads.txt/", true);
+        let mut profiles = BTreeMap::new();
+        let mut profile = Profile::default();
+        profile
+            .lists
+            .insert(Id::new("ads-b").unwrap(), ListPolicy::Deny);
+        profiles.insert("kids".to_string(), profile);
+
+        let plan = source_plan(&[], &[first, second], &profiles).unwrap();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+        assert_eq!(plan.representatives(), vec!["https://example.test/ads.txt"]);
+        assert_eq!(
+            bits.bit_for_url("https://EXAMPLE.test:443/ads.txt/"),
+            bits.bit_for_v1_id(&Id::new("ads-b").unwrap())
+        );
+        let source = plan.sources().next().unwrap();
+        assert_eq!(
+            source.schedule_key(),
+            &schedule_key_from_raw_fetch_url("https://example.test/ads.txt")
+        );
+    }
+
+    #[test]
+    fn resolved_plan_keeps_schedule_keys_bound_to_raw_fetch_identities() {
+        let first = mk_blocklist("one", "https://example.test/list/", true);
+        let second = mk_blocklist("two", "https://example.test/list//", true);
+        let plan = source_plan(&[], &[first, second], &BTreeMap::new()).unwrap();
+        let sources = plan.sources().collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0].schedule_key(), sources[1].schedule_key());
+        assert_eq!(
+            sources[0].schedule_key(),
+            &schedule_key_from_raw_fetch_url("https://example.test/list/")
+        );
+        assert_eq!(
+            sources[1].schedule_key(),
+            &schedule_key_from_raw_fetch_url("https://example.test/list//")
+        );
+    }
+
+    #[test]
+    fn resolved_plan_ignores_presentation_and_ineffective_row_settings() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let mut second = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        second.display_name = "Different label".to_string();
+        second.update_interval_hours = Some(1);
+        second.max_entries = Some(1);
+        second.accept_unsigned_allow = true;
+
+        assert!(source_plan(&[], &[first, second], &BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn effective_caps_inherit_narrow_and_never_exceed_global() {
+        let inherited = mk_blocklist("inherited", "https://example.test/inherited.txt", true);
+        let mut narrow = mk_blocklist("narrow", "https://example.test/narrow.txt", true);
+        narrow.max_entries = Some(5);
+        let mut wide = mk_blocklist("wide", "https://example.test/wide.txt", true);
+        wide.max_entries = Some(u64::MAX);
+
+        let plan = ResolvedSourcePlan::build_with_row_control_defaults(
+            &Catalog::fallback(),
+            &[],
+            &[inherited, narrow, wide],
+            &BTreeMap::new(),
+            RowControlDefaults {
+                max_entries: 10,
+                update_interval_secs: 3600,
+            },
+            RowControlMode::HonorOverrides,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.sources()
+                .map(ResolvedSource::effective_max_entries)
+                .collect::<Vec<_>>(),
+            vec![10, 5, 10]
+        );
+    }
+
+    #[test]
+    fn cap_aliases_only_conflict_when_overrides_are_honored() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let mut inherited_equivalent = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        inherited_equivalent.max_entries = Some(10);
+        assert!(ResolvedSourcePlan::build_with_row_control_defaults(
+            &Catalog::fallback(),
+            &[],
+            &[first.clone(), inherited_equivalent],
+            &BTreeMap::new(),
+            RowControlDefaults {
+                max_entries: 10,
+                update_interval_secs: 3600,
+            },
+            RowControlMode::HonorOverrides,
+        )
+        .is_ok());
+
+        let mut divergent = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        divergent.max_entries = Some(5);
+        let err = ResolvedSourcePlan::build_with_row_control_defaults(
+            &Catalog::fallback(),
+            &[],
+            &[first.clone(), divergent.clone()],
+            &BTreeMap::new(),
+            RowControlDefaults {
+                max_entries: 10,
+                update_interval_secs: 3600,
+            },
+            RowControlMode::HonorOverrides,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("effective max-entries cap"));
+
+        let v3 = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first, divergent],
+            &BTreeMap::new(),
+            RowControlDefaults {
+                max_entries: 10,
+                update_interval_secs: 3600,
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(v3.row_control_mode(), RowControlMode::InheritAll);
+        assert_eq!(v3.sources().next().unwrap().effective_max_entries(), 10);
+    }
+
+    #[test]
+    fn cadence_resolution_is_schema_aware_and_preserves_representative_order() {
+        let mut first = mk_blocklist("first", "https://example.test/first.txt", true);
+        first.update_interval_hours = Some(1);
+        let second = mk_blocklist("second", "https://example.test/second.txt", true);
+        let defaults = RowControlDefaults {
+            max_entries: 10,
+            update_interval_secs: 7200,
+        };
+
+        let v3 = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first.clone(), second.clone()],
+            &BTreeMap::new(),
+            defaults,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            v3.sources()
+                .map(ResolvedSource::effective_update_interval_secs)
+                .collect::<Vec<_>>(),
+            vec![7200, 7200],
+            "schema 3 leaves row cadence inert"
+        );
+
+        let v4 = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first, second],
+            &BTreeMap::new(),
+            defaults,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            v4.sources()
+                .map(ResolvedSource::effective_update_interval_secs)
+                .collect::<Vec<_>>(),
+            vec![3600, 7200],
+            "the omitted setting inherits the global interval"
+        );
+    }
+
+    #[test]
+    fn cadence_aliases_compare_effective_values_only_when_honored() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let mut equal_raw_different = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        equal_raw_different.update_interval_hours = Some(1);
+        let defaults = RowControlDefaults {
+            max_entries: 10,
+            update_interval_secs: 3600,
+        };
+
+        assert!(ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first.clone(), equal_raw_different.clone()],
+            &BTreeMap::new(),
+            defaults,
+            4,
+        )
+        .is_ok());
+
+        let mut different = equal_raw_different.clone();
+        different.update_interval_hours = Some(2);
+        let err = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first.clone(), different.clone()],
+            &BTreeMap::new(),
+            defaults,
+            4,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("effective update interval"));
+
+        let v3 = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[first, different],
+            &BTreeMap::new(),
+            defaults,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            v3.sources()
+                .next()
+                .unwrap()
+                .effective_update_interval_secs(),
+            3600
+        );
+    }
+
+    #[test]
+    fn cadence_resolution_applies_the_sixty_second_floor() {
+        let inherited = mk_blocklist("inherited", "https://example.test/inherited.txt", true);
+        let plan = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[inherited],
+            &BTreeMap::new(),
+            RowControlDefaults {
+                max_entries: 10,
+                update_interval_secs: 1,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.sources()
+                .map(ResolvedSource::effective_update_interval_secs)
+                .collect::<Vec<_>>(),
+            vec![60]
+        );
+    }
+
+    #[test]
+    fn resolved_plan_rejects_base_and_profile_policy_conflicts() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let mut base_conflict = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        base_conflict.base = BlocklistBase::Allow;
+        base_conflict.trust = BlocklistTrust::Local;
+        assert!(
+            source_plan(&[], &[first.clone(), base_conflict], &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("base direction")
+        );
+
+        let second = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+        let mut profiles = BTreeMap::new();
+        let mut profile = Profile::default();
+        profile
+            .lists
+            .insert(Id::new("ads-b").unwrap(), ListPolicy::Allow);
+        profiles.insert("children".to_string(), profile);
+        let err = source_plan(&[], &[first, second], &profiles).unwrap_err();
+        assert!(err.to_string().contains("profile \"children\""), "{err}");
+    }
+
+    #[test]
+    fn resolved_plan_rejects_every_shared_runtime_semantic_conflict() {
+        type BlocklistMutation = fn(&mut Blocklist);
+
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let cases: [(&str, BlocklistMutation); 4] = [
+            ("parser format", |b| b.format = BlocklistFormat::Hosts),
+            ("trust mode", |b| b.trust = BlocklistTrust::Local),
+            ("auth-token reference", |b| {
+                b.auth_token_ref = Some("other".to_string())
+            }),
+            ("max-consecutive-failures retry ownership", |b| {
+                b.max_consecutive_failures = 9
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut second = mk_blocklist("ads-b", "https://example.test/ads.txt", true);
+            mutate(&mut second);
+            let err = source_plan(&[], &[first.clone(), second], &BTreeMap::new()).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolved_plan_ignores_disabled_conflicts_until_the_row_is_enabled() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let mut second = mk_blocklist("ads-b", "https://example.test/ads.txt", false);
+        second.format = BlocklistFormat::Hosts;
+        assert!(source_plan(&[], &[first.clone(), second.clone()], &BTreeMap::new()).is_ok());
+        second.enabled = true;
+        assert!(source_plan(&[], &[first, second], &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn resolved_plan_unifies_matching_legacy_slug_and_v1_row() {
+        let legacy = vec!["privacy/ads".to_string()];
+        let blocklists = vec![mk_blocklist(
+            "privacy-ads",
+            "https://lists.purge.cc/ads.txt",
+            true,
+        )];
+        let plan = source_plan(&legacy, &blocklists, &BTreeMap::new()).unwrap();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+        assert_eq!(plan.representatives(), legacy);
+        assert_eq!(
+            bits.bit_for_legacy_catalog_id("privacy/ads"),
+            bits.bit_for_url("https://lists.purge.cc/ads.txt")
+        );
+        assert_eq!(
+            bits.bit_for_v1_id(&Id::new("privacy-ads").unwrap()),
+            bits.bit_for_legacy_catalog_id("privacy/ads")
+        );
+    }
+
+    #[test]
+    fn resolved_plan_unifies_unknown_legacy_id_aliases_with_the_enabled_row_fetch_url() {
+        let legacy = vec!["team-ads".to_string(), "team/ads".to_string()];
+        let rows = vec![mk_blocklist(
+            "team-ads",
+            "https://example.test/team-ads.txt",
+            true,
+        )];
+        let plan = source_plan(&legacy, &rows, &BTreeMap::new()).unwrap();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+
+        assert_eq!(plan.representatives(), vec!["team-ads"]);
+        assert_eq!(
+            plan.fetch_url_for_source("team/ads"),
+            Some("https://example.test/team-ads.txt")
+        );
+        assert_eq!(
+            plan.representative_for_source("https://EXAMPLE.test:443/team-ads.txt/"),
+            Some("team-ads")
+        );
+        assert_eq!(bits.len(), 1);
+        assert_eq!(
+            bits.bit_for_legacy_catalog_id("team/ads"),
+            bits.bit_for_v1_id(&Id::new("team-ads").unwrap())
+        );
+    }
+
+    #[test]
+    fn resolved_plan_keeps_catalog_url_conflict_for_matching_legacy_id() {
+        let catalog = Catalog::from_entries(vec![super::super::catalog::CatalogEntry {
+            scope: "team".to_string(),
+            topic: Some("ads".to_string()),
+            name: "Ads".to_string(),
+            url: "https://catalog.example.test/team-ads.txt".to_string(),
+            entries: 0,
+            updated_at: String::new(),
+            format: BlocklistFormat::Domains,
+        }]);
+        let rows = vec![mk_blocklist(
+            "team-ads",
+            "https://row.example.test/team-ads.txt",
+            true,
+        )];
+        let err =
+            ResolvedSourcePlan::build(&catalog, &["team/ads".to_string()], &rows, &BTreeMap::new())
+                .unwrap_err();
+        assert!(err.to_string().contains("resolved URL"), "{err}");
+    }
+
+    #[test]
+    fn compatibility_build_deduplicates_cosmetic_url_aliases_before_assigning_bits() {
+        let sources = vec![
+            "https://Example.test:443/ads.txt/".to_string(),
+            "https://example.test/ads.txt".to_string(),
+        ];
+        let map = SourceBitMap::build(&sources, &[]).unwrap();
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.bit_for_url("https://Example.test:443/ads.txt/"),
+            Some(0)
+        );
+        assert_eq!(map.bit_for_url("https://example.test/ads.txt"), Some(0));
+        assert_eq!(
+            map.bit_for_url("https://EXAMPLE.test:443/ads.txt/"),
+            Some(0)
+        );
+        assert_eq!(
+            map.iter_urls().collect::<Vec<_>>(),
+            vec![("https://Example.test:443/ads.txt/", 0)]
+        );
+    }
+
+    #[test]
+    fn resolved_plan_rejects_matching_legacy_id_with_a_different_url() {
+        let legacy = vec!["privacy/ads".to_string()];
+        let blocklists = vec![mk_blocklist(
+            "privacy-ads",
+            "https://example.test/other.txt",
+            true,
+        )];
+        let err = source_plan(&legacy, &blocklists, &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("resolved URL"), "{err}");
+    }
+
+    #[test]
+    fn resolved_plan_keeps_allow_aliases_allow_only() {
+        let mut first = mk_blocklist("allow-a", "https://example.test/allow.txt", true);
+        first.base = BlocklistBase::Allow;
+        first.trust = BlocklistTrust::Local;
+        let mut second = mk_blocklist("allow-b", "https://example.test/allow.txt", true);
+        second.base = BlocklistBase::Allow;
+        second.trust = BlocklistTrust::Local;
+        let plan = source_plan(&[], &[first.clone(), second.clone()], &BTreeMap::new()).unwrap();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+        let masks = bits.project_policy(&[first, second], &BTreeMap::new());
+        assert_eq!(masks.base.allow, 1);
+        assert_eq!(masks.base.block, 0);
+    }
+
+    #[test]
+    fn resolved_plan_keeps_first_representative_under_reversed_declarations() {
+        let first = mk_blocklist("ads-a", "https://example.test/ads.txt", true);
+        let second = mk_blocklist("ads-b", "https://EXAMPLE.test:443/ads.txt/", true);
+        let forward = source_plan(&[], &[first.clone(), second.clone()], &BTreeMap::new()).unwrap();
+        let reversed = source_plan(&[], &[second, first.clone()], &BTreeMap::new()).unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(reversed.len(), 1);
+        assert_eq!(
+            forward.representatives(),
+            vec!["https://example.test/ads.txt"]
+        );
+        assert_eq!(
+            reversed.representatives(),
+            vec!["https://EXAMPLE.test:443/ads.txt/"]
+        );
+
+        let mut conflicting = mk_blocklist("ads-c", "https://example.test/ads.txt", true);
+        conflicting.base = BlocklistBase::Allow;
+        conflicting.trust = BlocklistTrust::Local;
+        assert!(source_plan(&[], &[first.clone(), conflicting.clone()], &BTreeMap::new()).is_err());
+        assert!(source_plan(&[], &[conflicting, first], &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn resolved_plan_preserves_the_64_source_limit() {
+        let rows: Vec<Blocklist> = (0..65)
+            .map(|n| {
+                mk_blocklist(
+                    &format!("source-{n}"),
+                    &format!("https://example.test/{n}"),
+                    true,
+                )
+            })
+            .collect();
+        let plan = source_plan(&[], &rows, &BTreeMap::new()).unwrap();
+        assert!(SourceBitMap::from_plan(&plan).is_err());
     }
 
     #[test]
@@ -773,40 +2144,19 @@ mod tests {
     }
 
     #[test]
-    fn blocklist_url_alias_overwrites_slash_form_v1_id_alias() {
-        // Bit-shuffle gotcha pin. When BOTH source channels alias the
-        // same logical list (slash-form `[lists].sources` entry +
-        // matching `[[blocklists]]` row whose URL is a separate entry
-        // in the merged sources vector), the blocklist-step seeding
-        // overwrites the slash-form-translation step's `by_v1_id` entry
-        // because `HashMap::insert` overwrites. Final value points at
-        // the URL-derived bit, not the slash-form-derived one. Pinning
-        // this explicitly prevents an accidental order swap from
-        // breaking downstream test fixtures.
-        let sources = vec![
-            "security/malicious".to_string(),
-            "https://lists.purge.cc/security/malicious.txt".to_string(),
-        ];
+    fn resolved_plan_never_repoints_a_slug_alias_to_another_bit() {
+        let sources = vec!["security/malicious".to_string()];
         let blocklists = vec![mk_blocklist(
             "security-malicious",
-            "https://lists.purge.cc/security/malicious.txt",
+            "https://lists.purge.cc/malicious.txt",
             true,
         )];
-        let map = SourceBitMap::build(&sources, &blocklists).unwrap();
-
-        // Bit assignment is sequential: slash-form gets bit 0, URL bit 1.
-        assert_eq!(map.bit_for_legacy_catalog_id("security/malicious"), Some(0));
-        assert_eq!(
-            map.bit_for_url("https://lists.purge.cc/security/malicious.txt"),
-            Some(1),
-        );
-
-        // Slash-form translation step seeds `by_v1_id[Id] = 0` first;
-        // blocklist-URL-alias step then overwrites with bit 1.
+        let plan = source_plan(&sources, &blocklists, &BTreeMap::new()).unwrap();
+        let map = SourceBitMap::from_plan(&plan).unwrap();
         assert_eq!(
             map.bit_for_v1_id(&Id::new("security-malicious").unwrap()),
-            Some(1),
-            "URL-derived alias must win over slash-form translation",
+            map.bit_for_legacy_catalog_id("security/malicious"),
+            "one logical source owns one bit",
         );
     }
 
@@ -1229,6 +2579,34 @@ mod tests {
                 "key must be a fixed point: {raw}",
             );
         }
+    }
+
+    #[test]
+    fn canonical_schedule_key_v1_known_answers_and_aliases_are_frozen() {
+        let ads = schedule_key_from_raw_fetch_url("https://lists.purge.cc/ads.txt");
+        let ads_alias = schedule_key_from_raw_fetch_url("https://lists.purge.cc:443/ads.txt/");
+        let path = schedule_key_from_raw_fetch_url("https://example.com/path?x=1");
+
+        assert_eq!(
+            ads.as_str(),
+            "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1"
+        );
+        assert_eq!(ads, ads_alias);
+        assert_eq!(
+            path.as_str(),
+            "canonical-url-v1-sha256-4e597e623d4112f2872d16b23fdc91d5f7f38102bf6fcf204c8b41911e5da6f8"
+        );
+    }
+
+    #[test]
+    fn canonical_schedule_key_v1_excludes_auth_context() {
+        let unauthenticated = schedule_key_from_raw_fetch_url("https://example.com/a.txt");
+        let authenticated =
+            schedule_key_from_raw_fetch_url("https://user:secret@example.com/a.txt");
+
+        // Defense-in-depth: production validation rejects embedded userinfo.
+        assert_eq!(unauthenticated, authenticated);
+        assert!(!authenticated.as_str().contains("secret"));
     }
 
     /// The scheme contract, pinned at the seat rather than at N call

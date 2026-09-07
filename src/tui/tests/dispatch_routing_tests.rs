@@ -16,7 +16,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -140,7 +140,7 @@ fn ldns_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -253,7 +253,7 @@ fn mk_labels_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -646,7 +646,7 @@ fn mk_empty_labels_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]

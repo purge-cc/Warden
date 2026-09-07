@@ -22,7 +22,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -83,13 +83,14 @@ fn modal_for_privacy_ads() -> EditListModal {
         format: BlocklistFormat::Domains,
         auth_token_ref: String::new(),
         skip_head_check: true,
+        head_probe_passed_for: None,
         original: crate::config::schema::Blocklist {
             id: crate::config::schema::Id::new("privacy-ads").unwrap(),
             display_name: "Privacy: ads".into(),
             url: "https://example.com/ads.txt".into(),
             format: BlocklistFormat::Domains,
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: Some(12),
+            max_entries: Some(5_000_000),
             enabled: true,
             auth_token_ref: None,
             base: BlocklistBase::Deny,
@@ -104,6 +105,21 @@ fn modal_for_privacy_ads() -> EditListModal {
         submitting: false,
         consent_declared: false,
     }
+}
+
+fn modal_opened_for(live: crate::config::schema::Blocklist) -> EditListModal {
+    let mut modal = modal_for_privacy_ads();
+    modal.blocklist_id = live.id.as_str().to_string();
+    modal.display_name = live.display_name.clone();
+    modal.url = live.url.clone();
+    modal.nature = live.base;
+    modal.enabled = live.enabled;
+    modal.interval = IntervalChoice::from_optional_hours(live.update_interval_hours);
+    modal.interval_custom_buf.clear();
+    modal.format = live.format;
+    modal.auth_token_ref = live.auth_token_ref.clone().unwrap_or_default();
+    modal.original = live;
+    modal
 }
 
 // ── the Edit-modal save must not drop schema fields ───────────────
@@ -181,6 +197,26 @@ fn edit_save_does_not_invent_a_consent_that_was_never_declared() {
         !saved.accept_unsigned_allow,
         "the TUI must never declare a consent on the operator's behalf"
     );
+}
+
+#[test]
+fn edit_and_promote_payloads_keep_row_controls_inherited() {
+    let mut edit = modal_for_privacy_ads();
+    edit.interval = IntervalChoice::Inherited;
+    edit.original.update_interval_hours = None;
+    edit.original.max_entries = None;
+    let edited = save_roundtrip(&edit);
+    assert_eq!(edited.update_interval_hours, None);
+    assert_eq!(edited.max_entries, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = write_promote_master(&dir, "https://example.com/orphan.txt");
+    let app = app_with_orphan_source(&master, "https://example.com/orphan.txt");
+    let mut promote = tabs::lists::build_promote_modal_for(&app).unwrap();
+    promote.display_name = "Orphan".into();
+    let promoted = save_roundtrip(&promote);
+    assert_eq!(promoted.update_interval_hours, None);
+    assert_eq!(promoted.max_entries, None);
 }
 
 /// The third value the field can take, and the one the gate exists
@@ -326,7 +362,7 @@ fn plain_key(code: KeyCode) -> KeyEvent {
 /// tests reproduce that rather than reaching around it.
 fn staged_buffer(modal: &EditListModal) -> String {
     match &modal.mode {
-        EditModalMode::ConfirmUnsignedAllow { typed } => typed.clone(),
+        EditModalMode::ConfirmUnsignedAllow { typed, .. } => typed.clone(),
         other => panic!("expected the consent stage, got {other:?}"),
     }
 }
@@ -341,6 +377,7 @@ fn typing_the_id_exactly_declares_the_consent_and_resumes_the_save() {
     let mut modal = modal_for_privacy_ads();
     modal.mode = EditModalMode::ConfirmUnsignedAllow {
         typed: String::new(),
+        origin: crate::tui::app::UnsignedAllowOrigin::Edit,
     };
 
     for c in "privacy-ads".chars() {
@@ -350,6 +387,7 @@ fn typing_the_id_exactly_declares_the_consent_and_resumes_the_save() {
                 &mut app,
                 &mut modal,
                 buf,
+                crate::tui::app::UnsignedAllowOrigin::Edit,
                 plain_key(KeyCode::Char(c)),
             ),
             "no keystroke before Enter may commit anything"
@@ -362,6 +400,7 @@ fn typing_the_id_exactly_declares_the_consent_and_resumes_the_save() {
         &mut app,
         &mut modal,
         "privacy-ads".to_string(),
+        crate::tui::app::UnsignedAllowOrigin::Edit,
         plain_key(KeyCode::Enter),
     ));
     assert!(modal.consent_declared);
@@ -380,12 +419,14 @@ fn a_mismatched_buffer_is_refused_in_place_and_says_so() {
     let mut modal = modal_for_privacy_ads();
     modal.mode = EditModalMode::ConfirmUnsignedAllow {
         typed: "privacy-adz".into(),
+        origin: crate::tui::app::UnsignedAllowOrigin::Edit,
     };
 
     assert!(!handle_confirm_unsigned_allow_key(
         &mut app,
         &mut modal,
         "privacy-adz".to_string(),
+        crate::tui::app::UnsignedAllowOrigin::Edit,
         plain_key(KeyCode::Enter),
     ));
     assert!(!modal.consent_declared, "a near-miss must not declare");
@@ -409,12 +450,14 @@ fn esc_out_of_the_stage_declares_nothing() {
     modal.original.accept_unsigned_allow = true;
     modal.mode = EditModalMode::ConfirmUnsignedAllow {
         typed: "privacy-ads".into(),
+        origin: crate::tui::app::UnsignedAllowOrigin::Edit,
     };
 
     assert!(!handle_confirm_unsigned_allow_key(
         &mut app,
         &mut modal,
         "privacy-ads".to_string(),
+        crate::tui::app::UnsignedAllowOrigin::Edit,
         plain_key(KeyCode::Esc),
     ));
     assert!(!modal.consent_declared);
@@ -422,6 +465,112 @@ fn esc_out_of_the_stage_declares_nothing() {
     assert!(
         save_roundtrip(&modal).accept_unsigned_allow,
         "the file's own declaration survives the operator backing out"
+    );
+}
+
+/// The modal router, not the confirmation helper alone, must restore Add
+/// after Escape and resume the consent-cleared submit without probing the
+/// already-probed URL a second time.
+#[tokio::test]
+async fn unsigned_add_consent_handler_keeps_mode_and_does_not_reprobe() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let url = "http://127.0.0.1:1/already-probed.txt";
+    let mut modal = crate::tui::tabs::lists::build_add_modal();
+    modal.blocklist_id = "consent-add".into();
+    modal.display_name = "Consent add".into();
+    modal.url = url.into();
+    modal.nature = BlocklistBase::Allow;
+    modal.head_probe_passed_for = Some(url.into());
+    let mut app = app_with_modal_for(&master, modal);
+    let poller = dummy_poller(dir.path());
+
+    handle_lists_edit_modal_key(&mut app, ctrl('s'), &poller, &master).await;
+    assert!(matches!(
+        app.lists.edit_modal.as_ref().map(|modal| &modal.mode),
+        Some(EditModalMode::ConfirmUnsignedAllow {
+            origin: crate::tui::app::UnsignedAllowOrigin::Add,
+            ..
+        })
+    ));
+    handle_lists_edit_modal_key(&mut app, key(KeyCode::Esc), &poller, &master).await;
+    assert!(matches!(
+        app.lists.edit_modal.as_ref().map(|modal| &modal.mode),
+        Some(EditModalMode::Add)
+    ));
+
+    handle_lists_edit_modal_key(&mut app, ctrl('s'), &poller, &master).await;
+    for c in "consent-add".chars() {
+        handle_lists_edit_modal_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
+    }
+    handle_lists_edit_modal_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
+
+    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert!(loaded
+        .config
+        .blocklists
+        .iter()
+        .any(|blocklist| blocklist.id.as_str() == "consent-add"));
+}
+
+/// Promote carries its raw legacy source through the same confirmation
+/// router. A successful confirmation therefore performs Promote cleanup,
+/// rather than silently degrading into Add.
+#[tokio::test]
+async fn unsigned_promote_consent_handler_keeps_source_and_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let url = "http://127.0.0.1:1/promoted-after-consent.txt";
+    let mut text = std::fs::read_to_string(&master).unwrap();
+    text.push_str(&format!("\n[lists]\nsources = [\"{url}\"]\n"));
+    std::fs::write(&master, text).unwrap();
+
+    let mut modal = crate::tui::tabs::lists::build_add_modal();
+    modal.mode = EditModalMode::Promote {
+        source: url.to_string(),
+    };
+    modal.blocklist_id = "consent-promote".into();
+    modal.display_name = "Consent promote".into();
+    modal.url = url.into();
+    modal.nature = BlocklistBase::Allow;
+    modal.head_probe_passed_for = Some(url.into());
+    let mut app = app_with_modal_for(&master, modal);
+    let poller = dummy_poller(dir.path());
+
+    handle_lists_edit_modal_key(&mut app, ctrl('s'), &poller, &master).await;
+    assert!(matches!(
+        app.lists.edit_modal.as_ref().map(|modal| &modal.mode),
+        Some(EditModalMode::ConfirmUnsignedAllow {
+            origin: crate::tui::app::UnsignedAllowOrigin::Promote { source },
+            ..
+        }) if source == url
+    ));
+    handle_lists_edit_modal_key(&mut app, key(KeyCode::Esc), &poller, &master).await;
+    assert!(matches!(
+        app.lists.edit_modal.as_ref().map(|modal| &modal.mode),
+        Some(EditModalMode::Promote { source }) if source == url
+    ));
+
+    handle_lists_edit_modal_key(&mut app, ctrl('s'), &poller, &master).await;
+    for c in "consent-promote".chars() {
+        handle_lists_edit_modal_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
+    }
+    handle_lists_edit_modal_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
+
+    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert!(loaded
+        .config
+        .blocklists
+        .iter()
+        .any(|blocklist| blocklist.id.as_str() == "consent-promote"));
+    assert!(
+        !loaded
+            .config
+            .lists
+            .sources
+            .iter()
+            .any(|source| source == url),
+        "the successful confirmation must retain Promote's source removal"
     );
 }
 
@@ -434,7 +583,7 @@ fn master_with_untagged_deny(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -698,6 +847,10 @@ fn catalog_row(
     crate::tui::app::CatalogPickerRow {
         catalog_id: canonical_id.replace('-', "/"),
         canonical_id: canonical_id.to_string(),
+        captured_id: original.is_subscribed().then(|| canonical_id.to_string()),
+        captured_canonical_url: original
+            .is_subscribed()
+            .then(|| crate::lists::source_key::canonical_url_key(url)),
         url: url.to_string(),
         display_name: "irrelevant — `existing` wins whenever it is Some".to_string(),
         scope: String::new(),
@@ -711,179 +864,9 @@ fn catalog_row(
     }
 }
 
-/// Twin of `the_edit_builder_writes_every_blocklist_field`, for the
-/// catalog picker's row builder (`tui-mod-02` / `struct-04`). A SEPARATE
-/// test rather than an extension of the sibling: the two builders carry
-/// `accept_unsigned_allow` under different rules (`original ||
-/// consent_declared` there; unconditionally from `existing` here, since
-/// this picker has no session-level consent flag to OR against), so one
-/// destructure asserting both would average two different contracts
-/// into a weaker one. What the two tests share is the mechanism — an
-/// exhaustive `let Blocklist { .. }` that fails the build the day a
-/// 13th field is added and neither builder has been taught about it.
+/// A fresh catalog row gets security defaults by omission.
 #[test]
-fn the_catalog_builder_carries_every_field_from_an_existing_entry() {
-    const CARRIED_UNCONDITIONALLY: &[&str] = &[
-        "id",
-        "display_name",
-        "url",
-        "format",
-        "enabled",
-        "base",
-        "trust",
-        "update_interval_hours",
-        "max_entries",
-        "max_consecutive_failures",
-        "accept_unsigned_allow",
-    ];
-
-    let dir = tempfile::tempdir().unwrap();
-    let master = mk_master_with_blocklist(
-        &dir,
-        r#"
-[[blocklists]]
-id = "privacy-ads"
-display_name = "Privacy: ads"
-url = "https://example.com/ads.txt"
-format = "domains"
-enabled = true
-base = "allow"
-trust = "remote-unsigned"
-accept_unsigned_allow = true
-update_interval_hours = 12
-max_entries = 5000000
-max_consecutive_failures = 5
-auth_token_ref = "some-secret-ref"
-"#,
-    );
-    let on_disk = crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc())
-        .expect(
-            "fixture must be schema-valid: base=allow + trust=remote-unsigned + \
-             accept_unsigned_allow=true loads with a WARN, not an error — the old \
-             categorical ALLOW_LIST_REQUIRES_LOCAL_TRUST rule was retired 2026-08-01",
-        );
-    let existing = on_disk
-        .config
-        .blocklists
-        .iter()
-        .find(|b| b.id.as_str() == "privacy-ads")
-        .expect("fixture wrote this row");
-
-    // Exhaustive on purpose, mirroring the sibling test: a 13th field on
-    // `Blocklist` fails THIS build too, not only the edit builder's.
-    let crate::config::schema::Blocklist {
-        id: _,
-        display_name: _,
-        url: _,
-        format: _,
-        update_interval_hours: _,
-        max_entries: _,
-        enabled: _,
-        auth_token_ref: _,
-        base: _,
-        trust: _,
-        accept_unsigned_allow: _,
-        max_consecutive_failures: _,
-    } = existing;
-
-    let row = catalog_row(
-        "privacy-ads",
-        "https://example.com/ads.txt",
-        BlocklistBase::Allow,
-        true,
-        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
-    );
-    let value = build_catalog_blocklist_value(&row, Some(&on_disk));
-    let tbl = value.as_table().expect("a row is a table");
-
-    let missing: Vec<&str> = CARRIED_UNCONDITIONALLY
-        .iter()
-        .copied()
-        .filter(|f| !tbl.contains_key(*f))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "build_catalog_blocklist_value drops {missing:?} when `existing` is \
-             Some — upsert_id_keyed replaces the whole row, so every dropped \
-             field is silently reset to its serde default on the next save \
-             from the catalog picker: {tbl:?}"
-    );
-    assert_eq!(
-        tbl.get("accept_unsigned_allow"),
-        Some(&toml::Value::Boolean(true)),
-        "a declared consent must survive an unrelated save (e.g. toggling \
-             `enabled`) through the catalog picker: {tbl:?}"
-    );
-    assert!(
-        !tbl.contains_key("tags"),
-        "tags was removed from Blocklist in plp-s5d/plp-s5a; a surviving \
-             key here would fail to load under deny_unknown_fields: {tbl:?}"
-    );
-
-    // Not merely shaped right — the validator that required the consent
-    // in the first place must accept the row back, same as the picker's
-    // own save path does.
-    use crate::cli::commands::target::{
-        read_or_empty, resolve_target_file, upsert_id_keyed, write_value_validated, EntityClass,
-    };
-    let target_path = resolve_target_file(&master, EntityClass::Blocklists, None).unwrap();
-    let (mut doc, _) = read_or_empty(&target_path).unwrap();
-    upsert_id_keyed(
-        &mut doc,
-        EntityClass::Blocklists.toml_key(),
-        "privacy-ads",
-        value,
-    )
-    .unwrap();
-    write_value_validated(&master, &target_path, &doc).expect(
-        "a row carrying its own already-accepted consent must not be \
-             refused by the validator that required it",
-    );
-}
-
-/// `accept_unsigned_allow` is never synthesised — carried forward when
-/// `existing` says `false`, and omitted (not defaulted to any value) when
-/// there is no `existing` row at all. Two angles on one claim: this
-/// builder must not invent consent either way.
-#[test]
-fn the_catalog_builder_does_not_synthesise_consent() {
-    let dir = tempfile::tempdir().unwrap();
-    let master = mk_master_with_blocklist(
-        &dir,
-        r#"
-[[blocklists]]
-id = "privacy-tracking"
-display_name = "Privacy: tracking"
-url = "https://example.com/tracking.txt"
-format = "domains"
-enabled = true
-base = "deny"
-trust = "remote-unsigned"
-accept_unsigned_allow = false
-update_interval_hours = 12
-max_entries = 5000000
-max_consecutive_failures = 5
-"#,
-    );
-    let on_disk =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
-
-    let row = catalog_row(
-        "privacy-tracking",
-        "https://example.com/tracking.txt",
-        BlocklistBase::Deny,
-        true,
-        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
-    );
-    let value = build_catalog_blocklist_value(&row, Some(&on_disk));
-    let tbl = value.as_table().unwrap();
-    assert_eq!(
-        tbl.get("accept_unsigned_allow"),
-        Some(&toml::Value::Boolean(false)),
-        "an existing `false` must stay `false`, not flip to `true` on an \
-             unrelated save: {tbl:?}"
-    );
-
+fn a_fresh_catalog_row_does_not_synthesise_consent_or_limits() {
     let new_row = catalog_row(
         "brand-new",
         "https://example.com/new.txt",
@@ -891,14 +874,433 @@ max_consecutive_failures = 5
         false,
         crate::tui::app::CatalogRowState::NotSubscribed,
     );
-    let new_value = build_catalog_blocklist_value(&new_row, None);
+    let new_value = build_catalog_blocklist_value(&new_row);
     let new_tbl = new_value.as_table().unwrap();
     assert!(
         !new_tbl.contains_key("accept_unsigned_allow"),
-        "a first-time add through the picker (no `existing` row) must get \
-             the schema default via omission, not a value this builder \
-             invented: {new_tbl:?}"
+        "a first-time add must not invent unsigned-allow consent: {new_tbl:?}"
     );
+    assert!(!new_tbl.contains_key("update_interval_hours"));
+    assert!(!new_tbl.contains_key("max_entries"));
+}
+
+#[test]
+fn catalog_refuses_a_subscribed_row_whose_live_identity_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Replacement"
+url = "https://example.com/reassigned.txt"
+enabled = true
+"#,
+    );
+    let before = std::fs::read(&master).unwrap();
+    let row = catalog_row(
+        "privacy-ads",
+        "https://example.com/ads.txt",
+        BlocklistBase::Deny,
+        false,
+        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+    );
+
+    let error = apply_catalog_picker_changes(&master, &[row]).unwrap_err();
+    assert!(error.contains("different live list"), "got: {error}");
+    assert_eq!(std::fs::read(&master).unwrap(), before);
+}
+
+#[test]
+fn catalog_update_changes_only_enabled_on_the_guarded_live_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Keep this name"
+url = "https://example.com/ads.txt"
+format = "hosts"
+enabled = true
+base = "allow"
+trust = "remote-unsigned"
+accept_unsigned_allow = true
+update_interval_hours = 48
+max_entries = 99
+max_consecutive_failures = 9
+auth_token_ref = "keep-secret"
+"#,
+    );
+    let before = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists[0]
+        .clone();
+    let row = catalog_row(
+        "privacy-ads",
+        "https://example.com/ads.txt",
+        BlocklistBase::Deny,
+        false,
+        crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+    );
+
+    assert_eq!(
+        apply_catalog_picker_changes(&master, &[row]).unwrap(),
+        (0, 1)
+    );
+    let after = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists[0]
+        .clone();
+    assert!(!after.enabled);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.display_name, before.display_name);
+    assert_eq!(after.url, before.url);
+    assert_eq!(after.format, before.format);
+    assert_eq!(after.base, before.base);
+    assert_eq!(after.trust, before.trust);
+    assert_eq!(after.update_interval_hours, before.update_interval_hours);
+    assert_eq!(after.max_entries, before.max_entries);
+    assert_eq!(
+        after.max_consecutive_failures,
+        before.max_consecutive_failures
+    );
+    assert_eq!(after.auth_token_ref, before.auth_token_ref);
+    assert_eq!(after.accept_unsigned_allow, before.accept_unsigned_allow);
+}
+
+#[test]
+fn catalog_batch_updates_each_fragment_owner_and_adds_once_to_the_creation_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let master_text = std::fs::read_to_string(&master).unwrap().replace(
+        "schema_version = 4\n",
+        "schema_version = 4\nincludes = [\"fragments/*.toml\"]\n",
+    );
+    std::fs::write(&master, master_text).unwrap();
+    let fragments = dir.path().join("fragments");
+    std::fs::create_dir_all(&fragments).unwrap();
+    let first = fragments.join("first.toml");
+    let second = fragments.join("second.toml");
+    std::fs::write(
+        &first,
+        r#"# First owner's note
+[[blocklists]]
+id = "catalog-one"
+display_name = "Catalog one"
+url = "https://example.com/one.txt"
+enabled = true
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &second,
+        r#"# Second owner's note
+[[blocklists]]
+id = "catalog-two"
+display_name = "Catalog two"
+url = "https://example.com/two.txt"
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let changes = [
+        catalog_row(
+            "catalog-one",
+            "https://example.com/one.txt",
+            BlocklistBase::Deny,
+            false,
+            crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+        ),
+        catalog_row(
+            "catalog-two",
+            "https://example.com/two.txt",
+            BlocklistBase::Deny,
+            false,
+            crate::tui::app::CatalogRowState::Subscribed { enabled: true },
+        ),
+        catalog_row(
+            "catalog-new",
+            "https://example.com/new.txt",
+            BlocklistBase::Deny,
+            true,
+            crate::tui::app::CatalogRowState::NotSubscribed,
+        ),
+    ];
+
+    assert_eq!(
+        apply_catalog_picker_changes(&master, &changes).unwrap(),
+        (1, 2)
+    );
+
+    let first_text = std::fs::read_to_string(&first).unwrap();
+    let second_text = std::fs::read_to_string(&second).unwrap();
+    let master_text = std::fs::read_to_string(&master).unwrap();
+    for (text, id) in [(&first_text, "catalog-one"), (&second_text, "catalog-two")] {
+        assert!(
+            text.contains("enabled = false"),
+            "owner {id} was not updated"
+        );
+        assert_eq!(text.matches(&format!("id = \"{id}\"")).count(), 1);
+        assert!(
+            !text.contains("catalog-new"),
+            "owner {id} received the new row"
+        );
+    }
+    assert_eq!(master_text.matches("id = \"catalog-new\"").count(), 1);
+    assert!(!master_text.contains("catalog-one"));
+    assert!(!master_text.contains("catalog-two"));
+    assert_eq!(
+        load_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .len(),
+        3,
+        "the combined batch must leave no duplicate or partial rows"
+    );
+}
+
+#[test]
+fn catalog_batch_refuses_two_new_rows_that_reserve_the_same_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let before = std::fs::read(&master).unwrap();
+    let first = catalog_row(
+        "catalog-collision",
+        "https://example.com/first.txt",
+        BlocklistBase::Deny,
+        true,
+        crate::tui::app::CatalogRowState::NotSubscribed,
+    );
+    let second = catalog_row(
+        "catalog-collision",
+        "https://example.com/second.txt",
+        BlocklistBase::Deny,
+        true,
+        crate::tui::app::CatalogRowState::NotSubscribed,
+    );
+
+    let error = apply_catalog_picker_changes(&master, &[first, second]).unwrap_err();
+    assert!(error.contains("already taken"), "got: {error}");
+    assert_eq!(std::fs::read(&master).unwrap(), before);
+}
+
+#[test]
+fn catalog_batch_refuses_two_new_rows_with_one_canonical_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let before = std::fs::read(&master).unwrap();
+    let first = catalog_row(
+        "first-id",
+        "https://EXAMPLE.com:443/shared.txt/",
+        BlocklistBase::Deny,
+        true,
+        crate::tui::app::CatalogRowState::NotSubscribed,
+    );
+    let second = catalog_row(
+        "second-id",
+        "https://example.com/shared.txt",
+        BlocklistBase::Deny,
+        true,
+        crate::tui::app::CatalogRowState::NotSubscribed,
+    );
+
+    let error = apply_catalog_picker_changes(&master, &[first, second]).unwrap_err();
+    assert!(error.contains("already subscribed"), "got: {error}");
+    assert_eq!(std::fs::read(&master).unwrap(), before);
+}
+
+#[test]
+fn list_edit_rebases_only_the_fields_changed_in_the_modal() {
+    let mut modal = modal_for_privacy_ads();
+    modal.display_name = "Only this field changed".into();
+    modal.interval = IntervalChoice::H12;
+    let mut live = modal.original.clone();
+    live.url = "https://example.com/live-url.txt".into();
+    live.enabled = false;
+    live.update_interval_hours = Some(48);
+    live.format = BlocklistFormat::Hosts;
+    live.auth_token_ref = Some("live-secret".into());
+    live.base = BlocklistBase::Ignore;
+
+    let rebased = rebase_edit_modal_onto_live(&modal, &live);
+    assert_eq!(rebased.display_name, "Only this field changed");
+    assert_eq!(rebased.url, live.url);
+    assert_eq!(rebased.enabled, live.enabled);
+    assert_eq!(rebased.format, live.format);
+    assert_eq!(rebased.auth_token_ref, "live-secret");
+    assert_eq!(rebased.nature, BlocklistBase::Ignore);
+    assert_eq!(rebased.interval, IntervalChoice::H48);
+    assert_eq!(rebased.original, live);
+}
+
+#[test]
+fn list_edit_applies_its_delta_to_the_guarded_live_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Opened name"
+url = "https://example.com/opened.txt"
+format = "domains"
+update_interval_hours = 12
+max_entries = 10
+max_consecutive_failures = 3
+enabled = true
+base = "deny"
+"#,
+    );
+    let opened = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists[0]
+        .clone();
+    let mut modal = modal_for_privacy_ads();
+    modal.blocklist_id = opened.id.as_str().to_string();
+    modal.display_name = "Operator name".into();
+    modal.url = opened.url.clone();
+    modal.nature = opened.base;
+    modal.enabled = opened.enabled;
+    modal.interval = IntervalChoice::from_optional_hours(opened.update_interval_hours);
+    modal.interval_custom_buf.clear();
+    modal.format = opened.format;
+    modal.auth_token_ref = opened.auth_token_ref.clone().unwrap_or_default();
+    modal.original = opened;
+
+    let peer = std::fs::read_to_string(&master)
+        .unwrap()
+        .replace(
+            "display_name = \"Opened name\"",
+            "display_name = \"Peer name\"",
+        )
+        .replace(
+            "url = \"https://example.com/opened.txt\"",
+            "url = \"https://example.com/live.txt\"",
+        )
+        .replace("format = \"domains\"", "format = \"hosts\"")
+        .replace("update_interval_hours = 12", "update_interval_hours = 48")
+        .replace("max_entries = 10", "max_entries = 20")
+        .replace(
+            "max_consecutive_failures = 3",
+            "max_consecutive_failures = 8",
+        )
+        .replace("enabled = true", "enabled = false")
+        .replace("base = \"deny\"", "base = \"ignore\"");
+    std::fs::write(&master, peer).unwrap();
+
+    apply_list_edit(&master, &modal, "privacy-ads", false, None).unwrap();
+    let live = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists[0]
+        .clone();
+    assert_eq!(live.display_name, "Operator name");
+    assert_eq!(live.url, "https://example.com/live.txt");
+    assert_eq!(live.format, BlocklistFormat::Hosts);
+    assert_eq!(live.update_interval_hours, Some(48));
+    assert_eq!(live.max_entries, Some(20));
+    assert_eq!(live.max_consecutive_failures, 8);
+    assert!(!live.enabled);
+    assert_eq!(live.base, BlocklistBase::Ignore);
+}
+
+#[test]
+fn list_edit_updates_its_fragment_owner_without_creating_a_master_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let master_text = std::fs::read_to_string(&master).unwrap().replace(
+        "schema_version = 4\n",
+        "schema_version = 4\nincludes = [\"fragments/*.toml\"]\n",
+    );
+    std::fs::write(&master, master_text).unwrap();
+    let fragments = dir.path().join("fragments");
+    std::fs::create_dir_all(&fragments).unwrap();
+    let owner = fragments.join("owner.toml");
+    std::fs::write(
+        &owner,
+        r#"[[blocklists]]
+id = "privacy-ads"
+display_name = "Fragment ads"
+url = "https://example.com/ads.txt"
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let live = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut modal = modal_opened_for(live);
+    modal.display_name = "Edited in owner".to_string();
+
+    apply_list_edit(&master, &modal, "privacy-ads", false, None).unwrap();
+
+    let owner_text = std::fs::read_to_string(&owner).unwrap();
+    assert!(owner_text.contains("display_name = \"Edited in owner\""));
+    assert_eq!(owner_text.matches("id = \"privacy-ads\"").count(), 1);
+    let master_text = std::fs::read_to_string(&master).unwrap();
+    assert!(
+        !master_text.contains("[[blocklists]]"),
+        "an Edit must not write the master creation target: {master_text}"
+    );
+    assert_eq!(
+        load_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .len(),
+        1,
+        "the merged config must still have exactly one row"
+    );
+}
+
+#[test]
+fn list_edit_allows_an_unchanged_compatible_url_alias_to_be_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Ads"
+url = "https://lists.example/ads.txt/"
+enabled = true
+
+[[blocklists]]
+id = "legacy-ads"
+display_name = "Legacy ads"
+url = "https://LISTS.EXAMPLE:443/ads.txt"
+enabled = true
+"#,
+    );
+    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let live = loaded.config.blocklists[0].clone();
+    let mut modal = modal_for_privacy_ads();
+    modal.display_name = live.display_name.clone();
+    modal.url = live.url.clone();
+    modal.nature = live.base;
+    modal.enabled = false;
+    modal.interval = IntervalChoice::from_optional_hours(live.update_interval_hours);
+    modal.interval_custom_buf.clear();
+    modal.format = live.format;
+    modal.auth_token_ref = live.auth_token_ref.clone().unwrap_or_default();
+    modal.original = live;
+
+    apply_list_edit(&master, &modal, "privacy-ads", false, None)
+        .expect("unchanged compatible aliases must not block disabling this row");
+    let after = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert!(!after.config.blocklists[0].enabled);
+    assert!(after.config.blocklists[1].enabled);
 }
 
 // Sprint A.5 (lc2_v2 foundation) dropped two save-flow tests:
@@ -1233,7 +1635,7 @@ fn write_promote_master(dir: &tempfile::TempDir, orphan_source: &str) -> PathBuf
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1510,7 +1912,7 @@ async fn b_hotkey_opens_catalog_picker_with_baselines_correct() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1579,7 +1981,7 @@ fn catalog_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1728,7 +2130,11 @@ async fn catalog_picker_unticking_disables_and_never_removes() {
         b.display_name, "My renamed ads list",
         "the operator's display name must survive the patch"
     );
-    assert_eq!(b.update_interval_hours, 6, "the interval must survive");
+    assert_eq!(
+        b.update_interval_hours,
+        Some(6),
+        "the interval must survive"
+    );
 }
 
 /// Two staged rows, one write. N `run_add_silent` calls would mean N

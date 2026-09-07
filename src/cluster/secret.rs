@@ -26,7 +26,11 @@ use crate::ipc::auth_token::{load_token_at, save_token_at};
 /// mutable state.
 #[must_use]
 pub fn cluster_token_path(config_path: &Path) -> PathBuf {
-    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    // Saving and daemon startup may receive different spellings of the same
+    // master. Resolve existing aliases so both select one token sidecar.
+    let canonical =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let dir = canonical.parent().unwrap_or_else(|| Path::new("."));
     state_dir_for(dir).join("cluster_token")
 }
 
@@ -73,6 +77,21 @@ mod tests {
         assert_eq!(
             cluster_token_path(cfg),
             PathBuf::from("/var/lib/purge-warden/cluster_token"),
+        );
+    }
+
+    #[test]
+    fn token_path_follows_an_existing_master_alias() {
+        let canonical = tempfile::tempdir().unwrap();
+        let alias_dir = tempfile::tempdir().unwrap();
+        let master = canonical.path().join("config.toml");
+        std::fs::write(&master, "schema_version = 4\n").unwrap();
+        let alias = alias_dir.path().join("alias.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+        assert_eq!(
+            cluster_token_path(&alias),
+            canonical.path().join("cluster_token")
         );
     }
 

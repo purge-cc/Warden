@@ -17,6 +17,7 @@ use crate::config::loader::load_config;
 use crate::config::schema::validator::{inert_blocklists, InertListReason};
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client;
+use crate::lists::status::ServedState;
 
 use super::pid;
 
@@ -131,7 +132,7 @@ fn print_live_status(
             // wait for a cycle to END — `lists refresh` — and a sequence
             // number in a human summary is noise. Destructured to keep the
             // pattern exhaustive.
-            lists_cycle: _,
+            lists_cycle,
             lc2_list_diagnostics,
             // resource_budget is surfaced through the TUI Dashboard, not
             // the text CLI summary; the field is destructured here to
@@ -159,21 +160,16 @@ fn print_live_status(
                     format_upstream_status_line(&upstream_servers)
                 );
             }
-            // Render `active/total` when the registry-derived counters
-            // are populated; fall back to the legacy `list_count` scalar
-            // so an older daemon keeps the same single-number output.
-            if lists_total > 0 {
-                for line in format_lists_lines(
-                    lists_active,
-                    lists_total,
-                    lists_truncated,
-                    lists_corpus_refusal.as_ref(),
-                    lists_corpus_freeze.as_ref(),
-                ) {
-                    println!("{line}");
-                }
-            } else {
-                println!("lists:      {list_count} sources");
+            for line in format_reported_lists_lines(
+                list_count,
+                lists_active,
+                lists_total,
+                lists_truncated,
+                lists_corpus_refusal.as_ref(),
+                lists_corpus_freeze.as_ref(),
+                lists_cycle.as_ref(),
+            ) {
+                println!("{line}");
             }
             // A list can be active AND filter nothing. The counters
             // above cannot show that — they count fetches, not reach.
@@ -182,7 +178,11 @@ fn print_live_status(
             }
             println!(
                 "{}",
-                format_domains_line(domain_count, lists_corpus_refusal.as_ref())
+                format_domains_line_for_cycle(
+                    domain_count,
+                    lists_corpus_refusal.as_ref(),
+                    lists_cycle.as_ref(),
+                )
             );
             // `cache_cap` is a moka *weight* ceiling, not an entry count
             // (see `format_cache_line`), so the pair printed must be
@@ -721,13 +721,12 @@ pub(crate) fn format_frozen_since(freeze: &crate::lists::status::CorpusFreeze) -
     })
 }
 
-/// Render the `lists:` summary — three states, not two.
+/// Render the completed-registry `lists:` summary.
 ///
-/// A truncated source is still an *active* source, so the `active/total`
-/// fraction cannot express under-coverage: it read `8/8 sources active`
-/// while 2,370,261 domains were being dropped. An operator must not be
-/// able to read this line and conclude they are fully covered when they
-/// are not.
+/// An entry-cap refusal marks its source failed, though a retained
+/// last-good cache can still protect. Its overshoot remains visible through
+/// later non-cap failures until a source succeeds, so it cannot be read as
+/// the most recent attempt without the per-source row.
 ///
 /// A **refused cycle** is the sharper case of the same defect. Every
 /// source fetched, parsed and reported `Ok`, so the fraction is a
@@ -742,54 +741,190 @@ fn format_lists_lines(
     lists_truncated: u32,
     refusal: Option<&crate::lists::status::CorpusRefusal>,
     freeze: Option<&crate::lists::status::CorpusFreeze>,
+    cycle: Option<&crate::lists::status::CycleMark>,
 ) -> Vec<String> {
-    let Some(r) = refusal else {
-        let line = if lists_truncated > 0 {
-            format!(
-                "lists:      {lists_active}/{lists_total} sources active, \
-                 {lists_truncated} TRUNCATED (run `warden blocklist show` for counts)"
-            )
-        } else {
-            format!("lists:      {lists_active}/{lists_total} sources active")
-        };
-        return vec![line];
+    let outcome = cycle.and_then(|c| c.outcome);
+    let coverage_incomplete = cycle.is_some_and(|c| c.source_coverage_incomplete);
+    let generation_degraded = cycle.is_some_and(|c| c.generation_degraded);
+    let degraded_served_state = cycle.map(|c| c.served_state);
+    let frozen_line = || {
+        freeze.and_then(|f| Some((f, format_frozen_since(f)?)))
+            .map(|(f, since)| {
+                format!(
+                    "            FROZEN since {since} ({} refused cycles, counted since this daemon \
+                     started)",
+                    f.consecutive
+                )
+            })
     };
 
-    let mut lines = vec![format!(
-        "lists:      {lists_active}/{lists_total} sources fetched, CORPUS REFUSED \
-         — NOT INSTALLED"
-    )];
-    // Directly under the headline, because it is the line that separates a
-    // blip from an outage. A refusal that started this morning may clear
-    // itself when a list shrinks; one standing for a fortnight is a host
-    // that stopped tracking upstream, and the refusal payload alone reads
-    // the same either way. The horizon is stated rather than implied — the
-    // streak lives on the registry, so a restart resets it, and a count
-    // presented as all-time would understate a recurring freeze.
-    if let Some((f, since)) = freeze.and_then(|f| Some((f, format_frozen_since(f)?))) {
-        lines.push(format!(
-            "            FROZEN since {since} ({} refused cycles, counted since this daemon \
-             started)",
-            f.consecutive
+    if outcome == Some(crate::lists::status::CycleOutcome::ClearedNoSources) {
+        let mut lines = vec![format!(
+            "lists:      {lists_active}/{lists_total} source rows, BLOCKLIST CLEARED — filtering nothing"
+        )];
+        if generation_degraded {
+            lines.push(format_degraded_served_state_line(
+                degraded_served_state.unwrap_or_default(),
+            ));
+        }
+        return lines;
+    }
+
+    // A config rejection is the result of this cycle. Coverage is a standing
+    // fact from a prior manager attempt and must not relabel the rejection.
+    if outcome == Some(crate::lists::status::CycleOutcome::ConfigRejected) {
+        let mut lines = vec![format!(
+            "lists:      {lists_active}/{lists_total} source rows, CONFIG REJECTED — previous configuration remains in force"
+        )];
+        if coverage_incomplete {
+            lines.push(
+                "            standing SOURCE COVERAGE INCOMPLETE (most recent manager list attempt)"
+                    .to_string(),
+            );
+        }
+        if generation_degraded {
+            lines.push(format_degraded_served_state_line(
+                degraded_served_state.unwrap_or_default(),
+            ));
+        }
+        if let Some(line) = frozen_line() {
+            lines.push(line);
+        }
+        return lines;
+    }
+
+    // Refusal is likewise primary. In particular, cold incomplete + hard-cap
+    // refusal must not be rendered as a retained corpus; `domains: 0` states
+    // the resulting unfiltered condition explicitly below this summary.
+    if outcome == Some(crate::lists::status::CycleOutcome::Refused) || refusal.is_some() {
+        let mut lines = vec![format!(
+            "lists:      {lists_active}/{lists_total} sources fetched, CORPUS REFUSED \
+             — NOT INSTALLED"
+        )];
+        // Directly under the headline, because it is the line that separates a
+        // blip from an outage. A refusal that started this morning may clear
+        // itself when a list shrinks; one standing for a fortnight is a host
+        // that stopped tracking upstream, and the refusal payload alone reads
+        // the same either way. The horizon is stated rather than implied — the
+        // streak lives on the registry, so a restart resets it, and a count
+        // presented as all-time would understate a recurring freeze.
+        if let Some(line) = frozen_line() {
+            lines.push(line);
+        }
+        if let Some(r) = refusal {
+            lines.push(format!(
+                "            {} unique domains exceeds max_total_domains {}; nothing from this cycle was installed",
+                r.unique, r.ceiling
+            ));
+            if let Some((source, novel)) = r.novel_by_source.first() {
+                lines.push(format!(
+                    "            largest contributor: {source} (+{novel} domains no other list \
+                     supplies; order-dependent)"
+                ));
+            }
+        }
+        if coverage_incomplete {
+            lines.push(
+                "            SOURCE COVERAGE INCOMPLETE (supplementary; refusal is this cycle's result)"
+                    .to_string(),
+            );
+        }
+        if generation_degraded {
+            lines.push(format_degraded_served_state_line(
+                degraded_served_state.unwrap_or_default(),
+            ));
+        }
+        if lists_truncated > 0 {
+            lines.push(format!(
+                "            {lists_truncated} sources have an uncleared REFUSED-by-max_entries overshoot"
+            ));
+        }
+        return lines;
+    }
+
+    let headline = if coverage_incomplete || generation_degraded {
+        "source rows"
+    } else {
+        "sources active"
+    };
+    let mut lines = vec![if lists_truncated > 0 {
+        format!(
+            "lists:      {lists_active}/{lists_total} {headline}, \
+             {lists_truncated} REFUSED by max_entries (last uncleared overshoot since daemon start; run `warden blocklist show` for counts)"
+        )
+    } else {
+        format!("lists:      {lists_active}/{lists_total} {headline}")
+    }];
+    if coverage_incomplete {
+        let detail = match outcome {
+            Some(crate::lists::status::CycleOutcome::Installed) => "partial corpus installed",
+            Some(crate::lists::status::CycleOutcome::SkippedUnchanged) => {
+                "standing result from the most recent manager list attempt"
+            }
+            _ if generation_degraded => {
+                degraded_served_state_detail(degraded_served_state.unwrap_or_default())
+            }
+            _ => "standing result from the most recent manager list attempt",
+        };
+        lines.push(format!("            SOURCE COVERAGE INCOMPLETE — {detail}"));
+    }
+    if generation_degraded && !coverage_incomplete {
+        lines.push(format_degraded_served_state_line(
+            degraded_served_state.unwrap_or_default(),
         ));
     }
-    lines.push(format!(
-        "            {} unique domains exceeds max_total_domains {}; \
-         serving the previous generation",
-        r.unique, r.ceiling
-    ));
-    if let Some((source, novel)) = r.novel_by_source.first() {
-        lines.push(format!(
-            "            largest contributor: {source} (+{novel} domains no other list \
-             supplies; order-dependent)"
-        ));
-    }
-    if lists_truncated > 0 {
-        lines.push(format!(
-            "            {lists_truncated} of the fetched sources were also TRUNCATED"
-        ));
+    if let Some(line) = frozen_line() {
+        lines.push(line);
     }
     lines
+}
+
+/// `generation_degraded` says a refresh did not complete; the served state
+/// says what remains live, so never derive the latter from the former.
+fn degraded_served_state_detail(state: ServedState) -> &'static str {
+    match state {
+        ServedState::Complete => "previous complete generation remains serving",
+        ServedState::Partial => "partial generation is serving; retry expected",
+        ServedState::Uninitialized => "no generation is installed; DNS is answering unfiltered",
+        ServedState::IntentionalEmpty => {
+            "accepted complete empty generation is serving; filtering nothing"
+        }
+        ServedState::Cleared => "config-cleared corpus is serving; filtering nothing",
+        ServedState::Unknown => {
+            "served-generation completeness cannot be determined (legacy); inspect the journal; daemon will retry automatically"
+        }
+    }
+}
+
+fn format_degraded_served_state_line(state: ServedState) -> String {
+    format!(
+        "            SERVED STATE — {}",
+        degraded_served_state_detail(state)
+    )
+}
+
+/// Select completed-registry counters only when the daemon reports a cycle.
+/// A reported 0/0 is an intentional empty registry; no marker is legacy.
+fn format_reported_lists_lines(
+    list_count: usize,
+    lists_active: u32,
+    lists_total: u32,
+    lists_truncated: u32,
+    refusal: Option<&crate::lists::status::CorpusRefusal>,
+    freeze: Option<&crate::lists::status::CorpusFreeze>,
+    cycle: Option<&crate::lists::status::CycleMark>,
+) -> Vec<String> {
+    match cycle {
+        Some(cycle) => format_lists_lines(
+            lists_active,
+            lists_total,
+            lists_truncated,
+            refusal,
+            freeze,
+            Some(cycle),
+        ),
+        None => vec![format!("lists:      {list_count} sources")],
+    }
 }
 
 /// Render the `domains:` line, annotated when a refusal is standing.
@@ -806,10 +941,26 @@ fn format_lists_lines(
 /// installs rather than refusing (`lists::manager::cold_start_hard_cap`),
 /// but it is still reachable past the hard cap, and it is the single
 /// worst state the daemon has: up, listening, filtering nothing.
+#[cfg(test)]
 fn format_domains_line(
     domain_count: usize,
     refusal: Option<&crate::lists::status::CorpusRefusal>,
 ) -> String {
+    format_domains_line_for_cycle(domain_count, refusal, None)
+}
+
+fn format_domains_line_for_cycle(
+    domain_count: usize,
+    refusal: Option<&crate::lists::status::CorpusRefusal>,
+    cycle: Option<&crate::lists::status::CycleMark>,
+) -> String {
+    if domain_count == 0
+        && cycle.and_then(|mark| mark.outcome)
+            == Some(crate::lists::status::CycleOutcome::ClearedNoSources)
+    {
+        return "domains:    0 — BLOCKLIST CLEARED, DNS IS ANSWERING UNFILTERED (filtering nothing)"
+            .to_string();
+    }
     match refusal {
         None => format!("domains:    {domain_count}"),
         Some(_) if domain_count == 0 => format!(
@@ -945,7 +1096,7 @@ fn format_uptime(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lists::status::{CorpusFreeze, CorpusRefusal};
+    use crate::lists::status::{CorpusFreeze, CorpusRefusal, CycleMark, CycleOutcome, ServedState};
     use time::macros::datetime;
 
     // ── the daemon-unreachable `lists:` line ─────────────────────────
@@ -1053,6 +1204,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cleared_registry_renders_zero_rows_and_unfiltered_not_legacy_counts() {
+        let cleared = CycleMark {
+            seq: 4,
+            outcome: Some(CycleOutcome::ClearedNoSources),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: ServedState::Cleared,
+        };
+        let lines = format_reported_lists_lines(9, 0, 0, 0, None, None, Some(&cleared)).join("\n");
+        assert!(lines.contains("0/0 source rows"), "{lines}");
+        assert!(lines.contains("BLOCKLIST CLEARED"), "{lines}");
+        assert!(lines.contains("filtering nothing"), "{lines}");
+        assert!(!lines.contains("9 sources"), "{lines}");
+
+        let domains = format_domains_line_for_cycle(0, None, Some(&cleared));
+        assert!(domains.contains("CLEARED"), "{domains}");
+        assert!(domains.contains("UNFILTERED"), "{domains}");
+
+        let legacy = format_reported_lists_lines(9, 0, 0, 0, None, None, None);
+        assert_eq!(legacy, vec!["lists:      9 sources"]);
+    }
+
     // ── the `cache:` line ────────────────────────────────────────────
 
     /// The modern pair printed is weight-vs-weight
@@ -1117,7 +1291,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1154,7 +1328,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1188,7 +1362,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 3\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+            "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
              default_profile = \"default\"\n\n[profiles.default]\n\
              display_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
@@ -1286,7 +1460,7 @@ mod tests {
             ],
         };
 
-        let refused = format_lists_lines(8, 8, 0, Some(&refusal), None).join("\n");
+        let refused = format_lists_lines(8, 8, 0, Some(&refusal), None, None).join("\n");
         assert!(
             !refused.contains("active"),
             "a refused cycle still described its sources as active:\n{refused}"
@@ -1315,7 +1489,7 @@ mod tests {
         // Control arm: without a refusal the line is unchanged, so the
         // assertions above are about the refused state and not about some
         // blanket rewording of the line.
-        let healthy = format_lists_lines(8, 8, 0, None, None).join("\n");
+        let healthy = format_lists_lines(8, 8, 0, None, None, None).join("\n");
         assert!(
             healthy.contains("8/8 sources active"),
             "the healthy line changed:\n{healthy}"
@@ -1324,8 +1498,106 @@ mod tests {
 
         // And the pre-existing truncation suffix still works, refusal or
         // not — this line has three states now, not two.
-        let truncated = format_lists_lines(8, 8, 2, None, None).join("\n");
-        assert!(truncated.contains("2 TRUNCATED"), "{truncated}");
+        let truncated = format_lists_lines(8, 8, 2, None, None, None).join("\n");
+        assert!(
+            truncated.contains("2 REFUSED by max_entries"),
+            "{truncated}"
+        );
+    }
+
+    #[test]
+    fn incomplete_coverage_never_looks_healthy_for_hot_or_cold_cycles() {
+        let hot = CycleMark {
+            seq: 3,
+            outcome: Some(CycleOutcome::SpillRollbackFailed),
+            source_coverage_incomplete: true,
+            generation_degraded: true,
+            served_state: ServedState::Complete,
+        };
+        let held = format_lists_lines(8, 8, 0, None, None, Some(&hot)).join("\n");
+        assert!(held.contains("SOURCE COVERAGE INCOMPLETE"), "{held}");
+        assert!(
+            held.contains("previous complete generation remains serving"),
+            "{held}"
+        );
+        assert!(held.contains("8/8 source rows"), "{held}");
+        assert!(
+            !held.contains("8/8 sources active"),
+            "an N/N hot hold cannot look healthy: {held}"
+        );
+
+        let cold = CycleMark {
+            seq: 4,
+            outcome: Some(CycleOutcome::Installed),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: ServedState::Partial,
+        };
+        let partial = format_lists_lines(8, 8, 0, None, None, Some(&cold)).join("\n");
+        assert!(partial.contains("SOURCE COVERAGE INCOMPLETE"), "{partial}");
+        assert!(partial.contains("partial corpus installed"), "{partial}");
+        assert!(partial.contains("8/8 source rows"), "{partial}");
+        assert!(
+            !partial.contains("8/8 sources active"),
+            "an N/N cold partial install cannot look healthy: {partial}"
+        );
+
+        let degraded = CycleMark {
+            seq: 5,
+            outcome: Some(CycleOutcome::SpillRollbackFailed),
+            source_coverage_incomplete: false,
+            generation_degraded: true,
+            served_state: ServedState::Partial,
+        };
+        let held = format_lists_lines(8, 8, 0, None, None, Some(&degraded)).join("\n");
+        assert!(held.contains("partial generation is serving"), "{held}");
+        assert!(held.contains("8/8 source rows"), "{held}");
+        assert!(
+            !held.contains("8/8 sources active"),
+            "an N/N degraded generation cannot look healthy: {held}"
+        );
+    }
+
+    #[test]
+    fn degraded_generation_names_the_served_state_without_guessing() {
+        let cases = [
+            (
+                ServedState::Complete,
+                "previous complete generation remains serving",
+            ),
+            (
+                ServedState::Partial,
+                "partial generation is serving; retry expected",
+            ),
+            (
+                ServedState::Uninitialized,
+                "no generation is installed; DNS is answering unfiltered",
+            ),
+            (
+                ServedState::IntentionalEmpty,
+                "accepted complete empty generation is serving; filtering nothing",
+            ),
+            (
+                ServedState::Unknown,
+                "served-generation completeness cannot be determined (legacy)",
+            ),
+        ];
+
+        for (served_state, expected) in cases {
+            let cycle = CycleMark {
+                seq: 6,
+                outcome: Some(CycleOutcome::SpillRollbackFailed),
+                source_coverage_incomplete: false,
+                generation_degraded: true,
+                served_state,
+            };
+            let lines = format_lists_lines(8, 8, 0, None, None, Some(&cycle)).join("\n");
+            assert!(lines.contains(expected), "{served_state:?}: {lines}");
+            assert!(
+                !lines.contains("NO complete generation installed"),
+                "{served_state:?}: {lines}"
+            );
+        }
     }
 
     /// A refusal that does not say *when* reads the same on day one and
@@ -1345,7 +1617,7 @@ mod tests {
             consecutive: 9,
         };
 
-        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(
             out.contains(
                 "            FROZEN since 2026-08-04T03:00:00Z (9 refused cycles, \
@@ -1370,7 +1642,7 @@ mod tests {
 
         // Control arm: a refusal with no freeze reported (an older daemon)
         // still renders every pre-existing line, and adds nothing.
-        let no_freeze = format_lists_lines(8, 8, 0, Some(&refusal), None).join("\n");
+        let no_freeze = format_lists_lines(8, 8, 0, Some(&refusal), None, None).join("\n");
         assert!(no_freeze.contains("CORPUS REFUSED"), "{no_freeze}");
         assert!(
             !no_freeze.contains("FROZEN since"),
@@ -1378,9 +1650,49 @@ mod tests {
              for it:\n{no_freeze}"
         );
 
-        // ...and a healthy daemon never sees the line, freeze or not.
-        let healthy = format_lists_lines(8, 8, 0, None, Some(&freeze)).join("\n");
-        assert!(!healthy.contains("FROZEN"), "{healthy}");
+        // A later non-installing manager cycle can clear the refusal payload
+        // while the standing freeze remains actionable; never hide its age.
+        let healthy = format_lists_lines(8, 8, 0, None, Some(&freeze), None).join("\n");
+        assert!(healthy.contains("FROZEN since"), "{healthy}");
+    }
+
+    #[test]
+    fn refusal_and_config_rejection_take_precedence_over_standing_coverage() {
+        let refusal = CorpusRefusal {
+            unique: 10,
+            ceiling: 2,
+            novel_by_source: vec![],
+        };
+        let refused = CycleMark {
+            seq: 1,
+            outcome: Some(CycleOutcome::Refused),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: ServedState::Complete,
+        };
+        let refused_lines =
+            format_lists_lines(1, 2, 0, Some(&refusal), None, Some(&refused)).join("\n");
+        assert!(refused_lines.contains("CORPUS REFUSED"), "{refused_lines}");
+        assert!(refused_lines.contains("supplementary"), "{refused_lines}");
+        assert!(!refused_lines.contains("previous corpus retained"));
+        assert!(format_domains_line(0, Some(&refusal)).contains("NOTHING IS INSTALLED"));
+
+        let rejected = CycleMark {
+            seq: 2,
+            outcome: Some(CycleOutcome::ConfigRejected),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: ServedState::Complete,
+        };
+        let rejected_lines = format_lists_lines(1, 2, 0, None, None, Some(&rejected)).join("\n");
+        assert!(
+            rejected_lines.contains("CONFIG REJECTED"),
+            "{rejected_lines}"
+        );
+        assert!(
+            rejected_lines.contains("standing SOURCE COVERAGE"),
+            "{rejected_lines}"
+        );
     }
 
     /// The worst state the daemon has — refused, with no previous
@@ -1405,7 +1717,7 @@ mod tests {
             since: Some(datetime!(2026-08-04 03:00:00 UTC)),
             consecutive: 9,
         };
-        let lists = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        let lists = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(
             lists.contains("FROZEN since 2026-08-04T03:00:00Z"),
             "{lists}"
@@ -1432,7 +1744,7 @@ mod tests {
             since: None,
             consecutive: 4,
         };
-        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze)).join("\n");
+        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(!out.contains("FROZEN"), "{out}");
         assert!(!out.contains("unknown"), "{out}");
         assert!(out.contains("CORPUS REFUSED"), "{out}");
@@ -1533,7 +1845,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"

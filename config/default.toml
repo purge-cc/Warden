@@ -1,4 +1,4 @@
-# purge-warden configuration reference (schema v2)
+# purge-warden configuration reference (schema v4)
 # https://purge.cc
 #
 # Commented values show defaults — uncomment and edit as needed.
@@ -9,7 +9,7 @@
 # `tags`; profiles/devices/subnets carry `tags` too; a list applies
 # where the tag sets intersect.
 
-schema_version = 3
+schema_version = 4
 
 # ── Server ───────────────────────────────────────────────────────
 [server]

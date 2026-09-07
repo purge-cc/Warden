@@ -87,7 +87,7 @@ fn handle_query_attributes_admin_block() {
     use crate::profiles::ProfileResolver;
 
     let mut config = ConfigV1::test_scaffold();
-    config.schema_version = 3;
+    config.schema_version = 4;
     config.profiles.insert(
         "strict".into(),
         Profile {
@@ -807,7 +807,9 @@ fn test_state() -> DaemonState {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -847,11 +849,338 @@ fn test_state_with_token(token_plaintext: &str) -> DaemonState {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+    }
+}
+
+#[tokio::test]
+async fn force_refresh_authenticates_before_it_can_enqueue() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut state = test_state_with_token("correct-token");
+    state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::running(tx),
+    ));
+
+    let response = dispatch_command(
+        IpcCommand::ForceListRefresh { token: None },
+        Some(current_euid()),
+        &state,
+    )
+    .await;
+
+    assert!(matches!(response, IpcResponse::Error { .. }));
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "an unauthenticated force refresh must not reach the manager channel"
+    );
+}
+
+#[tokio::test]
+async fn force_refresh_with_no_sources_returns_an_explicit_clear() {
+    let mut state = test_state_with_token("correct-token");
+    state.list_statuses = Some(Arc::new(ListStatusRegistry::new(&[])));
+
+    let response = dispatch_command(
+        IpcCommand::ForceListRefresh {
+            token: Some("correct-token".into()),
+        },
+        Some(current_euid()),
+        &state,
+    )
+    .await;
+
+    let IpcResponse::ListRefreshCompleted {
+        disposition,
+        snapshot,
+        ..
+    } = response
+    else {
+        panic!("empty configured source plan must be a completed clear");
+    };
+    assert_eq!(
+        disposition,
+        crate::lists::manager::ListManagerCommandDisposition::Started
+    );
+    assert_eq!(
+        snapshot.cycle.outcome,
+        Some(crate::lists::status::CycleOutcome::ClearedNoSources)
+    );
+    assert_eq!(snapshot.domain_count, 0);
+}
+
+#[tokio::test]
+async fn force_refresh_never_turns_a_transition_into_a_clear() {
+    let mut state = test_state_with_token("correct-token");
+    state.list_statuses = Some(Arc::new(ListStatusRegistry::new(&[])));
+    state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::Transitioning,
+    ));
+
+    let response = dispatch_command(
+        IpcCommand::ForceListRefresh {
+            token: Some("correct-token".into()),
+        },
+        Some(current_euid()),
+        &state,
+    )
+    .await;
+    assert_eq!(response, ipc_error(IpcError::ListManagerUnavailable));
+}
+
+#[tokio::test]
+async fn saturated_force_waiters_do_not_block_ordinary_dispatch() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut state = test_state_with_token("token");
+    state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::Running {
+            sender: tx,
+            waiters: Arc::new(tokio::sync::Semaphore::new(0)),
+        },
+    ));
+    let force = handle_force_list_refresh_with_timeouts(
+        Some(current_euid()),
+        &state,
+        force_refresh_timeouts_for_test(),
+    )
+    .await;
+    assert_eq!(force, ipc_error(IpcError::ListRefreshBusy));
+    assert!(matches!(
+        dispatch_command(IpcCommand::DomainCount, Some(current_euid()), &state).await,
+        IpcResponse::DomainCount { .. }
+    ));
+}
+
+#[test]
+fn force_refresh_failure_phases_are_classified_once() {
+    for error in [
+        IpcError::ListManagerUnavailable,
+        IpcError::ListRefreshBusy,
+        IpcError::ListManagerChannelClosed,
+        IpcError::ListRefreshEnqueueTimeout,
+    ] {
+        assert_eq!(force_refresh_failure_phase(&error), "rejected");
+    }
+    for error in [
+        IpcError::ListRefreshAcceptanceTimeout,
+        IpcError::ListRefreshAcceptanceDropped,
+        IpcError::ListRefreshCompletionTimeout,
+        IpcError::ListRefreshCompletionDropped,
+    ] {
+        assert_eq!(force_refresh_failure_phase(&error), "unknown");
+    }
+}
+
+fn force_refresh_timeouts_for_test() -> ForceRefreshTimeouts {
+    ForceRefreshTimeouts {
+        enqueue: std::time::Duration::from_millis(20),
+        acceptance: std::time::Duration::from_millis(20),
+        completion: std::time::Duration::from_millis(20),
+    }
+}
+
+fn force_refresh_snapshot(domain_count: usize) -> crate::lists::status::RegistrySnapshot {
+    crate::lists::status::RegistrySnapshot {
+        rows: Vec::new(),
+        corpus_refusal: None,
+        corpus_freeze: None,
+        domain_count,
+        cycle: crate::lists::status::CycleMark {
+            seq: 9,
+            outcome: Some(crate::lists::status::CycleOutcome::Installed),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: crate::lists::status::ServedState::Complete,
+        },
+    }
+}
+
+#[tokio::test]
+async fn force_refresh_distinguishes_missing_closed_and_full_channels() {
+    let missing = test_state_with_token("token");
+    assert!(matches!(
+        handle_force_list_refresh_with_timeouts(
+            Some(current_euid()),
+            &missing,
+            force_refresh_timeouts_for_test()
+        )
+        .await,
+        IpcResponse::Error { .. }
+    ));
+
+    let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+    drop(closed_rx);
+    let mut closed = test_state_with_token("token");
+    closed.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::running(closed_tx),
+    ));
+    let closed = handle_force_list_refresh_with_timeouts(
+        Some(current_euid()),
+        &closed,
+        force_refresh_timeouts_for_test(),
+    )
+    .await;
+    assert_eq!(
+        closed,
+        ipc_error(IpcError::ListManagerChannelClosed),
+        "a closed manager receiver proves the request was never enqueued"
+    );
+
+    let (full_tx, mut full_rx) = tokio::sync::mpsc::channel(1);
+    let (accepted, _) = tokio::sync::oneshot::channel();
+    let (completion, _) = tokio::sync::oneshot::channel();
+    full_tx
+        .send(crate::lists::manager::ListManagerCommand::ForceRefresh {
+            accepted,
+            completion,
+        })
+        .await
+        .unwrap();
+    let mut full = test_state_with_token("token");
+    full.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::running(full_tx),
+    ));
+    let full = handle_force_list_refresh_with_timeouts(
+        Some(current_euid()),
+        &full,
+        force_refresh_timeouts_for_test(),
+    )
+    .await;
+    assert_eq!(full, ipc_error(IpcError::ListRefreshEnqueueTimeout));
+    drop(full_rx.recv().await);
+}
+
+#[tokio::test]
+async fn force_refresh_reports_post_enqueue_unknown_states() {
+    for phase in [
+        "acceptance_drop",
+        "acceptance_timeout",
+        "completion_drop",
+        "completion_timeout",
+    ] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut state = test_state_with_token("token");
+        state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::running(tx),
+        ));
+        let worker = tokio::spawn(async move {
+            let Some(crate::lists::manager::ListManagerCommand::ForceRefresh {
+                accepted,
+                completion,
+            }) = rx.recv().await
+            else {
+                panic!("test sender must enqueue a force refresh");
+            };
+            match phase {
+                "acceptance_drop" => drop((accepted, completion)),
+                "acceptance_timeout" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    drop((accepted, completion));
+                }
+                "completion_drop" => {
+                    accepted
+                        .send(crate::lists::manager::ListManagerCommandDisposition::Started)
+                        .unwrap();
+                    drop(completion);
+                }
+                "completion_timeout" => {
+                    accepted
+                        .send(crate::lists::manager::ListManagerCommandDisposition::Started)
+                        .unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    drop(completion);
+                }
+                _ => unreachable!(),
+            }
+        });
+        let response = handle_force_list_refresh_with_timeouts(
+            Some(current_euid()),
+            &state,
+            force_refresh_timeouts_for_test(),
+        )
+        .await;
+        let expected = match phase {
+            "acceptance_drop" => IpcError::ListRefreshAcceptanceDropped,
+            "acceptance_timeout" => IpcError::ListRefreshAcceptanceTimeout,
+            "completion_drop" => IpcError::ListRefreshCompletionDropped,
+            "completion_timeout" => IpcError::ListRefreshCompletionTimeout,
+            _ => unreachable!(),
+        };
+        assert_eq!(response, ipc_error(expected));
+        worker.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn force_refresh_returns_the_actor_snapshot_for_every_disposition() {
+    use crate::lists::manager::{ListManagerCommand, ListManagerCommandDisposition};
+
+    for disposition in [
+        ListManagerCommandDisposition::Started,
+        ListManagerCommandDisposition::JoinedInFlight,
+        ListManagerCommandDisposition::Queued,
+        ListManagerCommandDisposition::CoalescedQueued,
+    ] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut state = test_state_with_token("token");
+        let registry = Arc::new(ListStatusRegistry::new(&[]));
+        state.list_statuses = Some(registry.clone());
+        state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::running(tx),
+        ));
+        let worker = tokio::spawn(async move {
+            let Some(ListManagerCommand::ForceRefresh {
+                accepted,
+                completion,
+            }) = rx.recv().await
+            else {
+                panic!("test sender must enqueue a force refresh");
+            };
+            accepted.send(disposition).unwrap();
+            assert!(completion
+                .send(crate::lists::manager::ForceRefreshCompletion {
+                    snapshot: force_refresh_snapshot(73),
+                    max_total_domains: Some(100),
+                })
+                .is_ok());
+        });
+        let response = handle_force_list_refresh_with_timeouts(
+            Some(current_euid()),
+            &state,
+            force_refresh_timeouts_for_test(),
+        )
+        .await;
+        registry.record_cycle_with_source_coverage(
+            crate::lists::status::CycleOutcome::ConfigRejected,
+            false,
+            0,
+        );
+        let IpcResponse::ListRefreshCompleted {
+            disposition: returned,
+            snapshot,
+            max_total_domains,
+        } = response
+        else {
+            panic!("accepted force refresh must return the actor completion");
+        };
+        assert_eq!(returned, disposition);
+        assert_eq!(snapshot.domain_count, 73);
+        assert_eq!(max_total_domains, Some(100));
+        assert_eq!(snapshot.cycle.seq, 9);
+        assert_eq!(
+            snapshot.cycle.outcome,
+            Some(crate::lists::status::CycleOutcome::Installed),
+            "the response is the actor payload, not a registry reread after completion"
+        );
+        worker.await.unwrap();
     }
 }
 
@@ -895,7 +1224,9 @@ fn test_state_with_query_log(
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -1585,7 +1916,7 @@ async fn get_all_clients_empty_view_on_zero_clients() {
     use crate::profiles::ProfileResolver;
 
     let mut config = ConfigV1::test_scaffold();
-    config.schema_version = 3;
+    config.schema_version = 4;
     let bit_map = crate::lists::source_key::SourceBitMap::default();
     let profiles = Arc::new(ProfileResolver::build(
         &config,
@@ -1618,7 +1949,9 @@ async fn get_all_clients_empty_view_on_zero_clients() {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -1648,7 +1981,7 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
     use std::net::{IpAddr, Ipv4Addr};
 
     let mut config = ConfigV1::test_scaffold();
-    config.schema_version = 3;
+    config.schema_version = 4;
     config.profiles.insert(
         "default".into(),
         Profile {
@@ -1742,7 +2075,9 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -1813,7 +2148,9 @@ fn test_state_with_config_path(
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -1848,7 +2185,7 @@ fn load_devices(path: &std::path::Path) -> Vec<crate::config::schema::Device> {
 #[tokio::test]
 async fn client_add_happy_path_writes_and_reloads() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -1898,7 +2235,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_rejects_duplicate_name_with_named_error() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -1952,7 +2289,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_rejects_duplicate_ip_with_named_error() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2002,7 +2339,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-auth", path.clone());
@@ -2046,7 +2383,7 @@ async fn client_add_requires_admin_token() {
 #[tokio::test]
 async fn client_add_validator_catches_unknown_profile() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "validator",
     );
     let (state, _rx) = test_state_with_config_path("tok-val", path.clone());
@@ -2086,7 +2423,7 @@ async fn client_add_concurrent_calls_serialize_through_write_lock() {
     // must end up on disk — without the write lock the second
     // would overwrite the first's append.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "concurrent",
     );
     let (state, _rx) = test_state_with_config_path("tok-conc", path.clone());
@@ -2155,7 +2492,7 @@ async fn client_add_concurrent_calls_serialize_through_write_lock() {
 #[tokio::test]
 async fn client_update_partial_patch_only_touches_provided_fields() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2220,7 +2557,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_sets_network_name() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2260,7 +2597,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_clears_network_name_on_some_none() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2319,7 +2656,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn a_pre_s5_payload_still_carrying_tags_applies_its_other_fields() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2399,7 +2736,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_leaves_network_name_alone_when_patch_field_is_none() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2451,7 +2788,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_clear_name_with_wildcard_still_set_is_validator_refused() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2552,7 +2889,7 @@ fn two_group_dto() -> super::super::protocol::MappedDeviceDto {
 }
 
 const TWO_GROUP_CONFIG: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2637,7 +2974,7 @@ async fn client_update_some_none_clears_nullable_field() {
     // "leave alone" (which would be outer `None`). This is the
     // load-bearing reason DevicePatch uses Option<Option<T>>.
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2680,7 +3017,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_update_unknown_name_returns_friendly_error() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "update-unknown",
     );
     let (state, _rx) = test_state_with_config_path("tok-unk", path.clone());
@@ -2723,7 +3060,7 @@ async fn client_update_to_duplicate_ip_caught_by_validator() {
     // Duplicate-IP is the v1-relevant validate-or-revert case in
     // its place.)
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2777,7 +3114,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_update_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "update-auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-uauth", path.clone());
@@ -2797,7 +3134,7 @@ async fn client_update_requires_admin_token() {
 #[tokio::test]
 async fn client_remove_happy_path_drops_client_and_reloads() {
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2842,7 +3179,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_remove_unknown_name_returns_friendly_error() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "remove-unknown",
     );
     let (state, _rx) = test_state_with_config_path("tok-rmx", path.clone());
@@ -2876,7 +3213,7 @@ async fn client_remove_dangling_schedule_blocked_by_validator() {
     // and the touched file is rolled back. A sibling "laptop"
     // device is kept so the removal is an ordinary 2→1 case.
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -2948,7 +3285,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_remove_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "remove-auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-rmauth", path.clone());
@@ -3017,7 +3354,9 @@ fn test_state_with_resolver(
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -3037,7 +3376,7 @@ async fn client_promote_happy_path_pins_arp_mac() {
     // fires. The previous test that asserted Sprint-35-style
     // refusal is inverted here.
     let initial = r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -3103,7 +3442,7 @@ async fn client_promote_rejects_when_arp_has_no_entry() {
     // requirement and reintroduce the IP-only-identification
     // foot-gun documented in CLAUDE.md.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-no-arp",
     );
     let target_ip: std::net::IpAddr = "10.0.0.50".parse().unwrap();
@@ -3152,7 +3491,7 @@ async fn client_promote_validator_runs_via_delegated_add_path() {
     // test pins the unknown-profile case to confirm delegation
     // didn't bypass validation.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-validator",
     );
     let unmapped: std::net::IpAddr = "10.0.0.42".parse().unwrap();
@@ -3181,7 +3520,7 @@ async fn client_promote_validator_runs_via_delegated_add_path() {
 #[tokio::test]
 async fn client_promote_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-auth",
     );
     let target_ip: std::net::IpAddr = "10.0.0.42".parse().unwrap();
@@ -3206,7 +3545,7 @@ async fn client_promote_requires_admin_token() {
 
 fn tracking_v1_master() -> String {
     r#"
-schema_version = 3
+schema_version = 4
 
 [server]
 listen = "127.0.0.1:15353"
@@ -3417,7 +3756,9 @@ fn test_state_with_list_statuses() -> DaemonState {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -3458,6 +3799,7 @@ async fn status_carries_the_corpus_freeze_over_ipc() {
     let t0 = time::macros::datetime!(2026-08-04 03:00:00 UTC);
     reg.note_refused_cycle(t0);
     reg.note_refused_cycle(t0 + time::Duration::hours(24));
+    reg.record_cycle_with_qualifiers(crate::lists::status::CycleOutcome::Refused, false, false, 0);
 
     let resp = dispatch_command(IpcCommand::Status, None, &state).await;
     let carried = match &resp {
@@ -3492,6 +3834,12 @@ async fn status_carries_the_corpus_freeze_over_ipc() {
     // consumer polling `Status` sees the freeze end rather than having to
     // infer it from a field that stopped changing.
     reg.note_installed_cycle();
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        0,
+    );
     match dispatch_command(IpcCommand::Status, None, &state).await {
         IpcResponse::Status {
             lists_corpus_freeze,
@@ -3502,6 +3850,59 @@ async fn status_carries_the_corpus_freeze_over_ipc() {
         ),
         other => panic!("expected Status, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn status_uses_completed_registry_domain_count() {
+    let state = Arc::new(test_state_with_list_statuses());
+    let reg = state.list_statuses.clone().expect("registry wired");
+    // `FilterEngine` in this fixture has no domains, so this can only pass
+    // when IPC reads the completed manager snapshot.
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        321,
+    );
+
+    let response = dispatch_command(IpcCommand::Status, None, &state).await;
+    let IpcResponse::Status { domain_count, .. } = response else {
+        panic!("expected Status response");
+    };
+    assert_eq!(domain_count, 321);
+
+    reg.record_cycle(crate::lists::status::CycleOutcome::SkippedUnchanged);
+    let response = dispatch_command(IpcCommand::Status, None, &state).await;
+    let IpcResponse::Status { domain_count, .. } = response else {
+        panic!("expected Status response");
+    };
+    assert_eq!(domain_count, 321);
+}
+
+#[tokio::test]
+async fn domain_count_uses_and_preserves_the_completed_registry_snapshot() {
+    let state = Arc::new(test_state_with_list_statuses());
+    let reg = state.list_statuses.clone().expect("registry wired");
+    assert_eq!(
+        state.filter.domain_count(),
+        0,
+        "the live filter deliberately differs from the completed snapshot"
+    );
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        321,
+    );
+
+    let response = dispatch_command(IpcCommand::DomainCount, None, &state).await;
+    assert!(matches!(response, IpcResponse::DomainCount { count: 321 }));
+
+    // A non-manager publication advances the cycle while retaining the
+    // completed manager payload, including its installed-domain count.
+    reg.record_cycle(crate::lists::status::CycleOutcome::SkippedUnchanged);
+    let response = dispatch_command(IpcCommand::DomainCount, None, &state).await;
+    assert!(matches!(response, IpcResponse::DomainCount { count: 321 }));
 }
 
 #[tokio::test]
@@ -3523,6 +3924,117 @@ async fn blocklist_stats_exact_match_returns_one_entry() {
         }
         other => panic!("expected BlocklistStatsList, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn blocklist_stats_plan_routes_slug_id_and_url_aliases_to_one_primary_row() {
+    use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust, Id};
+    use crate::lists::catalog::Catalog;
+    use crate::lists::source_key::ResolvedSourcePlan;
+    use crate::lists::status::{ListStatus, ListStatusRegistry, ParsedCounts};
+    use std::collections::BTreeMap;
+
+    let row = Blocklist {
+        id: Id::new("team-ads").unwrap(),
+        display_name: "Team ads".to_string(),
+        url: "https://example.test/team-ads.txt".to_string(),
+        format: BlocklistFormat::Domains,
+        update_interval_hours: None,
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: BlocklistBase::Deny,
+        trust: BlocklistTrust::RemoteUnsigned,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    };
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        &["team/ads".to_string()],
+        &[row],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let registry = Arc::new(ListStatusRegistry::from_plan(&plan));
+    registry.update_for_url(
+        "team/ads",
+        ListStatus::from_refresh(
+            7,
+            ParsedCounts::default(),
+            None,
+            time::OffsetDateTime::now_utc(),
+        ),
+    );
+    let mut state = test_state_with_list_statuses();
+    state.list_count = 1;
+    state.list_statuses = Some(registry);
+    let state = Arc::new(state);
+
+    for alias in [
+        "team/ads",
+        "team-ads",
+        "https://example.test/team-ads.txt",
+        "https://EXAMPLE.test:443/team-ads.txt/",
+    ] {
+        let response = dispatch_command(
+            IpcCommand::BlocklistStats {
+                source_id: Some(alias.to_string()),
+            },
+            None,
+            &state,
+        )
+        .await;
+        let IpcResponse::BlocklistStatsList { stats } = response else {
+            panic!("expected BlocklistStatsList");
+        };
+        assert_eq!(stats.len(), 1, "alias {alias}");
+        assert_eq!(stats[0].source, "team/ads");
+        assert_eq!(stats[0].id.as_deref(), Some("team-ads"));
+    }
+}
+
+#[tokio::test]
+async fn empty_boot_registry_exposes_a_reload_added_source_over_ipc() {
+    use crate::lists::catalog::Catalog;
+    use crate::lists::source_key::ResolvedSourcePlan;
+    use crate::lists::status::ListStatusRegistry;
+    use std::collections::BTreeMap;
+
+    // Model boot with an intentionally empty config. DaemonState receives this
+    // Arc before any manager exists, then reload publishes the first plan into
+    // the same handle.
+    let registry = Arc::new(ListStatusRegistry::from_plan(&ResolvedSourcePlan::default()));
+    let mut state = test_state();
+    state.list_statuses = Some(registry.clone());
+    let state = Arc::new(state);
+    let before =
+        dispatch_command(IpcCommand::BlocklistStats { source_id: None }, None, &state).await;
+    assert!(matches!(
+        before,
+        IpcResponse::BlocklistStatsList { ref stats } if stats.is_empty()
+    ));
+
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        &["privacy/ads".to_string()],
+        &[],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    registry.sync_plan(&plan);
+    assert!(Arc::ptr_eq(
+        &registry,
+        state.list_statuses.as_ref().expect("boot registry")
+    ));
+
+    let after =
+        dispatch_command(IpcCommand::BlocklistStats { source_id: None }, None, &state).await;
+    let IpcResponse::BlocklistStatsList { stats } = after else {
+        panic!("expected BlocklistStatsList");
+    };
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].source, "privacy/ads");
+    assert_eq!(stats[0].last_outcome, "never_fetched");
 }
 
 #[tokio::test]
@@ -3806,7 +4318,9 @@ fn test_state_with_local_records_hits() -> DaemonState {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
@@ -3898,7 +4412,7 @@ fn local_records_hits_with_token_is_identity() {
 fn mount_fixture(suffix: &str, mounted: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let initial = format!(
         r#"
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"
@@ -4132,4 +4646,981 @@ async fn an_invalid_mount_id_refuses_the_whole_patch() {
         Some("Default"),
         "the sibling field of a refused patch must not land",
     );
+}
+
+// ── C5.5: IPC mutation lock fence ──────────────────────────────────
+
+const C55_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn c55_master() -> &'static str {
+    r#"
+schema_version = 4
+
+[server]
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+
+[profiles.profile]
+display_name = "Profile before external write"
+
+[[devices]]
+id = "device"
+display_name = "device"
+ip = "192.0.2.10"
+profile = "default"
+owner = "before external write"
+
+[tracking]
+enabled = true
+query_log_enabled = true
+retention_days = 7
+log_mode = "all"
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#
+}
+
+fn c55_client(name: &str, ip: &str) -> crate::config::settings::ClientConfig {
+    crate::config::settings::ClientConfig {
+        name: name.into(),
+        ip: ip.parse().unwrap(),
+        mac: None,
+        mac_aliases: Vec::new(),
+        profile: "default".into(),
+        owner: None,
+        device_type: None,
+        department: None,
+        group: None,
+        notes: None,
+    }
+}
+
+fn c55_master_value(path: &std::path::Path) -> toml::Value {
+    std::fs::read_to_string(path).unwrap().parse().unwrap()
+}
+
+fn c55_device_mut<'a>(doc: &'a mut toml::Value, id: &str) -> &'a mut toml::value::Table {
+    doc.get_mut("devices")
+        .and_then(toml::Value::as_array_mut)
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(toml::Value::as_str) == Some(id))
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+}
+
+fn c55_profile_mut<'a>(doc: &'a mut toml::Value, id: &str) -> &'a mut toml::value::Table {
+    doc.get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .get_mut(id)
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+}
+
+fn c55_external_device_add(doc: &mut toml::Value) {
+    let mut row = toml::value::Table::new();
+    row.insert("id".into(), toml::Value::String("added".into()));
+    row.insert("display_name".into(), toml::Value::String("added".into()));
+    row.insert("ip".into(), toml::Value::String("192.0.2.99".into()));
+    row.insert("profile".into(), toml::Value::String("default".into()));
+    row.insert("owner".into(), toml::Value::String("external owner".into()));
+    doc.get_mut("devices")
+        .and_then(toml::Value::as_array_mut)
+        .unwrap()
+        .push(toml::Value::Table(row));
+}
+
+fn c55_external_device_update(doc: &mut toml::Value) {
+    c55_device_mut(doc, "device")
+        .insert("owner".into(), toml::Value::String("external owner".into()));
+}
+
+fn c55_external_device_remove(doc: &mut toml::Value) {
+    doc.get_mut("devices")
+        .and_then(toml::Value::as_array_mut)
+        .unwrap()
+        .retain(|entry| entry.get("id").and_then(toml::Value::as_str) != Some("device"));
+}
+
+fn c55_external_tracking_update(doc: &mut toml::Value) {
+    doc.get_mut("tracking")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert("query_log_enabled".into(), toml::Value::Boolean(false));
+}
+
+fn c55_external_profile_create(doc: &mut toml::Value) {
+    let mut profile = toml::value::Table::new();
+    profile.insert(
+        "display_name".into(),
+        toml::Value::String("External profile".into()),
+    );
+    doc.get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert("created".into(), toml::Value::Table(profile));
+}
+
+fn c55_external_profile_update(doc: &mut toml::Value) {
+    c55_profile_mut(doc, "profile").insert("block_all".into(), toml::Value::Boolean(true));
+}
+
+fn c55_external_profile_delete(doc: &mut toml::Value) {
+    doc.get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .remove("profile");
+}
+
+enum C55ExternalExpectation {
+    DuplicateDevice,
+    DeviceUpdated,
+    DeviceMissing,
+    TrackingUpdated,
+    DuplicateProfile,
+    ProfileUpdated,
+    ProfileMissing,
+}
+
+struct C55ExternalWriterCase {
+    name: &'static str,
+    command: fn() -> IpcCommand,
+    external_write: fn(&mut toml::Value),
+    expectation: C55ExternalExpectation,
+}
+
+fn c55_assert_external_result(
+    expectation: &C55ExternalExpectation,
+    response: IpcResponse,
+    path: &std::path::Path,
+) {
+    match expectation {
+        C55ExternalExpectation::DuplicateDevice => {
+            assert_eq!(
+                response,
+                ipc_error(IpcError::DuplicateDeviceName {
+                    name: "added".into()
+                })
+            );
+            let mut doc = c55_master_value(path);
+            let row = c55_device_mut(&mut doc, "added");
+            assert_eq!(
+                row.get("owner").and_then(toml::Value::as_str),
+                Some("external owner")
+            );
+        }
+        C55ExternalExpectation::DeviceUpdated => {
+            assert!(matches!(response, IpcResponse::Ok { .. }));
+            let row = c55_device_mut(&mut c55_master_value(path), "device").clone();
+            assert_eq!(
+                row.get("owner").and_then(toml::Value::as_str),
+                Some("external owner")
+            );
+            assert_eq!(
+                row.get("device_type").and_then(toml::Value::as_str),
+                Some("router")
+            );
+        }
+        C55ExternalExpectation::DeviceMissing => {
+            assert_eq!(
+                response,
+                ipc_error(IpcError::DeviceNotFound {
+                    name: "device".into()
+                })
+            );
+            assert!(!c55_master_value(path)
+                .get("devices")
+                .and_then(toml::Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.get("id").and_then(toml::Value::as_str) == Some("device")));
+        }
+        C55ExternalExpectation::TrackingUpdated => {
+            assert!(matches!(response, IpcResponse::Ok { .. }));
+            let tracking = c55_master_value(path)
+                .get("tracking")
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                tracking
+                    .get("query_log_enabled")
+                    .and_then(toml::Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                tracking
+                    .get("retention_days")
+                    .and_then(toml::Value::as_integer),
+                Some(14)
+            );
+        }
+        C55ExternalExpectation::DuplicateProfile => {
+            assert_eq!(
+                response,
+                ipc_error(IpcError::DuplicateProfileId {
+                    id: "created".into()
+                })
+            );
+            assert_eq!(
+                c55_profile_mut(&mut c55_master_value(path), "created")
+                    .get("display_name")
+                    .and_then(toml::Value::as_str),
+                Some("External profile")
+            );
+        }
+        C55ExternalExpectation::ProfileUpdated => {
+            assert!(matches!(response, IpcResponse::Ok { .. }));
+            let profile = c55_master_value(path)
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .get("profile")
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                profile.get("block_all").and_then(toml::Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                profile.get("display_name").and_then(toml::Value::as_str),
+                Some("Profile after IPC write")
+            );
+        }
+        C55ExternalExpectation::ProfileMissing => {
+            assert_eq!(
+                response,
+                ipc_error(IpcError::ProfileNotFound {
+                    id: "profile".into()
+                })
+            );
+            assert!(!c55_master_value(path)
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .unwrap()
+                .contains_key("profile"));
+        }
+    }
+}
+
+fn c55_run_external_writer_case(case: C55ExternalWriterCase) {
+    let (_dir, path) = client_mutation_temp_config(c55_master(), case.name);
+    let (state, mut reload_rx) = test_state_with_config_path("c55", path.clone());
+    let state = Arc::new(state);
+    let held = crate::config::write_lock::acquire_for_write(&path).unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::sync_channel(1);
+    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+    let thread_state = state.clone();
+    let command = (case.command)();
+
+    let handler = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::Contended {
+                    let _ = contended_tx.try_send(());
+                }
+            },
+            || runtime.block_on(dispatch_command(command, None, &thread_state)),
+        );
+        let _ = response_tx.send(response);
+    });
+
+    if let Err(error) = contended_rx.recv_timeout(C55_TIMEOUT) {
+        drop(held);
+        panic!("{} did not block at the OS guard: {error}", case.name);
+    }
+
+    let (mut doc, _) = read_or_empty_locked(&held, &path, &path).unwrap();
+    (case.external_write)(&mut doc);
+    write_value_validated_locked(&held, &path, &path, &doc).unwrap();
+    let external_bytes = std::fs::read(&path).unwrap();
+    let external_metadata = std::fs::metadata(&path).unwrap();
+    drop(held);
+
+    let response = response_rx
+        .recv_timeout(C55_TIMEOUT)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} did not finish after the external write: {error}",
+                case.name
+            )
+        });
+    handler.join().unwrap();
+    if matches!(
+        &case.expectation,
+        C55ExternalExpectation::DuplicateDevice
+            | C55ExternalExpectation::DeviceMissing
+            | C55ExternalExpectation::DuplicateProfile
+            | C55ExternalExpectation::ProfileMissing
+    ) {
+        use std::os::unix::fs::MetadataExt;
+
+        assert_eq!(std::fs::read(&path).unwrap(), external_bytes);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.dev(), external_metadata.dev());
+        assert_eq!(after.ino(), external_metadata.ino());
+        assert!(reload_rx.try_recv().is_err());
+    }
+    c55_assert_external_result(&case.expectation, response, &path);
+}
+
+#[test]
+fn seven_ipc_mutation_seats_observe_an_external_writer_before_their_first_read() {
+    let cases = [
+        C55ExternalWriterCase {
+            name: "external-device-add",
+            command: || IpcCommand::DeviceAdd {
+                client: c55_client("added", "192.0.2.99"),
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_device_add,
+            expectation: C55ExternalExpectation::DuplicateDevice,
+        },
+        C55ExternalWriterCase {
+            name: "external-device-update",
+            command: || IpcCommand::DeviceUpdate {
+                name: "device".into(),
+                patch: crate::ipc::protocol::DevicePatch {
+                    device_type: Some(Some("router".into())),
+                    ..Default::default()
+                },
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_device_update,
+            expectation: C55ExternalExpectation::DeviceUpdated,
+        },
+        C55ExternalWriterCase {
+            name: "external-device-remove",
+            command: || IpcCommand::DeviceRemove {
+                name: "device".into(),
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_device_remove,
+            expectation: C55ExternalExpectation::DeviceMissing,
+        },
+        C55ExternalWriterCase {
+            name: "external-tracking-update",
+            command: || IpcCommand::TrackingConfigUpdate {
+                patch: crate::ipc::protocol::TrackingPatch {
+                    retention_days: Some(14),
+                    ..Default::default()
+                },
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_tracking_update,
+            expectation: C55ExternalExpectation::TrackingUpdated,
+        },
+        C55ExternalWriterCase {
+            name: "external-profile-create",
+            command: || IpcCommand::ProfileCreate {
+                id: "created".into(),
+                display_name: "Created by IPC".into(),
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_profile_create,
+            expectation: C55ExternalExpectation::DuplicateProfile,
+        },
+        C55ExternalWriterCase {
+            name: "external-profile-update",
+            command: || IpcCommand::ProfileUpdate {
+                id: "profile".into(),
+                patch: crate::ipc::protocol::ProfileUpdatePatch {
+                    display_name: Some("Profile after IPC write".into()),
+                    ..Default::default()
+                },
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_profile_update,
+            expectation: C55ExternalExpectation::ProfileUpdated,
+        },
+        C55ExternalWriterCase {
+            name: "external-profile-delete",
+            command: || IpcCommand::ProfileDelete {
+                id: "profile".into(),
+                token: Some("c55".into()),
+            },
+            external_write: c55_external_profile_delete,
+            expectation: C55ExternalExpectation::ProfileMissing,
+        },
+    ];
+
+    for case in cases {
+        c55_run_external_writer_case(case);
+    }
+}
+
+#[tokio::test]
+async fn cross_directory_master_alias_keeps_all_seven_mutations_in_the_canonical_tree() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_root = dir.path().join("canonical");
+    let alias_root = dir.path().join("alias");
+    std::fs::create_dir_all(canonical_root.join("devices.d")).unwrap();
+    std::fs::create_dir_all(canonical_root.join("profiles.d")).unwrap();
+    std::fs::create_dir(&alias_root).unwrap();
+    let master = canonical_root.join("config.toml");
+    std::fs::write(
+        &master,
+        r#"
+schema_version = 4
+includes = ["devices.d/*.toml", "profiles.d/*.toml"]
+
+[server]
+default_profile = "default"
+
+[tracking]
+enabled = true
+query_log_enabled = true
+retention_days = 7
+log_mode = "all"
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        canonical_root.join("profiles.d/profiles.toml"),
+        r#"
+[profiles.default]
+display_name = "Default"
+
+[profiles.update]
+display_name = "Before update"
+
+[profiles.delete]
+display_name = "Before delete"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        canonical_root.join("devices.d/devices.toml"),
+        r#"
+[[devices]]
+id = "update-device"
+display_name = "update-device"
+ip = "192.0.2.10"
+profile = "default"
+
+[[devices]]
+id = "delete-device"
+display_name = "delete-device"
+ip = "192.0.2.11"
+profile = "default"
+"#,
+    )
+    .unwrap();
+
+    let alias = alias_root.join("config.toml");
+    std::os::unix::fs::symlink(&master, &alias).unwrap();
+    let alias_target = std::fs::read_link(&alias).unwrap();
+    let alias_inode = std::fs::symlink_metadata(&alias).unwrap();
+    let before = std::fs::read_to_string(&master).unwrap();
+    let (state, _reload_rx) = test_state_with_config_path("alias", alias.clone());
+    let state = Arc::new(state);
+
+    let commands = vec![
+        IpcCommand::DeviceAdd {
+            client: c55_client("added", "192.0.2.99"),
+            token: Some("alias".into()),
+        },
+        IpcCommand::DeviceUpdate {
+            name: "update-device".into(),
+            patch: crate::ipc::protocol::DevicePatch {
+                owner: Some(Some("canonical owner".into())),
+                ..Default::default()
+            },
+            token: Some("alias".into()),
+        },
+        IpcCommand::DeviceRemove {
+            name: "delete-device".into(),
+            token: Some("alias".into()),
+        },
+        IpcCommand::TrackingConfigUpdate {
+            patch: crate::ipc::protocol::TrackingPatch {
+                retention_days: Some(14),
+                ..Default::default()
+            },
+            token: Some("alias".into()),
+        },
+        IpcCommand::ProfileCreate {
+            id: "created".into(),
+            display_name: "Created".into(),
+            token: Some("alias".into()),
+        },
+        IpcCommand::ProfileUpdate {
+            id: "update".into(),
+            patch: crate::ipc::protocol::ProfileUpdatePatch {
+                display_name: Some("After update".into()),
+                ..Default::default()
+            },
+            token: Some("alias".into()),
+        },
+        IpcCommand::ProfileDelete {
+            id: "delete".into(),
+            token: Some("alias".into()),
+        },
+    ];
+    for command in commands {
+        let response = dispatch_command(command, None, &state).await;
+        assert!(matches!(response, IpcResponse::Ok { .. }), "{response:?}");
+    }
+
+    let loaded = crate::config::loader::load_config(&alias, time::OffsetDateTime::now_utc())
+        .expect("the canonical tree must remain loadable through its alias");
+    let added = loaded
+        .config
+        .devices
+        .iter()
+        .find(|device| device.id.as_str() == "added")
+        .expect("device add must land in the canonical devices.d");
+    assert_eq!(added.display_name, "added");
+    let updated = loaded
+        .config
+        .devices
+        .iter()
+        .find(|device| device.id.as_str() == "update-device")
+        .expect("device update must preserve the canonical row");
+    assert_eq!(updated.owner.as_deref(), Some("canonical owner"));
+    assert!(!loaded
+        .config
+        .devices
+        .iter()
+        .any(|device| device.id.as_str() == "delete-device"));
+    assert_eq!(loaded.config.tracking.retention_days, 14);
+    assert_eq!(
+        loaded
+            .config
+            .profiles
+            .get("created")
+            .map(|profile| profile.display_name.as_str()),
+        Some("Created")
+    );
+    assert_eq!(
+        loaded
+            .config
+            .profiles
+            .get("update")
+            .map(|profile| profile.display_name.as_str()),
+        Some("After update")
+    );
+    assert!(!loaded.config.profiles.contains_key("delete"));
+    assert!(canonical_root.join("devices.d/added.toml").is_file());
+    assert_ne!(std::fs::read_to_string(&master).unwrap(), before);
+    assert_eq!(std::fs::read_link(&alias).unwrap(), alias_target);
+    let alias_after = std::fs::symlink_metadata(&alias).unwrap();
+    assert_eq!(alias_after.dev(), alias_inode.dev());
+    assert_eq!(alias_after.ino(), alias_inode.ino());
+    assert!(!alias_root.join(".warden-config.lock").exists());
+    assert!(!alias_root.join("devices.d").exists());
+    assert!(!alias_root.join("profiles.d").exists());
+}
+
+#[test]
+fn device_add_target_resolution_is_pinned_to_the_guarded_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    std::fs::write(&master, "schema_version = 4\n").unwrap();
+
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    assert_eq!(
+        resolve_device_add_target_locked(&guard, &master, "device").unwrap(),
+        master
+    );
+    drop(guard);
+
+    let devices = dir.path().join("devices.d");
+    std::fs::create_dir(&devices).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    assert_eq!(
+        resolve_device_add_target_locked(&guard, &master, "device").unwrap(),
+        devices.join("device.toml")
+    );
+    drop(guard);
+
+    std::fs::write(devices.join("existing.toml"), "# existing slice\n").unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    assert_eq!(
+        resolve_device_add_target_locked(&guard, &master, "device").unwrap(),
+        devices.join("device.toml")
+    );
+    drop(guard);
+
+    let aliases = dir.path().join("aliases");
+    std::fs::create_dir(&aliases).unwrap();
+    let alias = aliases.join("config.toml");
+    std::os::unix::fs::symlink(&master, &alias).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&alias).unwrap();
+    assert_eq!(
+        resolve_device_add_target_locked(&guard, &alias, "device").unwrap(),
+        devices.join("device.toml")
+    );
+    drop(guard);
+
+    std::fs::remove_file(devices.join("existing.toml")).unwrap();
+    std::fs::remove_dir(&devices).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), &devices).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    assert!(resolve_device_add_target_locked(&guard, &master, "device").is_err());
+    assert!(!outside.path().join("device.toml").exists());
+}
+
+#[test]
+fn blocklist_row_helper_refuses_a_guard_from_another_tree() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let left_master = left.path().join("config.toml");
+    let right_master = right.path().join("config.toml");
+    std::fs::write(&left_master, "schema_version = 4\n").unwrap();
+    std::fs::write(&right_master, "schema_version = 4\n").unwrap();
+    let before = std::fs::read_to_string(&right_master).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&left_master).unwrap();
+
+    assert!(blocklist_row_on_disk_locked(&guard, &right_master, "list").is_err());
+    assert_eq!(std::fs::read_to_string(&right_master).unwrap(), before);
+}
+
+#[test]
+fn os_guard_is_released_before_reload_while_the_ipc_mutex_remains_held() {
+    let commands = [
+        (
+            "device",
+            IpcCommand::DeviceAdd {
+                client: c55_client("added", "192.0.2.99"),
+                token: Some("boundary".into()),
+            },
+        ),
+        (
+            "profile",
+            IpcCommand::ProfileCreate {
+                id: "created".into(),
+                display_name: "Created".into(),
+                token: Some("boundary".into()),
+            },
+        ),
+    ];
+
+    for (name, command) in commands {
+        let (_dir, path) = client_mutation_temp_config(c55_master(), name);
+        let (state, _reload_rx) = test_state_with_config_path("boundary", path.clone());
+        let state = Arc::new(state);
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let thread_state = state.clone();
+        let thread_path = path.clone();
+
+        let handler = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = with_pre_reload_test_hook(
+                thread_path,
+                move || {
+                    let _ = paused_tx.try_send(());
+                    resume_rx
+                        .recv_timeout(C55_TIMEOUT)
+                        .expect("test must resume the pre-reload barrier");
+                },
+                || runtime.block_on(dispatch_command(command, None, &thread_state)),
+            );
+            let _ = response_tx.send(response);
+        });
+
+        paused_rx
+            .recv_timeout(C55_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{name} did not reach the pre-reload barrier: {error}"));
+        let os_guard = crate::config::write_lock::acquire_for_write(&path)
+            .unwrap_or_else(|error| panic!("{name} retained the OS guard at reload: {error:#}"));
+        drop(os_guard);
+        assert!(
+            state.config_write_lock.try_lock().is_err(),
+            "{name} released the daemon sequencer before reload decision"
+        );
+        resume_tx.send(()).unwrap();
+        let response = response_rx
+            .recv_timeout(C55_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("{name} did not complete after reload barrier: {error}")
+            });
+        handler.join().unwrap();
+        assert!(matches!(response, IpcResponse::Ok { .. }));
+    }
+}
+
+#[tokio::test]
+async fn migration_fence_maps_all_seven_acquisition_failures_without_writing_or_reloading() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = client_mutation_temp_config(c55_master(), "migration-fence");
+    let migration_guard = crate::config::write_lock::acquire_for_migration(&path).unwrap();
+    crate::config::migration_journal::create_fence(&migration_guard).unwrap();
+    let journal = path
+        .parent()
+        .unwrap()
+        .join(crate::config::migration_journal::TXN_DIR_NAME)
+        .join(crate::config::migration_journal::JOURNAL_NAME);
+    std::fs::write(&journal, r#"{"format_version":1,"migration":"v3-to-v4"}"#).unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(migration_guard);
+
+    let before = std::fs::read_to_string(&path).unwrap();
+    let (state, mut reload_rx) = test_state_with_config_path("fence", path.clone());
+    let state = Arc::new(state);
+    let cases = vec![
+        (
+            IpcCommand::DeviceAdd {
+                client: c55_client("added", "192.0.2.99"),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_CONFIG_READ_FAILED,
+        ),
+        (
+            IpcCommand::DeviceUpdate {
+                name: "device".into(),
+                patch: Default::default(),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_TARGET_SCAN_FAILED,
+        ),
+        (
+            IpcCommand::DeviceRemove {
+                name: "device".into(),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_TARGET_SCAN_FAILED,
+        ),
+        (
+            IpcCommand::TrackingConfigUpdate {
+                patch: crate::ipc::protocol::TrackingPatch {
+                    retention_days: Some(14),
+                    ..Default::default()
+                },
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_CONFIG_READ_FAILED,
+        ),
+        (
+            IpcCommand::ProfileCreate {
+                id: "created".into(),
+                display_name: "Created".into(),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_TARGET_SCAN_FAILED,
+        ),
+        (
+            IpcCommand::ProfileUpdate {
+                id: "profile".into(),
+                patch: Default::default(),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_TARGET_SCAN_FAILED,
+        ),
+        (
+            IpcCommand::ProfileDelete {
+                id: "profile".into(),
+                token: Some("fence".into()),
+            },
+            crate::ipc::errors::IPC_ERROR_TARGET_SCAN_FAILED,
+        ),
+    ];
+
+    for (command, expected) in cases {
+        assert_eq!(
+            dispatch_command(command, None, &state).await,
+            IpcResponse::Error {
+                message: expected.into()
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(reload_rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn profile_create_fails_closed_when_the_conventional_directory_escapes() {
+    let (dir, path) = client_mutation_temp_config(c55_master(), "profile-scan-error");
+    let profiles_dir = dir.path().join("profiles.d");
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), &profiles_dir).unwrap();
+    let master_before = std::fs::read(&path).unwrap();
+    let (state, mut reload_rx) = test_state_with_config_path("scan", path.clone());
+
+    let response = dispatch_command(
+        IpcCommand::ProfileCreate {
+            id: "created".into(),
+            display_name: "Created".into(),
+            token: Some("scan".into()),
+        },
+        None,
+        &Arc::new(state),
+    )
+    .await;
+
+    assert_eq!(response, ipc_error(IpcError::TargetScanFailed));
+    assert_eq!(std::fs::read(&path).unwrap(), master_before);
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert!(reload_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn closed_reload_channel_preserves_the_existing_post_write_split() {
+    let (_device_dir, device_path) =
+        client_mutation_temp_config(c55_master(), "closed-reload-device");
+    let (device_state, device_reload_rx) =
+        test_state_with_config_path("closed", device_path.clone());
+    drop(device_reload_rx);
+    let response = dispatch_command(
+        IpcCommand::DeviceAdd {
+            client: c55_client("added", "192.0.2.99"),
+            token: Some("closed".into()),
+        },
+        None,
+        &Arc::new(device_state),
+    )
+    .await;
+    assert_eq!(response, ipc_error(IpcError::ConfigSavedReloadClosed));
+    assert!(
+        crate::config::loader::load_config(&device_path, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .devices
+            .iter()
+            .any(|device| device.id.as_str() == "added")
+    );
+
+    let (_profile_dir, profile_path) =
+        client_mutation_temp_config(c55_master(), "closed-reload-profile");
+    let (profile_state, profile_reload_rx) =
+        test_state_with_config_path("closed", profile_path.clone());
+    drop(profile_reload_rx);
+    let response = dispatch_command(
+        IpcCommand::ProfileCreate {
+            id: "created".into(),
+            display_name: "Created".into(),
+            token: Some("closed".into()),
+        },
+        None,
+        &Arc::new(profile_state),
+    )
+    .await;
+    assert_eq!(
+        response,
+        IpcResponse::Ok {
+            message: "created profile \"created\"".into()
+        }
+    );
+    assert!(
+        crate::config::loader::load_config(&profile_path, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .profiles
+            .contains_key("created")
+    );
+}
+
+#[test]
+fn mutation_handlers_keep_the_acquire_read_write_drop_reload_fence() {
+    let source = include_str!("../socket_server.rs");
+    let handlers = [
+        (
+            "handle_device_add",
+            "load_config_for_schema_under_guard",
+            "try_send(peer_uid)",
+        ),
+        (
+            "handle_device_update",
+            "find_target_for_id_locked",
+            "try_send(peer_uid)",
+        ),
+        (
+            "handle_device_remove",
+            "find_target_for_id_locked",
+            "try_send(peer_uid)",
+        ),
+        (
+            "handle_tracking_config_update",
+            "read_or_empty_locked",
+            "try_send(peer_uid)",
+        ),
+        (
+            "handle_profile_create",
+            "find_target_for_id_locked",
+            "notify_reload(state",
+        ),
+        (
+            "handle_profile_update",
+            "find_target_for_id_locked",
+            "notify_reload(state",
+        ),
+        (
+            "handle_profile_delete",
+            "find_target_for_id_locked",
+            "notify_reload(state",
+        ),
+    ];
+
+    let starts: Vec<_> = handlers
+        .iter()
+        .map(|(name, _, _)| {
+            (
+                *name,
+                source
+                    .find(&format!("async fn {name}"))
+                    .unwrap_or_else(|| panic!("missing {name}")),
+            )
+        })
+        .collect();
+    for (index, (name, read, reload)) in handlers.iter().enumerate() {
+        let start = starts[index].1;
+        let end = starts
+            .get(index + 1)
+            .map(|(_, next)| *next)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+        let acquire = body
+            .find("acquire_for_write(config_path)")
+            .unwrap_or_else(|| panic!("{name} does not acquire the OS guard"));
+        let first_read = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{name} does not use {read}"));
+        let write = body
+            .find("write_value_validated_locked(&config_guard")
+            .unwrap_or_else(|| panic!("{name} does not use the locked writer"));
+        let drop_guard = body[write..]
+            .find("drop(config_guard)")
+            .map(|offset| write + offset)
+            .unwrap_or_else(|| panic!("{name} does not explicitly release the OS guard"));
+        let reload = body
+            .find(reload)
+            .unwrap_or_else(|| panic!("{name} has no reload decision"));
+        assert!(
+            acquire < first_read,
+            "{name} read before acquiring the OS guard"
+        );
+        assert!(
+            first_read < write,
+            "{name} did not keep read before promotion"
+        );
+        assert!(write < drop_guard, "{name} did not release after promotion");
+        assert!(drop_guard < reload, "{name} holds the OS guard into reload");
+        assert!(
+            !body[acquire..drop_guard].contains(".await"),
+            "{name} awaits while holding the OS guard"
+        );
+    }
 }

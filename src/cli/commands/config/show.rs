@@ -23,8 +23,6 @@ use std::path::Path;
 use crate::config::cidr::Cidr;
 use crate::config::loader::{self, LoadedConfig, ProvenanceMap};
 use crate::config::secrets;
-use crate::lists::manager::merge_sources_with_blocklists;
-use crate::lists::source_key::SourceBitMap;
 use crate::profiles::resolver::ResolveLevel;
 use crate::profiles::ProfileResolver;
 
@@ -202,11 +200,7 @@ fn render_resolved_view(loaded: &LoadedConfig, section: Option<&str>) -> anyhow:
     let want = |block: &str| section.is_none() || section == Some(block);
     let mut out = String::new();
 
-    let (merged_sources, _trust) =
-        merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-    let source_bits = SourceBitMap::build(&merged_sources, &loaded.config.blocklists)
-        .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
-    let resolver = ProfileResolver::build(&loaded.config, &source_bits, &loaded.custom_lists);
+    let resolver = ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
 
     let _ = writeln!(out, "# resolved view — what the 5-level chain would pick\n");
 
@@ -504,7 +498,7 @@ mod tests {
         let config_path = dir.join("config.toml");
         fs::write(
             &config_path,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 listen = "127.0.0.1:5353"

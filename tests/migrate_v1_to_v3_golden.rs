@@ -19,14 +19,30 @@
 //!
 //! The golden assertion below pins the post-transformation output
 //! end-to-end: invoke the migrator on a temp dir, read the produced
-//! file, compare bytes, and re-load through the production v2 loader
-//! to confirm it lints clean.
+//! file, compare bytes, validate it as historical schema 3, then run the
+//! required v3-to-v4 hop and load it through the current loader.
 
 use std::fs;
+use std::path::Path;
 
-use purge_warden::cli::commands::migrate::{migrate_v1_to_v3, V1ToV3Summary};
-use purge_warden::config::loader::load_config;
+use purge_warden::cli::commands::migrate::{
+    migrate_v1_to_v3, run_v3_to_v4, V1ToV3Summary, V3ToV4Mode,
+};
+use purge_warden::config::loader::{load_config, load_config_for_schema, LoadedConfig};
 use purge_warden::config::schema::{effective_direction, BlocklistBase, Id, ListPolicy};
+
+fn migrate_historical_v3_to_current(path: &Path) -> LoadedConfig {
+    let now = time::OffsetDateTime::now_utc();
+    let historical =
+        load_config_for_schema(path, 3, now).expect("migration output must be valid schema 3");
+    assert_eq!(historical.config.schema_version, 3);
+
+    assert_eq!(
+        run_v3_to_v4(path, V3ToV4Mode::Migrate).expect("v3-to-v4 migration must succeed"),
+        0
+    );
+    load_config(path, now).expect("v4 output must load under the current binary")
+}
 
 /// Live CT config, post 2026-05-07 incident restore.
 const V1_CT_LIVE_FIXTURE: &str = r##"schema_version = 2
@@ -127,9 +143,8 @@ fn migrate_v1_to_v3_ct_live_config_byte_pinned() {
         "only `mycompany` declared a `kind`"
     );
 
-    // The produced file lints clean through the production v3 loader.
-    let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(&target, now).expect("v3 output must lint clean");
+    // Validate the historical output before taking the required current-schema hop.
+    let loaded = migrate_historical_v3_to_current(&target);
 
     // Allow-list keeps tags = [] (D2: auto-allow for everyone is a sec
     // risk; operator tags allow-lists explicitly).
@@ -264,10 +279,8 @@ servers = ["192.0.2.1:53"]
     assert_eq!(summary.v2.blocklists_promoted_to_uncategorized, 1);
     assert_eq!(summary.v2.blocklists_kept_empty_tags, 1);
 
-    // The output lints clean — `[[categories]]` and the per-blocklist
-    // `category` fields are gone, so deny_unknown_fields is happy.
-    let now = time::OffsetDateTime::now_utc();
-    let _ = load_config(&target, now).expect("v3 output must lint clean");
+    // Both the historical output and its current-schema successor must load.
+    let _ = migrate_historical_v3_to_current(&target);
 }
 
 #[test]
@@ -308,14 +321,8 @@ servers = ["192.0.2.1:53"]
     let summary = migrate_v1_to_v3(&from, &target, false).expect("migration must succeed");
     assert_eq!(summary.v2.subnets_tagged_empty, 2);
 
-    // The v3 output must still lint clean — that half is the migration's
-    // contract and stays. `summary.v2.subnets_tagged_empty` above is the
-    // other half that still measures the migration: it counts what the
-    // migrator SAW in the v1 input. The loop that read the tags back off
-    // the v3 output measured the LOADER's auto-promotion instead, and
-    // `plp-s5a` removed the field it read.
-    let now = time::OffsetDateTime::now_utc();
-    load_config(&target, now).expect("v3 output must lint clean");
+    // Validate schema 3 explicitly, then prove the output reaches the live schema.
+    let _ = migrate_historical_v3_to_current(&target);
 }
 
 #[test]

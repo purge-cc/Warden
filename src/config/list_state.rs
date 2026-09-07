@@ -300,6 +300,14 @@ consecutive_failures = 3
     }
 
     #[test]
+    fn empty_state_serialization_has_no_schedule_sidecar_table() {
+        assert_eq!(
+            toml::to_string_pretty(&ListState::default()).unwrap(),
+            "[lists]\n"
+        );
+    }
+
+    #[test]
     fn unknown_top_level_field_rejected() {
         // `deny_unknown_fields` on the root keeps typos loud at load
         // time — the operator gets a directed parse error rather

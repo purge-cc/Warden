@@ -164,26 +164,6 @@ pub struct MappedDeviceSnapshot {
 pub struct ProfileResolver {
     inner: ArcSwap<ResolverMap>,
     arp_by_ip: ArcSwap<HashMap<IpAddr, CompactString>>,
-    /// Live handle to the daemon's blocklist download state, attached
-    /// once at boot by [`Self::attach_list_state`]. Every map rebuild
-    /// ([`Self::swap`]) snapshots it so `list_applies` can drop lists
-    /// that have never downloaded and keep lists serving from a stale
-    /// cache.
-    ///
-    /// **`None` is the fail-open default and the common case outside
-    /// the daemon** — one-shot CLI paths (`warden resolve`,
-    /// `warden config show`), the TUI's resolver modal and every test
-    /// build a resolver without ever attaching a handle. `None` means
-    /// "download state unknown", which `list_applies` translates into
-    /// "every list applies". Never populate this with a fabricated
-    /// state map: an absent entry must stay absent, not become
-    /// `Pending`.
-    ///
-    /// Not on the hot path — [`Self::resolve`] never reads it. Only
-    /// the reload / schedule-tick rebuild does, so the `Mutex` it
-    /// wraps (shared with `ListManager`'s refresh loop, which owns the
-    /// writes) is taken off the DNS path entirely.
-    list_state: arc_swap::ArcSwapOption<std::sync::Mutex<ListState>>,
     /// Per-`(ip, observed_mac)` rate limit on the MAC-mismatch audit
     /// warn. 8-slot sharded ring encoding `(hash << 32) | last_secs`
     /// per slot, indexed by `hash(ip, mac) & 7`. Structural memory
@@ -395,47 +375,29 @@ struct ScheduleMatch {
 }
 
 impl ProfileResolver {
-    /// Build a resolver from a v1 [`ConfigV1`] and the typed
-    /// [`SourceBitMap`] produced by [`SourceBitMap::build`]. The v1
-    /// resolver consumes the same bitmask namespace as the filter
-    /// engine — the engine itself does not need to know about it.
-    pub fn build(
-        config: &ConfigV1,
-        _list_bit_map: &SourceBitMap,
-        custom_lists: &CustomListStore,
-    ) -> Self {
-        // No list state at construction: the daemon has not built its
-        // `ListManager` yet, and non-daemon callers never will. Fail
-        // open — every list applies until `attach_list_state` + the
-        // post-refresh `swap` say otherwise.
+    /// Build a resolver without list-bit projection. List membership is
+    /// published with the filter generation, not stored in this resolver.
+    pub fn build_without_list_bits(config: &ConfigV1, custom_lists: &CustomListStore) -> Self {
         let map = build_resolver_map(config, custom_lists);
         let arp_by_ip = build_arp_snapshot();
         Self {
             inner: ArcSwap::from_pointee(map),
             arp_by_ip: ArcSwap::from_pointee(arp_by_ip),
             mac_mismatch_warns: MacMismatchRing::new(),
-            list_state: arc_swap::ArcSwapOption::empty(),
         }
     }
 
-    /// Attach the daemon's live blocklist-download state so subsequent
-    /// [`Self::swap`] rebuilds can honour it.
-    ///
-    /// `handle` is the same `Arc` the `ListManager` refresh loop writes
-    /// through (`ListManager::list_state_handle`) and the IPC
-    /// diagnostics walk reads — one source of truth, no copy to keep in
-    /// sync. Attaching does **not** rebuild the map; the caller swaps
-    /// when it wants the new state reflected (the daemon does so right
-    /// after the initial refresh, before the DNS listener binds).
-    ///
-    /// Idempotent — a later call replaces the handle.
-    pub fn attach_list_state(&self, handle: Arc<std::sync::Mutex<ListState>>) {
-        self.list_state.store(Some(handle));
+    /// Compatibility entry point retaining the unused list-bit argument.
+    pub fn build(
+        config: &ConfigV1,
+        _list_bit_map: &SourceBitMap,
+        custom_lists: &CustomListStore,
+    ) -> Self {
+        Self::build_without_list_bits(config, custom_lists)
     }
 
-    /// Atomically rebuild the resolver state from a new config. Takes
-    /// the same inputs as [`Self::build`]; SIGHUP and the schedule tick
-    /// both call through here.
+    /// Compatibility rebuild entry point retaining the unused list-bit
+    /// argument.
     ///
     /// Store order mirrors the legacy resolver: ARP first, then the
     /// inner map. Readers load `inner` first, so a reader observing a
@@ -448,6 +410,11 @@ impl ProfileResolver {
         _list_bit_map: &SourceBitMap,
         custom_lists: &CustomListStore,
     ) {
+        self.swap_without_list_bits(config, custom_lists);
+    }
+
+    /// Rebuild resolver state without constructing an unused list bitmap.
+    pub fn swap_without_list_bits(&self, config: &ConfigV1, custom_lists: &CustomListStore) {
         let map = build_resolver_map(config, custom_lists);
         let arp_by_ip = build_arp_snapshot();
         self.arp_by_ip.store(Arc::new(arp_by_ip));
@@ -711,14 +678,13 @@ impl ProfileResolver {
             .map(|p| Arc::clone(&p.filtered))
     }
 
-    /// Resolve a slug-form / canonical id to the
-    /// `[[blocklists]].id` it refers to.
+    /// Resolve a legacy slug or canonical spelling to its `[[blocklists]].id`.
     ///
     /// Accepts both the legacy slash-form (`"privacy/ads"` from
     /// `[lists].sources`) and the canonical hyphen-form
     /// (`"privacy-ads"` from `[[blocklists]].id`). Returns the v1 `Id`
-    /// when found. The IPC blocklist-stats handler uses this so the
-    /// operator can pass either form on the wire.
+    /// when found. Retained for compatibility callers; runtime list status
+    /// uses the resolved source plan.
     pub fn id_for_slug(&self, slug: &str) -> Option<Id> {
         self.inner.load().slug_to_id.get(slug).cloned()
     }
@@ -1053,28 +1019,10 @@ fn compute_active_schedules(
 
 // ── list-state ingestion ───────────────────────────────────────
 
-/// Read `data/list_state.toml` **fail-open**.
+/// Read `data/list_state.toml` for manager retry-state wiring.
 ///
-/// Every failure mode — missing file, unreadable file, malformed TOML,
-/// a half-written file from a crash — returns `None`, which
-/// `list_applies` reads as "download state unknown" and answers "the
-/// list applies". The one thing that removes a list from a profile's
-/// subscription mask is an entry that is present, parsed and explicitly
-/// says the list has no usable bytes (`Pending`, or `Failed` with no
-/// `cache_path`).
-///
-/// That direction is deliberate and load-bearing: this daemon serves a
-/// household's DNS, and a state file that vanished (fresh install,
-/// wiped `/var/lib`, a `ProtectSystem` misconfiguration) must degrade to
-/// "filter with everything I have", never to "filter with nothing".
-/// Callers must not "improve" this by defaulting a missing file to
-/// `Pending`.
-///
-/// Note the deliberate divergence from
-/// [`ListState::read_or_default`], which treats a malformed file as a
-/// hard error so a *writer* refuses to clobber it. The resolver is a
-/// reader with a safe fallback, so it downgrades that error to `None`
-/// plus a WARN.
+/// Missing files return an empty state. Read failures return `None` so
+/// startup uses the manager's default retry state and logs the cause.
 pub fn read_list_state_fail_open(path: &std::path::Path) -> Option<ListState> {
     match ListState::read_or_default(path) {
         Ok(state) => Some(state),
@@ -1082,7 +1030,7 @@ pub fn read_list_state_fail_open(path: &std::path::Path) -> Option<ListState> {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
-                "list state unreadable — treating every blocklist as applicable",
+                "list state unreadable — using empty retry state",
             );
             None
         }
@@ -1091,11 +1039,6 @@ pub fn read_list_state_fail_open(path: &std::path::Path) -> Option<ListState> {
 
 // ── map construction ───────────────────────────────────────────
 
-/// `list_state` carries the daemon's blocklist download state for this
-/// rebuild, or `None` when it is unknown (see
-/// [`ProfileResolver::list_state`]). It is threaded verbatim into every
-/// `build_v1` call below so a single rebuild cannot mix state-aware and
-/// state-blind subscription masks.
 /// The resolution a device actually gets from `base`.
 ///
 /// Policy is a property of the profile, so two devices on one profile
@@ -1133,14 +1076,6 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
                 continue;
             }
         };
-        // The persisted download state reaches `list_applies`. A list
-        // the daemon has never fetched successfully (`Pending`, or
-        // `Failed` with no cache on disk) stops occupying a bit; a
-        // `Failed` list that still has its previous cache keeps
-        // filtering (stale-cache fallback). `None` — the daemon before
-        // it has attached its handle, plus every CLI / TUI / test
-        // caller — means "state unknown" and every tag-intersecting
-        // list applies.
         let mut resolved = ResolvedProfile::build_v1(
             &id,
             profile,

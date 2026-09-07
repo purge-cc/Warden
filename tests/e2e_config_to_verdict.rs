@@ -189,7 +189,7 @@ fn config_toml_full(
     profile_extra: &str,
 ) -> String {
     format!(
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
          [server]\n\
          default_profile = \"default\"\n\n\
          [profiles.default]\n\

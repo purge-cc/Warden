@@ -942,7 +942,7 @@ mod tests {
         // Synthesise the loaded_config so render() takes the populated
         // path (a None loaded_config short-circuits to render_no_config).
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1017,7 +1017,7 @@ value = "192.168.1.50"
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new();
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1081,7 +1081,7 @@ value = "192.168.1.51"
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new();
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1170,7 +1170,7 @@ value = "192.168.1.50"
     }
 
     const MIXED: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1280,7 +1280,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         // pointing at 2 — which is the profile header.
         let shrunk = loaded_from(
             r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1333,7 +1333,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         use ratatui::Terminal;
         let mut app = App::new();
         app.loaded_config = Some(loaded_from(
-            "schema_version = 3\n\n[upstream]\nservers = [\"1.1.1.1\"]\n\n\
+            "schema_version = 4\n\n[upstream]\nservers = [\"1.1.1.1\"]\n\n\
              [profiles.kids]\ndisplay_name = \"Kids\"\n",
         ));
         assert!(build_rows(app.loaded_config.as_ref().unwrap()).is_empty());

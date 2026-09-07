@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use purge_warden::cli::commands::update::run_update;
+use sha2::{Digest, Sha256};
 
 const FAKE_BLOCKLIST_BODY: &str = "doubleclick.net\ngoogle-analytics.com\n";
 
@@ -38,7 +39,7 @@ fn write_pure_v1_fixture(dir: &Path, list_id: &str) -> PathBuf {
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 listen = "0.0.0.0:53"
@@ -86,7 +87,7 @@ fn write_empty_fixture(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 listen = "0.0.0.0:53"
@@ -115,7 +116,7 @@ fn write_disabled_blocklist_fixture(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 listen = "0.0.0.0:53"
@@ -147,7 +148,14 @@ servers = ["192.0.2.1:53"]
     master
 }
 
-fn count_cache_files(cache_dir: &Path) -> usize {
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn count_cache_artifacts(cache_dir: &Path) -> usize {
     let entries = match std::fs::read_dir(cache_dir) {
         Ok(rd) => rd,
         Err(_) => return 0,
@@ -155,13 +163,75 @@ fn count_cache_files(cache_dir: &Path) -> usize {
     entries
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|ext| ext == "cache")
-                .unwrap_or(false)
+            let name = e.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            name.ends_with(".cache")
+                || name.ends_with(".meta")
+                || name
+                    .rsplit_once(".body-")
+                    .is_some_and(|(_, sha256)| is_lowercase_sha256(sha256))
         })
         .count()
+}
+
+/// Return whether a current generation manifest selects the downloaded body.
+fn has_manifest_selected_download(cache_dir: &Path) -> bool {
+    let entries = std::fs::read_dir(cache_dir).unwrap_or_else(|error| {
+        panic!(
+            "cannot read cache directory {}: {error}",
+            cache_dir.display()
+        )
+    });
+
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".meta")) else {
+            return false;
+        };
+        let Ok(meta) = std::fs::read_to_string(entry.path()) else {
+            return false;
+        };
+
+        let mut body = None;
+        let mut sha256 = None;
+        let mut size = None;
+        for line in meta.lines() {
+            if let Some(value) = line.strip_prefix("body=") {
+                if body.replace(value).is_some() {
+                    return false;
+                }
+            } else if let Some(value) = line.strip_prefix("sha256=") {
+                if sha256.replace(value).is_some() {
+                    return false;
+                }
+            } else if let Some(value) = line.strip_prefix("size=") {
+                if size.replace(value).is_some() {
+                    return false;
+                }
+            }
+        }
+
+        let (Some(body), Some(sha256), Some(size)) = (body, sha256, size) else {
+            return false;
+        };
+        if !is_lowercase_sha256(sha256) || body != format!("{stem}.body-{sha256}") {
+            return false;
+        }
+
+        let Ok(size) = size.parse::<usize>() else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(cache_dir.join(body)) else {
+            return false;
+        };
+        size == bytes.len()
+            && sha256 == hex::encode(Sha256::digest(&bytes))
+            && std::str::from_utf8(&bytes).is_ok_and(|body| {
+                body.contains("doubleclick.net") && body.contains("google-analytics.com")
+            })
+    })
 }
 
 /// Resolve the lists cache directory for a given fixture config.
@@ -184,23 +254,20 @@ async fn pure_v1_config_actually_downloads_post_fix() {
     // The bug-trigger scenario from 2026-05-06: empty `[lists].sources`,
     // populated `[[blocklists]]`. Pre-fix `Settings::from_file` would
     // hit the early-exit at line 34 and silently no-op. Post-fix the v1
-    // loader sees the `[[blocklists]]` row, the imported.local bridge
-    // resolves it, the manager writes a `.cache` file in the lists dir.
+    // loader sees the `[[blocklists]]` row and the imported.local bridge
+    // resolves it into a manifest-selected cache generation.
     let tmp = tempfile::tempdir().unwrap();
     let master = write_pure_v1_fixture(tmp.path(), "test-pure-v1");
     let nonexistent_pid = tmp.path().join("nonexistent.pid");
-    let nonexistent_sock = tmp.path().join("nonexistent.sock");
-
-    run_update(&master, &nonexistent_pid, &nonexistent_sock)
+    run_update(&master, &nonexistent_pid)
         .await
         .map(|code| assert_eq!(code, 0, "pure-v1 refresh must exit SUCCESS"))
         .expect("run_update must succeed end-to-end on pure-v1 config");
 
     let cache_dir = cache_dir_for(&master);
     assert!(
-        count_cache_files(&cache_dir) >= 1,
-        "expected at least one *.cache file in {} after pure-v1 update; \
-         pre-fix this asserted because the loader silently exited early",
+        has_manifest_selected_download(&cache_dir),
+        "expected a valid manifest-selected generation containing downloaded domains in {}",
         cache_dir.display(),
     );
 }
@@ -214,18 +281,16 @@ async fn empty_config_still_short_circuits() {
     let tmp = tempfile::tempdir().unwrap();
     let master = write_empty_fixture(tmp.path());
     let nonexistent_pid = tmp.path().join("nonexistent.pid");
-    let nonexistent_sock = tmp.path().join("nonexistent.sock");
-
-    run_update(&master, &nonexistent_pid, &nonexistent_sock)
+    run_update(&master, &nonexistent_pid)
         .await
         .map(|code| assert_eq!(code, 0, "no-sources refresh is success, not failure"))
         .expect("run_update must succeed even with no sources");
 
     let cache_dir = cache_dir_for(&master);
     assert_eq!(
-        count_cache_files(&cache_dir),
+        count_cache_artifacts(&cache_dir),
         0,
-        "empty config must not produce cache files in {}",
+        "empty config must not produce cache artifacts in {}",
         cache_dir.display(),
     );
 }
@@ -239,18 +304,16 @@ async fn disabled_blocklist_short_circuits() {
     let tmp = tempfile::tempdir().unwrap();
     let master = write_disabled_blocklist_fixture(tmp.path());
     let nonexistent_pid = tmp.path().join("nonexistent.pid");
-    let nonexistent_sock = tmp.path().join("nonexistent.sock");
-
-    run_update(&master, &nonexistent_pid, &nonexistent_sock)
+    run_update(&master, &nonexistent_pid)
         .await
         .map(|code| assert_eq!(code, 0, "disabled-only refresh is success"))
         .expect("run_update must succeed when only disabled blocklists exist");
 
     let cache_dir = cache_dir_for(&master);
     assert_eq!(
-        count_cache_files(&cache_dir),
+        count_cache_artifacts(&cache_dir),
         0,
-        "disabled blocklist must not contribute fetched cache entries",
+        "disabled blocklist must not contribute cache artifacts",
     );
 }
 
@@ -263,9 +326,7 @@ async fn nonexistent_pid_file_falls_through_to_foreground() {
     let tmp = tempfile::tempdir().unwrap();
     let master = write_empty_fixture(tmp.path());
     let nonexistent_pid = tmp.path().join("absolutely-not-a-pid-file");
-    let nonexistent_sock = tmp.path().join("nonexistent.sock");
-
-    run_update(&master, &nonexistent_pid, &nonexistent_sock)
+    run_update(&master, &nonexistent_pid)
         .await
         .map(|code| {
             assert_eq!(

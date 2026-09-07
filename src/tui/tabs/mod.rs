@@ -87,7 +87,7 @@ mod scroll_persistence_tests {
     /// not care which one a given tab happens to use.
     fn big_config_toml() -> String {
         let mut s =
-            String::from("schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n");
+            String::from("schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n");
         for i in 0..ROWS {
             s += &format!("[profiles.prof-{i:02}]\ndisplay_name = \"Prof {i:02}\"\n\n");
         }

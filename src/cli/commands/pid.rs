@@ -50,6 +50,22 @@ impl std::error::Error for PidLockError {}
 /// [`PidLockError::AlreadyRunning`] with the PID read from the file (if
 /// readable).
 pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
+    acquire_pid_lock_with_retry(path, true)
+}
+
+/// Try to take the PID-file lease once, without the start command's retry.
+///
+/// A foreground refresh uses this to make its daemon-or-foreground choice
+/// atomically. Waiting here would add the start retry's one-second delay to
+/// the normal live-daemon IPC path.
+pub(crate) fn try_acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
+    acquire_pid_lock_with_retry(path, false)
+}
+
+fn acquire_pid_lock_with_retry(
+    path: &Path,
+    retry_transient_contention: bool,
+) -> Result<std::fs::File, PidLockError> {
     // Ensure the parent directory exists. In production systemd creates
     // /run/purge-warden/ via `RuntimeDirectory=`, but a foreground/dev
     // invocation (`warden start` after a `systemctl stop` wiped the
@@ -80,8 +96,8 @@ pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
     // acquire and its release, and a daemon starting inside that window
     // saw EWOULDBLOCK and refused to start with "already running".
     //
-    // Three interactive CLI paths are in that window today:
-    // `config restore`, `stop --force`, and `lists refresh`.
+    // Two interactive CLI paths are in that window today:
+    // `config restore` and `stop --force`.
     //
     // A single short retry separates the two cases cleanly, because they
     // differ by orders of magnitude and not by a hair: the probe's hold
@@ -121,7 +137,8 @@ pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
     const RELOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
     let deadline = std::time::Instant::now() + RELOCK_DEADLINE;
     let mut ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    while ret != 0
+    while retry_transient_contention
+        && ret != 0
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
         && std::time::Instant::now() < deadline
     {
@@ -277,8 +294,8 @@ pub fn pid_file_is_locked(path: &Path) -> bool {
 /// process that wrote it (crash, SIGKILL, an unclean container stop), and
 /// the kernel recycles PIDs — so the number in a stale file eventually
 /// names some unrelated live process. Asking only "does this PID exist?"
-/// then reports a running daemon, and the caller goes on to *signal* it:
-/// `lists refresh` sends SIGHUP, whose default disposition is terminate.
+/// then reports a running daemon, and the caller could go on to *signal* it:
+/// direct signals such as SIGHUP have a terminating default disposition.
 ///
 /// The advisory lock is what distinguishes the two, because only a live
 /// daemon holds it. Both signals must agree:

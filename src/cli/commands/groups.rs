@@ -15,13 +15,14 @@ use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    read_or_empty, remove_id_keyed, resolve_existing_target_file, resolve_target_file,
-    upsert_id_keyed, write_value_validated, EntityClass,
+    read_or_empty_locked, remove_id_keyed, resolve_existing_target_file_locked,
+    resolve_target_file_locked, upsert_id_keyed, write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::load_config;
+use crate::config::loader::{load_config, load_config_for_schema_under_guard};
 use crate::config::schema::ScheduleTargetType;
-use crate::config::schema::{Group, Id};
+use crate::config::schema::{Group, Id, SCHEMA_VERSION_V1};
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
@@ -177,8 +178,36 @@ pub(crate) fn add_inner(
     into: Option<&Path>,
 ) -> anyhow::Result<AddReport> {
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(
+        &guard,
+        config_path,
+        id,
+        display_name,
+        profile,
+        priority,
+        devices,
+        into,
+    )
+}
+
+/// Guard-reusing form of [`add_inner`]. The caller holds the tree lock from
+/// before its first config read through this validated promotion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    display_name: Option<&str>,
+    profile: &str,
+    priority: Option<i32>,
+    devices: &[String],
+    into: Option<&Path>,
+) -> anyhow::Result<AddReport> {
+    let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     validate_group_refs(&loaded, id, profile, devices)?;
 
     let mut tbl = toml::map::Map::new();
@@ -202,8 +231,8 @@ pub(crate) fn add_inner(
     // too. A new group starts with no tags; the caller adds them as a second
     // write.
 
-    let target_path = resolve_target_file(config_path, EntityClass::Groups, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_target_file_locked(guard, config_path, EntityClass::Groups, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     // A create, and the returned flag is what says so. `upsert_id_keyed`
     // replaces a matched row outright, and this builder writes a whole row, so
     // the day this verb stops refusing an existing id the replace would reset
@@ -219,7 +248,7 @@ pub(crate) fn add_inner(
          nothing was changed",
         target_path.display()
     );
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
@@ -252,8 +281,21 @@ pub(crate) fn set_fields_inner(
     fields: &[(&str, &str)],
     into: Option<&Path>,
 ) -> anyhow::Result<SetFieldsReport> {
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Groups, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let guard = acquire_for_write(config_path)?;
+    set_fields_inner_locked(&guard, config_path, id, fields, into)
+}
+
+/// Guard-reusing form of [`set_fields_inner`].
+pub(crate) fn set_fields_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    fields: &[(&str, &str)],
+    into: Option<&Path>,
+) -> anyhow::Result<SetFieldsReport> {
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Groups, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let entry =
         find_id_entry_mut(&mut doc, EntityClass::Groups.toml_key(), id)?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -265,7 +307,7 @@ pub(crate) fn set_fields_inner(
     for (field, value) in fields {
         apply_group_field(entry, field, value)?;
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let id_for_audit = id.to_string();
     let fields_after = fields
@@ -300,8 +342,20 @@ pub(crate) fn remove_inner(
     id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<Option<RemoveReport>> {
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, id, into)
+}
+
+/// Guard-reusing form of [`remove_inner`].
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<Option<RemoveReport>> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     let refs: Vec<&str> = loaded
         .config
         .devices
@@ -331,12 +385,13 @@ pub(crate) fn remove_inner(
         );
     }
 
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Groups, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Groups, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     if !remove_id_keyed(&mut doc, EntityClass::Groups.toml_key(), id)? {
         return Ok(None);
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
@@ -495,7 +550,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -739,7 +794,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"

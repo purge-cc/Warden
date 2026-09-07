@@ -18,9 +18,24 @@
 //! `warden --config /tmp/x/config.toml init` provisioned
 //! `/var/lib/purge-warden` and reported success.
 
+use std::ffi::{CString, OsStr};
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
+    AtomicWriteAtOpts, AtomicWriteError,
+};
+use crate::config::migration_journal;
+use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::tree_io::{inspect_at, CappedRead, PinnedTarget, TargetPlan};
+use crate::config::write_lock::{self, ConfigWriteLock};
 use crate::lists::catalog::{Catalog, DEFAULT_SOURCES};
 
 pub(crate) mod upstream;
@@ -186,16 +201,20 @@ impl InitLayout {
         dirs
     }
 
-    /// Roots to hand to the daemon user, recursively.
-    fn chown_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.state_dir.clone()];
+    /// Path-based ownership work outside the held canonical config tree.
+    fn chown_targets(&self) -> Vec<(PathBuf, bool)> {
+        let mut targets = vec![
+            (self.state_dir.clone(), false),
+            (self.state_dir.join("lists"), true),
+            (self.state_dir.join("data"), true),
+        ];
         if self.config_dir != self.state_dir {
-            roots.push(self.config_dir.clone());
+            targets.push((self.config_dir.clone(), false));
         }
         if let Some(run) = &self.run_dir {
-            roots.push(run.clone());
+            targets.push((run.clone(), true));
         }
-        roots
+        targets
     }
 }
 
@@ -312,14 +331,6 @@ pub fn run_init(
     };
     let allow_from = validated_allow_from(&allow_from_inputs)?;
 
-    let config_path = layout.config_path.as_path();
-    let config_display = config_path.display();
-
-    // Everything above either reads or prompts. Everything below mutates,
-    // and `provision` cannot be called without the receipt this returns.
-    let precondition = check_preconditions(config_path, force)?;
-    provision(&layout, &precondition)?;
-
     let body = render_default_config(
         &default_profile,
         &scaffold_lists,
@@ -329,42 +340,12 @@ pub fn run_init(
         &layout.socket_path,
     );
 
-    // Honour `--force`: rename any existing config aside before writing.
-    // `replacing_existing` is what the precondition check already
-    // observed, so this does not re-`stat` the path and cannot disagree
-    // with the decision that let us get this far.
-    if precondition.replacing_existing {
-        let ts = time::OffsetDateTime::now_utc()
-            .format(&time::macros::format_description!(
-                "[year][month][day]T[hour][minute][second]Z"
-            ))
-            .map_err(|e| anyhow::anyhow!("failed to format timestamp: {}", e))?;
-        // Bump the name on a same-second collision so a rapid `--force`
-        // re-run can't silently clobber the pre-init rollback copy.
-        let backup = crate::cli::commands::make_unique_path(
-            config_path.with_extension(format!("toml.pre-init-{ts}")),
-        );
-        std::fs::rename(config_path, &backup)?;
-        println!("renamed previous config to {}", backup.display());
+    let outcome = init_locked(&layout, force, &body, &system_init_ops())?;
+    if let Some(backup) = outcome.pre_init_copy {
+        println!("saved previous config to {}", backup.display());
     }
-
-    // Route the first-boot master through the hardened
-    // atomic-write helper. Explicit mode 0o640 closes the 0o644 race
-    // window the previous `fs::write` + `set_permissions` pair left
-    // open (the same antipattern documented in `src/config/audit.rs`).
-    // The owner-preservation branch of the helper only fires when the
-    // target already existed; we are on the first-write path so the
-    // explicit `chown` call afterwards keeps the daemon-owned semantics.
-    crate::config::atomic_write::hardened_atomic_write(
-        config_path,
-        body.as_bytes(),
-        crate::config::atomic_write::AtomicWriteOpts {
-            mode: Some(0o640),
-            ..Default::default()
-        },
-    )?;
-    chown(config_path)?;
-    println!("created {config_display}");
+    let config_path = layout.config_path.as_path();
+    println!("created {}", config_path.display());
 
     println!();
     println!("purge-warden initialized successfully");
@@ -440,16 +421,17 @@ fn run_init_cluster_secondary(
     };
     let allow_from = validated_allow_from(&allow_from_inputs)?;
 
-    let config_path = layout.config_path.as_path();
-    let precondition = check_preconditions(config_path, force)?;
-    provision(layout, &precondition)?;
-
     let body = render_cluster_secondary_config(listen, &allow_from, &layout.socket_path, peer);
 
-    write_cluster_secondary_scaffold(config_path, &body)?;
-    chown(config_path)?;
+    let outcome = init_locked(layout, force, &body, &system_init_ops())?;
+    if let Some(backup) = outcome.pre_init_copy {
+        println!("saved previous config to {}", backup.display());
+    }
 
-    println!("created {} (cluster secondary)", config_path.display());
+    println!(
+        "created {} (cluster secondary)",
+        layout.config_path.display()
+    );
     println!();
     println!("This node carries NO policy of its own — lists, profiles, devices and");
     println!("the upstream all arrive from the primary. It will not start until it has");
@@ -463,29 +445,6 @@ fn run_init_cluster_secondary(
     println!("  warden cluster join --peer {peer} --token-file <path>");
     println!();
     println!("after that: warden config lint   # should report a valid config");
-    Ok(())
-}
-
-/// Write the cluster-secondary scaffold at `0o640`.
-///
-/// A seam, not decoration. [`run_init_cluster_secondary`] is unreachable from a
-/// test — [`run_init`] bails on [`is_root`], and the two steps that need root
-/// ([`provision`], which runs `useradd`, and [`chown`]) mutate the machine
-/// running the suite. So the mode this config is created with — a security
-/// property, since the file will carry `cluster.token_hash` — was asserted by
-/// nothing at all.
-///
-/// Splitting the write out makes exactly that testable without pretending the
-/// root-only steps are.
-fn write_cluster_secondary_scaffold(config_path: &Path, body: &str) -> anyhow::Result<()> {
-    crate::config::atomic_write::hardened_atomic_write(
-        config_path,
-        body.as_bytes(),
-        crate::config::atomic_write::AtomicWriteOpts {
-            mode: Some(0o640),
-            ..Default::default()
-        },
-    )?;
     Ok(())
 }
 
@@ -508,7 +467,7 @@ fn render_cluster_secondary_config(
         .join(", ");
 
     let mut out = String::new();
-    out.push_str("# purge-warden configuration — CLUSTER SECONDARY (schema v2)\n");
+    out.push_str("# purge-warden configuration — CLUSTER SECONDARY (schema v4)\n");
     out.push_str("# Generated by `warden init --cluster-secondary`.\n");
     out.push_str(
         "#\n\
@@ -520,7 +479,7 @@ fn render_cluster_secondary_config(
          # would filter more than the primary does while sync reported success.\n\
          # The validator refuses such a master, and so does `cluster join`.\n",
     );
-    out.push_str("\nschema_version = 3\n");
+    writeln!(out, "\nschema_version = {SCHEMA_VERSION_V1}").unwrap();
 
     out.push_str("\n[server]\n");
     out.push_str(&format!("listen = \"{listen}\"\n"));
@@ -631,63 +590,610 @@ fn privileged_port(listen: &str) -> Option<u16> {
         .filter(|p| *p < FIRST_UNPRIVILEGED_PORT)
 }
 
-/// Receipt proving every `warden init` precondition passed.
-///
-/// Only [`check_preconditions`] can mint one and [`provision`] demands one,
-/// so the compiler — not a comment, and not the order two blocks happen to
-/// sit in — is what keeps the existence check ahead of the first mutation.
-/// That ordering is the whole defect: the check used to run *after* a
-/// `useradd`, four `create_dir` calls and two `chown -R` calls.
-#[must_use]
-#[derive(Debug)]
-struct PreconditionsPassed {
-    /// A config is already present AND `--force` authorised replacing it.
-    /// Carried forward so the write phase does not re-`stat` the path and
-    /// reach a different conclusion than the one that let it run.
-    replacing_existing: bool,
+/// The two privileged effects init needs. Keeping this seam this small lets
+/// the locked flow be tested without creating a real system user or chowning
+/// the machine that runs the test.
+struct InitOps<CreateUser, ResolveOwner, ChownPath> {
+    create_system_user: CreateUser,
+    resolve_daemon_owner: ResolveOwner,
+    chown_path: ChownPath,
 }
 
-/// Decide whether `warden init` may proceed. Reads only — no mutation.
-///
-/// Refusing here rather than after provisioning is the point: on an
-/// existing install, `warden init` without `--force` used to create the
-/// system user, create four directories and recursively re-own a live
-/// deployment's config, lists and data, and only then decline to do the
-/// thing the operator actually asked for.
-fn check_preconditions(config_path: &Path, force: bool) -> anyhow::Result<PreconditionsPassed> {
-    let exists = config_path.exists();
-    if exists && !force {
+type SystemInitOps = InitOps<
+    fn() -> anyhow::Result<()>,
+    fn() -> anyhow::Result<(u32, u32)>,
+    fn(&Path, bool) -> anyhow::Result<()>,
+>;
+
+fn system_init_ops() -> SystemInitOps {
+    InitOps {
+        create_system_user,
+        resolve_daemon_owner,
+        chown_path,
+    }
+}
+
+/// Receipt proving the canonical master's pinned snapshot passed the guarded
+/// precondition. It deliberately owns the plan so neither provisioning nor
+/// publication can restat a pathname selected before the lock.
+#[must_use]
+struct PreconditionsPassed<'g> {
+    master: TargetPlan<'g>,
+    original_bytes: Option<Vec<u8>>,
+}
+
+/// Decide whether `warden init` may proceed from the held canonical target.
+fn check_preconditions_locked<'g>(
+    guard: &'g ConfigWriteLock,
+    requested_master: &Path,
+    force: bool,
+) -> anyhow::Result<PreconditionsPassed<'g>> {
+    guard.verify_master(requested_master)?;
+    let master = guard.tree_io().plan_master_target()?;
+    if !master.is_new() && !force {
         anyhow::bail!(
             "config already exists: {}. Pass --force to overwrite \
-             (the existing file will be renamed with a .pre-init-<ts> suffix).",
-            config_path.display()
+             (the existing file will be copied with a .pre-init-<ts> suffix).",
+            requested_master.display()
         );
     }
+
+    let original_bytes = if master.is_new() {
+        None
+    } else {
+        let len = master
+            .original_len()
+            .ok_or_else(|| anyhow::anyhow!("existing config has no snapshot length"))?;
+        match master.read_original_capped(len)? {
+            CappedRead::Contents(bytes) => {
+                anyhow::ensure!(
+                    bytes.len() as u64 == len,
+                    "existing config changed while capturing its guarded snapshot"
+                );
+                Some(bytes)
+            }
+            CappedRead::Missing => anyhow::bail!("existing config disappeared during admission"),
+            CappedRead::LimitExceeded { .. } => {
+                anyhow::bail!("existing config changed while capturing its guarded snapshot")
+            }
+        }
+    };
+
     Ok(PreconditionsPassed {
-        replacing_existing: exists,
+        master,
+        original_bytes,
     })
 }
 
-/// Create the directories, the system user, and hand ownership over.
-///
-/// Requires a [`PreconditionsPassed`] receipt, which is what makes the
-/// ordering un-regressable rather than merely correct today.
-///
-/// Directories come before the user deliberately: an unwanted directory is
-/// undone with `rmdir`, whereas a system user outlives any failure and
-/// needs `userdel`. Least-reversible last.
-fn provision(layout: &InitLayout, _precondition: &PreconditionsPassed) -> anyhow::Result<()> {
+/// Create directories and the user while the write capability remains held.
+fn provision_locked<CreateUser, ResolveOwner, ChownPath>(
+    guard: &ConfigWriteLock,
+    layout: &InitLayout,
+    _precondition: &PreconditionsPassed<'_>,
+    config_dir_is_held_root: bool,
+    ops: &InitOps<CreateUser, ResolveOwner, ChownPath>,
+) -> anyhow::Result<(u32, u32)>
+where
+    CreateUser: Fn() -> anyhow::Result<()>,
+    ResolveOwner: Fn() -> anyhow::Result<(u32, u32)>,
+    ChownPath: Fn(&Path, bool) -> anyhow::Result<()>,
+{
+    guard.verify_master(&layout.config_path)?;
+    let held_root = guard.tree_io().backup_root_fd()?;
     for (dir, mode) in layout.dirs_to_create() {
+        if config_dir_is_held_root {
+            if let Ok(relative) = dir.strip_prefix(&layout.config_dir) {
+                create_dir_under_held_root(&held_root, relative, &dir, mode)?;
+                continue;
+            }
+        }
         create_dir(&dir, mode)?;
     }
 
     // Idempotent — skips if the user already exists.
-    create_system_user()?;
+    (ops.create_system_user)()?;
+    let owner = (ops.resolve_daemon_owner)()?;
 
-    for root in layout.chown_roots() {
-        chown_recursive(&root)?;
+    for (target, recursive) in layout.chown_targets() {
+        let resolved = write_lock::resolve_path(&target)?;
+        let canonical_root = &guard.identity().root;
+        if resolved.starts_with(canonical_root) {
+            continue;
+        }
+        let recursive = recursive && !canonical_root.starts_with(&resolved);
+        (ops.chown_path)(&target, recursive)?;
+    }
+    Ok(owner)
+}
+
+fn create_dir_under_held_root(
+    root: &File,
+    relative: &Path,
+    display: &Path,
+    mode: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut current = root.try_clone()?;
+    let mut created = false;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("invalid config-root directory: {}", display.display());
+        };
+        current = match write_lock::open_at(&current, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = CString::new(name.as_bytes())?;
+                if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), mode) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    anyhow::bail!(
+                        "cannot create {} (mode {mode:o}): {error}",
+                        display.display()
+                    );
+                }
+                created = true;
+                write_lock::open_at(
+                    &current,
+                    OsStr::from_bytes(name.as_bytes()),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )?
+            }
+            Err(error) => return Err(error.into()),
+        };
+    }
+    current.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    if created {
+        println!("created {} (mode {mode:o})", display.display());
+    } else {
+        println!("directory exists: {} (mode {mode:o})", display.display());
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct InitOutcome {
+    pre_init_copy: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalOwnershipScope {
+    WholeTree,
+    ManagedRoot { state_dirs: bool },
+    MasterOnly,
+}
+
+fn requested_leaf_is_symlink(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn published_ownership_error(
+    master: &Path,
+    outcome: &InitOutcome,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let recovery = outcome
+        .pre_init_copy
+        .as_ref()
+        .map(|path| format!("; recovery copy retained at {}", path.display()))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "config {} was published but ownership normalization failed: {error:#}{recovery}",
+        master.display()
+    )
+}
+
+/// The sole bootstrap mutation coordinator. Both scaffold shapes enter here
+/// only after their prompts and typed validation have completed.
+fn init_locked<CreateUser, ResolveOwner, ChownPath>(
+    layout: &InitLayout,
+    force: bool,
+    body: &str,
+    ops: &InitOps<CreateUser, ResolveOwner, ChownPath>,
+) -> anyhow::Result<InitOutcome>
+where
+    CreateUser: Fn() -> anyhow::Result<()>,
+    ResolveOwner: Fn() -> anyhow::Result<(u32, u32)>,
+    ChownPath: Fn(&Path, bool) -> anyhow::Result<()>,
+{
+    // Resolve this before acquisition's test hook can replace the pathname.
+    // A leaf alias remains external state; the admitted canonical root does not.
+    let requested_config_dir = write_lock::resolve_path(&layout.config_dir)?;
+    let requested_state_dir = write_lock::resolve_path(&layout.state_dir)?;
+    let leaf_alias = requested_leaf_is_symlink(&layout.config_path)?;
+    let guard = write_lock::acquire_for_write(&layout.config_path)?;
+    // Acquisition checks this too; repeat it so a fence inserted by a test
+    // hook or a non-cooperating actor is still refused before any effect.
+    migration_journal::refuse_normal_access(guard.tree_io())?;
+    anyhow::ensure!(
+        leaf_alias == requested_leaf_is_symlink(&layout.config_path)?,
+        "config master alias changed while acquiring its write guard"
+    );
+
+    let precondition = check_preconditions_locked(&guard, &layout.config_path, force)?;
+    let config_dir_is_held_root = requested_config_dir == guard.identity().root;
+    let owner = provision_locked(&guard, layout, &precondition, config_dir_is_held_root, ops)?;
+    let outcome = publish_scaffold_locked(&guard, precondition, body)?;
+
+    let ownership_scope = match (config_dir_is_held_root, leaf_alias) {
+        (true, false) => CanonicalOwnershipScope::WholeTree,
+        (true, true) => CanonicalOwnershipScope::ManagedRoot {
+            state_dirs: requested_state_dir == guard.identity().root,
+        },
+        (false, _) => CanonicalOwnershipScope::MasterOnly,
+    };
+    if let Err(error) = normalize_canonical_tree(&guard, owner, ownership_scope) {
+        return Err(published_ownership_error(
+            guard.canonical_master(),
+            &outcome,
+            error,
+        ));
+    }
+
+    Ok(outcome)
+}
+
+/// A create-only force recovery artifact, retained on success and whenever a
+/// post-publication rollback cannot be proven.
+struct PreInitCopy<'g> {
+    target: PinnedTarget<'g>,
+}
+
+impl PreInitCopy<'_> {
+    fn path(&self) -> PathBuf {
+        self.target.display().to_path_buf()
+    }
+
+    fn remove(self) -> anyhow::Result<()> {
+        self.target.rollback_target()?.unlink()?;
+        Ok(())
+    }
+}
+
+fn publish_scaffold_locked<'g>(
+    guard: &'g ConfigWriteLock,
+    precondition: PreconditionsPassed<'g>,
+    body: &str,
+) -> anyhow::Result<InitOutcome> {
+    let pre_init_copy = if precondition.original_bytes.is_some() {
+        Some(create_pre_init_copy(guard, &precondition)?)
+    } else {
+        None
+    };
+    let pre_init_path = pre_init_copy.as_ref().map(PreInitCopy::path);
+    let original_bytes = precondition.original_bytes.as_deref();
+    let master = match precondition.master.materialize() {
+        Ok(master) => master,
+        Err(err) => {
+            if let Some(copy) = pre_init_copy {
+                copy.remove().map_err(|cleanup| {
+                    anyhow::anyhow!(
+                        "cannot pin canonical master: {err:#}; cannot remove unused pre-init copy: {cleanup:#}"
+                    )
+                })?;
+            }
+            return Err(err);
+        }
+    };
+
+    match hardened_atomic_write_at(
+        &master,
+        body.as_bytes(),
+        AtomicWriteAtOpts {
+            mode: Some(0o640),
+            owner: Some(guard.admitted_side_lock_owner()?),
+            ..Default::default()
+        },
+    ) {
+        Ok(()) => Ok(InitOutcome {
+            pre_init_copy: pre_init_path,
+        }),
+        Err(err) if err.rename_landed() => {
+            match rollback_landed_scaffold(&master, original_bytes) {
+                Ok(()) => anyhow::bail!(
+                    "cannot publish config {}: {err}; previous config was restored",
+                    guard.canonical_master().display()
+                ),
+                Err(rollback) => anyhow::bail!(
+                "cannot publish config {}: {err}; rollback could not be confirmed: {rollback:#}{}",
+                guard.canonical_master().display(),
+                pre_init_path
+                    .as_ref()
+                    .map(|path| format!("; recovery copy retained at {}", path.display()))
+                    .unwrap_or_default(),
+            ),
+            }
+        }
+        Err(err) => {
+            if let Some(copy) = pre_init_copy {
+                copy.remove().map_err(|cleanup| {
+                    anyhow::anyhow!(
+                        "cannot publish config {}: {err}; cannot remove unused pre-init copy: {cleanup:#}",
+                        guard.canonical_master().display()
+                    )
+                })?;
+            }
+            Err(err.into())
+        }
+    }
+}
+
+fn rollback_landed_scaffold(
+    master: &PinnedTarget<'_>,
+    original_bytes: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let rollback = master.rollback_target()?;
+    match original_bytes {
+        Some(bytes) => hardened_atomic_write_at(&rollback, bytes, AtomicWriteAtOpts::default())?,
+        None => rollback.unlink()?,
+    }
+    Ok(())
+}
+
+fn create_pre_init_copy<'g>(
+    guard: &'g ConfigWriteLock,
+    precondition: &PreconditionsPassed<'g>,
+) -> anyhow::Result<PreInitCopy<'g>> {
+    let bytes = precondition
+        .original_bytes
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("force copy requested without an existing config"))?;
+    let metadata = precondition
+        .master
+        .original_metadata()
+        .ok_or_else(|| anyhow::anyhow!("force copy requested without original metadata"))?;
+    let mut source =
+        tempfile::tempfile().map_err(|e| anyhow::anyhow!("cannot spool pre-init copy: {e}"))?;
+    source
+        .write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("cannot spool pre-init copy: {e}"))?;
+    let timestamp = time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to format timestamp: {e}"))?;
+    let desired = guard
+        .canonical_master()
+        .with_extension(format!("toml.pre-init-{timestamp}"));
+    let desired_name = desired
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("canonical pre-init copy has no filename"))?;
+    let mode = metadata.mode() & 0o7777;
+    let owner = (metadata.uid(), metadata.gid());
+
+    for suffix in 0_u32.. {
+        let mut name = desired_name.to_os_string();
+        if suffix != 0 {
+            name.push(format!("-{suffix}"));
+        }
+        let plan = guard.tree_io().plan_root_file_no_follow(Path::new(&name))?;
+        if !plan.is_new() {
+            continue;
+        }
+        let target = plan.materialize()?;
+        match hardened_atomic_create_only_at(
+            &target,
+            &mut source,
+            bytes.len() as u64,
+            AtomicCreateOnlyAtOpts {
+                mode: Some(mode),
+                owner: Some(owner),
+                #[cfg(test)]
+                test_failure: None,
+            },
+        ) {
+            Ok(()) => return Ok(PreInitCopy { target }),
+            Err(AtomicWriteError::TargetExists { .. }) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    unreachable!("u32 pre-init copy suffix space exhausted")
+}
+
+fn normalize_canonical_tree(
+    guard: &ConfigWriteLock,
+    owner: (u32, u32),
+    scope: CanonicalOwnershipScope,
+) -> anyhow::Result<()> {
+    let root = guard.tree_io().backup_root_fd()?;
+    let master = guard
+        .canonical_master()
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("canonical config master has no filename"))?;
+    let admitted = guard.admitted_side_lock_owner()?;
+
+    match scope {
+        CanonicalOwnershipScope::WholeTree => {
+            normalize_tree_children(&root, owner, Some(master))?;
+        }
+        CanonicalOwnershipScope::ManagedRoot { state_dirs: true } => {
+            for name in [OsStr::new("lists"), OsStr::new("data")] {
+                normalize_managed_directory(&root, name, owner)?;
+            }
+        }
+        CanonicalOwnershipScope::ManagedRoot { state_dirs: false }
+        | CanonicalOwnershipScope::MasterOnly => {}
+    }
+    normalize_master_lock_pair(&root, master, admitted, owner)?;
+    if !matches!(scope, CanonicalOwnershipScope::MasterOnly) {
+        chown_root_descriptor(&root, owner)?;
+    }
+    root.sync_all()?;
+    Ok(())
+}
+
+fn normalize_managed_directory(root: &File, name: &OsStr, owner: (u32, u32)) -> anyhow::Result<()> {
+    let entry = inspect_at(root, name)?
+        .ok_or_else(|| anyhow::anyhow!("managed init directory disappeared: {:?}", name))?;
+    anyhow::ensure!(
+        entry.metadata()?.is_dir(),
+        "managed init path is not a directory: {:?}",
+        name
+    );
+    let directory = write_lock::reopen_inspected(&entry, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    normalize_tree_children(&directory, owner, None)?;
+    chown_root_descriptor(&directory, owner)?;
+    directory.sync_all()?;
+    Ok(())
+}
+
+fn normalize_tree_children(
+    parent: &File,
+    owner: (u32, u32),
+    root_master: Option<&OsStr>,
+) -> anyhow::Result<()> {
+    let proc_path = format!("/proc/self/fd/{}", parent.as_raw_fd());
+    for entry in std::fs::read_dir(proc_path)? {
+        let name = entry?.file_name();
+        let name = name.as_os_str();
+        if root_master.is_some_and(|master| name == master || name == ".warden-config.lock") {
+            continue;
+        }
+        let Some(inspected) = inspect_at(parent, name)? else {
+            anyhow::bail!("canonical tree entry disappeared during ownership normalization");
+        };
+        if inspected.metadata()?.is_dir() {
+            let child =
+                write_lock::reopen_inspected(&inspected, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            normalize_tree_children(&child, owner, None)?;
+            chown_root_descriptor(&child, owner)?;
+            child.sync_all()?;
+        } else {
+            chown_inspected(&inspected, owner)?;
+        }
+    }
+    Ok(())
+}
+
+fn chown_root_descriptor(file: &File, owner: (u32, u32)) -> anyhow::Result<()> {
+    if unsafe { libc::fchown(file.as_raw_fd(), owner.0, owner.1) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        (metadata.uid(), metadata.gid()) == owner,
+        "cannot set descriptor ownership to {}:{}",
+        owner.0,
+        owner.1
+    );
+    Ok(())
+}
+
+fn chown_inspected(file: &File, owner: (u32, u32)) -> anyhow::Result<()> {
+    if unsafe {
+        libc::fchownat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            owner.0,
+            owner.1,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        (metadata.uid(), metadata.gid()) == owner,
+        "cannot set held entry ownership to {}:{}",
+        owner.0,
+        owner.1
+    );
+    Ok(())
+}
+
+fn normalize_master_lock_pair(
+    root: &File,
+    master: &OsStr,
+    admitted: (u32, u32),
+    owner: (u32, u32),
+) -> anyhow::Result<()> {
+    let lock = OsStr::new(".warden-config.lock");
+    let master_file = pair_member(root, master)?;
+    let lock_file = pair_member(root, lock)?;
+    let master_meta = master_file.metadata()?;
+    let lock_meta = lock_file.metadata()?;
+    anyhow::ensure!(
+        (master_meta.uid(), master_meta.gid()) == admitted
+            && (lock_meta.uid(), lock_meta.gid()) == admitted,
+        "canonical master and side lock ownership changed before normalization"
+    );
+
+    chown_inspected(&master_file, owner)?;
+    if let Err(lock_error) = chown_inspected(&lock_file, owner) {
+        let rollback = chown_inspected(&master_file, admitted);
+        let pair = verify_pair_receipts(root, master, &master_file, lock, &lock_file)
+            .and_then(|()| pair_owners(root, master, lock));
+        match (rollback, pair) {
+            (Ok(()), Ok(current)) if current == admitted => anyhow::bail!(
+                "master and side lock ownership update failed ({lock_error}); master was rolled back to the admitted owner"
+            ),
+            (rollback, pair) => anyhow::bail!(
+                "master and side lock ownership update failed ({lock_error}); rollback result: {}; pair now: {}",
+                rollback
+                    .err()
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "completed but did not restore the pair".to_string()),
+                pair.map(|ids| format!("{}:{}", ids.0, ids.1))
+                    .unwrap_or_else(|err| format!("unverifiable ({err:#})"))
+            ),
+        }
+    }
+    verify_pair_receipts(root, master, &master_file, lock, &lock_file)?;
+    let current = pair_owners(root, master, lock)?;
+    anyhow::ensure!(
+        current == owner,
+        "canonical master and side lock ownership do not match after normalization"
+    );
+    Ok(())
+}
+
+fn pair_member_metadata(root: &File, name: &OsStr) -> anyhow::Result<std::fs::Metadata> {
+    Ok(pair_member(root, name)?.metadata()?)
+}
+
+fn pair_member(root: &File, name: &OsStr) -> anyhow::Result<File> {
+    let entry = inspect_at(root, name)?
+        .ok_or_else(|| anyhow::anyhow!("canonical ownership pair entry disappeared: {:?}", name))?;
+    let meta = entry.metadata()?;
+    anyhow::ensure!(
+        meta.is_file() && meta.nlink() == 1,
+        "canonical ownership pair entry is not a regular single-link file: {:?}",
+        name
+    );
+    Ok(entry)
+}
+
+fn verify_pair_receipts(
+    root: &File,
+    master_name: &OsStr,
+    master: &File,
+    lock_name: &OsStr,
+    lock: &File,
+) -> anyhow::Result<()> {
+    for (name, receipt) in [(master_name, master), (lock_name, lock)] {
+        let current = inspect_at(root, name)?;
+        anyhow::ensure!(
+            crate::config::tree_io::same_optional_inode(Some(receipt), current.as_ref())?,
+            "canonical ownership pair entry was replaced: {:?}",
+            name
+        );
+    }
+    Ok(())
+}
+
+fn pair_owners(root: &File, master: &OsStr, lock: &OsStr) -> anyhow::Result<(u32, u32)> {
+    let master = pair_member_metadata(root, master)?;
+    let lock = pair_member_metadata(root, lock)?;
+    anyhow::ensure!(
+        (master.uid(), master.gid()) == (lock.uid(), lock.gid()),
+        "canonical master and side lock ownership differ"
+    );
+    Ok((master.uid(), master.gid()))
 }
 
 /// Operator-facing refusal when a prompt hits end-of-stdin.
@@ -938,9 +1444,9 @@ fn render_default_config(
     };
 
     let mut out = String::new();
-    out.push_str("# purge-warden configuration (schema v2 — lists & categories v2)\n");
+    out.push_str("# purge-warden configuration (schema v4)\n");
     out.push_str("# Generated by `warden init`. See PROJECT.md for full reference.\n");
-    out.push_str("\nschema_version = 3\n");
+    writeln!(out, "\nschema_version = {SCHEMA_VERSION_V1}").unwrap();
 
     out.push_str("\n[server]\n");
     out.push_str(&format!("listen = \"{listen}\"\n"));
@@ -1137,6 +1643,23 @@ fn create_system_user() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_daemon_owner() -> anyhow::Result<(u32, u32)> {
+    fn id(flag: &str) -> anyhow::Result<u32> {
+        let output = Command::new("id").args([flag, USER]).output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "cannot resolve {USER} with `id {flag}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8(output.stdout)?
+            .trim()
+            .parse()
+            .map_err(Into::into)
+    }
+
+    Ok((id("-u")?, id("-g")?))
+}
+
 fn create_dir(path: &Path, mode: u32) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::os::unix::fs::DirBuilderExt;
@@ -1174,18 +1697,7 @@ fn set_permissions(path: &Path, mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn chown(path: &Path) -> anyhow::Result<()> {
-    let output = Command::new("chown")
-        .args([Path::new(&format!("{USER}:{USER}")), path])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("chown failed for {}: {stderr}", path.display());
-    }
-    Ok(())
-}
-
-fn chown_recursive(path: &Path) -> anyhow::Result<()> {
+fn chown_path(path: &Path, recursive: bool) -> anyhow::Result<()> {
     // `-h` (`--no-dereference`) so a symlink encountered during the
     // recursive walk has ITS OWN ownership changed, never the target's. On a
     // first `init` the tree is freshly created and symlink-free, but a `--force`
@@ -1194,13 +1706,14 @@ fn chown_recursive(path: &Path) -> anyhow::Result<()> {
     // must not let `chown -R` follow it to an arbitrary file. GNU coreutils
     // already defaults to no-follow (`-P`), but busybox/BSD differ and musl is
     // the prod target, so we force it explicitly.
-    let output = Command::new("chown")
-        .args([
-            Path::new("-R"),
-            Path::new("-h"),
-            Path::new(&format!("{USER}:{USER}")),
-            path,
-        ])
+    let mut command = Command::new("chown");
+    if recursive {
+        command.arg("-R");
+    }
+    let output = command
+        .arg("-h")
+        .arg(format!("{USER}:{USER}"))
+        .arg(path)
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1213,6 +1726,32 @@ fn chown_recursive(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::config::schema::ConfigV1;
+
+    fn current_owner() -> anyhow::Result<(u32, u32)> {
+        Ok(unsafe { (libc::geteuid(), libc::getegid()) })
+    }
+
+    fn foreign_gid_we_may_set() -> Option<u32> {
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if euid == 0 {
+            return Some(if egid == 0 { 1 } else { 0 });
+        }
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count <= 0 {
+            return None;
+        }
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if read < 0 {
+            return None;
+        }
+        groups.truncate(read as usize);
+        groups.into_iter().find(|gid| *gid != egid)
+    }
+
+    fn no_op_external_chown(_path: &Path, _recursive: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// `dirs_to_create` declares a security-relevant mode per directory, and
     /// `init` is the seat that declares them — so a directory that already
@@ -1304,10 +1843,12 @@ mod tests {
             ],
         );
         assert_eq!(
-            l.chown_roots(),
+            l.chown_targets(),
             vec![
-                PathBuf::from("/var/lib/purge-warden"),
-                PathBuf::from("/run/purge-warden"),
+                (PathBuf::from("/var/lib/purge-warden"), false),
+                (PathBuf::from("/var/lib/purge-warden/lists"), true),
+                (PathBuf::from("/var/lib/purge-warden/data"), true),
+                (PathBuf::from("/run/purge-warden"), true),
             ],
         );
     }
@@ -1332,7 +1873,7 @@ mod tests {
 
         // Nothing anywhere in the layout may reference a system root.
         let mut touched: Vec<PathBuf> = l.dirs_to_create().into_iter().map(|(p, _)| p).collect();
-        touched.extend(l.chown_roots());
+        touched.extend(l.chown_targets().into_iter().map(|(path, _)| path));
         touched.push(l.socket_path.clone());
         touched.push(l.config_path.clone());
         for p in &touched {
@@ -1371,8 +1912,8 @@ mod tests {
             "a writable dir under ProtectSystem=strict /etc is unusable: {dirs:?}"
         );
         assert!(l
-            .chown_roots()
-            .contains(&PathBuf::from("/etc/purge-warden")));
+            .chown_targets()
+            .contains(&(PathBuf::from("/etc/purge-warden"), false)));
     }
 
     /// The rendered `[socket] path` must name a directory init
@@ -1424,18 +1965,9 @@ mod tests {
     // fire before anything is created (`--peer`, `allow_from`). Those reach
     // `run_init_cluster_secondary` itself, not merely the renderer.
     //
-    // NOT covered, and not coverable in this suite: `provision` and `chown`.
-    // `provision` runs `useradd` and `chown -R` against real system paths, so
-    // exercising it would create a `purge-warden` account on whatever machine
-    // runs `cargo test` — a test that mutates the developer's box is worse
-    // than a gap. `run_init` bails on `is_root` for the same reason, which is
-    // why the seam is drawn at `write_cluster_secondary_scaffold` rather than
-    // by faking root.
-    //
-    // The consequence is real, and writing it down is the point: the ORDER of
-    // provision → write → chown, and the ownership those two steps establish,
-    // are proven only by the live host smoke. Do not read the green tests
-    // below as covering them.
+    // The two privileged calls are injected into the coordinator, so these
+    // tests exercise the real locked ordering without changing the host user
+    // database or ownership.
 
     fn secondary_scaffold(dir: &Path) -> String {
         render_cluster_secondary_config(
@@ -1456,14 +1988,33 @@ mod tests {
     /// `purge-warden` group, which `chown` sets on the next line.
     #[test]
     fn the_cluster_secondary_scaffold_is_written_group_readable_not_world() {
+        use std::cell::Cell;
         use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_cluster_secondary_scaffold(&path, &secondary_scaffold(dir.path())).unwrap();
+        let layout = InitLayout::for_config(&path);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+        let acquisitions = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&acquisitions);
+        write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || init_locked(&layout, false, &secondary_scaffold(dir.path()), &ops),
+        )
+        .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "got {mode:o}, want 640");
+        assert_eq!(acquisitions.get(), 1, "secondary init must acquire once");
     }
 
     /// `--peer` is validated BEFORE `provision` runs, so the refusal is
@@ -1475,6 +2026,9 @@ mod tests {
     /// credential in cleartext.
     #[test]
     fn the_cluster_secondary_init_refuses_a_plaintext_offbox_peer() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
         let dir = tempfile::tempdir().unwrap();
         let layout = InitLayout::for_config(&dir.path().join("config.toml"));
         let overrides = InitOverrides {
@@ -1482,12 +2036,23 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_init_cluster_secondary(
-            &layout,
-            false,
-            "0.0.0.0:53",
-            "http://10.10.1.94:8053",
-            &overrides,
+        let acquisitions = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&acquisitions);
+        let err = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || {
+                run_init_cluster_secondary(
+                    &layout,
+                    false,
+                    "0.0.0.0:53",
+                    "http://10.10.1.94:8053",
+                    &overrides,
+                )
+            },
         )
         .expect_err("a plaintext off-box peer must be refused");
 
@@ -1498,6 +2063,11 @@ mod tests {
         assert!(
             !layout.config_path.exists(),
             "a refused init must not create the config"
+        );
+        assert_eq!(
+            acquisitions.get(),
+            0,
+            "invalid peer must not acquire a lock"
         );
     }
 
@@ -1592,6 +2162,7 @@ mod tests {
         );
         // It is still a config, not a fragment.
         let cfg: ConfigV1 = toml::from_str(&body).expect("the scaffold parses as v1");
+        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
         assert_eq!(
             cfg.cluster.role,
             crate::config::schema::ClusterRole::Secondary
@@ -1783,70 +2354,376 @@ mod tests {
 
     // ── init mutated before checking ───────────────────
 
-    /// An existing config without `--force` is refused, and the refusal is
-    /// a *read-only* outcome: `check_preconditions` performs no mutation,
-    /// and `provision` — the only thing that does — cannot be called
-    /// without the receipt this fails to produce.
+    /// Existing refusal is decided from the pinned target while the one
+    /// write guard is live, before either injected privileged effect runs.
     #[test]
-    fn existing_config_without_force_is_refused_before_any_mutation() {
+    fn existing_config_without_force_refuses_under_one_guard_before_effects() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        std::fs::write(
-            &config,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        let old = "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+        std::fs::write(&config, old).unwrap();
+        let layout = InitLayout::for_config(&config);
+        let effects = Rc::new(Cell::new(0));
+        let effects_for_user = Rc::clone(&effects);
+        let effects_for_chown = Rc::clone(&effects);
+        let ops = InitOps {
+            create_system_user: move || -> anyhow::Result<()> {
+                effects_for_user.set(effects_for_user.get() + 1);
+                Ok(())
+            },
+            resolve_daemon_owner: current_owner,
+            chown_path: move |_path: &Path, _recursive: bool| -> anyhow::Result<()> {
+                effects_for_chown.set(effects_for_chown.get() + 1);
+                Ok(())
+            },
+        };
+        let acquisitions = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&acquisitions);
+        let err = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || init_locked(&layout, false, "new", &ops),
         )
-        .unwrap();
-
-        let err = check_preconditions(&config, false)
-            .expect_err("an existing config without --force must refuse")
-            .to_string();
+        .expect_err("an existing config without --force must refuse")
+        .to_string();
         assert!(err.contains("already exists"), "{err}");
         assert!(err.contains("--force"), "must name the way forward: {err}");
+        assert_eq!(acquisitions.get(), 1, "one guarded coordinator");
+        assert_eq!(effects.get(), 0, "refusal precedes all privileged effects");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), old);
+    }
 
-        // The refusal touched nothing: still exactly the file we wrote.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
+    /// `--force` uses the same guarded receipt, saves a create-only canonical
+    /// copy, and then publishes the replacement through the pinned master.
+    #[test]
+    fn force_observes_and_replaces_the_pinned_master_under_one_guard() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let old = b"old config bytes\n";
+        std::fs::write(&config, old).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let layout = InitLayout::for_config(&config);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+        let acquisitions = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&acquisitions);
+        let outcome = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || init_locked(&layout, true, "new config\n", &ops),
+        )
+        .expect("--force must be allowed");
+        let backup = outcome.pre_init_copy.expect("old config is retained");
+        assert_eq!(acquisitions.get(), 1, "one guarded coordinator");
+        assert_eq!(std::fs::read(&backup).unwrap(), old);
         assert_eq!(
-            entries.len(),
-            1,
-            "the check must not create anything: {entries:?}"
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the copy preserves the old mode"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "new config\n");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let owner = current_owner().unwrap();
+        assert_eq!(
+            (
+                std::fs::metadata(dir.path()).unwrap().uid(),
+                std::fs::metadata(dir.path()).unwrap().gid()
+            ),
+            owner,
+            "the held root is normalized through its descriptor"
         );
         assert_eq!(
-            std::fs::read_to_string(&config).unwrap(),
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-            "the check must not rewrite the config it refused"
+            (
+                std::fs::metadata(dir.path().join(".warden-config.lock"))
+                    .unwrap()
+                    .uid(),
+                std::fs::metadata(dir.path().join(".warden-config.lock"))
+                    .unwrap()
+                    .gid()
+            ),
+            owner,
+            "master and side lock ownership remain a pair"
         );
     }
 
-    /// `--force` authorises the overwrite, and the receipt remembers that a
-    /// file was there so the write phase renames it aside instead of
-    /// re-`stat`ing and possibly disagreeing.
     #[test]
-    fn force_authorises_replacement_and_records_it() {
+    fn post_publication_ownership_error_names_the_recovery_copy() {
+        let master = Path::new("/config/root/config.toml");
+        let copy = PathBuf::from("/config/root/config.toml.pre-init-20260906T000000Z");
+        let outcome = InitOutcome {
+            pre_init_copy: Some(copy.clone()),
+        };
+
+        let error = published_ownership_error(
+            master,
+            &outcome,
+            anyhow::anyhow!("injected ownership failure"),
+        )
+        .to_string();
+
+        assert!(error.contains(&master.display().to_string()), "{error}");
+        assert!(error.contains(&copy.display().to_string()), "{error}");
+        assert!(error.contains("injected ownership failure"), "{error}");
+    }
+
+    /// An absent master has an admitted target plan, not a pathname `exists`
+    /// decision.
+    #[test]
+    fn absent_config_has_a_new_guarded_target_plan() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        std::fs::write(
-            &config,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        let guard = write_lock::acquire_for_write(&config).unwrap();
+        let pre = check_preconditions_locked(&guard, &config, false)
+            .expect("a fresh install must proceed");
+        assert!(pre.master.is_new());
+    }
+
+    #[test]
+    fn migration_fence_refuses_before_provisioning_effects() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let fence = dir.path().join(migration_journal::TXN_DIR_NAME);
+        let layout = InitLayout::for_config(&config);
+        let effects = Rc::new(Cell::new(0));
+        let user_effects = Rc::clone(&effects);
+        let chown_effects = Rc::clone(&effects);
+        let ops = InitOps {
+            create_system_user: move || -> anyhow::Result<()> {
+                user_effects.set(user_effects.get() + 1);
+                Ok(())
+            },
+            resolve_daemon_owner: current_owner,
+            chown_path: move |_path: &Path, _recursive: bool| -> anyhow::Result<()> {
+                chown_effects.set(chown_effects.get() + 1);
+                Ok(())
+            },
+        };
+
+        let err = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    std::fs::create_dir(&fence).unwrap();
+                }
+            },
+            || init_locked(&layout, false, "new", &ops),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unfinished v3-to-v4 migration"));
+        assert_eq!(effects.get(), 0);
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn alias_writes_the_canonical_pinned_leaf_and_retains_the_alias() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::symlink;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let front = dir.path().join("front");
+        std::fs::create_dir(&front).unwrap();
+        let real = front.join("lists/real");
+        std::fs::create_dir_all(&real).unwrap();
+        let canonical = real.join("config.toml");
+        std::fs::write(&canonical, "old").unwrap();
+        let unrelated = real.join("unrelated.bin");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        let preserved_gid = foreign_gid_we_may_set();
+        if let Some(gid) = preserved_gid {
+            std::os::unix::fs::lchown(&real, None, Some(gid)).unwrap();
+            std::os::unix::fs::lchown(&unrelated, None, Some(gid)).unwrap();
+        }
+        let alias = front.join("active.toml");
+        symlink("lists/real/config.toml", &alias).unwrap();
+        let layout = InitLayout::for_config(&alias);
+        let external_roots = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&external_roots);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: move |path: &Path, recursive: bool| -> anyhow::Result<()> {
+                seen.borrow_mut().push((path.to_path_buf(), recursive));
+                Ok(())
+            },
+        };
+
+        let outcome = init_locked(&layout, true, "new", &ops).unwrap();
+        let backup = outcome.pre_init_copy.unwrap();
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "new");
+        assert_eq!(
+            &*external_roots.borrow(),
+            &[
+                (front.clone(), false),
+                (front.join("lists"), false),
+                (front.join("data"), true),
+            ]
+        );
+        if let Some(gid) = preserved_gid {
+            assert_eq!(std::fs::metadata(&real).unwrap().gid(), gid);
+            assert_eq!(std::fs::metadata(&unrelated).unwrap().gid(), gid);
+        }
+        assert_eq!(backup.parent(), canonical.parent());
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("config.toml.pre-init-"),
+            "backup must be beside the canonical master: {}",
+            backup.display()
+        );
+    }
+
+    #[test]
+    fn same_directory_leaf_alias_only_reowns_managed_entries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("config.toml");
+        std::fs::write(&canonical, "old").unwrap();
+        let alias = dir.path().join("active.toml");
+        symlink("config.toml", &alias).unwrap();
+        let lists = dir.path().join("lists");
+        std::fs::create_dir(&lists).unwrap();
+        let managed = lists.join("cache.bin");
+        std::fs::write(&managed, "cache").unwrap();
+        let unrelated = dir.path().join("unrelated.bin");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        let preserved_gid = foreign_gid_we_may_set();
+        if let Some(gid) = preserved_gid {
+            std::os::unix::fs::lchown(&managed, None, Some(gid)).unwrap();
+            std::os::unix::fs::lchown(&unrelated, None, Some(gid)).unwrap();
+        }
+        let layout = InitLayout::for_config(&alias);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+
+        init_locked(&layout, true, "new", &ops).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), "new");
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        if let Some(gid) = preserved_gid {
+            assert_eq!(
+                std::fs::metadata(&managed).unwrap().gid(),
+                current_owner().unwrap().1
+            );
+            assert_eq!(std::fs::metadata(&unrelated).unwrap().gid(), gid);
+        }
+    }
+
+    #[test]
+    fn replaced_root_is_not_sent_to_external_path_chown() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let held = dir.path().join("held");
+        let held_after = held.clone();
+        let replacement = root.clone();
+        let config = root.join("config.toml");
+        let layout = InitLayout::for_config(&config);
+        let external_roots = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&external_roots);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: move |path: &Path, recursive: bool| -> anyhow::Result<()> {
+                seen.borrow_mut().push((path.to_path_buf(), recursive));
+                Ok(())
+            },
+        };
+
+        write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    std::fs::rename(&root, &held).unwrap();
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
+                        .unwrap();
+                }
+            },
+            || init_locked(&layout, false, "new", &ops),
         )
         .unwrap();
 
-        let pre = check_preconditions(&config, true).expect("--force must be allowed");
+        assert!(external_roots.borrow().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(held_after.join("config.toml")).unwrap(),
+            "new"
+        );
         assert!(
-            pre.replacing_existing,
-            "the rename-aside step keys off this flag"
+            !config.exists(),
+            "the replacement root received no scaffold"
+        );
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711,
+            "the replacement root mode must not be normalized"
+        );
+        assert_eq!(
+            std::fs::read_dir(&replacement).unwrap().count(),
+            0,
+            "the replacement root must not receive state directories"
         );
     }
 
-    /// A fresh install passes with nothing to replace.
     #[test]
-    fn absent_config_passes_with_nothing_to_replace() {
+    fn coordinator_drops_the_guard_before_returning() {
+        use std::time::Duration;
+
         let dir = tempfile::tempdir().unwrap();
-        let pre = check_preconditions(&dir.path().join("config.toml"), false)
-            .expect("a fresh install must proceed");
-        assert!(!pre.replacing_existing);
+        let config = dir.path().join("config.toml");
+        let layout = InitLayout::for_config(&config);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+        init_locked(&layout, false, "new", &ops).unwrap();
+
+        let probe = write_lock::acquire_for_write_with_timeout(&config, Duration::from_millis(50))
+            .expect("the init guard must be gone before its caller continues");
+        drop(probe);
     }
 
     /// A relative `--config` must not produce an empty parent that
@@ -1934,8 +2811,9 @@ mod tests {
         let parsed: Result<ConfigV1, _> = toml::from_str(&body);
         assert!(
             parsed.is_ok(),
-            "default config should be valid v2 TOML: {parsed:?}"
+            "default config should be valid TOML: {parsed:?}"
         );
+        assert_eq!(parsed.unwrap().schema_version, SCHEMA_VERSION_V1);
     }
 
     // Replaces the old `default_config_sources_match_catalog_defaults`,
@@ -2082,6 +2960,7 @@ mod tests {
 
         let mut cfg: ConfigV1 =
             toml::from_str(&body).expect("rendered template parses as ConfigV1");
+        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
 
         // The scaffold deliberately ships NO upstream, so it
         // must fail validation on exactly that and nothing else. `warden

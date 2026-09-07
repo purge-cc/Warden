@@ -31,6 +31,9 @@ use purge_warden::config::schema::validator::{
     SAFE_SEARCH_FLAG_SELECTS_NOTHING, SECURITY_DISABLED_DROPS_ANTI_BYPASS,
 };
 use purge_warden::filter::rules::RuleParseError;
+use purge_warden::lists::source_key::{
+    format_list_source_alias_conflict, LIST_SOURCE_ALIAS_CONFLICT,
+};
 
 fn sample_variants() -> Vec<RuleParseError> {
     vec![
@@ -123,6 +126,18 @@ fn blocklist_duplicate_url_format_names_all_ids_and_the_url() {
     assert!(msg.contains("\"https://lists.purge.cc/ads.txt\""), "{msg}");
     // Ids are comma-separated, not concatenated.
     assert!(msg.contains("privacy-ads, ads"), "{msg}");
+}
+
+#[test]
+fn list_source_alias_conflict_template_byte_pinned() {
+    assert_eq!(
+        LIST_SOURCE_ALIAS_CONFLICT,
+        "list source aliases \"{first}\" and \"{second}\" resolve to \"{url}\" but disagree on {field}; make their effective source settings identical or disable one"
+    );
+    assert_eq!(
+        format_list_source_alias_conflict("first", "second", "https://example.test/a", "parser format"),
+        "list source aliases \"first\" and \"second\" resolve to \"https://example.test/a\" but disagree on parser format; make their effective source settings identical or disable one"
+    );
 }
 
 // ── N1 — the anti-bypass drop is loud ────────────────────────────────

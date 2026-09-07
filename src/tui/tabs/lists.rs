@@ -560,7 +560,7 @@ fn render_overlays(f: &mut Frame, area: Rect, app: &App) {
                 let cascade_targets = compute_cascade_targets(app, &modal.blocklist_id);
                 render_delete_confirm(f, area, modal, typed.as_str(), &cascade_targets)
             }
-            EditModalMode::ConfirmUnsignedAllow { typed } => render_unsigned_allow_confirm(
+            EditModalMode::ConfirmUnsignedAllow { typed, .. } => render_unsigned_allow_confirm(
                 f,
                 area,
                 &modal.blocklist_id,
@@ -1079,7 +1079,6 @@ pub fn build_edit_modal_for(
 /// entry + drops the orphan from `[lists].sources`.
 pub fn build_promote_modal_for(app: &App) -> Option<EditListModal> {
     use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust, Id};
-    use crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES;
 
     let meta = focused_list(app)?;
     // Refuse when this row already has a managed `[[blocklists]]` entry —
@@ -1111,18 +1110,14 @@ pub fn build_promote_modal_for(app: &App) -> Option<EditListModal> {
         .map(|_| id_seed)
         .unwrap_or_else(|_| String::new());
 
-    // Synthetic original — Promote mode never reads `original` for
-    // round-trip behavior, but `submit_edit_modal` consults
-    // `original.max_entries` and `original.trust` to fill schema
-    // defaults. Use the daemon-wide defaults so the new entry shapes
-    // exactly like one freshly added via `warden blocklist add`.
+    // Synthetic values are inherited so a new row does not manufacture overrides.
     let original = Blocklist {
         id: Id::new("placeholder").expect("static placeholder is valid"),
         display_name: String::new(),
         url: String::new(),
         format: BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: DEFAULT_MAX_LIST_ENTRIES as u64,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: BlocklistBase::Deny,
@@ -1142,11 +1137,12 @@ pub fn build_promote_modal_for(app: &App) -> Option<EditListModal> {
         url: url_seed,
         nature: BlocklistBase::Deny,
         enabled: true,
-        interval: IntervalChoice::H12,
+        interval: IntervalChoice::Inherited,
         interval_custom_buf: String::new(),
         format: BlocklistFormat::Domains,
         auth_token_ref: String::new(),
         skip_head_check: false,
+        head_probe_passed_for: None,
         original,
         focus: EditField::ListId,
         advanced_expanded: false,
@@ -1286,6 +1282,8 @@ pub fn build_catalog_picker_modal_from(
                 canonical_id: existing
                     .map(|b| b.id.as_str().to_string())
                     .unwrap_or_else(|| catalog_id.replace('/', "-")),
+                captured_id: existing.map(|b| b.id.as_str().to_string()),
+                captured_canonical_url: existing.map(|b| canonical_url_key(&b.url)),
                 url: e.url.clone(),
                 display_name: format!(
                     "{}: {}",
@@ -1781,8 +1779,8 @@ pub fn render_catalog_picker(f: &mut Frame, area: Rect, modal: &app::CatalogPick
 
 /// Build the "Add new list" modal — same form layout as Promote but
 /// with no source string to clean up at save. All buffers start blank,
-/// the synthetic `original` snapshot only carries the schema defaults
-/// the save pipeline reads (`max_entries`, `trust`). Cursor lands on
+/// the synthetic `original` snapshot carries read-only schema values.
+/// Cursor lands on
 /// List ID because it's the first thing the operator must type.
 ///
 /// Builds a blank Add modal, `base = Deny` as the default nature.
@@ -1793,15 +1791,14 @@ pub fn render_catalog_picker(f: &mut Frame, area: Rect, modal: &app::CatalogPick
 /// `uncategorized` an exemption the operator never chose.
 pub fn build_add_modal() -> EditListModal {
     use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust, Id};
-    use crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES;
 
     let original = Blocklist {
         id: Id::new("placeholder").expect("static placeholder is valid"),
         display_name: String::new(),
         url: String::new(),
         format: BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: DEFAULT_MAX_LIST_ENTRIES as u64,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: BlocklistBase::Deny,
@@ -1821,13 +1818,14 @@ pub fn build_add_modal() -> EditListModal {
         url: String::new(),
         nature: BlocklistBase::Deny,
         enabled: true,
-        interval: IntervalChoice::H12,
+        interval: IntervalChoice::Inherited,
         interval_custom_buf: String::new(),
         format: BlocklistFormat::Domains,
         auth_token_ref: String::new(),
         // No default chip on either branch — see this function's doc
         // comment for why.
         skip_head_check: false,
+        head_probe_passed_for: None,
         original,
         focus: EditField::ListId,
         advanced_expanded: false,
@@ -1868,9 +1866,9 @@ fn build_edit_modal_from_blocklist(
     canonical_id: String,
     blist: crate::config::schema::Blocklist,
 ) -> Option<EditListModal> {
-    let interval = IntervalChoice::from_hours(blist.update_interval_hours);
+    let interval = IntervalChoice::from_optional_hours(blist.update_interval_hours);
     let interval_custom_buf = if matches!(interval, IntervalChoice::Custom) {
-        blist.update_interval_hours.to_string()
+        blist.update_interval_hours.unwrap_or_default().to_string()
     } else {
         String::new()
     };
@@ -1882,6 +1880,7 @@ fn build_edit_modal_from_blocklist(
         nature: blist.base,
         enabled: blist.enabled,
         skip_head_check: false,
+        head_probe_passed_for: None,
         interval,
         interval_custom_buf,
         format: blist.format,

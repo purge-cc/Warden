@@ -35,11 +35,10 @@
 //!
 //! # Validation
 //!
-//! After the files are written, [`crate::config::loader::load_config`]
-//! runs end-to-end against the new master. A validator failure aborts the
-//! migration with the full error list (file:line per error). The legacy
-//! file is NEVER deleted by this tool: the operator removes it manually
-//! after confirming the new tree boots.
+//! The complete destination overlay is validated as historical schema v3
+//! before any file is promoted. A validation failure aborts with the full
+//! error list. The legacy file is NEVER deleted by this tool: the operator
+//! removes it manually after confirming the new tree boots.
 //!
 //! # Backup
 //!
@@ -48,7 +47,9 @@
 //! cannot undo itself, but the backup gives the operator a trivial
 //! rollback: point the systemd unit's `--config` back at the old file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::Metadata;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
@@ -57,44 +58,229 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use toml::Value;
 
-use crate::cli::commands::config::restore::StagingDir;
-use crate::config::atomic_write::atomic_write_and_validate;
+use crate::cli::commands::target::{write_historical_values_validated_locked, StagedWrite};
 use crate::config::schema::{
     AdminRule, Blocklist, BlocklistFormat, ConfigV1, Device, Id, Profile, Schedule,
-    SCHEMA_VERSION_V1,
 };
 use crate::config::settings::{ClientConfig, ScheduleConfig};
-use crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES;
+use crate::config::write_lock::{self, ConfigWriteLock};
 
-/// Syntactic TOML round-trip validator for the migration writes. Full
-/// v1 / v2 loader passes would fail on mid-migration intermediate
-/// states (a slice file may already carry v2 shape while the master
-/// still carries v1, etc.) — the `toml::Value` parse catches
-/// serialiser corruption without coupling to schema-stage timing.
-fn migration_toml_validator(staged: &Path) -> Result<(), String> {
-    let raw = std::fs::read_to_string(staged).map_err(|e| e.to_string())?;
-    raw.parse::<Value>().map(|_| ()).map_err(|e| e.to_string())
+pub mod v3_to_v4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum V3ToV4Mode {
+    Migrate,
+    Check,
+    Rollback,
+    Finalize,
 }
 
-/// Adapter: pipe an [`atomic_write_and_validate`] call into the
-/// migration's `anyhow::Result` surface with a fixed validator.
-fn migration_atomic_write(path: &Path, content: &str) -> anyhow::Result<()> {
-    atomic_write_and_validate(path, content, migration_toml_validator)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+/// CLI entry point for `warden migrate v3-to-v4`.
+pub fn run_v3_to_v4(from_config: &Path, mode: V3ToV4Mode) -> anyhow::Result<i32> {
+    match mode {
+        V3ToV4Mode::Migrate => run_v3_to_v4_migrate(from_config),
+        V3ToV4Mode::Check => run_v3_to_v4_check(from_config),
+        V3ToV4Mode::Rollback => run_v3_to_v4_rollback(from_config),
+        V3ToV4Mode::Finalize => run_v3_to_v4_finalize(from_config),
+    }
 }
 
-/// Create `path` (and any missing parents) at `mode` rather than the umask
-/// default. Migrated `*.d/` slice dirs must not be world-listable — the
-/// filenames leak device/profile ids even when the file contents stay `0o640`.
-/// Mirrors `backup.rs` / `init.rs`; `recursive` makes it a no-op on an existing
-/// dir (the mode applies only to dirs we actually create).
-fn create_dir_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(mode)
-        .create(path)
-        .with_context(|| format!("cannot create {} (mode {:o})", path.display(), mode))
+fn print_source_plan_warnings(warnings: Vec<String>) {
+    let mut printed_warnings = BTreeSet::new();
+    for warning in warnings {
+        if printed_warnings.insert(warning.clone()) {
+            eprintln!("warning: {warning}");
+        }
+    }
+}
+
+fn run_v3_to_v4_migrate(from_config: &Path) -> anyhow::Result<i32> {
+    let summary = v3_to_v4::migrate_tree(from_config)?;
+    print_source_plan_warnings(summary.source_plan_warnings);
+    match summary.status {
+        v3_to_v4::TreeMigrationStatus::AlreadyV4 => {
+            println!("config is already schema 4 and unchanged");
+        }
+        v3_to_v4::TreeMigrationStatus::Migrated {
+            members,
+            cleanup_path,
+        } => {
+            println!("migrated {members} config member(s) to schema 4");
+            println!("retained rollback snapshot: {}", cleanup_path.display());
+            println!("keep the snapshot until the release health gate succeeds");
+        }
+    }
+    Ok(0)
+}
+
+fn run_v3_to_v4_check(from_config: &Path) -> anyhow::Result<i32> {
+    let summary = v3_to_v4::check_tree(from_config)?;
+    print_source_plan_warnings(summary.source_plan_warnings);
+    match summary.status {
+        v3_to_v4::TreeCheckStatus::AlreadyV4 => {
+            println!("config is already schema 4 and valid");
+        }
+        v3_to_v4::TreeCheckStatus::Ready { members } => {
+            println!("schema-3 config is ready for v3-to-v4 migration ({members} members)");
+        }
+    }
+    Ok(0)
+}
+
+fn run_v3_to_v4_rollback(from_config: &Path) -> anyhow::Result<i32> {
+    let summary = v3_to_v4::rollback_tree(from_config)?;
+    print_source_plan_warnings(summary.source_plan_warnings);
+    match summary.status {
+        v3_to_v4::TreeRollbackStatus::Restored => {
+            println!("schema-3 config restored and valid");
+        }
+        v3_to_v4::TreeRollbackStatus::AlreadyValidNoSnapshot => {
+            println!("schema-3 config is already valid; no rollback snapshot found");
+        }
+    }
+    Ok(0)
+}
+
+fn run_v3_to_v4_finalize(from_config: &Path) -> anyhow::Result<i32> {
+    let summary = v3_to_v4::finalize_tree(from_config)?;
+    print_source_plan_warnings(summary.source_plan_warnings);
+    match summary.status {
+        v3_to_v4::TreeFinalizeStatus::Finalized => {
+            println!("schema-4 config is valid; rollback snapshot finalized");
+        }
+        v3_to_v4::TreeFinalizeStatus::AlreadyValidNoSnapshot => {
+            println!("schema-4 config is valid; no rollback snapshot found");
+        }
+    }
+    Ok(0)
+}
+
+// Historical commands must stay on v3 when the live schema advances.
+const HISTORICAL_SCHEMA_V3: u32 = 3;
+
+struct SourceSnapshot {
+    raw: String,
+    metadata: Metadata,
+    display: PathBuf,
+    in_destination_tree: bool,
+    external_parent: Option<std::fs::File>,
+}
+
+/// Read the legacy document once after the destination tree is fenced.  A
+/// member admitted by the held tree is never reopened by pathname; a rejected
+/// in-tree spelling is an error, not an excuse to fall back to external I/O.
+fn snapshot_source_locked(
+    guard: &ConfigWriteLock,
+    source: &Path,
+    destination_master: &Path,
+) -> anyhow::Result<SourceSnapshot> {
+    let tree = guard.tree_io();
+    match tree.plan_target(source) {
+        Ok(plan) => {
+            let raw = plan
+                .read_original()?
+                .ok_or_else(|| anyhow!("config not found: {}", source.display()))?;
+            let metadata = plan
+                .original_metadata()
+                .cloned()
+                .expect("existing source plan has metadata");
+            Ok(SourceSnapshot {
+                raw,
+                metadata,
+                display: plan.display().to_path_buf(),
+                in_destination_tree: true,
+                external_parent: None,
+            })
+        }
+        Err(in_tree_error) => {
+            let cwd = std::env::current_dir()?;
+            let source_spelling = normalize_absolute(&cwd, source);
+            let canonical_root = normalize_absolute(
+                Path::new("/"),
+                guard.canonical_master().parent().expect("master parent"),
+            );
+            let requested_root = normalize_absolute(
+                &cwd,
+                destination_master
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            );
+            if source_spelling.starts_with(&canonical_root)
+                || source_spelling.starts_with(&requested_root)
+            {
+                return Err(in_tree_error);
+            }
+            let (resolved, inspected) =
+                crate::config::tree_io::resolve_external_entry_from(source, &cwd)?;
+            if resolved.starts_with(guard.canonical_master().parent().expect("master parent")) {
+                return Err(in_tree_error);
+            }
+            let inspected =
+                inspected.ok_or_else(|| anyhow!("config not found: {}", source.display()))?;
+            let metadata = inspected.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "config path is not a regular file: {}",
+                source.display()
+            );
+            let mut raw = String::new();
+            crate::config::write_lock::reopen_inspected(&inspected, libc::O_RDONLY)?
+                .take(crate::config::loader::MAX_TOTAL_BYTES + 1)
+                .read_to_string(&mut raw)?;
+            anyhow::ensure!(
+                raw.len() as u64 <= crate::config::loader::MAX_TOTAL_BYTES,
+                "config snapshot exceeds size limit"
+            );
+            #[cfg(test)]
+            crate::config::write_lock::test_event(
+                crate::config::write_lock::TestEvent::BeforeExternalSourceParentPin,
+            );
+            let parent_path = resolved
+                .parent()
+                .ok_or_else(|| anyhow!("legacy config path has no parent directory"))?;
+            let parent = crate::config::tree_io::plan_external_directory_from(parent_path, &cwd)?
+                .open_existing()?;
+            let current = crate::config::tree_io::inspect_at(
+                &parent,
+                resolved.file_name().context("legacy config filename")?,
+            )?
+            .context("legacy config disappeared while pinning its parent")?;
+            anyhow::ensure!(
+                crate::config::tree_io::same_inode(&metadata, &current.metadata()?),
+                "legacy config parent changed while taking its snapshot"
+            );
+            Ok(SourceSnapshot {
+                raw,
+                metadata,
+                display: resolved,
+                in_destination_tree: false,
+                external_parent: Some(parent),
+            })
+        }
+    }
+}
+
+fn normalize_absolute(cwd: &Path, path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
 }
 
 /// Per-category entity counts reported by the migration, plus the notes
@@ -131,12 +317,9 @@ pub fn run(
 /// `v1-to-v3`**.
 ///
 /// The verb cannot do what its name says any more. `migrate_v1_to_v2`
-/// writes [`SCHEMA_VERSION_V1`] into its output, which is now `3`, so it
-/// would stamp a v3 version onto v2 *content* (`kind`, no `lists`) and its
-/// own post-write validator would refuse it. Writing a literal `2` does not
-/// rescue it either: `check_schema_version` demands equality with the
-/// current constant, so the output would be a file no binary in the tree
-/// can load. There is no reading of "v1 to v2" this build can satisfy.
+/// preserves its historical v2 shape transformation but stamps and validates
+/// its output as schema v3, so it cannot produce a schema-v2 config. There is
+/// no reading of "v1 to v2" this build can satisfy.
 ///
 /// So it forwards, loudly, rather than being deleted: an operator following
 /// a two-year-old runbook gets their config migrated and told the new name,
@@ -190,14 +373,25 @@ pub fn migrate_v1_to_v2(
     target: &Path,
     force: bool,
 ) -> anyhow::Result<V1ToV2Summary> {
-    if !from_config.exists() {
-        bail!("v1 config not found: {}", from_config.display());
-    }
+    let guard = write_lock::acquire_for_write(target)?;
+    migrate_v1_to_v2_locked(&guard, from_config, target, force)
+}
+
+fn migrate_v1_to_v2_locked(
+    guard: &ConfigWriteLock,
+    from_config: &Path,
+    target: &Path,
+    force: bool,
+) -> anyhow::Result<V1ToV2Summary> {
+    guard.verify_master(target)?;
+    let source = snapshot_source_locked(guard, from_config, target)
+        .with_context(|| format!("v1 config not found: {}", from_config.display()))?;
+    let target_exists = !guard.tree_io().plan_master_target()?.is_new();
 
     // Refuse to clobber an existing target
     // unless --force. Previously the single-file output was overwritten
     // silently, costing operator post-edits on a re-run.
-    if target.exists() && !force {
+    if target_exists && !force {
         bail!(
             "target {} already exists. Pass --force to overwrite (will replace the file). \
              Re-running on an already-migrated input is idempotent so the new \
@@ -207,75 +401,51 @@ pub fn migrate_v1_to_v2(
         );
     }
 
-    let raw = std::fs::read_to_string(from_config)
-        .with_context(|| format!("cannot read {}", from_config.display()))?;
-    let mut root: Value = raw
+    let mut root: Value = source
+        .raw
         .parse()
         .with_context(|| format!("{} is not valid TOML", from_config.display()))?;
 
     let mut summary = V1ToV2Summary::default();
     apply_v1_to_v2_transformations(&mut root, &mut summary)?;
 
-    // Pin schema_version to the current value so a downgrade-input
-    // (legacy schema_version = 1) lands on the current v2 wire.
+    // Pin the historical migration output rather than following the live schema.
     if let Value::Table(t) = &mut root {
         t.insert(
             "schema_version".into(),
-            Value::Integer(SCHEMA_VERSION_V1 as i64),
+            Value::Integer(HISTORICAL_SCHEMA_V3 as i64),
         );
     }
 
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-    }
-
-    if force && target.exists() {
+    if force && target_exists {
         eprintln!(
             "warning: --force overwrites existing target {}",
             target.display()
         );
     }
 
-    let backup_path = backup_legacy(from_config)?;
+    let backup_path = backup_legacy_locked(guard, &source)?;
     summary.backup_path = backup_path;
 
     let output = toml::to_string_pretty(&root).with_context(|| "failed to serialise v2 config")?;
 
-    // Validate through the full v2 loader BEFORE the rename, not after.
-    // `atomic_write_and_validate` writes a temp in target's directory, runs
-    // the validator against that temp, and only renames it into place if it
-    // passes — so a transformation bug surfaces here with `target` left
-    // untouched, instead of after a corrupt-but-parseable config has already
-    // clobbered the live master (the `--from-config X --target X --force`
-    // in-place case the migrate-transactionality lens forbids). The v0→v1
-    // multi-file path keeps the TOML-parse-only validator because its staged
-    // slices can be mid-schema; this v1→v2 path produces a single complete
-    // file, so the full loader can and must gate the rename.
-    let now = OffsetDateTime::now_utc();
-    atomic_write_and_validate(target, &output, |staged: &Path| {
-        crate::config::loader::load_config(staged, now)
-            .map(|_| ())
-            .map_err(|errs| {
-                let mut msg = format!("{} error(s):", errs.len());
-                for e in &errs {
-                    msg.push_str("\n  - ");
-                    msg.push_str(&e.to_string());
-                }
-                msg
-            })
-    })
+    write_historical_values_validated_locked(
+        guard,
+        target,
+        &[StagedWrite {
+            final_path: guard.canonical_master().to_path_buf(),
+            content: output,
+        }],
+        HISTORICAL_SCHEMA_V3,
+    )
     .map_err(|e| {
         anyhow!(
-            "v1→v2 migration produced an invalid v2 config ({e})\n\
+            "v1→v2 migration did not complete ({e})\n\
              legacy backup preserved at {}; the input may carry an unhandled \
              field or a custom invariant the migrator does not know about — fix \
-             the input or extend `apply_v1_to_v2_transformations`. {} was left \
-             unchanged.",
-            summary.backup_path.display(),
-            target.display()
+             the input or extend `apply_v1_to_v2_transformations`. Migration did \
+             not complete; see the transaction detail above for recovery state.",
+            summary.backup_path.display()
         )
     })?;
     summary.target_path = target.to_path_buf();
@@ -781,10 +951,21 @@ pub fn migrate_v2_to_v3(
     target: &Path,
     force: bool,
 ) -> anyhow::Result<V2ToV3Summary> {
-    if !from_config.exists() {
-        bail!("v2 config not found: {}", from_config.display());
-    }
-    if target.exists() && !force && target != from_config {
+    let guard = write_lock::acquire_for_write(target)?;
+    migrate_v2_to_v3_locked(&guard, from_config, target, force)
+}
+
+fn migrate_v2_to_v3_locked(
+    guard: &ConfigWriteLock,
+    from_config: &Path,
+    target: &Path,
+    force: bool,
+) -> anyhow::Result<V2ToV3Summary> {
+    guard.verify_master(target)?;
+    let source = snapshot_source_locked(guard, from_config, target)
+        .with_context(|| format!("v2 config not found: {}", from_config.display()))?;
+    let target_exists = !guard.tree_io().plan_master_target()?.is_new();
+    if target_exists && !force && target != from_config {
         bail!(
             "target {} already exists. Pass --force to overwrite (will replace the file). \
              Re-running on an already-migrated input is idempotent, so the new output \
@@ -794,9 +975,8 @@ pub fn migrate_v2_to_v3(
         );
     }
 
-    let raw = std::fs::read_to_string(from_config)
-        .with_context(|| format!("cannot read {}", from_config.display()))?;
-    let mut root: Value = raw
+    let mut root: Value = source
+        .raw
         .parse()
         .with_context(|| format!("{} is not valid TOML", from_config.display()))?;
 
@@ -806,46 +986,35 @@ pub fn migrate_v2_to_v3(
     if let Value::Table(t) = &mut root {
         t.insert(
             "schema_version".into(),
-            Value::Integer(SCHEMA_VERSION_V1 as i64),
+            Value::Integer(HISTORICAL_SCHEMA_V3 as i64),
         );
     }
 
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-    }
-    if force && target.exists() {
+    if force && target_exists {
         eprintln!(
             "warning: --force overwrites existing target {}",
             target.display()
         );
     }
 
-    summary.backup_path = backup_legacy(from_config)?;
+    summary.backup_path = backup_legacy_locked(guard, &source)?;
 
     let output = toml::to_string_pretty(&root).with_context(|| "failed to serialise v3 config")?;
 
-    let now = OffsetDateTime::now_utc();
-    atomic_write_and_validate(target, &output, |staged: &Path| {
-        crate::config::loader::load_config(staged, now)
-            .map(|_| ())
-            .map_err(|errs| {
-                let mut msg = format!("{} error(s):", errs.len());
-                for e in &errs {
-                    msg.push_str("\n  - ");
-                    msg.push_str(&e.to_string());
-                }
-                msg
-            })
-    })
+    write_historical_values_validated_locked(
+        guard,
+        target,
+        &[StagedWrite {
+            final_path: guard.canonical_master().to_path_buf(),
+            content: output,
+        }],
+        HISTORICAL_SCHEMA_V3,
+    )
     .map_err(|e| {
         anyhow!(
-            "v2→v3 migration produced an invalid v3 config ({e})\n\
-             legacy backup preserved at {}; {} was left unchanged.",
-            summary.backup_path.display(),
-            target.display()
+            "v2→v3 migration did not complete ({e})\n\
+             legacy backup preserved at {}; see the transaction detail above for recovery state.",
+            summary.backup_path.display()
         )
     })?;
     summary.target_path = target.to_path_buf();
@@ -991,10 +1160,21 @@ pub fn migrate_v1_to_v3(
     target: &Path,
     force: bool,
 ) -> anyhow::Result<V1ToV3Summary> {
-    if !from_config.exists() {
-        bail!("v1 config not found: {}", from_config.display());
-    }
-    if target.exists() && !force && target != from_config {
+    let guard = write_lock::acquire_for_write(target)?;
+    migrate_v1_to_v3_locked(&guard, from_config, target, force)
+}
+
+fn migrate_v1_to_v3_locked(
+    guard: &ConfigWriteLock,
+    from_config: &Path,
+    target: &Path,
+    force: bool,
+) -> anyhow::Result<V1ToV3Summary> {
+    guard.verify_master(target)?;
+    let source = snapshot_source_locked(guard, from_config, target)
+        .with_context(|| format!("v1 config not found: {}", from_config.display()))?;
+    let target_exists = !guard.tree_io().plan_master_target()?.is_new();
+    if target_exists && !force && target != from_config {
         bail!(
             "target {} already exists. Pass --force to overwrite (will replace the file). \
              Re-running on an already-migrated input is idempotent so the new \
@@ -1004,9 +1184,8 @@ pub fn migrate_v1_to_v3(
         );
     }
 
-    let raw = std::fs::read_to_string(from_config)
-        .with_context(|| format!("cannot read {}", from_config.display()))?;
-    let mut root: Value = raw
+    let mut root: Value = source
+        .raw
         .parse()
         .with_context(|| format!("{} is not valid TOML", from_config.display()))?;
 
@@ -1048,47 +1227,36 @@ pub fn migrate_v1_to_v3(
     if let Value::Table(t) = &mut root {
         t.insert(
             "schema_version".into(),
-            Value::Integer(SCHEMA_VERSION_V1 as i64),
+            Value::Integer(HISTORICAL_SCHEMA_V3 as i64),
         );
     }
 
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-    }
-    if force && target.exists() {
+    if force && target_exists {
         eprintln!(
             "warning: --force overwrites existing target {}",
             target.display()
         );
     }
 
-    summary.backup_path = backup_legacy(from_config)?;
+    summary.backup_path = backup_legacy_locked(guard, &source)?;
     summary.v2.backup_path = summary.backup_path.clone();
 
     let output = toml::to_string_pretty(&root).with_context(|| "failed to serialise v3 config")?;
 
-    let now = OffsetDateTime::now_utc();
-    atomic_write_and_validate(target, &output, |staged: &Path| {
-        crate::config::loader::load_config(staged, now)
-            .map(|_| ())
-            .map_err(|errs| {
-                let mut msg = format!("{} error(s):", errs.len());
-                for e in &errs {
-                    msg.push_str("\n  - ");
-                    msg.push_str(&e.to_string());
-                }
-                msg
-            })
-    })
+    write_historical_values_validated_locked(
+        guard,
+        target,
+        &[StagedWrite {
+            final_path: guard.canonical_master().to_path_buf(),
+            content: output,
+        }],
+        HISTORICAL_SCHEMA_V3,
+    )
     .map_err(|e| {
         anyhow!(
-            "v1→v3 migration produced an invalid v3 config ({e})\n\
-             legacy backup preserved at {}; {} was left unchanged.",
-            summary.backup_path.display(),
-            target.display()
+            "v1→v3 migration did not complete ({e})\n\
+             legacy backup preserved at {}; see the transaction detail above for recovery state.",
+            summary.backup_path.display()
         )
     })?;
     summary.target_path = target.to_path_buf();
@@ -1290,129 +1458,96 @@ fn print_v1_to_v2_summary(s: &V1ToV2Summary) {
 
 /// Core migration routine, public for tests + programmatic callers.
 ///
-/// The write sequence is
-/// transactional via a `<target>/.staging/` directory:
-///
-/// 1. Pre-flight: refuse to clobber existing migration artifacts
-///    unless `force` is set.
-/// 2. `backup_legacy` runs BEFORE any write so a crash mid-stage
-///    leaves the operator with a recoverable state (pre-fix the
-///    backup landed AFTER `write_multi_file`).
-/// 3. All writes land in `<target>/.staging/<class>.d/...` first;
-///    the staged master is then validated end-to-end via
-///    `load_config`.
-/// 4. Only after validation succeeds is the staged tree promoted
-///    into `<target>/` via per-file `rename(2)` (atomic within a
-///    filesystem) — and the staging directory is removed.
-/// 5. A staging/validation failure (step 3) wipes the staging directory
-///    and leaves `<target>/` untouched. A failure *during* promote (step 4
-///    — rare: post-validation intra-filesystem renames) also wipes staging
-///    but may leave `<target>/` holding a partial subset of the renamed
-///    files; the legacy config is never touched, so re-running with
-///    `--force` completes it.
+/// The write sequence is fenced by the destination guard: snapshot and
+/// backup first, render all writes in memory, validate the final overlay as
+/// historical schema v3, then publish the slices before the master.
+/// Overlay-validation failure promotes nothing; a later write failure uses
+/// reverse compensating rollback and may report that recovery is required.
 pub fn migrate(
     legacy_config: &Path,
     target: &Path,
     single_file: bool,
     force: bool,
 ) -> anyhow::Result<MigrationSummary> {
-    if !legacy_config.exists() {
-        bail!("legacy config not found: {}", legacy_config.display());
-    }
+    let destination_master = target.join("config.toml");
+    let guard = write_lock::acquire_for_write(&destination_master)?;
+    migrate_locked(
+        &guard,
+        legacy_config,
+        target,
+        &destination_master,
+        single_file,
+        force,
+    )
+}
 
-    let raw = std::fs::read_to_string(legacy_config)
-        .with_context(|| format!("cannot read {}", legacy_config.display()))?;
-    let root: Value = raw
+fn migrate_locked(
+    guard: &ConfigWriteLock,
+    legacy_config: &Path,
+    target: &Path,
+    destination_master: &Path,
+    single_file: bool,
+    force: bool,
+) -> anyhow::Result<MigrationSummary> {
+    guard.verify_master(destination_master)?;
+    let source = snapshot_source_locked(guard, legacy_config, destination_master)
+        .with_context(|| format!("legacy config not found: {}", legacy_config.display()))?;
+    let root: Value = source
+        .raw
         .parse()
         .with_context(|| format!("{} is not valid TOML", legacy_config.display()))?;
 
     let (mut config_v1, mut notes) = translate(&root)?;
 
     // Pre-flight: target shape + overwrite policy.
-    if target.exists() {
-        if !target.is_dir() {
-            bail!("{} exists and is not a directory", target.display());
-        }
-        if target_has_existing_artifacts(target)? {
-            if !force {
-                bail!(
-                    "{} already contains migration artifacts (config.toml or non-empty \
-                     <entity>.d/). Pass --force to overwrite — the master + every \
-                     auto-migrated.toml slice will be replaced; other files in \
-                     <entity>.d/ stay untouched.",
-                    target.display()
-                );
-            }
-            eprintln!(
-                "warning: --force overwrites the existing migration tree under {}",
+    if target_has_existing_artifacts_locked(guard)? {
+        if !force {
+            bail!(
+                "{} already contains migration artifacts (config.toml or non-empty \
+                 <entity>.d/). Pass --force to overwrite — the master + every \
+                 auto-migrated.toml slice will be replaced; other files in \
+                 <entity>.d/ stay untouched.",
                 target.display()
             );
         }
-    } else {
-        create_dir_mode(target, 0o750)?;
+        eprintln!(
+            "warning: --force overwrites the existing migration tree under {}",
+            target.display()
+        );
     }
 
     // Backup BEFORE any writes hit disk so a partial
     // crash leaves the operator with a recoverable state.
-    let backup_path = backup_legacy(legacy_config)?;
+    let backup_path = backup_legacy_locked(guard, &source)?;
 
-    // Stage into a CSPRNG-named 0o700 dir under the target
-    // (same filesystem, so the promote rename(2) stays atomic) instead of a
-    // predictable, EEXIST-tolerant `<target>/.staging` an attacker could
-    // pre-create or symlink. The StagingDir guard wipes the staging tree on
-    // every exit path (success, error, or panic), replacing the manual
-    // remove_dir_all calls the previous code threaded through each arm.
-    let staging = StagingDir::create_in(target)?;
-    let staging_path = staging.path();
-
-    // Stage every write; StagingDir::drop wipes the tree on any early return.
-    let staged: anyhow::Result<(PathBuf, Counts)> = if single_file {
-        write_monolithic(staging_path, &config_v1)
+    let (rendered, counts) = if single_file {
+        render_monolithic(&config_v1)
     } else {
-        write_multi_file(staging_path, &mut config_v1)
-    };
-    let (staged_master, counts) = staged?;
-
-    // Validate the staged tree end-to-end. load_config follows the
-    // staged master's [includes] globs, which resolve relative to the
-    // master's directory (staging/) — so the staged slices are picked
-    // up correctly without any path rewriting.
-    let now = OffsetDateTime::now_utc();
-    if let Err(errs) = crate::config::loader::load_config(&staged_master, now) {
-        let mut msg = format!(
-            "migration produced an invalid v1 config at staged {} ({} error(s)):",
-            staged_master.display(),
-            errs.len()
-        );
-        for e in &errs {
-            msg.push_str("\n  - ");
-            msg.push_str(&e.to_string());
-        }
-        msg.push_str(&format!(
-            "\nlegacy backup preserved at {}; <target>/ left untouched. \
-             Fix the translator or the input config and re-run.",
-            backup_path.display()
-        ));
-        bail!(msg);
-    }
-
-    // Promote staged tree → target. Per-file rename(2) is atomic on
-    // the same filesystem; the validation step above ensures the
-    // tree is internally consistent, so a partial-promote (e.g. a
-    // crash between renames) leaves the target with a valid prefix
-    // and the operator can re-run with --force to finish.
-    // `<target>/` may hold a partial set of already-renamed files on
-    // a promote failure; the legacy config is never deleted, so a `--force`
-    // re-run completes the promote. StagingDir::drop wipes the staging
-    // remainder on either outcome.
-    let target_master = promote_staging_to_target(staging_path, target).map_err(|e| {
-        e.context(format!(
-            "promoting staged tree from {} to {} failed (target may hold a \
-             partial tree; re-run with --force)",
-            staging_path.display(),
+        render_multi_file(&mut config_v1)
+    }?;
+    let root = guard.canonical_master().parent().expect("master parent");
+    let writes = rendered
+        .into_iter()
+        .map(|(relative, content)| StagedWrite {
+            final_path: root.join(relative),
+            content,
+        })
+        .collect::<Vec<_>>();
+    write_historical_values_validated_locked(
+        guard,
+        destination_master,
+        &writes,
+        HISTORICAL_SCHEMA_V3,
+    )
+    .map_err(|error| {
+        anyhow!(
+            "migration did not complete ({error:#}); legacy backup preserved at {}; \
+             see the transaction detail for the state of {}",
+            backup_path.display(),
             target.display()
-        ))
+        )
     })?;
+    let target_master = guard.canonical_master().to_path_buf();
 
     // Surface a friendly reminder when the operator should pick a
     // `default_profile`. `translate` already pushed a note if the legacy
@@ -1447,8 +1582,9 @@ pub fn migrate(
 /// `<target>/config.toml` exists, or any of the known entity
 /// subdirectories carry at least one file. Used by `migrate()` and
 /// gated on `--force`.
-fn target_has_existing_artifacts(target: &Path) -> anyhow::Result<bool> {
-    if target.join("config.toml").exists() {
+fn target_has_existing_artifacts_locked(guard: &ConfigWriteLock) -> anyhow::Result<bool> {
+    let tree = guard.tree_io();
+    if !tree.plan_master_target()?.is_new() {
         return Ok(true);
     }
     for sub in [
@@ -1460,76 +1596,18 @@ fn target_has_existing_artifacts(target: &Path) -> anyhow::Result<bool> {
         "schedules.d",
         "rules.d",
     ] {
-        let dir = target.join(sub);
-        if dir.is_dir() {
-            let mut it = std::fs::read_dir(&dir)
-                .with_context(|| format!("cannot read {}", dir.display()))?;
-            if it.next().is_some() {
+        if let Some(dir) = tree.directory_from(&tree.master_key(), Path::new(sub))? {
+            let mut found = false;
+            crate::config::tree_io::for_each_dir_name(&dir, |_| {
+                found = true;
+                Ok(())
+            })?;
+            if found {
                 return Ok(true);
             }
         }
     }
     Ok(false)
-}
-
-/// Recursively rename every file under `staging` into the matching
-/// path under `target`. Directories are created as needed; existing
-/// files at the destination are removed before the rename so the
-/// per-file atomicity holds on overwrite. Returns the final path of
-/// the master `config.toml` for use in `MigrationSummary`.
-fn promote_staging_to_target(staging: &Path, target: &Path) -> anyhow::Result<PathBuf> {
-    let mut master_landed: Option<PathBuf> = None;
-    promote_recursive(staging, target, staging, &mut master_landed)?;
-    master_landed
-        .ok_or_else(|| anyhow!("internal: no config.toml landed during promote_staging_to_target"))
-}
-
-fn promote_recursive(
-    cur: &Path,
-    target_root: &Path,
-    staging_root: &Path,
-    master_landed: &mut Option<PathBuf>,
-) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(cur)
-        .with_context(|| format!("cannot read staging dir {}", cur.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path
-            .strip_prefix(staging_root)
-            .expect("staging-root prefix invariant: scanned path is under staging_root");
-        let dest = target_root.join(rel);
-
-        if path.is_dir() {
-            create_dir_mode(&dest, 0o750)?;
-            promote_recursive(&path, target_root, staging_root, master_landed)?;
-        } else {
-            if let Some(parent) = dest.parent() {
-                if !parent.exists() {
-                    create_dir_mode(parent, 0o750)?;
-                }
-            }
-            // Overwrite-safe: rename(2) replaces the destination on
-            // POSIX, but the explicit remove_file makes the --force
-            // overwrite intent visible in the diff and decouples the
-            // logic from kernel-specific rename atomicity edge cases.
-            if dest.exists() {
-                std::fs::remove_file(&dest)
-                    .with_context(|| format!("cannot remove existing {}", dest.display()))?;
-            }
-            std::fs::rename(&path, &dest).with_context(|| {
-                format!("cannot promote {} → {}", path.display(), dest.display())
-            })?;
-            // master_landed is the config.toml at the immediate root
-            // of target (NOT the per-profile *.toml under profiles.d/).
-            if dest.file_name().and_then(|n| n.to_str()) == Some("config.toml")
-                && dest.parent() == Some(target_root)
-            {
-                *master_landed = Some(dest);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn print_summary(s: &MigrationSummary) {
@@ -1638,10 +1716,10 @@ pub fn translate(root_raw: &Value) -> anyhow::Result<(ConfigV1, Vec<String>)> {
             }
         }
 
-        // Ensure schema_version = 2 before the v1 deserialiser looks at it.
+        // Pin historical v3 before ConfigV1 deserialises the input.
         root_table
             .entry("schema_version")
-            .or_insert_with(|| Value::Integer(SCHEMA_VERSION_V1 as i64));
+            .or_insert_with(|| Value::Integer(HISTORICAL_SCHEMA_V3 as i64));
     }
 
     let mut config_v1: ConfigV1 = filtered.try_into().map_err(|e: toml::de::Error| {
@@ -1665,20 +1743,7 @@ pub fn translate(root_raw: &Value) -> anyhow::Result<(ConfigV1, Vec<String>)> {
     let name_to_device_id = translate_v0_clients(&mut config_v1, v0_clients, &mut notes);
     translate_v0_schedules(&mut config_v1, v0_schedules, &name_to_device_id, &mut notes);
 
-    // Derive legacy `[lists].sources` from `[[blocklists]]` when the v0
-    // config had nothing — the downloader is still driven off `[lists]`
-    // until the kebab→slash shim is retired. Leaves an explicit array in
-    // the master so `warden start` picks up the right sources.
-    if config_v1.lists.sources.is_empty() && !config_v1.blocklists.is_empty() {
-        config_v1.lists.sources = config_v1
-            .blocklists
-            .iter()
-            .filter(|b| b.enabled)
-            .map(|b| kebab_to_slash(b.id.as_str()))
-            .collect();
-    }
-
-    config_v1.schema_version = SCHEMA_VERSION_V1;
+    config_v1.schema_version = HISTORICAL_SCHEMA_V3;
     Ok((config_v1, notes))
 }
 
@@ -1738,8 +1803,8 @@ fn apply_v0_profile_extras(
                     display_name: slash_id.clone(),
                     url: format!("https://lists.purge.cc/{slash_id}.txt"),
                     format: BlocklistFormat::Domains,
-                    update_interval_hours: 12,
-                    max_entries: DEFAULT_MAX_LIST_ENTRIES as u64,
+                    update_interval_hours: None,
+                    max_entries: None,
                     enabled: true,
                     auth_token_ref: None,
                     base: Default::default(),
@@ -1937,7 +2002,7 @@ fn translate_v0_schedules(
 
 // ── output writers ────────────────────────────────────────────────────
 
-fn write_multi_file(target_dir: &Path, config: &mut ConfigV1) -> anyhow::Result<(PathBuf, Counts)> {
+fn render_multi_file(config: &mut ConfigV1) -> anyhow::Result<(Vec<(PathBuf, String)>, Counts)> {
     let counts = Counts {
         devices: config.devices.len(),
         groups: config.groups.len(),
@@ -1958,13 +2023,19 @@ fn write_multi_file(target_dir: &Path, config: &mut ConfigV1) -> anyhow::Result<
         "rules.d/*.toml".to_string(),
     ];
 
-    write_array_file(target_dir, "devices.d", "devices", &config.devices)?;
-    write_array_file(target_dir, "groups.d", "groups", &config.groups)?;
-    write_array_file(target_dir, "subnets.d", "subnets", &config.subnets)?;
-    write_array_file(target_dir, "blocklists.d", "blocklists", &config.blocklists)?;
-    write_array_file(target_dir, "schedules.d", "schedules", &config.schedules)?;
-    write_array_file(target_dir, "rules.d", "admin_rules", &config.admin_rules)?;
-    write_profiles(target_dir, &config.profiles)?;
+    let mut writes = Vec::new();
+    render_array_file(&mut writes, "devices.d", "devices", &config.devices)?;
+    render_array_file(&mut writes, "groups.d", "groups", &config.groups)?;
+    render_array_file(&mut writes, "subnets.d", "subnets", &config.subnets)?;
+    render_array_file(
+        &mut writes,
+        "blocklists.d",
+        "blocklists",
+        &config.blocklists,
+    )?;
+    render_array_file(&mut writes, "schedules.d", "schedules", &config.schedules)?;
+    render_array_file(&mut writes, "rules.d", "admin_rules", &config.admin_rules)?;
+    render_profiles(&mut writes, &config.profiles)?;
 
     // Clone the full config; the master keeps `retired` (a ledger, not
     // a `.d/`-splittable entity class) plus every pass-through daemon
@@ -1979,15 +2050,15 @@ fn write_multi_file(target_dir: &Path, config: &mut ConfigV1) -> anyhow::Result<
     master_cfg.admin_rules.clear();
     master_cfg.profiles.clear();
 
-    let master_path = target_dir.join("config.toml");
     let master_str =
         toml::to_string_pretty(&master_cfg).context("failed to serialise v1 master config")?;
-    migration_atomic_write(&master_path, &master_str)?;
+    // The master switches the include graph, so it is always published last.
+    writes.push((PathBuf::from("config.toml"), master_str));
 
-    Ok((master_path, counts))
+    Ok((writes, counts))
 }
 
-fn write_monolithic(target_dir: &Path, config: &ConfigV1) -> anyhow::Result<(PathBuf, Counts)> {
+fn render_monolithic(config: &ConfigV1) -> anyhow::Result<(Vec<(PathBuf, String)>, Counts)> {
     let counts = Counts {
         devices: config.devices.len(),
         groups: config.groups.len(),
@@ -1998,15 +2069,12 @@ fn write_monolithic(target_dir: &Path, config: &ConfigV1) -> anyhow::Result<(Pat
         profiles: config.profiles.len(),
     };
 
-    let master_path = target_dir.join("config.toml");
     let s = toml::to_string_pretty(config).context("failed to serialise v1 config")?;
-    migration_atomic_write(&master_path, &s)?;
-
-    Ok((master_path, counts))
+    Ok((vec![(PathBuf::from("config.toml"), s)], counts))
 }
 
-fn write_array_file<T: Serialize>(
-    target_dir: &Path,
+fn render_array_file<T: Serialize>(
+    writes: &mut Vec<(PathBuf, String)>,
     subdir: &str,
     key: &str,
     items: &[T],
@@ -2014,9 +2082,6 @@ fn write_array_file<T: Serialize>(
     if items.is_empty() {
         return Ok(());
     }
-    let dir = target_dir.join(subdir);
-    create_dir_mode(&dir, 0o750)?;
-
     let mut arr = Vec::with_capacity(items.len());
     for item in items {
         let v = Value::try_from(item).with_context(|| format!("serialise {key} entry"))?;
@@ -2027,19 +2092,24 @@ fn write_array_file<T: Serialize>(
     let body = toml::to_string_pretty(&Value::Table(root))
         .with_context(|| format!("serialise {key} file"))?;
 
-    migration_atomic_write(&dir.join("auto-migrated.toml"), &body)
+    writes.push((Path::new(subdir).join("auto-migrated.toml"), body));
+    Ok(())
 }
 
-fn write_profiles(target_dir: &Path, profiles: &BTreeMap<String, Profile>) -> anyhow::Result<()> {
+fn render_profiles(
+    writes: &mut Vec<(PathBuf, String)>,
+    profiles: &BTreeMap<String, Profile>,
+) -> anyhow::Result<()> {
     if profiles.is_empty() {
         return Ok(());
     }
-    let dir = target_dir.join("profiles.d");
-    create_dir_mode(&dir, 0o750)?;
-
+    let mut destinations = BTreeSet::new();
     for (id_str, prof) in profiles {
         let safe_filename = sanitize_filename(id_str);
-        let path = dir.join(format!("{safe_filename}.toml"));
+        anyhow::ensure!(
+            destinations.insert(safe_filename.clone()),
+            "duplicate sanitized profile destination: profiles.d/{safe_filename}.toml"
+        );
 
         let mut root = toml::value::Table::new();
         let mut profiles_tbl = toml::value::Table::new();
@@ -2051,56 +2121,43 @@ fn write_profiles(target_dir: &Path, profiles: &BTreeMap<String, Profile>) -> an
 
         let body = toml::to_string_pretty(&Value::Table(root))
             .with_context(|| format!("serialise profile file for '{id_str}'"))?;
-        migration_atomic_write(&path, &body)?;
+        writes.push((
+            Path::new("profiles.d").join(format!("{safe_filename}.toml")),
+            body,
+        ));
     }
     Ok(())
 }
 
 // ── backup ────────────────────────────────────────────────────────────
 
-/// Give `path` `want_mode` and the owner of `src_meta`.
-///
-/// `std::fs::copy` carries the source's mode but stamps the copy with the
-/// *calling* process's identity, and there is nothing for a fresh path to
-/// inherit — unlike `hardened_atomic_write`, which preserves uid/gid only
-/// because it writes over an existing target. An upgrade run as root
-/// therefore leaves the rollback copy `root:root` beside a config the
-/// daemon user owns, and the daemon cannot read the one file it could be
-/// rolled back to.
-///
-/// Both calls are skipped when the metadata already matches — the steady
-/// state for an operator migrating their own files — so no ordinary run
-/// issues a `chown` at all.
-fn mirror_ownership(
-    path: &Path,
-    src_meta: &std::fs::Metadata,
+fn mirror_ownership_fd_or_warn(
+    file: &std::fs::File,
+    display: &Path,
+    src_meta: &Metadata,
     want_mode: u32,
-) -> std::io::Result<()> {
+) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let current = std::fs::symlink_metadata(path)?;
-    if current.mode() & 0o7777 != want_mode {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(want_mode))?;
-    }
-    if (current.uid(), current.gid()) != (src_meta.uid(), src_meta.gid()) {
-        std::os::unix::fs::lchown(path, Some(src_meta.uid()), Some(src_meta.gid()))?;
-    }
-    Ok(())
-}
+    use std::os::unix::io::AsRawFd;
 
-/// [`mirror_ownership`], downgraded to a warning.
-///
-/// A rollback copy with the wrong owner is worth shouting about but is not
-/// worth aborting an upgrade over: the bytes are correct and the operator
-/// running the migration can still read them. stderr, not `tracing` — no
-/// CLI dispatch installs a subscriber, and under the upgrade script stderr
-/// is the operator's terminal.
-fn mirror_ownership_or_warn(path: &Path, src_meta: &std::fs::Metadata, want_mode: u32) {
-    use std::os::unix::fs::MetadataExt;
-    if let Err(e) = mirror_ownership(path, src_meta, want_mode) {
+    let result = (|| -> std::io::Result<()> {
+        let current = file.metadata()?;
+        if current.mode() & 0o7777 != want_mode {
+            file.set_permissions(std::fs::Permissions::from_mode(want_mode))?;
+        }
+        if (current.uid(), current.gid()) != (src_meta.uid(), src_meta.gid()) {
+            let rc = unsafe { libc::fchown(file.as_raw_fd(), src_meta.uid(), src_meta.gid()) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
         eprintln!(
             "warning: cannot give {} mode {:o} and owner {}:{}: {e} \
              (the daemon user may not be able to read this rollback copy)",
-            path.display(),
+            display.display(),
             want_mode,
             src_meta.uid(),
             src_meta.gid()
@@ -2108,57 +2165,183 @@ fn mirror_ownership_or_warn(path: &Path, src_meta: &std::fs::Metadata, want_mode
     }
 }
 
-fn backup_legacy(legacy_config: &Path) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+fn open_existing_relative_directory(
+    mut directory: std::fs::File,
+    relative: &Path,
+) -> anyhow::Result<std::fs::File> {
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("non-canonical backup parent: {}", relative.display());
+        };
+        let entry = crate::config::tree_io::inspect_at(&directory, name)?
+            .ok_or_else(|| anyhow!("backup parent does not exist: {}", relative.display()))?;
+        let meta = entry.metadata()?;
+        anyhow::ensure!(
+            !meta.file_type().is_symlink() && meta.is_dir(),
+            "backup parent is not a directory: {}",
+            relative.display()
+        );
+        directory = write_lock::reopen_inspected(&entry, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    }
+    Ok(directory)
+}
 
-    let parent = legacy_config
-        .parent()
-        .ok_or_else(|| anyhow!("legacy config path has no parent directory"))?;
-    // The reference for everything below: whoever can read the config can
-    // read its rollback copy.
-    let src_meta = std::fs::metadata(legacy_config)
-        .with_context(|| format!("cannot stat {}", legacy_config.display()))?;
-
-    let backup_dir = parent.join("backups");
-    // Only a directory we create is ours to mode and own; an existing one
-    // carries the operator's choices. 0o750 and not the config's own mode:
-    // a directory without the execute bit cannot be traversed at all.
-    match std::fs::DirBuilder::new().mode(0o750).create(&backup_dir) {
-        Ok(()) => mirror_ownership_or_warn(&backup_dir, &src_meta, 0o750),
-        // An existing *file* on that path would otherwise be swallowed here
-        // and resurface as a confusing copy failure one line down.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !backup_dir.is_dir() {
-                return Err(anyhow!(
-                    "{} exists and is not a directory",
-                    backup_dir.display()
-                ));
-            }
+fn backup_directory(
+    parent: &std::fs::File,
+    parent_display: &Path,
+    src_meta: &Metadata,
+) -> anyhow::Result<(std::fs::File, PathBuf)> {
+    let display = parent_display.join("backups");
+    match crate::config::tree_io::inspect_at(parent, std::ffi::OsStr::new("backups"))? {
+        Some(entry) => {
+            let meta = entry.metadata()?;
+            anyhow::ensure!(
+                !meta.file_type().is_symlink() && meta.is_dir(),
+                "{} exists and is not a directory",
+                display.display()
+            );
+            Ok((
+                write_lock::reopen_inspected(&entry, libc::O_RDONLY | libc::O_DIRECTORY)?,
+                display,
+            ))
         }
-        Err(e) => {
-            return Err(
-                anyhow::Error::new(e).context(format!("cannot create {}", backup_dir.display()))
-            )
+        None => {
+            use std::ffi::CString;
+            use std::os::unix::io::AsRawFd;
+
+            let name = CString::new("backups")?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o750) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("cannot create {}", display.display()));
+            }
+            let directory = write_lock::open_at(
+                parent,
+                std::ffi::OsStr::new("backups"),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
+            mirror_ownership_fd_or_warn(&directory, &display, src_meta, 0o750);
+            directory.sync_all()?;
+            parent.sync_all()?;
+            Ok((directory, display))
         }
     }
+}
 
+fn create_private_backup_file(
+    directory: &std::fs::File,
+) -> anyhow::Result<(std::ffi::OsString, std::fs::File)> {
+    use rand_core::RngCore;
+
+    for _ in 0..32 {
+        let mut random = [0_u8; 16];
+        rand_core::OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(|error| anyhow!("cannot generate private backup name: {error}"))?;
+        let name = std::ffi::OsString::from(format!(
+            ".warden-pre-migration-{}-{:032x}",
+            std::process::id(),
+            u128::from_ne_bytes(random)
+        ));
+        match write_lock::open_at(
+            directory,
+            &name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => return Ok((name, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create private migration backup"),
+        }
+    }
+    bail!("cannot allocate a private migration backup name")
+}
+
+fn backup_snapshot_in_directory(
+    parent: &std::fs::File,
+    parent_display: &Path,
+    source: &SourceSnapshot,
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (directory, directory_display) =
+        backup_directory(parent, parent_display, &source.metadata)?;
     let ts = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown-time".to_string())
         .replace(':', "-");
-    // Bump the name on a same-second collision so a rapid re-run can't
-    // silently overwrite the pre-migration rollback copy.
-    let path =
-        crate::cli::commands::make_unique_path(backup_dir.join(format!("pre-migration-{ts}.toml")));
-    std::fs::copy(legacy_config, &path).with_context(|| {
-        format!(
-            "cannot copy {} to backup at {}",
-            legacy_config.display(),
-            path.display()
-        )
-    })?;
-    mirror_ownership_or_warn(&path, &src_meta, src_meta.mode() & 0o7777);
-    Ok(path)
+    let base = format!("pre-migration-{ts}.toml");
+    let (temporary_name, mut backup) = create_private_backup_file(&directory)?;
+    let prepared = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+
+        backup.write_all(source.raw.as_bytes())?;
+        mirror_ownership_fd_or_warn(
+            &backup,
+            &directory_display.join(&base),
+            &source.metadata,
+            source.metadata.mode() & 0o7777,
+        );
+        backup.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let _ = crate::config::tree_io::unlink_at(&directory, &temporary_name);
+        return Err(error).context("prepare migration backup");
+    }
+
+    for n in 0..=10_000u32 {
+        let name = if n == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        match crate::config::tree_io::rename_noreplace_at(
+            &directory,
+            &temporary_name,
+            &directory,
+            std::ffi::OsStr::new(&name),
+        ) {
+            Ok(()) => {
+                directory.sync_all()?;
+                return Ok(directory_display.join(name));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = crate::config::tree_io::unlink_at(&directory, &temporary_name);
+                return Err(error).context("publish migration backup");
+            }
+        }
+    }
+    let _ = crate::config::tree_io::unlink_at(&directory, &temporary_name);
+    bail!(
+        "cannot allocate a unique backup name in {}",
+        directory_display.display()
+    )
+}
+
+fn backup_legacy_locked(
+    guard: &ConfigWriteLock,
+    source: &SourceSnapshot,
+) -> anyhow::Result<PathBuf> {
+    let source_parent = source
+        .display
+        .parent()
+        .ok_or_else(|| anyhow!("legacy config path has no parent directory"))?;
+    if source.in_destination_tree {
+        let root = guard.canonical_master().parent().expect("master parent");
+        let relative = source_parent
+            .strip_prefix(root)
+            .expect("admitted source parent is inside held root");
+        let parent = open_existing_relative_directory(guard.tree_io().backup_root_fd()?, relative)?;
+        backup_snapshot_in_directory(&parent, source_parent, source)
+    } else {
+        let parent = source
+            .external_parent
+            .as_ref()
+            .context("external source parent was not retained")?;
+        backup_snapshot_in_directory(parent, source_parent, source)
+    }
 }
 
 // ── id + filename helpers ─────────────────────────────────────────────
@@ -2169,15 +2352,6 @@ fn backup_legacy(legacy_config: &Path) -> anyhow::Result<PathBuf> {
 /// which the validator will reject, producing a clear manual-review note.
 fn slash_to_kebab(s: &str) -> String {
     s.replacen('/', "-", 1).to_lowercase()
-}
-
-/// Inverse of [`slash_to_kebab`] for the first dash only. Used to populate
-/// the legacy `[lists].sources` array from `[[blocklists]]` when the v0
-/// config had no explicit `[lists]` section. Round-trips the common
-/// `"privacy-ads"` → `"privacy/ads"` case; leaves multi-dash ids without
-/// forcing a path structure the operator may not want.
-fn kebab_to_slash(s: &str) -> String {
-    s.replacen('-', "/", 1)
 }
 
 /// Turn an arbitrary string into a candidate v1 [`Id`]. Lowercases, replaces
@@ -2235,6 +2409,177 @@ mod tests {
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn backup_legacy_for_test(legacy_config: &Path) -> anyhow::Result<PathBuf> {
+        let destination = tmpdir();
+        let master = destination.path().join("config.toml");
+        let guard = write_lock::acquire_for_write(&master)?;
+        let source = snapshot_source_locked(&guard, legacy_config, &master)?;
+        backup_legacy_locked(&guard, &source)
+    }
+
+    fn v1_snapshot_fixture(profile_name: &str) -> String {
+        format!(
+            "schema_version = 2\n\
+             [server]\n\
+             default_profile = \"default\"\n\
+             [profiles.default]\n\
+             display_name = \"{profile_name}\"\n\
+             [upstream]\n\
+             servers = [\"192.0.2.1:53\"]\n"
+        )
+    }
+
+    #[test]
+    fn migration_fence_refuses_before_source_data_is_opened() {
+        use crate::config::write_lock::{with_test_hook, TestEvent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let source_dir = tmpdir();
+        let source = source_dir.path().join("source.toml");
+        let source_bytes = v1_snapshot_fixture("Source");
+        std::fs::write(&source, &source_bytes).unwrap();
+
+        let destination = tmpdir();
+        let target = destination.path().join("config.toml");
+        let fence = destination.path().join(".warden-migration");
+        std::fs::create_dir(&fence).unwrap();
+        let data_opens = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&data_opens);
+
+        let error = with_test_hook(
+            move |event| {
+                if event == TestEvent::BeforeDataOpen {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            || migrate_v1_to_v2(&source, &target, false),
+        )
+        .expect_err("the destination fence must refuse migration");
+
+        assert!(error.to_string().contains("unfinished v3-to-v4 migration"));
+        assert_eq!(data_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), source_bytes);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn migration_snapshots_same_tree_source_after_waiting_for_one_write_guard() {
+        use crate::config::write_lock::{with_test_hook, TestEvent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let dir = tmpdir();
+        let source = dir.path().join("source.toml");
+        let target = dir.path().join("config.toml");
+        std::fs::write(&source, v1_snapshot_fixture("Stale")).unwrap();
+        let held = write_lock::acquire_for_write(&target).unwrap();
+
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let write_locks = Arc::new(AtomicUsize::new(0));
+        let read_locks = Arc::new(AtomicUsize::new(0));
+        let worker_write_locks = Arc::clone(&write_locks);
+        let worker_read_locks = Arc::clone(&read_locks);
+        let worker_source = source.clone();
+        let worker_target = target.clone();
+        let worker = std::thread::spawn(move || {
+            with_test_hook(
+                move |event| match event {
+                    TestEvent::Contended => {
+                        let _ = contended_tx.send(());
+                    }
+                    TestEvent::WriteRootLocked => {
+                        worker_write_locks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    TestEvent::RootLocked => {
+                        worker_read_locks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                },
+                || migrate_v1_to_v2(&worker_source, &worker_target, false),
+            )
+        });
+
+        contended_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("migration must wait before reading its source");
+        let latest = v1_snapshot_fixture("Latest");
+        std::fs::write(&source, &latest).unwrap();
+        drop(held);
+
+        let summary = worker.join().unwrap().expect("migration must succeed");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("Latest"));
+        assert_eq!(
+            std::fs::read_to_string(summary.backup_path).unwrap(),
+            latest
+        );
+        assert_eq!(write_locks.load(Ordering::SeqCst), 1);
+        assert_eq!(read_locks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn external_source_parent_replacement_cannot_redirect_its_backup() {
+        use crate::config::write_lock::{with_test_hook, TestEvent};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let root = tmpdir();
+        let source_dir = root.path().join("legacy");
+        let moved_source_dir = root.path().join("legacy-moved");
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("source.toml");
+        std::fs::write(&source, v1_snapshot_fixture("Original")).unwrap();
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let target = destination.join("config.toml");
+
+        let swapped = Arc::new(AtomicBool::new(false));
+        let hook_swapped = Arc::clone(&swapped);
+        let hook_source_dir = source_dir.clone();
+        let hook_moved_source_dir = moved_source_dir.clone();
+        let error = with_test_hook(
+            move |event| {
+                if event == TestEvent::BeforeExternalSourceParentPin
+                    && !hook_swapped.swap(true, Ordering::SeqCst)
+                {
+                    std::fs::rename(&hook_source_dir, &hook_moved_source_dir).unwrap();
+                    std::fs::create_dir(&hook_source_dir).unwrap();
+                    std::fs::write(
+                        hook_source_dir.join("source.toml"),
+                        v1_snapshot_fixture("Replacement"),
+                    )
+                    .unwrap();
+                }
+            },
+            || migrate_v1_to_v2(&source, &target, false),
+        )
+        .expect_err("a replaced external parent must be refused");
+
+        assert!(swapped.load(Ordering::SeqCst));
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("legacy config parent changed while taking its snapshot"),
+            "got: {message}"
+        );
+        assert!(!source_dir.join("backups").exists());
+        assert!(!moved_source_dir.join("backups").exists());
+        assert!(!target.exists());
+    }
+
+    /// Migration output is an archival v3 artifact, independent of the live schema.
+    fn assert_historical_schema_v3_output(path: &Path) {
+        let raw = std::fs::read_to_string(path).expect("migration output must be readable");
+        let root: Value = raw.parse().expect("migration output must be TOML");
+        assert_eq!(
+            root.get("schema_version").and_then(Value::as_integer),
+            Some(3),
+            "historical migration output must pin the literal v3 schema"
+        );
+        crate::config::loader::load_config_for_schema(path, 3, OffsetDateTime::now_utc())
+            .expect("historical v3 output must validate as schema 3");
     }
 
     /// **Both migration paths strip the retired `tags` key, and the test
@@ -2439,8 +2784,25 @@ servers = ["192.0.2.1:53"]
         assert_eq!(cfg.profiles.len(), 1);
         assert_eq!(cfg.devices.len(), 1);
         assert_eq!(cfg.devices[0].id.as_str(), "iphone");
-        // [lists].sources is derived from [[blocklists]] when absent.
-        assert!(cfg.lists.sources.iter().any(|s| s == "privacy/ads"));
+        assert!(cfg.lists.sources.is_empty());
+        let plan = crate::lists::source_key::ResolvedSourcePlan::build_for_schema(
+            &crate::lists::catalog::Catalog::fallback(),
+            &cfg.lists.sources,
+            &cfg.blocklists,
+            &BTreeMap::new(),
+            crate::lists::source_key::RowControlDefaults {
+                max_entries: cfg.lists.max_entries,
+                update_interval_secs: cfg.lists.update_interval_secs,
+            },
+            cfg.schema_version,
+        )
+        .expect("translated blocklist-only config must build a source plan");
+        assert_eq!(plan.representatives(), vec![cfg.blocklists[0].url.clone()]);
+        assert_eq!(
+            plan.fetch_url_for_source(&cfg.blocklists[0].id.to_string()),
+            Some(cfg.blocklists[0].url.as_str()),
+            "the blocklist row is the only source; no generated slug may resolve through the catalog"
+        );
     }
 
     #[test]
@@ -2466,16 +2828,7 @@ profile = "default"
         // v0 profile.lists -> blocklists + [[blocklists]] entry
         assert_eq!(cfg.blocklists.len(), 1);
         assert_eq!(cfg.blocklists[0].id.as_str(), "privacy-ads");
-        // surface-5m: the v0->v1 migration path used to hardcode
-        // `max_entries: 5_000_000` here — a stale copy of the daemon-wide
-        // default. With the fail-closed corpus guard, a migrated list
-        // over that stale cap would be refused whole on the next
-        // refresh instead of truncated.
-        assert_eq!(
-            cfg.blocklists[0].max_entries,
-            crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES as u64,
-            "migrated blocklist must inherit the shared default max_entries"
-        );
+        assert_eq!(cfg.blocklists[0].max_entries, None);
         let _default_prof = cfg.profiles.get("default").unwrap();
         // `Profile.blocklists` is
         // gone. The list is still emitted into `[[blocklists]]`
@@ -2602,10 +2955,8 @@ servers = ["192.0.2.1:53"]
         let entries: Vec<_> = std::fs::read_dir(&backups_dir).unwrap().collect();
         assert_eq!(entries.len(), 1);
 
-        // The produced config lints cleanly via load_config
-        let now = OffsetDateTime::now_utc();
-        crate::config::loader::load_config(&summary.target_master, now)
-            .expect("migrated config should lint clean");
+        // The multi-file output and its includes validate against literal v3.
+        assert_historical_schema_v3_output(&summary.target_master);
     }
 
     /// Every migrated `*.d/` dir (and the fresh target
@@ -2691,6 +3042,7 @@ servers = ["192.0.2.1:53"]
         // No subdirs in single-file mode
         assert!(!target.join("devices.d").exists());
         assert!(!target.join("blocklists.d").exists());
+        assert_historical_schema_v3_output(&summary.target_master);
     }
 
     // ── preserve explicit `query_log_enabled` ──────────
@@ -2821,12 +3173,14 @@ servers = ["192.0.2.1:53"]
 
         migrate_v1_to_v2(&from, &target_a, false).unwrap();
         let first = std::fs::read_to_string(&target_a).unwrap();
+        assert_historical_schema_v3_output(&target_a);
 
         // Feed the FIRST output back through the migrator. The result
         // must match byte-for-byte — operator-set tags / unfiltered /
         // dropped-blocklists fields are all already present.
         migrate_v1_to_v2(&target_a, &target_b, false).unwrap();
         let second = std::fs::read_to_string(&target_b).unwrap();
+        assert_historical_schema_v3_output(&target_b);
         assert_eq!(
             first, second,
             "second-run output must be byte-identical to the first"
@@ -2874,6 +3228,7 @@ servers = ["192.0.2.1:53"]
         let target = tmp.path().join("v2.toml");
 
         migrate_v1_to_v2(&from, &target, false).unwrap();
+        assert_historical_schema_v3_output(&target);
         let body = std::fs::read_to_string(&target).unwrap();
         let parsed: Value = body.parse().unwrap();
         let table = parsed.as_table().unwrap();
@@ -3043,20 +3398,18 @@ servers = ["192.0.2.1:53"]
         let target = tmp.path().join("etc-purge-warden");
         let err = migrate(&legacy, &target, false, false).expect_err("must fail validation");
         assert!(
-            err.to_string().contains("invalid v1 config"),
+            err.to_string()
+                .contains("historical schema 3 validation failed"),
             "must surface the validation error; got: {err}"
         );
 
-        // Target dir was created (it's our staging parent) but holds
-        // NO migration artifacts — only the staging dir itself, which
-        // must have been cleaned up.
+        // Guard acquisition may create the target root and stable lock, but
+        // validation failure must leave every migration output absent.
         assert!(
             !target.join("config.toml").exists(),
             "target master must not exist after validation failure"
         );
-        // The CSPRNG-named staging dir is wiped by the
-        // StagingDir guard on the validation-failure return — no leftover
-        // `purge-warden-stage-*` dir under target.
+        // Validation failure leaves no generated migration files behind.
         let leftover = std::fs::read_dir(&target).unwrap().any(|e| {
             e.unwrap()
                 .file_name()
@@ -3205,7 +3558,7 @@ servers = ["192.0.2.1:53"]
             "fixture cannot discriminate: a fresh file would get this group anyway"
         );
 
-        let backup = backup_legacy(&legacy).unwrap();
+        let backup = backup_legacy_for_test(&legacy).unwrap();
         let got = std::fs::metadata(&backup).unwrap();
         assert_eq!(
             (got.uid(), got.gid()),
@@ -3234,7 +3587,7 @@ servers = ["192.0.2.1:53"]
         let backup_dir = dir.path().join("backups");
         assert!(!backup_dir.exists(), "fixture starts without the dir");
 
-        backup_legacy(&legacy).unwrap();
+        backup_legacy_for_test(&legacy).unwrap();
 
         assert_eq!(
             std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,
@@ -3256,7 +3609,7 @@ servers = ["192.0.2.1:53"]
         std::fs::create_dir(&backup_dir).unwrap();
         std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        backup_legacy(&legacy).unwrap();
+        backup_legacy_for_test(&legacy).unwrap();
 
         assert_eq!(
             std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,

@@ -23,7 +23,7 @@ use purge_warden::config::error::ConfigError;
 use purge_warden::config::loader::load_config;
 use time::macros::datetime;
 
-const BASE: &str = "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n\
+const BASE: &str = "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
                     [profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
 
 fn config_with_ref(token_ref: &str) -> String {
@@ -102,7 +102,7 @@ fn m4_multi_file_tree_resolves_secrets_beside_the_master() {
     // scopes it into whichever section came last.
     std::fs::write(
         &master,
-        "schema_version = 3\nincludes = [\"conf.d/*.toml\"]\n\n\
+        "schema_version = 4\nincludes = [\"conf.d/*.toml\"]\n\n\
          [server]\ndefault_profile = \"default\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )

@@ -18,7 +18,7 @@
 #
 # This file MUST load with zero validator ERRORS and at least one WARNING.
 
-schema_version = 3
+schema_version = 4
 
 [server]
 default_profile = "default"
@@ -35,8 +35,6 @@ id = "privacy-ads"
 display_name = "Privacy: Ads"
 url = "https://lists.purge.cc/privacy/ads.txt"
 format = "domains"
-refresh_interval_hours = 12
-max_entries = 5000000
 enabled = true
 
 [[blocklists]]

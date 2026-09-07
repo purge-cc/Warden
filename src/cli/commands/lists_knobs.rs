@@ -12,7 +12,7 @@
 //! unknown-key error and the value parser, so none of the four can drift
 //! from the others.
 //!
-//! `set` edits the TOML through [`write_value_validated`] (which validates
+//! `set` edits the TOML through the guarded target writer (which validates
 //! the COMBINED master + includes state before promoting anything) and
 //! then asks the daemon to reload. Nothing on the daemon side needs
 //! rewiring: the reload path re-reads the corpus ceiling and the shrink
@@ -34,7 +34,7 @@ use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
 use crate::lists::status::{CorpusRefusal, CycleMark};
 
-use super::target::{read_or_empty, write_value_validated};
+use super::target::{read_or_empty_locked, write_value_validated_locked};
 
 /// One tunable, its field name under `[lists]`, and how to parse an
 /// operator's string.
@@ -99,7 +99,7 @@ const KNOBS: &[Knob] = &[
     },
     Knob {
         key: "shrink_guard_enabled",
-        help: "refuse a refresh that shrinks a list too far, keeping the last good copy",
+        help: "refuse a refresh that shrinks a list too far; reuse a retained body when usable",
         kind: KnobKind::Bool,
     },
     Knob {
@@ -185,7 +185,8 @@ pub async fn run_show(config_path: &Path, socket_path: &Path) -> anyhow::Result<
 pub(crate) struct LiveCorpus {
     /// Deduplicated domains in the filter map right now, across shards.
     pub(crate) unique_installed: u64,
-    /// Sources whose last refresh hit `max_entries` and dropped the rest.
+    /// Sources with an uncleared `max_entries` refusal overshoot since this
+    /// daemon started. A later non-cap failure retains it until success.
     pub(crate) truncated: u32,
     /// Configured sources, for the `n of m` denominator.
     pub(crate) total_sources: u32,
@@ -449,7 +450,7 @@ pub(crate) fn format_corpus_lines(
         // the operator ran a command about `max_entries` — "nothing is
         // truncated" is the answer to their question, not noise.
         let mut line = format!(
-            "  truncated sources:         {} of {} hit max_entries",
+            "  refused sources:           {} of {} hit max_entries",
             live.truncated, live.total_sources
         );
         if live.truncated > 0 {
@@ -461,24 +462,33 @@ pub(crate) fn format_corpus_lines(
     if let Some(r) = &live.refusal {
         out.push(String::new());
         out.push(format!(
-            "  CORPUS REFUSED: the last cycle measured {} unique domains against a ceiling \
+            "  CORPUS REFUSED: {} measured {} unique domains against a ceiling \
              of {}, and installed nothing.",
-            r.unique, r.ceiling
+            refusal_cycle_subject(live.cycle),
+            r.unique,
+            r.ceiling
         ));
-        out.push(
-            "  Every source downloaded and parsed correctly; the daemon is serving the \
-             previous generation."
-                .to_string(),
-        );
-        // The line that separates a blip from an outage; same wording as
-        // `warden status`, so the two surfaces cannot disagree about it.
+        if unique == 0 {
+            out.push("  NOTHING IS INSTALLED; DNS IS ANSWERING UNFILTERED.".to_string());
+        } else {
+            out.push(
+                "  Every source downloaded and parsed correctly; the daemon is serving the \
+                 previous generation. The corpus is FROZEN."
+                    .to_string(),
+            );
+        }
         if let Some((f, since)) = live
             .freeze
             .as_ref()
             .and_then(|f| Some((f, super::status::format_frozen_since(f)?)))
         {
+            let label = if unique == 0 {
+                "REFUSAL STREAK"
+            } else {
+                "FROZEN"
+            };
             out.push(format!(
-                "  FROZEN since {since} ({} refused cycles, counted since this daemon started).",
+                "  {label} since {since} ({} refused cycles, counted since this daemon started).",
                 f.consecutive
             ));
         }
@@ -501,6 +511,19 @@ pub(crate) fn format_corpus_lines(
     }
 
     out
+}
+
+/// Name the refusal without claiming a later non-manager publication was
+/// itself refused.
+fn refusal_cycle_subject(cycle: Option<CycleMark>) -> &'static str {
+    if matches!(
+        cycle.and_then(|mark| mark.outcome),
+        Some(crate::lists::status::CycleOutcome::Refused)
+    ) {
+        "the last completed cycle"
+    } else {
+        "a refused cycle"
+    }
 }
 
 /// What subscribing to one more list would do to the corpus ceiling.
@@ -552,8 +575,8 @@ pub(crate) fn corpus_projection(installed: u64, ceiling: u64, entries: Option<u6
     }
 }
 
-/// The banner for a corpus the daemon has stopped updating, or `None`
-/// when the last cycle installed.
+/// The warning banner for a standing corpus refusal, or `None` when no
+/// refusal is standing.
 ///
 /// Pure so the wording is pinned without a daemon. On every verb but
 /// `show` this line is the *only* notice a refusal gets, and a refusal
@@ -564,13 +587,23 @@ pub(crate) fn corpus_projection(installed: u64, ceiling: u64, entries: Option<u6
 /// warden named here would be a guess at their memory budget.
 pub(crate) fn frozen_banner(live: &LiveCorpus) -> Option<String> {
     let r = live.refusal.as_ref()?;
-    Some(format!(
-        "warning: CORPUS FROZEN — the last refresh was refused (merged corpus {} > \
-         max_total_domains {}); domains published upstream since then are NOT being \
-         blocked. Run: warden status. Raise with: warden lists set max_total_domains \
-         <n>, or drop a list.",
-        r.unique, r.ceiling
-    ))
+    let cycle = refusal_cycle_subject(live.cycle);
+    if live.unique_installed == 0 {
+        Some(format!(
+            "warning: CORPUS REFUSED — NOTHING IS INSTALLED; DNS IS ANSWERING UNFILTERED \
+             ({cycle} measured merged corpus {} > max_total_domains {}). Run: warden status. \
+             Raise with: warden lists set max_total_domains <n>, or drop a list.",
+            r.unique, r.ceiling
+        ))
+    } else {
+        Some(format!(
+            "warning: CORPUS FROZEN — {cycle} was refused (merged corpus {} > \
+             max_total_domains {}); domains published upstream since then are NOT being \
+             blocked. Run: warden status. Raise with: warden lists set max_total_domains \
+             <n>, or drop a list.",
+            r.unique, r.ceiling
+        ))
+    }
 }
 
 /// Print [`frozen_banner`] on stderr when the daemon reports a refusal.
@@ -610,7 +643,8 @@ pub async fn run_set(
 
     let parsed = parse_value(knob, value)?;
 
-    let (mut doc, _orig) = read_or_empty(config_path)?;
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let (mut doc, _orig) = read_or_empty_locked(&guard, config_path, config_path)?;
     let table = doc
         .as_table_mut()
         .context("config root is not a TOML table")?;
@@ -632,13 +666,14 @@ pub async fn run_set(
     // Validates master + every include as one combined state BEFORE any
     // file is promoted, so an out-of-range value is refused with the
     // config untouched rather than written and then rejected at load.
-    write_value_validated(config_path, config_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, config_path, &doc)?;
 
     match previous {
         Some(p) => println!("lists.{key}: {p} → {value}"),
         None => println!("lists.{key} = {value} (was unset, using the built-in default)"),
     }
 
+    drop(guard);
     let outcome = super::ipc_reload::attempt_reload(socket_path).await;
     super::ipc_reload::report_reload_outcome(&outcome);
     Ok(())
@@ -789,9 +824,8 @@ mod tests {
             total_sources: total,
             refusal,
             freeze: None,
-            // These tests are about the corpus RENDERER, which never reads
-            // the cycle mark — that field exists for `lists refresh`, which
-            // has to wait for a cycle to end.
+            // Most renderer tests do not care which completed cycle produced
+            // the refusal; the wording-specific cases set this explicitly.
             cycle: None,
         }
     }
@@ -961,7 +995,7 @@ mod tests {
 
     #[test]
     fn corpus_lines_render_a_refused_cycle_with_its_largest_contributor() {
-        let l = live(
+        let mut l = live(
             12_000_000,
             0,
             8,
@@ -974,10 +1008,19 @@ mod tests {
                 ],
             }),
         );
+        l.cycle = Some(CycleMark {
+            seq: 3,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        });
         let lines = format_corpus_lines(14_000_000, Ok(&l)).join("\n");
         assert!(lines.contains("CORPUS REFUSED"), "{lines}");
+        assert!(lines.contains("last completed cycle"), "{lines}");
         assert!(lines.contains("15000000"), "{lines}");
         assert!(lines.contains("previous generation"), "{lines}");
+        assert!(lines.contains("FROZEN"), "{lines}");
         assert!(lines.contains("malicious.txt"), "{lines}");
         assert!(lines.contains("order-dependent"), "{lines}");
         // Config and daemon agree, so no divergence note.
@@ -991,6 +1034,38 @@ mod tests {
             "a band prediction must not contradict the refusal: {lines}"
         );
         assert!(!lines.contains("  band:"), "{lines}");
+    }
+
+    #[test]
+    fn corpus_lines_for_a_cold_hard_cap_refusal_never_reassure_about_retention() {
+        let mut l = live(
+            0,
+            0,
+            8,
+            Some(CorpusRefusal {
+                unique: 29_000_000,
+                ceiling: 14_000_000,
+                novel_by_source: vec![],
+            }),
+        );
+        l.cycle = Some(CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        });
+        l.freeze = Some(crate::lists::status::CorpusFreeze {
+            since: Some(time::macros::datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 1,
+        });
+
+        let lines = format_corpus_lines(14_000_000, Ok(&l)).join("\n");
+        assert!(lines.contains("NOTHING IS INSTALLED"), "{lines}");
+        assert!(lines.contains("DNS IS ANSWERING UNFILTERED"), "{lines}");
+        assert!(lines.contains("REFUSAL STREAK"), "{lines}");
+        assert!(!lines.contains("previous generation"), "{lines}");
+        assert!(!lines.contains("FROZEN"), "{lines}");
     }
 
     /// The bands above are computed from the config file's ceiling, but
@@ -1104,8 +1179,8 @@ mod tests {
     /// consequence is, and both ways out. `<n>` stays literal — warden
     /// does not know the operator's memory budget and must not appear to.
     #[test]
-    fn the_frozen_banner_says_what_stopped_and_both_ways_out() {
-        let l = live(
+    fn the_hot_refusal_banner_says_what_stopped_and_both_ways_out() {
+        let mut l = live(
             12_000_000,
             0,
             8,
@@ -1115,13 +1190,47 @@ mod tests {
                 novel_by_source: vec![],
             }),
         );
+        l.cycle = Some(CycleMark {
+            seq: 3,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        });
         assert_eq!(
             frozen_banner(&l).expect("a refusal on record must produce a banner"),
-            "warning: CORPUS FROZEN — the last refresh was refused (merged corpus 15012024 \
+            "warning: CORPUS FROZEN — the last completed cycle was refused (merged corpus 15012024 \
              > max_total_domains 14000000); domains published upstream since then are NOT \
              being blocked. Run: warden status. Raise with: warden lists set \
              max_total_domains <n>, or drop a list."
         );
+    }
+
+    #[test]
+    fn the_cold_hard_cap_banner_says_dns_is_unfiltered() {
+        let mut l = live(
+            0,
+            0,
+            8,
+            Some(CorpusRefusal {
+                unique: 29_000_000,
+                ceiling: 14_000_000,
+                novel_by_source: vec![],
+            }),
+        );
+        l.cycle = Some(CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        });
+
+        let banner = frozen_banner(&l).expect("a refusal on record must produce a banner");
+        assert!(banner.contains("NOTHING IS INSTALLED"), "{banner}");
+        assert!(banner.contains("DNS IS ANSWERING UNFILTERED"), "{banner}");
+        assert!(!banner.contains("FROZEN"), "{banner}");
+        assert!(!banner.contains("previous generation"), "{banner}");
     }
 
     /// No refusal, no banner. The banner is printed by verbs that are

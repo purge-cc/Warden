@@ -87,11 +87,14 @@
 //! there is no shared state left to race on.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::exit_codes::{CONFIG, SUCCESS};
 use crate::config::error::ConfigError;
 use crate::config::loader::{self, LoadedConfig};
+use crate::config::source_preflight::preflight_resolved_source_plan;
+use crate::lists::catalog::Catalog;
+use crate::lists::source_key::is_url_source;
 
 /// Run the lint. Returns the intended process exit code.
 pub fn run_lint(config_path: &Path, strict: bool) -> anyhow::Result<i32> {
@@ -115,7 +118,7 @@ pub fn run_lint(config_path: &Path, strict: bool) -> anyhow::Result<i32> {
 /// **Warnings are rendered on both arms.** A config carrying an error AND
 /// a deprecation used to show only the error, so the operator fixed one
 /// thing, re-ran, and discovered four more — on exactly the messages that
-/// name `schema_version = 3` as their removal point.
+/// mention a promised alias-removal schema.
 fn report(
     diagnostics: &mut dyn Write,
     config_path: &Path,
@@ -169,7 +172,70 @@ fn lint_collect(config_path: &Path) -> (Result<LoadedConfig, Vec<ConfigError>>, 
     let now = time::OffsetDateTime::now_utc();
     // No subscriber, no thread-local, no shared state of any kind: the
     // validator hands its audit WARNs back in the return value.
-    loader::load_config_collect(config_path, now)
+    let (result, mut warnings) = loader::load_config_collect(config_path, now);
+    let result = result.and_then(|loaded| {
+        let (preflight, preflight_warnings) =
+            preflight_source_plan_collect(config_path, &loaded.config);
+        warnings.extend(preflight_warnings);
+        preflight?;
+        Ok(loaded)
+    });
+    (result, warnings)
+}
+
+/// Run source-plan preflight with lint's read-only catalog selection policy.
+pub(crate) fn preflight_source_plan_collect(
+    config_path: &Path,
+    config: &crate::config::schema::ConfigV1,
+) -> (Result<(), Vec<ConfigError>>, Vec<String>) {
+    let (catalog, warnings) = preflight_catalog(config_path, config);
+    let result = preflight_resolved_source_plan(config_path, config, &catalog).map(|_| ());
+    (result, warnings)
+}
+
+/// Select the catalog source preflight resolves against.
+///
+/// Lint must not fetch or create its cache directory: a catalog-dependent
+/// config falls back only with an explicit drift warning.
+fn preflight_catalog(
+    config_path: &Path,
+    config: &crate::config::schema::ConfigV1,
+) -> (Catalog, Vec<String>) {
+    let mut warnings = Vec::new();
+    let catalog = if config
+        .lists
+        .sources
+        .iter()
+        .any(|source| !is_url_source(source))
+    {
+        let dir = read_only_lists_cache_dir(config_path, config);
+        match Catalog::load_from_disk(&dir) {
+            Some(catalog) => catalog,
+            None => {
+                warnings.push(format!(
+                    "source-plan preflight used the built-in fallback because the persisted \
+                     catalog at {} is missing, unreadable, corrupt, or empty; boot/reload may \
+                     select a newer catalog. Re-run lint after the catalog is persisted.",
+                    dir.display()
+                ));
+                Catalog::fallback()
+            }
+        }
+    } else {
+        // URL and blocklist rows do not consult catalog entries.
+        Catalog::fallback()
+    };
+
+    (catalog, warnings)
+}
+
+/// Mirror `lists_cache_dir` without its `create_dir_all` side effect.
+fn read_only_lists_cache_dir(
+    config_path: &Path,
+    config: &crate::config::schema::ConfigV1,
+) -> PathBuf {
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    crate::cli::commands::start::state_dir_for(parent).join(&config.lists.cache_dir)
 }
 
 fn print_clean_summary(config_path: &Path, loaded: &LoadedConfig) {
@@ -448,6 +514,212 @@ mod tests {
         path
     }
 
+    const CATALOG_URL: &str = "https://catalog.example.test/from-catalog.txt";
+
+    fn source_plan_config(sources: &str, blocklists: &str) -> String {
+        format!(
+            r#"schema_version = 4
+
+[server]
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+
+[anti_bypass]
+enabled = false
+
+[lists]
+sources = [{sources}]
+cache_dir = "lint-lists"
+
+{blocklists}
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#
+        )
+    }
+
+    fn catalog_first() -> Catalog {
+        Catalog::from_entries(vec![crate::lists::catalog::CatalogEntry {
+            scope: "catalog".to_string(),
+            topic: Some("first".to_string()),
+            name: "First".to_string(),
+            url: CATALOG_URL.to_string(),
+            entries: 1,
+            updated_at: String::new(),
+            format: crate::config::schema::BlocklistFormat::Domains,
+        }])
+    }
+
+    fn persist_catalog_for(path: &Path, catalog: &Catalog) -> PathBuf {
+        // Seed the disk fixture without loading its intentionally conflicting plan.
+        let cache_dir = crate::cli::commands::start::state_dir_for(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+        )
+        .join("lint-lists");
+        catalog.save_to_disk(&cache_dir).unwrap();
+        cache_dir
+    }
+
+    fn catalog_row_conflict() -> &'static str {
+        r#"[[blocklists]]
+id = "catalog-first"
+display_name = "Different URL"
+url = "https://row.example.test/different.txt"
+enabled = true
+"#
+    }
+
+    #[test]
+    fn lint_preflights_catalog_row_conflicts_with_the_plan_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            &source_plan_config("\"catalog/first\"", catalog_row_conflict()),
+        );
+        persist_catalog_for(&path, &catalog_first());
+
+        let (result, _) = lint_collect(&path);
+        let errors = result.expect_err("a catalog and row URL disagreement must fail lint");
+        let expected = crate::lists::source_key::format_list_source_alias_conflict(
+            "catalog/first",
+            "catalog-first",
+            CATALOG_URL,
+            "resolved URL",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.to_string().contains(&expected)),
+            "lint must preserve the plan's exact alias conflict text: {errors:?}"
+        );
+        assert_eq!(run_lint(&path, false).unwrap(), CONFIG);
+    }
+
+    #[test]
+    fn lint_preflights_catalog_row_conflicts_from_included_blocklist_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let included = dir.path().join("blocklists.toml");
+        std::fs::write(&included, catalog_row_conflict()).unwrap();
+        let master = source_plan_config("\"catalog/first\"", "");
+        let path = write_config(
+            &dir,
+            &master.replacen(
+                "schema_version = 4",
+                "schema_version = 4\nincludes = [\"blocklists.toml\"]",
+                1,
+            ),
+        );
+        persist_catalog_for(&path, &catalog_first());
+
+        let (result, _) = lint_collect(&path);
+        let errors = result.expect_err("the included row must be part of the effective plan");
+        let expected = crate::lists::source_key::format_list_source_alias_conflict(
+            "catalog/first",
+            "catalog-first",
+            CATALOG_URL,
+            "resolved URL",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.to_string().contains(&expected)),
+            "the included row must retain the exact plan error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn lint_warns_when_a_catalog_dependent_source_has_no_usable_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, &source_plan_config("\"privacy/ads\"", ""));
+        let cache_dir = dir.path().join("lint-lists");
+
+        let (result, warnings) = lint_collect(&path);
+        assert!(result.is_ok(), "the built-in fallback resolves privacy/ads");
+        assert!(warnings.iter().any(|warning| warning.contains(
+            "boot/reload may select a newer catalog. Re-run lint after the catalog is persisted."
+        )));
+        assert!(
+            !cache_dir.exists(),
+            "lint must not create a cache directory while warning about a missing catalog"
+        );
+        assert_eq!(run_lint(&path, false).unwrap(), SUCCESS);
+        assert_eq!(run_lint(&path, true).unwrap(), CONFIG);
+
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("catalog.json"), b"not JSON").unwrap();
+        let (result, warnings) = lint_collect(&path);
+        assert!(
+            result.is_ok(),
+            "a corrupt catalog must fall back advisory-only"
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("missing, unreadable, corrupt, or empty")));
+        assert_eq!(
+            std::fs::read_dir(&cache_dir).unwrap().count(),
+            1,
+            "lint must not create a replacement catalog or sidecar"
+        );
+    }
+
+    #[test]
+    fn lint_needs_no_catalog_for_raw_urls_or_blocklist_only_configs() {
+        let raw_dir = tempfile::tempdir().unwrap();
+        let raw_path = write_config(
+            &raw_dir,
+            &source_plan_config("\"https://example.test/raw.txt\"", ""),
+        );
+        assert!(lint_collect(&raw_path).0.is_ok());
+        assert!(
+            !raw_dir.path().join("lint-lists").exists(),
+            "catalog-independent lint must not create its cache directory"
+        );
+
+        let blocklist_dir = tempfile::tempdir().unwrap();
+        let blocklist_path = write_config(
+            &blocklist_dir,
+            &source_plan_config(
+                "",
+                r#"[[blocklists]]
+id = "raw-row"
+display_name = "Raw row"
+url = "https://example.test/raw.txt"
+"#,
+            ),
+        );
+        assert!(lint_collect(&blocklist_path).0.is_ok());
+        assert!(!blocklist_dir.path().join("lint-lists").exists());
+    }
+
+    #[test]
+    fn lint_accepts_a_valid_plan_from_the_persisted_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, &source_plan_config("\"catalog/first\"", ""));
+        let cache_dir = persist_catalog_for(&path, &catalog_first());
+
+        assert!(lint_collect(&path).0.is_ok());
+        assert!(cache_dir.join("catalog.json").is_file());
+    }
+
+    #[test]
+    fn lint_preflights_the_source_bitmap_limit() {
+        let sources = (0..65)
+            .map(|index| format!("\"https://example.test/{index}.txt\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, &source_plan_config(&sources, ""));
+
+        let (result, _) = lint_collect(&path);
+        let errors = result.expect_err("65 source identities exceed the u64 bitmap");
+        assert!(errors.iter().any(|error| error
+            .to_string()
+            .contains("too many list sources: 65 configured, max 64")));
+    }
+
     /// **Case 1, inverted.** It used to read "inert case 1 — an
     /// allow-list with no tags […] installed, visible, and filters nothing.
     /// This is how `mycompany` got onto the live box."
@@ -467,7 +739,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -529,7 +801,7 @@ servers = ["192.0.2.1:53"]
     fn tmc_lint_reports_a_base_ignore_list_as_inert() {
         let config = |base: &str| {
             format!(
-                r#"schema_version = 3
+                r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -587,7 +859,7 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -626,7 +898,7 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -657,7 +929,7 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -703,9 +975,8 @@ servers = ["192.0.2.1:53"]
 
     /// A config carrying an error AND a deprecation showed only the
     /// error, so the operator fixed one thing, re-ran, and discovered
-    /// four more — on exactly the messages naming `schema_version = 3`
-    /// as their removal point. On a config being prepared for that
-    /// version, that is backwards.
+    /// four more — including deprecation messages that may accompany an
+    /// unrelated error.
     #[test]
     fn an_invalid_config_still_reports_its_deprecations() {
         let mut out: Vec<u8> = Vec::new();

@@ -80,7 +80,7 @@ fn write_master(dir: &tempfile::TempDir, body: &str) -> PathBuf {
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [upstream]
 mode = "plain"
@@ -489,7 +489,7 @@ async fn removing_a_list_cascades_into_a_profile_living_in_another_file() {
     // parses it as a member of the last one.
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["conf.d/*.toml"]
 
 [upstream]

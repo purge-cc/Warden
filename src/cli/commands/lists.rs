@@ -5,10 +5,14 @@ use std::path::Path;
 
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
-use super::target::{read_or_empty, remove_id_keyed, write_value_validated, EntityClass};
+use super::target::{
+    guarded_master_locked, read_or_empty_locked, remove_id_keyed,
+    resolve_existing_target_file_locked, write_value_validated_locked, EntityClass,
+};
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::load_config;
+use crate::config::loader::{load_config, load_config_for_schema_under_guard};
 use crate::config::schema::Blocklist;
+use crate::config::schema::SCHEMA_VERSION_V1;
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client;
 use crate::lists::catalog::{Catalog, CatalogEntry};
@@ -238,7 +242,8 @@ fn unknown_note(reason: &str) -> String {
 /// the profile's `profiles.<id>.lists` entry for that list if it has
 /// one, else the list's own `base`. Tags play no part in it.
 ///
-/// The entry itself is built by [`super::blocklists::run_add_silent`]
+/// The entry itself is built by the guarded
+/// [`super::blocklists::run_add_silent_with_direction_locked`]
 /// rather than by a second writer here, so a list added with `lists add`
 /// and one added with `blocklist add` are the same object with the same
 /// validation, the same duplicate-URL rule, and the same audit record.
@@ -261,11 +266,14 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
     // Both channels are checked: an entry may predate this verb writing
     // entities, and a legacy leftover still downloads, so re-adding it
     // would put the same body behind two sources.
-    // Held past the duplicate checks: the ceiling this list is projected
-    // against comes from the same load, so the projection cannot answer
-    // from a different config than the checks just used.
+    // The projection needs a snapshot before its IPC/catalog await. Take it
+    // under a write guard, then reload and recheck in the guarded add core
+    // after that await before any mutation is promoted.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).ok();
+    let loaded = {
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now).ok()
+    };
     if let Some(loaded) = &loaded {
         let canonical = canonical_url_key(&url);
         if let Some(existing) = loaded
@@ -332,21 +340,84 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
         Some(source)
     };
 
-    let outcome = super::blocklists::run_add_silent(
-        config_path,
-        socket_path,
-        &id,
-        display_name,
-        &url,
-        None,
-        None,
-        None,
-        None,
-        None,
-        true, // reachability probe: see the doc comment above
-        None,
-    )
-    .await?;
+    let written = {
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        let now = time::OffsetDateTime::now_utc();
+        if let Ok(loaded) =
+            load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        {
+            let canonical = canonical_url_key(&url);
+            if let Some(existing) = loaded
+                .config
+                .blocklists
+                .iter()
+                .find(|b| canonical_url_key(&b.url) == canonical)
+            {
+                println!("already subscribed: {source} (list \"{}\")", existing.id);
+                return Ok(());
+            }
+            if let Some(existing) = loaded
+                .config
+                .blocklists
+                .iter()
+                .find(|b| b.id.as_str() == id)
+            {
+                anyhow::bail!(
+                    "\"{source}\" would be named \"{id}\", which is already taken by a \
+                     different list ({}). Add it with a name of your own:\n  \
+                     warden blocklist add <name> --url {url}",
+                    existing.url
+                );
+            }
+            if loaded
+                .config
+                .lists
+                .sources
+                .iter()
+                .any(|s| s == source || canonical_url_key(s) == canonical)
+            {
+                println!("already subscribed: {source}");
+                println!(
+                    "It is recorded in the older `[lists].sources` form, which downloads but \
+                     never filters. Run `warden lists remove {source}` and add it again to \
+                     convert it."
+                );
+                return Ok(());
+            }
+        }
+        super::blocklists::run_add_silent_with_direction_locked(
+            &guard,
+            config_path,
+            &id,
+            display_name,
+            &url,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            super::blocklists::AddDirection::default(),
+        )?
+    };
+    let id_for_audit = id.clone();
+    let target_for_audit = written.target_path.clone();
+    let url_for_audit = url.clone();
+    persist_cli_mutation_audit(config_path, move || {
+        AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
+            .with_uid(current_uid())
+            .with_action("blocklist.add")
+            .with_scope("blocklist")
+            .with_target_id(id_for_audit)
+            .with_fields_after(url_for_audit)
+            .with_files([config_path, target_for_audit.as_path()])
+    });
+    let reload_outcome = super::ipc_reload::attempt_reload(socket_path).await;
+    let outcome = super::blocklists::AddOutcome {
+        target_path: written.target_path,
+        warnings: written.warnings,
+        reload_outcome,
+    };
 
     for warn in &outcome.warnings {
         eprintln!("warning: {warn}");
@@ -374,6 +445,12 @@ pub async fn run_remove(
 ) -> anyhow::Result<()> {
     super::lists_knobs::warn_if_frozen(socket_path).await;
 
+    // The daemon preflight above is complete; hold one tree guard from the
+    // first tolerant load through every target scan, document edit, and write.
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let master_target = guarded_master_locked(&guard, config_path)?;
+    let master_path = master_target.display().to_path_buf();
+
     // The id `run_add` would have chosen for this argument, so removing
     // by URL finds the entry that URL created. Unresolvable arguments
     // (an id typed directly, a slug not in the catalog) are not an error
@@ -388,18 +465,20 @@ pub async fn run_remove(
     // Which entry does this argument name? Matched by id, by the id the
     // argument would derive to, or by URL.
     let now = time::OffsetDateTime::now_utc();
-    let entity_id = load_config(config_path, now).ok().and_then(|loaded| {
-        loaded
-            .config
-            .blocklists
-            .iter()
-            .find(|b| {
-                b.id.as_str() == source
-                    || derived_id.as_deref() == Some(b.id.as_str())
-                    || canonical_url_key(&b.url) == canonical
-            })
-            .map(|b| b.id.as_str().to_string())
-    });
+    let entity_id = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .ok()
+        .and_then(|loaded| {
+            loaded
+                .config
+                .blocklists
+                .iter()
+                .find(|b| {
+                    b.id.as_str() == source
+                        || derived_id.as_deref() == Some(b.id.as_str())
+                        || canonical_url_key(&b.url) == canonical
+                })
+                .map(|b| b.id.as_str().to_string())
+        });
 
     // Where the entry lives. On a single-file config this is the master
     // itself, which is the case worth being careful about: the same
@@ -409,7 +488,8 @@ pub async fn run_remove(
     // legacy string still there, list filtering nothing. So when both
     // land in one file they are staged on one document and written once.
     let entity_target = match &entity_id {
-        Some(id) => Some(super::target::resolve_existing_target_file(
+        Some(id) => Some(resolve_existing_target_file_locked(
+            &guard,
             config_path,
             EntityClass::Blocklists,
             id,
@@ -417,13 +497,16 @@ pub async fn run_remove(
         )?),
         None => None,
     };
-    let one_file = entity_target.as_deref() == Some(config_path);
+    let one_file = match entity_target.as_deref() {
+        Some(path) => master_target.matches_path(&guard, path)?,
+        None => false,
+    };
 
     let mut removed_from: Vec<String> = Vec::new();
 
     // Master document, carrying the legacy edit and — when they share a
     // file — the entry removal too.
-    let (mut master, _) = read_or_empty(config_path)?;
+    let (mut master, _) = read_or_empty_locked(&guard, config_path, &master_path)?;
 
     let removed_entity = match (entity_id.as_deref(), entity_target.as_deref()) {
         (Some(id), Some(_)) if one_file => {
@@ -432,10 +515,10 @@ pub async fn run_remove(
         (Some(id), Some(target)) => {
             // Separate file: nothing to stage together, so this is its
             // own write and its own validation.
-            let (mut doc, _) = read_or_empty(target)?;
+            let (mut doc, _) = read_or_empty_locked(&guard, config_path, target)?;
             let hit = remove_id_keyed(&mut doc, EntityClass::Blocklists.toml_key(), id)?;
             if hit {
-                write_value_validated(config_path, target, &doc)?;
+                write_value_validated_locked(&guard, config_path, target, &doc)?;
             }
             hit
         }
@@ -470,8 +553,9 @@ pub async fn run_remove(
 
     // One write covering whatever was staged on the master.
     if removed_legacy || (one_file && removed_entity) {
-        write_value_validated(config_path, config_path, &master)?;
+        write_value_validated_locked(&guard, config_path, &master_path, &master)?;
     }
+    drop(guard);
 
     if removed_entity {
         let id_for_audit = entity_id.clone().unwrap_or_default();
@@ -838,6 +922,7 @@ pub async fn run_forget(socket_path: &Path, source: &str) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -877,8 +962,8 @@ mod tests {
             display_name: id.to_string(),
             url: url.to_string(),
             format: crate::config::schema::BlocklistFormat::Domains,
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled,
             auth_token_ref: None,
             base: crate::config::schema::BlocklistBase::Deny,
@@ -1060,7 +1145,7 @@ mod tests {
     /// `validate_or_revert` (the full v1 loader), and `run_list` reads
     /// via `load_config`, so every config-touching test fixture must
     /// carry `schema_version` + a resolvable `default_profile`.
-    const MINIMAL_V1: &str = r#"schema_version = 3
+    const MINIMAL_V1: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1188,7 +1273,7 @@ servers = ["192.0.2.1:53"]
         // a tag, so the tag was inert here too — and the shape now under
         // test is the one an operator is actually handed.
         let path = temp_config(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1233,7 +1318,7 @@ servers = ["192.0.2.1:53"]
         );
 
         let path = temp_config(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1412,6 +1497,40 @@ servers = ["192.0.2.1:53"]
         std::fs::remove_file(&path).ok();
     }
 
+    /// A symlink spelling makes the loader report the canonical master as the
+    /// blocklist owner. The legacy source still belongs to that same member.
+    #[tokio::test]
+    async fn remove_clears_both_shapes_through_a_noncanonical_master_spelling() {
+        let path = temp_config(MINIMAL_V1);
+        run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut doc: toml::Value = toml::from_str(&body).unwrap();
+        doc.as_table_mut()
+            .unwrap()
+            .entry("lists".to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "sources".to_string(),
+                toml::Value::Array(vec![toml::Value::String("privacy/ads".to_string())]),
+            );
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+
+        let alias = path.with_extension("remove-alias.toml");
+        symlink(&path, &alias).unwrap();
+        run_remove(&alias, &no_socket(), "privacy/ads")
+            .await
+            .unwrap();
+
+        let after = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        assert!(after.config.blocklists.is_empty());
+        assert!(after.config.lists.sources.is_empty());
+        std::fs::remove_file(&alias).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Two different lists can reduce to one derived name. Reporting the
     /// second as "already subscribed" would be the same silent failure
     /// this verb was changed to end, so it is refused instead.
@@ -1454,7 +1573,7 @@ servers = ["192.0.2.1:53"]
     #[tokio::test]
     async fn add_leaves_every_other_section_untouched() {
         let path = temp_config(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"

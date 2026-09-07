@@ -3,7 +3,7 @@
 # and the `includes` directives. Every entity definition lives in a
 # dedicated `.d/*.toml` file to exercise the merge rules from §7.3.
 
-schema_version = 3
+schema_version = 4
 
 includes = [
   "blocklists.d/*.toml",

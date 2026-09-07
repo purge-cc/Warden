@@ -1,6 +1,56 @@
 use super::*;
+use crate::filter::engine::ProfileMasks;
 use crate::lists::catalog::Catalog;
 use crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES;
+use std::collections::BTreeMap;
+
+mod s7_memory;
+
+#[cfg(unix)]
+fn replace_path_with_mode_0640(path: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let name = path.file_name().unwrap().to_string_lossy();
+    let displaced = path.with_file_name(format!(".{name}.displaced"));
+    let replacement = path.with_file_name(format!(".{name}.replacement"));
+    std::fs::rename(path, displaced).unwrap();
+    std::fs::write(&replacement, bytes).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::rename(replacement, path).unwrap();
+}
+
+#[cfg(unix)]
+fn streamed_temp_path_in(cache_dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(cache_dir)
+        .unwrap()
+        .flatten()
+        .find_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.contains(".download-"))
+                .then_some(entry.path())
+        })
+        .expect("streamed cache body must retain its temporary pathname")
+}
+
+/// A refresh controller returns its manager from `spawn_blocking`, so a
+/// scheduler tick and the completed registry publication are deliberately
+/// separate observations. Wait in wall-clock time without advancing Tokio's
+/// paused clock; the small blocking sleep gives the blocking worker a chance
+/// to hand the manager back to the current-thread controller.
+async fn wait_for_cycle_seq(registry: &Arc<ListStatusRegistry>, expected: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while registry.cycle().seq < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for completed list cycle {expected}; last was {}",
+            registry.cycle().seq
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 impl ListManager {
     /// The client downloads currently go out on.
@@ -17,14 +67,37 @@ impl ListManager {
     }
 }
 
-/// Generous per-test body cap (200 MB) — matches production default.
+/// Production body cap, named through the authoritative default rather than
+/// a duplicated byte count.
 /// Real-network tests need at least this much because the official
 /// purge.cc lists have grown past 100 MB.
-const TEST_CAP: usize = 200 * 1024 * 1024;
+const TEST_CAP: usize = crate::config::settings::DEFAULT_MAX_LIST_BODY_BYTES;
 
 /// Small cap (50 MB) for the OOM regression test — it streams 60 MB
 /// and must abort before reading the full body.
 const TEST_SMALL_CAP: usize = 50 * 1024 * 1024;
+
+fn install_test_schedule(
+    mgr: &mut ListManager,
+    source: &str,
+) -> crate::lists::source_key::CanonicalSourceScheduleKey {
+    use sha2::Digest;
+    use std::str::FromStr;
+
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(&format!(
+        "canonical-url-v1-sha256-{}",
+        hex::encode(sha2::Sha256::digest(source.as_bytes()))
+    ))
+    .unwrap();
+    mgr.source_schedules.insert(
+        source.to_string(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(60 * 60),
+        },
+    );
+    key
+}
 
 #[test]
 fn list_cache_default_has_no_headers() {
@@ -51,6 +124,1804 @@ fn min_refresh_interval_clamped() {
         None,
     );
     assert!(mgr.refresh_interval >= MIN_REFRESH_INTERVAL);
+}
+
+#[test]
+fn refresh_cadence_degraded_interval_stays_within_the_recovery_band() {
+    for (configured, expected) in [
+        (Duration::from_secs(30), Duration::from_secs(60)),
+        (Duration::from_secs(2 * 60), Duration::from_secs(2 * 60)),
+        (Duration::from_secs(10 * 60), Duration::from_secs(5 * 60)),
+    ] {
+        assert_eq!(
+            degraded_refresh_interval(configured),
+            expected,
+            "configured interval {configured:?} chose the wrong degraded retry cadence"
+        );
+    }
+}
+
+#[test]
+fn canonical_schedule_uses_per_source_success_failure_and_future_deadlines() {
+    use std::str::FromStr;
+
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    mgr.source_schedules.insert(
+        "fast".to_string(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(2 * 60 * 60),
+        },
+    );
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    mgr.schedule_state.record_success(key.clone(), anchor);
+    assert!(!mgr.source_is_due("fast", anchor + time::Duration::minutes(119)));
+    assert!(mgr.source_is_due("fast", anchor + time::Duration::hours(2)));
+
+    mgr.schedule_state.record_failure(key.clone(), anchor);
+    assert!(!mgr.source_is_due("fast", anchor + time::Duration::seconds(59)));
+    assert!(mgr.source_is_due("fast", anchor + time::Duration::minutes(5)));
+
+    mgr.schedule_state
+        .record_success(key, anchor + time::Duration::days(1));
+    assert!(mgr.source_is_due("fast", anchor));
+}
+
+#[test]
+fn schedule_wait_uses_earliest_deadline_and_degraded_missing_row_floor() {
+    use std::str::FromStr;
+
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let a = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    let b = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-4e597e623d4112f2872d16b23fdc91d5f7f38102bf6fcf204c8b41911e5da6f8",
+    )
+    .unwrap();
+    for (source, key) in [("a", a.clone()), ("b", b.clone())] {
+        mgr.source_schedules.insert(
+            source.to_string(),
+            SourceSchedule {
+                key,
+                interval: Duration::from_secs(60 * 60),
+            },
+        );
+    }
+    let now = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    mgr.schedule_state
+        .record_success(a, now - time::Duration::minutes(30));
+    mgr.schedule_state
+        .record_success(b, now - time::Duration::minutes(45));
+    assert_eq!(mgr.next_schedule_wait(now), Duration::from_secs(15 * 60));
+
+    mgr.schedule_state = ListScheduleState::default();
+    mgr.status_registry.record_cycle_with_qualifiers(
+        CycleOutcome::SpillRollbackFailed,
+        true,
+        true,
+        0,
+    );
+    assert_eq!(
+        mgr.next_loop_wait(now),
+        Duration::from_secs(60),
+        "a degraded planned loop cannot spin on a missing ledger row"
+    );
+}
+
+#[test]
+fn one_shot_legacy_seed_fills_absent_keys_in_a_partial_ledger() {
+    let first = "https://lists.test/first.txt".to_string();
+    let second = "https://lists.test/second.txt".to_string();
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        &[first.clone(), second.clone()],
+        &[],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let planned: Vec<_> = plan
+        .sources()
+        .map(|source| {
+            (
+                source.representative().to_string(),
+                source.fetch_url().to_string(),
+                source.schedule_key().clone(),
+            )
+        })
+        .collect();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let first_key = planned[0].2.clone();
+    let second_url = planned[1].1.clone();
+    let second_key = planned[1].2.clone();
+    let mut mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(60 * 60),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    let mut state = ListScheduleState::default();
+    state.record_success(first_key.clone(), anchor - time::Duration::minutes(1));
+    mgr.set_schedule_state(state, None, true);
+    mgr.cache.insert(
+        second_url,
+        ListCache {
+            etag: None,
+            last_modified: None,
+            body: Some("second.example\n".to_string()),
+            fetched_at: anchor - time::Duration::minutes(2),
+        },
+    );
+    mgr.seed_schedule_state(anchor);
+
+    assert_eq!(
+        mgr.schedule_state.lookup(&second_key).unwrap().last_attempt,
+        anchor - time::Duration::minutes(2)
+    );
+    assert_eq!(
+        mgr.schedule_state.lookup(&first_key).unwrap().last_attempt,
+        anchor - time::Duration::minutes(1),
+        "an existing canonical row is never replaced by a compatibility seed"
+    );
+}
+
+#[test]
+fn plan_backed_manager_uses_schema4_cadence_override_and_floor() {
+    let row = crate::config::schema::Blocklist {
+        id: crate::config::schema::Id::new("fast").unwrap(),
+        display_name: "fast".to_string(),
+        url: "https://lists.test/fast.txt".to_string(),
+        format: Default::default(),
+        update_interval_hours: Some(0),
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: crate::config::schema::BlocklistBase::Deny,
+        trust: crate::config::schema::BlocklistTrust::RemoteUnsigned,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    };
+    let plan = ResolvedSourcePlan::build_for_schema(
+        &Catalog::fallback(),
+        &[],
+        &[row],
+        &BTreeMap::new(),
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: DEFAULT_MAX_LIST_ENTRIES,
+            update_interval_secs: 7_200,
+        },
+        4,
+    )
+    .unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(7_200),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+
+    assert_eq!(
+        mgr.source_schedules["https://lists.test/fast.txt"].interval,
+        Duration::from_secs(60)
+    );
+}
+
+#[tokio::test]
+async fn effective_cadence_does_not_enter_the_installed_corpus_digest() {
+    fn manager(hours: u32) -> (ListManager, String) {
+        let row = crate::config::schema::Blocklist {
+            id: crate::config::schema::Id::new("digest").unwrap(),
+            display_name: "digest".to_string(),
+            url: "https://lists.test/digest.txt".to_string(),
+            format: Default::default(),
+            update_interval_hours: Some(hours),
+            max_entries: None,
+            enabled: true,
+            auth_token_ref: None,
+            base: crate::config::schema::BlocklistBase::Deny,
+            trust: crate::config::schema::BlocklistTrust::RemoteUnsigned,
+            accept_unsigned_allow: false,
+            max_consecutive_failures: 5,
+        };
+        let plan = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &[],
+            &[row],
+            &BTreeMap::new(),
+            crate::lists::source_key::RowControlDefaults {
+                max_entries: DEFAULT_MAX_LIST_ENTRIES,
+                update_interval_secs: 7_200,
+            },
+            4,
+        )
+        .unwrap();
+        let url = plan.sources().next().unwrap().fetch_url().to_string();
+        let bits = SourceBitMap::from_plan(&plan).unwrap();
+        (
+            ListManager::with_plan_and_tokens(
+                reqwest::Client::new(),
+                Arc::new(FilterEngine::new()),
+                plan,
+                Duration::from_secs(7_200),
+                bits,
+                SourceTokenMap::default(),
+                TEST_CAP,
+                DEFAULT_MAX_LIST_ENTRIES,
+                None,
+            ),
+            url,
+        )
+    }
+
+    let (mut hourly, hourly_url) = manager(1);
+    let (mut two_hourly, two_hourly_url) = manager(2);
+    for (mgr, url) in [(&mut hourly, hourly_url), (&mut two_hourly, two_hourly_url)] {
+        mgr.cache.insert(
+            url,
+            ListCache {
+                etag: None,
+                last_modified: None,
+                body: Some("same-corpus.example\n".to_string()),
+                fetched_at: OffsetDateTime::now_utc(),
+            },
+        );
+        assert_eq!(mgr.refresh_with_mode(RefreshMode::CacheOnly).await, 1);
+    }
+    assert_ne!(
+        hourly.source_schedules.values().next().unwrap().interval,
+        two_hourly
+            .source_schedules
+            .values()
+            .next()
+            .unwrap()
+            .interval
+    );
+    assert_eq!(
+        hourly.installed_corpus_digest,
+        two_hourly.installed_corpus_digest
+    );
+}
+
+#[test]
+fn legacy_cache_timestamp_and_corrupt_sidecar_cannot_seed_a_schedule() {
+    use std::str::FromStr;
+
+    let url = "https://lists.test/legacy.txt".to_string();
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    for allow_seed in [true, false] {
+        let mut mgr = ListManager::new(
+            reqwest::Client::new(),
+            Arc::new(FilterEngine::new()),
+            vec![url.clone()],
+            Catalog::fallback(),
+            Duration::from_secs(60 * 60),
+            build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+            TEST_CAP,
+            DEFAULT_MAX_LIST_ENTRIES,
+            None,
+        );
+        mgr.source_schedules.insert(
+            url.clone(),
+            SourceSchedule {
+                key: key.clone(),
+                interval: Duration::from_secs(60 * 60),
+            },
+        );
+        mgr.set_schedule_state(ListScheduleState::default(), None, allow_seed);
+        mgr.cache.insert(
+            url.clone(),
+            ListCache {
+                etag: None,
+                last_modified: None,
+                body: Some("legacy.example\n".to_string()),
+                fetched_at: anchor,
+            },
+        );
+        if allow_seed {
+            mgr.legacy_cache_timestamp_urls.insert(url.clone());
+        }
+        mgr.seed_schedule_state(anchor + time::Duration::minutes(1));
+        assert!(mgr.schedule_state.lookup(&key).is_none());
+    }
+
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(60 * 60),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    mgr.source_schedules.insert(
+        url.clone(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(60 * 60),
+        },
+    );
+    mgr.set_schedule_state(ListScheduleState::default(), None, true);
+    mgr.cache.insert(
+        url,
+        ListCache {
+            etag: None,
+            last_modified: None,
+            body: Some("future.example\n".to_string()),
+            fetched_at: anchor + time::Duration::days(1),
+        },
+    );
+    mgr.seed_schedule_state(anchor);
+    assert!(
+        mgr.schedule_state.lookup(&key).is_none(),
+        "a future compatibility candidate stays absent and therefore due"
+    );
+}
+
+#[test]
+fn legacy_seed_ignores_future_alias_and_cache_evidence() {
+    let rows = ["owner", "alias"].map(|id| crate::config::schema::Blocklist {
+        id: crate::config::schema::Id::new(id).unwrap(),
+        display_name: id.to_string(),
+        url: "https://lists.test/shared.txt".to_string(),
+        format: Default::default(),
+        update_interval_hours: None,
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: crate::config::schema::BlocklistBase::Deny,
+        trust: crate::config::schema::BlocklistTrust::RemoteUnsigned,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    });
+    let plan =
+        ResolvedSourcePlan::build(&Catalog::fallback(), &[], &rows, &BTreeMap::new()).unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let key = plan.sources().next().unwrap().schedule_key().clone();
+    let url = plan.sources().next().unwrap().fetch_url().to_string();
+    let mut mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(60 * 60),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    let mut state = crate::config::list_state::ListState::default();
+    state.lists.insert(
+        crate::config::schema::Id::new("owner").unwrap(),
+        crate::config::list_state::ListStatusEntry {
+            last_attempt: Some(anchor - time::Duration::minutes(2)),
+            ..Default::default()
+        },
+    );
+    state.lists.insert(
+        crate::config::schema::Id::new("alias").unwrap(),
+        crate::config::list_state::ListStatusEntry {
+            last_attempt: Some(anchor + time::Duration::minutes(1)),
+            consecutive_failures: 1,
+            ..Default::default()
+        },
+    );
+    mgr.set_list_state(state, None);
+    mgr.cache.insert(
+        url,
+        ListCache {
+            etag: None,
+            last_modified: None,
+            body: Some("shared.example\n".to_string()),
+            fetched_at: anchor + time::Duration::minutes(2),
+        },
+    );
+
+    mgr.seed_schedule_state(anchor);
+
+    let entry = mgr.schedule_state.lookup(&key).unwrap();
+    assert_eq!(entry.last_attempt, anchor - time::Duration::minutes(2));
+    assert_eq!(entry.outcome, CanonicalScheduleOutcome::Success);
+}
+
+#[tokio::test]
+async fn missing_retained_body_turns_a_non_due_source_into_a_recorded_attempt() {
+    use std::str::FromStr;
+
+    let url = "https://127.0.0.1/no-retained-body.txt".to_string();
+    let bits = build_source_bit_map(std::slice::from_ref(&url)).unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(60 * 60),
+        bits,
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    mgr.source_schedules.insert(
+        url.clone(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(60 * 60),
+        },
+    );
+    mgr.schedule_state.record_success(key.clone(), anchor);
+
+    mgr.refresh_at(anchor + time::Duration::minutes(1)).await;
+
+    let entry = mgr.schedule_state.lookup(&key).unwrap();
+    assert_eq!(entry.last_attempt, anchor + time::Duration::minutes(1));
+    assert_eq!(entry.outcome, CanonicalScheduleOutcome::Failure);
+}
+
+#[tokio::test]
+async fn corrupted_retained_body_makes_a_non_due_planned_source_due_and_failed() {
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        tls_ok_response("retained.example\n", "\"retained\""),
+        "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n".to_string(),
+    ])
+    .await;
+    let url = "https://lists.test/corrupt-retained.txt".to_string();
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        std::slice::from_ref(&url),
+        &[],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(60 * 60),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    assert_eq!(
+        mgr.refresh_at_with_mode(anchor, RefreshMode::Force).await,
+        1
+    );
+    let key = mgr.source_schedules[&url].key.clone();
+    let now = anchor + time::Duration::minutes(1);
+    mgr.schedule_state.record_success(key.clone(), anchor);
+    assert!(!mgr.source_is_due(&url, now), "fixture must start non-due");
+    std::fs::write(
+        selected_cache_body_path(cache_dir.path(), &url).unwrap(),
+        "corrupt.example\n",
+    )
+    .unwrap();
+
+    assert_eq!(mgr.refresh_at(now).await, 1);
+    let entry = mgr.schedule_state.lookup(&key).unwrap();
+    assert_eq!(entry.last_attempt, now);
+    assert_eq!(entry.outcome, CanonicalScheduleOutcome::Failure);
+    assert!(matches!(
+        mgr.status_registry
+            .status_for_url(&url)
+            .unwrap()
+            .last_outcome,
+        LastOutcome::Failed { .. }
+    ));
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn planned_scheduled_cycle_fetches_only_due_remote_source_and_keeps_non_due_health() {
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        tls_ok_response("due-old.example\n", "\"due-old\""),
+        tls_ok_response("kept.example\n", "\"kept\""),
+        tls_ok_response("due-new.example\n", "\"due-new\""),
+    ])
+    .await;
+    let due = "https://lists.test/due.txt".to_string();
+    let kept = "https://lists.test/kept.txt".to_string();
+    let plan = ResolvedSourcePlan::build_with_row_control_defaults(
+        &Catalog::fallback(),
+        &[due.clone(), kept.clone()],
+        &[],
+        &BTreeMap::new(),
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: DEFAULT_MAX_LIST_ENTRIES,
+            update_interval_secs: 60 * 60,
+        },
+        crate::lists::source_key::RowControlMode::InheritAll,
+    )
+    .unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let mut mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(60 * 60),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let anchor = OffsetDateTime::now_utc();
+    assert_eq!(
+        mgr.refresh_at_with_mode(anchor, RefreshMode::Force).await,
+        2
+    );
+    let kept_before = (*mgr.status_registry.status_for_url(&kept).unwrap()).clone();
+    let due_key = mgr.source_schedules[&due].key.clone();
+    let kept_key = mgr.source_schedules[&kept].key.clone();
+    mgr.schedule_state
+        .record_success(due_key, anchor - time::Duration::hours(2));
+    mgr.schedule_state.record_success(kept_key, anchor);
+
+    assert_eq!(mgr.refresh_at(anchor).await, 2);
+    assert!(mgr.filter.is_blocked("due-new.example"));
+    assert!(mgr.filter.is_blocked("kept.example"));
+    assert!(!mgr.filter.is_blocked("due-old.example"));
+    assert_eq!(
+        *mgr.status_registry.status_for_url(&kept).unwrap(),
+        kept_before,
+        "parsing a planned non-due body must not refresh its health"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "only the due source was acquired"
+    );
+    assert!(mgr.installed_corpus_digest.is_some());
+}
+
+#[tokio::test]
+async fn force_refresh_attempts_all_sources_and_accepts_a_conditional_304() {
+    use std::str::FromStr;
+
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+    ])
+    .await;
+    let url = "https://lists.test/forced.txt".to_string();
+    let anchor = OffsetDateTime::now_utc();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    mgr.cache.insert(
+        url.clone(),
+        ListCache {
+            etag: Some("\"retained\"".to_string()),
+            last_modified: None,
+            body: Some("forced.example\n".to_string()),
+            fetched_at: anchor - time::Duration::hours(1),
+        },
+    );
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    mgr.source_schedules.insert(
+        url.clone(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(60 * 60),
+        },
+    );
+    mgr.schedule_state
+        .record_failure(key.clone(), anchor - time::Duration::minutes(1));
+
+    assert_eq!(
+        mgr.refresh_at_with_mode(anchor, RefreshMode::Force).await,
+        1
+    );
+    assert!(mgr.filter.is_blocked("forced.example"));
+    assert_eq!(mgr.cache[&url].fetched_at, anchor);
+    assert_eq!(
+        mgr.schedule_state.lookup(&key).unwrap().outcome,
+        CanonicalScheduleOutcome::Success
+    );
+    assert_eq!(
+        mgr.schedule_state.lookup(&key).unwrap().last_attempt,
+        anchor
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("if-none-match: \"retained\""));
+}
+
+#[tokio::test]
+async fn scheduled_non_due_imported_local_uses_retained_disk_body_without_list_cache() {
+    use std::str::FromStr;
+
+    let (mut mgr, url, dir) = bridge_manager("retained-local.example\n");
+    let anchor = OffsetDateTime::now_utc();
+    assert_eq!(
+        mgr.refresh_at_with_mode(anchor, RefreshMode::Force).await,
+        1
+    );
+    assert!(
+        !mgr.cache.contains_key(&url),
+        "local candidates keep no memory cache"
+    );
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    mgr.source_schedules.insert(
+        url.clone(),
+        SourceSchedule {
+            key: key.clone(),
+            interval: Duration::from_secs(60 * 60),
+        },
+    );
+    mgr.schedule_state.record_success(key, anchor);
+    write_bridge_body(&dir, "edited-local.example\n");
+
+    assert_eq!(mgr.refresh_at(anchor + time::Duration::minutes(1)).await, 1);
+    assert!(mgr.filter.is_blocked("retained-local.example"));
+    assert!(
+        !mgr.filter.is_blocked("edited-local.example"),
+        "a non-due source must use its retained body, not reacquire the edited file"
+    );
+}
+
+#[tokio::test]
+async fn cache_only_leaves_the_schedule_ledger_byte_for_byte_unchanged() {
+    use std::str::FromStr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data/list_schedule_state.toml");
+    let key = crate::lists::source_key::CanonicalSourceScheduleKey::from_str(
+        "canonical-url-v1-sha256-5f96be98e676eb9d356654baaff1e8f8e02de9e32dc8cbaf27fda1599ffbb5e1",
+    )
+    .unwrap();
+    let anchor = time::macros::datetime!(2026-09-05 10:00:00 UTC);
+    let mut state = ListScheduleState::default();
+    state.record_success(key, anchor);
+    state.write_atomic(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    mgr.set_schedule_state(state.clone(), Some(path.clone()), true);
+    mgr.refresh_at_with_mode(anchor + time::Duration::hours(1), RefreshMode::CacheOnly)
+        .await;
+
+    assert_eq!(mgr.schedule_state, state);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn force_refresh_command_is_accepted_after_initial_cycle_publication() {
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let (tx, rx) = mpsc::channel(1);
+    mgr.set_command_channel(rx);
+    let registry = mgr.status_registry();
+    let handle = mgr.spawn_refresh_loop();
+    wait_for_cycle_seq(&registry, 1).await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (completion_tx, completion_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: completion_tx,
+    })
+    .await
+    .unwrap();
+    // The cycle mark is published by the blocking worker before the
+    // controller receives the returned manager. A Force arriving in that
+    // handoff window must queue behind the active scheduled cycle; after the
+    // handoff it starts immediately. Both are prompt, correct acceptance
+    // outcomes, and treating the former as Started would violate the
+    // single-owner / Force-Forget ordering barrier.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        ListManagerCommandDisposition::Started | ListManagerCommandDisposition::Queued
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), completion_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .domain_count,
+        0
+    );
+    handle.retire().await.unwrap();
+}
+
+/// The blocking worker must return the snapshot published by its own cycle.
+///
+/// Deliberately publish later reload marks *after the worker joins but before
+/// this result is used*. The old controller design reloaded the shared
+/// registry at precisely that boundary, so it would have returned the later
+/// `SkippedUnchanged` snapshot instead of the Force cycle.
+#[tokio::test]
+async fn refresh_worker_carries_its_published_snapshot_across_later_reload_marks() {
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let registry = mgr.status_registry();
+    let RefreshWorkerOutcome::Completed { completion, .. } =
+        spawn_list_refresh_worker(mgr, RefreshMode::Force, RefreshCancellation::default())
+            .await
+            .expect("refresh worker completed")
+    else {
+        panic!("unexpected cancellation");
+    };
+    assert_eq!(completion.snapshot.cycle.seq, 1);
+    assert_eq!(
+        completion.snapshot.cycle.outcome,
+        Some(CycleOutcome::Installed)
+    );
+
+    registry.record_cycle(CycleOutcome::ConfigRejected);
+    registry.record_cycle(CycleOutcome::SkippedUnchanged);
+    assert_eq!(registry.cycle().seq, 3);
+    assert_eq!(
+        registry.cycle().outcome,
+        Some(CycleOutcome::SkippedUnchanged)
+    );
+    assert_eq!(
+        completion.snapshot.cycle.seq, 1,
+        "worker result must retain its own publication, not reload shared state"
+    );
+    assert_eq!(
+        completion.snapshot.cycle.outcome,
+        Some(CycleOutcome::Installed)
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn post_refresh_controller_uses_the_next_deadline_not_an_immediate_tick() {
+    let interval = Duration::from_secs(12 * 60 * 60);
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        interval,
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let registry = mgr.status_registry();
+    mgr.refresh().await;
+    assert_eq!(registry.cycle().seq, 1, "foreground rebuild completed");
+
+    let task = mgr.spawn_refresh_loop_after_refresh();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "post-refresh controller must not duplicate the completed rebuild immediately"
+    );
+    tokio::time::advance(interval).await;
+    wait_for_cycle_seq(&registry, 2).await;
+    task.retire().await.unwrap();
+}
+
+#[tokio::test]
+async fn manager_retirement_reports_a_terminal_controller_failure() {
+    let (retire_tx, _retire_rx) = oneshot::channel();
+    let join = tokio::spawn(async { panic!("test controller failure") });
+    let task = ListManagerTask { retire_tx, join };
+
+    assert!(
+        task.retire().await.is_err(),
+        "a failed controller must not be normalized into successful retirement"
+    );
+}
+
+fn pending_refresh_join() -> tokio::task::JoinHandle<RefreshWorkerOutcome> {
+    tokio::spawn(std::future::pending())
+}
+
+fn force_command() -> (
+    ListManagerCommand,
+    oneshot::Receiver<ListManagerCommandDisposition>,
+) {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (completion_tx, _completion_rx) = oneshot::channel();
+    (
+        ListManagerCommand::ForceRefresh {
+            accepted: accepted_tx,
+            completion: completion_tx,
+        },
+        accepted_rx,
+    )
+}
+
+fn forget_command(
+    source: &str,
+) -> (
+    ListManagerCommand,
+    oneshot::Receiver<ListManagerCommandDisposition>,
+) {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (completion_tx, _completion_rx) = oneshot::channel();
+    (
+        ListManagerCommand::Forget {
+            source: source.to_string(),
+            accepted: accepted_tx,
+            completion: completion_tx,
+        },
+        accepted_rx,
+    )
+}
+
+#[tokio::test]
+async fn force_joins_an_active_force_only_when_the_queue_is_empty() {
+    let mut active = ActiveRefresh {
+        work: ActiveManagerWork::Force {
+            completions: Vec::new(),
+        },
+        join: pending_refresh_join(),
+        cancellation: RefreshCancellation::default(),
+        registry: Arc::new(ListStatusRegistry::new(&[])),
+        seq_at_start: 0,
+    };
+    let mut queued = std::collections::VecDeque::new();
+    let (command, accepted) = force_command();
+
+    accept_while_active(command, &mut active, &mut queued);
+
+    assert_eq!(
+        accepted.await.unwrap(),
+        ListManagerCommandDisposition::JoinedInFlight
+    );
+    assert!(queued.is_empty(), "joining must not create follow-up work");
+    assert!(matches!(
+        &active.work,
+        ActiveManagerWork::Force { completions } if completions.len() == 1
+    ));
+    active.join.abort();
+}
+
+#[tokio::test]
+async fn forces_queue_then_coalesce_behind_an_active_scheduled_cycle() {
+    let mut active = ActiveRefresh {
+        work: ActiveManagerWork::Scheduled,
+        join: pending_refresh_join(),
+        cancellation: RefreshCancellation::default(),
+        registry: Arc::new(ListStatusRegistry::new(&[])),
+        seq_at_start: 0,
+    };
+    let mut queued = std::collections::VecDeque::new();
+    let (first, first_accepted) = force_command();
+    let (second, second_accepted) = force_command();
+
+    accept_while_active(first, &mut active, &mut queued);
+    accept_while_active(second, &mut active, &mut queued);
+
+    assert_eq!(
+        first_accepted.await.unwrap(),
+        ListManagerCommandDisposition::Queued
+    );
+    assert_eq!(
+        second_accepted.await.unwrap(),
+        ListManagerCommandDisposition::CoalescedQueued
+    );
+    assert!(matches!(
+        queued.front(),
+        Some(QueuedManagerWork::Force { completions }) if completions.len() == 2
+    ));
+    active.join.abort();
+}
+
+#[tokio::test]
+async fn forget_is_a_barrier_between_active_and_queued_forces() {
+    let mut active = ActiveRefresh {
+        work: ActiveManagerWork::Force {
+            completions: Vec::new(),
+        },
+        join: pending_refresh_join(),
+        cancellation: RefreshCancellation::default(),
+        registry: Arc::new(ListStatusRegistry::new(&[])),
+        seq_at_start: 0,
+    };
+    let mut queued = std::collections::VecDeque::new();
+    let (forget, forget_accepted) = forget_command("privacy/ads");
+    let (force, force_accepted) = force_command();
+
+    accept_while_active(forget, &mut active, &mut queued);
+    accept_while_active(force, &mut active, &mut queued);
+
+    assert_eq!(
+        forget_accepted.await.unwrap(),
+        ListManagerCommandDisposition::Queued
+    );
+    assert_eq!(
+        force_accepted.await.unwrap(),
+        ListManagerCommandDisposition::Queued,
+        "the barrier prevents joining the active force"
+    );
+    assert!(matches!(
+        queued.pop_front(),
+        Some(QueuedManagerWork::Forget { .. })
+    ));
+    assert!(matches!(
+        queued.pop_front(),
+        Some(QueuedManagerWork::Force { .. })
+    ));
+    assert!(queued.is_empty());
+    active.join.abort();
+}
+
+/// A reserved permit must not hold retirement open or create a later cycle.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn retirement_drops_a_reserved_command_without_starting_a_scheduled_cycle() {
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let registry = mgr.status_registry();
+    let (tx, rx) = mpsc::channel(1);
+    mgr.set_command_channel(rx);
+    mgr.refresh().await;
+    let task = mgr.spawn_refresh_loop_after_refresh();
+
+    let permit = tx
+        .clone()
+        .reserve_owned()
+        .await
+        .expect("reserve command slot");
+    tokio::time::timeout(Duration::from_secs(1), task.retire())
+        .await
+        .expect("a reserved permit must not delay retirement")
+        .unwrap();
+
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "retirement must never fall through and launch a scheduled cycle"
+    );
+    assert!(tx.is_closed());
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (completion_tx, completion_rx) = oneshot::channel();
+    permit.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: completion_tx,
+    });
+    assert!(tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+        .await
+        .unwrap()
+        .is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(1), completion_rx)
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(registry.cycle().seq, 1);
+}
+
+mod concurrency {
+    use super::*;
+
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("concurrency boundary timed out")
+    }
+
+    fn pause_worker(
+        manager: &mut ListManager,
+        target: &'static str,
+        nth: usize,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut reached_tx = Some(reached_tx);
+        let mut seen = 0;
+        manager.set_worker_hook_for_test(move |at| {
+            if at == target {
+                seen += 1;
+                if seen == nth {
+                    reached_tx.take().unwrap().send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release worker barrier");
+                }
+            }
+        });
+        (reached_rx, release_tx)
+    }
+
+    fn force() -> (
+        ListManagerCommand,
+        oneshot::Receiver<ListManagerCommandDisposition>,
+        oneshot::Receiver<ForceRefreshCompletion>,
+    ) {
+        let (accepted, acceptance) = oneshot::channel();
+        let (completion, result) = oneshot::channel();
+        (
+            ListManagerCommand::ForceRefresh {
+                accepted,
+                completion,
+            },
+            acceptance,
+            result,
+        )
+    }
+
+    #[tokio::test]
+    async fn retirement_drops_queued_buffered_and_reserved_work_before_worker_returns() {
+        let (mut manager, source, dir) = bridge_manager("old.example\n");
+        manager.refresh().await;
+        let filter = manager.filter.clone();
+        let registry = manager.status_registry();
+        let generations = filter.filter_gen_ids();
+        let seq = registry.cycle().seq;
+        let cache_path = selected_cache_body_path(&dir.path().join("cache"), &source).unwrap();
+        std::fs::write(
+            dir.path().join("lists/poison.txt"),
+            "new.example\nother.example\n",
+        )
+        .unwrap();
+        let (reached, release) = pause_worker(&mut manager, "parse_line", 2);
+        let (tx, rx) = mpsc::channel(8);
+        manager.set_command_channel(rx);
+        let task = manager.spawn_refresh_loop_after_refresh();
+        let (command, accepted, active_result) = force();
+        tx.send(command).await.unwrap();
+        assert_eq!(
+            bounded(accepted).await.unwrap(),
+            ListManagerCommandDisposition::Started
+        );
+        bounded(reached).await.unwrap();
+
+        let (accepted, acceptance) = oneshot::channel();
+        let (completion, forget_result) = oneshot::channel();
+        tx.send(ListManagerCommand::Forget {
+            source: source.clone(),
+            accepted,
+            completion,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            bounded(acceptance).await.unwrap(),
+            ListManagerCommandDisposition::Queued
+        );
+        let (command, accepted, force_result) = force();
+        tx.send(command).await.unwrap();
+        assert_eq!(
+            bounded(accepted).await.unwrap(),
+            ListManagerCommandDisposition::Queued
+        );
+        let permit = tx.clone().reserve_owned().await.unwrap();
+        let (buffered, _, buffered_result) = force();
+        tx.try_send(buffered).unwrap();
+
+        let retirement = task.retire();
+        tokio::pin!(retirement);
+        bounded(async {
+            tokio::select! {
+                biased;
+                _ = &mut retirement => panic!("retirement must wait for the active worker"),
+                _ = tx.closed() => {}
+            }
+        })
+        .await;
+        assert!(bounded(forget_result).await.is_err());
+        assert!(bounded(force_result).await.is_err());
+        assert!(bounded(buffered_result).await.is_err());
+        let (reserved, acceptance, reserved_result) = force();
+        permit.send(reserved);
+        assert!(bounded(acceptance).await.is_err());
+        assert!(bounded(reserved_result).await.is_err());
+        release.send(()).unwrap();
+        bounded(retirement).await.unwrap();
+        assert!(bounded(active_result).await.is_err());
+        assert_eq!(registry.cycle().seq, seq);
+        assert_eq!(filter.filter_gen_ids(), generations);
+        assert_eq!(
+            std::fs::read_to_string(cache_path).unwrap(),
+            "old.example\n"
+        );
+        assert!(!dir.path().join("cache").join(SHARD_SPILL_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn late_force_after_snapshot_publication_queues_a_new_cycle() {
+        let (mut manager, _, _dir) = bridge_manager("old.example\n");
+        manager.refresh().await;
+        let registry = manager.status_registry();
+        let (published, release) = pause_worker(&mut manager, "worker_return", 1);
+        let (tx, rx) = mpsc::channel(8);
+        manager.set_command_channel(rx);
+        let task = manager.spawn_refresh_loop_after_refresh();
+        let (command, accepted, first_result) = force();
+        tx.send(command).await.unwrap();
+        assert_eq!(
+            bounded(accepted).await.unwrap(),
+            ListManagerCommandDisposition::Started
+        );
+        bounded(published).await.unwrap();
+        let published_seq = registry.cycle().seq;
+        let (command, accepted, late_result) = force();
+        tx.send(command).await.unwrap();
+        assert_eq!(
+            bounded(accepted).await.unwrap(),
+            ListManagerCommandDisposition::Queued
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            bounded(first_result).await.unwrap().snapshot.cycle.seq,
+            published_seq
+        );
+        assert_eq!(
+            bounded(late_result).await.unwrap().snapshot.cycle.seq,
+            published_seq + 1
+        );
+        bounded(task.retire()).await.unwrap();
+    }
+
+    async fn cancel_prepublication_at(
+        target: &'static str,
+        nth: usize,
+        mode: RefreshMode,
+        disk: bool,
+    ) {
+        let (mut manager, source, dir) = if target == "cache_hash" {
+            let (manager, sources, dir) = cached_manager(&["old.example\n"]);
+            (manager, sources[0].clone(), dir)
+        } else {
+            bridge_manager("old.example\n")
+        };
+        if !disk {
+            manager.cache_dir = None;
+        }
+        manager.refresh().await;
+        manager.set_max_total_domains(100_000);
+        let filter = manager.filter.clone();
+        let registry = manager.status_registry();
+        let generations = filter.filter_gen_ids();
+        let digest = manager.installed_corpus_digest;
+        let seq = registry.cycle().seq;
+        let cache_dir = dir.path().join("cache");
+        let before_files: BTreeSet<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .map(|p| p.unwrap().file_name())
+            .collect();
+        let before_meta = disk.then(|| {
+            std::fs::read(cache_dir.join(format!("{}.meta", source_to_cache_stem(&source))))
+                .unwrap()
+        });
+        // More than one read, and only comments before valid rows: cancellation
+        // must not depend on the parser emitting a domain into the sink.
+        let mut body = format!("{}new.example\nother.example\n", "# comment\n".repeat(2000));
+        for idx in 0..DOMAIN_SHARDS {
+            let domain = (0..)
+                .map(|n| format!("shard-{idx}-{n}.example"))
+                .find(|domain| FilterEngine::shard_index(domain) == idx)
+                .unwrap();
+            body.push_str(&domain);
+            body.push('\n');
+        }
+        std::fs::create_dir_all(dir.path().join("lists")).unwrap();
+        std::fs::write(dir.path().join("lists/poison.txt"), body).unwrap();
+        let signal = RefreshCancellation::default();
+        let cancel = signal.clone();
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit_hook = hit.clone();
+        let mut seen = 0;
+        manager.set_worker_hook_for_test(move |at| {
+            if at == target {
+                seen += 1;
+                if seen == nth {
+                    hit_hook.store(true, std::sync::atomic::Ordering::Release);
+                    cancel.cancel();
+                }
+            }
+        });
+        let outcome = bounded(spawn_list_refresh_worker(manager, mode, signal))
+            .await
+            .unwrap();
+        assert!(
+            hit.load(std::sync::atomic::Ordering::Acquire),
+            "missed {target}"
+        );
+        let RefreshWorkerOutcome::Cancelled { manager } = outcome else {
+            panic!("{target} published after cancellation");
+        };
+        assert_eq!(manager.installed_corpus_digest, digest, "{target}");
+        assert_eq!(registry.cycle().seq, seq, "{target}");
+        assert_eq!(filter.filter_gen_ids(), generations, "{target}");
+        assert!(filter.is_blocked("old.example"));
+        assert!(!filter.is_blocked("new.example"));
+        let after_files: BTreeSet<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .map(|p| p.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            after_files, before_files,
+            "{target}: leaked spill/staged body"
+        );
+        if let Some(before_meta) = before_meta {
+            assert_eq!(
+                std::fs::read(cache_dir.join(format!("{}.meta", source_to_cache_stem(&source))))
+                    .unwrap(),
+                before_meta
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_304_defers_metadata_and_health_until_commit() {
+        for (target, changed) in [
+            ("source", true),
+            ("before_commit", true),
+            ("before_commit", false),
+            ("after_swap", true),
+            ("worker_return", false),
+        ] {
+            let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+                tls_ok_response("retained.example\n", "\"retained\""),
+                tls_ok_response("old.example\n", "\"old\""),
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+                tls_ok_response(
+                    if changed {
+                        "new.example\n"
+                    } else {
+                        "old.example\n"
+                    },
+                    "\"later\"",
+                ),
+            ])
+            .await;
+            let earlier = "https://lists.test/earlier.txt".to_string();
+            let later = "https://lists.test/later.txt".to_string();
+            let sources = vec![earlier.clone(), later];
+            let dir = tempfile::tempdir().unwrap();
+            let cache_dir = dir.path().join("cache");
+            let mut manager = ListManager::new(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve("lists.test", origin)
+                    .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+                Arc::new(FilterEngine::new()),
+                sources.clone(),
+                Catalog::fallback(),
+                Duration::from_secs(3600),
+                build_source_bit_map(&sources).unwrap(),
+                TEST_CAP,
+                DEFAULT_MAX_LIST_ENTRIES,
+                Some(cache_dir.clone()),
+            );
+            let id = crate::config::schema::Id::new("earlier").unwrap();
+            manager.set_source_blocklist_map(HashMap::from([(earlier.clone(), (id.clone(), 2))]));
+            let state_path = dir.path().join("list_state.toml");
+            let schedule_path = dir.path().join("list_schedule_state.toml");
+            manager.set_list_state(Default::default(), Some(state_path.clone()));
+            manager.set_schedule_state(Default::default(), Some(schedule_path.clone()), false);
+            let key = install_test_schedule(&mut manager, &earlier);
+            let anchor = OffsetDateTime::now_utc() - time::Duration::hours(2);
+            assert_eq!(bounded(manager.refresh_at(anchor)).await, 2);
+
+            // A cancelled confirmation must not recover an unhealthy source.
+            manager.record_blocklist_failure(&id, 2);
+            manager.record_blocklist_failure(&id, 2);
+            let previous = manager.status_registry.status_for_url(&earlier).unwrap();
+            manager.status_registry.update_for_url(
+                &earlier,
+                ListStatus::from_failure(Some(&previous), "prior failure".to_string(), anchor),
+            );
+            manager.schedule_state.record_failure(key.clone(), anchor);
+            manager.persist_schedule_state();
+            manager.legacy_cache_timestamp_urls.insert(earlier.clone());
+            let meta_path = cache_dir.join(format!("{}.meta", source_to_cache_stem(&earlier)));
+            let meta_before = std::fs::read(&meta_path).unwrap();
+            let state_bytes_before = std::fs::read(&state_path).unwrap();
+            let schedule_bytes_before = std::fs::read(&schedule_path).unwrap();
+            let cache_before = manager.cache[&earlier].clone();
+            let legacy_before = manager.legacy_cache_timestamp_urls.clone();
+            let state_before = manager.list_state_handle().lock().unwrap().clone();
+            let schedule_before = manager.schedule_state.clone();
+            let status_before = manager.status_registry.status_for_url(&earlier).unwrap();
+            let generations = manager.filter.filter_gen_ids();
+            let digest = manager.installed_corpus_digest;
+            let cycle = manager.status_registry.cycle();
+            assert!(digest.is_some());
+            let files_before: BTreeSet<_> = std::fs::read_dir(&cache_dir)
+                .unwrap()
+                .map(|p| p.unwrap().file_name())
+                .collect();
+
+            let signal = RefreshCancellation::default();
+            let cancel = signal.clone();
+            let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hit_hook = hit.clone();
+            let mut seen = 0;
+            manager.set_worker_hook_for_test(move |at| {
+                if at == target {
+                    seen += 1;
+                    if seen == if target == "source" { 2 } else { 1 } {
+                        hit_hook.store(true, std::sync::atomic::Ordering::Release);
+                        cancel.cancel();
+                    }
+                }
+            });
+            let outcome = bounded(spawn_list_refresh_worker(
+                manager,
+                RefreshMode::Force,
+                signal,
+            ))
+            .await
+            .unwrap();
+            assert!(
+                hit.load(std::sync::atomic::Ordering::Acquire),
+                "missed {target}"
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), if target == "source" { 3 } else { 4 });
+            assert!(requests[2].starts_with("get /earlier.txt "));
+            assert!(requests[2].contains("if-none-match: \"retained\""));
+
+            match outcome {
+                RefreshWorkerOutcome::Cancelled { manager } => {
+                    assert!(matches!(target, "source" | "before_commit"));
+                    assert_eq!(std::fs::read(&meta_path).unwrap(), meta_before, "{target}");
+                    assert_eq!(manager.cache[&earlier], cache_before);
+                    assert_eq!(manager.legacy_cache_timestamp_urls, legacy_before);
+                    assert_eq!(*manager.list_state_handle().lock().unwrap(), state_before);
+                    assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes_before);
+                    assert_eq!(manager.schedule_state, schedule_before);
+                    assert_eq!(
+                        std::fs::read(&schedule_path).unwrap(),
+                        schedule_bytes_before
+                    );
+                    assert_eq!(
+                        manager.status_registry.status_for_url(&earlier).unwrap(),
+                        status_before
+                    );
+                    assert_eq!(manager.filter.filter_gen_ids(), generations);
+                    assert_eq!(manager.installed_corpus_digest, digest);
+                    assert_eq!(manager.status_registry.cycle(), cycle);
+                    assert!(manager.filter.is_blocked("retained.example"));
+                    assert!(manager.filter.is_blocked("old.example"));
+                    assert!(!manager.filter.is_blocked("new.example"));
+                    let files_after: BTreeSet<_> = std::fs::read_dir(&cache_dir)
+                        .unwrap()
+                        .map(|p| p.unwrap().file_name())
+                        .collect();
+                    assert_eq!(files_after, files_before);
+                }
+                RefreshWorkerOutcome::Completed {
+                    manager,
+                    completion,
+                } => {
+                    assert!(matches!(target, "after_swap" | "worker_return"));
+                    let fetched_at = manager.cache[&earlier].fetched_at;
+                    assert!(fetched_at > anchor);
+                    assert_eq!(load_meta_file(&meta_path).fetched_at, Some(fetched_at));
+                    assert!(!manager.legacy_cache_timestamp_urls.contains(&earlier));
+                    let state = manager.list_state_handle().lock().unwrap().clone();
+                    assert_eq!(state.lists[&id].consecutive_failures, 0);
+                    assert_eq!(
+                        state.lists[&id].status,
+                        crate::config::list_state::ListStatus::Active
+                    );
+                    assert!(state.lists[&id].last_success > state_before.lists[&id].last_success);
+                    assert_eq!(
+                        state.lists[&id].cache_path,
+                        state_before.lists[&id].cache_path
+                    );
+                    assert_eq!(
+                        crate::config::list_state::ListState::read_or_default(&state_path).unwrap(),
+                        state
+                    );
+                    assert_eq!(
+                        manager.schedule_state.lookup(&key).unwrap().outcome,
+                        CanonicalScheduleOutcome::Success
+                    );
+                    assert_eq!(
+                        manager.schedule_state.lookup(&key).unwrap().last_attempt,
+                        fetched_at
+                    );
+                    assert_eq!(
+                        ListScheduleState::read_or_default(&schedule_path).unwrap(),
+                        manager.schedule_state
+                    );
+                    assert_eq!(
+                        manager
+                            .status_registry
+                            .status_for_url(&earlier)
+                            .unwrap()
+                            .last_outcome,
+                        LastOutcome::Ok
+                    );
+                    assert_eq!(completion.snapshot.cycle.seq, cycle.seq + 1);
+                    assert_eq!(completion.snapshot.domain_count, 2);
+                    assert!(!completion.snapshot.cycle.generation_degraded);
+                    assert!(manager.filter.is_blocked("retained.example"));
+                    assert_eq!(manager.filter.is_blocked("new.example"), changed);
+                    assert_eq!(manager.filter.is_blocked("old.example"), !changed);
+                    let ids = manager.filter.filter_gen_ids();
+                    assert!(ids.iter().all(|id| *id == ids[0]));
+                    assert_eq!(ids == generations, !changed);
+                    assert!(manager.installed_corpus_digest.is_some());
+                    assert_eq!(manager.installed_corpus_digest == digest, !changed);
+                    assert!(!cache_dir.join(SHARD_SPILL_DIR).exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_local_read_parse_and_staging_preserves_publication() {
+        for (target, nth) in [
+            ("local_read", 2),
+            ("sniff", 2),
+            ("parse_line", 2),
+            ("parse_read", 2),
+            ("staged_body", 1),
+        ] {
+            cancel_prepublication_at(target, nth, RefreshMode::Force, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retained_hash_and_parse_preserves_publication() {
+        cancel_prepublication_at("cache_hash", 1, RefreshMode::CacheOnly, true).await;
+        cancel_prepublication_at("parse_line", 1, RefreshMode::CacheOnly, false).await;
+    }
+
+    async fn retire_stalled_http(headers: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["lists.test".to_string()]).unwrap();
+        let client_cert = reqwest::Certificate::from_pem(cert.cert.pem().as_bytes()).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(tls.read_u8().await.unwrap());
+            }
+            request_tx.send(()).unwrap();
+            if !headers {
+                tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\npartial.example\n",
+                )
+                .await
+                .unwrap();
+                tls.flush().await.unwrap();
+            }
+            // Keep the socket open until the cancelled client drops it.
+            let mut byte = [0];
+            let _ = tls.read(&mut byte).await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(client_cert)
+            .resolve("lists.test", addr)
+            .timeout(Duration::from_secs(600))
+            .build()
+            .unwrap();
+        let source = format!("https://lists.test:{}/list.txt", addr.port());
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = ListManager::new(
+            client,
+            Arc::new(FilterEngine::new()),
+            vec![source.clone()],
+            Catalog::fallback(),
+            Duration::from_secs(3600),
+            build_source_bit_map(&[source]).unwrap(),
+            TEST_CAP,
+            DEFAULT_MAX_LIST_ENTRIES,
+            Some(dir.path().to_path_buf()),
+        );
+        let (body_tx, body_rx) = oneshot::channel();
+        let mut body_tx = Some(body_tx);
+        manager.set_worker_hook_for_test(move |at| {
+            if at == "http_body_chunk" {
+                if let Some(tx) = body_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let filter = manager.filter.clone();
+        let registry = manager.status_registry();
+        let generations = filter.filter_gen_ids();
+        let task = manager.spawn_refresh_loop();
+        bounded(request_rx).await.unwrap();
+        if !headers {
+            bounded(body_rx).await.unwrap();
+        }
+        bounded(task.retire()).await.unwrap();
+        assert_eq!(registry.cycle().seq, 0);
+        assert_eq!(filter.filter_gen_ids(), generations);
+        assert_eq!(filter.domain_count(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        bounded(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_http_while_waiting_for_headers() {
+        retire_stalled_http(true).await;
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_http_while_waiting_for_more_body() {
+        retire_stalled_http(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_first_swap_and_during_spill_work_preserves_publication() {
+        for disk in [true, false] {
+            for target in [
+                "spill_validate",
+                "before_sort",
+                "after_sort",
+                "before_commit",
+            ] {
+                cancel_prepublication_at(target, 1, RefreshMode::Force, disk).await;
+            }
+            cancel_prepublication_at(
+                if disk { "spill_read" } else { "spill_count" },
+                1,
+                RefreshMode::Force,
+                disk,
+            )
+            .await;
+        }
+        cancel_prepublication_at("spill_load", 1, RefreshMode::Force, false).await;
+        cancel_prepublication_at("spill_flush", 1, RefreshMode::Force, true).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_cannot_interrupt_an_empty_commit_or_change_its_digest() {
+        for target in ["before_commit", "after_swap"] {
+            let (mut manager, _, dir) = bridge_manager("old.example\n");
+            manager.refresh().await;
+            manager.set_shrink_guard(false, 90);
+            let digest = manager.installed_corpus_digest;
+            let generations = manager.filter.filter_gen_ids();
+            let seq = manager.status_registry.cycle().seq;
+            std::fs::write(dir.path().join("lists/poison.txt"), "").unwrap();
+            let signal = RefreshCancellation::default();
+            let cancel = signal.clone();
+            manager.set_worker_hook_for_test(move |at| {
+                if at == target {
+                    cancel.cancel();
+                }
+            });
+            match bounded(spawn_list_refresh_worker(
+                manager,
+                RefreshMode::Force,
+                signal,
+            ))
+            .await
+            .unwrap()
+            {
+                RefreshWorkerOutcome::Cancelled { manager } => {
+                    assert_eq!(target, "before_commit");
+                    assert_eq!(manager.installed_corpus_digest, digest);
+                    assert_eq!(manager.filter.filter_gen_ids(), generations);
+                    assert_eq!(manager.status_registry.cycle().seq, seq);
+                }
+                RefreshWorkerOutcome::Completed {
+                    manager,
+                    completion,
+                } => {
+                    assert_eq!(target, "after_swap");
+                    assert_ne!(manager.installed_corpus_digest, digest);
+                    assert!(manager.installed_corpus_digest.is_some());
+                    assert_eq!(completion.snapshot.cycle.seq, seq + 1);
+                    assert_eq!(completion.snapshot.domain_count, 0);
+                    let ids = manager.filter.filter_gen_ids();
+                    assert_ne!(ids, generations);
+                    assert!(ids.iter().all(|id| *id == ids[0]));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_spill_open_failure_does_not_publish_a_cycle() {
+        let (mut manager, _, _dir) = bridge_manager("old.example\n");
+        let signal = RefreshCancellation::default();
+        let cancel = signal.clone();
+        manager.set_worker_hook_for_test(move |at| {
+            if at == "start" {
+                fail_next_shard_spill_dir_create_for_test();
+            }
+            if at == "before_commit" {
+                cancel.cancel();
+            }
+        });
+        let RefreshWorkerOutcome::Cancelled { manager } = bounded(spawn_list_refresh_worker(
+            manager,
+            RefreshMode::Force,
+            signal,
+        ))
+        .await
+        .unwrap() else {
+            panic!("cancelled spill failure published a cycle");
+        };
+        assert_eq!(manager.status_registry.cycle().seq, 0);
+        assert!(manager.installed_corpus_digest.is_none());
+        assert_eq!(manager.filter.domain_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retirement_after_first_swap_waits_for_the_complete_commit() {
+        let (mut manager, source, dir) = bridge_manager("old.example\n");
+        manager.refresh().await;
+        let filter = manager.filter.clone();
+        let registry = manager.status_registry();
+        let generations = filter.filter_gen_ids();
+        let seq = registry.cycle().seq;
+        std::fs::write(
+            dir.path().join("lists/poison.txt"),
+            "new.example\nother.example\n",
+        )
+        .unwrap();
+        let (swapped, release) = pause_worker(&mut manager, "after_swap", 1);
+        let (tx, rx) = mpsc::channel(8);
+        manager.set_command_channel(rx);
+        let task = manager.spawn_refresh_loop_after_refresh();
+        let (command, accepted, result) = force();
+        tx.send(command).await.unwrap();
+        bounded(accepted).await.unwrap();
+        bounded(swapped).await.unwrap();
+        let retirement = task.retire();
+        tokio::pin!(retirement);
+        bounded(async {
+            tokio::select! {
+                biased;
+                _ = &mut retirement => panic!("commit must finish first"),
+                _ = tx.closed() => {}
+            }
+        })
+        .await;
+        assert_eq!(registry.cycle().seq, seq);
+        release.send(()).unwrap();
+        bounded(retirement).await.unwrap();
+        let completion = bounded(result).await.unwrap();
+        assert_eq!(completion.snapshot.cycle.seq, seq + 1);
+        assert_eq!(completion.snapshot.domain_count, 2);
+        assert!(filter.is_blocked("new.example"));
+        assert!(!filter.is_blocked("old.example"));
+        let committed = filter.filter_gen_ids();
+        assert!(committed.iter().all(|id| *id == committed[0]));
+        assert_ne!(committed, generations);
+        let path = selected_cache_body_path(&dir.path().join("cache"), &source).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "new.example\nother.example\n"
+        );
+        assert!(!dir.path().join("cache").join(SHARD_SPILL_DIR).exists());
+    }
 }
 
 #[tokio::test]
@@ -270,6 +2141,41 @@ async fn read_bounded_body_aborts_on_oversized_stream_no_content_length() {
         }
         other => panic!("expected TooLarge, got {other:?}"),
     }
+}
+
+#[test]
+fn bounded_body_growth_refuses_integer_overflow() {
+    assert_eq!(bounded_body_growth(8, 2, 10), Ok(10));
+    assert_eq!(bounded_body_growth(8, 3, 10), Err(11));
+    assert_eq!(
+        bounded_body_growth(usize::MAX - 1, 1, usize::MAX),
+        Ok(usize::MAX)
+    );
+    assert_eq!(
+        bounded_body_growth(usize::MAX, 1, usize::MAX),
+        Err(usize::MAX)
+    );
+}
+
+#[test]
+fn resident_body_content_length_hint_has_an_independent_cap() {
+    assert_eq!(bounded_body_initial_capacity(None, usize::MAX), 0);
+    assert_eq!(bounded_body_initial_capacity(Some(12), 10), 10);
+    assert_eq!(
+        bounded_body_initial_capacity(Some(u64::MAX), usize::MAX),
+        if usize::BITS < 64 {
+            0
+        } else {
+            RESIDENT_BODY_INITIAL_CAPACITY_MAX
+        }
+    );
+    assert_eq!(
+        bounded_body_initial_capacity(
+            Some((RESIDENT_BODY_INITIAL_CAPACITY_MAX as u64) * 8),
+            usize::MAX,
+        ),
+        RESIDENT_BODY_INITIAL_CAPACITY_MAX
+    );
 }
 
 /// Small body well under the cap — happy path.
@@ -616,23 +2522,28 @@ fn meta_file_round_trip() {
     write_cache_to_disk(
         dir.path(),
         source,
+        "https://lists.purge.cc/ads.txt",
         "example.com\nads.tracker.io\n",
         Some("W/\"abc123\""),
         Some("Thu, 10 Apr 2026 12:00:00 GMT"),
         stamp,
-    );
-
+    )
+    .unwrap();
     let stem = source_to_cache_stem(source);
-    let cache_path = dir.path().join(format!("{stem}.cache"));
     let meta_path = dir.path().join(format!("{stem}.meta"));
-
+    let parsed = load_meta_file(&meta_path);
+    let cache_path = selected_body_path(dir.path(), &stem, &parsed).unwrap();
     assert!(cache_path.exists());
     assert!(meta_path.exists());
-
-    let body = std::fs::read_to_string(&cache_path).unwrap();
-    assert_eq!(body, "example.com\nads.tracker.io\n");
-
-    let parsed = load_meta_file(&meta_path);
+    assert_eq!(
+        std::fs::read_to_string(&cache_path).unwrap(),
+        "example.com\nads.tracker.io\n"
+    );
+    assert_eq!(
+        parsed.body.as_deref(),
+        cache_path.file_name().and_then(|name| name.to_str())
+    );
+    assert_eq!(parsed.sha256.as_deref().map(str::len), Some(64));
     assert_eq!(parsed.etag.as_deref(), Some("W/\"abc123\""));
     assert_eq!(
         parsed.last_modified.as_deref(),
@@ -690,8 +2601,10 @@ fn build_meta_content_strips_control_chars_from_header_values() {
     let content = build_meta_content(
         Some(hostile_etag),
         Some("Mon,\r\n01 Jan 2024"),
+        "https://lists.example.test/list.txt",
         now,
         Some(42),
+        None,
     );
     // Round-trip through the real parser: the forged values must NOT
     // take effect.
@@ -742,6 +2655,25 @@ fn meta_file_legacy_format_has_no_fetched_at() {
 }
 
 #[test]
+fn legacy_meta_is_usable_only_for_a_raw_url_representative() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta_path = dir.path().join("legacy.meta");
+    std::fs::write(&meta_path, "etag=\"old\"\n").unwrap();
+    let parsed = load_meta_file(&meta_path);
+
+    assert!(cache_identity_matches(
+        "https://example.test/ads.txt",
+        "https://example.test/ads.txt",
+        &parsed
+    ));
+    assert!(!cache_identity_matches(
+        "privacy/ads",
+        "https://example.test/ads.txt",
+        &parsed
+    ));
+}
+
+#[test]
 fn meta_file_invalid_fetched_at_is_ignored() {
     // Garbage in the fetched-at field must not crash parsing —
     // load_meta_file logs a warning and returns None for that
@@ -768,11 +2700,13 @@ fn load_disk_cache_loads_headers_only() {
     write_cache_to_disk(
         dir.path(),
         source,
+        "https://lists.purge.cc/ads.txt",
         "cached.example.com\n",
         Some("\"etag1\""),
         None,
         OffsetDateTime::now_utc(),
-    );
+    )
+    .unwrap();
 
     let client = reqwest::Client::new();
     let filter = Arc::new(FilterEngine::new());
@@ -820,14 +2754,14 @@ fn load_disk_cache_loads_headers_only() {
 }
 
 #[test]
-fn load_disk_cache_legacy_meta_falls_back_to_now() {
+fn load_disk_cache_legacy_raw_url_meta_falls_back_to_now() {
     // A pre-Sprint-24 .meta file (no fetched-at line) should NOT
     // crash load_disk_cache. The cache entry should get a fresh
     // now_utc() stamp so the freshness check (Phase 1.2) treats
     // the legacy cache as just-stamped, avoiding a startup HTTP
     // burst on the first run after a binary upgrade.
     let dir = tempfile::tempdir().unwrap();
-    let source = "privacy/ads";
+    let source = "https://lists.purge.cc/ads.txt";
 
     // Manually write a legacy-format cache pair (no fetched-at line).
     let stem = source_to_cache_stem(source);
@@ -863,7 +2797,7 @@ fn load_disk_cache_legacy_meta_falls_back_to_now() {
 
     let entry = mgr
         .cache
-        .get("https://lists.purge.cc/ads.txt")
+        .get(source)
         .expect("legacy cache should still load");
     assert_eq!(entry.etag.as_deref(), Some("\"old\""));
     assert!(
@@ -956,7 +2890,7 @@ async fn refresh_skips_http_when_cache_is_fresh() {
 /// cached response body"). Since this fixture's `.cache` file is
 /// exactly what both CacheOnly's skip path AND that HTTP-failure
 /// fallback would parse, `count == 1` either way. Verified
-/// empirically: hardcoding `mode = RefreshMode::Network` at the top
+/// empirically: hardcoding `mode = RefreshMode::Scheduled` at the top
 /// of `refresh_with_mode` still passes a `count`/`is_blocked`-only
 /// version of this test.
 ///
@@ -1038,16 +2972,15 @@ async fn cache_only_refresh_serves_a_stale_cache_without_http() {
          field the TUI stale badge reads, and stamping it `now` for \
          a 30-day-old body is the exact lie §2.8 prohibits"
     );
+    assert_eq!(
+        status.entries, 1,
+        "the installed cache body must report its served contribution"
+    );
 }
 
 /// Sharper than the test above: seeds a **non-default** prior status
 /// (as if a real refresh had already run earlier in this process's
-/// lifetime) and asserts it survives a CacheOnly cache-hit cycle
-/// unchanged, field for field. The default-`NeverFetched` case above
-/// would still pass a bug that stamped some *other* fixed value on
-/// this path; only comparing against an arbitrary known prior value
-/// pins "carry forward" as the actual behaviour rather than "happens
-/// to leave the zero value alone".
+/// lifetime) and asserts CacheOnly changes only its served contribution.
 #[tokio::test]
 async fn cache_only_leaves_prior_status_untouched() {
     use crate::lists::status::LastOutcome;
@@ -1093,13 +3026,18 @@ async fn cache_only_leaves_prior_status_untouched() {
     let seeded_last_refresh = OffsetDateTime::now_utc() - time::Duration::hours(9);
     let prior = ListStatus {
         entries: 42,
+        parsed_ok: 17,
+        unique_domains: 4,
+        parsed_skipped: 3,
+        parsed_skipped_samples: vec!["bad row".to_string()],
+        parsed_truncated: 2,
         last_outcome: LastOutcome::Failed {
             reason: "prior network attempt failed".to_string(),
         },
         fetched_at: Some(seeded_last_refresh),
         last_refresh_at: Some(seeded_last_refresh),
+        delta_pct_vs_prev: Some(12.5),
         prev_entries: Some(37),
-        ..ListStatus::default()
     };
     reg.update_for_url(&url, prior.clone());
 
@@ -1107,14 +3045,13 @@ async fn cache_only_leaves_prior_status_untouched() {
 
     // The list still contributes its domains to the map ...
     assert!(filter.is_blocked("stale.example.com"));
-    // ... but its health/freshness reporting is exactly what it was
-    // before this cycle — this is the assertion that fails if
-    // `update_list_status_ok` / `ListStatus::from_refresh` is ever
-    // reinstated on the CacheOnly cache-hit path.
+    // ... while its health/freshness reporting stays exactly as it was.
     let status = reg.status_for_url(&url).unwrap();
+    let mut expected = prior;
+    expected.entries = 1;
     assert_eq!(
-        *status, prior,
-        "CacheOnly must carry the prior status forward untouched (§2.8)"
+        *status, expected,
+        "CacheOnly may reconcile served entries but must not claim health"
     );
 }
 
@@ -1138,7 +3075,7 @@ async fn cache_only_leaves_prior_status_untouched() {
 /// Without the `last_outcome` assertion, this test (and the one
 /// above) both pass on a `refresh_with_mode` that ignores `mode`
 /// entirely — confirmed by temporarily hardcoding
-/// `RefreshMode::Network` at the top of `refresh_with_mode` and
+/// `RefreshMode::Scheduled` at the top of `refresh_with_mode` and
 /// re-running the CacheOnly test above alone.
 #[tokio::test]
 async fn network_refresh_with_a_stale_cache_still_reaches_http() {
@@ -1178,7 +3115,13 @@ async fn network_refresh_with_a_stale_cache_still_reaches_http() {
     mgr.load_disk_cache();
     let reg = mgr.status_registry();
 
-    let count = mgr.refresh_with_mode(RefreshMode::Network).await;
+    // Establish the cached body as the live corpus first. The following
+    // failed Network attempt then has usable inputs identical to what is
+    // already live; calling that an install would be false even though the
+    // per-source attempt remains Failed.
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::CacheOnly).await, 1);
+    let live_digest = mgr.installed_corpus_digest;
+    let count = mgr.refresh_with_mode(RefreshMode::Scheduled).await;
 
     assert_eq!(
         count, 1,
@@ -1193,6 +3136,13 @@ async fn network_refresh_with_a_stale_cache_still_reaches_http() {
          refusal: got {:?}",
         status.last_outcome
     );
+    assert_eq!(
+        reg.cycle().outcome,
+        Some(CycleOutcome::SkippedUnchanged),
+        "a retained fallback that reproduces the live corpus is not a new install"
+    );
+    assert!(!reg.cycle().source_coverage_incomplete);
+    assert_eq!(mgr.installed_corpus_digest, live_digest);
 }
 
 /// Closes a gap the two tests above cannot: both their fixtures have
@@ -1497,10 +3447,13 @@ async fn a_failed_download_does_not_stamp_fetched_at() {
         Some(dir.path().to_path_buf()),
     );
     mgr.load_disk_cache();
+    let blocklist_id = crate::config::schema::Id::new("remote-retained").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (blocklist_id.clone(), 1))]));
     let before = mgr.cache.get(&url).expect("entry loaded").fetched_at;
     let reg = mgr.status_registry();
 
-    mgr.refresh_with_mode(RefreshMode::Network).await;
+    mgr.refresh_with_mode(RefreshMode::Scheduled).await;
 
     // Proves `download_list` was actually reached and actually
     // failed — without this, a mutated freshness gate that always
@@ -1523,6 +3476,19 @@ async fn a_failed_download_does_not_stamp_fetched_at() {
         before, after,
         "a failed download must leave fetched_at alone — stamping it \
          would make a permanently-dead list read as fresh forever"
+    );
+    assert!(
+        filter.is_blocked("kept.example.com"),
+        "the generic remote failure must retain only a cache body that parsed successfully"
+    );
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    let expected_cache_path = dir.path().join(format!("{stem}.cache"));
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Failed);
+    assert_eq!(entry.consecutive_failures, 1);
+    assert_eq!(
+        entry.cache_path.as_deref(),
+        Some(expected_cache_path.as_path())
     );
 }
 
@@ -1947,23 +3913,33 @@ fn cleanup_stale_caches_removes_old_files() {
     let dir = tempfile::tempdir().unwrap();
 
     // Write cache for a source that IS still configured
-    write_cache_to_disk(
+    let active_body = write_cache_to_disk(
         dir.path(),
         "privacy/ads",
+        "https://lists.purge.cc/ads.txt",
         "body",
         None,
         None,
         OffsetDateTime::now_utc(),
-    );
+    )
+    .unwrap();
+    let active_stem = source_to_cache_stem("privacy/ads");
+    let active_orphan = dir.path().join(generation_basename(
+        &active_stem,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ));
+    std::fs::write(&active_orphan, "orphan").unwrap();
     // Write cache for a source that is NOT configured
     write_cache_to_disk(
         dir.path(),
         "content/adult",
+        "https://lists.purge.cc/adult.txt",
         "body",
         None,
         None,
         OffsetDateTime::now_utc(),
-    );
+    )
+    .unwrap();
 
     let client = reqwest::Client::new();
     let filter = Arc::new(FilterEngine::new());
@@ -1985,13 +3961,86 @@ fn cleanup_stale_caches_removes_old_files() {
     mgr.cleanup_stale_caches();
 
     // privacy/ads files should remain (active source).
-    let active_stem = source_to_cache_stem("privacy/ads");
-    assert!(dir.path().join(format!("{active_stem}.cache")).exists());
     assert!(dir.path().join(format!("{active_stem}.meta")).exists());
+    assert!(
+        active_body.exists(),
+        "cleanup must preserve the selected body"
+    );
+    assert!(
+        !active_orphan.exists(),
+        "cleanup must remove an active-stem orphan"
+    );
     // content/adult files should be removed (no longer in config).
     let stale_stem = source_to_cache_stem("content/adult");
-    assert!(!dir.path().join(format!("{stale_stem}.cache")).exists());
     assert!(!dir.path().join(format!("{stale_stem}.meta")).exists());
+    assert_eq!(generation_body_paths(dir.path(), &active_stem).len(), 1);
+    assert!(generation_body_paths(dir.path(), &stale_stem).is_empty());
+}
+
+fn cleanup_manager(cache_dir: &Path, source: &str) -> ListManager {
+    ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.to_path_buf()),
+    )
+}
+
+fn write_generation_body(cache_dir: &Path, source: &str, body: &[u8]) -> PathBuf {
+    use sha2::Digest;
+
+    let stem = source_to_cache_stem(source);
+    let sha256 = hex::encode(sha2::Sha256::digest(body));
+    let path = cache_dir.join(generation_basename(&stem, &sha256));
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn cleanup_preserves_generations_when_manifest_is_invalid_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/unreadable.txt";
+    let body = write_generation_body(dir.path(), source, b"kept\n");
+    let stem = source_to_cache_stem(source);
+    std::fs::write(dir.path().join(format!("{stem}.meta")), [0xff]).unwrap();
+
+    let parsed = load_meta_file(&dir.path().join(format!("{stem}.meta")));
+    assert_eq!(parsed.load_state, MetaLoadState::Unreadable);
+    assert!(selected_body_path(dir.path(), &stem, &parsed).is_none());
+    cleanup_manager(dir.path(), source).cleanup_stale_caches();
+    assert!(body.exists());
+}
+
+#[test]
+fn cleanup_preserves_generations_for_duplicate_or_partial_manifest_fields() {
+    let source = "https://lists.example.test/malformed.txt";
+    for manifest in [
+        "body=partial\n",
+        "body=first\nbody=second\nsha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let body = write_generation_body(dir.path(), source, b"kept\n");
+        let stem = source_to_cache_stem(source);
+        std::fs::write(dir.path().join(format!("{stem}.meta")), manifest).unwrap();
+
+        cleanup_manager(dir.path(), source).cleanup_stale_caches();
+        assert!(body.exists(), "cleanup deleted body for {manifest:?}");
+    }
+}
+
+#[test]
+fn cleanup_removes_active_generation_orphans_when_meta_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/missing.txt";
+    let body = write_generation_body(dir.path(), source, b"orphan\n");
+
+    cleanup_manager(dir.path(), source).cleanup_stale_caches();
+    assert!(!body.exists());
 }
 
 // ── S50 T5.5: imported.local loader-bridge ─────────────────────────
@@ -2077,8 +4126,8 @@ async fn neutrality06_allow_direction_list_reaches_engine_as_allow() {
             display_name: id.to_string(),
             url: url.to_string(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base,
@@ -2169,8 +4218,8 @@ async fn cluster_build_allow_direction_survives_sharded_install() {
             display_name: id.to_string(),
             url: url.to_string(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base,
@@ -2366,8 +4415,8 @@ fn pure_v1_auth_token_ref_attaches_bearer_via_v1_id_fallback() {
         display_name: "sec".to_string(),
         url: url.to_string(),
         format: BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: Some("sec-token".to_string()),
         base: BlocklistBase::Deny,
@@ -2446,13 +4495,21 @@ fn imported_local_url_missing_id_segment_refuses() {
 }
 
 #[test]
-fn imported_local_url_oversize_file_refuses() {
-    // Defence-in-depth: a runaway local file shouldn't OOM the
-    // daemon any more than a runaway HTTP body would. The HTTP
-    // path uses `read_bounded_body`; the bridge mirrors via a
-    // `metadata().len()` check before reading.
-    let dir = write_imported_local_file("oversize.txt", "0123456789ABCDEF\n");
-    // Cap of 4 bytes — strictly smaller than the 17-byte body.
+fn imported_local_url_exactly_at_body_cap_is_loaded() {
+    let body = "cap!";
+    let dir = write_imported_local_file("cap.txt", body);
+    let outcome = try_bridge_imported_local(
+        "https://imported.local/cap.txt",
+        BlocklistTrust::Local,
+        dir.path(),
+        body.len(),
+    );
+    assert!(matches!(outcome, LocalBridgeOutcome::Loaded { body: got, .. } if got == body));
+}
+
+#[test]
+fn imported_local_url_cap_plus_one_refuses() {
+    let dir = write_imported_local_file("oversize.txt", "12345");
     let outcome = try_bridge_imported_local(
         "https://imported.local/oversize.txt",
         BlocklistTrust::Local,
@@ -2462,7 +4519,7 @@ fn imported_local_url_oversize_file_refuses() {
     match outcome {
         LocalBridgeOutcome::Refused(reason) => {
             assert!(
-                reason.contains("17 bytes"),
+                reason.contains("5 bytes"),
                 "error message should report the actual size; got: {reason}"
             );
             assert!(
@@ -2472,6 +4529,70 @@ fn imported_local_url_oversize_file_refuses() {
         }
         other => panic!("expected Refused for oversize file, got {other:?}"),
     }
+}
+
+#[test]
+fn imported_local_url_reads_the_opened_handle_after_path_replacement() {
+    let original = "cap!";
+    let dir = write_imported_local_file("replace.txt", original);
+    let on_disk = dir.path().join("lists").join("replace.txt");
+    let replacement = dir.path().join("lists").join("replacement.tmp");
+    set_imported_local_after_metadata_hook_for_test(move || {
+        std::fs::write(&replacement, "replacement is deliberately over the cap").unwrap();
+        std::fs::rename(&replacement, &on_disk).unwrap();
+    });
+
+    let outcome = try_bridge_imported_local(
+        "https://imported.local/replace.txt",
+        BlocklistTrust::Local,
+        dir.path(),
+        original.len(),
+    );
+    assert!(matches!(outcome, LocalBridgeOutcome::Loaded { body: got, .. } if got == original));
+}
+
+#[test]
+fn imported_local_url_growth_after_metadata_cannot_bypass_body_cap() {
+    let original = "cap!";
+    let dir = write_imported_local_file("grow.txt", original);
+    let on_disk = dir.path().join("lists").join("grow.txt");
+    set_imported_local_after_metadata_hook_for_test(move || {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&on_disk)
+            .unwrap();
+        file.write_all(b"+").unwrap();
+    });
+
+    let outcome = try_bridge_imported_local(
+        "https://imported.local/grow.txt",
+        BlocklistTrust::Local,
+        dir.path(),
+        original.len(),
+    );
+    assert!(
+        matches!(outcome, LocalBridgeOutcome::Refused(reason) if reason.contains("5 bytes") && reason.contains("max 4 bytes"))
+    );
+}
+
+#[test]
+fn imported_local_url_invalid_utf8_refuses() {
+    let dir = write_imported_local_file("invalid.txt", "placeholder");
+    std::fs::write(
+        dir.path().join("lists").join("invalid.txt"),
+        b"valid.example\n\xff",
+    )
+    .unwrap();
+
+    let outcome = try_bridge_imported_local(
+        "https://imported.local/invalid.txt",
+        BlocklistTrust::Local,
+        dir.path(),
+        TEST_CAP,
+    );
+    assert!(
+        matches!(outcome, LocalBridgeOutcome::Refused(reason) if reason.contains("invalid UTF-8"))
+    );
 }
 
 #[test]
@@ -2544,8 +4665,8 @@ fn set_local_bridge_attaches_trust_map_and_dir() {
         display_name: "mycompany".to_string(),
         url: imported_url.clone(),
         format: Default::default(),
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: crate::config::schema::BlocklistBase::Allow,
@@ -2617,8 +4738,8 @@ fn merge_sources_with_blocklists_appends_url_and_records_trust() {
             display_name: "mycompany".to_string(),
             url: "https://imported.local/mycompany.txt".to_string(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base: BlocklistBase::Allow,
@@ -2632,8 +4753,8 @@ fn merge_sources_with_blocklists_appends_url_and_records_trust() {
             display_name: "paused".to_string(),
             url: "https://example.com/paused.txt".to_string(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: false,
             auth_token_ref: None,
             base: BlocklistBase::Deny,
@@ -2690,8 +4811,8 @@ fn merge_sources_with_blocklists_does_not_duplicate_when_url_already_in_sources(
         display_name: "mycompany".to_string(),
         url: "https://imported.local/mycompany.txt".to_string(),
         format: Default::default(),
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: BlocklistBase::Allow,
@@ -2725,9 +4846,10 @@ fn forget_removes_in_memory_entry() {
     );
 
     let resolved_url = mgr
-        .catalog
-        .resolve("privacy/ads")
-        .expect("privacy/ads in fallback catalog");
+        .fetch_urls
+        .get("privacy/ads")
+        .cloned()
+        .expect("privacy/ads has a resolved fetch URL");
     mgr.cache.insert(
         resolved_url.clone(),
         ListCache {
@@ -2809,15 +4931,2180 @@ fn forget_returns_false_when_source_not_cached() {
 
     // Cache an entry, forget once (true), forget again (false).
     let url = mgr
-        .catalog
-        .resolve("privacy/ads")
-        .expect("privacy/ads in fallback catalog");
+        .fetch_urls
+        .get("privacy/ads")
+        .cloned()
+        .expect("privacy/ads has a resolved fetch URL");
     mgr.cache.insert(url, ListCache::default());
     assert!(mgr.forget_source("privacy/ads"));
     assert!(
         !mgr.forget_source("privacy/ads"),
         "second forget on already-cleared source returns false"
     );
+}
+
+#[test]
+fn planned_forget_routes_slug_id_and_url_aliases_to_the_representative_cache() {
+    use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat, Id};
+    use std::collections::BTreeMap;
+
+    let row = Blocklist {
+        id: Id::new("team-ads").unwrap(),
+        display_name: "Team ads".to_string(),
+        url: "https://example.test/team-ads.txt".to_string(),
+        format: BlocklistFormat::Domains,
+        update_interval_hours: None,
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: BlocklistBase::Deny,
+        trust: BlocklistTrust::RemoteUnsigned,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    };
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        &["team/ads".to_string()],
+        &[row],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+
+    for alias in [
+        "team/ads",
+        "team-ads",
+        "https://example.test/team-ads.txt",
+        "https://EXAMPLE.test:443/team-ads.txt/",
+    ] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let representative = plan.representatives().pop().unwrap();
+        let fetch_url = plan
+            .fetch_url_for_source(&representative)
+            .unwrap()
+            .to_string();
+        write_cache_to_disk(
+            cache_dir.path(),
+            &representative,
+            &fetch_url,
+            "ads.example\n",
+            None,
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let mut manager = ListManager::with_plan_and_tokens(
+            reqwest::Client::new(),
+            Arc::new(FilterEngine::new()),
+            plan.clone(),
+            Duration::from_secs(3600),
+            bits.clone(),
+            SourceTokenMap::default(),
+            TEST_CAP,
+            DEFAULT_MAX_LIST_ENTRIES,
+            Some(cache_dir.path().to_path_buf()),
+        );
+        manager.cache.insert(fetch_url, ListCache::default());
+
+        assert!(manager.forget_source(alias), "alias {alias}");
+        let stem = source_to_cache_stem(&representative);
+        assert!(!cache_dir.path().join(format!("{stem}.cache")).exists());
+        assert!(!cache_dir.path().join(format!("{stem}.meta")).exists());
+    }
+}
+
+async fn spawn_unconditional_304_tls_origin() -> (
+    std::net::SocketAddr,
+    String,
+    Arc<std::sync::Mutex<Option<String>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let cert = rcgen::generate_simple_self_signed(vec!["lists.test".to_string()]).unwrap();
+    let pem = cert.cert.pem();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let request_seen = Arc::new(std::sync::Mutex::new(None));
+    let request_for_task = request_seen.clone();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        if let Ok(read) = tls.read(&mut request).await {
+            *request_for_task.lock().unwrap() =
+                Some(String::from_utf8_lossy(&request[..read]).to_ascii_lowercase());
+        }
+        let _ = tls
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = tls.shutdown().await;
+    });
+    (addr, pem, request_seen)
+}
+
+async fn spawn_tls_origin_responses(
+    responses: Vec<String>,
+) -> (
+    std::net::SocketAddr,
+    String,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let cert = rcgen::generate_simple_self_signed(vec!["lists.test".to_string()]).unwrap();
+    let pem = cert.cert.pem();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests_for_task = requests.clone();
+    tokio::spawn(async move {
+        for response in responses {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            if let Ok(read) = tls.read(&mut request).await {
+                requests_for_task
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..read]).to_ascii_lowercase());
+            }
+            let _ = tls.write_all(response.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+    });
+    (addr, pem, requests)
+}
+
+async fn spawn_etag_precedence_tls_origin() -> (
+    std::net::SocketAddr,
+    String,
+    Arc<std::sync::Mutex<Option<String>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let cert = rcgen::generate_simple_self_signed(vec!["lists.test".to_string()]).unwrap();
+    let pem = cert.cert.pem();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let request_seen = Arc::new(std::sync::Mutex::new(None));
+    let request_for_task = request_seen.clone();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let Ok(read) = tls.read(&mut request).await else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+        *request_for_task.lock().unwrap() = Some(request.clone());
+        let response = if request.contains("if-modified-since:") {
+            "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string()
+        } else {
+            tls_ok_response_with_last_modified(
+                "changed.example\n",
+                "\"new\"",
+                "Thu, 01 Jan 1970 00:00:00 GMT",
+            )
+        };
+        let _ = tls.write_all(response.as_bytes()).await;
+        let _ = tls.shutdown().await;
+    });
+    (addr, pem, request_seen)
+}
+
+fn tls_ok_response(body: &str, etag: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn tls_ok_response_with_last_modified(body: &str, etag: &str, last_modified: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nETag: {etag}\r\nLast-Modified: {last_modified}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test]
+async fn download_list_returns_an_uncommitted_validator_candidate() {
+    let last_modified = "Thu, 01 Jan 1970 00:00:00 GMT";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![tls_ok_response_with_last_modified(
+        "candidate.example\n",
+        "\"candidate\"",
+        last_modified,
+    )])
+    .await;
+    let url = "https://lists.test/candidate.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let prior = ListCache {
+        etag: Some("\"retained\"".into()),
+        last_modified: Some("Wed, 31 Dec 1969 00:00:00 GMT".into()),
+        body: Some("retained.example\n".into()),
+        fetched_at: time::macros::datetime!(2026-09-04 12:00:00 UTC),
+    };
+    mgr.cache.insert(url.clone(), prior.clone());
+
+    let FetchResult::Fresh(candidate) = mgr.download_list(&url, &url).await.unwrap() else {
+        panic!("200 must return a fresh candidate");
+    };
+    assert!(matches!(
+        candidate.body,
+        FreshBody::Resident(ref body) if body == "candidate.example\n"
+    ));
+    assert_eq!(candidate.etag.as_deref(), Some("\"candidate\""));
+    assert_eq!(candidate.last_modified.as_deref(), Some(last_modified));
+    assert_eq!(mgr.cache.get(&url), Some(&prior));
+}
+
+#[tokio::test]
+async fn download_list_prefers_etag_over_last_modified() {
+    let last_modified = "Thu, 01 Jan 1970 00:00:00 GMT";
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        tls_ok_response_with_last_modified("etag.example\n", "\"new-etag\"", last_modified),
+        tls_ok_response_with_last_modified("date.example\n", "\"new-date\"", last_modified),
+    ])
+    .await;
+    let etag_url = "https://lists.test/etag.txt".to_string();
+    let date_url = "https://lists.test/date.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    mgr.cache.insert(
+        etag_url.clone(),
+        ListCache {
+            etag: Some("\"old-etag\"".into()),
+            last_modified: Some(last_modified.into()),
+            body: None,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    );
+    mgr.cache.insert(
+        date_url.clone(),
+        ListCache {
+            etag: None,
+            last_modified: Some(last_modified.into()),
+            body: None,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    );
+
+    mgr.download_list(&etag_url, &etag_url).await.unwrap();
+    mgr.download_list(&date_url, &date_url).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].contains("if-none-match: \"old-etag\""));
+    assert!(!requests[0].contains("if-modified-since:"));
+    assert!(!requests[1].contains("if-none-match:"));
+    assert!(requests[1].contains("if-modified-since: thu, 01 jan 1970 00:00:00 gmt"));
+}
+
+#[tokio::test]
+async fn an_etag_mismatch_with_the_same_last_modified_returns_the_new_body() {
+    let last_modified = "Thu, 01 Jan 1970 00:00:00 GMT";
+    let (origin, pem, request_seen) = spawn_etag_precedence_tls_origin().await;
+    let url = "https://lists.test/changed.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        SourceBitMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    mgr.cache.insert(
+        url.clone(),
+        ListCache {
+            etag: Some("\"old\"".into()),
+            last_modified: Some(last_modified.into()),
+            body: Some("retained.example\n".into()),
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    );
+
+    let FetchResult::Fresh(candidate) = mgr.download_list(&url, &url).await.unwrap() else {
+        panic!("an ETag mismatch must return 200");
+    };
+    assert!(matches!(
+        candidate.body,
+        FreshBody::Resident(ref body) if body == "changed.example\n"
+    ));
+    assert_eq!(candidate.etag.as_deref(), Some("\"new\""));
+    assert_eq!(candidate.last_modified.as_deref(), Some(last_modified));
+    assert!(
+        !request_seen
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("if-modified-since:"),
+        "the origin returns 304 when a date validator is sent"
+    );
+}
+
+/// The disk-backed production branch must carry only a staged generation;
+/// restoring `read_bounded_body(...)->String` here makes this pattern fail.
+#[tokio::test]
+async fn disk_backed_http_fresh_is_staged_and_refresh_parses_the_generation() {
+    let body = "staged.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(body, "\"staged-one\""),
+        tls_ok_response(body, "\"staged-two\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/staged-fresh.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    let FetchResult::Fresh(candidate) = mgr.download_list(&source, &source).await.unwrap() else {
+        panic!("200 must produce a fresh candidate");
+    };
+    let FreshBody::Staged(staged) = &candidate.body else {
+        panic!("disk-backed HTTP FreshDownload retained a resident body");
+    };
+    assert_eq!(staged.len, body.len());
+    assert_eq!(std::fs::read(&staged.body_path).unwrap(), body.as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&staged.body_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+    drop(candidate);
+    assert_eq!(
+        std::fs::read_dir(cache_dir.path()).unwrap().count(),
+        0,
+        "dropping an unselected fresh generation must reclaim it"
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    assert!(mgr.filter.is_blocked("staged.example"));
+    assert_eq!(mgr.read_body_from_disk(&source).as_deref(), Some(body));
+}
+
+#[test]
+fn fresh_staged_equal_length_edit_is_refused_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/fresh-stage-edit.txt";
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(b"good.example\n").unwrap();
+    let staged = streamed.finish().unwrap();
+    std::fs::write(&staged.body_path, b"evil.example\n").unwrap();
+
+    let candidate = FreshDownload {
+        body: FreshBody::Staged(staged),
+        etag: None,
+        last_modified: None,
+    };
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    spill.push("kept.example", 1).unwrap();
+    let before = spill.mark();
+
+    let error = parse_fresh_download_into_spill_counted(
+        &candidate,
+        2,
+        &mut spill,
+        100,
+        source,
+        Some(ListFormat::DomainOnly),
+        UniqueCount::Measure(None),
+    )
+    .expect_err("equal-length edits must not be admitted from a staged generation");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(spill.mark(), before, "the altered source escaped rollback");
+}
+
+#[test]
+fn fresh_staged_length_plus_one_edit_is_refused_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/fresh-stage-length.txt";
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(b"good.example\n").unwrap();
+    let staged = streamed.finish().unwrap();
+    let staged_path = staged.body_path.clone();
+    set_staged_cache_reader_constructed_hook_for_test(move || {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(staged_path)
+            .unwrap();
+        file.write_all(b"x").unwrap();
+    });
+
+    let candidate = FreshDownload {
+        body: FreshBody::Staged(staged),
+        etag: None,
+        last_modified: None,
+    };
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    spill.push("kept.example", 1).unwrap();
+    let before = spill.mark();
+
+    assert!(
+        parse_fresh_download_into_spill_counted(
+            &candidate,
+            2,
+            &mut spill,
+            100,
+            source,
+            Some(ListFormat::DomainOnly),
+            UniqueCount::Measure(None),
+        )
+        .is_err(),
+        "the bounded reader must retain an overflow witness"
+    );
+    assert_eq!(
+        spill.mark(),
+        before,
+        "the overlong candidate escaped rollback"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_staged_path_replacement_is_refused_without_removing_replacement() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/fresh-stage-replacement.txt";
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(b"good.example\n").unwrap();
+    let staged = streamed.finish().unwrap();
+    let body_path = staged.body_path.clone();
+    let replacement = dir.path().join("replacement.body");
+    std::fs::write(&replacement, b"evil.example\n").unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::fs::rename(&replacement, &body_path).unwrap();
+
+    let candidate = FreshDownload {
+        body: FreshBody::Staged(staged),
+        etag: None,
+        last_modified: None,
+    };
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    let before = spill.mark();
+    assert!(
+        parse_fresh_download_into_spill_counted(
+            &candidate,
+            1,
+            &mut spill,
+            100,
+            source,
+            Some(ListFormat::DomainOnly),
+            UniqueCount::Measure(None),
+        )
+        .is_err(),
+        "a replacement pathname must not be parsed through the original handle"
+    );
+    assert_eq!(spill.mark(), before);
+    drop(candidate);
+    assert_eq!(std::fs::read(&body_path).unwrap(), b"evil.example\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_temp_path_replacement_survives_ordinary_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-temp-drop.txt";
+    let streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    let temp_path = streamed.temp_path.clone().unwrap();
+
+    replace_path_with_mode_0640(&temp_path, b"replacement.example\n");
+    drop(streamed);
+
+    assert_eq!(std::fs::read(temp_path).unwrap(), b"replacement.example\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_promotion_authenticates_destination_before_accepting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-destination.txt";
+    let body = b"good.example\n";
+    let digest = hash_body(std::io::Cursor::new(body)).unwrap();
+    let destination = dir.path().join(generation_basename(
+        &source_to_cache_stem(source),
+        &hex::encode(digest),
+    ));
+    let expected_destination = destination.clone();
+    set_streamed_cache_body_after_persist_hook_for_test(move |path| {
+        assert_eq!(path, expected_destination.as_path());
+        replace_path_with_mode_0640(path, b"replacement.example\n");
+    });
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body).unwrap();
+    assert!(
+        streamed.finish().is_err(),
+        "a destination substituted after promotion must not be accepted"
+    );
+    assert_eq!(
+        std::fs::read(destination).unwrap(),
+        b"replacement.example\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_temp_replacement_before_selected_collision_preserves_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-temp-collision.txt";
+    let body = "good.example\n";
+    let selected = stage_cache_body(dir.path(), source, body).unwrap();
+    commit_staged_cache_body(
+        dir.path(),
+        source,
+        source,
+        &selected,
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let selected_path = selected.body_path.clone();
+    drop(selected);
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body.as_bytes()).unwrap();
+    let temp_path = streamed.temp_path.clone().unwrap();
+    replace_path_with_mode_0640(&temp_path, b"replacement.example\n");
+
+    assert!(
+        streamed.finish().is_err(),
+        "a substituted spool must not reach a selected-generation collision"
+    );
+    assert_eq!(std::fs::read(&temp_path).unwrap(), b"replacement.example\n");
+    assert_eq!(std::fs::read(&selected_path).unwrap(), body.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_stage_rejects_existing_generation_symlink() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-symlink.txt";
+    let body = b"good.example\n";
+    let target = external.path().join("external.body");
+    std::fs::write(&target, body).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let digest = hash_body(std::io::Cursor::new(body)).unwrap();
+    let basename = generation_basename(&source_to_cache_stem(source), &hex::encode(digest));
+    std::os::unix::fs::symlink(&target, dir.path().join(basename)).unwrap();
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body).unwrap();
+    assert!(
+        streamed.finish().is_err(),
+        "a content-addressed collision must not adopt a symlink"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), body);
+}
+
+#[cfg(unix)]
+#[test]
+fn streamed_stage_rejects_matching_collision_without_the_staging_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-mode.txt";
+    let body = b"good.example\n";
+    let digest = hash_body(std::io::Cursor::new(body)).unwrap();
+    let basename = generation_basename(&source_to_cache_stem(source), &hex::encode(digest));
+    let collision = dir.path().join(basename);
+    std::fs::write(&collision, body).unwrap();
+    std::fs::set_permissions(&collision, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body).unwrap();
+    assert!(
+        streamed.finish().is_err(),
+        "a matching collision without the owned 0640 contract must be rejected"
+    );
+    assert_eq!(std::fs::read(&collision).unwrap(), body);
+}
+
+#[test]
+fn streamed_stage_reuses_a_selected_matching_regular_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-reuse.txt";
+    let body = "good.example\n";
+    let selected = stage_cache_body(dir.path(), source, body).unwrap();
+    commit_staged_cache_body(
+        dir.path(),
+        source,
+        source,
+        &selected,
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let selected_path = selected.body_path.clone();
+    drop(selected);
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body.as_bytes()).unwrap();
+    let reused = streamed.finish().unwrap();
+    assert_eq!(reused.body_path, selected_path);
+    drop(reused);
+    assert_eq!(std::fs::read(&selected_path).unwrap(), body.as_bytes());
+}
+
+#[test]
+fn streamed_collision_mutation_is_refused_without_deleting_selected_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-collision-mutation.txt";
+    let body = "good.example\n";
+    let selected = stage_cache_body(dir.path(), source, body).unwrap();
+    commit_staged_cache_body(
+        dir.path(),
+        source,
+        source,
+        &selected,
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let selected_path = selected.body_path.clone();
+    drop(selected);
+
+    let mut streamed = StreamedCacheBody::new(dir.path(), source).unwrap();
+    streamed.write_chunk(body.as_bytes()).unwrap();
+    let reused = streamed.finish().unwrap();
+    std::fs::write(&reused.body_path, b"evil.example\n").unwrap();
+
+    let candidate = FreshDownload {
+        body: FreshBody::Staged(reused),
+        etag: None,
+        last_modified: None,
+    };
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    let before = spill.mark();
+    assert!(
+        parse_fresh_download_into_spill_counted(
+            &candidate,
+            1,
+            &mut spill,
+            100,
+            source,
+            Some(ListFormat::DomainOnly),
+            UniqueCount::Measure(None),
+        )
+        .is_err(),
+        "a reused collision must be authenticated through its retained handle"
+    );
+    assert_eq!(spill.mark(), before);
+    drop(candidate);
+    assert_eq!(std::fs::read(&selected_path).unwrap(), b"evil.example\n");
+}
+
+#[tokio::test]
+async fn restored_staged_mutation_cannot_publish_or_commit_the_wrong_corpus() {
+    let old = "kept.example\n";
+    let fresh = "fresh.example\n";
+    let altered = "other.example\n";
+    assert_eq!(fresh.len(), altered.len());
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        tls_ok_response(fresh, "\"fresh\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/restored-stage-mutation.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let meta_path = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(&source)));
+    let old_meta = std::fs::read(&meta_path).unwrap();
+    let old_cache = mgr.cache.get(&source).unwrap().clone();
+    let candidate_path = Arc::new(std::sync::Mutex::new(None));
+    let candidate_path_for_hook = Arc::clone(&candidate_path);
+    let cache_dir_for_hook = cache_dir.path().to_path_buf();
+    let source_for_hook = source.clone();
+    let selected_for_hook = selected.clone();
+    mgr.set_worker_hook_for_test(move |at| {
+        if at == "staged_body" {
+            let path =
+                generation_body_paths(&cache_dir_for_hook, &source_to_cache_stem(&source_for_hook))
+                    .into_iter()
+                    .find(|path| path != &selected_for_hook)
+                    .expect("fresh candidate must be staged before it is parsed");
+            std::fs::write(&path, altered).unwrap();
+            *candidate_path_for_hook.lock().unwrap() = Some(path);
+        } else if at == "parsed" {
+            if let Some(path) = candidate_path_for_hook.lock().unwrap().as_ref() {
+                // The vulnerable path still has a pending candidate here;
+                // restore it so commit cannot expose the earlier mutation.
+                if path.is_file() {
+                    std::fs::write(path, fresh).unwrap();
+                }
+            }
+        }
+    });
+
+    let RefreshWorkerOutcome::Completed { manager, .. } =
+        spawn_list_refresh_worker(mgr, RefreshMode::Force, RefreshCancellation::default())
+            .await
+            .unwrap()
+    else {
+        panic!("a rejected candidate with a retained body should complete the cycle");
+    };
+
+    assert!(manager.filter.is_blocked("kept.example"));
+    assert!(!manager.filter.is_blocked("fresh.example"));
+    assert!(!manager.filter.is_blocked("other.example"));
+    assert_eq!(
+        selected_cache_body_path(cache_dir.path(), &source),
+        Some(selected.clone())
+    );
+    assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+    assert_eq!(std::fs::read(&meta_path).unwrap(), old_meta);
+    assert_eq!(manager.cache.get(&source), Some(&old_cache));
+    assert_eq!(
+        generation_body_paths(cache_dir.path(), &source_to_cache_stem(&source)),
+        vec![selected],
+        "the rejected candidate must not survive the cycle"
+    );
+}
+
+#[tokio::test]
+async fn streamed_shrink_refusal_retains_selected_body_without_an_orphan() {
+    let old: String = (0..20).map(|n| format!("old-{n}.example\n")).collect();
+    let replacement = "replacement.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(&old, "\"old\""),
+        tls_ok_response(replacement, "\"replacement\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-shrink.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 20);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let meta_path = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(&source)));
+    let old_meta = std::fs::read(&meta_path).unwrap();
+    let old_bytes = std::fs::read(&selected).unwrap();
+    age_cache_entries(&mut mgr);
+
+    assert_eq!(mgr.refresh().await, 20);
+    assert_eq!(
+        selected_cache_body_path(cache_dir.path(), &source),
+        Some(selected.clone())
+    );
+    assert_eq!(std::fs::read(&selected).unwrap(), old_bytes);
+    assert_eq!(std::fs::read(&meta_path).unwrap(), old_meta);
+    assert_eq!(
+        generation_body_paths(cache_dir.path(), &source_to_cache_stem(&source)),
+        vec![selected],
+        "a refused streamed candidate must not leave an unselected generation"
+    );
+    assert!(mgr.filter.is_blocked("old-0.example"));
+    assert!(!mgr.filter.is_blocked("replacement.example"));
+}
+
+#[tokio::test]
+async fn streamed_cache_write_failure_keeps_selected_body_and_leaves_no_temp() {
+    let old = "old.example\n";
+    let replacement = "replacement.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        tls_ok_response(replacement, "\"replacement\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-write-failure.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let before: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    age_cache_entries(&mut mgr);
+    fail_nth_streamed_cache_body_write_for_test(1);
+
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::Force).await, 1);
+    let after: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(after, before);
+    assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+    assert_eq!(mgr.read_body_from_disk(&source).as_deref(), Some(old));
+    assert!(mgr.filter.is_blocked("old.example"));
+    assert!(!mgr.filter.is_blocked("replacement.example"));
+}
+
+#[tokio::test]
+async fn cancellation_after_streamed_stage_reclaims_the_unselected_generation() {
+    let old = "old.example\n";
+    let replacement = "replacement.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        tls_ok_response(replacement, "\"replacement\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-cancel.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let before: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let signal = RefreshCancellation::default();
+    let cancel = signal.clone();
+    mgr.set_worker_hook_for_test(move |at| {
+        if at == "staged_body" {
+            cancel.cancel();
+        }
+    });
+
+    let RefreshWorkerOutcome::Cancelled { manager } =
+        spawn_list_refresh_worker(mgr, RefreshMode::Force, signal)
+            .await
+            .unwrap()
+    else {
+        panic!("cancellation after a staged body must prevent publication");
+    };
+    let after: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(after, before);
+    assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+    assert!(manager.filter.is_blocked("old.example"));
+    assert!(!manager.filter.is_blocked("replacement.example"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_after_streamed_temp_substitution_preserves_replacement_and_prior_state() {
+    let old = "old.example\n";
+    let fresh = "fresh.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        tls_ok_response(fresh, "\"fresh\""),
+    ])
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-temp-cancel.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let meta_path = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(&source)));
+    let old_meta = std::fs::read(&meta_path).unwrap();
+    let old_cache = mgr.cache.get(&source).unwrap().clone();
+    let substituted_temp = Arc::new(std::sync::Mutex::new(None));
+    let substituted_temp_for_hook = Arc::clone(&substituted_temp);
+    let cache_dir_for_hook = cache_dir.path().to_path_buf();
+    let signal = RefreshCancellation::default();
+    let cancel = signal.clone();
+    mgr.set_worker_hook_for_test(move |at| {
+        if at == "staged_body_write" {
+            let temp_path = streamed_temp_path_in(&cache_dir_for_hook);
+            replace_path_with_mode_0640(&temp_path, b"replacement.example\n");
+            *substituted_temp_for_hook.lock().unwrap() = Some(temp_path);
+            cancel.cancel();
+        }
+    });
+
+    let RefreshWorkerOutcome::Cancelled { manager } =
+        spawn_list_refresh_worker(mgr, RefreshMode::Force, signal)
+            .await
+            .unwrap()
+    else {
+        panic!("cancellation after a substituted streamed spool must stop publication");
+    };
+    let temp_path = substituted_temp.lock().unwrap().take().unwrap();
+    assert_eq!(std::fs::read(temp_path).unwrap(), b"replacement.example\n");
+    assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+    assert_eq!(std::fs::read(&meta_path).unwrap(), old_meta);
+    assert_eq!(manager.cache.get(&source), Some(&old_cache));
+    assert!(manager.filter.is_blocked("old.example"));
+    assert!(!manager.filter.is_blocked("fresh.example"));
+}
+
+#[tokio::test]
+async fn cancellation_at_each_streamed_cache_io_boundary_reclaims_the_candidate() {
+    let old = "old.example\n";
+    let replacement = "replacement.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(
+        std::iter::once(tls_ok_response(old, "\"old\""))
+            .chain(
+                [
+                    "staged_body_write",
+                    "staged_body_flush",
+                    "staged_body_sync",
+                    "staged_body_promote",
+                    "staged_body_parent_fsync",
+                ]
+                .into_iter()
+                .map(|_| tls_ok_response(replacement, "\"replacement\"")),
+            )
+            .collect(),
+    )
+    .await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/streamed-io-cancel.txt".to_string();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 1);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let before: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+
+    for target in [
+        "staged_body_write",
+        "staged_body_flush",
+        "staged_body_sync",
+        "staged_body_promote",
+        "staged_body_parent_fsync",
+    ] {
+        let signal = RefreshCancellation::default();
+        let cancel = signal.clone();
+        mgr.set_worker_hook_for_test(move |at| {
+            if at == target {
+                cancel.cancel();
+            }
+        });
+        let RefreshWorkerOutcome::Cancelled { manager } =
+            spawn_list_refresh_worker(mgr, RefreshMode::Force, signal)
+                .await
+                .unwrap()
+        else {
+            panic!("cancellation at {target} must prevent publication");
+        };
+        mgr = manager;
+        let after: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            after, before,
+            "cancellation at {target} leaked a cache file"
+        );
+        assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+        assert!(mgr.filter.is_blocked("old.example"));
+        assert!(!mgr.filter.is_blocked("replacement.example"));
+    }
+}
+
+#[tokio::test]
+async fn streamed_cache_body_caps_decompressed_response_and_cleans_up() {
+    const CAP: usize = 1024 * 1024;
+    let body = "bomb.example\n".repeat((2 * CAP) / "bomb.example\n".len());
+    let origin = MockOrigin::new(&body, true);
+    let addr = spawn_mock_origin(Arc::clone(&origin)).await;
+    let url = format!("http://{addr}/over-cap.txt");
+    let response = test_bulk_client().get(&url).send().await.unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.test/over-cap.txt";
+    let old = stage_cache_body(cache_dir.path(), source, "old.example\n").unwrap();
+    commit_staged_cache_body(
+        cache_dir.path(),
+        source,
+        source,
+        &old,
+        Some("\"old\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let selected = selected_cache_body_path(cache_dir.path(), source).unwrap();
+    let meta = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(source)));
+    let old_meta = std::fs::read(&meta).unwrap();
+    let before: BTreeSet<_> = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+
+    let result = stage_bounded_response_body(response, &url, source, cache_dir.path(), CAP).await;
+    assert!(matches!(result, Err(ListError::TooLarge { max: CAP, .. })));
+    assert_eq!(
+        std::fs::read_dir(cache_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>(),
+        before,
+        "an over-cap decoded stream must not leave staging or alter the selected generation"
+    );
+    assert_eq!(std::fs::read(&selected).unwrap(), b"old.example\n");
+    assert_eq!(std::fs::read(&meta).unwrap(), old_meta);
+    assert!(
+        origin.body_bytes_on_wire() < CAP / 10,
+        "fixture must be compressed enough to exercise decoded-byte accounting"
+    );
+}
+
+#[test]
+fn streamed_cache_lossy_utf8_matches_whole_body_across_split_invalid_sequence() {
+    use sha2::Digest;
+
+    let raw = b"good.example\ninvalid-\xF0\x9F\xFF.example\nalso.example\n";
+    let expected = String::from_utf8_lossy(raw).into_owned();
+    let source = "https://lists.test/lossy-chunks.txt";
+    for split in 0..=raw.len() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut streamed = StreamedCacheBody::new(cache_dir.path(), source).unwrap();
+        streamed.write_chunk(&raw[..split]).unwrap();
+        streamed.write_chunk(&raw[split..]).unwrap();
+        let staged = streamed.finish().unwrap();
+        let stored = std::fs::read(&staged.body_path).unwrap();
+
+        assert_eq!(
+            stored,
+            expected.as_bytes(),
+            "lossy bytes differ at split {split}"
+        );
+        assert_eq!(
+            staged.sha256,
+            hex::encode(sha2::Sha256::digest(&stored)),
+            "content address differs at split {split}"
+        );
+        let parsed = crate::lists::parser::parse_domain_list(std::str::from_utf8(&stored).unwrap());
+        assert!(parsed.contains("good.example"));
+        assert!(parsed.contains("also.example"));
+        assert_eq!(parsed.len(), 2, "only the malformed line is discarded");
+        drop(staged);
+        assert!(
+            generation_body_paths(cache_dir.path(), &source_to_cache_stem(source)).is_empty(),
+            "dropping an unselected lossy generation must reclaim it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_fresh_refresh_commits_candidate_validators_at_the_cycle_anchor() {
+    let last_modified = "Thu, 01 Jan 1970 00:00:00 GMT";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![tls_ok_response_with_last_modified(
+        "accepted.example\n",
+        "\"accepted\"",
+        last_modified,
+    )])
+    .await;
+    let url = "https://lists.test/accepted.txt".to_string();
+    let anchor = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    mgr.cache.insert(
+        url.clone(),
+        ListCache {
+            etag: Some("\"retained\"".into()),
+            last_modified: Some("Wed, 31 Dec 1969 00:00:00 GMT".into()),
+            body: Some("retained.example\n".into()),
+            fetched_at: anchor - time::Duration::hours(2),
+        },
+    );
+
+    assert_eq!(mgr.refresh_at(anchor).await, 1);
+    let entry = mgr.cache.get(&url).unwrap();
+    assert_eq!(entry.etag.as_deref(), Some("\"accepted\""));
+    assert_eq!(entry.last_modified.as_deref(), Some(last_modified));
+    assert_eq!(entry.fetched_at, anchor);
+}
+
+#[tokio::test]
+async fn stage_write_failure_records_a_schedule_failure() {
+    use sha2::Digest;
+
+    let old = "old.example\n";
+    let candidate = "candidate.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        tls_ok_response(candidate, "\"candidate\""),
+    ])
+    .await;
+    let url = "https://lists.test/stage-write-fault.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let key = install_test_schedule(&mut mgr, &url);
+    let anchor = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    assert_eq!(mgr.refresh_at(anchor).await, 1);
+    let candidate_sha = hex::encode(sha2::Sha256::digest(candidate.as_bytes()));
+    let blocked_path = cache_dir.path().join(generation_basename(
+        &source_to_cache_stem(&url),
+        &candidate_sha,
+    ));
+    std::fs::create_dir(&blocked_path).unwrap();
+    mgr.schedule_state
+        .record_success(key.clone(), anchor - time::Duration::hours(2));
+
+    assert_eq!(mgr.refresh_at(anchor + time::Duration::hours(2)).await, 1);
+    let entry = mgr.schedule_state.lookup(&key).unwrap();
+    assert_eq!(entry.last_attempt, anchor + time::Duration::hours(2));
+    assert_eq!(entry.outcome, CanonicalScheduleOutcome::Failure);
+    assert!(mgr.filter.is_blocked("old.example"));
+    assert!(!mgr.filter.is_blocked("candidate.example"));
+}
+
+#[tokio::test]
+async fn deferred_persistence_failure_keeps_durable_cache_and_records_failure() {
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        tls_ok_response("new.example\n", "\"new\""),
+    ])
+    .await;
+    let url = "https://lists.test/persist.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let id = crate::config::schema::Id::new("persist-fault").unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (id.clone(), 2))]));
+    let schedule_key = install_test_schedule(&mut mgr, &url);
+    let anchor = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    assert_eq!(mgr.refresh_at(anchor).await, 1);
+    let old_digest = mgr.installed_corpus_digest;
+    let stem = source_to_cache_stem(&url);
+    let meta_path = cache_dir.path().join(format!("{stem}.meta"));
+    let meta = std::fs::read_to_string(&meta_path).unwrap();
+    age_cache_entries(&mut mgr);
+    let retained = mgr.cache.get(&url).unwrap().clone();
+    let retained_retry = mgr.list_state_handle().lock().unwrap().lists[&id].clone();
+    mgr.schedule_state
+        .record_success(schedule_key.clone(), anchor - time::Duration::hours(2));
+    fail_next_cache_manifest_write_for_test();
+
+    assert_eq!(mgr.refresh_at(anchor + time::Duration::hours(2)).await, 1);
+    assert_eq!(mgr.cache.get(&url), Some(&retained));
+    assert_eq!(std::fs::read_to_string(meta_path).unwrap(), meta);
+    assert!(mgr.filter.list_membership("old.example").is_empty());
+    assert!(!mgr.filter.list_membership("new.example").is_empty());
+    assert_ne!(mgr.installed_corpus_digest, old_digest);
+    assert_eq!(
+        mgr.status_registry.cycle().outcome,
+        Some(CycleOutcome::Installed),
+        "the candidate corpus is live even though its cache commit failed"
+    );
+    assert!(matches!(
+        mgr.status_registry
+            .status_for_url(&url)
+            .unwrap()
+            .last_outcome,
+        LastOutcome::Failed { .. }
+    ));
+    let retry = mgr.list_state_handle().lock().unwrap().lists[&id].clone();
+    assert_eq!(
+        retry.consecutive_failures,
+        retained_retry.consecutive_failures + 1
+    );
+    assert_eq!(retry.last_success, retained_retry.last_success);
+    assert_eq!(retry.cache_path, retained_retry.cache_path);
+    let schedule = mgr.schedule_state.lookup(&schedule_key).unwrap();
+    assert_eq!(schedule.last_attempt, anchor + time::Duration::hours(2));
+    assert_eq!(schedule.outcome, CanonicalScheduleOutcome::Failure);
+}
+
+#[tokio::test]
+async fn unusable_304_retries_unconditionally_and_commits_replacement() {
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        tls_ok_response(
+            "old-one.example\nold-two.example\nold-three.example\n",
+            "\"old\"",
+        ),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+        tls_ok_response("replacement.example\n", "\"new\""),
+    ])
+    .await;
+    let url = "https://lists.test/retry.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        4,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    assert_eq!(mgr.refresh().await, 3);
+    mgr.set_source_max_entries(HashMap::from([(url.clone(), 2)]));
+    age_cache_entries(&mut mgr);
+    assert_eq!(mgr.refresh().await, 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("if-none-match: \"old\""));
+    assert!(!requests[2].contains("if-none-match:") && !requests[2].contains("if-modified-since:"));
+    assert!(!mgr.filter.list_membership("replacement.example").is_empty());
+    assert_eq!(mgr.cache[&url].etag.as_deref(), Some("\"new\""));
+}
+
+#[tokio::test]
+async fn retry_200_staged_mutation_cannot_publish_or_commit_the_wrong_corpus() {
+    let old = "old-one.example\nold-two.example\nold-three.example\n";
+    let fresh = "fresh.example\n";
+    let altered = "other.example\n";
+    assert_eq!(fresh.len(), altered.len());
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old\""),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+        tls_ok_response(fresh, "\"new\""),
+    ])
+    .await;
+    let source = "https://lists.test/retry-mutation.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![source.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&source)).unwrap(),
+        TEST_CAP,
+        4,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    assert_eq!(mgr.refresh().await, 3);
+    let selected = selected_cache_body_path(cache_dir.path(), &source).unwrap();
+    let meta_path = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(&source)));
+    let old_meta = std::fs::read(&meta_path).unwrap();
+    mgr.set_source_max_entries(HashMap::from([(source.clone(), 2)]));
+    age_cache_entries(&mut mgr);
+    let old_cache = mgr.cache.get(&source).unwrap().clone();
+
+    let staged_path = Arc::new(std::sync::Mutex::new(None));
+    let staged_path_for_hook = Arc::clone(&staged_path);
+    let cache_dir_for_hook = cache_dir.path().to_path_buf();
+    let source_for_hook = source.clone();
+    let selected_for_hook = selected.clone();
+    mgr.set_worker_hook_for_test(move |at| {
+        if at == "staged_body" {
+            let path =
+                generation_body_paths(&cache_dir_for_hook, &source_to_cache_stem(&source_for_hook))
+                    .into_iter()
+                    .find(|path| path != &selected_for_hook)
+                    .expect("the unconditional retry must stage a fresh candidate");
+            std::fs::write(&path, altered).unwrap();
+            *staged_path_for_hook.lock().unwrap() = Some(path);
+        }
+    });
+
+    let RefreshWorkerOutcome::Completed { manager, .. } =
+        spawn_list_refresh_worker(mgr, RefreshMode::Force, RefreshCancellation::default())
+            .await
+            .unwrap()
+    else {
+        panic!("a rejected retry candidate must complete the cycle");
+    };
+    assert!(staged_path.lock().unwrap().is_some());
+    assert_eq!(std::fs::read(&selected).unwrap(), old.as_bytes());
+    assert_eq!(std::fs::read(&meta_path).unwrap(), old_meta);
+    assert_eq!(manager.cache.get(&source), Some(&old_cache));
+    assert!(manager.filter.is_blocked("old-one.example"));
+    assert!(!manager.filter.is_blocked("fresh.example"));
+    assert!(!manager.filter.is_blocked("other.example"));
+    assert_eq!(
+        generation_body_paths(cache_dir.path(), &source_to_cache_stem(&source)),
+        vec![selected],
+        "the rejected retry generation must not survive"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].contains("if-none-match: \"old\""));
+    assert!(!requests[2].contains("if-none-match:") && !requests[2].contains("if-modified-since:"));
+}
+
+#[tokio::test]
+async fn metadata_failure_after_valid_304_keeps_timestamp_and_records_failure() {
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+    ])
+    .await;
+    let url = "https://lists.test/meta.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let id = crate::config::schema::Id::new("meta-fault").unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (id.clone(), 2))]));
+    let schedule_key = install_test_schedule(&mut mgr, &url);
+    assert_eq!(mgr.refresh().await, 1);
+    let meta_path = cache_dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(&url)));
+    let old_meta = std::fs::read_to_string(&meta_path).unwrap();
+    age_cache_entries(&mut mgr);
+    let old_time = mgr.cache[&url].fetched_at;
+    let old_digest = mgr.installed_corpus_digest;
+    let generations = mgr.filter.filter_gen_ids();
+    // Force a rebuild so retained membership cannot pass via the old generation.
+    mgr.installed_corpus_digest = None;
+    mgr.legacy_cache_timestamp_urls.insert(url.clone());
+    mgr.record_blocklist_failure(&id, 2);
+    let old_state = mgr.list_state_handle().lock().unwrap().lists[&id].clone();
+    mgr.schedule_state.record_success(
+        schedule_key.clone(),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
+    );
+    fail_next_cache_manifest_write_for_test();
+
+    assert_eq!(mgr.refresh().await, 1);
+    assert_eq!(mgr.cache[&url].fetched_at, old_time);
+    assert_eq!(std::fs::read_to_string(meta_path).unwrap(), old_meta);
+    assert!(!mgr.filter.list_membership("old.example").is_empty());
+    let ids = mgr.filter.filter_gen_ids();
+    assert_ne!(ids, generations);
+    assert!(ids.iter().all(|id| *id == ids[0]));
+    assert_eq!(mgr.installed_corpus_digest, old_digest);
+    assert!(mgr.legacy_cache_timestamp_urls.contains(&url));
+    assert!(matches!(
+        &mgr.status_registry
+            .status_for_url(&url)
+            .unwrap()
+            .last_outcome,
+        LastOutcome::Failed { reason }
+            if reason == "validated cache body but failed to update cache metadata"
+    ));
+    let state = mgr.list_state_handle().lock().unwrap().lists[&id].clone();
+    assert_eq!(
+        state.consecutive_failures,
+        old_state.consecutive_failures + 1
+    );
+    assert_eq!(state.status, crate::config::list_state::ListStatus::Failed);
+    assert_eq!(state.last_success, old_state.last_success);
+    assert_eq!(state.cache_path, old_state.cache_path);
+    assert_eq!(
+        mgr.status_registry.cycle().outcome,
+        Some(CycleOutcome::Installed)
+    );
+    assert_eq!(
+        mgr.schedule_state.lookup(&schedule_key).unwrap().outcome,
+        CanonicalScheduleOutcome::Failure
+    );
+}
+
+#[tokio::test]
+async fn rejected_fresh_candidates_keep_the_retained_validators_and_freshness() {
+    let last_modified = "Thu, 01 Jan 1970 00:00:00 GMT";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response_with_last_modified(
+            "old-one.example\nold-two.example\nold-three.example\n",
+            "\"retained\"",
+            last_modified,
+        ),
+        tls_ok_response_with_last_modified("candidate.example\n", "\"candidate\"", last_modified),
+    ])
+    .await;
+    let url = "https://lists.test/refused.txt".to_string();
+    let anchor = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+
+    assert_eq!(mgr.refresh_at(anchor).await, 3);
+    let retained = mgr.cache.get(&url).unwrap().clone();
+    mgr.set_shrink_guard(true, 50);
+
+    assert_eq!(mgr.refresh_at(anchor + time::Duration::hours(2)).await, 3);
+    assert_eq!(mgr.cache.get(&url), Some(&retained));
+}
+
+#[tokio::test]
+async fn cap_refused_fresh_candidate_keeps_the_retained_validators_and_freshness() {
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![tls_ok_response(
+        "candidate-one.example\ncandidate-two.example\n",
+        "\"candidate\"",
+    )])
+    .await;
+    let url = "https://lists.test/cap-refused.txt".to_string();
+    let anchor = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        1,
+        None,
+    );
+    let retained = ListCache {
+        etag: Some("\"retained\"".into()),
+        last_modified: Some("Wed, 31 Dec 1969 00:00:00 GMT".into()),
+        body: Some("retained.example\n".into()),
+        fetched_at: anchor - time::Duration::hours(2),
+    };
+    mgr.cache.insert(url.clone(), retained.clone());
+
+    assert_eq!(mgr.refresh_at(anchor).await, 1);
+    assert_eq!(mgr.cache.get(&url), Some(&retained));
+}
+
+#[tokio::test]
+async fn disk_backed_corpus_refusal_keeps_old_generations_and_cache_only_recovers_them() {
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response("old-a.example\n", "\"a-old\""),
+        tls_ok_response("old-b.example\n", "\"b-old\""),
+        tls_ok_response("new-a-one.example\nnew-a-two.example\n", "\"a-new\""),
+        tls_ok_response("new-b.example\n", "\"b-new\""),
+    ])
+    .await;
+    let a = "https://lists.test/corpus-a.txt".to_string();
+    let b = "https://lists.test/corpus-b.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![a.clone(), b.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[a.clone(), b.clone()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let a_id = crate::config::schema::Id::new("corpus-a").unwrap();
+    let b_id = crate::config::schema::Id::new("corpus-b").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([
+        (a.clone(), (a_id.clone(), 3)),
+        (b.clone(), (b_id.clone(), 3)),
+    ]));
+
+    assert_eq!(mgr.refresh().await, 2);
+    let old_retry = mgr.list_state_handle().lock().unwrap().clone();
+    let old_meta: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|source| {
+            let stem = source_to_cache_stem(source);
+            (
+                std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+                selected_cache_body_path(cache_dir.path(), source).unwrap(),
+            )
+        })
+        .collect();
+
+    age_cache_entries(&mut mgr);
+    let old_cache = mgr.cache.clone();
+    mgr.set_max_total_domains(2);
+    assert_eq!(mgr.refresh().await, 2);
+
+    assert_eq!(
+        mgr.cache, old_cache,
+        "refusal must not publish fresh validators"
+    );
+    assert_eq!(
+        *mgr.list_state_handle().lock().unwrap(),
+        old_retry,
+        "refusal must not record list retry success"
+    );
+    for ((meta, body), source) in old_meta.iter().zip([&a, &b]) {
+        let stem = source_to_cache_stem(source);
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+            *meta,
+            "refusal rewrote {source}'s manifest"
+        );
+        assert!(body.is_file(), "refusal collected {source}'s selected body");
+        assert_eq!(
+            generation_body_paths(cache_dir.path(), &stem),
+            vec![body.clone()],
+            "refusal left an unselected {source} body behind"
+        );
+    }
+
+    let mut boot = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![a.clone(), b.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[a.clone(), b.clone()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    boot.load_disk_cache();
+    boot.set_max_total_domains(2);
+    assert_eq!(boot.refresh_with_mode(RefreshMode::CacheOnly).await, 2);
+    assert!(boot.filter.is_blocked("old-a.example"));
+    assert!(boot.filter.is_blocked("old-b.example"));
+    assert!(!boot.filter.is_blocked("new-a-one.example"));
+    assert!(!boot.filter.is_blocked("new-a-two.example"));
+    assert!(!boot.filter.is_blocked("new-b.example"));
+}
+
+#[tokio::test]
+async fn disk_backed_unconditional_retry_waits_for_the_corpus_verdict() {
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response("old-a.example\n", "\"a-old\""),
+        tls_ok_response("old-a.example\nold-b.example\n", "\"b-old\""),
+        tls_ok_response("old-a.example\n", "\"c-old\""),
+        tls_ok_response("new-a.example\n", "\"a-new\""),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+        tls_ok_response("new-b.example\n", "\"b-new\""),
+        tls_ok_response("new-c.example\n", "\"c-new\""),
+    ])
+    .await;
+    let a = "https://lists.test/retry-a.txt".to_string();
+    let b = "https://lists.test/retry-b.txt".to_string();
+    let c = "https://lists.test/retry-c.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        vec![a.clone(), b.clone(), c.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[a.clone(), b.clone(), c.clone()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let b_id = crate::config::schema::Id::new("retry-b").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(b.clone(), (b_id, 3))]));
+
+    assert_eq!(mgr.refresh().await, 2);
+    let old_b_retry = mgr.list_state_handle().lock().unwrap().clone();
+    let stem = source_to_cache_stem(&b);
+    let old_b_meta =
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+    let old_b_body = selected_cache_body_path(cache_dir.path(), &b).unwrap();
+
+    mgr.max_entries = 1;
+    mgr.set_max_total_domains(2);
+    age_cache_entries(&mut mgr);
+    let old_b_cache = mgr.cache[&b].clone();
+    assert_eq!(mgr.refresh().await, 2);
+
+    assert_eq!(mgr.cache[&b], old_b_cache);
+    assert_eq!(*mgr.list_state_handle().lock().unwrap(), old_b_retry);
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        old_b_meta
+    );
+    assert!(old_b_body.is_file());
+}
+
+/// The 304 body is itself the retained fallback. If a lowered cap makes it
+/// unusable, a fresh A response must not replace the hot A+B generation.
+#[tokio::test]
+async fn a_304_cached_body_cap_refusal_keeps_the_complete_hot_generation() {
+    let responses = vec![
+        tls_ok_response("old-a.example\n", "\"a0\""),
+        tls_ok_response(
+            "old-b-one.example\nold-b-two.example\nold-b-three.example\n",
+            "\"b0\"",
+        ),
+        tls_ok_response("old-a.example\nnew-a.example\n", "\"a1\""),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+        "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string(),
+    ];
+    let (origin, pem, requests) = spawn_tls_origin_responses(responses).await;
+    let client = reqwest::Client::builder()
+        .resolve("lists.test", origin)
+        .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let a = "https://lists.test/a.txt".to_string();
+    let b = "https://lists.test/b.txt".to_string();
+    let bits = build_source_bit_map(&[a.clone(), b.clone()]).unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let mut mgr = ListManager::new(
+        client,
+        Arc::new(FilterEngine::new()),
+        vec![a.clone(), b.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        bits,
+        TEST_CAP,
+        4,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let blocklist_id = crate::config::schema::Id::new("304-cap").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(b.clone(), (blocklist_id.clone(), 2))]));
+
+    assert_eq!(mgr.refresh().await, 4);
+    assert!(mgr.installed_corpus_digest.is_some());
+    mgr.set_source_max_entries(HashMap::from([(a.clone(), 4), (b.clone(), 2)]));
+    age_cache_entries(&mut mgr);
+
+    assert_eq!(mgr.refresh().await, 4);
+    for domain in [
+        "old-a.example",
+        "old-b-one.example",
+        "old-b-two.example",
+        "old-b-three.example",
+    ] {
+        assert!(
+            !mgr.filter.list_membership(domain).is_empty(),
+            "{domain} vanished from the prior generation"
+        );
+    }
+    assert!(mgr.filter.list_membership("new-a.example").is_empty());
+    assert!(mgr.installed_corpus_digest.is_none());
+    assert_eq!(
+        mgr.status_registry.cycle().outcome,
+        Some(CycleOutcome::SpillRollbackFailed)
+    );
+    assert!(mgr.status_registry.cycle().source_coverage_incomplete);
+    let a_status = mgr.status_registry.status_for_url(&a).unwrap();
+    assert_eq!(a_status.entries, 1);
+    assert_eq!(a_status.unique_domains, 1);
+    let b_status = mgr.status_registry.status_for_url(&b).unwrap();
+    assert_eq!(b_status.entries, 3);
+    assert_eq!(b_status.unique_domains, 3);
+    assert_eq!(b_status.parsed_truncated, 1);
+    assert!(matches!(b_status.last_outcome, LastOutcome::Failed { .. }));
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    assert_eq!(
+        state.lists.get(&blocklist_id).unwrap().consecutive_failures,
+        1
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "the unusable 304 gets one retry");
+    assert!(requests[3].contains("get /b.txt"));
+    assert!(requests[3].contains("if-none-match: \"b0\""));
+    assert!(requests[4].contains("get /b.txt"));
+    assert!(!requests[4].contains("if-none-match:"));
+}
+
+#[tokio::test]
+async fn canonically_equal_catalog_url_and_unconditional_304_never_relabel_the_old_cache() {
+    use crate::config::schema::BlocklistFormat;
+    use crate::lists::catalog::CatalogEntry;
+    use std::collections::BTreeMap;
+
+    let old_catalog = Catalog::from_entries(vec![CatalogEntry {
+        scope: "team".to_string(),
+        topic: Some("ads".to_string()),
+        name: "Team ads".to_string(),
+        url: "https://lists.test/ads.txt/".to_string(),
+        entries: 0,
+        updated_at: String::new(),
+        format: BlocklistFormat::Domains,
+    }]);
+    let new_catalog = Catalog::from_entries(vec![CatalogEntry {
+        scope: "team".to_string(),
+        topic: Some("ads".to_string()),
+        name: "Team ads".to_string(),
+        url: "https://lists.test/ads.txt".to_string(),
+        entries: 0,
+        updated_at: String::new(),
+        format: BlocklistFormat::Domains,
+    }]);
+    let legacy = vec!["team/ads".to_string()];
+    let old_plan = ResolvedSourcePlan::build(&old_catalog, &legacy, &[], &BTreeMap::new()).unwrap();
+    let new_plan = ResolvedSourcePlan::build(&new_catalog, &legacy, &[], &BTreeMap::new()).unwrap();
+    assert_eq!(
+        crate::lists::source_key::canonical_url_key(
+            old_plan.fetch_url_for_source("team/ads").unwrap()
+        ),
+        crate::lists::source_key::canonical_url_key(
+            new_plan.fetch_url_for_source("team/ads").unwrap()
+        ),
+        "the regression requires canonical-equivalent but exact-different URLs"
+    );
+    let cache_dir = tempfile::tempdir().unwrap();
+    write_cache_to_disk(
+        cache_dir.path(),
+        "team/ads",
+        old_plan.fetch_url_for_source("team/ads").unwrap(),
+        "ads.example\n",
+        Some("\"old\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+
+    let (origin, pem, request_seen) = spawn_unconditional_304_tls_origin().await;
+    let client = reqwest::Client::builder()
+        .resolve("lists.test", origin)
+        .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let bits = SourceBitMap::from_plan(&new_plan).unwrap();
+    let mut manager = ListManager::with_plan_and_tokens(
+        client,
+        Arc::new(FilterEngine::new()),
+        new_plan,
+        Duration::from_secs(3600),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    manager.load_disk_cache();
+
+    assert!(manager.cache.is_empty(), "the old URL was not admitted");
+    assert!(manager.open_body_from_disk("team/ads").is_none());
+    assert_eq!(manager.refresh().await, 0);
+    let request = request_seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the planned manager must reach the test origin");
+    assert!(
+        !request.contains("if-none-match:") && !request.contains("if-modified-since:"),
+        "the moved URL has no admitted cache entry, so this was an unconditional 304"
+    );
+    assert!(
+        manager.cache.is_empty(),
+        "an unconditional 304 must not create a cache entry for the new URL"
+    );
+    assert!(
+        matches!(
+            manager
+                .status_registry()
+                .status_for_url("team/ads")
+                .unwrap()
+                .last_outcome,
+            LastOutcome::Failed { .. }
+        ),
+        "the invalid 304 must never be recorded as source success"
+    );
+    assert!(
+        manager.open_body_from_disk("team/ads").is_none(),
+        "the old body must remain rejected under the moved catalog URL"
+    );
+    let meta = std::fs::read_to_string(
+        cache_dir
+            .path()
+            .join(format!("{}.meta", source_to_cache_stem("team/ads"))),
+    )
+    .unwrap();
+    assert!(meta.contains("resolved-url=https://lists.test/ads.txt/"));
+    assert!(
+        !meta.contains("resolved-url=https://lists.test/ads.txt\n"),
+        "rejecting the unconditional 304 must leave the old sidecar unmodified"
+    );
+}
+
+#[tokio::test]
+async fn a_conditional_304_with_an_over_cap_cached_body_reports_typed_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://lists.test/cap.txt".to_string();
+    let old = OffsetDateTime::now_utc() - time::Duration::days(1);
+    write_cache_to_disk(
+        dir.path(),
+        &url,
+        &url,
+        "one.example\ntwo.example\nthree.example\n",
+        Some("\"cap\""),
+        None,
+        old,
+    )
+    .unwrap();
+
+    let (origin, pem, request_seen) = spawn_unconditional_304_tls_origin().await;
+    let client = reqwest::Client::builder()
+        .resolve("lists.test", origin)
+        .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let bits = build_source_bit_map(std::slice::from_ref(&url)).expect("at-cap accept");
+    let mut mgr = ListManager::new(
+        client,
+        Arc::new(FilterEngine::new()),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        bits,
+        TEST_CAP,
+        4,
+        Some(dir.path().to_path_buf()),
+    );
+    mgr.load_disk_cache();
+    mgr.set_source_max_entries(HashMap::from([(url.clone(), 2)]));
+    let blocklist_id = crate::config::schema::Id::new("conditional-304-cap").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (blocklist_id.clone(), 2))]));
+
+    assert_eq!(mgr.refresh().await, 0);
+    let request = request_seen.lock().unwrap().clone().unwrap();
+    assert!(
+        request.contains("if-none-match: \"cap\""),
+        "the test must exercise a conditional, not unconditional, 304: {request}"
+    );
+    let status = mgr.status_registry.status_for_url(&url).unwrap();
+    assert_eq!(status.parsed_truncated, 1);
+    assert!(matches!(status.last_outcome, LastOutcome::Failed { .. }));
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(entry.consecutive_failures, 1);
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Pending);
+}
+
+#[test]
+fn cache_sidecar_identity_requires_the_exact_fetch_url() {
+    let old = "https://lists.test/ads.txt/";
+    let new = "https://lists.test/ads.txt";
+    assert_eq!(
+        crate::lists::source_key::canonical_url_key(old),
+        crate::lists::source_key::canonical_url_key(new),
+        "test targets must share the canonical routing identity"
+    );
+
+    let exact = ParsedMeta {
+        load_state: MetaLoadState::Loaded,
+        etag: Some("\"old\"".to_string()),
+        last_modified: None,
+        fetched_at: None,
+        size: None,
+        resolved_url: Some(old.to_string()),
+        has_resolved_url: true,
+        body: None,
+        sha256: None,
+        manifest_invalid: false,
+    };
+    assert!(cache_identity_matches("team/ads", old, &exact));
+    assert!(
+        !cache_identity_matches("team/ads", new, &exact),
+        "canonical-equivalent fetch targets must not share validators"
+    );
+
+    let legacy_raw = ParsedMeta {
+        load_state: MetaLoadState::Loaded,
+        etag: Some("\"legacy\"".to_string()),
+        last_modified: None,
+        fetched_at: None,
+        size: None,
+        resolved_url: None,
+        has_resolved_url: false,
+        body: None,
+        sha256: None,
+        manifest_invalid: false,
+    };
+    assert!(cache_identity_matches(old, old, &legacy_raw));
+    assert!(
+        !cache_identity_matches(old, new, &legacy_raw),
+        "a legacy raw-URL sidecar is accepted only for its exact source URL"
+    );
+}
+
+#[test]
+fn cache_sidecar_persists_the_exact_fetch_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fetch_url = "https://LISTS.test:443/ads.txt/";
+    write_cache_to_disk(
+        tmp.path(),
+        "team/ads",
+        fetch_url,
+        "ads.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+
+    let meta = std::fs::read_to_string(
+        tmp.path()
+            .join(format!("{}.meta", source_to_cache_stem("team/ads"))),
+    )
+    .unwrap();
+    assert!(meta.contains(&format!("resolved-url={fetch_url}\n")));
 }
 
 /// §4.7 Phase 2 T3: `write_cache_to_disk` stamps `size=<bytes>`
@@ -2831,11 +7118,13 @@ fn meta_size_field_serializes_and_deserializes() {
     write_cache_to_disk(
         tmp.path(),
         "privacy/ads",
+        "https://lists.purge.cc/ads.txt",
         body,
         Some("\"etag\""),
         Some("Wed, 21 Oct 2024 07:28:00 GMT"),
         now,
-    );
+    )
+    .unwrap();
 
     let stem = source_to_cache_stem("privacy/ads");
     let meta_path = tmp.path().join(format!("{stem}.meta"));
@@ -2935,7 +7224,7 @@ fn load_disk_cache_skips_invalidated_body() {
     std::fs::write(
         &meta_path,
         format!(
-            "etag=\nlast-modified=\nfetched-at=\nsize={}\n",
+            "etag=\nlast-modified=\nresolved-url=https://lists.purge.cc/ads.txt\nfetched-at=\nsize={}\n",
             body.len() * 10
         ),
     )
@@ -2952,21 +7241,17 @@ fn load_disk_cache_skips_invalidated_body() {
     // Cross-check: a body within tolerance is accepted.
     std::fs::write(
         &meta_path,
-        format!("etag=\nlast-modified=\nfetched-at=\nsize={}\n", body.len()),
+        format!(
+            "etag=\nlast-modified=\nresolved-url=https://lists.purge.cc/ads.txt\nfetched-at=\nsize={}\n",
+            body.len()
+        ),
     )
     .unwrap();
     let result_ok = mgr.read_body_from_disk("privacy/ads");
     assert_eq!(result_ok.as_deref(), Some(body));
 }
 
-/// s-4.31-disc-3: `write_cache_to_disk` stages `.cache.new` +
-/// `.meta.new` then promotes both via rename. On success no `.new`
-/// temps are left behind, and the promoted pair is internally
-/// consistent — the `.meta` `size=` matches the `.cache` body, so
-/// `read_body_from_disk`'s §4.7-T3 predicate accepts it without a
-/// spurious re-download. (The crash-recovery side — divergent
-/// `.cache` vs stale `.meta` → re-download — is already pinned by
-/// `load_disk_cache_skips_invalidated_body` above.)
+/// A committed manifest selects a complete immutable generation body.
 #[test]
 fn write_cache_to_disk_leaves_no_new_files_on_success() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2977,16 +7262,17 @@ fn write_cache_to_disk_leaves_no_new_files_on_success() {
     write_cache_to_disk(
         tmp.path(),
         source,
+        "https://lists.purge.cc/ads.txt",
         body,
         Some("\"etag-123\""),
         Some("Wed, 14 May 2026 00:00:00 GMT"),
         OffsetDateTime::now_utc(),
-    );
+    )
+    .unwrap();
 
-    let cache_path = tmp.path().join(format!("{stem}.cache"));
     let meta_path = tmp.path().join(format!("{stem}.meta"));
-    let cache_tmp = tmp.path().join(format!("{stem}.cache.new"));
-    let meta_tmp = tmp.path().join(format!("{stem}.meta.new"));
+    let parsed = load_meta_file(&meta_path);
+    let cache_path = selected_body_path(tmp.path(), &stem, &parsed).unwrap();
 
     assert_eq!(std::fs::read_to_string(&cache_path).unwrap(), body);
     assert!(
@@ -2995,8 +7281,7 @@ fn write_cache_to_disk_leaves_no_new_files_on_success() {
             .contains(&format!("size={}", body.len())),
         "meta must stamp the body size"
     );
-    assert!(!cache_tmp.exists(), "stray .cache.new left after success");
-    assert!(!meta_tmp.exists(), "stray .meta.new left after success");
+    assert!(!tmp.path().join(format!("{stem}.cache")).exists());
 
     // The promoted pair is internally consistent — the §4.7-T3
     // size predicate accepts it (no spurious re-download).
@@ -3017,6 +7302,740 @@ fn write_cache_to_disk_leaves_no_new_files_on_success() {
     assert_eq!(mgr.read_body_from_disk(source).as_deref(), Some(body));
 }
 
+#[test]
+fn legacy_cache_body_remains_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/legacy.txt";
+    let stem = source_to_cache_stem(source);
+    std::fs::write(dir.path().join(format!("{stem}.cache")), "legacy.example\n").unwrap();
+    std::fs::write(
+        dir.path().join(format!("{stem}.meta")),
+        format!("resolved-url={source}\n"),
+    )
+    .unwrap();
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert_eq!(
+        mgr.read_body_from_disk(source).as_deref(),
+        Some("legacy.example\n")
+    );
+}
+
+#[test]
+fn generation_commit_retires_legacy_body_only_after_manifest_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/migrate.txt";
+    let stem = source_to_cache_stem(source);
+    let legacy = dir.path().join(format!("{stem}.cache"));
+    std::fs::write(&legacy, "legacy.example\n").unwrap();
+    std::fs::write(
+        dir.path().join(format!("{stem}.meta")),
+        format!("resolved-url={source}\n"),
+    )
+    .unwrap();
+    let before = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert_eq!(
+        before.read_body_from_disk(source).as_deref(),
+        Some("legacy.example\n")
+    );
+    assert!(legacy.exists());
+
+    let generation = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "generation.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    assert!(!legacy.exists());
+    assert!(generation.exists());
+}
+
+#[test]
+fn generation_manifest_rejects_partial_malformed_and_traversal_fields() {
+    let stem = source_to_cache_stem("privacy/ads");
+    for manifest in [
+        "body=x\n",
+        "sha256=0123\n",
+        "body=../escape\nsha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "body=privacy_ads.body-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nsha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "body=wrong.body-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join(format!("{stem}.meta"));
+        std::fs::write(&meta_path, manifest).unwrap();
+        let parsed = load_meta_file(&meta_path);
+        assert!(selected_body_path(dir.path(), &stem, &parsed).is_none(), "{manifest}");
+    }
+}
+
+#[test]
+fn generation_size_must_match_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/exact.txt";
+    let body = format!("{}\n", "a".repeat(128));
+    let body_path = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        &body,
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    std::fs::write(&body_path, format!("{body}x")).unwrap();
+    assert!(validate_cached_body_size(Some(body.len()), body.len() + 1));
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert!(mgr.read_body_from_disk(source).is_none());
+}
+
+#[test]
+fn generation_body_confirmation_streams_length_and_hash() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("body");
+    let body = b"streamed body";
+    std::fs::write(&path, body).unwrap();
+    let digest: [u8; 32] = sha2::Sha256::digest(body).into();
+    assert!(generation_body_matches(&path, body.len(), digest));
+    assert!(!generation_body_matches(&path, body.len() + 1, digest));
+    assert!(file_matches_content(&path, body));
+    assert!(!file_matches_content(&path, b"streamed body plus one byte"));
+}
+
+#[test]
+fn meta_only_update_preserves_generation_fields_and_gc_keeps_selected_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/update.txt";
+    let first = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "first.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let second = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "second.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    assert!(
+        !first.exists(),
+        "only a committed replacement may collect the old body"
+    );
+    let stem = source_to_cache_stem(source);
+    let meta_path = dir.path().join(format!("{stem}.meta"));
+    let before = load_meta_file(&meta_path);
+    write_meta_file(
+        &meta_path,
+        None,
+        None,
+        source,
+        OffsetDateTime::now_utc(),
+        before.size,
+        manifest_from_meta(&stem, &before),
+    )
+    .unwrap();
+    let after = load_meta_file(&meta_path);
+    assert_eq!(after.body, before.body);
+    assert_eq!(after.sha256, before.sha256);
+    assert_eq!(selected_body_path(dir.path(), &stem, &after), Some(second));
+}
+
+#[test]
+fn manifest_generation_survives_restart_and_load_disk_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/restart.txt";
+    let body = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "restart.example\n",
+        Some("\"restart\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    mgr.load_disk_cache();
+    assert_eq!(mgr.cache[source].etag.as_deref(), Some("\"restart\""));
+    assert_eq!(
+        mgr.read_body_from_disk(source).as_deref(),
+        Some("restart.example\n")
+    );
+    assert!(body.exists());
+}
+
+#[test]
+fn orphan_generation_cannot_replace_committed_manifest_before_meta_commit() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/order.txt";
+    let old = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "old.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let stem = source_to_cache_stem(source);
+    let new_body = b"new.example\n";
+    let new_sha = hex::encode(sha2::Sha256::digest(new_body));
+    let orphan = dir.path().join(generation_basename(&stem, &new_sha));
+    std::fs::write(&orphan, new_body).unwrap();
+
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert_eq!(
+        mgr.read_body_from_disk(source).as_deref(),
+        Some("old.example\n")
+    );
+    assert!(old.exists());
+    assert!(orphan.exists());
+}
+
+#[test]
+fn manifest_write_failure_retains_prior_selected_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/failure.txt";
+    let old = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "old.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    fail_next_cache_manifest_write_for_test();
+    assert!(write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "new.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .is_err());
+
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert_eq!(
+        mgr.read_body_from_disk(source).as_deref(),
+        Some("old.example\n")
+    );
+    assert!(old.exists());
+    let stem = source_to_cache_stem(source);
+    assert_eq!(generation_body_paths(dir.path(), &stem), vec![old]);
+}
+
+#[test]
+fn uncertain_manifest_commit_keeps_legacy_and_previous_bodies_for_restart_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/fsync-ambiguity.txt";
+    let old = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "old.example\n",
+        Some("\"old\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let stem = source_to_cache_stem(source);
+    let meta_path = dir.path().join(format!("{stem}.meta"));
+    let old_meta = std::fs::read_to_string(&meta_path).unwrap();
+    let legacy = dir.path().join(format!("{stem}.cache"));
+    std::fs::write(&legacy, "legacy.example\n").unwrap();
+
+    fail_next_cache_manifest_parent_fsync_for_test();
+    let new = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "new.example\n",
+        Some("\"new\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    assert_eq!(
+        selected_cache_body_path(dir.path(), source),
+        Some(new.clone()),
+        "the landed manifest is selected in this process"
+    );
+    assert!(old.is_file(), "old manifest may return after power loss");
+    assert!(
+        legacy.is_file(),
+        "uncertain commit must not retire legacy body"
+    );
+
+    // Model recovery of the old directory entry after a power loss. The old
+    // manifest must still have a complete selected body to load.
+    std::fs::write(&meta_path, old_meta).unwrap();
+    let mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert_eq!(
+        mgr.read_body_from_disk(source).as_deref(),
+        Some("old.example\n")
+    );
+}
+
+fn cache_transaction_admission(
+    source: &str,
+    url: &str,
+    staged: StagedCacheBody,
+) -> PendingCacheAdmission {
+    PendingCacheAdmission {
+        source: source.to_string(),
+        url: url.to_string(),
+        etag: Some(format!("\"{source}\"")),
+        last_modified: None,
+        staged: Some(staged),
+        body: None,
+        previous_cache_path: PathBuf::new(),
+    }
+}
+
+#[tokio::test]
+async fn second_manifest_failure_rolls_back_all_cache_admissions_without_partial_state() {
+    let old = "old-1.example\nold-2.example\nold-3.example\nold-4.example\nold-5.example\n";
+    let new_a = "new-1.example\nnew-2.example\nnew-3.example\nnew-4.example\n";
+    let (origin, pem, _) = spawn_tls_origin_responses(vec![
+        tls_ok_response(old, "\"old-a\""),
+        tls_ok_response(old, "\"old-b\""),
+        tls_ok_response(new_a, "\"new-a\""),
+        tls_ok_response("", "\"new-b\""),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let sources = vec![
+        "https://lists.test/txn-a.txt".to_string(),
+        "https://lists.test/txn-b.txt".to_string(),
+    ];
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        Arc::new(FilterEngine::new()),
+        sources.clone(),
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&sources).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    let ids = [
+        crate::config::schema::Id::new("txn-a").unwrap(),
+        crate::config::schema::Id::new("txn-b").unwrap(),
+    ];
+    mgr.set_source_blocklist_map(HashMap::from([
+        (sources[0].clone(), (ids[0].clone(), 3)),
+        (sources[1].clone(), (ids[1].clone(), 3)),
+    ]));
+    let schedule_keys: Vec<_> = sources
+        .iter()
+        .map(|source| install_test_schedule(&mut mgr, source))
+        .collect();
+    assert_eq!(mgr.refresh().await, 5);
+    let cache_dir = dir.path().to_path_buf();
+    let old_meta: Vec<Vec<u8>> = sources
+        .iter()
+        .map(|source| {
+            std::fs::read(cache_dir.join(format!("{}.meta", source_to_cache_stem(source)))).unwrap()
+        })
+        .collect();
+    let old_bodies: Vec<PathBuf> = sources
+        .iter()
+        .map(|source| selected_cache_body_path(&cache_dir, source).unwrap())
+        .collect();
+    let retained_retry: Vec<_> = ids
+        .iter()
+        .map(|id| mgr.list_state_handle().lock().unwrap().lists[id].clone())
+        .collect();
+
+    age_cache_entries(&mut mgr);
+    mgr.set_shrink_guard(false, 90);
+    mgr.set_max_total_domains(4);
+    let retained_cache = mgr.cache.clone();
+    for key in &schedule_keys {
+        mgr.schedule_state.record_success(
+            key.clone(),
+            OffsetDateTime::now_utc() - time::Duration::hours(2),
+        );
+    }
+    fail_nth_cache_manifest_write_for_test(2);
+
+    assert_eq!(
+        mgr.refresh().await,
+        4,
+        "the globally accepted corpus is live"
+    );
+    assert!(!mgr.filter.list_membership("new-1.example").is_empty());
+    assert!(!rollback_journal_path(&cache_dir).try_exists().unwrap());
+    for (i, source) in sources.iter().enumerate() {
+        let stem = source_to_cache_stem(source);
+        assert_eq!(
+            std::fs::read(cache_dir.join(format!("{stem}.meta"))).unwrap(),
+            old_meta[i]
+        );
+        assert_eq!(
+            selected_cache_body_path(&cache_dir, source),
+            Some(old_bodies[i].clone())
+        );
+        assert_eq!(
+            generation_body_paths(&cache_dir, &stem),
+            vec![old_bodies[i].clone()]
+        );
+        assert_eq!(mgr.cache.get(source), retained_cache.get(source));
+        let retry = mgr.list_state_handle().lock().unwrap().lists[&ids[i]].clone();
+        assert_eq!(
+            retry.consecutive_failures,
+            retained_retry[i].consecutive_failures + 1
+        );
+        assert_eq!(retry.last_success, retained_retry[i].last_success);
+        assert_eq!(retry.cache_path, retained_retry[i].cache_path);
+        assert_eq!(
+            mgr.schedule_state
+                .lookup(&schedule_keys[i])
+                .unwrap()
+                .outcome,
+            CanonicalScheduleOutcome::Failure,
+            "transaction failure must leave {source}'s scheduler row retryable"
+        );
+    }
+
+    let filter = Arc::new(FilterEngine::new());
+    let mut boot = ListManager::new(
+        reqwest::Client::new(),
+        filter.clone(),
+        sources.clone(),
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&sources).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir),
+    );
+    boot.set_max_total_domains(4);
+    boot.load_disk_cache();
+    assert_eq!(boot.refresh_with_mode(RefreshMode::CacheOnly).await, 5);
+    assert!(!filter.list_membership("old-1.example").is_empty());
+    assert!(filter.list_membership("new-1.example").is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_manifest_transaction_recovers_the_complete_old_corpus_before_cache_only_boot()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let sources = [
+        "https://lists.example.test/txn-a.txt",
+        "https://lists.example.test/txn-b.txt",
+    ];
+    let old = "old-1.example\nold-2.example\nold-3.example\nold-4.example\nold-5.example\n";
+    for source in sources {
+        write_cache_to_disk(
+            dir.path(),
+            source,
+            source,
+            old,
+            Some("\"old\""),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    }
+    let new_a = "new-1.example\nnew-2.example\nnew-3.example\nnew-4.example\n";
+    let staged_a = stage_cache_body(dir.path(), sources[0], new_a).unwrap();
+    let staged_b = stage_cache_body(dir.path(), sources[1], "").unwrap();
+    let admissions = vec![
+        cache_transaction_admission(sources[0], sources[0], staged_a),
+        cache_transaction_admission(sources[1], sources[1], staged_b),
+    ];
+
+    crash_after_nth_cache_manifest_commit_for_test(1);
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit_cache_admissions_transaction(dir.path(), &admissions, OffsetDateTime::now_utc())
+    }));
+    assert!(interrupted.is_err());
+    assert!(rollback_journal_path(dir.path()).is_file());
+    assert_eq!(
+        selected_cache_body_path(dir.path(), sources[0]),
+        Some(admissions[0].staged.as_ref().unwrap().body_path.clone())
+    );
+    let old_b = selected_cache_body_path(dir.path(), sources[1]).unwrap();
+    assert_eq!(std::fs::read_to_string(old_b).unwrap(), old);
+    assert!(
+        9 > cold_start_hard_cap(4),
+        "the 4-new plus 5-old hybrid would exceed the cold hard cap"
+    );
+
+    let filter = Arc::new(FilterEngine::new());
+    let mut boot = ListManager::new(
+        reqwest::Client::new(),
+        filter.clone(),
+        sources.iter().map(ToString::to_string).collect(),
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&sources.map(str::to_string)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    boot.set_max_total_domains(4);
+    boot.load_disk_cache();
+    assert!(!rollback_journal_path(dir.path()).exists());
+    assert_eq!(boot.refresh_with_mode(RefreshMode::CacheOnly).await, 5);
+    assert!(!filter.list_membership("old-1.example").is_empty());
+    assert!(filter.list_membership("new-1.example").is_empty());
+}
+
+#[test]
+fn malformed_rollback_journal_refuses_disk_cache_and_blocks_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/malformed-journal.txt";
+    let old = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "old.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let hybrid = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "new.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    std::fs::write(rollback_journal_path(dir.path()), b"not a journal").unwrap();
+
+    let mut mgr = cleanup_manager(dir.path(), source);
+    mgr.load_disk_cache();
+    assert!(mgr.cache.is_empty(), "a malformed journal must fail closed");
+    mgr.cleanup_stale_caches();
+    assert!(
+        hybrid.exists(),
+        "cleanup deleted a body needed to inspect recovery"
+    );
+    assert!(
+        !old.exists(),
+        "fixture sanity: the selected hybrid manifest replaced the old body"
+    );
+}
+
+#[test]
+fn unreadable_rollback_journal_refuses_disk_cache_and_blocks_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/unreadable-journal.txt";
+    let body = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "kept.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    std::fs::create_dir(rollback_journal_path(dir.path())).unwrap();
+
+    let mut mgr = cleanup_manager(dir.path(), source);
+    mgr.load_disk_cache();
+    assert!(
+        mgr.cache.is_empty(),
+        "an unreadable journal must fail closed"
+    );
+    mgr.cleanup_stale_caches();
+    assert!(body.exists(), "cleanup deleted a recovery body");
+}
+
+#[test]
+fn metadata_write_fault_is_deterministic_and_preserves_generation_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/meta-fault.txt";
+    write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "old.example\n",
+        Some("\"old\""),
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let stem = source_to_cache_stem(source);
+    let meta_path = dir.path().join(format!("{stem}.meta"));
+    let before = std::fs::read_to_string(&meta_path).unwrap();
+    let parsed = load_meta_file(&meta_path);
+    fail_next_cache_manifest_write_for_test();
+    assert!(write_meta_file(
+        &meta_path,
+        Some("\"old\""),
+        None,
+        source,
+        OffsetDateTime::now_utc(),
+        parsed.size,
+        manifest_from_meta(&stem, &parsed),
+    )
+    .is_err());
+    assert_eq!(std::fs::read_to_string(meta_path).unwrap(), before);
+}
+
+#[test]
+fn confirmed_commit_reclaims_active_stem_orphans_but_keeps_selected_body() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/gc.txt";
+    let stem = source_to_cache_stem(source);
+    let orphan_bytes = b"orphan.example\n";
+    let orphan_sha = hex::encode(sha2::Sha256::digest(orphan_bytes));
+    let orphan = dir.path().join(generation_basename(&stem, &orphan_sha));
+    std::fs::write(&orphan, orphan_bytes).unwrap();
+    let selected = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "selected.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    assert!(!orphan.exists());
+    assert!(selected.exists());
+    assert_eq!(generation_body_paths(dir.path(), &stem), vec![selected]);
+}
+
+#[test]
+fn forget_removes_exact_generation_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/forget.txt";
+    let body = write_cache_to_disk(
+        dir.path(),
+        source,
+        source,
+        "forget.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![source.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&[source.to_string()]).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    assert!(mgr.forget_source(source));
+    assert!(!body.exists());
+    assert!(!dir
+        .path()
+        .join(format!("{}.meta", source_to_cache_stem(source)))
+        .exists());
+}
+
 // ── rev-2606 §06 manager-01: retention guard ──────────────────
 
 fn prev_with_unique(unique: u64) -> ListStatus {
@@ -3033,7 +8052,7 @@ fn shrink_verdict_first_fetch_always_accepts() {
     // No prior status → no baseline → accept even an empty body, so
     // initial provisioning is never bricked.
     assert!(matches!(
-        compute_shrink_verdict(true, 90, None, 0),
+        compute_shrink_verdict(true, 90, None, 0, usize::MAX),
         ShrinkVerdict::Accept { .. }
     ));
 }
@@ -3042,7 +8061,7 @@ fn shrink_verdict_first_fetch_always_accepts() {
 fn shrink_verdict_disabled_accepts_catastrophic_drop() {
     let prev = prev_with_unique(1000);
     assert!(matches!(
-        compute_shrink_verdict(false, 90, Some(&prev), 0),
+        compute_shrink_verdict(false, 90, Some(&prev), 0, usize::MAX),
         ShrinkVerdict::Accept { .. }
     ));
 }
@@ -3050,7 +8069,7 @@ fn shrink_verdict_disabled_accepts_catastrophic_drop() {
 #[test]
 fn shrink_verdict_trips_on_collapse_to_zero() {
     let prev = prev_with_unique(1000);
-    match compute_shrink_verdict(true, 90, Some(&prev), 0) {
+    match compute_shrink_verdict(true, 90, Some(&prev), 0, usize::MAX) {
         ShrinkVerdict::Refuse {
             drop_pct,
             got,
@@ -3067,12 +8086,12 @@ fn shrink_verdict_boundary_exact_threshold_accepts_just_over_trips() {
     let prev = prev_with_unique(1000);
     // Exactly 90% drop (fresh = 100 = 10% of baseline) → accept.
     assert!(matches!(
-        compute_shrink_verdict(true, 90, Some(&prev), 100),
+        compute_shrink_verdict(true, 90, Some(&prev), 100, usize::MAX),
         ShrinkVerdict::Accept { .. }
     ));
     // Just over 90% (fresh = 99) → trip.
     assert!(matches!(
-        compute_shrink_verdict(true, 90, Some(&prev), 99),
+        compute_shrink_verdict(true, 90, Some(&prev), 99, usize::MAX),
         ShrinkVerdict::Refuse { .. }
     ));
 }
@@ -3082,7 +8101,7 @@ fn shrink_verdict_legitimate_prune_accepts() {
     // An 80% upstream prune is below the 90% threshold → accepted.
     let prev = prev_with_unique(1000);
     assert!(matches!(
-        compute_shrink_verdict(true, 90, Some(&prev), 200),
+        compute_shrink_verdict(true, 90, Some(&prev), 200, usize::MAX),
         ShrinkVerdict::Accept { .. }
     ));
 }
@@ -3091,7 +8110,7 @@ fn shrink_verdict_legitimate_prune_accepts() {
 fn shrink_verdict_large_swing_accepts_with_delta_warn() {
     let prev = prev_with_unique(1000);
     // 60% shrink: under the 90% refusal but over the 50% canary.
-    match compute_shrink_verdict(true, 90, Some(&prev), 400) {
+    match compute_shrink_verdict(true, 90, Some(&prev), 400, usize::MAX) {
         ShrinkVerdict::Accept { delta_warn } => {
             let d = delta_warn.expect("a 60% shrink must arm the canary");
             assert!(d <= -DELTA_WARN_THRESHOLD_PCT);
@@ -3099,7 +8118,7 @@ fn shrink_verdict_large_swing_accepts_with_delta_warn() {
         other => panic!("expected Accept, got {other:?}"),
     }
     // A 1000x GROWTH is also a canary signal.
-    match compute_shrink_verdict(true, 90, Some(&prev), 1_000_000) {
+    match compute_shrink_verdict(true, 90, Some(&prev), 1_000_000, usize::MAX) {
         ShrinkVerdict::Accept { delta_warn } => {
             assert!(delta_warn.expect("growth canary").abs() >= DELTA_WARN_THRESHOLD_PCT);
         }
@@ -3117,7 +8136,20 @@ fn shrink_verdict_falls_back_to_prev_entries_when_no_unique_baseline() {
         ..ListStatus::default()
     };
     assert!(matches!(
-        compute_shrink_verdict(true, 90, Some(&prev), 0),
+        compute_shrink_verdict(true, 90, Some(&prev), 0, usize::MAX),
+        ShrinkVerdict::Refuse { .. }
+    ));
+}
+
+#[test]
+fn shrink_verdict_uses_the_effective_source_cap_for_a_live_baseline() {
+    let prev = prev_with_unique(100);
+    assert!(matches!(
+        compute_shrink_verdict(true, 50, Some(&prev), 2, 2),
+        ShrinkVerdict::Accept { .. }
+    ));
+    assert!(matches!(
+        compute_shrink_verdict(true, 50, Some(&prev), 2, usize::MAX),
         ShrinkVerdict::Refuse { .. }
     ));
 }
@@ -3140,8 +8172,8 @@ fn cache_hit_message_pins_the_mode_mapping() {
         "boot: loaded from disk cache, no HTTP",
     );
     assert_eq!(
-        cache_hit_message(RefreshMode::Network),
-        "list fresh, skipping HTTP and reusing cache",
+        cache_hit_message(RefreshMode::Scheduled),
+        "list not due, reusing retained cache",
     );
 }
 
@@ -3172,26 +8204,198 @@ fn bridge_manager(body: &str) -> (ListManager, String, tempfile::TempDir) {
         DEFAULT_MAX_LIST_ENTRIES,
         Some(cache_dir),
     );
-    let bl = crate::config::schema::Blocklist {
-        id: crate::config::schema::id::Id::new("poison").unwrap(),
-        display_name: "poison".to_string(),
-        url: url.clone(),
-        format: Default::default(),
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
-        enabled: true,
-        auth_token_ref: None,
-        base: crate::config::schema::BlocklistBase::Deny,
-        trust: BlocklistTrust::Local,
-        accept_unsigned_allow: false,
-        max_consecutive_failures: 5,
-    };
+    let bl = bridge_blocklist(&url, BlocklistTrust::Local);
     mgr.set_local_bridge(SourceTrustMap::build(&[bl]), dir.path().to_path_buf());
     (mgr, url, dir)
 }
 
+fn bridge_blocklist(url: &str, trust: BlocklistTrust) -> crate::config::schema::Blocklist {
+    crate::config::schema::Blocklist {
+        id: crate::config::schema::id::Id::new("poison").unwrap(),
+        display_name: "poison".to_string(),
+        url: url.to_string(),
+        format: Default::default(),
+        update_interval_hours: None,
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: crate::config::schema::BlocklistBase::Deny,
+        trust,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    }
+}
+
+/// Construct the production restart shape: only the accepted disk cache and
+/// its fresh metadata are restored before the next refresh.
+fn restarted_bridge_manager(
+    dir: &tempfile::TempDir,
+    url: &str,
+    trust: BlocklistTrust,
+    max_body_bytes: usize,
+) -> ListManager {
+    let bits = build_source_bit_map(&[url.to_string()]).expect("at-cap accept");
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![url.to_string()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        bits,
+        max_body_bytes,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().join("cache")),
+    );
+    mgr.set_local_bridge(
+        SourceTrustMap::build(&[bridge_blocklist(url, trust)]),
+        dir.path().to_path_buf(),
+    );
+    mgr.load_disk_cache();
+    mgr
+}
+
 fn write_bridge_body(dir: &tempfile::TempDir, body: &str) {
     std::fs::write(dir.path().join("lists").join("poison.txt"), body).unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_local_bridge_stamps_the_accepted_retained_cache_path() {
+    use crate::lists::status::LastOutcome;
+
+    let good = "a.example.com\nb.example.com\n";
+    let (mut mgr, url, dir) = bridge_manager(good);
+    let blocklist_id = crate::config::schema::Id::new("bridge-retained").unwrap();
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (blocklist_id.clone(), 1))]));
+    assert_eq!(mgr.refresh().await, 2);
+    let stem = source_to_cache_stem(&url);
+    let cache_path = selected_cache_body_path(&dir.path().join("cache"), &url).unwrap();
+    assert!(
+        cache_path.is_file(),
+        "the successful bridge cycle writes a cache"
+    );
+    let first_success = mgr.list_state_handle().lock().unwrap().clone();
+    assert_eq!(
+        first_success.lists[&blocklist_id].cache_path.as_deref(),
+        Some(cache_path.as_path()),
+        "first fetch must stamp the manifest-selected generation body"
+    );
+    assert!(
+        !cache_path.ends_with(format!("{stem}.cache")),
+        "a fresh manifest commit must not stamp a synthetic legacy path"
+    );
+
+    // Reset after the cache write: this failure path has to stamp the path.
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(url.clone(), (blocklist_id.clone(), 1))]));
+    std::fs::remove_file(dir.path().join("lists").join("poison.txt")).unwrap();
+
+    assert_eq!(
+        mgr.refresh().await,
+        2,
+        "a refused bridge may retain only a cache body that parses successfully"
+    );
+    match &mgr
+        .status_registry
+        .status_for_url(&url)
+        .unwrap()
+        .last_outcome
+    {
+        LastOutcome::Failed { reason } => assert!(reason.contains("not readable"), "{reason}"),
+        other => panic!("expected the bridge refusal, got {other:?}"),
+    }
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Failed);
+    assert_eq!(entry.consecutive_failures, 1);
+    assert_eq!(entry.cache_path.as_deref(), Some(cache_path.as_path()));
+}
+
+#[tokio::test]
+async fn retained_body_reader_never_opens_the_live_bridge_file() {
+    let (mut mgr, url, _dir) = bridge_manager("live.example.com\n");
+    assert_eq!(mgr.refresh().await, 1);
+
+    let reader = mgr.resolve_retained_body_reader(&url, &url).unwrap();
+    assert!(matches!(&reader, BodyReader::RetainedCache { .. }));
+    assert!(reader.retained_cache_path().is_some());
+}
+
+#[tokio::test]
+async fn fresh_disk_cache_with_oversized_imported_local_candidate_retains_last_good_body() {
+    use crate::lists::status::LastOutcome;
+
+    let good = "old-a.example\nold-b.example\n";
+    let (mut initial, url, dir) = bridge_manager(good);
+    assert_eq!(initial.refresh().await, 2);
+
+    write_bridge_body(
+        &dir,
+        "candidate-a.example\ncandidate-b.example\ncandidate-c.example\n",
+    );
+    let mut mgr = restarted_bridge_manager(&dir, &url, BlocklistTrust::Local, good.len());
+    assert!(
+        mgr.cache.contains_key(&url),
+        "load_disk_cache must restore the fresh retained entry before Network refresh"
+    );
+    assert!(
+        is_cache_fresh(
+            mgr.cache.get(&url).unwrap().fetched_at,
+            OffsetDateTime::now_utc(),
+            mgr.refresh_interval,
+        ),
+        "the fixture must exercise the Network fresh-cache bypass"
+    );
+
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::Force).await, 2);
+    for domain in ["old-a.example", "old-b.example"] {
+        assert!(
+            !mgr.filter.list_membership(domain).is_empty(),
+            "{domain} vanished"
+        );
+    }
+    assert!(mgr.filter.list_membership("candidate-a.example").is_empty());
+    let status = mgr.status_registry().status_for_url(&url).unwrap();
+    match &status.last_outcome {
+        LastOutcome::Failed { reason } => assert!(reason.contains("max"), "{reason}"),
+        other => panic!("expected oversized live candidate failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fresh_disk_cache_with_untrusted_imported_local_candidate_retains_last_good_body() {
+    use crate::lists::status::LastOutcome;
+
+    let good = "old-a.example\nold-b.example\n";
+    let (mut initial, url, dir) = bridge_manager(good);
+    assert_eq!(initial.refresh().await, 2);
+    write_bridge_body(&dir, "candidate-a.example\ncandidate-b.example\n");
+    let mut mgr = restarted_bridge_manager(&dir, &url, BlocklistTrust::RemoteUnsigned, TEST_CAP);
+    assert!(
+        mgr.cache.contains_key(&url),
+        "load_disk_cache must restore the fresh retained entry before Network refresh"
+    );
+    assert!(
+        is_cache_fresh(
+            mgr.cache.get(&url).unwrap().fetched_at,
+            OffsetDateTime::now_utc(),
+            mgr.refresh_interval,
+        ),
+        "the fixture must exercise the Network fresh-cache bypass"
+    );
+
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::Force).await, 2);
+    for domain in ["old-a.example", "old-b.example"] {
+        assert!(
+            !mgr.filter.list_membership(domain).is_empty(),
+            "{domain} vanished"
+        );
+    }
+    assert!(mgr.filter.list_membership("candidate-a.example").is_empty());
+    let status = mgr.status_registry().status_for_url(&url).unwrap();
+    match &status.last_outcome {
+        LastOutcome::Failed { reason } => assert!(reason.contains("trust=local"), "{reason}"),
+        other => panic!("expected untrusted live candidate failure, got {other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -3208,32 +8412,10 @@ fn cache_dir_lax_mode_flags_group_world_writable() {
     assert_eq!(cache_dir_lax_mode(&dir.path().join("nope")), None);
 }
 
-/// A SECOND attempt at pinning the fix in-suite, and it does not pin it
-/// either. Kept, with the negative result, so the next reader does not spend
-/// the same hour.
-///
-/// The idea was sound: seed `cache` with a FRESH entry holding the OLD body,
-/// which is the state the defect lives in on a live daemon between scheduled
-/// cycles, then assert the operator's edit still lands. `resolve_body_reader`
-/// tries `cache.body` first, so without the local-file branch it should have
-/// returned the seeded three domains.
-///
-/// Measured: with that branch forced off, this test STAYS GREEN. The bridge
-/// runs during `refresh()` and overwrites the seeded entry before anything
-/// reads it, so the seeding never survives to matter.
-///
-/// Two attempts, two negative results. What they establish together is not
-/// "the fix is unpinnable" but something narrower and useful: **this harness
-/// re-bridges on every refresh, so no in-process test can hold a cache entry
-/// stale against the file**. Pinning it needs a harness that can suppress the
-/// bridge for one cycle — which does not exist and is a real piece of work,
-/// not an oversight.
-///
-/// Until then the pin is the live isolated-daemon run recorded in
-/// `sighup-ignores-bridge-body`: append, SIGHUP, `lists reloaded count`
-/// 300000 -> 300001.
+/// A Network refresh bypasses both generic cache shortcuts for an
+/// `imported.local` source and validates the current file through the bridge.
 #[tokio::test]
-async fn a_stale_but_fresh_cache_entry_does_not_hide_an_edited_local_body() {
+async fn network_refresh_with_fresh_cache_reads_the_edited_local_body() {
     let old = "a.example.com\nb.example.com\nc.example.com\n";
     let (mut mgr, url, dir) = bridge_manager(old);
     assert_eq!(mgr.refresh().await, 3);
@@ -3244,9 +8426,8 @@ async fn a_stale_but_fresh_cache_entry_does_not_hide_an_edited_local_body() {
         "a.example.com\nb.example.com\nc.example.com\nd.example.com\n",
     );
 
-    // ...but a cache entry from "the last fetch" is still FRESH, so the
-    // freshness shortcut fires and nothing re-reads the file. This is the
-    // state a live daemon reaches between scheduled cycles.
+    // Seed the generic fresh-cache state that Network must ignore for the
+    // imported.local sentinel.
     mgr.cache.insert(
         url.clone(),
         ListCache {
@@ -3258,57 +8439,14 @@ async fn a_stale_but_fresh_cache_entry_does_not_hide_an_edited_local_body() {
     );
 
     assert_eq!(
-        mgr.refresh().await,
+        mgr.refresh_with_mode(RefreshMode::Force).await,
         4,
         "a fresh cache entry must not hide the operator's edit — 3 means the \
          seeded body was parsed instead of the file on disk"
     );
 }
 
-/// The core poison chain: a previously-good list whose upstream flips
-/// to an empty 200 must NOT lose its on-disk cache or stop blocking,
-/// and the outage must survive a daemon restart.
-/// End-to-end: an operator's edit to a `trust = local` body is picked up by
-/// the next refresh — the property `sighup-ignores-bridge-body` is about,
-/// driven through the manager's real `refresh()` rather than asserted on a
-/// fingerprint.
-///
-/// # Why this needs no mocked HTTP client
-///
-/// The task that filed this test assumed one, because `drive_gate_reload`'s
-/// rebuild branch fetches over the network. That is true of a REMOTE source.
-/// With only an `imported.local` source there is no fetch to mock: the bridge
-/// reads the file from disk, and [`bridge_manager`] already builds exactly
-/// that shape for the retention-guard tests below.
-///
-/// # What it does NOT pin — measured, not assumed
-///
-/// **This test passes with the fix REMOVED.** Mutation run: force
-/// `resolve_body_reader`'s local-file branch off, and this stays green while
-/// the three retention-guard tests below also stay green. The prediction
-/// written before the run said it would go red on 4 vs 3. It did not.
-///
-/// The reason is the harness, not the assertion: every `refresh()` here goes
-/// through the bridge, which re-copies the file into the cache, so
-/// `resolve_body_reader` receives a fresh copy either way. The real defect
-/// needs `is_cache_fresh` to SKIP the fetch — and, as the retention-guard
-/// test below already documents, "the bridge path leaves no in-memory cache
-/// entry, so the freshness shortcut does not fire". This harness cannot
-/// reach the state the defect lives in.
-///
-/// So what pins the fix is the live isolated-daemon run recorded in
-/// `sighup-ignores-bridge-body`'s closure note: append, SIGHUP, and
-/// `lists reloaded count` moving 300000 -> 300001. Reproducing that in-process
-/// needs a harness that can age a cache entry into freshness without a
-/// re-bridge, which does not exist yet.
-///
-/// # What it DOES pin
-///
-/// That an edited `trust = local` body reaches the corpus through the real
-/// `refresh()` path at all — a regression net for the bridge itself, which
-/// is worth keeping. It is simply not the net for the caching defect, and
-/// saying so here is the point: a test whose doc claims a catch it does not
-/// have is worse than no test, because the next reader stops looking.
+/// A normal Network cycle applies a local edit through the validated bridge.
 #[tokio::test]
 async fn a_local_body_edit_is_picked_up_by_the_next_refresh() {
     let (mut mgr, _url, dir) = bridge_manager("a.example.com\nb.example.com\nc.example.com\n");
@@ -3333,16 +8471,38 @@ async fn a_local_body_edit_is_picked_up_by_the_next_refresh() {
     );
 }
 
+/// CacheOnly boot reads the retained accepted cache for imported.local and
+/// never opens the current operator file.
+#[tokio::test]
+async fn cache_only_boot_uses_retained_imported_local_cache_not_live_file() {
+    let good = "old-a.example\nold-b.example\n";
+    let (mut initial, url, dir) = bridge_manager(good);
+    assert_eq!(initial.refresh().await, 2);
+    write_bridge_body(&dir, "candidate-a.example\ncandidate-b.example\n");
+
+    let mut boot = restarted_bridge_manager(&dir, &url, BlocklistTrust::Local, TEST_CAP);
+    assert_eq!(boot.refresh_with_mode(RefreshMode::CacheOnly).await, 2);
+    for domain in ["old-a.example", "old-b.example"] {
+        assert!(
+            !boot.filter.list_membership(domain).is_empty(),
+            "{domain} vanished"
+        );
+    }
+    assert!(boot
+        .filter
+        .list_membership("candidate-a.example")
+        .is_empty());
+}
+
 #[tokio::test]
 async fn retention_guard_keeps_prior_cache_on_empty_200() {
     use crate::lists::status::LastOutcome;
     let good = "a.example.com\nb.example.com\nc.example.com\nd.example.com\n";
     let (mut mgr, url, dir) = bridge_manager(good);
-    let stem = source_to_cache_stem(&url);
-    let cache_file = dir.path().join("cache").join(format!("{stem}.cache"));
 
     // Refresh 1: good body accepted, cache written, domains in the map.
     assert_eq!(mgr.refresh().await, 4);
+    let cache_file = selected_cache_body_path(&dir.path().join("cache"), &url).unwrap();
     assert_eq!(std::fs::read_to_string(&cache_file).unwrap(), good);
     let st = mgr.status_registry().status_for_url(&url).unwrap();
     assert!(matches!(st.last_outcome, LastOutcome::Ok));
@@ -3410,14 +8570,13 @@ async fn retention_guard_accepts_legitimate_prune() {
     use crate::lists::status::LastOutcome;
     let good = "a.example.com\nb.example.com\nc.example.com\nd.example.com\n";
     let (mut mgr, url, dir) = bridge_manager(good);
-    let stem = source_to_cache_stem(&url);
-    let cache_file = dir.path().join("cache").join(format!("{stem}.cache"));
     assert_eq!(mgr.refresh().await, 4);
 
     // 4 → 1 domain = 75% drop, under the 90% threshold.
     let pruned = "a.example.com\n";
     write_bridge_body(&dir, pruned);
     assert_eq!(mgr.refresh().await, 1);
+    let cache_file = selected_cache_body_path(&dir.path().join("cache"), &url).unwrap();
     assert_eq!(
         std::fs::read_to_string(&cache_file).unwrap(),
         pruned,
@@ -3438,7 +8597,15 @@ async fn retention_guard_accepts_legitimate_prune() {
 async fn retention_guard_first_fetch_empty_accepts() {
     use crate::lists::status::LastOutcome;
     let (mut mgr, url, _dir) = bridge_manager("");
+    mgr.status_registry()
+        .note_refused_cycle(OffsetDateTime::now_utc());
     assert_eq!(mgr.refresh().await, 0);
+    let cycle = mgr.status_registry().cycle();
+    assert_eq!(cycle.outcome, Some(CycleOutcome::Installed));
+    assert!(!cycle.source_coverage_incomplete);
+    assert!(!cycle.generation_degraded);
+    assert!(mgr.installed_corpus_digest.is_some());
+    assert!(mgr.status_registry().corpus_freeze().is_none());
     assert!(matches!(
         mgr.status_registry()
             .status_for_url(&url)
@@ -3650,8 +8817,8 @@ fn spill_manager_with_cap(
             display_name: name.clone(),
             url: url.clone(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base: crate::config::schema::BlocklistBase::Deny,
@@ -3676,6 +8843,126 @@ fn spill_manager_with_cap(
     );
     mgr.set_local_bridge(SourceTrustMap::build(&blocklists), dir.path().to_path_buf());
     (mgr, urls, dir)
+}
+
+#[tokio::test]
+async fn source_cap_refuses_only_its_fresh_candidate() {
+    let (mut mgr, urls, _dir) =
+        spill_manager_with_cap(&["one.test\ntwo.test\n", "three.test\nfour.test\n"], 2);
+    assert_eq!(mgr.refresh().await, 4, "seed a safe retained generation");
+    mgr.set_source_max_entries(HashMap::from([
+        (urls[0].clone(), 1),
+        (urls[1].clone(), usize::MAX),
+    ]));
+    assert_eq!(
+        mgr.source_max_entries_for(&urls[1]),
+        2,
+        "manager wiring cannot widen the global hard ceiling"
+    );
+    assert_eq!(
+        mgr.refresh().await,
+        4,
+        "a source whose candidate and retained body exceed its new cap keeps the safe generation"
+    );
+    let refused = mgr.status_registry().status_for_url(&urls[0]).unwrap();
+    assert!(refused.parsed_truncated > 0);
+    assert_eq!(
+        refused.entries, 2,
+        "refused source retains its old status rather than contributing the candidate"
+    );
+    let healthy = mgr.status_registry().status_for_url(&urls[1]).unwrap();
+    assert_eq!(healthy.parsed_ok, 2);
+    assert_eq!(
+        healthy.entries, 2,
+        "healthy source retains its exact contribution"
+    );
+}
+
+#[tokio::test]
+async fn reload_cap_narrowing_bounds_live_baseline_consumers_in_either_wiring_order() {
+    let (mut mgr, urls, _dir) = spill_manager_with_cap(&["one.test\ntwo.test\n"], 10);
+    let source = urls[0].clone();
+    let shared = Arc::new(ListStatusRegistry::new(&urls));
+    let now = OffsetDateTime::now_utc();
+    shared.update_for_url(
+        &source,
+        ListStatus {
+            entries: 100,
+            parsed_ok: 100,
+            unique_domains: 100,
+            fetched_at: Some(now),
+            last_outcome: LastOutcome::Ok,
+            prev_entries: Some(100),
+            last_refresh_at: Some(now),
+            ..ListStatus::default()
+        },
+    );
+
+    // Reload builds a replacement manager, wires its plan caps, then attaches
+    // the daemon's already-populated registry. The live status remains the
+    // served generation; guard and allocation consumers apply the new cap.
+    mgr.set_source_max_entries(HashMap::from([(source.clone(), 2)]));
+    mgr.attach_status_registry(shared.clone());
+    let narrowed = shared.status_for_url(&source).unwrap();
+    assert_eq!(narrowed.entries, 100, "the served count remains truthful");
+    assert_eq!(narrowed.parsed_ok, 100);
+    assert_eq!(narrowed.prev_entries, Some(100));
+    assert_eq!(narrowed.unique_domains, 100);
+    assert_eq!(narrowed.last_outcome, LastOutcome::Ok);
+    assert_eq!(narrowed.fetched_at, Some(now));
+    assert_eq!(narrowed.last_refresh_at, Some(now));
+    match UniqueCount::measure(Some(narrowed.as_ref()), 2) {
+        UniqueCount::Measure(Some(hint)) => assert_eq!(hint.get(), 2),
+        other => panic!("narrowed status must bound the allocation hint: {other:?}"),
+    }
+    assert!(matches!(
+        compute_shrink_verdict(true, 50, Some(narrowed.as_ref()), 2, 2),
+        ShrinkVerdict::Accept { .. }
+    ));
+
+    mgr.set_shrink_guard(true, 50);
+    assert_eq!(
+        mgr.refresh().await,
+        2,
+        "a candidate at the narrowed cap must not be refused against the old live baseline"
+    );
+    assert_eq!(
+        mgr.status_registry()
+            .status_for_url(&source)
+            .unwrap()
+            .entries,
+        2,
+        "the accepted candidate replaces the now-obsolete served count"
+    );
+
+    // The same consumption seams make the setter order irrelevant.
+    let (mut reverse, reverse_urls, _dir) = spill_manager_with_cap(&["one.test\ntwo.test\n"], 10);
+    let reverse_source = reverse_urls[0].clone();
+    let reverse_shared = Arc::new(ListStatusRegistry::new(&reverse_urls));
+    reverse_shared.update_for_url(
+        &reverse_source,
+        ListStatus {
+            entries: 100,
+            unique_domains: 100,
+            last_outcome: LastOutcome::Ok,
+            prev_entries: Some(100),
+            ..ListStatus::default()
+        },
+    );
+    reverse.attach_status_registry(reverse_shared.clone());
+    reverse.set_source_max_entries(HashMap::from([(reverse_source.clone(), 2)]));
+    let reverse_status = reverse_shared.status_for_url(&reverse_source).unwrap();
+    assert_eq!(reverse_status.entries, 100);
+    assert_eq!(reverse_status.prev_entries, Some(100));
+    assert_eq!(reverse_status.unique_domains, 100);
+    match UniqueCount::carry_or_measure(Some(reverse_status.as_ref()), 2) {
+        UniqueCount::Carried(hint) => assert_eq!(hint.get(), 2),
+        other => panic!("reverse wiring must bound the carried baseline: {other:?}"),
+    }
+    assert!(matches!(
+        compute_shrink_verdict(true, 50, Some(reverse_status.as_ref()), 2, 2),
+        ShrinkVerdict::Accept { .. }
+    ));
 }
 
 /// A manager whose sources are ordinary remote URLs already present in
@@ -3716,7 +9003,16 @@ fn cached_manager(bodies: &[&str]) -> (ListManager, Vec<String>, tempfile::TempD
         Some(cache_dir.clone()),
     );
     for (url, body) in urls.iter().zip(bodies) {
-        write_cache_to_disk(&cache_dir, url, body, None, None, OffsetDateTime::now_utc());
+        write_cache_to_disk(
+            &cache_dir,
+            url,
+            url,
+            body,
+            None,
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         mgr.cache.insert(
             url.clone(),
             ListCache {
@@ -3736,11 +9032,13 @@ fn rewrite_cached_body(dir: &tempfile::TempDir, url: &str, body: &str) {
     write_cache_to_disk(
         &dir.path().join("cache"),
         url,
+        url,
         body,
         None,
         None,
         OffsetDateTime::now_utc(),
-    );
+    )
+    .unwrap();
 }
 
 /// The precondition three `retention_guard_*` tests state in their own
@@ -3901,6 +9199,43 @@ async fn entries_still_counts_only_net_new_domains() {
     assert_eq!(s1.unique_domains, 2);
 }
 
+#[tokio::test]
+async fn retained_failure_reconciles_served_overlap_without_recovering_health() {
+    let (mut mgr, urls, dir) = spill_manager(&["shared.example\n", "shared.example\nb.example\n"]);
+    assert_eq!(mgr.refresh().await, 2);
+    assert_eq!(
+        mgr.status_registry
+            .status_for_url(&urls[0])
+            .unwrap()
+            .entries,
+        1
+    );
+    assert_eq!(
+        mgr.status_registry
+            .status_for_url(&urls[1])
+            .unwrap()
+            .entries,
+        1
+    );
+
+    rewrite_body(&dir, 0, "a.example\n");
+    std::fs::remove_file(dir.path().join("lists/src1.txt")).unwrap();
+    expire_bodies(&mut mgr);
+
+    assert_eq!(mgr.refresh().await, 3);
+    let a = mgr.status_registry.status_for_url(&urls[0]).unwrap();
+    let b = mgr.status_registry.status_for_url(&urls[1]).unwrap();
+    assert_eq!(a.entries, 1);
+    assert_eq!(
+        b.entries, 2,
+        "the retained source now owns shared.example as well as b.example"
+    );
+    assert!(
+        matches!(b.last_outcome, LastOutcome::Failed { .. }),
+        "retaining a body does not recover the failed fetch"
+    );
+}
+
 /// The retention guard trips on `unique_domains`, which must stay
 /// immune to a body that repeats one domain N times. The frozen
 /// [`DomainSink::accept`] hands the skeleton no way to learn a domain
@@ -4044,7 +9379,7 @@ fn partial_stream_error_rolls_the_spill_back() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     assert!(spill.is_disk(), "test must exercise the disk path");
 
     // A first, complete source.
@@ -4076,16 +9411,88 @@ fn partial_stream_error_rolls_the_spill_back() {
 
     // And the built shards contain only the first source.
     spill.flush().unwrap();
-    let mut added = [0u64; 64];
     let mut found = Vec::new();
     let policy = ListPolicy::publish_uniform(0);
     for idx in 0..DOMAIN_SHARDS {
-        let shard = spill.build_shard(idx, 4, &mut added, &policy).unwrap();
+        let shard = spill.build_shard(idx, 4, &policy).unwrap().shard;
         for (d, bits) in shard.iter() {
             found.push((d.to_string(), shard.split_base(bits).block_mask));
         }
     }
     assert_eq!(found, vec![("kept.example".to_string(), 1)]);
+}
+
+#[test]
+fn disk_spill_overlong_line_after_valid_prefix_rolls_back_whole_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    assert!(spill.is_disk(), "test must exercise the disk spill path");
+
+    parse_source_into_spill(
+        std::io::Cursor::new(b"kept.example\n".to_vec()),
+        1,
+        &mut spill,
+        100,
+        "retained",
+        Some(ListFormat::DomainOnly),
+    )
+    .unwrap();
+    let before = spill.mark();
+
+    let overlong = format!("new.example\n#{}\nlate.example\n", "x".repeat(64 * 1024));
+    let error = parse_source_into_spill(
+        std::io::Cursor::new(overlong.into_bytes()),
+        2,
+        &mut spill,
+        100,
+        "candidate",
+        Some(ListFormat::DomainOnly),
+    )
+    .expect_err("a valid prefix cannot survive an overlong physical line");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        spill.mark(),
+        before,
+        "the candidate left partial spill rows"
+    );
+
+    spill.flush().unwrap();
+    let policy = ListPolicy::publish_uniform(0);
+    let mut found = Vec::new();
+    for idx in 0..DOMAIN_SHARDS {
+        let shard = spill.build_shard(idx, 4, &policy).unwrap().shard;
+        for (domain, bits) in shard.iter() {
+            found.push((domain.to_string(), shard.split_base(bits).block_mask));
+        }
+    }
+    assert_eq!(found, vec![("kept.example".to_string(), 1)]);
+}
+
+#[test]
+fn manifest_hash_mismatch_rolls_back_every_retained_parse_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let body_path = dir.path().join("retained.body");
+    std::fs::write(&body_path, "tampered.example\n").unwrap();
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    let before = spill.mark();
+    let reader = BodyReader::RetainedCache {
+        reader: std::io::BufReader::new(std::fs::File::open(&body_path).unwrap()),
+        path: body_path,
+        expected_sha256: Some([0; 32]),
+    };
+
+    let error = parse_retained_source_into_spill_counted(
+        reader,
+        1,
+        &mut spill,
+        100,
+        "retained",
+        Some(ListFormat::DomainOnly),
+        UniqueCount::Measure(None),
+    )
+    .expect_err("manifest hash mismatch must reject the retained body");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(spill.mark(), before, "mismatched rows escaped the rollback");
 }
 
 /// neutrality-06 — a source whose blocklist row carries `base = allow`
@@ -4100,7 +9507,7 @@ fn partial_stream_error_rolls_the_spill_back() {
 #[test]
 fn neutrality06_allow_direction_source_populates_allow_mask() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
 
     // bit 0 — a deny list carrying two domains.
     parse_source_into_spill(
@@ -4127,11 +9534,10 @@ fn neutrality06_allow_direction_source_populates_allow_mask() {
     spill.flush().unwrap();
 
     let allow_bits: u64 = 1 << 1;
-    let mut added = [0u64; 64];
     let mut found: HashMap<String, DomainMasks> = HashMap::new();
     let policy = ListPolicy::publish_uniform(allow_bits);
     for idx in 0..DOMAIN_SHARDS {
-        let shard = spill.build_shard(idx, 4, &mut added, &policy).unwrap();
+        let shard = spill.build_shard(idx, 4, &policy).unwrap().shard;
         for (d, bits) in shard.iter() {
             found.insert(d.to_string(), shard.split_base(bits));
         }
@@ -4183,7 +9589,7 @@ fn neutrality06_allow_direction_source_populates_allow_mask() {
 #[test]
 fn allow_direction_routing_survives_reversed_spill_order() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
 
     // bit 1 — the allow list, spilled FIRST this time.
     parse_source_into_spill(
@@ -4210,11 +9616,10 @@ fn allow_direction_routing_survives_reversed_spill_order() {
     spill.flush().unwrap();
 
     let allow_bits: u64 = 1 << 1;
-    let mut added = [0u64; 64];
     let mut found: HashMap<String, DomainMasks> = HashMap::new();
     let policy = ListPolicy::publish_uniform(allow_bits);
     for idx in 0..DOMAIN_SHARDS {
-        let shard = spill.build_shard(idx, 4, &mut added, &policy).unwrap();
+        let shard = spill.build_shard(idx, 4, &policy).unwrap().shard;
         for (d, bits) in shard.iter() {
             found.insert(d.to_string(), shard.split_base(bits));
         }
@@ -4258,11 +9663,10 @@ fn allow_direction_routing_survives_reversed_spill_order() {
     assert_eq!(blocked.block_mask, 0b01);
 }
 
-/// The in-RAM fallback (`cache_dir: None`, or an uncreatable spill
-/// dir) must partition identically to the disk path — it costs more
-/// memory, never different domains.
+/// Explicit in-RAM mode (`cache_dir: None`) must partition identically
+/// to the disk path — it costs more memory, never different domains.
 #[test]
-fn memory_fallback_partitions_identically_to_disk() {
+fn memory_mode_partitions_identically_to_disk() {
     let body = "one.example\ntwo.example\nthree.example\nfour.example\none.example\n";
 
     let build = |spill: &mut ShardSpill| {
@@ -4280,12 +9684,11 @@ fn memory_fallback_partitions_identically_to_disk() {
         let mut per_shard: Vec<Vec<String>> = Vec::new();
         let policy = ListPolicy::publish_uniform(0);
         for idx in 0..DOMAIN_SHARDS {
-            let mut names: Vec<String> = spill
-                .build_shard(idx, 4, &mut added, &policy)
+            let shard = spill
+                .build_shard(idx, 4, &policy)
                 .unwrap()
-                .iter()
-                .map(|(k, _)| k.to_string())
-                .collect();
+                .merge_added_by_bit(&mut added);
+            let mut names: Vec<String> = shard.iter().map(|(k, _)| k.to_string()).collect();
             names.sort();
             per_shard.push(names);
         }
@@ -4293,10 +9696,13 @@ fn memory_fallback_partitions_identically_to_disk() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let mut disk = ShardSpill::open(Some(dir.path()));
+    let mut disk = ShardSpill::open(Some(dir.path())).unwrap();
     assert!(disk.is_disk());
-    let mut mem = ShardSpill::open(None);
-    assert!(!mem.is_disk());
+    let mut mem = ShardSpill::open(None).unwrap();
+    assert!(
+        !mem.is_disk(),
+        "memory arm must exercise explicit memory mode"
+    );
 
     let (disk_shards, disk_added) = build(&mut disk);
     let (mem_shards, mem_added) = build(&mut mem);
@@ -4308,6 +9714,660 @@ fn memory_fallback_partitions_identically_to_disk() {
         4,
         "one.example appears twice in the body but once in the map"
     );
+}
+
+#[test]
+fn disk_spill_setup_errors_never_select_memory() {
+    let dir = tempfile::tempdir().unwrap();
+
+    fail_next_shard_spill_dir_create_for_test();
+    assert!(
+        ShardSpill::open(Some(dir.path())).is_err(),
+        "a configured spill directory failure must surface"
+    );
+
+    fail_nth_shard_spill_file_create_for_test(3);
+    assert!(
+        ShardSpill::open(Some(dir.path())).is_err(),
+        "a configured spill file failure must surface"
+    );
+    assert!(
+        !dir.path().join(SHARD_SPILL_DIR).exists(),
+        "a failed spill setup must remove its partial partition"
+    );
+
+    assert!(
+        !ShardSpill::open(None).unwrap().is_disk(),
+        "memory mode remains an explicit cache_dir: None choice"
+    );
+}
+
+#[tokio::test]
+async fn disk_spill_setup_failure_publishes_one_degraded_completed_cycle() {
+    let (mut mgr, _urls, _dir) = spill_manager(&["kept.example\n"]);
+    assert_eq!(mgr.refresh().await, 1);
+    let before = mgr.status_registry.cycle();
+    assert_eq!(before.served_state, ServedState::Complete);
+
+    fail_next_shard_spill_dir_create_for_test();
+    assert_eq!(mgr.refresh().await, 1, "the prior corpus remains live");
+
+    let after = mgr.status_registry.cycle();
+    assert_eq!(
+        after.seq,
+        before.seq + 1,
+        "one failed attempt publishes once"
+    );
+    assert_eq!(after.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(after.source_coverage_incomplete);
+    assert!(after.generation_degraded);
+    assert_eq!(after.served_state, ServedState::Complete);
+    assert!(mgr.status_registry.corpus_refusal().is_none());
+    assert!(mgr.filter.is_blocked("kept.example"));
+}
+
+#[test]
+fn poisoned_spill_rejects_publication_operations_after_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    let mark = spill.mark();
+
+    fail_nth_shard_spill_write_for_test(1);
+    assert!(spill.push("candidate.example", 1).is_err());
+    assert!(spill.is_poisoned(), "write failure must latch poison");
+    assert!(
+        spill.rollback(&mark, SpillRollbackSite::DirectTest).is_ok(),
+        "cleanup remains available after a write failure"
+    );
+    assert!(
+        spill.is_poisoned(),
+        "successful cleanup must not clear poison"
+    );
+    assert!(spill.push("later.example", 1).is_err());
+    assert!(spill.flush().is_err());
+    assert!(spill.count_unique(0, &mut [0; 64]).is_err());
+    assert!(spill
+        .build_shard(0, 0, &ListPolicy::publish_uniform(0))
+        .is_err());
+}
+
+#[test]
+fn flush_and_sync_failures_latch_spill_poison() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut flush_spill = ShardSpill::open(Some(dir.path())).unwrap();
+    fail_nth_shard_spill_flush_for_test(1);
+    assert!(flush_spill.flush().is_err());
+    assert!(
+        flush_spill.is_poisoned(),
+        "injected flush failure must latch poison"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut sync_spill = ShardSpill::open(Some(dir.path())).unwrap();
+    fail_nth_shard_spill_sync_for_test(1);
+    assert!(sync_spill.flush().is_err());
+    assert!(
+        sync_spill.is_poisoned(),
+        "injected sync failure must latch poison"
+    );
+}
+
+#[test]
+fn guard_count_failure_after_prepare_validate_latches_spill_poison() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    spill.push("candidate.example", 1).unwrap();
+    spill.flush().unwrap();
+    spill.prepare_validate().unwrap();
+
+    fail_nth_shard_spill_guard_count_for_test(1);
+    assert!(spill.count_unique(0, &mut [0; 64]).is_err());
+    assert!(spill.is_poisoned());
+    assert!(spill
+        .build_shard(0, 0, &ListPolicy::publish_uniform(0))
+        .is_err());
+}
+
+#[test]
+fn exact_boundary_truncation_is_not_accepted_as_clean_spill_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+    spill.push("complete.example", 1).unwrap();
+    spill.flush().unwrap();
+
+    // This removes only the final domain record and leaves its preceding
+    // valid bit tag at EOF. A decoder alone can mistake that for clean EOF;
+    // the writer-tracked extent must refuse it first.
+    truncate_final_shard_spill_record_before_validate_for_test();
+    let err = spill
+        .prepare_validate()
+        .expect_err("a complete final record must not disappear at a valid boundary");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(spill.is_poisoned());
+}
+
+#[test]
+fn spill_validation_rejects_malformed_framing_bits_domains_and_routing() {
+    let add_raw = |spill: &mut ShardSpill, idx: usize, raw: &[u8]| match spill {
+        ShardSpill::Disk { writers, .. } => {
+            writers[idx].file.write_all(raw).unwrap();
+            writers[idx].written += raw.len() as u64;
+        }
+        ShardSpill::Memory { .. } => unreachable!("raw framing needs a disk spill"),
+    };
+    let tagged = |bit: u64, domain: &str| {
+        let mut raw = vec![SPILL_BIT_TAG];
+        raw.extend_from_slice(&bit.to_le_bytes());
+        raw.push(domain.len() as u8);
+        raw.extend_from_slice(domain.as_bytes());
+        raw
+    };
+
+    let valid = "valid.example";
+    let cases = [
+        (
+            0,
+            vec![valid.len() as u8]
+                .into_iter()
+                .chain(valid.bytes())
+                .collect(),
+        ),
+        (
+            0,
+            vec![SPILL_BIT_TAG]
+                .into_iter()
+                .chain(0u64.to_le_bytes())
+                .collect(),
+        ),
+        (
+            0,
+            vec![SPILL_BIT_TAG]
+                .into_iter()
+                .chain(3u64.to_le_bytes())
+                .collect(),
+        ),
+        (0, vec![SPILL_BIT_TAG, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xff]),
+        (
+            FilterEngine::shard_index("bad..example"),
+            tagged(1, "bad..example"),
+        ),
+        (
+            (FilterEngine::shard_index(valid) + 1) % DOMAIN_SHARDS,
+            tagged(1, valid),
+        ),
+    ];
+
+    for (idx, raw) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+        add_raw(&mut spill, idx, &raw);
+        spill.flush().unwrap();
+        assert!(
+            spill.prepare_validate().is_err(),
+            "malformed shard was accepted"
+        );
+        assert!(spill.is_poisoned());
+    }
+}
+
+#[test]
+fn memory_spill_validation_checks_records_without_flattening_buckets() {
+    let domain = "memory-validated.example";
+    let idx = FilterEngine::shard_index(domain);
+    let mut spill = ShardSpill::memory();
+    let (ptr, len, capacity) = match &mut spill {
+        ShardSpill::Memory { buckets, .. } => {
+            buckets[idx].push((CompactString::new(domain), 1));
+            (
+                buckets[idx].as_ptr(),
+                buckets[idx].len(),
+                buckets[idx].capacity(),
+            )
+        }
+        ShardSpill::Disk { .. } => unreachable!(),
+    };
+    spill.prepare_validate().unwrap();
+    match &spill {
+        ShardSpill::Memory { buckets, .. } => {
+            assert_eq!(buckets[idx].as_ptr(), ptr);
+            assert_eq!(buckets[idx].len(), len);
+            assert_eq!(buckets[idx].capacity(), capacity);
+        }
+        ShardSpill::Disk { .. } => unreachable!(),
+    }
+
+    let mut malformed = ShardSpill::memory();
+    if let ShardSpill::Memory { buckets, .. } = &mut malformed {
+        buckets[idx].push((CompactString::new(domain), 3));
+    }
+    assert!(malformed.prepare_validate().is_err());
+    assert!(malformed.is_poisoned());
+}
+
+fn domain_for_spill_shard(idx: usize) -> String {
+    domain_for_named_spill_shard(idx, "spill-shard")
+}
+
+fn domain_for_named_spill_shard(idx: usize, name: &str) -> String {
+    (0usize..)
+        .map(|n| format!("{name}-{idx}-{n}.example"))
+        .find(|domain| FilterEngine::shard_index(domain) == idx)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn late_spill_validation_failure_swaps_nothing_or_admits_no_cache_on_hot_or_cold_cycles() {
+    let shard_zero = domain_for_spill_shard(0);
+    let late_idx = DOMAIN_SHARDS - 1;
+    let late = domain_for_spill_shard(late_idx);
+    let candidate = format!("{shard_zero}\n{late}\n");
+
+    let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        tls_ok_response(&candidate, "\"candidate\""),
+    ])
+    .await;
+    assert_eq!(mgr.refresh().await, 1);
+    let hot_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+
+    age_cache_entries(&mut mgr);
+    let hot_cache = mgr.cache.clone();
+    // The first validated record belongs to shard zero. The injected second
+    // read therefore proves a later shard blocks every swap.
+    fail_nth_shard_spill_validation_read_for_test(2);
+    assert_eq!(mgr.refresh().await, 1);
+    assert_eq!(
+        filter.filter_gen_ids(),
+        hot_ids,
+        "a late validation failure swapped a shard"
+    );
+    assert_eq!(
+        mgr.cache, hot_cache,
+        "validation failure admitted candidate cache"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "validation failure committed a candidate manifest"
+    );
+    assert!(filter.list_membership(&late).is_empty());
+    assert!(
+        mgr.installed_corpus_digest.is_none(),
+        "a poisoned spill retained a digest that could authorise reuse"
+    );
+
+    let (mut cold_mgr, cold_filter, cold_cache, _url, _requests) =
+        remote_spill_manager(vec![tls_ok_response(&candidate, "\"candidate\"")]).await;
+    fail_nth_shard_spill_validation_read_for_test(2);
+    assert_eq!(cold_mgr.refresh().await, 0);
+    assert_eq!(cold_filter.filter_gen_ids(), vec![0; DOMAIN_SHARDS]);
+    assert!(
+        cold_mgr.cache.is_empty(),
+        "cold validation failure admitted cache"
+    );
+    assert!(generation_body_paths(
+        cold_cache.path(),
+        &source_to_cache_stem("https://lists.test/spill-storage-failure.txt")
+    )
+    .is_empty());
+}
+
+#[tokio::test]
+async fn late_guard_count_failure_rejects_whole_candidate_before_any_shard_publishes() {
+    let candidates: Vec<String> = (0..DOMAIN_SHARDS).map(domain_for_spill_shard).collect();
+    let candidate = format!("{}\n", candidates.join("\n"));
+
+    let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        tls_ok_response(&candidate, "\"candidate\""),
+    ])
+    .await;
+    assert_eq!(mgr.refresh().await, 1);
+    let hot_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+
+    age_cache_entries(&mut mgr);
+    let hot_cache = mgr.cache.clone();
+    mgr.set_max_total_domains(1_000_000);
+    // The count pass runs only after prepare_validate; 16 is the final
+    // per-shard invocation, so no earlier shard may have published.
+    fail_nth_shard_spill_guard_count_for_test(DOMAIN_SHARDS);
+    assert_eq!(mgr.refresh().await, 1);
+    assert_eq!(filter.filter_gen_ids(), hot_ids);
+    assert!(!filter.list_membership("old.example").is_empty());
+    for domain in &candidates {
+        assert!(
+            filter.list_membership(domain).is_empty(),
+            "{domain} published"
+        );
+    }
+    assert_eq!(
+        mgr.cache, hot_cache,
+        "guard failure admitted candidate cache"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "guard failure committed a candidate manifest"
+    );
+    assert!(
+        mgr.installed_corpus_digest.is_none(),
+        "guard failure retained a digest that could authorise reuse"
+    );
+    let cycle = mgr.status_registry().cycle();
+    assert_eq!(cycle.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(cycle.generation_degraded);
+
+    let (mut cold_mgr, cold_filter, cold_cache, cold_url, _requests) =
+        remote_spill_manager(vec![tls_ok_response(&candidate, "\"candidate\"")]).await;
+    cold_mgr.set_max_total_domains(1_000_000);
+    fail_nth_shard_spill_guard_count_for_test(DOMAIN_SHARDS);
+    assert_eq!(cold_mgr.refresh().await, 0);
+    assert_eq!(cold_filter.filter_gen_ids(), vec![0; DOMAIN_SHARDS]);
+    for domain in &candidates {
+        assert!(
+            cold_filter.list_membership(domain).is_empty(),
+            "{domain} published"
+        );
+    }
+    assert!(
+        cold_mgr.cache.is_empty(),
+        "cold guard failure admitted cache"
+    );
+    assert!(cold_mgr.installed_corpus_digest.is_none());
+    let cold_stem = source_to_cache_stem(&cold_url);
+    assert!(!cold_cache.path().join(format!("{cold_stem}.meta")).exists());
+    assert!(generation_body_paths(cold_cache.path(), &cold_stem).is_empty());
+    let cycle = cold_mgr.status_registry().cycle();
+    assert_eq!(cycle.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(cycle.generation_degraded);
+}
+
+#[tokio::test]
+async fn spill_validation_refuses_when_max_total_domains_is_disabled() {
+    let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        tls_ok_response("candidate.example\n", "\"candidate\""),
+    ])
+    .await;
+    assert_eq!(mgr.refresh().await, 1);
+    let hot_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+
+    mgr.set_max_total_domains(0);
+    age_cache_entries(&mut mgr);
+    let hot_cache = mgr.cache.clone();
+    fail_nth_shard_spill_validation_read_for_test(1);
+    assert_eq!(mgr.refresh().await, 1);
+    assert_eq!(filter.filter_gen_ids(), hot_ids);
+    assert_eq!(mgr.cache, hot_cache, "disabled ceiling bypassed validation");
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest
+    );
+    assert!(filter.list_membership("candidate.example").is_empty());
+}
+
+#[test]
+fn rollback_truncate_and_seek_failures_latch_spill_poison() {
+    for fail in [
+        fail_nth_shard_spill_rollback_truncate_for_test as fn(usize),
+        fail_nth_shard_spill_rollback_seek_for_test as fn(usize),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
+        let mark = spill.mark();
+        spill.push("candidate.example", 1).unwrap();
+        fail(1);
+
+        assert!(spill
+            .rollback(&mark, SpillRollbackSite::DirectTest)
+            .is_err());
+        assert!(
+            spill.is_poisoned(),
+            "rollback storage failure must latch poison"
+        );
+        assert!(spill.flush().is_err());
+        assert!(spill.count_unique(0, &mut [0; 64]).is_err());
+        assert!(spill
+            .build_shard(0, 0, &ListPolicy::publish_uniform(0))
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn disk_spill_dir_failure_keeps_hot_generation_and_cache_unchanged() {
+    let (origin, pem, requests) =
+        spawn_tls_origin_responses(vec![tls_ok_response("old.example\n", "\"old\"")]).await;
+    let url = "https://lists.test/spill-hot.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let filter = Arc::new(FilterEngine::new());
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        filter.clone(),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    let now = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    assert_eq!(mgr.refresh_at(now).await, 1);
+    let hot_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+    let body = selected_cache_body_path(cache_dir.path(), &url).unwrap();
+
+    age_cache_entries(&mut mgr);
+    let hot_cache = mgr.cache.clone();
+    fail_next_shard_spill_dir_create_for_test();
+
+    assert_eq!(mgr.refresh_at(now + time::Duration::hours(2)).await, 1);
+    assert_eq!(filter.filter_gen_ids(), hot_ids, "no hot shard may publish");
+    assert_eq!(
+        mgr.cache, hot_cache,
+        "setup failure must not admit cache data"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "setup failure must not commit a cache manifest"
+    );
+    assert!(body.is_file(), "the retained cache generation must survive");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "setup failure must stop before fetching sources"
+    );
+}
+
+#[tokio::test]
+async fn disk_spill_file_failure_leaves_cold_start_empty() {
+    let (origin, pem, requests) = spawn_tls_origin_responses(vec![tls_ok_response(
+        "candidate.example\n",
+        "\"candidate\"",
+    )])
+    .await;
+    let url = "https://lists.test/spill-cold.txt".to_string();
+    let stem = source_to_cache_stem(&url);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let filter = Arc::new(FilterEngine::new());
+    let mut mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        filter.clone(),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+
+    fail_nth_shard_spill_file_create_for_test(3);
+
+    assert_eq!(mgr.refresh().await, 0);
+    assert_eq!(filter.domain_count(), 0, "cold start must stay empty");
+    assert_eq!(
+        filter.filter_gen_ids(),
+        vec![0; DOMAIN_SHARDS],
+        "cold shards must remain unpublished"
+    );
+    assert!(
+        mgr.cache.is_empty(),
+        "setup failure must not admit a cache body"
+    );
+    assert!(!cache_dir.path().join(format!("{stem}.meta")).exists());
+    assert!(generation_body_paths(cache_dir.path(), &stem).is_empty());
+    assert!(
+        !cache_dir.path().join(SHARD_SPILL_DIR).exists(),
+        "a failed setup must not leave a partial spill"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        0,
+        "cold setup failure must stop before fetching sources"
+    );
+    let cycle = mgr.status_registry.cycle();
+    assert_eq!(cycle.seq, 1, "one failed attempt publishes once");
+    assert_eq!(cycle.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(cycle.source_coverage_incomplete);
+    assert!(cycle.generation_degraded);
+    assert_eq!(cycle.served_state, ServedState::Uninitialized);
+}
+
+async fn remote_spill_manager(
+    responses: Vec<String>,
+) -> (
+    ListManager,
+    Arc<FilterEngine>,
+    tempfile::TempDir,
+    String,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (origin, pem, requests) = spawn_tls_origin_responses(responses).await;
+    let url = "https://lists.test/spill-storage-failure.txt".to_string();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let filter = Arc::new(FilterEngine::new());
+    let mgr = ListManager::new(
+        reqwest::Client::builder()
+            .resolve("lists.test", origin)
+            .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).unwrap())
+            .build()
+            .unwrap(),
+        filter.clone(),
+        vec![url.clone()],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(std::slice::from_ref(&url)).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(cache_dir.path().to_path_buf()),
+    );
+    (mgr, filter, cache_dir, url, requests)
+}
+
+#[tokio::test]
+async fn spill_write_failure_preserves_hot_generation_and_refuses_candidate_cache() {
+    let (mut mgr, filter, cache_dir, url, requests) = remote_spill_manager(vec![
+        tls_ok_response("old.example\n", "\"old\""),
+        tls_ok_response("candidate.example\n", "\"candidate\""),
+    ])
+    .await;
+    let now = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+    assert_eq!(mgr.refresh_at(now).await, 1);
+    let hot_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+
+    age_cache_entries(&mut mgr);
+    let hot_cache = mgr.cache.clone();
+    fail_nth_shard_spill_write_for_test(1);
+
+    assert_eq!(mgr.refresh_at(now + time::Duration::hours(2)).await, 1);
+    assert_eq!(filter.filter_gen_ids(), hot_ids, "no hot shard may publish");
+    assert_eq!(
+        mgr.cache, hot_cache,
+        "write failure admitted candidate cache"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "write failure committed a candidate manifest"
+    );
+    assert!(filter.list_membership("candidate.example").is_empty());
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn spill_write_failure_leaves_cold_generation_and_cache_empty() {
+    let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![tls_ok_response(
+        "candidate.example\n",
+        "\"candidate\"",
+    )])
+    .await;
+    let stem = source_to_cache_stem(&url);
+    fail_nth_shard_spill_write_for_test(1);
+
+    assert_eq!(mgr.refresh().await, 0);
+    assert_eq!(filter.filter_gen_ids(), vec![0; DOMAIN_SHARDS]);
+    assert!(
+        mgr.cache.is_empty(),
+        "write failure admitted candidate cache"
+    );
+    assert!(!cache_dir.path().join(format!("{stem}.meta")).exists());
+    assert!(generation_body_paths(cache_dir.path(), &stem).is_empty());
+}
+
+#[tokio::test]
+async fn spill_flush_and_sync_failures_preserve_hot_generation_and_cache() {
+    for fail in [
+        fail_nth_shard_spill_flush_for_test as fn(usize),
+        fail_nth_shard_spill_sync_for_test as fn(usize),
+    ] {
+        let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![
+            tls_ok_response("old.example\n", "\"old\""),
+            tls_ok_response("candidate.example\n", "\"candidate\""),
+        ])
+        .await;
+        let now = time::macros::datetime!(2026-09-05 12:00:00 UTC);
+        assert_eq!(mgr.refresh_at(now).await, 1);
+        let hot_ids = filter.filter_gen_ids();
+        let stem = source_to_cache_stem(&url);
+        let manifest =
+            std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+
+        age_cache_entries(&mut mgr);
+        let hot_cache = mgr.cache.clone();
+        fail(1);
+
+        assert_eq!(mgr.refresh_at(now + time::Duration::hours(2)).await, 1);
+        assert_eq!(filter.filter_gen_ids(), hot_ids, "no hot shard may publish");
+        assert_eq!(
+            mgr.cache, hot_cache,
+            "storage failure admitted candidate cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+            manifest,
+            "storage failure committed a candidate manifest"
+        );
+        assert!(filter.list_membership("candidate.example").is_empty());
+    }
 }
 
 // ── The global corpus guard, driven through `refresh()` ───────────
@@ -4337,8 +10397,8 @@ fn guard_manager(bodies: &[&str], on_disk: bool) -> (ListManager, tempfile::Temp
             display_name: name.clone(),
             url: url.clone(),
             format: Default::default(),
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base: crate::config::schema::BlocklistBase::Deny,
@@ -4374,16 +10434,14 @@ fn rewrite_body(dir: &tempfile::TempDir, i: usize, body: &str) {
     std::fs::write(dir.path().join("lists").join(format!("src{i}.txt")), body).unwrap();
 }
 
-/// Drop the in-memory body cache so the next cycle re-reads the bridge.
+/// Drop the in-memory cache so the next cycle re-reads the bridge.
 ///
 /// Needed only on the `cache_dir: None` (memory-spill) arm, and it is
-/// not a contrivance: with a cache dir the manager keeps **no**
-/// in-memory `cache` entry at all (bodies go to disk), so the freshness
-/// shortcut never fires and every cycle re-downloads. Without one the
-/// body is retained in memory and `MIN_REFRESH_INTERVAL` (60 s, clamped
-/// in `new`) makes it fresh, so a second cycle in the same test second
-/// would silently re-parse the *old* corpus and take the `unchanged`
-/// path. Calling this on both arms keeps them symmetric.
+/// not a contrivance: with a cache dir bodies are not retained in memory.
+/// Without one the body is retained and `MIN_REFRESH_INTERVAL` (60 s,
+/// clamped in `new`) makes it fresh, so a second cycle in the same test
+/// second would silently re-parse the old corpus. Calling this on both
+/// arms keeps them symmetric.
 fn expire_bodies(mgr: &mut ListManager) {
     mgr.cache.clear();
 }
@@ -4611,7 +10669,680 @@ fn age_cache_entries(mgr: &mut ListManager) {
     }
 }
 
-/// A source whose fresh body is refused by the per-list entry cap keeps
+#[tokio::test]
+async fn a_nonempty_refused_allow_candidate_never_reaches_the_next_generation() {
+    const DENY_FIRST: &str = "protected.example\nother-protected.example\nold-unrelated.example\n";
+    const DENY_SECOND: &str = "protected.example\nother-protected.example\nnew-unrelated.example\n";
+    let retained_allow: String = (0..11)
+        .map(|i| format!("retained-allow-{i}.example\n"))
+        .collect();
+
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(&[DENY_FIRST, &retained_allow], on_disk);
+        mgr.set_list_policy(PolicyMasks {
+            base: ProfileMasks {
+                allow: 1 << 1,
+                block: 1,
+            },
+            per_profile: Default::default(),
+        });
+
+        assert_eq!(mgr.refresh().await, 14, "on_disk={on_disk}");
+
+        // Source zero changes independently, so this cycle must install.
+        rewrite_body(&dir, 0, DENY_SECOND);
+        rewrite_body(&dir, 1, "protected.example\n");
+        age_cache_entries(&mut mgr);
+
+        assert_eq!(mgr.refresh().await, 14, "on_disk={on_disk}");
+        assert_eq!(mgr.rebuild_count, 2, "on_disk={on_disk}");
+        assert_ne!(
+            mgr.filter
+                .list_membership("new-unrelated.example")
+                .block_mask,
+            0,
+            "the unrelated source change was not installed (on_disk={on_disk})"
+        );
+        let protected = mgr.filter.list_membership("protected.example");
+        assert_ne!(protected.block_mask, 0, "on_disk={on_disk}");
+        assert_eq!(
+            protected.allow_mask, 0,
+            "the refused allow candidate unblocked a deny-list domain (on_disk={on_disk})"
+        );
+        assert_ne!(
+            mgr.filter
+                .list_membership("retained-allow-0.example")
+                .allow_mask,
+            0,
+            "the retained allow body was not restored (on_disk={on_disk})"
+        );
+        assert!(matches!(
+            mgr.status_registry
+                .status_for_url("https://imported.local/src1.txt")
+                .unwrap()
+                .last_outcome,
+            crate::lists::status::LastOutcome::Failed { .. }
+        ));
+        let digest_after_refusal = mgr
+            .installed_corpus_digest
+            .expect("the retained corpus installed without a digest");
+
+        if !on_disk {
+            assert_eq!(
+                mgr.cache
+                    .get("https://imported.local/src1.txt")
+                    .and_then(|entry| entry.body.as_deref()),
+                Some(retained_allow.as_str()),
+                "the memory-only fallback lost its retained body"
+            );
+        }
+
+        // Changing only a refused candidate cannot change the installed digest.
+        rewrite_body(&dir, 1, "other-protected.example\n");
+        age_cache_entries(&mut mgr);
+
+        assert_eq!(mgr.refresh().await, 14, "on_disk={on_disk}");
+        assert_eq!(
+            mgr.rebuild_count, 2,
+            "a refused candidate changed the installed digest (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.installed_corpus_digest,
+            Some(digest_after_refusal),
+            "the digest includes a refused candidate (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.filter
+                .list_membership("other-protected.example")
+                .allow_mask,
+            0,
+            "the next refused allow candidate reached the map (on_disk={on_disk})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_parse_rollback_failure_keeps_all_cycle_records_out_of_the_map() {
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(
+            &["old-a.example\n", "old-b-one.example\nold-b-two.example\n"],
+            on_disk,
+        );
+        mgr.max_entries = 2;
+        assert_eq!(mgr.refresh().await, 3, "on_disk={on_disk}");
+
+        rewrite_body(&dir, 0, "old-a.example\nnew-a.example\n");
+        rewrite_body(
+            &dir,
+            1,
+            "candidate-b-one.example\ncandidate-b-two.example\ncandidate-b-three.example\n",
+        );
+        age_cache_entries(&mut mgr);
+        fail_shard_spill_rollback_at_for_test(SpillRollbackSite::FreshParse);
+
+        assert_eq!(mgr.refresh().await, 3, "on_disk={on_disk}");
+        for domain in ["old-a.example", "old-b-one.example", "old-b-two.example"] {
+            assert!(
+                !mgr.filter.list_membership(domain).is_empty(),
+                "{domain} was removed (on_disk={on_disk})"
+            );
+        }
+        for domain in [
+            "new-a.example",
+            "candidate-b-one.example",
+            "candidate-b-two.example",
+            "candidate-b-three.example",
+        ] {
+            assert!(
+                mgr.filter.list_membership(domain).is_empty(),
+                "{domain} leaked from a poisoned spill (on_disk={on_disk})"
+            );
+        }
+        assert!(
+            mgr.installed_corpus_digest.is_none(),
+            "a poisoned spill must not publish a digest (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed),
+            "the cycle must not report Installed (on_disk={on_disk})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rollback_truncate_and_seek_failures_poison_the_hot_cycle() {
+    for fail in [
+        fail_nth_shard_spill_rollback_truncate_for_test as fn(usize),
+        fail_nth_shard_spill_rollback_seek_for_test as fn(usize),
+    ] {
+        let (mut mgr, dir) = guard_manager(
+            &["old-a.example\n", "old-b-one.example\nold-b-two.example\n"],
+            true,
+        );
+        mgr.max_entries = 2;
+        assert_eq!(mgr.refresh().await, 3);
+        let hot_ids = mgr.filter.filter_gen_ids();
+
+        rewrite_body(&dir, 0, "old-a.example\nnew-a.example\n");
+        rewrite_body(
+            &dir,
+            1,
+            "candidate-b-one.example\ncandidate-b-two.example\ncandidate-b-three.example\n",
+        );
+        age_cache_entries(&mut mgr);
+        fail(1);
+
+        assert_eq!(mgr.refresh().await, 3);
+        assert_eq!(
+            mgr.filter.filter_gen_ids(),
+            hot_ids,
+            "rollback storage failure swapped a hot shard"
+        );
+        assert!(mgr.filter.list_membership("new-a.example").is_empty());
+        assert!(mgr
+            .filter
+            .list_membership("candidate-b-one.example")
+            .is_empty());
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed)
+        );
+        assert!(mgr.status_registry.cycle().generation_degraded);
+    }
+}
+
+#[tokio::test]
+async fn a_retained_body_parse_rollback_failure_keeps_all_cycle_records_out_of_the_map() {
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(
+            &[
+                "old-a.example\n",
+                "old-b-one.example\nold-b-two.example\nold-b-three.example\n",
+            ],
+            on_disk,
+        );
+        mgr.max_entries = 3;
+        assert_eq!(mgr.refresh().await, 4, "on_disk={on_disk}");
+
+        mgr.max_entries = 2;
+        mgr.set_shrink_guard(true, 49);
+        rewrite_body(&dir, 0, "old-a.example\nnew-a.example\n");
+        rewrite_body(&dir, 1, "candidate-b.example\n");
+        age_cache_entries(&mut mgr);
+        // The retained body trips the lower cap after guard fallback.
+        // Target that rollback directly; unrelated rollback order must not matter.
+        fail_shard_spill_rollback_at_for_test(SpillRollbackSite::RetainedParse);
+
+        assert_eq!(mgr.refresh().await, 4, "on_disk={on_disk}");
+        for domain in [
+            "old-a.example",
+            "old-b-one.example",
+            "old-b-two.example",
+            "old-b-three.example",
+        ] {
+            assert!(
+                !mgr.filter.list_membership(domain).is_empty(),
+                "{domain} was removed (on_disk={on_disk})"
+            );
+        }
+        for domain in ["new-a.example", "candidate-b.example"] {
+            assert!(
+                mgr.filter.list_membership(domain).is_empty(),
+                "{domain} leaked from a poisoned spill (on_disk={on_disk})"
+            );
+        }
+        assert!(
+            mgr.installed_corpus_digest.is_none(),
+            "a poisoned spill must not publish a digest (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed),
+            "the cycle must not report Installed (on_disk={on_disk})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_candidate_rollback_failure_keeps_all_cycle_records_out_of_the_map() {
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(
+            &[
+                "old-a.example\n",
+                "old-b-one.example\nold-b-two.example\nold-b-three.example\n",
+            ],
+            on_disk,
+        );
+        assert_eq!(mgr.refresh().await, 4, "on_disk={on_disk}");
+
+        mgr.set_shrink_guard(true, 50);
+        rewrite_body(&dir, 0, "old-a.example\nnew-a.example\n");
+        rewrite_body(&dir, 1, "candidate-b.example\n");
+        age_cache_entries(&mut mgr);
+        fail_shard_spill_rollback_at_for_test(SpillRollbackSite::FreshRetentionGuard);
+
+        assert_eq!(mgr.refresh().await, 4, "on_disk={on_disk}");
+        for domain in [
+            "old-a.example",
+            "old-b-one.example",
+            "old-b-two.example",
+            "old-b-three.example",
+        ] {
+            assert!(
+                !mgr.filter.list_membership(domain).is_empty(),
+                "{domain} was removed (on_disk={on_disk})"
+            );
+        }
+        for domain in ["new-a.example", "candidate-b.example"] {
+            assert!(
+                mgr.filter.list_membership(domain).is_empty(),
+                "{domain} leaked from a poisoned spill (on_disk={on_disk})"
+            );
+        }
+        assert!(
+            mgr.installed_corpus_digest.is_none(),
+            "a poisoned spill must not publish a digest (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed),
+            "the cycle must not report Installed (on_disk={on_disk})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_empty_spill_replaces_the_live_generation() {
+    let (mut mgr, dir) = guard_manager(&["old-a.example\nold-b.example\n"], true);
+    assert_eq!(mgr.refresh().await, 2);
+    let before = mgr.filter.filter_gen_ids();
+    mgr.set_shrink_guard(false, 0);
+    rewrite_body(&dir, 0, "");
+    age_cache_entries(&mut mgr);
+
+    assert_eq!(mgr.refresh().await, 0);
+    let mark = mgr.status_registry().consistent_snapshot().cycle;
+    assert_eq!(mark.outcome, Some(CycleOutcome::Installed));
+    assert!(!mark.generation_degraded);
+    assert_eq!(mark.served_state, ServedState::IntentionalEmpty);
+    let row = mgr
+        .status_registry()
+        .status_for_url("https://imported.local/src0.txt")
+        .unwrap();
+    assert_eq!(row.entries, 0, "the row must describe the empty generation");
+    assert!(
+        mgr.filter.list_membership("old-a.example").is_empty(),
+        "an accepted empty source must clear the hot corpus"
+    );
+    let after = mgr.filter.filter_gen_ids();
+    assert!(after.iter().all(|&id| id != 0));
+    assert!(after.iter().all(|&id| id == after[0]));
+    assert_ne!(after, before, "the empty replacement must publish");
+}
+
+#[tokio::test]
+async fn complete_empty_cold_install_is_not_an_uninitialized_corpus() {
+    let (mut mgr, _urls, _dir) = spill_manager(&[""]);
+
+    assert_eq!(mgr.refresh().await, 0);
+    let mark = mgr.status_registry().cycle();
+    assert_eq!(mark.outcome, Some(CycleOutcome::Installed));
+    assert_eq!(mark.served_state, ServedState::IntentionalEmpty);
+    assert!(!mark.source_coverage_incomplete);
+    assert!(!mark.generation_degraded);
+}
+
+#[tokio::test]
+async fn comments_only_corpus_installs_an_empty_ready_generation() {
+    let (mut mgr, _urls, _dir) = spill_manager(&["# no domains\n! comment\n"]);
+    let gate = ReadinessGate::new(false);
+    mgr.set_filter_ready_gate(gate.clone());
+
+    assert_eq!(mgr.refresh().await, 0);
+    assert_eq!(
+        mgr.status_registry().cycle().served_state,
+        ServedState::IntentionalEmpty
+    );
+    assert!(
+        gate.is_open(),
+        "an accepted empty generation is ready to serve"
+    );
+}
+
+#[tokio::test]
+async fn repeated_empty_corpus_skips_the_unchanged_rebuild() {
+    let (mut mgr, _urls, _dir) = spill_manager(&[""]);
+
+    assert_eq!(mgr.refresh().await, 0);
+    let first_ids = mgr.filter.filter_gen_ids();
+    assert_eq!(mgr.refresh().await, 0);
+
+    let mark = mgr.status_registry().cycle();
+    assert_eq!(mark.outcome, Some(CycleOutcome::SkippedUnchanged));
+    assert_eq!(mark.served_state, ServedState::IntentionalEmpty);
+    assert_eq!(mgr.filter.filter_gen_ids(), first_ids);
+}
+
+#[tokio::test]
+async fn spill_flush_failure_keeps_prior_counts_and_never_reports_installed() {
+    let (mut mgr, dir) = guard_manager(&["old-a.example\nold-b.example\n"], true);
+    assert_eq!(mgr.refresh().await, 2);
+    rewrite_body(&dir, 0, "old-a.example\nold-b.example\nnew.example\n");
+    age_cache_entries(&mut mgr);
+    fail_nth_shard_spill_flush_for_test(1);
+
+    assert_eq!(mgr.refresh().await, 2);
+    let mark = mgr.status_registry().consistent_snapshot().cycle;
+    assert_eq!(mark.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(mark.generation_degraded);
+    let row = mgr
+        .status_registry()
+        .status_for_url("https://imported.local/src0.txt")
+        .unwrap();
+    assert_eq!(
+        row.entries, 2,
+        "flush failure must retain live contribution counts"
+    );
+    assert!(mgr.filter.list_membership("new.example").is_empty());
+}
+
+#[tokio::test]
+async fn disk_shard_build_retries_at_first_middle_and_last_positions() {
+    let domains: Vec<String> = (0..DOMAIN_SHARDS).map(domain_for_spill_shard).collect();
+    let body = format!("{}\n", domains.join("\n"));
+
+    for failure_at in [1, 8, DOMAIN_SHARDS] {
+        let (mut mgr, _dir) = guard_manager(&[&body], true);
+        fail_nth_shard_build_for_test(failure_at);
+
+        assert_eq!(
+            mgr.refresh().await,
+            DOMAIN_SHARDS,
+            "failure_at={failure_at}"
+        );
+        let ids = mgr.filter.filter_gen_ids();
+        assert!(ids.iter().all(|&id| id != 0), "failure_at={failure_at}");
+        assert!(
+            ids.iter().all(|&id| id == ids[0]),
+            "retry left a hybrid generation at build {failure_at}"
+        );
+        for domain in &domains {
+            assert!(
+                !mgr.filter.list_membership(domain).is_empty(),
+                "{domain} missing after retry at build {failure_at}"
+            );
+        }
+        let row = mgr
+            .status_registry()
+            .status_for_url("https://imported.local/src0.txt")
+            .unwrap();
+        assert_eq!(row.entries, DOMAIN_SHARDS as u64, "failure_at={failure_at}");
+        assert_eq!(
+            row.unique_domains, DOMAIN_SHARDS as u64,
+            "failure_at={failure_at}"
+        );
+        let cycle = mgr.status_registry().cycle();
+        assert_eq!(cycle.outcome, Some(CycleOutcome::Installed));
+        assert!(!cycle.generation_degraded);
+    }
+}
+
+#[tokio::test]
+async fn memory_shard_build_replays_a_borrowed_bucket() {
+    let domains: Vec<String> = (0..DOMAIN_SHARDS).map(domain_for_spill_shard).collect();
+    let body = format!("{}\n", domains.join("\n"));
+    let (mut mgr, _dir) = guard_manager(&[&body], false);
+    fail_nth_shard_build_for_test(8);
+
+    assert_eq!(mgr.refresh().await, DOMAIN_SHARDS);
+    let ids = mgr.filter.filter_gen_ids();
+    assert!(ids.iter().all(|&id| id != 0));
+    assert!(ids.iter().all(|&id| id == ids[0]));
+    for domain in &domains {
+        assert!(
+            !mgr.filter.list_membership(domain).is_empty(),
+            "{domain} missing"
+        );
+    }
+    let row = mgr
+        .status_registry()
+        .status_for_url("https://imported.local/src0.txt")
+        .unwrap();
+    assert_eq!(row.entries, DOMAIN_SHARDS as u64);
+    assert_eq!(row.unique_domains, DOMAIN_SHARDS as u64);
+}
+
+#[tokio::test]
+async fn persistent_shard_build_failure_keeps_only_that_old_shard_and_candidate_cache_out() {
+    let old: Vec<String> = (0..DOMAIN_SHARDS)
+        .map(|idx| domain_for_named_spill_shard(idx, "old"))
+        .collect();
+    let candidate: Vec<String> = (0..DOMAIN_SHARDS)
+        .map(|idx| domain_for_named_spill_shard(idx, "candidate"))
+        .collect();
+    let old_body = format!("{}\n", old.join("\n"));
+    let candidate_body = format!("{}\n", candidate.join("\n"));
+    let (mut mgr, filter, cache_dir, url, _requests) = remote_spill_manager(vec![
+        tls_ok_response(&old_body, "\"old\""),
+        tls_ok_response(&candidate_body, "\"candidate\""),
+        tls_ok_response(&candidate_body, "\"candidate\""),
+    ])
+    .await;
+
+    assert_eq!(mgr.refresh().await, DOMAIN_SHARDS);
+    let before_ids = filter.filter_gen_ids();
+    let stem = source_to_cache_stem(&url);
+    let manifest = std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap();
+    let bodies = generation_body_paths(cache_dir.path(), &stem);
+
+    mgr.set_list_policy(PolicyMasks {
+        base: ProfileMasks { allow: 1, block: 0 },
+        per_profile: Default::default(),
+    });
+    age_cache_entries(&mut mgr);
+    let cache = mgr.cache.clone();
+    let failed_idx = 7;
+    fail_nth_shard_builds_for_test(failed_idx + 1, 2);
+
+    assert_eq!(mgr.refresh().await, DOMAIN_SHARDS);
+    let after_ids = filter.filter_gen_ids();
+    for idx in 0..DOMAIN_SHARDS {
+        if idx == failed_idx {
+            assert_eq!(after_ids[idx], before_ids[idx], "failed shard changed");
+        } else {
+            assert_ne!(
+                after_ids[idx], before_ids[idx],
+                "shard {idx} did not publish"
+            );
+            let membership = filter.list_membership(&candidate[idx]);
+            assert_eq!(
+                membership.allow_mask, 1,
+                "shard {idx} lost its policy pairing"
+            );
+            assert_eq!(membership.block_mask, 0, "shard {idx} used its old policy");
+        }
+    }
+    assert_eq!(
+        filter.list_membership(&old[failed_idx]).block_mask,
+        1,
+        "the failed shard did not retain its old policy and domain"
+    );
+    assert!(filter.list_membership(&candidate[failed_idx]).is_empty());
+    let cycle = mgr.status_registry().cycle();
+    assert_eq!(cycle.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    assert!(cycle.generation_degraded);
+    assert_eq!(cycle.served_state, ServedState::Partial);
+    assert_eq!(
+        mgr.status_registry().status_for_url(&url).unwrap().entries,
+        DOMAIN_SHARDS as u64,
+        "the partial cycle must keep reporting the old complete source contribution"
+    );
+    assert!(mgr.installed_corpus_digest.is_none());
+    assert_eq!(
+        mgr.cache, cache,
+        "persistent failure admitted candidate cache"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "persistent failure committed a candidate manifest"
+    );
+    assert_eq!(generation_body_paths(cache_dir.path(), &stem), bodies);
+
+    age_cache_entries(&mut mgr);
+    assert_eq!(
+        mgr.refresh().await,
+        DOMAIN_SHARDS,
+        "manager did not recover"
+    );
+    let recovered_ids = mgr.filter.filter_gen_ids();
+    assert!(recovered_ids.iter().all(|&id| id != 0));
+    assert!(recovered_ids.iter().all(|&id| id == recovered_ids[0]));
+    for domain in &candidate {
+        let membership = mgr.filter.list_membership(domain);
+        assert_eq!(
+            membership.allow_mask, 1,
+            "{domain} did not recover as allow"
+        );
+        assert_eq!(
+            membership.block_mask, 0,
+            "{domain} recovered with an old policy"
+        );
+    }
+    for domain in &old {
+        assert!(
+            mgr.filter.list_membership(domain).is_empty(),
+            "{domain} survived recovery"
+        );
+    }
+    let recovered = mgr.status_registry().cycle();
+    assert_eq!(recovered.served_state, ServedState::Complete);
+    assert!(!recovered.generation_degraded);
+    assert!(mgr.installed_corpus_digest.is_some());
+    assert_ne!(
+        mgr.cache, cache,
+        "recovery did not admit its candidate cache"
+    );
+    assert_ne!(
+        std::fs::read_to_string(cache_dir.path().join(format!("{stem}.meta"))).unwrap(),
+        manifest,
+        "recovery did not commit its candidate manifest"
+    );
+}
+
+/// A degraded cycle must retry on the bounded recovery cadence, then return
+/// to the configured cadence once that retry builds a complete generation.
+///
+/// The first cycle deterministically loses its imported-local body. This is a
+/// real degraded input path that crosses the blocking worker boundary; direct
+/// refresh tests retain the thread-local shard-build fault coverage.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn degraded_refresh_retries_at_the_bounded_deadline_then_recovers_normal_cadence() {
+    let domains: Vec<String> = (0..DOMAIN_SHARDS).map(domain_for_spill_shard).collect();
+    let body = format!("{}\n", domains.join("\n"));
+    let (mut mgr, dir) = guard_manager(&[&body], true);
+    let configured = Duration::from_secs(10 * 60);
+    mgr.refresh_interval = configured;
+    let registry = mgr.status_registry();
+
+    let body_path = dir.path().join("lists/src0.txt");
+    std::fs::remove_file(&body_path).unwrap();
+    let loop_handle = mgr.spawn_refresh_loop();
+
+    wait_for_cycle_seq(&registry, 1).await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "the first ticker tick is immediate"
+    );
+    assert!(
+        registry.cycle().generation_degraded,
+        "the missing imported-local body must degrade the first cycle"
+    );
+
+    std::fs::write(&body_path, &body).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(5 * 60 - 1)).await;
+    wait_for_cycle_seq(&registry, 1).await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "a degraded cycle retried before its bounded five-minute deadline"
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_for_cycle_seq(&registry, 2).await;
+    assert_eq!(
+        registry.cycle().seq,
+        2,
+        "the recovery deadline did not tick"
+    );
+    assert!(
+        !registry.cycle().generation_degraded,
+        "the retry must recover once the one-shot build failure is consumed"
+    );
+
+    tokio::time::sleep(configured - Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        registry.cycle().seq,
+        2,
+        "a clean recovery retained the bounded retry cadence"
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_for_cycle_seq(&registry, 3).await;
+    assert_eq!(
+        registry.cycle().seq,
+        3,
+        "the configured cadence was not anchored from the recovery tick"
+    );
+    loop_handle.retire().await.unwrap();
+}
+
+/// The recovery shortcut is only for degraded cycles. A clean first cycle
+/// must not wake at five minutes when its configured cadence is longer.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn clean_refresh_keeps_the_configured_cadence_not_the_recovery_deadline() {
+    let domains: Vec<String> = (0..DOMAIN_SHARDS).map(domain_for_spill_shard).collect();
+    let body = format!("{}\n", domains.join("\n"));
+    let (mut mgr, _dir) = guard_manager(&[&body], true);
+    let configured = Duration::from_secs(10 * 60);
+    mgr.refresh_interval = configured;
+    let registry = mgr.status_registry();
+    let loop_handle = mgr.spawn_refresh_loop();
+
+    wait_for_cycle_seq(&registry, 1).await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "the first ticker tick is immediate"
+    );
+    assert!(
+        !registry.cycle().generation_degraded,
+        "fixture precondition: the first cycle must be clean"
+    );
+
+    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        registry.cycle().seq,
+        1,
+        "a clean cycle incorrectly retried at the five-minute recovery deadline"
+    );
+
+    tokio::time::sleep(configured - Duration::from_secs(5 * 60)).await;
+    wait_for_cycle_seq(&registry, 2).await;
+    assert_eq!(
+        registry.cycle().seq,
+        2,
+        "a clean cycle did not retain the configured refresh cadence"
+    );
+    loop_handle.retire().await.unwrap();
+}
+
+/// A source whose fresh body is refused by the global entry cap keeps
 /// filtering with the body it last ingested, instead of vanishing from
 /// the corpus this cycle installs.
 ///
@@ -4629,6 +11360,191 @@ fn age_cache_entries(mgr: &mut ListManager) {
 /// refused wholesale and left the previous generation standing — that is
 /// a different mechanism with the same symptom, and it is what
 /// [`refresh_refuses_the_cycle_and_keeps_the_previous_generation`] pins.
+#[tokio::test]
+async fn cap_refusal_reports_overshoot_advances_retry_state_once_and_recovers() {
+    const FIRST: &str = "one.example\ntwo.example\nthree.example\n";
+    const LAST_GOOD: &str = "one.example\ntwo.example\nthree.example\nfour.example\n";
+    const OVERSIZED: &str = "one.example\ntwo.example\nthree.example\nfour.example\nfive.example\n";
+    const CAP: usize = 4;
+
+    let (mut mgr, dir) = guard_manager(&[FIRST], true);
+    let source = "https://imported.local/src0.txt";
+    let blocklist_id = crate::config::schema::Id::new("cap-retry").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(
+        source.to_string(),
+        (blocklist_id.clone(), 2),
+    )]));
+    mgr.max_entries = CAP;
+
+    assert_eq!(mgr.refresh().await, 3);
+    rewrite_body(&dir, 0, LAST_GOOD);
+    assert_eq!(mgr.refresh().await, 4);
+    let last_good = mgr.status_registry.status_for_url(source).unwrap();
+    assert_eq!(last_good.entries, 4);
+    assert_eq!(last_good.unique_domains, 4);
+    assert_eq!(last_good.prev_entries, Some(3));
+    let last_refresh_at = last_good.last_refresh_at;
+
+    // Reset only after the last successful cache write. The next failure
+    // must stamp its accepted retained-cache path itself.
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+
+    rewrite_body(&dir, 0, OVERSIZED);
+    assert_eq!(
+        mgr.refresh().await,
+        4,
+        "the retained body must keep filtering"
+    );
+
+    let refused = mgr.status_registry.status_for_url(source).unwrap();
+    match &refused.last_outcome {
+        crate::lists::status::LastOutcome::Failed { reason } => assert_eq!(
+            reason,
+            &crate::lists::status::format_blocklist_truncation_refused(CAP, 1)
+        ),
+        other => panic!("expected cap refusal, got {other:?}"),
+    }
+    assert_eq!(refused.entries, 4, "last-good entries survive refusal");
+    assert_eq!(
+        refused.unique_domains, 4,
+        "last-good unique count survives refusal"
+    );
+    assert_eq!(refused.prev_entries, Some(3));
+    assert_eq!(refused.last_refresh_at, last_refresh_at);
+    assert_eq!(refused.parsed_truncated, 1, "five against four is one over");
+
+    // `parsed_truncated` means the last uncleared cap-refusal overshoot,
+    // not necessarily the most recent attempt. A generic fetch failure uses
+    // the retained body and must leave that diagnostic intact.
+    let bridge_body = dir.path().join("lists/src0.txt");
+    std::fs::remove_file(&bridge_body).unwrap();
+    assert_eq!(mgr.refresh().await, 4);
+    let generic_failure = mgr.status_registry.status_for_url(source).unwrap();
+    assert!(matches!(
+        generic_failure.last_outcome,
+        crate::lists::status::LastOutcome::Failed { .. }
+    ));
+    assert_eq!(
+        generic_failure.parsed_truncated, 1,
+        "a generic failure must retain the last uncleared cap-refusal overshoot"
+    );
+    std::fs::write(&bridge_body, OVERSIZED).unwrap();
+
+    let dto = crate::lists::status::BlocklistStatusDto::from_status(
+        source.to_string(),
+        Some(blocklist_id.to_string()),
+        &refused,
+    );
+    assert_eq!(
+        dto.parsed_truncated, 1,
+        "the IPC/API/CLI DTO exposes the overshoot"
+    );
+
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(
+        entry.consecutive_failures, 2,
+        "the cap refusal and generic failure are separate retry attempts"
+    );
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Failed);
+    let cache_path = entry.cache_path.as_ref().expect("retained cache path");
+    assert!(
+        cache_path.is_file(),
+        "retry state must name a real retained body"
+    );
+
+    assert_eq!(mgr.refresh().await, 4);
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(entry.consecutive_failures, 3);
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Failed);
+
+    mgr.max_entries = 5;
+    assert_eq!(mgr.refresh().await, 5);
+    let recovered = mgr.status_registry.status_for_url(source).unwrap();
+    assert!(matches!(
+        recovered.last_outcome,
+        crate::lists::status::LastOutcome::Ok
+    ));
+    assert_eq!(
+        recovered.parsed_truncated, 0,
+        "success clears the refusal count"
+    );
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(entry.consecutive_failures, 0);
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Active);
+}
+
+#[tokio::test]
+async fn cap_refusal_with_an_over_cap_retained_body_counts_one_attempt() {
+    let (mut mgr, dir) = guard_manager(
+        &["a1.example\n", "b1.example\nb2.example\nb3.example\n"],
+        true,
+    );
+    let source = "https://imported.local/src1.txt";
+    let blocklist_id = crate::config::schema::Id::new("cap-retained").unwrap();
+    mgr.max_entries = 4;
+    assert_eq!(mgr.refresh().await, 4);
+
+    // Lost state must not invent a path merely because the cache opens:
+    // the next retained parse also has to accept it before it is stamped.
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(
+        source.to_string(),
+        (blocklist_id.clone(), 2),
+    )]));
+
+    // B's fresh candidate is three entries over the new cap; its retained
+    // cache is one. The incomplete hot cycle must keep A+B intact.
+    rewrite_body(&dir, 0, "a1.example\na2.example\n");
+    rewrite_body(
+        &dir,
+        1,
+        "b1.example\nb2.example\nb3.example\nb4.example\nb5.example\n",
+    );
+    mgr.max_entries = 2;
+    assert_eq!(mgr.refresh().await, 4);
+
+    let status = mgr.status_registry.status_for_url(source).unwrap();
+    assert_eq!(
+        status.parsed_truncated, 3,
+        "the published overshoot comes from the fresh candidate, not its retained fallback"
+    );
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(
+        entry.consecutive_failures, 1,
+        "candidate plus fallback is one attempt"
+    );
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Pending);
+    assert!(
+        entry.cache_path.is_none(),
+        "an over-cap retained body must not stamp lost state with a fake cache path"
+    );
+}
+
+#[tokio::test]
+async fn cap_refusal_without_a_retained_body_does_not_stamp_a_cache_path() {
+    let (mut mgr, urls, _dir) =
+        spill_manager_with_cap(&["one.example\ntwo.example\nthree.example\n"], 2);
+    let source = &urls[0];
+    let blocklist_id = crate::config::schema::Id::new("cap-no-cache").unwrap();
+    mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+    mgr.set_source_blocklist_map(HashMap::from([(source.clone(), (blocklist_id.clone(), 1))]));
+
+    assert_eq!(mgr.refresh().await, 0);
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    let entry = state.lists.get(&blocklist_id).unwrap();
+    assert_eq!(entry.status, crate::config::list_state::ListStatus::Failed);
+    assert_eq!(entry.consecutive_failures, 1);
+    assert!(
+        entry.cache_path.is_none(),
+        "no retained body must not create a fake path"
+    );
+}
+
 #[tokio::test]
 async fn a_source_over_its_entry_cap_keeps_its_last_good_body() {
     const A_FIRST: &str = "a1.example\na2.example\n";
@@ -4676,6 +11592,11 @@ async fn a_source_over_its_entry_cap_keeps_its_last_good_body() {
             total, 6,
             "3 from A plus B's 3 retained domains (on_disk={on_disk})"
         );
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::Installed),
+            "an accepted retained body must let A's new generation install (on_disk={on_disk})"
+        );
 
         // Loudly: the operator must be able to see WHY the source is
         // frozen, with the cap and the overshoot in the reason.
@@ -4693,6 +11614,10 @@ async fn a_source_over_its_entry_cap_keeps_its_last_good_body() {
             ),
             other => panic!("B must be Failed with the cap reason, got {other:?}"),
         }
+        assert_eq!(
+            b_status.parsed_truncated, 1,
+            "the status must expose the candidate's exact overshoot (on_disk={on_disk})"
+        );
 
         // Per-source, not corpus-level: nothing here is a ceiling
         // refusal, and publishing one would send the operator to the
@@ -4716,18 +11641,11 @@ async fn a_source_over_its_entry_cap_keeps_its_last_good_body() {
         }
     }
 }
-/// The other half of the freeze: when the RETAINED body fails the cap
-/// too, the source contributes nothing and says why — once, not in a
-/// retry loop.
-///
-/// Reachable the moment an operator lowers `max_entries` below what a
-/// healthy list already holds: the fresh body is refused, and so is the
-/// body the fallback reaches for. The fallback parses under the same cap
-/// on purpose — ingesting a body the operator's own limit forbids would
-/// make the limit advisory — so the honest outcome is an absent source
-/// with the cap named in its status.
+/// A refused candidate whose retained body also exceeds a newly lowered
+/// cap leaves source coverage incomplete. A hot refresh must preserve the
+/// complete old generation, including unrelated source A's old body.
 #[tokio::test]
-async fn a_retained_body_over_a_lowered_cap_contributes_nothing() {
+async fn an_over_cap_retained_body_keeps_the_complete_hot_generation() {
     const B_CACHED: [&str; 3] = ["b1.example", "b2.example", "b3.example"];
 
     for on_disk in [true, false] {
@@ -4737,6 +11655,13 @@ async fn a_retained_body_over_a_lowered_cap_contributes_nothing() {
         );
         mgr.max_entries = 4;
         assert_eq!(mgr.refresh().await, 4, "on_disk={on_disk}");
+        let digest_before = mgr.installed_corpus_digest;
+        let blocklist_id = crate::config::schema::Id::new("cap-over-retained").unwrap();
+        mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+        mgr.set_source_blocklist_map(HashMap::from([(
+            "https://imported.local/src1.txt".to_string(),
+            (blocklist_id.clone(), 2),
+        )]));
 
         // The operator lowers the cap under B, and leaves B's upstream
         // alone: both the fresh body and the retained one are now over.
@@ -4746,13 +11671,21 @@ async fn a_retained_body_over_a_lowered_cap_contributes_nothing() {
 
         assert_eq!(
             mgr.refresh().await,
-            2,
-            "only A survives a cap that both of B's bodies fail (on_disk={on_disk})"
+            4,
+            "an incomplete hot cycle must report the old complete corpus (on_disk={on_disk})"
+        );
+        assert!(
+            !mgr.filter.list_membership("a1.example").is_empty(),
+            "old A vanished (on_disk={on_disk})"
+        );
+        assert!(
+            mgr.filter.list_membership("a2.example").is_empty(),
+            "new A installed beside an unavailable B (on_disk={on_disk})"
         );
         for d in B_CACHED {
             assert!(
-                mgr.filter.list_membership(d).is_empty(),
-                "{d} was ingested under a cap its body fails (on_disk={on_disk})"
+                !mgr.filter.list_membership(d).is_empty(),
+                "{d} vanished from the complete prior generation (on_disk={on_disk})"
             );
         }
 
@@ -4770,7 +11703,144 @@ async fn a_retained_body_over_a_lowered_cap_contributes_nothing() {
             ),
             other => panic!("B must be Failed with the cap reason, got {other:?}"),
         }
+        assert_eq!(
+            b_status.entries, 3,
+            "B must report live entries (on_disk={on_disk})"
+        );
+        assert_eq!(
+            b_status.unique_domains, 3,
+            "B must report live uniques (on_disk={on_disk})"
+        );
+        assert_eq!(
+            b_status.parsed_truncated, 1,
+            "B must expose this attempt's overshoot"
+        );
+        let a_status = mgr
+            .status_registry
+            .status_for_url("https://imported.local/src0.txt")
+            .unwrap();
+        assert_eq!(
+            a_status.entries, 1,
+            "A must report the live old body (on_disk={on_disk})"
+        );
+        assert_eq!(
+            a_status.unique_domains, 1,
+            "A must report the live old body (on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.installed_corpus_digest,
+            None,
+            "an incomplete cycle must not publish a digest (was {digest_before:?}; on_disk={on_disk})"
+        );
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed),
+            "the cycle must not claim Installed (on_disk={on_disk})"
+        );
+        assert!(mgr.status_registry.cycle().source_coverage_incomplete);
+        assert!(mgr.status_registry.corpus_refusal().is_none());
+        let state = mgr.list_state_handle().lock().unwrap().clone();
+        let retry = state.lists.get(&blocklist_id).unwrap();
+        assert_eq!(
+            retry.consecutive_failures, 1,
+            "candidate plus fallback is one retry"
+        );
+        assert_eq!(retry.status, crate::config::list_state::ListStatus::Pending);
     }
+}
+
+/// A failed fetch with no usable retained body is the generic sibling of a
+/// cap refusal. It must take the same hot-generation hold, not be mistaken
+/// for a spill rollback failure.
+#[tokio::test]
+async fn a_missing_retained_body_after_download_failure_keeps_the_hot_generation() {
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(
+            &["old-a.example\n", "old-b-one.example\nold-b-two.example\n"],
+            on_disk,
+        );
+        assert_eq!(mgr.refresh().await, 3, "on_disk={on_disk}");
+        assert!(mgr.installed_corpus_digest.is_some());
+
+        let blocklist_id = crate::config::schema::Id::new("missing-retained").unwrap();
+        mgr.set_list_state(crate::config::list_state::ListState::default(), None);
+        mgr.set_source_blocklist_map(HashMap::from([(
+            "https://imported.local/src1.txt".to_string(),
+            (blocklist_id.clone(), 2),
+        )]));
+        rewrite_body(&dir, 0, "old-a.example\nnew-a.example\n");
+        let b_source = "https://imported.local/src1.txt";
+        let b_stem = source_to_cache_stem(b_source);
+        let _ = std::fs::remove_file(dir.path().join("lists/src1.txt"));
+        if on_disk {
+            let _ = std::fs::remove_file(dir.path().join("cache").join(format!("{b_stem}.cache")));
+            let _ = std::fs::remove_file(dir.path().join("cache").join(format!("{b_stem}.meta")));
+        } else {
+            mgr.cache.clear();
+        }
+        age_cache_entries(&mut mgr);
+
+        assert_eq!(mgr.refresh().await, 3, "on_disk={on_disk}");
+        for domain in ["old-a.example", "old-b-one.example", "old-b-two.example"] {
+            assert!(
+                !mgr.filter.list_membership(domain).is_empty(),
+                "{domain} vanished from the held generation (on_disk={on_disk})"
+            );
+        }
+        assert!(mgr.filter.list_membership("new-a.example").is_empty());
+        assert!(mgr.installed_corpus_digest.is_none());
+        assert_eq!(
+            mgr.status_registry.cycle().outcome,
+            Some(CycleOutcome::SpillRollbackFailed)
+        );
+        assert!(mgr.status_registry.cycle().source_coverage_incomplete);
+        let b_status = mgr.status_registry.status_for_url(b_source).unwrap();
+        assert_eq!(b_status.entries, 2);
+        assert_eq!(b_status.unique_domains, 2);
+        assert!(matches!(b_status.last_outcome, LastOutcome::Failed { .. }));
+        let state = mgr.list_state_handle().lock().unwrap().clone();
+        assert_eq!(
+            state.lists.get(&blocklist_id).unwrap().consecutive_failures,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn incomplete_hot_hold_clears_stale_refusal_but_keeps_freeze_visible() {
+    let (mut mgr, dir) = guard_manager(&["old-a.example\nold-b.example\n"], true);
+    assert_eq!(mgr.refresh().await, 2);
+    let now = OffsetDateTime::now_utc();
+    mgr.status_registry().note_refused_cycle(now);
+    mgr.status_registry()
+        .set_corpus_refusal(Some(CorpusRefusal {
+            unique: 10,
+            ceiling: 2,
+            novel_by_source: vec![],
+        }));
+    mgr.status_registry()
+        .record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 2);
+
+    // This manager attempt cannot remeasure a corpus refusal: its only body
+    // is gone, including the retained cache. It must clear the stale payload
+    // but leave the independently tracked freeze age intact.
+    std::fs::remove_file(dir.path().join("lists/src0.txt")).unwrap();
+    let source = "https://imported.local/src0.txt";
+    let cache_path = selected_cache_body_path(&dir.path().join("cache"), source).unwrap();
+    std::fs::remove_file(cache_path).unwrap();
+    let stem = source_to_cache_stem(source);
+    std::fs::remove_file(dir.path().join("cache").join(format!("{stem}.meta"))).unwrap();
+    age_cache_entries(&mut mgr);
+
+    assert_eq!(mgr.refresh().await, 2);
+    let snapshot = mgr.status_registry().consistent_snapshot();
+    assert_eq!(
+        snapshot.cycle.outcome,
+        Some(CycleOutcome::SpillRollbackFailed)
+    );
+    assert!(snapshot.cycle.source_coverage_incomplete);
+    assert!(snapshot.corpus_refusal.is_none());
+    assert_eq!(snapshot.corpus_freeze.unwrap().since, Some(now));
 }
 
 /// The P0, end to end through `refresh()`: a **first** cycle over the
@@ -4857,17 +11927,39 @@ async fn a_cold_start_over_the_ceiling_installs_instead_of_serving_nothing() {
     }
 }
 
+#[tokio::test]
+async fn cold_incomplete_hard_cap_refusal_reports_nothing_installed() {
+    for on_disk in [true, false] {
+        let (mut mgr, dir) = guard_manager(
+            &[
+                "a.example\nb.example\nc.example\nd.example\ne.example\n",
+                "missing.example\n",
+            ],
+            on_disk,
+        );
+        // Five usable domains exceed the hard cap (2 × 2). The other source
+        // fails before contributing, so this combines cold coverage loss and
+        // a corpus refusal.
+        mgr.set_max_total_domains(2);
+        std::fs::remove_file(dir.path().join("lists/src1.txt")).unwrap();
+
+        assert_eq!(mgr.refresh().await, 0, "on_disk={on_disk}");
+        let snapshot = mgr.status_registry().consistent_snapshot();
+        assert_eq!(snapshot.cycle.outcome, Some(CycleOutcome::Refused));
+        assert!(snapshot.cycle.source_coverage_incomplete);
+        assert!(!snapshot.cycle.generation_degraded);
+        assert!(snapshot.corpus_refusal.is_some());
+        assert_eq!(mgr.filter.domain_count(), 0, "no prior corpus exists");
+    }
+}
+
 /// All four bands off one spill, so each is shown to be reached by the
 /// ceiling alone rather than by anything else about the corpus.
 ///
 /// The 90 % band exists to warn *before* the wall, so the load-bearing
-/// assertion is that it still yields `Install`. And the threshold is a
-/// fraction of the **operator's** value: the 14,680,064 hash-table
-/// doubling point was a property of one representation on one box, and
-/// cabling it in would have made our hardware the product's upper limit.
-/// `mem-t6` has since removed that representation and with it the
-/// doubling point — which is the argument's own vindication, not a
-/// footnote to it: a constant hard-wired then would be wrong now.
+/// assertion is that it still yields `Install`. The threshold is always a
+/// fraction of the **operator's** value, not a property of one host's
+/// representation.
 ///
 /// Every band here is measured with a generation **serving**, which is
 /// the case in which the ceiling is a wall. `serving` used to be read
@@ -4881,7 +11973,7 @@ fn the_guard_bands_are_taken_against_the_operators_own_ceiling() {
     const SERVING: usize = 5;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     let body: String = (0..9).map(|i| format!("d{i}.example\n")).collect();
     parse_source_into_spill(
         std::io::Cursor::new(body.into_bytes()),
@@ -4900,7 +11992,7 @@ fn the_guard_bands_are_taken_against_the_operators_own_ceiling() {
     mgr.set_max_total_domains(12);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, SERVING),
+            mgr.corpus_guard(&mut spill, SERVING).unwrap(),
             CorpusVerdict::Install {
                 unique: 9,
                 warn: false,
@@ -4914,7 +12006,7 @@ fn the_guard_bands_are_taken_against_the_operators_own_ceiling() {
     mgr.set_max_total_domains(10);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, SERVING),
+            mgr.corpus_guard(&mut spill, SERVING).unwrap(),
             CorpusVerdict::Install {
                 unique: 9,
                 warn: true,
@@ -4927,7 +12019,7 @@ fn the_guard_bands_are_taken_against_the_operators_own_ceiling() {
     // 9 over 8: refuse.
     mgr.set_max_total_domains(8);
     assert!(matches!(
-        mgr.corpus_guard(&spill, SERVING),
+        mgr.corpus_guard(&mut spill, SERVING).unwrap(),
         CorpusVerdict::Refuse {
             unique: 9,
             ceiling: 8,
@@ -4939,19 +12031,24 @@ fn the_guard_bands_are_taken_against_the_operators_own_ceiling() {
     mgr.set_max_total_domains(9);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, SERVING),
+            mgr.corpus_guard(&mut spill, SERVING).unwrap(),
             CorpusVerdict::Install { unique: 9, .. }
         ),
         "refusal must be strictly greater than the ceiling"
     );
 
-    // 0 disables. Not merely "never refuses" — `Unmeasured` is how the
-    // counting pass is skipped, so a disabled guard costs nothing.
+    spill.prepare_validate().unwrap();
+    // 0 disables. The armed hook must survive this call: `Unmeasured`
+    // means no ceiling and no count, never a failed measurement.
     mgr.set_max_total_domains(0);
+    fail_nth_shard_spill_guard_count_for_test(1);
     assert!(matches!(
-        mgr.corpus_guard(&spill, SERVING),
+        mgr.corpus_guard(&mut spill, SERVING).unwrap(),
         CorpusVerdict::Unmeasured
     ));
+    mgr.set_max_total_domains(12);
+    assert!(mgr.corpus_guard(&mut spill, SERVING).is_err());
+    assert!(spill.is_poisoned());
 }
 
 /// The boot bands, off one spill, as the mirror of
@@ -4972,7 +12069,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     const NOTHING_SERVING: usize = 0;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     let body: String = (0..10).map(|i| format!("d{i}.example\n")).collect();
     parse_source_into_spill(
         std::io::Cursor::new(body.into_bytes()),
@@ -4991,7 +12088,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     mgr.set_max_total_domains(12);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, NOTHING_SERVING),
+            mgr.corpus_guard(&mut spill, NOTHING_SERVING).unwrap(),
             CorpusVerdict::Install { unique: 10, .. }
         ),
         "an empty filter must not perturb a corpus that fits"
@@ -5002,7 +12099,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     mgr.set_max_total_domains(8);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, NOTHING_SERVING),
+            mgr.corpus_guard(&mut spill, NOTHING_SERVING).unwrap(),
             CorpusVerdict::InstallOverCeiling {
                 unique: 10,
                 ceiling: 8,
@@ -5017,7 +12114,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     mgr.set_max_total_domains(5);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, NOTHING_SERVING),
+            mgr.corpus_guard(&mut spill, NOTHING_SERVING).unwrap(),
             CorpusVerdict::InstallOverCeiling { unique: 10, .. }
         ),
         "exactly at the hard cap must install; refusal is strictly past it"
@@ -5027,7 +12124,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     mgr.set_max_total_domains(4);
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, NOTHING_SERVING),
+            mgr.corpus_guard(&mut spill, NOTHING_SERVING).unwrap(),
             CorpusVerdict::Refuse {
                 unique: 10,
                 ceiling: 4,
@@ -5042,7 +12139,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
     // turned off.
     mgr.set_max_total_domains(0);
     assert!(matches!(
-        mgr.corpus_guard(&spill, NOTHING_SERVING),
+        mgr.corpus_guard(&mut spill, NOTHING_SERVING).unwrap(),
         CorpusVerdict::Unmeasured
     ));
 }
@@ -5056,7 +12153,7 @@ fn a_cold_start_has_no_generation_to_keep_so_the_ceiling_is_a_budget() {
 #[test]
 fn serving_is_the_only_thing_that_separates_the_two_over_ceiling_verdicts() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     let body: String = (0..10).map(|i| format!("d{i}.example\n")).collect();
     parse_source_into_spill(
         std::io::Cursor::new(body.into_bytes()),
@@ -5074,13 +12171,16 @@ fn serving_is_the_only_thing_that_separates_the_two_over_ceiling_verdicts() {
 
     assert!(
         matches!(
-            mgr.corpus_guard(&spill, 0),
+            mgr.corpus_guard(&mut spill, 0).unwrap(),
             CorpusVerdict::InstallOverCeiling { .. }
         ),
         "nothing serving → install"
     );
     assert!(
-        matches!(mgr.corpus_guard(&spill, 1), CorpusVerdict::Refuse { .. }),
+        matches!(
+            mgr.corpus_guard(&mut spill, 1).unwrap(),
+            CorpusVerdict::Refuse { .. }
+        ),
         "a single domain serving is a generation to keep → refuse, exactly as before"
     );
 }
@@ -5183,8 +12283,9 @@ fn count_unique_sums_to_the_build_loop_total_on_both_variants() {
         let built: usize = (0..DOMAIN_SHARDS)
             .map(|idx| {
                 spill
-                    .build_shard(idx, 4, &mut added, &policy)
+                    .build_shard(idx, 4, &policy)
                     .unwrap()
+                    .merge_added_by_bit(&mut added)
                     .len()
             })
             .sum();
@@ -5209,22 +12310,19 @@ fn count_unique_sums_to_the_build_loop_total_on_both_variants() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let mut disk = ShardSpill::open(Some(dir.path()));
+    let mut disk = ShardSpill::open(Some(dir.path())).unwrap();
     assert!(disk.is_disk(), "disk arm must exercise the disk path");
     check(&mut disk);
 
-    let mut mem = ShardSpill::open(None);
-    assert!(!mem.is_disk(), "memory arm must exercise the fallback");
+    let mut mem = ShardSpill::open(None).unwrap();
+    assert!(
+        !mem.is_disk(),
+        "memory arm must exercise explicit memory mode"
+    );
     check(&mut mem);
 }
 
-/// F2: `build_shard` is destructive — it `remove_file`s the consumed
-/// spill and `mem::take`s the memory bucket. The counting pass runs
-/// *before* it on the same spill, so if it inherited either behaviour
-/// the generation built afterwards would be silently empty.
-///
-/// This is the single easiest thing in the design to get wrong, so it
-/// is asserted against a control arm that never ran the count.
+/// Counting leaves every shard available for the build pass.
 #[test]
 fn count_unique_leaves_the_spill_intact_for_the_build_pass() {
     let harvest = |spill: &mut ShardSpill, count_first: bool| {
@@ -5239,13 +12337,11 @@ fn count_unique_leaves_the_spill_intact_for_the_build_pass() {
         let mut names: Vec<String> = Vec::new();
         let policy = ListPolicy::publish_uniform(0);
         for idx in 0..DOMAIN_SHARDS {
-            names.extend(
-                spill
-                    .build_shard(idx, 4, &mut added, &policy)
-                    .unwrap()
-                    .iter()
-                    .map(|(k, _)| k.to_string()),
-            );
+            let shard = spill
+                .build_shard(idx, 4, &policy)
+                .unwrap()
+                .merge_added_by_bit(&mut added);
+            names.extend(shard.iter().map(|(k, _)| k.to_string()));
         }
         names.sort();
         (names, added)
@@ -5257,9 +12353,9 @@ fn count_unique_leaves_the_spill_intact_for_the_build_pass() {
             if is_disk {
                 let p = dir.path().join(sub);
                 std::fs::create_dir_all(&p).unwrap();
-                ShardSpill::open(Some(&p))
+                ShardSpill::open(Some(&p)).unwrap()
             } else {
-                ShardSpill::open(None)
+                ShardSpill::open(None).unwrap()
             }
         };
 
@@ -5300,7 +12396,7 @@ fn count_unique_leaves_the_spill_intact_for_the_build_pass() {
 #[test]
 fn spill_counts_the_entries_the_cap_drops() {
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
 
     // Comment and blank lines past the cap must NOT inflate the count —
     // otherwise a list with a long trailing licence header reports
@@ -5333,6 +12429,15 @@ fn spill_counts_the_entries_the_cap_drops() {
     )
     .expect_err("a truncated list must be refused, not silently half-loaded");
 
+    assert_eq!(
+        err.cap_refusal(),
+        Some(SpillCapRefusal {
+            max_entries: 3,
+            dropped: 2,
+        }),
+        "the cap measurements must survive the spill rollback"
+    );
+
     let msg = err.to_string();
     assert!(
         msg.contains('2'),
@@ -5350,7 +12455,7 @@ fn spill_counts_the_entries_the_cap_drops() {
 
     // Control arm: identical body, cap above the entry count. Proves
     // the refusal keys on truncation and not merely on this body.
-    let mut spill_roomy = ShardSpill::open(Some(dir.path()));
+    let mut spill_roomy = ShardSpill::open(Some(dir.path())).unwrap();
     let (roomy, _) = parse_source_into_spill(
         std::io::Cursor::new(body.to_vec()),
         1,
@@ -5378,7 +12483,7 @@ fn spill_places_each_domain_in_shard_index_s_shard() {
     let body = format!("{}\n", domains.join("\n"));
 
     let dir = tempfile::tempdir().unwrap();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     parse_source_into_spill(
         std::io::Cursor::new(body.as_bytes()),
         1,
@@ -5390,11 +12495,10 @@ fn spill_places_each_domain_in_shard_index_s_shard() {
     .unwrap();
     spill.flush().unwrap();
 
-    let mut added = [0u64; 64];
     let mut seen = 0usize;
     let policy = ListPolicy::publish_uniform(0);
     for idx in 0..DOMAIN_SHARDS {
-        let shard = spill.build_shard(idx, 64, &mut added, &policy).unwrap();
+        let shard = spill.build_shard(idx, 64, &policy).unwrap().shard;
         for (d, _) in shard.iter() {
             assert_eq!(
                 FilterEngine::shard_index(d),
@@ -5455,46 +12559,38 @@ async fn unchanged_corpus_skips_the_rebuild_and_a_changed_one_does_not() {
     assert!(!mgr.filter.list_membership("c.example").is_empty());
 }
 
-/// The T5 digest may only be stored when a generation actually reached
-/// the engine.
-///
-/// Storing it after a cycle that installed nothing is the worst bug this
-/// lane can ship: the next cycle recomputes the same digest, concludes
-/// nothing changed, skips again — and the daemon serves a stale blocklist
-/// silently and indefinitely, even after the underlying failure clears.
-/// A cycle that parses nothing installs nothing, and is the cheap way to
-/// reach that state on purpose; a spill `flush` failing under ENOSPC is
-/// the way to reach it by accident.
+/// A fully covered empty candidate is a complete generation, including when
+/// it replaces a non-empty one. Its digest makes the next identical cycle a
+/// no-op instead of repeatedly rebuilding sixteen empty shards.
 #[tokio::test]
-async fn digest_is_not_stored_when_nothing_was_installed() {
-    let (mut mgr, _urls, _dir) = spill_manager(&["# nothing but a comment\n"]);
+async fn accepted_empty_replaces_live_and_stores_its_digest() {
+    let (mut mgr, _url, dir) = bridge_manager("live.example.com\n");
+    assert_eq!(mgr.refresh().await, 1);
+    assert!(mgr.installed_corpus_digest.is_some());
 
-    assert_eq!(mgr.refresh().await, 0, "no domains to install");
+    mgr.set_shrink_guard(false, 0);
+    write_bridge_body(&dir, "");
+
+    assert_eq!(mgr.refresh().await, 0);
+    let cycle = mgr.status_registry().cycle();
+    assert_eq!(cycle.outcome, Some(CycleOutcome::Installed));
+    assert_eq!(cycle.served_state, ServedState::IntentionalEmpty);
+    assert!(!cycle.generation_degraded);
+    assert!(mgr.filter.list_membership("live.example.com").is_empty());
+    let empty_digest = mgr
+        .installed_corpus_digest
+        .expect("the installed empty generation needs a digest");
+
+    assert_eq!(mgr.refresh().await, 0);
     assert_eq!(
-        mgr.rebuild_count, 0,
-        "pass 2 must not run for an empty corpus"
+        mgr.status_registry().cycle().outcome,
+        Some(CycleOutcome::SkippedUnchanged)
     );
-    assert!(
-        mgr.installed_corpus_digest.is_none(),
-        "a cycle that installed nothing recorded a digest — the next cycle would \
-         match it, skip the rebuild, and pin a stale map forever"
-    );
+    assert_eq!(mgr.installed_corpus_digest, Some(empty_digest));
 }
 
-/// A `CacheOnly` boot whose sources are only partially backed by disk
-/// cache must still leave `installed_corpus_digest` valid.
-///
-/// The no-usable-cache stop inside `refresh_with_mode`'s `CacheOnly`
-/// branch (see the comment on that arm) deliberately does not set
-/// `digest_valid = false`: that source's
-/// contribution is known to be zero, not unknown, so the digest still
-/// describes the corpus that was actually installed. Getting this
-/// wrong is not cosmetic — `installed_corpus_digest` is what lets the
-/// first background `Network` refresh decide "no body changed, skip
-/// the rebuild" instead of rebuilding, and skipping on a digest that
-/// does not actually describe the corpus is the failure this module's
-/// own comment calls "the daemon then serves a stale blocklist
-/// silently and indefinitely".
+/// Cold-start policy: install usable sources even when another source has
+/// no cache, but do not publish a digest for that incomplete coverage.
 ///
 /// Two sources, deliberately: `kept` has a `.cache` file and
 /// contributes a domain; `missing` has none. A single-source fixture
@@ -5505,7 +12601,7 @@ async fn digest_is_not_stored_when_nothing_was_installed() {
 /// installs anything at all, so it can't tell a valid digest from a
 /// merely-absent one either.
 #[tokio::test]
-async fn cache_only_boot_with_partial_cache_coverage_keeps_digest_valid() {
+async fn cache_only_boot_with_partial_cache_coverage_installs_usable_sources_without_a_digest() {
     let dir = tempfile::tempdir().unwrap();
 
     let kept_url = "https://127.0.0.1/kept.txt".to_string();
@@ -5532,7 +12628,7 @@ async fn cache_only_boot_with_partial_cache_coverage_keeps_digest_valid() {
     // cache entry at all" route.
 
     let filter = Arc::new(FilterEngine::new());
-    let urls = vec![kept_url.clone(), missing_url];
+    let urls = vec![kept_url.clone(), missing_url.clone()];
     let source_bits = build_source_bit_map(&urls).expect("at-cap accept");
     let mut mgr = ListManager::new(
         reqwest::Client::new(),
@@ -5546,7 +12642,6 @@ async fn cache_only_boot_with_partial_cache_coverage_keeps_digest_valid() {
         Some(dir.path().to_path_buf()),
     );
     mgr.load_disk_cache();
-
     let count = mgr.refresh_with_mode(RefreshMode::CacheOnly).await;
 
     // Sanity: the fixture exercises both routes it claims to — one
@@ -5554,17 +12649,108 @@ async fn cache_only_boot_with_partial_cache_coverage_keeps_digest_valid() {
     assert_eq!(count, 1, "only `kept` has a body to contribute");
     assert!(filter.is_blocked("kept.example.com"));
 
-    // The assertion with teeth: restoring `digest_valid = false` on
-    // the no-usable-cache arm makes this `None` instead, and every
-    // first background refresh after a boot like this one would
-    // rebuild the corpus it just finished loading, rather than only
-    // rebuilding when something actually changed.
     assert!(
-        mgr.installed_corpus_digest.is_some(),
-        "a CacheOnly boot whose sources are all accounted for must leave the \
-         digest valid — restoring `digest_valid = false` on the no-cache arm \
-         makes this None and re-rebuilds every first background refresh"
+        mgr.installed_corpus_digest.is_none(),
+        "an incomplete cold-start corpus must not publish a digest"
     );
+    assert_eq!(
+        mgr.status_registry.cycle().outcome,
+        Some(CycleOutcome::Installed),
+        "a cold partial corpus is installed, but only as an explicitly qualified outcome"
+    );
+    assert!(mgr.status_registry.cycle().source_coverage_incomplete);
+    let kept = mgr.status_registry.status_for_url(&kept_url).unwrap();
+    let missing = mgr.status_registry.status_for_url(&missing_url).unwrap();
+    assert_eq!(kept.entries, 1);
+    assert_eq!(missing.entries, 0);
+    assert!(matches!(kept.last_outcome, LastOutcome::NeverFetched));
+    assert!(matches!(missing.last_outcome, LastOutcome::NeverFetched));
+}
+
+#[tokio::test]
+async fn cache_only_cap_refusal_leaves_health_and_retry_state_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept_url = "https://127.0.0.1/kept.txt".to_string();
+    let refused_url = "https://127.0.0.1/refused.txt".to_string();
+    let missing_url = "https://127.0.0.1/missing.txt".to_string();
+    let old = OffsetDateTime::now_utc() - time::Duration::days(30);
+
+    for (url, body) in [
+        (&kept_url, "kept.example.com\n"),
+        (
+            &refused_url,
+            "refused-one.example.com\nrefused-two.example.com\nrefused-three.example.com\n",
+        ),
+    ] {
+        let stem = source_to_cache_stem(url);
+        std::fs::write(dir.path().join(format!("{stem}.cache")), body).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{stem}.meta")),
+            format!(
+                "etag=\nlast-modified=\nfetched-at={}\n",
+                old.format(&Rfc3339).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    let filter = Arc::new(FilterEngine::new());
+    let urls = vec![kept_url.clone(), refused_url.clone(), missing_url];
+    let source_bits = build_source_bit_map(&urls).expect("at-cap accept");
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        filter.clone(),
+        urls,
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        source_bits,
+        TEST_CAP,
+        4,
+        Some(dir.path().to_path_buf()),
+    );
+    mgr.load_disk_cache();
+    mgr.set_source_max_entries(HashMap::from([
+        (kept_url.clone(), 4),
+        (refused_url.clone(), 2),
+    ]));
+
+    let blocklist_id = crate::config::schema::Id::new("boot-refused").unwrap();
+    let prior_entry = crate::config::list_state::ListStatusEntry {
+        status: crate::config::list_state::ListStatus::Active,
+        last_success: Some(old),
+        last_attempt: Some(old),
+        consecutive_failures: 1,
+        cache_path: Some(dir.path().join("previous.cache")),
+    };
+    let mut prior_state = crate::config::list_state::ListState::default();
+    prior_state
+        .lists
+        .insert(blocklist_id.clone(), prior_entry.clone());
+    mgr.set_list_state(prior_state, None);
+    mgr.set_source_blocklist_map(HashMap::from([(
+        refused_url.clone(),
+        (blocklist_id.clone(), 2),
+    )]));
+    let (notification_tx, mut notifications) = tokio::sync::broadcast::channel(8);
+    mgr.set_notification_channel(notification_tx);
+
+    assert_eq!(
+        mgr.refresh_with_mode(RefreshMode::CacheOnly).await,
+        1,
+        "the accepted cached source installs while the refused and missing sources contribute zero"
+    );
+    assert!(filter.is_blocked("kept.example.com"));
+    assert!(!filter.is_blocked("refused-one.example.com"));
+
+    let refused = mgr.status_registry.status_for_url(&refused_url).unwrap();
+    assert_eq!(
+        refused.last_outcome,
+        crate::lists::status::LastOutcome::NeverFetched
+    );
+
+    let state = mgr.list_state_handle().lock().unwrap().clone();
+    assert_eq!(state.lists.get(&blocklist_id), Some(&prior_entry));
+    assert!(notifications.try_recv().is_err());
 }
 
 /// A `kind` flip must reach the map even when no body changed.
@@ -5718,6 +12904,29 @@ async fn an_all_fresh_cycle_parses_no_body() {
     );
 }
 
+#[tokio::test]
+async fn effective_cap_change_invalidates_the_fresh_cache_digest_probe() {
+    let (mut mgr, urls, _dir) = cached_manager(&["a.example\n", "b.example\n"]);
+    assert_eq!(mgr.refresh().await, 2, "first cycle installs the digest");
+    let before = mgr.installed_corpus_digest.unwrap();
+
+    mgr.set_source_max_entries(HashMap::from([
+        (urls[0].clone(), DEFAULT_MAX_LIST_ENTRIES - 1),
+        (urls[1].clone(), DEFAULT_MAX_LIST_ENTRIES),
+    ]));
+    assert_eq!(mgr.refresh().await, 2, "the unchanged bodies remain valid");
+    assert_eq!(
+        mgr.probe_skips, 0,
+        "the old digest must not settle a source whose effective cap changed"
+    );
+    assert_eq!(mgr.rebuild_count, 2, "the changed parse semantics rebuild");
+    assert_ne!(
+        mgr.installed_corpus_digest,
+        Some(before),
+        "the parse path must fold the new effective cap too"
+    );
+}
+
 /// The probe reaches `PendingStatus` by a different route than the
 /// cache-hit arm, and must reach the same answer about `verified_fresh`.
 ///
@@ -5739,7 +12948,7 @@ async fn an_all_fresh_cycle_parses_no_body() {
 #[tokio::test]
 async fn the_probe_does_not_stamp_a_refresh_on_a_cache_only_cycle() {
     for (mode, expected) in [
-        (RefreshMode::Network, true),
+        (RefreshMode::Scheduled, true),
         (RefreshMode::CacheOnly, false),
     ] {
         let (mut mgr, urls, _dir) = cached_manager(&["a.example\n"]);
@@ -5776,26 +12985,17 @@ async fn the_probe_does_not_stamp_a_refresh_on_a_cache_only_cycle() {
     }
 }
 
-/// The probe must be a check, not a cache. A body whose bytes changed
-/// but whose length did not — so `.meta`'s `size=` still validates —
-/// must still rebuild.
-///
-/// This is why the digest is recomputed from the bodies rather than
-/// read from a `sha256=` sidecar line: a stored hash cannot see this
-/// edit, and a skipped rebuild would pin it in place. The `.cache`
-/// directory is a trust boundary (`cache_dir_lax_mode` warns about it),
-/// so "someone wrote to it" is a case with a threat model, not a
-/// hypothetical.
+/// A manifest generation is content-addressed.  A constant-size edit must
+/// fail the probe and retained parse, preserving the complete hot corpus.
 #[tokio::test]
-async fn a_planted_cache_edit_of_identical_size_still_rebuilds() {
+async fn a_planted_manifest_generation_edit_of_identical_size_is_rejected() {
     let (mut mgr, urls, dir) = cached_manager(&["aaa.example\n"]);
     assert_eq!(mgr.refresh().await, 1);
     assert_eq!(mgr.rebuild_count, 1);
 
     // Same byte count, different bytes, straight into the trusted
     // cache — the sidecar's size= still matches.
-    let stem = source_to_cache_stem(&urls[0]);
-    let cache_path = dir.path().join("cache").join(format!("{stem}.cache"));
+    let cache_path = selected_cache_body_path(&dir.path().join("cache"), &urls[0]).unwrap();
     let before = std::fs::metadata(&cache_path).unwrap().len();
     std::fs::write(&cache_path, "bbb.example\n").unwrap();
     assert_eq!(
@@ -5804,18 +13004,93 @@ async fn a_planted_cache_edit_of_identical_size_still_rebuilds() {
         "the fixture must keep the length identical or it proves nothing"
     );
 
-    assert_eq!(mgr.refresh().await, 1, "one domain either way");
+    assert_eq!(mgr.refresh().await, 1, "the hot generation is preserved");
     assert_eq!(
         mgr.probe_skips, 0,
-        "the probe accepted a body it had not read — it is a cache, not a check"
+        "a mismatched manifest body must not settle the probe"
     );
     assert_eq!(
-        mgr.rebuild_count, 2,
-        "a planted edit did not force a rebuild"
+        mgr.rebuild_count, 1,
+        "a rejected retained body must not rebuild a tampered corpus"
     );
     assert!(
-        !mgr.filter.list_membership("bbb.example").is_empty(),
-        "the rebuilt map must reflect what is actually on disk"
+        !mgr.filter.list_membership("aaa.example").is_empty(),
+        "the trusted hot generation must remain installed"
+    );
+    assert!(mgr.filter.list_membership("bbb.example").is_empty());
+}
+
+#[tokio::test]
+async fn cache_only_rejects_a_tampered_manifest_generation() {
+    let (mut mgr, urls, dir) = cached_manager(&["old.example\n"]);
+    assert_eq!(mgr.refresh().await, 1);
+    let cache_path = selected_cache_body_path(&dir.path().join("cache"), &urls[0]).unwrap();
+    std::fs::write(cache_path, "bad.example\n").unwrap();
+
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::CacheOnly).await, 1);
+    assert!(!mgr.filter.list_membership("old.example").is_empty());
+    assert!(mgr.filter.list_membership("bad.example").is_empty());
+    assert_eq!(mgr.probe_skips, 0);
+}
+
+/// A retained reader that fails parsing is not a missing retained body.
+#[tokio::test]
+async fn cache_only_retained_parse_failure_does_not_log_missing_body() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct Messages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(String);
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    let (mut mgr, urls, dir) = cached_manager(&["old.example\n"]);
+    assert_eq!(mgr.refresh().await, 1);
+    let cache_path = selected_cache_body_path(&dir.path().join("cache"), &urls[0]).unwrap();
+    std::fs::write(cache_path, "bad.example\n").unwrap();
+
+    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber =
+        tracing_subscriber::registry().with(Messages(std::sync::Arc::clone(&messages)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    mgr.refresh_with_mode(RefreshMode::CacheOnly).await;
+
+    let messages = messages.lock().unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("failed to stream fresh cache body"))
+            .count(),
+        1,
+        "a retained parse failure must emit its stream-failure warning"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("cache marked fresh but body missing")),
+        "a retained parse failure must not also claim the body was missing"
     );
 }
 
@@ -5898,7 +13173,7 @@ fn a_zero_count_is_never_carried_forward() {
     };
     assert!(
         matches!(
-            UniqueCount::carry_or_measure(Some(&prev)),
+            UniqueCount::carry_or_measure(Some(&prev), usize::MAX),
             UniqueCount::Measure(_)
         ),
         "a zero was carried forward — the next download's shrink guard would then have \
@@ -5906,7 +13181,7 @@ fn a_zero_count_is_never_carried_forward() {
     );
     assert!(
         matches!(
-            compute_shrink_verdict(true, 90, Some(&prev), 0),
+            compute_shrink_verdict(true, 90, Some(&prev), 0, usize::MAX),
             ShrinkVerdict::Accept { .. }
         ),
         "this is why: a zero baseline accepts an empty body outright"
@@ -5914,27 +13189,28 @@ fn a_zero_count_is_never_carried_forward() {
 
     // A usable prior is carried, and carried exactly.
     prev.unique_domains = 5_000;
-    match UniqueCount::carry_or_measure(Some(&prev)) {
+    match UniqueCount::carry_or_measure(Some(&prev), usize::MAX) {
         UniqueCount::Carried(n) => assert_eq!(n.get(), 5_000),
         other => panic!("a usable prior count must be carried, got {other:?}"),
     }
 
     // And the arm that must always measure does, prior or not.
     assert!(matches!(
-        UniqueCount::measure(Some(&prev)),
+        UniqueCount::measure(Some(&prev), usize::MAX),
         UniqueCount::Measure(Some(_))
     ));
     assert!(matches!(
-        UniqueCount::measure(None),
+        UniqueCount::measure(None, usize::MAX),
         UniqueCount::Measure(None)
     ));
 }
 
 // ── mem2608-t0: the tick that could never fetch ───────────────────
 //
-// These drive the relationship the daemon has, not the predicate on
-// its own: a fixed-period tick, and a stamp written while the cycle
-// runs. `refresh_at` supplies the cycle anchor, so "the cycle began
+// These drive the healthy-ticker relationship the daemon has, not the
+// predicate on its own: a fixed-period tick, and a stamp written while the
+// cycle runs. A degraded cycle alone resets its next deadline to the bounded
+// recovery cadence. `refresh_at` supplies the cycle anchor, so "the cycle began
 // 456 s ago" is expressible without waiting 456 s. 456 s is measured
 // — the 2026-08-15 13:22:52 cycle on the lab host took exactly that to
 // fetch its 14 lists.
@@ -5954,7 +13230,7 @@ fn a_zero_count_is_never_carried_forward() {
 /// tempting single-half fixes both fail here.
 ///
 /// A cycle ticks at `tick` and takes 456 s (measured: the lab host,
-/// 2026-08-15 13:22:52). The next fixed-period tick lands at
+/// 2026-08-15 13:22:52). The next healthy fixed-period tick lands at
 /// `tick + interval`. The only thing that differs between the broken
 /// and the fixed daemon is **which instant got stamped**.
 ///
@@ -6013,7 +13289,7 @@ async fn a_cycle_stamps_its_anchor_not_its_completion() {
     assert_eq!(
         stamped, tick,
         "the cycle stamped {stamped} instead of its anchor {tick} — any later instant \
-         hands the next fixed-period tick an age short of a full interval, which is \
+         hands the next healthy fixed-period tick an age short of a full interval, which is \
          fresh by construction"
     );
 }
@@ -6112,7 +13388,7 @@ fn perf_corpus_guard_counting_pass() {
     let spill_dir = dir.path().join("spill");
     std::fs::create_dir_all(&spill_dir).unwrap();
 
-    let mut spill = ShardSpill::open(Some(&spill_dir));
+    let mut spill = ShardSpill::open(Some(&spill_dir)).unwrap();
     assert!(spill.is_disk(), "the guard's cost is a disk-spill property");
     let body = std::fs::read_to_string(&corpus).unwrap();
     parse_source_into_spill(
@@ -6143,13 +13419,9 @@ fn perf_corpus_guard_counting_pass() {
     let policy = ListPolicy::publish_uniform(0);
     for idx in 0..DOMAIN_SHARDS {
         built += spill
-            .build_shard(
-                idx,
-                unique as usize / DOMAIN_SHARDS + 1,
-                &mut added_by_bit,
-                &policy,
-            )
+            .build_shard(idx, unique as usize / DOMAIN_SHARDS + 1, &policy)
             .unwrap()
+            .merge_added_by_bit(&mut added_by_bit)
             .len();
     }
     let build_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -6303,7 +13575,7 @@ fn perf_reload_peak_sharded_producer() {
 
     // ── the new producer ──
     let estimated = engine.domain_count();
-    let mut spill = ShardSpill::open(Some(dir.path()));
+    let mut spill = ShardSpill::open(Some(dir.path())).unwrap();
     assert!(spill.is_disk(), "must measure the disk path");
     parse_source_into_spill(
         std::io::BufReader::with_capacity(SPILL_WRITE_BUF, std::fs::File::open(&path).unwrap()),
@@ -6320,8 +13592,9 @@ fn perf_reload_peak_sharded_producer() {
     let policy = ListPolicy::publish_uniform(0);
     for idx in 0..DOMAIN_SHARDS {
         let shard = spill
-            .build_shard(idx, estimated / DOMAIN_SHARDS + 1, &mut added, &policy)
-            .unwrap();
+            .build_shard(idx, estimated / DOMAIN_SHARDS + 1, &policy)
+            .unwrap()
+            .merge_added_by_bit(&mut added);
         total += shard.len();
         engine.swap_shard_sorted(idx, shard);
     }

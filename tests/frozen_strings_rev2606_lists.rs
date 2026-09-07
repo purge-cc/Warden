@@ -12,6 +12,7 @@
 
 use purge_warden::lists::status::{
     format_blocklist_shrink_refused, BLOCKLIST_DELTA_WARN, BLOCKLIST_SHRINK_REFUSED,
+    BLOCKLIST_TRUNCATION_REFUSED,
 };
 
 #[test]
@@ -27,7 +28,7 @@ fn blocklist_shrink_refused_template_is_frozen() {
     assert_eq!(
         BLOCKLIST_SHRINK_REFUSED,
         "refresh refused: list shrank by {drop}% to {got} domains (was {kept}); \
-         keeping the previous list — run `warden lists forget <source>` to accept"
+         candidate not installed — run `warden lists forget <source>` to accept"
     );
 }
 
@@ -37,10 +38,19 @@ fn blocklist_shrink_refused_format_helper_substitutes() {
     assert_eq!(
         got,
         "refresh refused: list shrank by 100% to 0 domains (was 12345); \
-         keeping the previous list — run `warden lists forget <source>` to accept"
+         candidate not installed — run `warden lists forget <source>` to accept"
     );
     // No placeholder survives substitution.
     assert!(!got.contains("{drop}"));
     assert!(!got.contains("{got}"));
     assert!(!got.contains("{kept}"));
+}
+
+#[test]
+fn blocklist_truncation_refused_template_is_frozen() {
+    assert_eq!(
+        BLOCKLIST_TRUNCATION_REFUSED,
+        "refresh refused: candidate not installed; max_entries ({cap}) would drop {dropped} \
+         entries — inspect effective_max_entries with `warden blocklist show <id>` and raise the limiting configured cap"
+    );
 }

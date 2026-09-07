@@ -16,7 +16,7 @@
 //! those two rows as one and silently overwrite the first with the
 //! second, so this module carries pair-keyed equivalents. The parts of
 //! the pipeline that carry the safety properties —
-//! [`read_or_empty`] and [`write_value_validated`], the latter running
+//! `read_or_empty_locked` and `write_value_validated_locked`, the latter running
 //! the full loader against the *staged* bytes before the rename — are
 //! the shared ones, unchanged.
 //!
@@ -34,11 +34,13 @@ use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    owner_candidate_files, read_or_empty, resolve_target_file, write_value_validated, EntityClass,
+    owner_candidate_files_locked, read_or_empty_locked, resolve_target_file_locked,
+    write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::load_config;
-use crate::config::schema::{ConfigV1, Id, Label, LabelKind};
+use crate::config::loader::{load_config, load_config_for_schema_under_guard};
+use crate::config::schema::{ConfigV1, Id, Label, LabelKind, SCHEMA_VERSION_V1};
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 /// How many referring entities `remove` names before eliding the rest.
 const MAX_REFERENCES_SHOWN: usize = 5;
@@ -179,9 +181,33 @@ pub(crate) fn add_inner(
     into: Option<&Path>,
 ) -> anyhow::Result<AddReport> {
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(
+        &guard,
+        config_path,
+        id,
+        kind,
+        display_name,
+        description,
+        into,
+    )
+}
+
+/// Guard-reusing form of [`add_inner`].
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    kind: LabelKind,
+    display_name: Option<&str>,
+    description: Option<&str>,
+    into: Option<&Path>,
+) -> anyhow::Result<AddReport> {
+    let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if loaded
         .config
         .labels
@@ -205,8 +231,8 @@ pub(crate) fn add_inner(
         tbl.insert("description".into(), Value::String(d.to_string()));
     }
 
-    let target_path = resolve_target_file(config_path, EntityClass::Labels, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_target_file_locked(guard, config_path, EntityClass::Labels, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     // A create, and the returned flag is what says so. `upsert_label`
     // replaces a matched (kind, id) row outright, so a replace reached from
     // here would reset every field this builder omits.
@@ -216,7 +242,7 @@ pub(crate) fn add_inner(
          write; nothing was changed",
         target_path.display()
     );
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     audit(config_path, &target_path, "label.add", id);
     Ok(AddReport {
         id: id.to_string(),
@@ -246,6 +272,19 @@ pub(crate) fn set_fields_inner(
     fields: &[(&str, &str)],
     into: Option<&Path>,
 ) -> anyhow::Result<SetReport> {
+    let guard = acquire_for_write(config_path)?;
+    set_fields_inner_locked(&guard, config_path, id, kind, fields, into)
+}
+
+/// Guard-reusing form of [`set_fields_inner`].
+pub(crate) fn set_fields_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    kind: Option<LabelKind>,
+    fields: &[(&str, &str)],
+    into: Option<&Path>,
+) -> anyhow::Result<SetReport> {
     anyhow::ensure!(
         !fields.iter().any(|(f, _)| *f == "kind"),
         "a kind change must go through the single-field path — batching it \
@@ -253,15 +292,16 @@ pub(crate) fn set_fields_inner(
     );
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     // Resolve which row we are editing BEFORE touching a file, so an
     // ambiguous id is refused rather than silently resolved to whichever
     // row happens to come first on disk.
     let label = select_label(&loaded.config.labels, id, kind)?;
     let current_kind = label.kind;
 
-    let target_path = find_label_file(config_path, current_kind, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = find_label_file_locked(guard, config_path, current_kind, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let entry = find_label_entry_mut(&mut doc, current_kind, id)?.ok_or_else(|| {
         anyhow::anyhow!(
             "label \"{id}\" (kind {current_kind}) not found in {}. Use `--into <file>` to \
@@ -274,7 +314,7 @@ pub(crate) fn set_fields_inner(
     for (field, value) in fields {
         apply_label_field(entry, field, value)?;
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let fields_after = fields
         .iter()
@@ -308,12 +348,27 @@ pub(crate) fn set_inner(
     value: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<SetReport> {
+    let guard = acquire_for_write(config_path)?;
+    set_inner_locked(&guard, config_path, id, kind, field, value, into)
+}
+
+/// Guard-reusing form of [`set_inner`].
+pub(crate) fn set_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    kind: Option<LabelKind>,
+    field: &str,
+    value: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<SetReport> {
     if field != "kind" {
-        return set_fields_inner(config_path, id, kind, &[(field, value)], into);
+        return set_fields_inner_locked(guard, config_path, id, kind, &[(field, value)], into);
     }
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     // Resolve which row we are editing BEFORE touching a file, so an
     // ambiguous id is refused rather than silently resolved to whichever
     // row happens to come first on disk.
@@ -350,8 +405,8 @@ pub(crate) fn set_inner(
         }
     }
 
-    let target_path = find_label_file(config_path, current_kind, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = find_label_file_locked(guard, config_path, current_kind, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let entry = find_label_entry_mut(&mut doc, current_kind, id)?.ok_or_else(|| {
         anyhow::anyhow!(
             "label \"{id}\" (kind {current_kind}) not found in {}. Use `--into <file>` to \
@@ -360,7 +415,7 @@ pub(crate) fn set_inner(
         )
     })?;
     apply_label_field(entry, field, value)?;
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     audit_with_fields(
         config_path,
         &target_path,
@@ -399,8 +454,22 @@ fn remove_if_present(
     kind: Option<LabelKind>,
     into: Option<&Path>,
 ) -> anyhow::Result<Option<RemovedLabel>> {
+    let guard = acquire_for_write(config_path)?;
+    remove_if_present_locked(&guard, config_path, id, kind, into)
+}
+
+/// Guard-reusing removal core. The caller owns `guard` through owner lookup,
+/// document surgery, and promotion.
+fn remove_if_present_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    kind: Option<LabelKind>,
+    into: Option<&Path>,
+) -> anyhow::Result<Option<RemovedLabel>> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
 
     let matches: Vec<&Label> = loaded
         .config
@@ -429,8 +498,8 @@ fn remove_if_present(
     }
 
     let label_kind = label.kind;
-    let target_path = find_label_file(config_path, label_kind, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = find_label_file_locked(guard, config_path, label_kind, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     if !remove_label(&mut doc, label_kind, id)? {
         // The pre-check above already PROVED this label exists in the merged
         // config, so "not found" here means it lives in a different file —
@@ -444,7 +513,7 @@ fn remove_if_present(
             target_path.display()
         );
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     audit(config_path, &target_path, "label.remove", id);
     Ok(Some(RemovedLabel {
         report: RemoveReport {
@@ -473,7 +542,19 @@ pub(crate) fn remove_inner(
     kind: Option<LabelKind>,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveReport> {
-    remove_if_present(config_path, id, kind, into)?
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, id, kind, into)
+}
+
+/// Guard-reusing form of [`remove_inner`].
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    kind: Option<LabelKind>,
+    into: Option<&Path>,
+) -> anyhow::Result<RemoveReport> {
+    remove_if_present_locked(guard, config_path, id, kind, into)?
         .map(|removed| removed.report)
         // `select_label`'s two spellings verbatim, rather than a third one
         // for the same condition.
@@ -729,20 +810,18 @@ fn labels_array_mut(value: &mut Value) -> anyhow::Result<&mut Vec<Value>> {
 /// merged, so an entity in a hand-written `includes = [...]` glob is
 /// found too. Falls back to the default creation target when nothing
 /// matches, so a genuine not-found surfaces the normal error.
-fn find_label_file(
+fn find_label_file_locked(
+    guard: &ConfigWriteLock,
     master: &Path,
     kind: LabelKind,
     id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     if into.is_some() {
-        return resolve_target_file(master, EntityClass::Labels, into);
+        return resolve_target_file_locked(guard, master, EntityClass::Labels, into);
     }
-    for path in owner_candidate_files(master, &[EntityClass::Labels]) {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = raw.parse::<Value>() else {
+    for path in owner_candidate_files_locked(guard, master, &[EntityClass::Labels])? {
+        let Ok((value, _)) = read_or_empty_locked(guard, master, &path) else {
             continue;
         };
         if let Some(Value::Array(arr)) = value.get(EntityClass::Labels.toml_key()) {
@@ -751,7 +830,7 @@ fn find_label_file(
             }
         }
     }
-    resolve_target_file(master, EntityClass::Labels, None)
+    resolve_target_file_locked(guard, master, EntityClass::Labels, None)
 }
 
 fn apply_label_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Result<()> {

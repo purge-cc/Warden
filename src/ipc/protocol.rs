@@ -83,6 +83,13 @@ pub enum IpcCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
+    /// Force all enabled list sources through one manager-owned refresh
+    /// cycle. Tier `Mutating`, matching the existing refresh control
+    /// (`Reload`) while avoiding its unrelated config-reload work.
+    ForceListRefresh {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
     /// Request graceful shutdown (equivalent to SIGTERM).
     Shutdown {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,9 +264,8 @@ pub enum IpcCommand {
     /// Reads per-source runtime telemetry.
     ///
     /// `source_id = None` returns a snapshot of every configured
-    /// `[lists].sources` entry. `source_id = Some("ads")` (or any
-    /// canonical `[[blocklists]].id`, or the legacy slash-form slug)
-    /// resolves a single entry via the resolver's `slug_to_id` bridge.
+    /// planned representative. `source_id` accepts a canonical Id, legacy
+    /// slug, or URL alias through the live registry routing snapshot.
     ///
     /// **Tier: `ReadOnly`.** No token gate — the TUI Lists tab and any
     /// operator running `warden blocklist show` polls this on every
@@ -736,6 +742,7 @@ impl IpcCommand {
             Self::CacheFlush { .. }
             | Self::Reload { .. }
             | Self::ForgetList { .. }
+            | Self::ForceListRefresh { .. }
             | Self::ProfileCreate { .. }
             | Self::ProfileUpdate { .. }
             | Self::ProfileDelete { .. } => CommandTier::Mutating,
@@ -768,6 +775,7 @@ impl IpcCommand {
             Self::CacheFlush { .. } => "cache.flush",
             Self::Reload { .. } => "reload",
             Self::ForgetList { .. } => "list.forget",
+            Self::ForceListRefresh { .. } => "list.refresh.force",
             Self::Shutdown { .. } => "shutdown",
             Self::DomainCount => "domain.count",
             Self::TrackingStats { .. } => "tracking.stats",
@@ -797,6 +805,7 @@ impl IpcCommand {
             Self::CacheFlush { token, .. }
             | Self::Reload { token }
             | Self::ForgetList { token, .. }
+            | Self::ForceListRefresh { token }
             | Self::Shutdown { token }
             | Self::TrackingStats { token }
             | Self::DeviceStats { token }
@@ -831,6 +840,7 @@ impl IpcCommand {
             Self::CacheFlush { domain, .. } => Self::CacheFlush { domain, token: t },
             Self::Reload { .. } => Self::Reload { token: t },
             Self::ForgetList { id, .. } => Self::ForgetList { id, token: t },
+            Self::ForceListRefresh { .. } => Self::ForceListRefresh { token: t },
             Self::Shutdown { .. } => Self::Shutdown { token: t },
             Self::TrackingStats { .. } => Self::TrackingStats { token: t },
             Self::DeviceStats { .. } => Self::DeviceStats { token: t },
@@ -990,6 +1000,46 @@ pub struct UpstreamServerInfo {
 /// without protocol-shape changes.
 pub const RELOAD_PENDING_SUFFIX: &str = "; reload already pending, takes effect within ~60s";
 
+/// Serializable completed-registry view returned with a forced refresh.
+///
+/// The internal registry stores statuses behind `Arc`s and deliberately does
+/// not implement serde. This DTO preserves every completed-snapshot value
+/// while making the IPC shape explicit and additive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListRegistrySnapshotDto {
+    pub rows: Vec<ListRegistryRowDto>,
+    pub corpus_refusal: Option<crate::lists::status::CorpusRefusal>,
+    pub corpus_freeze: Option<crate::lists::status::CorpusFreeze>,
+    pub domain_count: usize,
+    pub cycle: crate::lists::status::CycleMark,
+}
+
+/// One source row in [`ListRegistrySnapshotDto`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ListRegistryRowDto {
+    pub source: String,
+    pub status: crate::lists::status::ListStatus,
+}
+
+impl From<crate::lists::status::RegistrySnapshot> for ListRegistrySnapshotDto {
+    fn from(snapshot: crate::lists::status::RegistrySnapshot) -> Self {
+        Self {
+            rows: snapshot
+                .rows
+                .into_iter()
+                .map(|(source, status)| ListRegistryRowDto {
+                    source,
+                    status: (*status).clone(),
+                })
+                .collect(),
+            corpus_refusal: snapshot.corpus_refusal,
+            corpus_freeze: snapshot.corpus_freeze,
+            domain_count: snapshot.domain_count,
+            cycle: snapshot.cycle,
+        }
+    }
+}
+
 /// Response sent from daemon to CLI via Unix socket.
 ///
 /// The `TrackingStats` variant trips clippy's `large_enum_variant`
@@ -1054,19 +1104,18 @@ pub enum IpcResponse {
         /// decoded from an older daemon.
         #[serde(default)]
         lists_active: u32,
-        /// Total number of configured blocklist sources (registry slot
-        /// count). 0 when decoded from an older daemon — `list_count`
-        /// is the legacy fallback.
+        /// Total number of completed-registry source rows. A reported 0
+        /// can be an intentional no-sources clear; `lists_cycle` tells a
+        /// client whether these registry counters are supported.
         #[serde(default)]
         lists_total: u32,
-        /// Number of blocklist sources whose most recent refresh hit the
-        /// `max_entries` cap and dropped entries on the floor.
+        /// Number of blocklist sources with an uncleared `max_entries` cap
+        /// refusal since this daemon started. The last attempted refresh can
+        /// be a different failure; a successful refresh clears the per-source
+        /// overshoot.
         ///
-        /// Distinct from `lists_active` on purpose: a truncated source is
-        /// *also* active — it fetched, it parsed, it reported `Ok`. That
-        /// is exactly why the old `lists: 8/8 sources active` line could
-        /// print while 19% of the corpus was missing, and why this needs
-        /// its own counter rather than a tweak to the active tally.
+        /// Kept beside `lists_active`: a failed source can still serve its
+        /// retained last-good cache.
         ///
         /// 0 when decoded from a daemon that predates the counter, which
         /// is indistinguishable from "nothing truncated" — acceptable,
@@ -1078,10 +1127,11 @@ pub enum IpcResponse {
         /// `[lists] max_total_domains`.
         ///
         /// Needs its own channel for the same reason `lists_truncated`
-        /// does, only more so: in this state every source fetched, parsed
-        /// and reported `Ok`, so `lists_active`/`lists_total` reads `N/N`
-        /// while the daemon serves the *previous* generation. No
-        /// per-source field can express a cycle-level outcome.
+        /// does, only more so: every source can fetch and parse `Ok` while
+        /// the aggregate is refused. A complete prior generation remains
+        /// only when one exists; a cold start may install over the ceiling
+        /// up to its hard cap, then refuses with nothing installed. No
+        /// per-source field can express that cycle-level outcome.
         ///
         /// `None` when decoded from a daemon that predates the guard,
         /// which is indistinguishable from "nothing refused" — the same
@@ -1165,6 +1215,16 @@ pub enum IpcResponse {
     /// the source had any in-memory or on-disk state before the call —
     /// `false` is the idempotent / no-op case, not an error.
     ListForgotten { id: String, was_cached: bool },
+    /// Completed result of [`IpcCommand::ForceListRefresh`]. The snapshot is
+    /// the actor-returned value, never a second read of shared state.
+    ListRefreshCompleted {
+        disposition: crate::lists::manager::ListManagerCommandDisposition,
+        snapshot: ListRegistrySnapshotDto,
+        /// Ceiling actually enforced by the manager for this cycle. Zero
+        /// means explicitly disabled; omission means it was unavailable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_total_domains: Option<u64>,
+    },
     /// Domain count response.
     DomainCount { count: usize },
     /// Tracking stats (global + top-N + time-series).

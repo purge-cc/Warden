@@ -9,7 +9,7 @@
 //! Mutation flow:
 //!   1. Validator pre-flight against the merged `[existing..., new]`
 //!      slice via `validate_local_records_v2`.
-//!   2. TOML mutation via [`super::target::write_value_validated`]: the
+//!   2. TOML mutation via [`super::target::write_value_validated_locked`]: the
 //!      full v1 loader runs against the STAGED bytes before the rename,
 //!      so a tree the loader would reject never lands on disk.
 //!   3. `super::ipc_reload::attempt_reload` fires the reload feedback.
@@ -33,12 +33,13 @@ use crate::config::validator::validate_local_records_v2;
 
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::target::{
-    count_devices_on_profile, read_or_empty, resolve_explicit_into_under, write_value_validated,
+    read_or_empty_locked, resolve_explicit_into_under_locked, write_value_validated_locked,
 };
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 use self::profile_scoped::{
-    ensure_profile_exists, ensure_profile_exists_in, find_profile_entry_mut,
-    find_profile_target_file, load_for_resolution,
+    ensure_profile_exists_in, ensure_profile_exists_locked, find_profile_entry_mut,
+    find_profile_target_file_locked, load_for_resolution, load_for_resolution_locked,
 };
 
 // ── Frozen strings ─────────────────────────────────────────────────────
@@ -59,8 +60,7 @@ pub fn format_local_records_profile_not_found(id: &str, known: &[&str]) -> Strin
 }
 
 /// Operator-facing success message for a global-scope `add`.
-pub const LOCAL_RECORDS_ADDED_GLOBAL: &str =
-    "Added global local DNS record '{domain}' {type} → {value}. To remove: warden local-dns remove '{domain}'";
+pub const LOCAL_RECORDS_ADDED_GLOBAL: &str = "Added global local DNS record '{domain}' {type} → {value}. To remove: warden local-dns remove '{domain}'";
 
 pub fn format_local_records_added_global(domain: &str, ty: &str, value: &str) -> String {
     LOCAL_RECORDS_ADDED_GLOBAL
@@ -70,8 +70,7 @@ pub fn format_local_records_added_global(domain: &str, ty: &str, value: &str) ->
 }
 
 /// Operator-facing success message for a profile-scope `add`.
-pub const LOCAL_RECORDS_ADDED_PROFILE: &str =
-    "Added local DNS record '{domain}' {type} → {value} on profile '{profile}'. Affects {n} device(s) currently. To remove: warden local-dns remove '{domain}' --profile '{profile}'";
+pub const LOCAL_RECORDS_ADDED_PROFILE: &str = "Added local DNS record '{domain}' {type} → {value} on profile '{profile}'. Affects {n} device(s) currently. To remove: warden local-dns remove '{domain}' --profile '{profile}'";
 
 pub fn format_local_records_added_profile(
     domain: &str,
@@ -113,8 +112,7 @@ pub const LOCAL_RECORDS_TAB_EMPTY_GLOBAL: &str =
     "No global local DNS records. Add with `warden local-dns add <domain> <type> <value>`.";
 
 /// TUI Local DNS tab — empty state on a per-profile panel.
-pub const LOCAL_RECORDS_TAB_EMPTY_PROFILE: &str =
-    "No local DNS records on profile '{profile}'. Add with `warden local-dns add <domain> <type> <value> --profile '{profile}'`.";
+pub const LOCAL_RECORDS_TAB_EMPTY_PROFILE: &str = "No local DNS records on profile '{profile}'. Add with `warden local-dns add <domain> <type> <value> --profile '{profile}'`.";
 
 pub fn format_local_records_tab_empty_profile(profile: &str) -> String {
     LOCAL_RECORDS_TAB_EMPTY_PROFILE.replace("{profile}", profile)
@@ -245,15 +243,32 @@ pub(crate) fn add_inner(
     spec: &LocalRecordSpec,
     into: Option<&Path>,
 ) -> anyhow::Result<AddOutcome> {
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(&guard, config_path, scope, spec, into)
+}
+
+/// Guarded add entry point for compound TUI edits.
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    scope: &LocalRecordScope,
+    spec: &LocalRecordSpec,
+    into: Option<&Path>,
+) -> anyhow::Result<AddOutcome> {
     // 1. Validate scope target exists (profile-scope only — global
     //    always has a home, the master config).
     if let LocalRecordScope::Profile(id) = scope {
-        ensure_profile_exists(config_path, id, format_local_records_profile_not_found)?;
+        ensure_profile_exists_locked(
+            guard,
+            config_path,
+            id,
+            format_local_records_profile_not_found,
+        )?;
     }
 
     // 2. Snapshot existing records in this scope (for idempotency probe
     //    + validator pre-flight context).
-    let existing = load_scope_records(config_path, scope)?;
+    let existing = load_scope_records_locked(guard, config_path, scope)?;
 
     // 3. Idempotent silent no-op: identical record already present.
     let new_record = spec.to_schema();
@@ -279,13 +294,13 @@ pub(crate) fn add_inner(
     let target_path = match scope {
         LocalRecordScope::Global => config_path.to_path_buf(),
         LocalRecordScope::Profile(id) => match into {
-            Some(p) => resolve_explicit_into_under(config_path, p)?,
-            None => find_profile_target_file(config_path, id)?,
+            Some(p) => resolve_explicit_into_under_locked(guard, config_path, p)?,
+            None => find_profile_target_file_locked(guard, config_path, id)?,
         },
     };
 
     // 6. TOML mutation.
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let inserted = match scope {
         LocalRecordScope::Global => append_global_record(&mut doc, spec)?,
         LocalRecordScope::Profile(id) => append_profile_record(&mut doc, id, spec)?,
@@ -295,7 +310,7 @@ pub(crate) fn add_inner(
         // record between step 3 and now. Treat as no-op.
         return Ok(AddOutcome::NoOp);
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     // 7. Audit emit (single-seat). Best-effort — never bubbles. The
     //    record `value` / `match_subdomains` / `ttl_secs` are persisted
@@ -340,7 +355,7 @@ pub(crate) fn add_inner(
 
     let devices_affected = match scope {
         LocalRecordScope::Global => 0,
-        LocalRecordScope::Profile(id) => count_devices_on_profile(config_path, id),
+        LocalRecordScope::Profile(id) => count_devices_on_profile_locked(guard, config_path, id),
     };
     Ok(AddOutcome::Applied {
         file: target_path,
@@ -358,16 +373,34 @@ pub(crate) fn remove_inner(
     record_type_filter: Option<LocalDnsRecordType>,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, scope, domain, record_type_filter, into)
+}
+
+/// Guarded remove entry point for compound TUI edits.
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    scope: &LocalRecordScope,
+    domain: &str,
+    record_type_filter: Option<LocalDnsRecordType>,
+    into: Option<&Path>,
+) -> anyhow::Result<RemoveOutcome> {
     if let LocalRecordScope::Profile(id) = scope {
-        ensure_profile_exists(config_path, id, format_local_records_profile_not_found)?;
+        ensure_profile_exists_locked(
+            guard,
+            config_path,
+            id,
+            format_local_records_profile_not_found,
+        )?;
     }
 
     let canonical_domain = domain.to_ascii_lowercase();
     let target_path = match scope {
         LocalRecordScope::Global => config_path.to_path_buf(),
         LocalRecordScope::Profile(id) => match into {
-            Some(p) => resolve_explicit_into_under(config_path, p)?,
-            None => find_profile_target_file(config_path, id)?,
+            Some(p) => resolve_explicit_into_under_locked(guard, config_path, p)?,
+            None => find_profile_target_file_locked(guard, config_path, id)?,
         },
     };
 
@@ -376,7 +409,7 @@ pub(crate) fn remove_inner(
     // one record matches we have enough signal to populate every field;
     // on a multi-match remove we leave them empty so the audit panel
     // doesn't claim a single value covered all dropped rows.
-    let pre_removal: Vec<LocalDnsRecord> = load_scope_records(config_path, scope)
+    let pre_removal: Vec<LocalDnsRecord> = load_scope_records_locked(guard, config_path, scope)
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.domain.eq_ignore_ascii_case(&canonical_domain))
@@ -386,7 +419,7 @@ pub(crate) fn remove_inner(
         })
         .collect();
 
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let n_dropped = match scope {
         LocalRecordScope::Global => {
             drop_global_records(&mut doc, &canonical_domain, record_type_filter)?
@@ -398,7 +431,7 @@ pub(crate) fn remove_inner(
     if n_dropped == 0 {
         return Ok(RemoveOutcome::NotFound);
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let scope_tag = scope.as_tag();
     let target_id_for_audit = scope.target_id().to_string();
@@ -773,8 +806,34 @@ pub(crate) mod profile_scoped {
     use toml::Value;
 
     use crate::cli::commands::target::{self, EntityClass};
-    use crate::config::loader::load_config;
-    use crate::config::schema::ConfigV1;
+    use crate::config::loader::{load_config, load_config_for_schema_under_guard, MAX_TOTAL_BYTES};
+    use crate::config::schema::{ConfigV1, SCHEMA_VERSION_V1};
+    use crate::config::tree_io::CappedRead;
+    use crate::config::write_lock::ConfigWriteLock;
+
+    #[derive(Debug)]
+    pub(super) struct ProfileOwnerScanLimitExceeded {
+        pub(super) budget: u64,
+        pub(super) scanned_bytes: u64,
+        pub(super) bytes_read: u64,
+        pub(super) path: PathBuf,
+    }
+
+    impl std::fmt::Display for ProfileOwnerScanLimitExceeded {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "profile owner scan would exceed {} bytes (>{} MB cap reading {}, observed {} bytes after {} bytes)",
+                self.budget,
+                self.budget / 1024 / 1024,
+                self.path.display(),
+                self.bytes_read,
+                self.scanned_bytes,
+            )
+        }
+    }
+
+    impl std::error::Error for ProfileOwnerScanLimitExceeded {}
 
     /// Renders the caller's own "profile not found" message.
     ///
@@ -784,12 +843,13 @@ pub(crate) mod profile_scoped {
     /// behaviour switch: the control flow is identical either way.
     pub(crate) type ProfileNotFound = fn(&str, &[&str]) -> String;
 
-    pub(crate) fn ensure_profile_exists(
+    pub(crate) fn ensure_profile_exists_locked(
+        guard: &ConfigWriteLock,
         config_path: &Path,
         profile_id: &str,
         not_found: ProfileNotFound,
     ) -> anyhow::Result<()> {
-        let cfg = load_for_resolution(config_path)?;
+        let cfg = load_for_resolution_locked(guard, config_path)?;
         ensure_profile_exists_in(&cfg, profile_id, not_found)
     }
 
@@ -805,26 +865,87 @@ pub(crate) mod profile_scoped {
         bail!("{}", not_found(profile_id, &known));
     }
 
-    /// Locate the file containing `[profiles.<profile_id>]`.
-    ///
-    /// Delegates to [`target::find_target_for_id`], which resolves owners from
-    /// the loader's include graph. A profile living in an include the master
-    /// reaches by glob is found here; a scan restricted to the master plus
-    /// `profiles.d/*.toml` accepts the id and then fails the write.
-    pub(crate) fn find_profile_target_file(
+    pub(crate) fn find_profile_target_file_locked(
+        guard: &ConfigWriteLock,
         config_path: &Path,
         profile_id: &str,
     ) -> anyhow::Result<PathBuf> {
-        if let Some(owner) =
-            target::find_target_for_id(config_path, EntityClass::Profiles, profile_id)?
-        {
-            return Ok(owner);
+        find_profile_target_file_locked_with_budget(guard, config_path, profile_id, MAX_TOTAL_BYTES)
+    }
+
+    fn find_profile_target_file_locked_with_budget(
+        guard: &ConfigWriteLock,
+        config_path: &Path,
+        profile_id: &str,
+        raw_byte_budget: u64,
+    ) -> anyhow::Result<PathBuf> {
+        let candidates =
+            target::owner_candidate_files_locked(guard, config_path, &[EntityClass::Profiles])?;
+        let mut scanned_bytes = 0_u64;
+        for path in candidates.iter() {
+            // Optional owner candidates are a repair path: unreadable and
+            // malformed members cannot own this edit, so inspect the next.
+            let remaining = raw_byte_budget.saturating_sub(scanned_bytes);
+            let Ok((raw, display)) =
+                target::read_raw_capped_locked(guard, config_path, path, remaining)
+            else {
+                continue;
+            };
+            let doc = match raw {
+                CappedRead::Missing => Value::Table(Default::default()),
+                CappedRead::Contents(bytes) => {
+                    scanned_bytes += bytes.len() as u64;
+                    let Ok(source) = std::str::from_utf8(&bytes) else {
+                        continue;
+                    };
+                    match source.parse::<Value>() {
+                        Ok(doc) => doc,
+                        Err(_) => continue,
+                    }
+                }
+                CappedRead::LimitExceeded { bytes_read } => {
+                    bail!(ProfileOwnerScanLimitExceeded {
+                        budget: raw_byte_budget,
+                        scanned_bytes,
+                        bytes_read,
+                        path: display,
+                    });
+                }
+            };
+            if doc
+                .get("profiles")
+                .and_then(Value::as_table)
+                .is_some_and(|profiles| profiles.contains_key(profile_id))
+            {
+                return Ok(path.clone());
+            }
         }
-        bail!(
-            "profile '{profile_id}' not found in any of the {} config file(s) reachable from {}. \
+        bail!(profile_owner_not_found(
+            profile_id,
+            candidates.len(),
+            config_path
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn find_profile_target_file_locked_with_budget_for_test(
+        guard: &ConfigWriteLock,
+        config_path: &Path,
+        profile_id: &str,
+        raw_byte_budget: u64,
+    ) -> anyhow::Result<PathBuf> {
+        find_profile_target_file_locked_with_budget(guard, config_path, profile_id, raw_byte_budget)
+    }
+
+    fn profile_owner_not_found(
+        profile_id: &str,
+        candidate_count: usize,
+        config_path: &Path,
+    ) -> String {
+        format!(
+            "profile '{profile_id}' not found in any of the {candidate_count} config file(s) reachable from {}. \
              Run `warden profile list` to see configured profiles, or pass `--into <file>` \
              to target a specific include.",
-            target::owner_candidate_files(config_path, &[EntityClass::Profiles]).len(),
             config_path.display()
         )
     }
@@ -832,6 +953,23 @@ pub(crate) mod profile_scoped {
     pub(crate) fn load_for_resolution(config_path: &Path) -> anyhow::Result<ConfigV1> {
         let now = time::OffsetDateTime::now_utc();
         load_config(config_path, now)
+            .map(|loaded| loaded.config)
+            .map_err(|errs| {
+                let mut msg = format!("cannot load config ({} error(s)):", errs.len());
+                for e in &errs {
+                    msg.push_str("\n  - ");
+                    msg.push_str(&e.to_string());
+                }
+                anyhow::anyhow!(msg)
+            })
+    }
+
+    pub(crate) fn load_for_resolution_locked(
+        guard: &ConfigWriteLock,
+        config_path: &Path,
+    ) -> anyhow::Result<ConfigV1> {
+        let now = time::OffsetDateTime::now_utc();
+        load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
             .map(|loaded| loaded.config)
             .map_err(|errs| {
                 let mut msg = format!("cannot load config ({} error(s)):", errs.len());
@@ -860,11 +998,12 @@ pub(crate) mod profile_scoped {
     }
 }
 
-fn load_scope_records(
+fn load_scope_records_locked(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     scope: &LocalRecordScope,
 ) -> anyhow::Result<Vec<LocalDnsRecord>> {
-    let cfg = load_for_resolution(config_path)?;
+    let cfg = load_for_resolution_locked(guard, config_path)?;
     match scope {
         LocalRecordScope::Global => Ok(cfg.local_dns.records.clone()),
         LocalRecordScope::Profile(id) => {
@@ -875,6 +1014,24 @@ fn load_scope_records(
             Ok(p.local_records.clone())
         }
     }
+}
+
+fn count_devices_on_profile_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    profile_id: &str,
+) -> usize {
+    load_for_resolution_locked(guard, config_path)
+        .map(|cfg| {
+            cfg.devices
+                .iter()
+                .filter(|d| {
+                    super::target::effective_profile_for_device(&cfg, d)
+                        .is_some_and(|p| p.as_str() == profile_id)
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 // ── Helpers: TOML mutations ───────────────────────────────────────────
@@ -1059,6 +1216,7 @@ fn spec_to_toml_value(spec: &LocalRecordSpec) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// `rewrite` once carried its own byte-identical copy of this layer,
     /// operator-facing not-found text included, so improving one verb
@@ -1097,7 +1255,7 @@ mod tests {
     }
 
     fn v1_master_with_default_profile() -> &'static str {
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1116,6 +1274,95 @@ display_name = "Kids"
 [upstream]
 servers = ["192.0.2.1:53"]
 "#
+    }
+
+    fn owner_scan_master(dir: &Path) -> PathBuf {
+        let master = dir.join("config.toml");
+        std::fs::write(&master, v1_master_with_default_profile()).unwrap();
+        master
+    }
+
+    #[test]
+    fn profile_owner_scan_returns_before_a_later_unreadable_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = owner_scan_master(dir.path());
+        let profiles_dir = dir.path().join("profiles.d");
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let later = profiles_dir.join("later-unreadable.toml");
+        std::fs::write(&later, "[profiles.later]\n").unwrap();
+        std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&later).is_ok() {
+            // Privileged test runners bypass mode bits, so cannot exercise
+            // the eager-open regression deterministically.
+            std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let budget = std::fs::read_to_string(&master).unwrap().len() as u64;
+        let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+
+        let owner = profile_scoped::find_profile_target_file_locked_with_budget_for_test(
+            &guard, &master, "default", budget,
+        )
+        .unwrap();
+
+        assert_eq!(owner, master);
+        drop(guard);
+        std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn profile_owner_scan_refuses_undeclared_candidates_over_the_cumulative_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = owner_scan_master(dir.path());
+        let profiles_dir = dir.path().join("profiles.d");
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let first = profiles_dir.join("a.toml");
+        let second = profiles_dir.join("b.toml");
+        std::fs::write(&first, "# first\n").unwrap();
+        std::fs::write(&second, "# ".repeat(1024 * 1024)).unwrap();
+        let budget = (std::fs::read_to_string(&master).unwrap().len()
+            + std::fs::read_to_string(&first).unwrap().len()) as u64;
+        let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+
+        let err = profile_scoped::find_profile_target_file_locked_with_budget_for_test(
+            &guard, &master, "wanted", budget,
+        )
+        .unwrap_err();
+        let limit = err
+            .downcast_ref::<profile_scoped::ProfileOwnerScanLimitExceeded>()
+            .expect("structured profile owner scan limit error");
+
+        assert_eq!(limit.budget, budget);
+        assert_eq!(limit.scanned_bytes, budget);
+        assert_eq!(limit.bytes_read, 1);
+        assert_eq!(limit.path, second);
+    }
+
+    #[test]
+    fn profile_owner_scan_charges_invalid_utf8_before_skipping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = owner_scan_master(dir.path());
+        let profiles_dir = dir.path().join("profiles.d");
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let invalid = profiles_dir.join("a.toml");
+        let later = profiles_dir.join("b.toml");
+        std::fs::write(&invalid, [0xff; 4]).unwrap();
+        std::fs::write(&later, "# later\n").unwrap();
+        let budget = (std::fs::read_to_string(&master).unwrap().len()
+            + std::fs::read(&invalid).unwrap().len()) as u64;
+        let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+
+        let err = profile_scoped::find_profile_target_file_locked_with_budget_for_test(
+            &guard, &master, "wanted", budget,
+        )
+        .unwrap_err();
+        let limit = err
+            .downcast_ref::<profile_scoped::ProfileOwnerScanLimitExceeded>()
+            .expect("structured profile owner scan limit error");
+
+        assert_eq!(limit.scanned_bytes, budget);
+        assert_eq!(limit.bytes_read, 1);
+        assert_eq!(limit.path, later);
     }
 
     fn make_spec_a(domain: &str, value: &str) -> LocalRecordSpec {

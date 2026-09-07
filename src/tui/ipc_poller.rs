@@ -138,13 +138,10 @@ impl IpcPoller {
             // its `cache_capacity` extrapolation and surface real list /
             // version counters.
             //
-            // `lists_corpus_refusal`, `lists_corpus_freeze` and
-            // `lists_truncated` must NOT be swallowed by the `..` below:
-            // each describes an outcome that the counters beside them
-            // actively contradict. A refused or truncated cycle still
-            // reports `lists_active == lists_total`, because every source
-            // really did fetch. Anything added here that qualifies an
-            // existing counter must be destructured, not defaulted away.
+            // `lists_corpus_refusal`, `lists_corpus_freeze`, `lists_cycle`
+            // and `lists_truncated` must NOT be swallowed by the `..` below:
+            // each qualifies the counters beside it and must not be
+            // defaulted away.
             //
             // `upstream_servers` flows through so the System card can
             // render the literal resolver addresses.
@@ -164,6 +161,7 @@ impl IpcPoller {
                 resource_budget,
                 lists_corpus_refusal,
                 lists_corpus_freeze,
+                lists_cycle,
                 lists_truncated,
                 upstream_servers,
                 ..
@@ -183,6 +181,7 @@ impl IpcPoller {
                 resource_budget,
                 lists_corpus_refusal,
                 lists_corpus_freeze,
+                lists_cycle,
                 lists_truncated,
                 upstream_servers,
             }),
@@ -552,7 +551,7 @@ pub struct PromoteFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lists::status::{CorpusFreeze, CorpusRefusal};
+    use crate::lists::status::{CorpusFreeze, CorpusRefusal, CycleMark, CycleOutcome};
     use time::macros::datetime;
 
     /// Build a `Status` response with every field named explicitly.
@@ -608,6 +607,21 @@ mod tests {
         }
     }
 
+    fn with_coverage_cycle(outcome: CycleOutcome) -> IpcResponse {
+        let mut response = status_response(None, None, 0);
+        let IpcResponse::Status { lists_cycle, .. } = &mut response else {
+            unreachable!("status_response always returns Status");
+        };
+        *lists_cycle = Some(CycleMark {
+            seq: 1,
+            outcome: Some(outcome),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: Default::default(),
+        });
+        response
+    }
+
     /// The projection must CARRY the refusal, not merely compile.
     ///
     /// The mutation this is built to catch is not deletion — dropping the
@@ -639,8 +653,7 @@ mod tests {
         let status = IpcPoller::status_from_response(status_response(None, None, 3)).unwrap();
         assert_eq!(
             status.lists_truncated, 3,
-            "a truncated source is also `active`, so this counter is the only \
-             thing that can contradict a healthy-looking N/N"
+            "entry-cap refusals must survive the projection for operator visibility"
         );
     }
 
@@ -657,6 +670,16 @@ mod tests {
             .expect("the freeze must survive the projection, not vanish into the `..`");
         assert_eq!(carried.consecutive, 9);
         assert_eq!(carried.since, Some(datetime!(2026-08-04 03:00:00 UTC)));
+    }
+
+    #[test]
+    fn coverage_qualifier_survives_the_poller_projection() {
+        let status =
+            IpcPoller::status_from_response(with_coverage_cycle(CycleOutcome::SpillRollbackFailed))
+                .unwrap();
+        assert!(status
+            .lists_cycle
+            .is_some_and(|cycle| cycle.source_coverage_incomplete));
     }
 
     /// The control arm. Without it, a projection that hardcoded

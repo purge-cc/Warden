@@ -13,7 +13,7 @@ fn master_with(dir: &tempfile::TempDir, kids_extra: &str) -> PathBuf {
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -136,9 +136,93 @@ fn creating_writes_the_pack_file_and_the_declaration() {
     );
 }
 
-/// **`create_pack` OVERWRITES and `upsert_id_keyed` REPLACES**, so a
-/// create on a taken id would destroy that list's rules before the
-/// config write was even attempted. It is refused up front.
+#[test]
+fn uncertain_declaration_commit_retains_the_new_pack() {
+    use crate::cli::commands::target::{
+        commit_prevalidated_single_write_with_ops, prepare_value_validated_single_locked,
+        read_or_empty_locked, upsert_id_keyed,
+    };
+    use crate::config::atomic_write::{
+        hardened_atomic_write_at, AtomicWriteAtOpts, AtomicWriteTestFailure,
+    };
+    use crate::config::custom_list::io::create_pack_with_receipt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let resolved = custom_list_modal::ResolvedForm {
+        id: "tv".to_string(),
+        display_name: "Telly".to_string(),
+        description: String::new(),
+    };
+    let guard = crate::tui::tabs::custom_lists::claim_tree(&master).unwrap();
+    let loaded = load_v1_config_locked(&guard, &master).unwrap();
+    let id = crate::config::schema::Id::new(&resolved.id).unwrap();
+    let path = crate::config::custom_list::pack_path(&guard.identity().root, &id);
+    let receipt = create_pack_with_receipt(
+        &guard,
+        &path,
+        &resolved.display_name,
+        crate::tui::tabs::custom_lists::max_pack_bytes(&loaded),
+    )
+    .unwrap();
+    let (mut doc, _) = read_or_empty_locked(&guard, &master, &loaded.master_path).unwrap();
+    upsert_id_keyed(
+        &mut doc,
+        "custom_lists",
+        &resolved.id,
+        custom_list_value(&resolved),
+    )
+    .unwrap();
+    let prepared =
+        prepare_value_validated_single_locked(&guard, &master, &loaded.master_path, &doc).unwrap();
+    let commit_error = commit_prevalidated_single_write_with_ops(
+        prepared,
+        |target, content| {
+            hardened_atomic_write_at(
+                target,
+                content.as_bytes(),
+                AtomicWriteAtOpts {
+                    test_failure: Some(AtomicWriteTestFailure::ParentFsync),
+                    ..Default::default()
+                },
+            )
+        },
+        |target, before| {
+            let rollback = target.rollback_target()?;
+            let original = before.expect("the fixture starts with a master declaration");
+            hardened_atomic_write_at(
+                &rollback,
+                original.as_bytes(),
+                AtomicWriteAtOpts {
+                    test_failure: Some(AtomicWriteTestFailure::ParentFsync),
+                    ..Default::default()
+                },
+            )
+            .map_err(anyhow::Error::new)
+        },
+    )
+    .expect_err("post-rename failure with failed rollback is uncertain");
+
+    let error = finish_custom_list_declaration_commit_failure(receipt, &path, commit_error)
+        .expect_err("an uncertain declaration commit must require recovery");
+    assert!(error.contains("retaining newly created"), "got: {error}");
+    assert!(
+        path.exists(),
+        "the pack must remain when declaration durability is uncertain"
+    );
+    drop(guard);
+    assert!(
+        !reload(&master)
+            .config
+            .custom_lists
+            .iter()
+            .any(|list| list.id == id),
+        "the injected rollback restored visible declaration absence"
+    );
+}
+
+/// A create on a taken id is refused under the guarded live declaration
+/// check, before it can publish or touch that list's pack.
 #[test]
 fn creating_refuses_a_taken_id_without_touching_its_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -161,6 +245,192 @@ fn creating_refuses_a_taken_id_without_touching_its_file() {
         before,
         "the existing pack must be byte-identical — this is where 32 \
              hand-written rules would have gone"
+    );
+}
+
+/// A create retains its one acquisition for both pack publication and
+/// declaration promotion. A second claim would self-contend under flock; the
+/// hook catches that immediately instead of waiting for the deadline.
+#[test]
+fn creating_custom_list_never_self_contends() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let acquisitions = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&acquisitions);
+
+    crate::config::write_lock::with_test_hook(
+        move |event| {
+            if event == crate::config::write_lock::TestEvent::Contended {
+                panic!("create_custom_list must not acquire a second guard");
+            }
+            if event == crate::config::write_lock::TestEvent::WriteRootLocked {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+        || {
+            create_custom_list(
+                &master,
+                &custom_list_modal::ResolvedForm {
+                    id: "tv".to_string(),
+                    display_name: "Telly".to_string(),
+                    description: String::new(),
+                },
+            )
+            .expect("create must succeed");
+        },
+    );
+    assert_eq!(
+        acquisitions.load(Ordering::SeqCst),
+        1,
+        "pack creation and declaration promotion must share one write guard"
+    );
+}
+
+/// The operation must load only after it owns the tree.  A peer declaring the
+/// id while this operation is waiting makes the create refuse rather than
+/// publishing/overwriting the pack based on the stale modal snapshot.
+#[test]
+fn creating_observes_a_peer_declaration_landed_before_acquisition() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let held = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let (contended_tx, contended_rx) = mpsc::channel();
+
+    let result = std::thread::scope(|scope| {
+        let worker_master = master.clone();
+        let worker = scope.spawn(move || {
+            crate::config::write_lock::with_test_hook(
+                move |event| {
+                    if event == crate::config::write_lock::TestEvent::Contended {
+                        contended_tx.send(()).unwrap();
+                    }
+                },
+                || {
+                    create_custom_list(
+                        &worker_master,
+                        &custom_list_modal::ResolvedForm {
+                            id: "tv".to_string(),
+                            display_name: "Telly".to_string(),
+                            description: String::new(),
+                        },
+                    )
+                },
+            )
+        });
+        contended_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the create must contend before it can read the tree");
+
+        let loaded = load_v1_config_locked(&held, &master).unwrap();
+        let path = crate::config::custom_list::pack_path(
+            &held.identity().root,
+            &crate::config::schema::Id::new("tv").unwrap(),
+        );
+        crate::config::custom_list::create_pack(&held, &path, "Peer TV", 1024).unwrap();
+        crate::config::custom_list::add_rule(
+            &held,
+            &path,
+            "peer-sentinel.example.com",
+            false,
+            1024,
+        )
+        .unwrap();
+        let (mut doc, _) =
+            crate::cli::commands::target::read_or_empty_locked(&held, &master, &loaded.master_path)
+                .unwrap();
+        crate::cli::commands::target::upsert_id_keyed(
+            &mut doc,
+            "custom_lists",
+            "tv",
+            custom_list_value(&custom_list_modal::ResolvedForm {
+                id: "tv".to_string(),
+                display_name: "Peer TV".to_string(),
+                description: String::new(),
+            }),
+        )
+        .unwrap();
+        crate::cli::commands::target::write_value_validated_locked(
+            &held,
+            &master,
+            &loaded.master_path,
+            &doc,
+        )
+        .unwrap();
+        drop(held);
+        worker.join().unwrap()
+    });
+
+    let error = result.expect_err("the peer now owns this id");
+    assert!(error.contains("already exists"), "got: {error}");
+    assert_eq!(
+        std::fs::read(dir.path().join("packs").join("tv.txt")).unwrap(),
+        b"||peer-sentinel.example.com^\n",
+        "the stale create must preserve the peer's non-empty sentinel, not merely recreate an empty pack"
+    );
+}
+
+/// A migration journal is rejected at acquisition, before create can publish
+/// a pack or inspect the live declaration tree.
+#[test]
+fn creating_refuses_a_migration_fence_before_any_pack_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let migration = crate::config::write_lock::acquire_for_migration(&master).unwrap();
+    crate::config::migration_journal::create_fence(&migration).unwrap();
+    drop(migration);
+
+    let error = create_custom_list(
+        &master,
+        &custom_list_modal::ResolvedForm {
+            id: "tv".to_string(),
+            display_name: "Telly".to_string(),
+            description: String::new(),
+        },
+    )
+    .expect_err("a live migration fence must refuse normal writes");
+    assert!(error.contains("migration"), "got: {error}");
+    assert!(
+        !dir.path().join("packs").join("tv.txt").exists(),
+        "the refused create must not publish a pack"
+    );
+}
+
+/// A master alias resolves all new managed files under the canonical tree,
+/// never beside the alias path used to launch the TUI.
+#[test]
+fn creating_through_a_master_alias_keeps_pack_under_canonical_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("dashboard.toml");
+    std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+    create_custom_list(
+        &alias,
+        &custom_list_modal::ResolvedForm {
+            id: "tv".to_string(),
+            display_name: "Telly".to_string(),
+            description: String::new(),
+        },
+    )
+    .expect("the canonical tree owns the create");
+
+    assert!(std::fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(dir.path().join("packs").join("tv.txt").exists());
+    assert!(
+        !alias_dir.path().join("packs").exists(),
+        "no pack directory may appear beside a master alias"
     );
 }
 
@@ -199,6 +469,11 @@ fn editing_metadata_leaves_the_pack_file_byte_identical() {
             display_name: "Renamed".to_string(),
             description: "a note".to_string(),
         },
+        &custom_list_modal::OriginalSnapshot {
+            id: "videogames".to_string(),
+            display_name: "Video games".to_string(),
+            description: String::new(),
+        },
     )
     .expect("edit must succeed");
 
@@ -207,6 +482,44 @@ fn editing_metadata_leaves_the_pack_file_byte_identical() {
     let e = &after.config.custom_lists[0];
     assert_eq!(e.display_name, "Renamed");
     assert_eq!(e.description, "a note");
+}
+
+/// A modal changes only its name while a peer adds a description before the
+/// guarded save. The peer's untouched field must survive the disk round-trip.
+#[tokio::test]
+async fn editing_only_the_name_preserves_a_peer_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    let opened = reload(&master)
+        .config
+        .custom_lists
+        .into_iter()
+        .find(|list| list.id.as_str() == "videogames")
+        .expect("the fixture declares the edited list");
+
+    let peer = std::fs::read_to_string(&master).unwrap().replace(
+        "display_name = \"Video games\"",
+        "display_name = \"Video games\"\ndescription = \"peer description\"",
+    );
+    std::fs::write(&master, peer).unwrap();
+
+    let mut form = custom_list_modal::Form::new_edit(&opened, "packs".to_string());
+    form.display_name = "Operator rename".to_string();
+    let modal = custom_list_modal::CustomListModal {
+        stage: custom_list_modal::Stage::EditingForm(form),
+    };
+    let mut app = App::new();
+    let poller = IpcPoller::new(&dir.path().join("ghost.sock"));
+    submit_custom_list_modal(&mut app, modal, &poller, &master).await;
+
+    let list = reload(&master)
+        .config
+        .custom_lists
+        .into_iter()
+        .find(|list| list.id.as_str() == "videogames")
+        .expect("the edited list remains declared");
+    assert_eq!(list.display_name, "Operator rename");
+    assert_eq!(list.description, "peer description");
 }
 
 /// A pack shaped like a real one: comment headings organising the
@@ -271,8 +584,7 @@ fn adding_a_rule_from_the_tui_destroys_no_comment_and_no_broken_line() {
              test cannot see the loss it exists for"
     );
 
-    let app = app_on(&master);
-    add_rule_to_pack(&app, "videogames", "new.example.com", false).expect("the add must land");
+    add_rule_to_pack(&master, "videogames", "new.example.com", false).expect("the add must land");
 
     let after = std::fs::read_to_string(&pack).unwrap();
     assert_eq!(
@@ -306,8 +618,7 @@ fn removing_a_rule_from_the_tui_destroys_no_comment_and_no_broken_line() {
     std::fs::write(&pack, MESSY_PACK).unwrap();
     let before = std::fs::read_to_string(&pack).unwrap();
 
-    let app = app_on(&master);
-    remove_rule_from_pack(&app, "videogames", "tracking.example.com")
+    remove_rule_from_pack(&master, "videogames", "tracking.example.com")
         .expect("the remove must land");
 
     let after = std::fs::read_to_string(&pack).unwrap();
@@ -334,8 +645,7 @@ fn removing_takes_both_directions_of_the_same_domain() {
     )
     .unwrap();
 
-    let app = app_on(&master);
-    remove_rule_from_pack(&app, "videogames", "both.example.com").unwrap();
+    remove_rule_from_pack(&master, "videogames", "both.example.com").unwrap();
 
     let after = std::fs::read_to_string(&pack).unwrap();
     assert!(
@@ -356,8 +666,7 @@ fn adding_a_rule_that_is_already_there_writes_nothing() {
     std::fs::write(&pack, MESSY_PACK).unwrap();
     let before = std::fs::read_to_string(&pack).unwrap();
 
-    let app = app_on(&master);
-    let msg = add_rule_to_pack(&app, "videogames", "ads.example.com", false).unwrap();
+    let msg = add_rule_to_pack(&master, "videogames", "ads.example.com", false).unwrap();
 
     assert!(msg.contains("already"), "got: {msg}");
     assert_eq!(std::fs::read_to_string(&pack).unwrap(), before);
@@ -374,14 +683,36 @@ fn a_wildcard_is_refused_rather_than_written() {
     std::fs::write(&pack, MESSY_PACK).unwrap();
     let before = std::fs::read_to_string(&pack).unwrap();
 
-    let app = app_on(&master);
-    add_rule_to_pack(&app, "videogames", "*.evil.example.com", false)
+    add_rule_to_pack(&master, "videogames", "*.evil.example.com", false)
         .expect_err("a wildcard must be refused");
 
     assert_eq!(
         std::fs::read_to_string(&pack).unwrap(),
         before,
         "a refused rule must write nothing at all"
+    );
+}
+
+/// Domain grammar is local input validation. A malformed replacement must
+/// fail before this operation opens or reads the live config tree.
+#[test]
+fn invalid_pack_rule_is_refused_before_the_tree_is_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with(&dir, "");
+    crate::config::write_lock::with_test_hook(
+        |_| panic!("invalid domain reached tree access"),
+        || {
+            let error = replace_rule_in_pack(
+                &master,
+                "videogames",
+                2,
+                ("tracking.example.com", false),
+                "*.evil.example.com",
+                false,
+            )
+            .expect_err("wildcards are not custom-list domains");
+            assert!(error.contains("not allowed") || error.contains("unrecognised"));
+        },
     );
 }
 
@@ -643,9 +974,8 @@ fn replacing_a_rule_from_the_tui_destroys_no_comment_and_no_broken_line() {
         "the fixture must carry comments"
     );
 
-    let app = app_on_line(&master, 3);
     replace_rule_in_pack(
-        &app,
+        &master,
         "videogames",
         3,
         ("tracking.example.com", false),
@@ -685,9 +1015,8 @@ fn flipping_one_direction_from_the_tui_leaves_the_other_alone() {
     )
     .unwrap();
 
-    let app = app_on_line(&master, 2);
     replace_rule_in_pack(
-        &app,
+        &master,
         "videogames",
         2,
         ("both.example.com", true),
@@ -716,13 +1045,12 @@ fn a_replacement_whose_line_moved_under_the_pane_is_refused() {
     let pack = dir.path().join("packs").join("videogames.txt");
     std::fs::write(&pack, "||a.example.com^\n||b.example.com^\n").unwrap();
 
-    let app = app_on_line(&master, 2);
     // Somebody else rewrites the file behind the pane's back.
     std::fs::write(&pack, "||b.example.com^\n||c.example.com^\n").unwrap();
     let before = std::fs::read_to_string(&pack).unwrap();
 
     let err = replace_rule_in_pack(
-        &app,
+        &master,
         "videogames",
         2,
         ("b.example.com", false),

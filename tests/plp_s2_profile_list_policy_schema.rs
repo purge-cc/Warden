@@ -54,7 +54,7 @@ fn now() -> OffsetDateTime {
 /// belongs; carrying it here as well would make eleven tests about `lists`
 /// overrides depend on the strip.
 const ZIMA_SHAPE: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "plain"

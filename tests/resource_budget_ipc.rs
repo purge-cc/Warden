@@ -76,7 +76,9 @@ async fn spawn_fixture(tick: Duration, rss_warn_mb: u64) -> Fixture {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            purge_warden::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: purge_warden::ipc::socket_server::current_euid(),
         resource_budget_store: resource_budget_store.clone(),
         #[cfg(feature = "cluster")]

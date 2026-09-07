@@ -47,11 +47,13 @@ pub use device::Device;
 pub use group::Group;
 pub use id::Id;
 pub use label::{Label, LabelKind};
+pub use load::load_from_str_collect_for_schema;
 pub use profile::{BlockResponseV1, Profile, ProfileEcsConfig};
 pub use resource_budget::ResourceBudgetConfig;
 pub use retired::{RetiredEntry, RetiredType, RETIREMENT_WINDOW_DAYS};
 pub use schedule::{Schedule, ScheduleTargetType};
 pub use subnet::Subnet;
+pub use validator::validate_collect_for_schema;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -66,8 +68,9 @@ use crate::config::settings::{
 
 /// Fixed schema discriminant. Declared as a `u32` rather than a phantom
 /// enum variant so the TOML representation is a plain integer:
-/// `schema_version = 3`. The validator (or manual check) rejects any
-/// value other than [`SCHEMA_VERSION_V1`]. The legacy name
+/// `schema_version = 4`. Current-schema wrappers reject any value other than
+/// [`SCHEMA_VERSION_V1`]; explicit-target APIs can validate another version
+/// without changing the daemon's accepted schema. The legacy name
 /// `SCHEMA_VERSION_V1` is kept to minimise churn on call sites; treat the
 /// constant as "the schema version this binary supports", whatever the
 /// numeric value is.
@@ -76,13 +79,13 @@ use crate::config::settings::{
 /// ORDER.** `check_schema_version`
 /// demands equality, not `>=`, so an older version on disk under a newer
 /// binary is *refused*, not degraded: the daemon does not start. Every
-/// upgrade path that installs this binary must therefore migrate and lint
-/// **before** it restarts anything, and abort while the old daemon is
-/// still serving if either step fails. That sequence lives in
-/// `scripts/upgrade_config_gate.sh`, is called by `make upgrade` and by
-/// `scripts/install.sh` Phase 3.5, and is fenced by
+/// upgrade path must precheck, quiesce every old participant, preserve the
+/// old ELF and unit, migrate, install, health-check, and only then finalize.
+/// Before finalization the retained rollback snapshot restores the complete
+/// old tree together with its executable; this transaction is implemented by
+/// `scripts/upgrade_config_gate.sh` and fenced by
 /// `scripts/check_upgrade_config_gate.sh`.
-pub const SCHEMA_VERSION_V1: u32 = 3;
+pub const SCHEMA_VERSION_V1: u32 = 4;
 
 fn default_blocked_ttl_secs() -> u32 {
     60
@@ -527,7 +530,7 @@ mod tests {
         // the pass-through defaults produce, and the upstream default is now
         // one of the things being asserted (see the bottom of the fn).
         let src = r#"
-schema_version = 3
+schema_version = 4
 "#;
         let c: ConfigV1 = toml::from_str(src).unwrap();
         assert_eq!(c.schema_version, SCHEMA_VERSION_V1);
@@ -547,7 +550,7 @@ schema_version = 3
     fn top_level_unknown_field_rejected() {
         let err = toml::from_str::<ConfigV1>(
             r#"
-schema_version = 3
+schema_version = 4
 mystery = 1
 
 [upstream]
@@ -564,7 +567,7 @@ servers = ["192.0.2.1:53"]
 
         // Absent [dnssec] → off + design-doc cap defaults.
         let c: ConfigV1 =
-            toml::from_str("schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
+            toml::from_str("schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
                 .unwrap();
         assert_eq!(c.dnssec.mode, DnssecMode::Off);
         assert_eq!(c.dnssec.max_chain_depth, 10);
@@ -574,23 +577,23 @@ servers = ["192.0.2.1:53"]
 
         // Modes parse from kebab-case spelling.
         let validate: ConfigV1 =
-            toml::from_str("schema_version = 3\n[dnssec]\nmode = \"validate\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
+            toml::from_str("schema_version = 4\n[dnssec]\nmode = \"validate\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
         assert_eq!(validate.dnssec.mode, DnssecMode::Validate);
         let log_only: ConfigV1 =
-            toml::from_str("schema_version = 3\n[dnssec]\nmode = \"log-only\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
+            toml::from_str("schema_version = 4\n[dnssec]\nmode = \"log-only\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
         assert_eq!(log_only.dnssec.mode, DnssecMode::LogOnly);
 
         // A partial override keeps the other caps at their defaults
         // (container-level `#[serde(default)]`).
         let partial: ConfigV1 =
-            toml::from_str("schema_version = 3\n[dnssec]\nmax_queries = 12\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
+            toml::from_str("schema_version = 4\n[dnssec]\nmax_queries = 12\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n").unwrap();
         assert_eq!(partial.dnssec.mode, DnssecMode::Off);
         assert_eq!(partial.dnssec.max_queries, 12);
         assert_eq!(partial.dnssec.max_chain_depth, 10);
 
         // An unknown key in [dnssec] is rejected (deny_unknown_fields).
         assert!(
-            toml::from_str::<ConfigV1>("schema_version = 3\n[dnssec]\nmoed = \"validate\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
+            toml::from_str::<ConfigV1>("schema_version = 4\n[dnssec]\nmoed = \"validate\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
                 .is_err()
         );
     }
@@ -601,7 +604,7 @@ servers = ["192.0.2.1:53"]
         // sections; this test pins that ConfigV1 accepts them in one
         // parse pass without falling through to an unknown-field error.
         let src = r#"
-schema_version = 3
+schema_version = 4
 
 [server]
 listen = "0.0.0.0:53"
@@ -654,7 +657,7 @@ log_mode = "blocked_only"
         // guard on ServerGlobals makes this fail loudly at parse time.
         let err = toml::from_str::<ConfigV1>(
             r#"
-schema_version = 3
+schema_version = 4
 
 [server]
 block_unmapped_clients = true
@@ -670,7 +673,7 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn full_config_roundtrips() {
         let src = r#"
-schema_version = 3
+schema_version = 4
 includes = ["devices.d/*.toml"]
 
 [server]
@@ -721,7 +724,7 @@ rule = "@@||github.com^"
 servers = ["192.0.2.1:53"]
 "#;
         let c: ConfigV1 = toml::from_str(src).unwrap();
-        assert_eq!(c.schema_version, 3);
+        assert_eq!(c.schema_version, SCHEMA_VERSION_V1);
         assert_eq!(c.server.default_blocked_ttl_secs, 90);
         assert_eq!(c.blocklists.len(), 1);
         assert_eq!(c.profiles.len(), 1);
@@ -754,7 +757,7 @@ servers = ["192.0.2.1:53"]
     /// it (serialises as null/absent).
     fn secret_bearing_config() -> ConfigV1 {
         let src = r#"
-schema_version = 3
+schema_version = 4
 
 [api]
 enabled = true
@@ -874,7 +877,7 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn redacted_preserves_unset_shape() {
         let c = toml::from_str::<ConfigV1>(
-            "schema_version = 3\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         let json = serde_json::to_value(c.redacted()).unwrap();

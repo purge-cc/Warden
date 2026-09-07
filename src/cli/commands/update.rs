@@ -1,250 +1,170 @@
-//! `warden lists refresh` — trigger list re-download. Sends SIGHUP to a
-//! running daemon, or performs a foreground download if none is up.
+//! `warden lists refresh` — trigger list re-download through the live
+//! daemon's typed IPC, or perform a foreground download when it is stopped.
 //!
 //! The module keeps the `update` name (and `run_update` its symbol)
 //! because the CLI rename to `lists refresh` was a label change only;
 //! `tests/cli_update_pure_v1.rs` imports this path.
 
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::exit_codes::{CONFIG, SUCCESS};
-use crate::config::loader;
-use crate::filter::FilterEngine;
-use crate::lists::catalog::Catalog;
-use crate::lists::manager::{merge_sources_with_blocklists, ListManager};
-use crate::lists::source_key::{SourceBitMap, SourceTokenMap};
-
-use crate::lists::status::{CycleMark, CycleOutcome};
-
-use super::lists_knobs::{fetch_live_corpus, format_corpus_lines, LiveCorpus};
+use super::lists_knobs::{format_corpus_lines, LiveCorpus};
 use super::pid;
 use super::start::{list_stats_path, lists_cache_dir, ListStateWriteback, ManagerWiring};
+use crate::cli::exit_codes::{CONFIG, FAILURE, SUCCESS};
+use crate::config::loader;
+use crate::filter::FilterEngine;
+use crate::ipc::protocol::{IpcCommand, IpcResponse, ListRegistrySnapshotDto};
+use crate::ipc::socket_client::send_command;
+use crate::lists::manager::ListManager;
+use crate::lists::source_key::{ResolvedSourcePlan, SourceBitMap, SourceTokenMap};
+use crate::lists::status::{CycleOutcome, ServedState};
 
-/// How long to wait for the signalled reload to finish before giving up and
-/// saying so.
-///
-/// Sized against the work, not against a round number: a full rebuild of a
-/// ~13M-domain corpus is tens of seconds on the boxes this runs on. Too
-/// short and the command reports "could not confirm" on healthy hosts,
-/// which trains the operator to ignore the line; too long and a wedged
-/// daemon holds the terminal. The timeout is not a verdict either way — it
-/// is reported as the non-answer it is.
-const RELOAD_WAIT: Duration = Duration::from_secs(90);
-
-/// Gap between polls while waiting. Each one is a full IPC round-trip
-/// against a daemon that is busy merging, so this is deliberately not
-/// aggressive.
-const RELOAD_POLL_EVERY: Duration = Duration::from_secs(2);
-
-/// Whether the cycle that just ended can be attributed to this command.
-///
-/// A monotonic counter proves a cycle ENDED. It cannot, on its own, prove
-/// the cycle was the one this command asked for — SIGHUP carries no payload,
-/// so there is no request id to correlate on. The DISTANCE between the two
-/// readings is what remains, and it is enough to rule out the wrong claims.
-///
-/// Pulled out of [`report_reload_outcome`] purely so it can be tested: the
-/// caller is `async`, polls a real socket, and cannot be driven through
-/// these cases without a daemon. The rule is arithmetic and belongs where
-/// arithmetic can be checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attribution {
-    /// Exactly one cycle closed after the signal. Ours.
-    Ours,
-    /// More than one closed. The daemon runs periodic refreshes and serves
-    /// other clients, so the reported outcome may belong to one of those.
-    /// Reported as the latest, and said to be possibly not ours — the naive
-    /// "the counter moved, therefore this is my result" would present a
-    /// concurrent cycle's verdict as this command's own.
-    Ambiguous { cycles: u64 },
-    /// The counter went BACKWARDS, which it never does inside one process:
-    /// it is per-daemon and starts at zero. The daemon restarted, so what
-    /// ran was the boot rebuild.
-    Restarted,
+fn spill_rollback_failed_lines() -> [&'static str; 3] {
+    [
+        "the list refresh kept the previous generation because its temporary spill could not be rolled back.",
+        "the prior generation remains active; this cycle contributes no records.",
+        "Check the journal, then retry the refresh.",
+    ]
 }
 
-impl Attribution {
-    fn of(before: u64, after: u64) -> Self {
-        if after < before {
-            Self::Restarted
-        } else if after > before + 1 {
-            Self::Ambiguous {
-                cycles: after - before,
-            }
-        } else {
-            Self::Ours
-        }
-    }
+fn source_coverage_incomplete_lines() -> [&'static str; 3] {
+    [
+        "source coverage is incomplete for the most recent manager list attempt.",
+        "A hot attempt keeps the complete prior corpus; a cold attempt may install",
+        "usable sources. Check failed list sources before treating this as a full update.",
+    ]
 }
 
-/// Report what the reload the caller just triggered actually DID.
-///
-/// The defect this exists to fix: `lists refresh` sent SIGHUP, printed
-/// "lists will reload" and exited 0 — including when the corpus was about
-/// to be refused. On a live daemon the ceiling is a hard wall, so a refused
-/// cycle does not serve zero, it FREEZES: the previous generation keeps
-/// filtering and never advances, and every domain published from then on
-/// goes unblocked. Filtering that is stale rather than absent is the harder
-/// state to notice, and the command that caused it said nothing.
-///
-/// **Never gates on the absence of a refusal.** `corpus_refusal()` is an
-/// `Option` over four states — installed, refused, still running, skipped —
-/// and three of them read `None`, so "no refusal appeared" is not evidence
-/// that anything installed. The verdict comes from the cycle counter
-/// advancing and from the outcome that counter carries.
-///
-/// Best-effort and never fatal: this reports on a refresh that has already
-/// been triggered successfully. An IPC hiccup here must not turn a
-/// delivered SIGHUP into a failed command, so every arm prints and returns.
-async fn report_reload_outcome(socket_path: &Path, config_path: &Path, before: Option<CycleMark>) {
-    // `None` means the daemon cannot answer at all — too old to carry the
-    // field, or no list subsystem wired. Waiting would burn the whole
-    // timeout on every refresh for a counter that is never going to move.
-    let Some(before) = before else {
-        return;
+/// A failed cycle and the live corpus are different facts; report both.
+fn generation_degraded_lines(state: ServedState) -> [String; 2] {
+    let served = match state {
+        ServedState::Complete => "the previous complete generation remains serving",
+        ServedState::Partial => "a partial generation is serving; retry expected",
+        ServedState::Uninitialized => "no generation is installed; DNS is answering unfiltered",
+        ServedState::IntentionalEmpty => {
+            "an accepted complete empty generation is serving; filtering nothing"
+        }
+        ServedState::Cleared => "the config-cleared corpus is serving; filtering nothing",
+        ServedState::Unknown => "served-generation completeness cannot be determined (legacy)",
     };
+    [
+        format!("the refresh did not complete; served state: {served}."),
+        "The daemon will retry automatically; inspect status and the journal.".to_string(),
+    ]
+}
 
-    // `tokio::time::Instant`, NOT `std::time::Instant`, and the two must not
-    // be mixed. The sleep below is on tokio's clock; a deadline on the std
-    // clock is invisible to it, so under a paused clock (any `start_paused`
-    // test) the sleeps would return instantly while the deadline sat still —
-    // spinning the connect loop for a real 90 seconds. Under a normal clock
-    // the mix happens to work, which is what makes it a trap: it is correct
-    // in production and wrong in the only place that can prove it.
-    let deadline = tokio::time::Instant::now() + RELOAD_WAIT;
-    let mut live = None;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(RELOAD_POLL_EVERY).await;
-        let Ok(now) = fetch_live_corpus(socket_path).await else {
-            // The daemon may be mid-reload and briefly unresponsive; that
-            // is not an answer, so keep waiting rather than concluding.
-            continue;
-        };
-        if now.cycle.is_some_and(|c| c.seq != before.seq) {
-            live = Some(now);
-            break;
-        }
+/// Classify the completed cycle, not delivery of its request.
+fn completed_refresh_exit(snapshot: &ListRegistrySnapshotDto) -> i32 {
+    let cycle = snapshot.cycle;
+    if cycle.outcome == Some(CycleOutcome::ConfigRejected) {
+        return CONFIG;
     }
-
-    let Some(live) = live else {
-        println!();
-        println!("could not confirm the reload finished within {RELOAD_WAIT:?}.");
-        println!("The refresh was triggered — this says nothing about whether it");
-        println!("succeeded. Check with: warden status");
-        return;
-    };
-
-    // ATTRIBUTION, before the outcome. A counter says a cycle ENDED; it
-    // cannot by itself say the cycle was ours. SIGHUP carries no payload, so
-    // there is no request id to correlate on — but the DISTANCE between the
-    // two readings still rules out the wrong readings:
-    //
-    //   +1        exactly one cycle closed after our signal. Ours.
-    //   > +1      several closed. The daemon has periodic refreshes and other
-    //             clients; one of them may be the one being reported. Say so
-    //             rather than claim a causal link the counter cannot support.
-    //   < before  the counter went BACKWARDS, which it never does within one
-    //             process. The daemon restarted, and whatever ran is the boot
-    //             rebuild, not our refresh.
-    //
-    // Written as an explicit reading of the gap because the naive form —
-    // "seq changed, therefore this is my result" — reports a concurrent
-    // cycle's verdict as this command's own, which is the same lie in a new
-    // place. Found by an external audit of this file, not by its own tests.
-    let after_seq = live.cycle.map_or(0, |c| c.seq);
-    match Attribution::of(before.seq, after_seq) {
-        Attribution::Restarted => {
-            println!();
-            println!("the daemon restarted while the reload was in flight, so this");
-            println!("refresh has no result of its own — the corpus was rebuilt at");
-            println!("boot instead. Check with: warden status");
-            return;
-        }
-        Attribution::Ambiguous { cycles } => {
-            println!();
-            println!("note: {cycles} reload cycles completed while waiting, so what follows");
-            println!("is the LATEST one and may not be the result of this command.");
-        }
-        Attribution::Ours => {}
+    if cycle.source_coverage_incomplete || cycle.generation_degraded {
+        return FAILURE;
     }
-
-    match live.cycle.and_then(|c| c.outcome) {
-        Some(CycleOutcome::SkippedUnchanged) => {
-            println!();
-            println!("nothing to do — the list files on disk are unchanged, so the");
-            println!("live blocklist was reused without rebuilding.");
-        }
-        Some(CycleOutcome::Refused) => {
-            println!();
-            println!("REFUSED — the merged corpus exceeds max_total_domains.");
-            println!();
-            println!("The previous generation is still filtering, and it will keep");
-            println!("filtering the SAME domains until this is resolved: nothing new");
-            println!("from any list will be blocked. Raise the ceiling with");
-            println!("`warden lists set max_total_domains <n>` or drop a list.");
-            print_corpus(config_path, &live);
-        }
-        Some(CycleOutcome::Installed) => {
-            println!();
-            println!("installed.");
-            print_corpus(config_path, &live);
-        }
-        Some(CycleOutcome::ClearedNoSources) => {
-            println!();
-            println!("the config has NO list sources, so the blocklist was CLEARED.");
-            println!("This host is now filtering nothing. Add a list with");
-            println!("`warden lists add <id>` if that was not intended.");
-        }
-        Some(CycleOutcome::ConfigRejected) => {
-            println!();
-            println!("the daemon REFUSED the new config, so nothing was reloaded and");
-            println!("the previous config is still in force. The validator errors are");
-            println!("in the journal: journalctl -u purge-warden");
-        }
-        // `seq` moved forward but carries no outcome. The two are written
-        // together and `seq: 0` is the only markless state, so this is
-        // unreachable short of a protocol change.
-        None => {
-            println!();
-            println!("the reload finished, but the daemon did not report what it did.");
-            println!("Check with: warden status");
-        }
+    match cycle.outcome {
+        Some(
+            CycleOutcome::Installed
+            | CycleOutcome::SkippedUnchanged
+            | CycleOutcome::ClearedNoSources,
+        ) => SUCCESS,
+        Some(
+            CycleOutcome::Refused
+            | CycleOutcome::SpillRollbackFailed
+            | CycleOutcome::ConfigRejected,
+        )
+        | None => FAILURE,
     }
 }
 
-/// Render the corpus block, reusing `lists show`'s renderer rather than
-/// growing a second one that can disagree with it.
-///
-/// The reuse pays for itself beyond consistency: the config is re-read here,
-/// so the ceiling printed could differ from the one the daemon actually
-/// enforced if an edit landed between the SIGHUP and this report.
-/// [`format_corpus_lines`] already carries the note for exactly that skew —
-/// it compares the refusal's own `ceiling` against the one passed in and
-/// says which is which — so a second renderer would have to grow the same
-/// warning or silently print the newer number as if it were in force.
-fn print_corpus(config_path: &Path, live: &LiveCorpus) {
-    let now = time::OffsetDateTime::now_utc();
-    let Ok(loaded) = loader::load_config(config_path, now) else {
-        return;
-    };
+fn live_corpus_from_snapshot(snapshot: &ListRegistrySnapshotDto) -> LiveCorpus {
+    LiveCorpus {
+        unique_installed: snapshot.domain_count as u64,
+        truncated: snapshot
+            .rows
+            .iter()
+            .filter(|row| row.status.parsed_truncated > 0)
+            .count() as u32,
+        total_sources: snapshot.rows.len() as u32,
+        refusal: snapshot.corpus_refusal.clone(),
+        freeze: snapshot.corpus_freeze.clone(),
+        cycle: Some(snapshot.cycle),
+    }
+}
+
+fn print_snapshot_corpus(snapshot: &ListRegistrySnapshotDto, ceiling: Option<u64>) {
+    let Some(ceiling) = ceiling else { return };
+    let live = live_corpus_from_snapshot(snapshot);
     println!();
-    for line in format_corpus_lines(loaded.config.lists.max_total_domains as u64, Ok(live)) {
+    for line in format_corpus_lines(ceiling, Ok(&live)) {
         println!("{line}");
     }
 }
 
-/// Trigger a list update. If a daemon is running, sends SIGHUP.
-/// Otherwise, performs a foreground download to verify the config.
+/// Render exactly the completed actor snapshot used for the exit decision.
+fn render_completed_refresh(snapshot: &ListRegistrySnapshotDto, ceiling: Option<u64>) {
+    let cycle = snapshot.cycle;
+    match cycle.outcome {
+        Some(CycleOutcome::Installed) => {
+            println!("installed.");
+            print_snapshot_corpus(snapshot, ceiling);
+        }
+        Some(CycleOutcome::SkippedUnchanged) => {
+            println!("no new list generation was built; the current corpus was retained.");
+        }
+        Some(CycleOutcome::ClearedNoSources) => {
+            println!("the config has NO list sources, so the blocklist was CLEARED.");
+        }
+        Some(CycleOutcome::Refused) => {
+            println!("REFUSED — the merged corpus exceeds max_total_domains.");
+            let live = live_corpus_from_snapshot(snapshot);
+            if live.unique_installed == 0 {
+                println!("NOTHING is installed; DNS is answering unfiltered.");
+            } else {
+                println!(
+                    "The previous generation is still filtering; no new list domains are active."
+                );
+            }
+            print_snapshot_corpus(snapshot, ceiling);
+        }
+        Some(CycleOutcome::SpillRollbackFailed) if !cycle.generation_degraded => {
+            for line in spill_rollback_failed_lines() {
+                println!("{line}");
+            }
+        }
+        Some(CycleOutcome::SpillRollbackFailed) => {}
+        Some(CycleOutcome::ConfigRejected) => {
+            println!("the daemon REFUSED the new config; the previous config remains in force.");
+        }
+        None => println!("the refresh completed without a reported outcome."),
+    }
+    if cycle.source_coverage_incomplete {
+        for line in source_coverage_incomplete_lines() {
+            println!("{line}");
+        }
+    }
+    if cycle.generation_degraded {
+        for line in generation_degraded_lines(cycle.served_state) {
+            println!("{line}");
+        }
+    }
+}
+
+/// Trigger a list update. A validated live daemon receives only typed IPC;
+/// otherwise this process performs the foreground refresh.
 ///
 /// Returns the intended process exit code; `main.rs` translates it via
 /// [`crate::cli::exit_codes::exit_with`].
 ///
 /// # Exit codes
 ///
-/// - [`SUCCESS`] — SIGHUP delivered, or the foreground refresh completed
-///   (including the legitimate "nothing configured to fetch" case).
+/// - [`SUCCESS`] — the exact completed cycle installed, retained unchanged,
+///   or intentionally cleared an empty configuration without degradation.
+/// - [`FAILURE`] — a live IPC/auth/compatibility failure, or a completed
+///   cycle that was refused, incomplete, or degraded.
 /// - [`CONFIG`] — the config could not be loaded. This path previously
 ///   printed the errors and returned `Ok(())`, so `warden lists refresh`
 ///   reported success on a config the daemon would refuse to boot.
@@ -263,42 +183,9 @@ fn print_corpus(config_path: &Path, live: &LiveCorpus) {
 /// the foreground tool writes into the same FHS-aware path as the
 /// daemon (`/var/lib/<pkg>/lists/` on prod, `<config-parent>/<cache_dir>`
 /// on dev).
-pub async fn run_update(
-    config_path: &Path,
-    pid_file: &Path,
-    socket_path: &Path,
-) -> anyhow::Result<i32> {
-    // If daemon is running, just signal it.
-    //
-    // The gate is `daemon_is_live`, not `is_process_alive`: a stale PID file
-    // whose number the kernel recycled onto an unrelated process passes the
-    // liveness check, and this path does not merely *report* on that PID —
-    // it signals it. SIGHUP's default disposition is terminate, so the old
-    // gate could kill an unrelated process and then print "lists will
-    // reload" as if a daemon had been refreshed.
-    if let Ok(daemon_pid) = pid::read_pid_file(pid_file) {
-        if pid::daemon_is_live(pid_file, daemon_pid) {
-            // Read the cycle counter BEFORE signalling. Everything the
-            // report below says depends on being able to tell THIS
-            // refresh's cycle from whatever ran last.
-            let before = fetch_live_corpus(socket_path)
-                .await
-                .ok()
-                .and_then(|c| c.cycle);
-
-            pid::send_signal(daemon_pid, "HUP")?;
-            println!(
-                "sent SIGHUP to purge-warden (PID {}) — lists will reload",
-                daemon_pid
-            );
-
-            report_reload_outcome(socket_path, config_path, before).await;
-            return Ok(SUCCESS);
-        }
-    }
-
-    // No daemon running — do a foreground download
-    println!("no running daemon found, performing foreground list download...");
+pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i32> {
+    // Resolve this command's socket here, not in `main`: an invalid config
+    // must return CONFIG rather than escaping through anyhow as exit 1.
     let now = time::OffsetDateTime::now_utc();
     let loaded = match loader::load_config(config_path, now) {
         Ok(l) => l,
@@ -314,22 +201,148 @@ pub async fn run_update(
             return Ok(CONFIG);
         }
     };
+    let socket_path = &loaded.config.socket.path;
 
-    let (merged_sources, source_trust) =
-        merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-    if merged_sources.is_empty() {
+    // This lease is the decision, not a prior liveness observation. Holding it
+    // through foreground work excludes a concurrent daemon start and its list
+    // state writes. A held lease belongs to a daemon (or another refresh), so
+    // it is IPC-only and can never fall back.
+    let foreground_lease = match pid::try_acquire_pid_lock(pid_file) {
+        Ok(lease) => Some(lease),
+        Err(pid::PidLockError::AlreadyRunning(_)) => None,
+        Err(pid::PidLockError::Io(error)) => {
+            eprintln!(
+                "cannot acquire PID-file lease {}: {error}",
+                pid_file.display()
+            );
+            return Ok(FAILURE);
+        }
+    };
+
+    let socket_probe = if foreground_lease.is_some() {
+        probe_socket(socket_path).await
+    } else {
+        // A contended lease is already a live/unsafe signal. Do not probe a
+        // second time before routing IPC: that would only add delay.
+        SocketProbe::Live
+    };
+    match select_refresh_route(foreground_lease.is_some(), socket_probe) {
+        RefreshRoute::Foreground => {}
+        RefreshRoute::FailClosed => {
+            // WHY: an uncertain socket can be a wedged live daemon; treating it as
+            // absent would reintroduce concurrent cache/list-state writes.
+            eprintln!("cannot determine whether the configured IPC socket is live; refusing foreground refresh");
+            return Ok(FAILURE);
+        }
+        RefreshRoute::TypedIpc => {
+            // Once a held lease or a live socket is observed, IPC failure is
+            // terminal: foreground work could overlap the daemon's writes.
+            match send_command(socket_path, &IpcCommand::ForceListRefresh { token: None }).await {
+                Ok(IpcResponse::ListRefreshCompleted {
+                    disposition,
+                    snapshot,
+                    max_total_domains,
+                }) => {
+                    println!("list refresh accepted: {}", disposition.as_str());
+                    render_completed_refresh(&snapshot, max_total_domains);
+                    return Ok(completed_refresh_exit(&snapshot));
+                }
+                Ok(IpcResponse::Error { message }) => {
+                    if message == crate::ipc::errors::IPC_ERROR_INVALID_COMMAND {
+                        eprintln!(
+                            "live daemon and CLI are incompatible: typed list refresh is unsupported. \
+                             Restart or upgrade the daemon before retrying."
+                        );
+                    } else {
+                        eprintln!("live daemon refused list refresh: {message}");
+                    }
+                }
+                Ok(other) => {
+                    eprintln!(
+                        "live daemon and CLI are incompatible: typed list refresh is unsupported \
+                         ({other:?}). Restart or upgrade the daemon before retrying."
+                    );
+                }
+                Err(error) => {
+                    eprintln!("could not request typed list refresh from live daemon: {error}");
+                }
+            }
+            return Ok(FAILURE);
+        }
+    }
+
+    // No daemon socket is reachable and the lease remains held for this whole
+    // branch — do a foreground download.
+    println!("no running daemon found, performing foreground list download...");
+
+    if loaded.config.lists.sources.is_empty()
+        && !loaded
+            .config
+            .blocklists
+            .iter()
+            .any(|blocklist| blocklist.enabled)
+    {
         // Not a failure: an operator with no lists configured asked for a
         // refresh and got the correct answer — there is nothing to fetch.
         println!("no list sources or blocklists configured");
         return Ok(SUCCESS);
     }
 
-    let (_filter, count) =
-        refresh_foreground_filter(config_path, &loaded.config, merged_sources, source_trust)
-            .await?;
-    println!("downloaded and merged: {} unique domains", count);
+    let (_filter, completion) = refresh_foreground_filter(config_path, &loaded.config).await?;
+    let snapshot: ListRegistrySnapshotDto = completion.snapshot.into();
+    render_completed_refresh(
+        &snapshot,
+        completion.max_total_domains.map(|value| value as u64),
+    );
+    Ok(completed_refresh_exit(&snapshot))
+}
 
-    Ok(SUCCESS)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketProbe {
+    Live,
+    AbsentOrRefused,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshRoute {
+    Foreground,
+    TypedIpc,
+    FailClosed,
+}
+
+/// Select exactly one writer path from the atomic PID lease plus socket probe.
+fn select_refresh_route(lease_acquired: bool, socket_probe: SocketProbe) -> RefreshRoute {
+    if !lease_acquired || matches!(socket_probe, SocketProbe::Live) {
+        RefreshRoute::TypedIpc
+    } else if matches!(socket_probe, SocketProbe::AbsentOrRefused) {
+        RefreshRoute::Foreground
+    } else {
+        RefreshRoute::FailClosed
+    }
+}
+
+/// Probe only after owning the foreground lease. A live unlinked daemon PID
+/// file is still caught by its socket; all uncertain transport states fail
+/// closed instead of being mistaken for a stopped daemon.
+async fn probe_socket(socket_path: &Path) -> SocketProbe {
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await
+    {
+        Ok(Ok(_)) => SocketProbe::Live,
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) =>
+        {
+            SocketProbe::AbsentOrRefused
+        }
+        Ok(Err(_)) | Err(_) => SocketProbe::Ambiguous,
+    }
 }
 
 /// Build a [`ListManager`] exactly the way the daemon's boot and reload
@@ -350,9 +363,10 @@ pub async fn run_update(
 async fn refresh_foreground_filter(
     config_path: &Path,
     config: &crate::config::schema::ConfigV1,
-    merged_sources: Vec<String>,
-    source_trust: crate::lists::source_key::SourceTrustMap,
-) -> anyhow::Result<(Arc<FilterEngine>, usize)> {
+) -> anyhow::Result<(
+    Arc<FilterEngine>,
+    crate::lists::manager::ForceRefreshCompletion,
+)> {
     // Bulk client: this fetches whole list bodies, which a single total
     // deadline turns into a bandwidth-dependent size cap. Unlike the boot
     // and reload paths, an operator-invoked foreground refresh blocks only
@@ -368,29 +382,43 @@ async fn refresh_foreground_filter(
     // removing it would leave the catalog's pending phase on the 600s
     // ceiling.
     let client = crate::lists::http_client::build_bulk_list_client()?;
+    let lists_dir = lists_cache_dir(config_path, config);
 
-    let catalog = match Catalog::fetch(&client).await {
-        Ok(c) => {
-            println!("catalog fetched ({} lists available)", c.entries().len());
-            c
-        }
-        Err(e) => {
-            println!("catalog fetch failed ({}), using fallback", e);
-            Catalog::fallback()
-        }
-    };
-
+    let catalog = super::start::fetch_catalog_or_fallback(
+        &client,
+        &lists_dir,
+        super::start::CatalogPreference::Network,
+    )
+    .await;
+    println!(
+        "catalog ready ({} lists available)",
+        catalog.entries().len()
+    );
+    let source_plan = ResolvedSourcePlan::build_for_schema(
+        &catalog,
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    )
+    .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
+    if super::start::config_declares_list_sources(config) && source_plan.is_empty() {
+        anyhow::bail!("configured list sources resolved to no reproducible catalog entries");
+    }
     let filter = Arc::new(FilterEngine::new());
     let interval = Duration::from_secs(config.lists.update_interval_secs);
-    let source_bits = SourceBitMap::build(&merged_sources, &config.blocklists)
-        .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
+    let source_bits =
+        SourceBitMap::from_plan(&source_plan).map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
 
     // The operator's per-profile list policy, projected onto this
     // bit assignment. Computed here, before `source_bits` moves into the
     // manager below, mirroring `start.rs`'s boot and reload paths.
     let policy_masks = source_bits.project_policy(&config.blocklists, &config.profiles);
 
-    let lists_dir = lists_cache_dir(config_path, config);
     let bridge_config_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -405,13 +433,12 @@ async fn refresh_foreground_filter(
     let secrets_path = crate::config::secrets::secrets_path_for(config_path);
     let secrets = crate::config::secrets::load_secrets(&secrets_path)
         .map_err(|e| anyhow::anyhow!("secrets file rejected: {e}"))?;
-    let source_tokens = SourceTokenMap::build(config, &secrets);
+    let source_tokens = SourceTokenMap::from_plan(&source_plan, &secrets);
 
-    let mut mgr = ListManager::with_tokens(
+    let mut mgr = ListManager::with_plan_and_tokens(
         client,
         filter.clone(),
-        merged_sources,
-        catalog,
+        source_plan.clone(),
         interval,
         source_bits,
         source_tokens,
@@ -419,6 +446,7 @@ async fn refresh_foreground_filter(
         config.lists.max_entries,
         Some(lists_dir),
     );
+    mgr.status_registry().sync_plan(&source_plan);
 
     // The same wiring the daemon applies at boot and at reload. This
     // tool used to hand-maintain its own shorter list, which is how it
@@ -435,7 +463,7 @@ async fn refresh_foreground_filter(
     ManagerWiring::from_config(
         config,
         config_path,
-        source_trust,
+        &source_plan,
         bridge_config_dir,
         policy_masks,
         ListStateWriteback::ReadOnly,
@@ -448,8 +476,8 @@ async fn refresh_foreground_filter(
     mgr.load_status_baselines(&list_stats_path(config_path));
 
     mgr.load_disk_cache();
-    let count = mgr.refresh().await;
-    Ok((filter, count))
+    let completion = mgr.force_refresh_completion().await;
+    Ok((filter, completion))
 }
 
 #[cfg(test)]
@@ -460,107 +488,162 @@ mod tests {
     const ALLOWED_DOMAIN: &str = "allowed-example.test";
     const BLOCKED_DOMAIN: &str = "blocked-example.test";
 
-    /// A counter that moved is not proof that OUR cycle moved it.
-    ///
-    /// The gap between the two readings is the only correlation available —
-    /// SIGHUP carries no request id — and each band means something the
-    /// operator must be told differently. An external audit named the naive
-    /// reading (`after != before` ⇒ "this is my result") as the top defect in
-    /// this feature: under a concurrent reload it reports someone else's
-    /// verdict as this command's own, with exit 0 and the word "installed".
-    ///
-    /// The restart case is the one that would otherwise be silently wrong in
-    /// the WORST direction: after a restart the boot rebuild records
-    /// `seq: 1, Installed`, so a `!=` test sees movement and a plausible
-    /// success — for a refresh that never ran.
+    fn completed_snapshot(
+        outcome: Option<CycleOutcome>,
+        source_coverage_incomplete: bool,
+        generation_degraded: bool,
+    ) -> ListRegistrySnapshotDto {
+        ListRegistrySnapshotDto {
+            rows: Vec::new(),
+            corpus_refusal: None,
+            corpus_freeze: None,
+            domain_count: 0,
+            cycle: crate::lists::status::CycleMark {
+                seq: 1,
+                outcome,
+                source_coverage_incomplete,
+                generation_degraded,
+                served_state: ServedState::Complete,
+            },
+        }
+    }
+
     #[test]
-    fn attribution_reads_the_gap_not_merely_a_change() {
-        assert_eq!(Attribution::of(7, 8), Attribution::Ours);
-        assert_eq!(Attribution::of(0, 1), Attribution::Ours, "first ever cycle");
-
+    fn refresh_exit_uses_completed_outcome_and_health() {
+        for outcome in [
+            CycleOutcome::Installed,
+            CycleOutcome::SkippedUnchanged,
+            CycleOutcome::ClearedNoSources,
+        ] {
+            assert_eq!(
+                completed_refresh_exit(&completed_snapshot(Some(outcome), false, false)),
+                SUCCESS
+            );
+        }
+        for outcome in [CycleOutcome::Refused, CycleOutcome::SpillRollbackFailed] {
+            assert_eq!(
+                completed_refresh_exit(&completed_snapshot(Some(outcome), false, false)),
+                FAILURE
+            );
+        }
         assert_eq!(
-            Attribution::of(7, 10),
-            Attribution::Ambiguous { cycles: 3 },
-            "three cycles closed; the last one may not be ours"
+            completed_refresh_exit(&completed_snapshot(None, false, false)),
+            FAILURE
         );
-
-        // The daemon restarted and its boot rebuild installed: seq 1 with a
-        // perfectly healthy outcome. Movement, and none of it ours.
-        assert_eq!(Attribution::of(42, 1), Attribution::Restarted);
         assert_eq!(
-            Attribution::of(42, 0),
-            Attribution::Restarted,
-            "restarted, no cycle finished yet"
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::Installed),
+                true,
+                false,
+            )),
+            FAILURE
         );
-
-        // Equality cannot reach the reporter — the poll only breaks out on a
-        // CHANGE — but the classifier must not invent a restart from it.
-        assert_eq!(Attribution::of(7, 7), Attribution::Ours);
+        assert_eq!(
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::SpillRollbackFailed),
+                false,
+                true,
+            )),
+            FAILURE
+        );
+        assert_eq!(
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::ConfigRejected),
+                false,
+                false,
+            )),
+            CONFIG
+        );
+        assert_eq!(
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::ConfigRejected),
+                true,
+                true
+            )),
+            CONFIG
+        );
+        assert_eq!(
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::ClearedNoSources),
+                true,
+                false
+            )),
+            FAILURE
+        );
+        assert_eq!(
+            completed_refresh_exit(&completed_snapshot(
+                Some(CycleOutcome::Installed),
+                false,
+                true
+            )),
+            FAILURE
+        );
     }
 
-    /// A daemon that cannot report cycles must not be WAITED for.
-    ///
-    /// `None` reaches [`report_reload_outcome`] from a daemon too old to
-    /// carry `lists_cycle`, or one with no list subsystem wired. In both
-    /// cases no cycle mark is ever coming, so polling for one to advance
-    /// burns the entire [`RELOAD_WAIT`] on every single refresh and then
-    /// reports "could not confirm" — turning a working command into a
-    /// 90-second hang against every older daemon on the network.
-    ///
-    /// **Timed, because the ambiguity is temporal, not textual.** A version
-    /// that polls produces the same final output as one that returns at
-    /// once; the only thing separating them is how long it took. Asserting
-    /// on the printed text would pass on the broken build. The threshold is
-    /// two orders of magnitude below `RELOAD_WAIT`, so it cannot be met by
-    /// a poll that merely got lucky on its first iteration —
-    /// `RELOAD_POLL_EVERY` alone is 2s.
-    #[tokio::test]
-    async fn old_daemon_is_not_polled() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sock = tmp.path().join("absent.sock");
-        let cfg = tmp.path().join("absent.toml");
-
-        let started = std::time::Instant::now();
-        report_reload_outcome(&sock, &cfg, None).await;
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "a daemon that cannot report cycles must return immediately, \
-             not wait out RELOAD_WAIT ({RELOAD_WAIT:?}); took {elapsed:?}"
+    #[test]
+    fn spill_rollback_failure_rendering_keeps_the_previous_generation() {
+        assert_eq!(
+            spill_rollback_failed_lines(),
+            [
+                "the list refresh kept the previous generation because its temporary spill could not be rolled back.",
+                "the prior generation remains active; this cycle contributes no records.",
+                "Check the journal, then retry the refresh.",
+            ]
         );
     }
 
-    /// The control arm for the test above: the same function, given a mark,
-    /// DOES wait. Without this the timing assertion is unfalsifiable — a
-    /// `report_reload_outcome` that returned instantly in every case would
-    /// satisfy it forever while measuring nothing.
-    ///
-    /// The socket does not exist, so every poll fails and the loop runs to
-    /// its deadline. That is the point: it proves the waiting is real. Uses
-    /// a paused clock so proving it costs no wall-clock time.
-    #[tokio::test(start_paused = true)]
-    async fn a_reporting_daemon_is_waited_for() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sock = tmp.path().join("absent.sock");
-        let cfg = tmp.path().join("absent.toml");
-
-        let started = tokio::time::Instant::now();
-        report_reload_outcome(
-            &sock,
-            &cfg,
-            Some(CycleMark {
-                seq: 7,
-                outcome: Some(CycleOutcome::Installed),
-            }),
-        )
-        .await;
-
-        assert!(
-            started.elapsed() >= RELOAD_WAIT,
-            "given a cycle mark, the reporter must actually wait for the \
-             cycle to advance — otherwise the other test proves nothing"
+    #[test]
+    fn incomplete_source_coverage_rendering_names_hot_and_cold_policy() {
+        assert_eq!(
+            source_coverage_incomplete_lines(),
+            [
+                "source coverage is incomplete for the most recent manager list attempt.",
+                "A hot attempt keeps the complete prior corpus; a cold attempt may install",
+                "usable sources. Check failed list sources before treating this as a full update.",
+            ]
         );
+    }
+
+    #[test]
+    fn degraded_refresh_rendering_names_the_served_state() {
+        let cases = [
+            (
+                ServedState::Complete,
+                "previous complete generation remains serving",
+            ),
+            (
+                ServedState::Partial,
+                "partial generation is serving; retry expected",
+            ),
+            (
+                ServedState::Uninitialized,
+                "no generation is installed; DNS is answering unfiltered",
+            ),
+            (
+                ServedState::IntentionalEmpty,
+                "accepted complete empty generation is serving; filtering nothing",
+            ),
+            (
+                ServedState::Unknown,
+                "served-generation completeness cannot be determined (legacy)",
+            ),
+        ];
+        for (served_state, expected) in cases {
+            let lines = generation_degraded_lines(served_state).join("\n");
+            assert!(lines.contains(expected), "{served_state:?}: {lines}");
+            assert!(
+                lines.contains("the refresh did not complete; served state:"),
+                "{served_state:?}: {lines}"
+            );
+            assert!(
+                lines.contains("will retry automatically"),
+                "{served_state:?}: {lines}"
+            );
+            assert!(
+                !lines.contains("no complete generation was installed"),
+                "{served_state:?}: {lines}"
+            );
+        }
     }
 
     /// Two `trust = "local"` blocklists: one `base = "allow"` carrying
@@ -574,7 +657,7 @@ mod tests {
         let master = dir.join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 listen = "0.0.0.0:53"
@@ -650,13 +733,9 @@ servers = ["192.0.2.1:53"]
 
         let now = time::OffsetDateTime::now_utc();
         let loaded = loader::load_config(&master, now).expect("fixture config must load");
-        let (merged_sources, source_trust) =
-            merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-
-        let (filter, _count) =
-            refresh_foreground_filter(&master, &loaded.config, merged_sources, source_trust)
-                .await
-                .expect("foreground refresh must succeed on the direction fixture");
+        let (filter, _count) = refresh_foreground_filter(&master, &loaded.config)
+            .await
+            .expect("foreground refresh must succeed on the direction fixture");
 
         let allowed = filter.list_membership(ALLOWED_DOMAIN);
         assert_ne!(
@@ -676,6 +755,43 @@ servers = ["192.0.2.1:53"]
         assert_eq!(
             blocked.allow_mask, 0,
             "{BLOCKED_DOMAIN} must not also be classified allow-direction"
+        );
+    }
+
+    #[test]
+    fn lease_and_socket_probe_choose_one_refresh_writer() {
+        assert_eq!(
+            select_refresh_route(true, SocketProbe::AbsentOrRefused),
+            RefreshRoute::Foreground
+        );
+        assert_eq!(
+            select_refresh_route(true, SocketProbe::Live),
+            RefreshRoute::TypedIpc
+        );
+        assert_eq!(
+            select_refresh_route(true, SocketProbe::Ambiguous),
+            RefreshRoute::FailClosed
+        );
+        assert_eq!(
+            select_refresh_route(false, SocketProbe::AbsentOrRefused),
+            RefreshRoute::TypedIpc,
+            "a contended PID lease never falls back to foreground"
+        );
+    }
+
+    #[test]
+    fn foreground_lease_excludes_a_concurrent_daemon_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("warden.pid");
+        let _foreground_lease = pid::try_acquire_pid_lock(&pid_path)
+            .expect("foreground refresh takes the exclusive PID-file lease");
+
+        assert!(
+            matches!(
+                pid::try_acquire_pid_lock(&pid_path),
+                Err(pid::PidLockError::AlreadyRunning(_))
+            ),
+            "a daemon start must not acquire the PID file while refresh owns it"
         );
     }
 }

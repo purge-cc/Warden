@@ -66,7 +66,7 @@ use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 /// Upstream is RFC 5737 TEST-NET-1 and every list URL is first-party —
 /// warden ships no provider defaults and a fixture is not the place to
 /// introduce one.
-const MASTER_SEED: &str = r#"schema_version = 3
+const MASTER_SEED: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -171,7 +171,9 @@ async fn spawn_fixture() -> Fixture {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            purge_warden::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: purge_warden::ipc::socket_server::current_euid(),
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]

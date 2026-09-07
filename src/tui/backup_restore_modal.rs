@@ -69,10 +69,8 @@ pub enum BackupModal {
     /// have been drawn.
     ///
     /// Every key is swallowed while this stage is live — deliberately, and the
-    /// card must not advertise one. A second `y` would race a second
-    /// `create_backup` against the same backup dir (which, unlike the
-    /// `run_backup_managed` CLI path, takes no lock), and an `Esc` would only
-    /// hide a card whose outcome is still coming.
+    /// card must not advertise one. The output lock serializes owners; this is
+    /// defense in depth against duplicate jobs and orphaned outcomes.
     Running { dir: PathBuf },
     /// Terminal — render the outcome. Any key closes the modal. `ok`
     /// switches the colour via [`outcome_notice`], shared with the

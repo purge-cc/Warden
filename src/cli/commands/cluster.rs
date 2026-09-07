@@ -10,12 +10,12 @@
 //! absent from a default doc build); there is still no live handshake
 //! at `join` time.
 //!
-//! Config writes mirror the hardened path proven by `token.rs`: read the
-//! master as a format-preserving document, mutate only the `[cluster]`
-//! table (and, for `join`, the top-level `includes`), then
-//! [`atomic_write_and_validate`] with the full v1 loader as the staging
-//! validator. Every other section survives with its comments and key
-//! order, and a mutation that would not load never reaches disk.
+//! Config writes mirror the guarded path proven by `token.rs`: claim the
+//! config tree, read the descriptor-pinned master as a format-preserving
+//! document, mutate only the requested fields, overlay-validate the exact
+//! bytes, and promote them while holding that same guard. Every other section
+//! survives with its comments and key order, and a mutation that would not
+//! load never reaches disk.
 //!
 //! The phrase here used to be "survives byte-for-byte" while both
 //! writers went through `toml::to_string_pretty`, which deletes every
@@ -23,15 +23,23 @@
 //! claim in `token.rs`, which this module copied it from -- one wrong
 //! sentence propagated by being cited as precedent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::{format_config_errors, format_config_errors_flat};
+use super::format_config_errors;
+use super::target::{
+    commit_prevalidated_single_write, prepare_raw_validated_single_locked,
+    read_raw_or_empty_locked, ConfigCommitDisposition, PreparedValidatedSingleWrite,
+};
 use crate::auth::token::{generate_token, hash_token};
-use crate::config::atomic_write::atomic_write_and_validate;
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts, AtomicWriteError,
+};
 use crate::config::loader;
-use crate::config::schema::ClusterRole;
+use crate::config::schema::{ClusterRole, SCHEMA_VERSION_V1};
+use crate::config::tree_io::PinnedTarget;
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 /// `warden cluster token` — primary: mint the cluster bearer token.
 ///
@@ -42,15 +50,23 @@ use crate::config::schema::ClusterRole;
 /// — minting a credential is distinct from turning clustering on.
 pub fn run_token(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let _loaded = loader::load_config(config_path, now).map_err(format_config_errors)?;
+    let plaintext = {
+        // `acquire_for_write` refuses an active migration journal before the
+        // schema load. Keep this one guard through the promotion so a peer
+        // cannot replace the master between either decision and the write.
+        let guard = acquire_for_write(config_path)?;
+        let _loaded =
+            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+                .map_err(format_config_errors)?;
 
-    let (plaintext, hash) = generate_token();
-
-    write_cluster_fields_to_master(
-        config_path,
-        &[("token_hash", Some(toml::Value::String(hash)))],
-        now,
-    )?;
+        let (plaintext, hash) = generate_token();
+        write_cluster_fields_to_master(
+            &guard,
+            config_path,
+            &[("token_hash", Some(toml::Value::String(hash)))],
+        )?;
+        plaintext
+    };
 
     println!("Cluster token: {plaintext}");
     println!();
@@ -241,31 +257,8 @@ pub fn run_join_pinned(
     // Refuse before anything is persisted. See `ensure_can_join`.
     ensure_can_join()?;
 
-    let now = time::OffsetDateTime::now_utc();
-    // No pre-load: a policy-free secondary master does not validate
-    // until `enabled = true` is written, and writing it is what `join`
-    // does — a pre-load guard here would deadlock a node that could not
-    // join because it had not joined.
-    //
-    // Nothing is lost. `write_cluster_fields_to_master` parses the raw master
-    // itself, and `atomic_write_and_validate` validates the POST state with
-    // the full loader, so any pre-existing defect survives into that state and
-    // fails there. The only errors the post state does NOT inherit are exactly
-    // the ones joining fixes — which is the semantics wanted, for free and
-    // without an error-string allowlist. `run_leave` has always worked this
-    // way (raw read, no pre-load); this makes the two siblings consistent
-    // rather than adding a third pattern.
-    //
-    // `run_token` keeps its pre-load on purpose: minting is a PRIMARY
-    // operation, and failing it on an unjoined secondary is correct.
-
-    // Refuse a policy-carrying master HERE, before anything is
-    // written. The permanent guard in the validator would catch it too, but
-    // only on the staged-write path, where the provenance map names the
-    // STAGING TEMP FILE: a remedy pointing at a path that no longer exists
-    // when the operator reads it. This reads the real master and names it.
-    ensure_master_carries_no_policy(config_path)?;
-
+    // Complete all external input before the guard. A token prompt or PEM
+    // read must never hold up another local config mutation.
     let peer = peer.trim();
     // A secondary sends the plaintext cluster token to `peer` on every
     // poll, so reject a non-https (or non-loopback-http) peer at join time —
@@ -298,7 +291,23 @@ pub fn run_join_pinned(
         fields.push(("peer_cert", Some(toml::Value::String(path))));
     }
 
-    write_cluster_fields_to_master(config_path, &fields, now)?;
+    let canonical_master = {
+        // Joining deliberately has no pre-load: an unjoined secondary is
+        // allowed to be incomplete until this one combined master mutation
+        // makes it a secondary. The guarded raw policy probe and overlay
+        // validation still reject every defect that remains in the result.
+        let guard = acquire_for_write(config_path)?;
+        ensure_master_carries_no_policy(&guard, config_path)?;
+        write_master_sections(
+            &guard,
+            config_path,
+            &fields,
+            &[],
+            None,
+            cfg!(feature = "cluster"),
+        )?;
+        guard.canonical_master().to_path_buf()
+    };
 
     // Make this node a working secondary. Both steps are gated on the
     // `cluster` feature — a feature-less build refuses upstream in
@@ -310,11 +319,12 @@ pub fn run_join_pinned(
     //       against the primary's stored hash.
     #[cfg(feature = "cluster")]
     {
-        ensure_cluster_include(config_path, now)?;
-        let token_path = crate::cluster::secret::save_cluster_token(config_path, token)
+        let token_path = save_join_token_after_unlock(&canonical_master, token)
             .context("persisting the plaintext cluster token")?;
         tracing::debug!(path = %token_path.display(), "cluster: saved plaintext token for poll loop");
     }
+    #[cfg(not(feature = "cluster"))]
+    let _ = canonical_master;
 
     println!("Joined cluster as a secondary.");
     println!("  peer: {peer}");
@@ -330,6 +340,36 @@ pub fn run_join_pinned(
         println!("from it. `warden cluster status`.");
     }
     Ok(())
+}
+
+/// Save the secondary-only plaintext secret after `run_join_pinned` has
+/// released its config guard. Keeping the boundary named makes it testable and
+/// prevents future edits from moving a filesystem side effect into the lock.
+#[cfg(feature = "cluster")]
+fn save_join_token_after_unlock(master: &Path, token: &str) -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    join_sidecar_test_event();
+    Ok(crate::cluster::secret::save_cluster_token(master, token)?)
+}
+
+#[cfg(all(test, feature = "cluster"))]
+type JoinSidecarTestHook = Box<dyn FnMut()>;
+
+#[cfg(all(test, feature = "cluster"))]
+thread_local! {
+    static JOIN_SIDECAR_TEST_HOOK:
+        std::cell::RefCell<Option<JoinSidecarTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, feature = "cluster"))]
+fn join_sidecar_test_event() {
+    JOIN_SIDECAR_TEST_HOOK.with(|slot| {
+        let Some(mut hook) = slot.borrow_mut().take() else {
+            return;
+        };
+        hook();
+        *slot.borrow_mut() = Some(hook);
+    });
 }
 
 /// Refuse `warden cluster join` on a build that cannot act as a secondary.
@@ -381,11 +421,19 @@ fn ensure_can_join() -> anyhow::Result<()> {
 ///
 /// A master that will not parse is left to the writer below, which reports
 /// TOML errors with more context than this check could.
-fn ensure_master_carries_no_policy(config_path: &Path) -> anyhow::Result<()> {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
+fn ensure_master_carries_no_policy(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    // Identity must be checked before treating an unreadable/broken document
+    // as inconclusive. Otherwise a wrong-tree call could silently turn into
+    // an allowed join.
+    let (raw, _) = read_raw_or_empty_locked(guard, config_path, config_path)?;
+    let Some(raw) = raw else {
         return Ok(());
     };
-    let Ok(provenance) = loader::provenance_of_file(config_path, &raw) else {
+    let canonical = guard.canonical_master();
+    let Ok(provenance) = loader::provenance_of_file(canonical, &raw) else {
         return Ok(());
     };
     let offenders =
@@ -412,7 +460,7 @@ fn ensure_master_carries_no_policy(config_path: &Path) -> anyhow::Result<()> {
          Move these sections out of {}:\n{}\n\
          \n\
          Nothing has been written.",
-        config_path.display(),
+        canonical.display(),
         listed,
     )
 }
@@ -473,13 +521,19 @@ enum OwnUpstream {
 
 /// Probe the node's own resolver. The load is deliberately **non-fatal** — see
 /// [`OwnUpstream::Unknown`].
-fn own_upstream(config_path: &Path) -> OwnUpstream {
+fn own_upstream(guard: &ConfigWriteLock, config_path: &Path) -> anyhow::Result<OwnUpstream> {
+    // Keep identity failures distinct from ordinary loader failures: only the
+    // latter are the deliberately tolerant `Unknown` repair path.
+    guard.verify_master(config_path)?;
     let now = time::OffsetDateTime::now_utc();
-    match loader::load_config(config_path, now) {
-        Ok(loaded) if loaded.config.upstream.servers.is_empty() => OwnUpstream::WouldStrand,
-        Ok(_) => OwnUpstream::Present,
-        Err(_) => OwnUpstream::Unknown,
-    }
+    Ok(
+        match loader::load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        {
+            Ok(loaded) if loaded.config.upstream.servers.is_empty() => OwnUpstream::WouldStrand,
+            Ok(_) => OwnUpstream::Present,
+            Err(_) => OwnUpstream::Unknown,
+        },
+    )
 }
 
 /// `warden cluster leave` — undo a join; make this node standalone again.
@@ -512,93 +566,108 @@ fn own_upstream(config_path: &Path) -> OwnUpstream {
 /// A no-op when the node is not a member: prints so and returns without
 /// rewriting the file.
 pub fn run_leave(config_path: &Path, upstream: Option<&str>) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(config_path)
-        .with_context(|| format!("cannot read {}", config_path.display()))?;
-    let value: toml::Value = raw
-        .parse()
-        .with_context(|| format!("cannot parse {} as TOML", config_path.display()))?;
+    enum LeaveResult {
+        Noop {
+            canonical: std::path::PathBuf,
+        },
+        Left {
+            cleared: Vec<&'static str>,
+            kept_token: bool,
+            kept_include: bool,
+        },
+    }
 
-    // Read membership off the RAW master, not a loaded config: the master is
-    // the file we would rewrite, and a broken config never loads at all.
-    let cluster = value.get("cluster").and_then(toml::Value::as_table);
+    let result = {
+        // `leave` is a repair operation, so inspect its raw master under the
+        // guard instead of pre-loading a configuration that can be invalid.
+        let guard = acquire_for_write(config_path)?;
+        let (raw, display) = read_raw_or_empty_locked(&guard, config_path, config_path)?;
+        let raw = raw.ok_or_else(|| anyhow::anyhow!("cannot read {}", display.display()))?;
+        let value: toml::Value = raw
+            .parse()
+            .with_context(|| format!("cannot parse {} as TOML", display.display()))?;
+        let cluster = value.get("cluster").and_then(toml::Value::as_table);
 
-    if !cluster.is_some_and(asserts_membership) {
-        bail_if_an_include_holds_membership(config_path)?;
+        if !cluster.is_some_and(asserts_membership) {
+            bail_if_an_include_holds_membership(&guard, config_path)?;
+            LeaveResult::Noop {
+                canonical: guard.canonical_master().to_path_buf(),
+            }
+        } else {
+            match (upstream, own_upstream(&guard, config_path)?) {
+                (None, OwnUpstream::WouldStrand) => {
+                    anyhow::bail!(
+                        "{LEAVE_WOULD_STRAND_NODE}\n\
+                         Re-run as `warden cluster leave --upstream <addr:port>` to clear membership \
+                         and set this node's own resolver in the same write.\n\
+                         Nothing has been written; {} is unchanged.",
+                        guard.canonical_master().display()
+                    );
+                }
+                (Some(u), OwnUpstream::Present) => {
+                    anyhow::bail!(
+                        "{LEAVE_UPSTREAM_NOT_NEEDED}\n\
+                         Passing --upstream {u} would REPLACE that list, not add to it.\n\
+                         Re-run `warden cluster leave` without the flag.\n\
+                         Nothing has been written; {} is unchanged.",
+                        guard.canonical_master().display()
+                    );
+                }
+                // `Unknown` is intentionally permissive in both cases: a
+                // malformed config is precisely what this repair verb must
+                // be allowed to rescue.
+                _ => {}
+            }
+
+            let cleared: Vec<&'static str> = MEMBERSHIP_FIELDS
+                .iter()
+                .copied()
+                .filter(|k| cluster.is_some_and(|t| t.contains_key(*k)))
+                .collect();
+            let kept_token = cluster.is_some_and(|t| t.contains_key("token_hash"));
+            let kept_include = value
+                .get("includes")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(CLUSTER_INCLUDE)));
+
+            write_cluster_fields_to_master_with_upstream(
+                &guard,
+                config_path,
+                &MEMBERSHIP_FIELDS.map(|k| (k, None::<toml::Value>)),
+                upstream,
+            )
+            .map_err(|e| {
+                if upstream.is_some() {
+                    return e;
+                }
+                anyhow::anyhow!(
+                    "{e}\n\n\
+                     If this node has no upstream resolver of its own, \
+                     `warden cluster leave --upstream <addr:port>` clears membership and sets one \
+                     in the same write — neither order works alone."
+                )
+            })?;
+            LeaveResult::Left {
+                cleared,
+                kept_token,
+                kept_include,
+            }
+        }
+    };
+
+    if let LeaveResult::Noop { canonical } = result {
         println!("cluster: not a member — nothing to leave.");
-        println!("{} was not modified.", config_path.display());
+        println!("{} was not modified.", canonical.display());
         return Ok(());
     }
-
-    match (upstream, own_upstream(config_path)) {
-        (None, OwnUpstream::WouldStrand) => {
-            anyhow::bail!(
-                "{LEAVE_WOULD_STRAND_NODE}\n\
-                 Re-run as `warden cluster leave --upstream <addr:port>` to clear membership \
-                 and set this node's own resolver in the same write.\n\
-                 Nothing has been written; {} is unchanged.",
-                config_path.display()
-            );
-        }
-        // The flag REPLACES `upstream.servers` wholesale. On a node that
-        // already resolves one — a synced secondary whose bundle supplies it,
-        // or a primary — that silently discards a working list, and a
-        // multi-server list loses every entry but the one typed. It exists for
-        // the stranding case; refuse it where it can only destroy.
-        (Some(u), OwnUpstream::Present) => {
-            anyhow::bail!(
-                "{LEAVE_UPSTREAM_NOT_NEEDED}\n\
-                 Passing --upstream {u} would REPLACE that list, not add to it.\n\
-                 Re-run `warden cluster leave` without the flag.\n\
-                 Nothing has been written; {} is unchanged.",
-                config_path.display()
-            );
-        }
-        // `Unknown` takes the unchanged path in BOTH columns: the config does
-        // not load, so neither refusal can be justified, and `leave`'s rescue
-        // role outranks a guess. With the flag it may even be the repair.
-        _ => {}
-    }
-
-    // Report only the keys that were really there; clear all three regardless,
-    // so a half-written section can't survive as `enabled = false` + a stale peer.
-    let cleared: Vec<&str> = MEMBERSHIP_FIELDS
-        .iter()
-        .copied()
-        .filter(|k| cluster.is_some_and(|t| t.contains_key(*k)))
-        .collect();
-    let kept_token = cluster.is_some_and(|t| t.contains_key("token_hash"));
-    let kept_include = value
-        .get("includes")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(CLUSTER_INCLUDE)));
-
-    // On failure with no flag, point at the flag. The probe above answers
-    // `Unknown` for a config that does not load, and that is exactly the
-    // operator whose post-leave state may ALSO lack an upstream — they would
-    // otherwise get a bare `UPSTREAM_SERVERS_EMPTY` from a verb they ran about
-    // cluster membership, with no hint that `leave` can fix it in one write.
-    //
-    // Worded as a possibility, not a diagnosis: we genuinely do not know why
-    // the staged write failed, and classifying it by matching the validator's
-    // error text is the error-string allowlist this module has twice refused
-    // to grow.
-    write_cluster_fields_to_master_with_upstream(
-        config_path,
-        &MEMBERSHIP_FIELDS.map(|k| (k, None::<toml::Value>)),
-        upstream,
-        time::OffsetDateTime::now_utc(),
-    )
-    .map_err(|e| {
-        if upstream.is_some() {
-            return e;
-        }
-        anyhow::anyhow!(
-            "{e}\n\n\
-             If this node has no upstream resolver of its own, \
-             `warden cluster leave --upstream <addr:port>` clears membership and sets one \
-             in the same write — neither order works alone."
-        )
-    })?;
+    let LeaveResult::Left {
+        cleared,
+        kept_token,
+        kept_include,
+    } = result
+    else {
+        unreachable!("the no-op result returned above")
+    };
 
     println!("Left the cluster — this node is standalone again.");
     println!("  cleared: {}", cleared.join(", "));
@@ -637,8 +706,20 @@ pub fn run_leave(config_path: &Path, upstream: Option<&str>) -> anyhow::Result<(
 /// guess. A master that has its OWN `[cluster]` never reaches here — this runs
 /// only after the master was found clean, and a second definition of a
 /// singleton is a hard duplicate error anyway.
-fn bail_if_an_include_holds_membership(config_path: &Path) -> anyhow::Result<()> {
-    let Ok(loaded) = loader::load_config(config_path, time::OffsetDateTime::now_utc()) else {
+fn bail_if_an_include_holds_membership(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+) -> anyhow::Result<()> {
+    // The read is deliberately tolerant, but never at the expense of a
+    // guard/tree mismatch. Verify first, then map only an ordinary loader
+    // failure to the historical inconclusive result.
+    guard.verify_master(config_path)?;
+    let Ok(loaded) = loader::load_config_for_schema_under_guard(
+        guard,
+        config_path,
+        SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    ) else {
         return Ok(());
     };
     let c = &loaded.config.cluster;
@@ -654,7 +735,7 @@ fn bail_if_an_include_holds_membership(config_path: &Path) -> anyhow::Result<()>
         "clustering is on, but `[cluster]` is not in {} — it comes from {source}.\n\
          `cluster leave` only rewrites the master config, so it has changed nothing. \
          Remove the `[cluster]` section from that file by hand.",
-        config_path.display()
+        guard.canonical_master().display()
     )
 }
 
@@ -865,11 +946,11 @@ fn truncate(s: &str, max: usize) -> String {
 /// so deleting a key restores its inert default exactly — without leaving
 /// `enabled = false` cruft behind that reads like a deliberate setting.
 fn write_cluster_fields_to_master(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     fields: &[(&str, Option<toml::Value>)],
-    now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
-    write_cluster_fields_to_master_with_upstream(config_path, fields, None, now)
+    write_cluster_fields_to_master_with_upstream(guard, config_path, fields, None)
 }
 
 /// [`write_cluster_fields_to_master`] plus, optionally, this node's own
@@ -881,34 +962,15 @@ fn write_cluster_fields_to_master(
 /// `[upstream]` exists yet — and adding `[upstream]` first is refused by
 /// `CLUSTER_SECONDARY_MASTER_CARRIES_POLICY` while membership still stands.
 /// Either order fails; only the simultaneous one is representable, because
-/// `atomic_write_and_validate` validates the post state and nothing in
+/// the guarded overlay validator validates the post state and nothing in
 /// between.
 fn write_cluster_fields_to_master_with_upstream(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     fields: &[(&str, Option<toml::Value>)],
     upstream: Option<&str>,
-    now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
-    write_master_sections(config_path, fields, &[], upstream, now)
-}
-
-/// [`write_cluster_fields_to_master`] plus `[api]` fields, mutated into the
-/// SAME staged write (S4).
-///
-/// Third instance of the same argument, and the sharpest one.
-/// `check_api` turns on **four** rules the instant `api.enabled = true`:
-/// a non-blank `token_hash`, both halves of the TLS pair on a non-loopback
-/// `listen`, and never a half pair. `atomic_write_and_validate` validates the
-/// POST state and nothing in between, so `[cluster]` first and `[api]` second
-/// — or the reverse — passes through a document the loader rejects, and the
-/// verb fails half-applied. Only the simultaneous write is representable.
-fn write_cluster_and_api_fields_to_master(
-    config_path: &Path,
-    cluster_fields: &[(&str, Option<toml::Value>)],
-    api_fields: &[(&str, Option<toml::Value>)],
-    now: time::OffsetDateTime,
-) -> anyhow::Result<()> {
-    write_master_sections(config_path, cluster_fields, api_fields, None, now)
+    write_master_sections(guard, config_path, fields, &[], upstream, false)
 }
 
 /// The one staged, validated master write the three wrappers above share.
@@ -917,51 +979,74 @@ fn write_cluster_and_api_fields_to_master(
 /// intent in its own name, and none of them has to restate why the sections
 /// travel together.
 fn write_master_sections(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     cluster_fields: &[(&str, Option<toml::Value>)],
     api_fields: &[(&str, Option<toml::Value>)],
     upstream: Option<&str>,
-    now: time::OffsetDateTime,
+    add_cluster_include: bool,
 ) -> anyhow::Result<()> {
-    let content = super::toml_write::edit_document(config_path, |doc| {
-        if let Some(u) = upstream {
-            let mut servers = toml_edit::Array::new();
-            servers.push(u);
-            super::toml_write::table_mut(doc, "upstream")?
-                .insert("servers", toml_edit::value(servers));
+    let prepared = prepare_master_sections(
+        guard,
+        config_path,
+        cluster_fields,
+        api_fields,
+        upstream,
+        add_cluster_include,
+    )?;
+    commit_prevalidated_single_write(prepared).map_err(anyhow::Error::new)
+}
+
+/// Build and overlay-validate one exact master replacement without promoting
+/// it. `enable` uses this to prove the final descriptor-pinned master before
+/// either TLS artifact is published.
+fn prepare_master_sections<'g>(
+    guard: &'g ConfigWriteLock,
+    config_path: &Path,
+    cluster_fields: &[(&str, Option<toml::Value>)],
+    api_fields: &[(&str, Option<toml::Value>)],
+    upstream: Option<&str>,
+    add_cluster_include: bool,
+) -> anyhow::Result<PreparedValidatedSingleWrite<'g>> {
+    let (raw, _) = read_raw_or_empty_locked(guard, config_path, config_path)?;
+    let raw =
+        raw.ok_or_else(|| anyhow::anyhow!("cannot read {}", guard.canonical_master().display()))?;
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().with_context(|| {
+        format!(
+            "cannot parse {} as TOML",
+            guard.canonical_master().display()
+        )
+    })?;
+
+    if let Some(u) = upstream {
+        let mut servers = toml_edit::Array::new();
+        servers.push(u);
+        super::toml_write::table_mut(&mut doc, "upstream")?
+            .insert("servers", toml_edit::value(servers));
+    }
+    for (section, fields) in [("cluster", cluster_fields), ("api", api_fields)] {
+        if fields.is_empty() {
+            // `table_mut` creates the table, so do not add a cosmetic empty
+            // header when this operation has no fields for that section.
+            continue;
         }
-        for (section, fields) in [("cluster", cluster_fields), ("api", api_fields)] {
-            if fields.is_empty() {
-                // Not a micro-optimisation: `table_mut` CREATES the table, so
-                // an unconditional pass would add an empty `[api]` header to
-                // every `join` and `leave` write.
-                continue;
-            }
-            let table = super::toml_write::table_mut(doc, section)?;
-            for (k, v) in fields {
-                match v {
-                    Some(v) => {
-                        table.insert(k, super::toml_write::value_to_item(v)?);
-                    }
-                    None => {
-                        table.remove(k);
-                    }
+        let table = super::toml_write::table_mut(&mut doc, section)?;
+        for (k, v) in fields {
+            match v {
+                Some(v) => {
+                    table.insert(k, super::toml_write::value_to_item(v)?);
+                }
+                None => {
+                    table.remove(k);
                 }
             }
         }
-        Ok(())
-    })?;
+    }
+    if add_cluster_include {
+        ensure_cluster_include(guard, config_path, &mut doc)?;
+    }
 
-    atomic_write_and_validate(
-        config_path,
-        &content,
-        |staged: &Path| -> Result<(), String> {
-            loader::load_config(staged, now)
-                .map(|_| ())
-                .map_err(|e| format_config_errors_flat(&e))
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    prepare_raw_validated_single_locked(guard, config_path, config_path, doc.to_string())
 }
 
 /// `warden cluster enable --role primary` — S4: turn a standalone node into a
@@ -973,9 +1058,9 @@ fn write_master_sections(
 /// primary needs `api.enabled = true` on an address its secondary can reach,
 /// and `check_api` makes four rules bite the instant that flips — a non-blank
 /// `token_hash`, both halves of the TLS pair on a non-loopback `listen`, and
-/// never a half pair. `atomic_write_and_validate` validates the POST state and
-/// nothing in between, so any split write passes through a document the loader
-/// rejects. See [`write_cluster_and_api_fields_to_master`].
+/// never a half pair. The guarded overlay validator validates the POST state,
+/// so any split write passes through a document the loader rejects. Its final
+/// master is prepared and validated before TLS publication.
 ///
 /// # Why the pre-state is necessarily `api.enabled = false`
 ///
@@ -1014,135 +1099,184 @@ pub fn run_enable(
     ensure_can_enable()?;
 
     let now = time::OffsetDateTime::now_utc();
-    // Pre-load, unlike `run_join`. A would-be PRIMARY's master is an ordinary
-    // standalone config that already loads — the §5.3 deadlock that forced
-    // `join` to read raw is a SECONDARY-only condition. Same reasoning keeps
-    // `run_token`'s pre-load. It also buys the parsed `api.listen`, defaults
-    // applied, which R3 needs and a raw TOML read cannot give.
-    let loaded = loader::load_config(config_path, now).map_err(format_load_errs)?;
-    let cluster = &loaded.config.cluster;
-    let api = &loaded.config.api;
+    let outcome = {
+        let guard = acquire_for_write(config_path)?;
+        // Pre-load, unlike `run_join`. A would-be PRIMARY's master is an
+        // ordinary standalone config that already loads, and its parsed API
+        // defaults are what R3 needs.
+        let loaded =
+            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+                .map_err(format_config_errors)?;
+        let cluster = &loaded.config.cluster;
+        let api = &loaded.config.api;
 
-    // R2 — the credential must exist before the door opens.
-    if !is_set(cluster.token_hash.as_deref()) {
-        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_TOKEN_HASH);
-    }
+        if !is_set(cluster.token_hash.as_deref()) {
+            anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_TOKEN_HASH);
+        }
+        let listen = api_listen.unwrap_or(api.listen);
+        if listen.ip().is_loopback() {
+            anyhow::bail!(cluster_schema::CLUSTER_ENABLE_LISTEN_IS_LOOPBACK);
+        }
+        if !is_set(api.token_hash.as_deref()) {
+            anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH);
+        }
 
-    // R3 — the RESULTING listen, not the configured one: `--api-listen` is
-    // what makes a fresh node (default `127.0.0.1:8053`) reachable at all.
-    let listen = api_listen.unwrap_or(api.listen);
-    if listen.ip().is_loopback() {
-        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_LISTEN_IS_LOOPBACK);
-    }
+        // A configured half-pair is still operator material; do not mint over
+        // it while API validation is dormant.
+        let has_own_cert = api.tls_cert.is_some() || api.tls_key.is_some();
+        if has_own_cert && !sans.is_empty() {
+            anyhow::bail!(cluster_schema::CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT);
+        }
+        if !has_own_cert && sans.is_empty() {
+            anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_SAN);
+        }
 
-    // R4 — without it the post state is refused by
-    // `API_ENABLED_REQUIRES_TOKEN_HASH`, i.e. the verb would build a master
-    // the daemon cannot start from and fail late, in the staged write, naming
-    // a temp path that is unlinked by the time the operator reads the error.
-    if !is_set(api.token_hash.as_deref()) {
-        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_API_TOKEN_HASH);
-    }
+        // Plan against the held root, not beside the spelling the operator
+        // supplied. This both rejects symlink leaves and yields canonical TLS
+        // paths for the final `[api]` fields.
+        let (crt, key, cert_plan, key_plan, owner) = if has_own_cert {
+            (None, None, None, None, None)
+        } else {
+            use std::os::unix::fs::MetadataExt;
 
-    // Either half counts as "the operator brought their own". A lone
-    // `tls_cert` is loadable today only because `check_api` is inert while
-    // `api.enabled = false`; treating it as absent would mint over half a
-    // pair the operator configured on purpose.
-    let has_own_cert = api.tls_cert.is_some() || api.tls_key.is_some();
+            for candidate in [Path::new("api.crt"), Path::new("api.key")] {
+                if let Some(declared_by) = loader::loaded_include_matches_root_file(
+                    &guard,
+                    config_path,
+                    &loaded,
+                    candidate,
+                )? {
+                    anyhow::bail!(
+                        "refusing cluster enable: TLS artifact {} would match an include declared by {}; remove or narrow that include before enabling",
+                        candidate.display(),
+                        declared_by.display()
+                    );
+                }
+            }
 
-    if has_own_cert && !sans.is_empty() {
-        // R7 — the certificate would be written and never used.
-        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_SAN_WITH_EXISTING_CERT);
-    }
-    if !has_own_cert && sans.is_empty() {
-        // R5.
-        anyhow::bail!(cluster_schema::CLUSTER_ENABLE_REQUIRES_SAN);
-    }
+            let master_plan = guard.tree_io().plan_master_target()?;
+            let master_meta = master_plan
+                .original_metadata()
+                .context("inspect descriptor-pinned master ownership")?;
+            let owner = (master_meta.uid(), master_meta.gid());
+            let cert_plan = guard
+                .tree_io()
+                .plan_root_file_no_follow(Path::new("api.crt"))?;
+            let key_plan = guard
+                .tree_io()
+                .plan_root_file_no_follow(Path::new("api.key"))?;
+            let crt = cert_plan.display().to_path_buf();
+            let key = key_plan.display().to_path_buf();
+            if !cert_plan.is_new() || !key_plan.is_new() {
+                anyhow::bail!(cluster_schema::format_cluster_enable_cert_already_exists(
+                    &[crt, key]
+                ));
+            }
+            (
+                Some(crt),
+                Some(key),
+                Some(cert_plan),
+                Some(key_plan),
+                Some(owner),
+            )
+        };
 
-    let dir = config_dir(config_path)?;
-    let crt = dir.join("api.crt");
-    let key = dir.join("api.key");
-
-    let minted = if has_own_cert {
-        // R7's mirror, and NOT a refusal: existing material plus no `--san`
-        // means "use what I already have", a supported way to run a primary.
-        // Nothing is generated and `api.tls_cert` is left exactly as it is.
-        None
-    } else {
-        // R6 — checked here so the message can name both paths before
-        // anything is minted. `create_new(true)` below re-checks it
-        // atomically; this one exists for the diagnostic, not the guarantee.
-        if crt.exists() || key.exists() {
-            anyhow::bail!(cluster_schema::format_cluster_enable_cert_already_exists(
-                &[crt.clone(), key.clone()]
+        let minted = (!has_own_cert)
+            .then(|| mint_primary_cert(sans, validity_days, now))
+            .transpose()?;
+        let cluster_fields = [
+            ("enabled", Some(toml::Value::Boolean(true))),
+            ("role", Some(toml::Value::String("primary".into()))),
+        ];
+        let mut api_fields = vec![("enabled", Some(toml::Value::Boolean(true)))];
+        if api_listen.is_some() {
+            api_fields.push(("listen", Some(toml::Value::String(listen.to_string()))));
+        }
+        if let (Some(crt), Some(key)) = (&crt, &key) {
+            api_fields.push((
+                "tls_cert",
+                Some(toml::Value::String(crt.display().to_string())),
+            ));
+            api_fields.push((
+                "tls_key",
+                Some(toml::Value::String(key.display().to_string())),
             ));
         }
-        Some(mint_primary_cert(sans, validity_days, now)?)
-    };
 
-    let cluster_fields: [(&str, Option<toml::Value>); 2] = [
-        ("enabled", Some(toml::Value::Boolean(true))),
-        ("role", Some(toml::Value::String("primary".into()))),
-    ];
-    let mut api_fields: Vec<(&str, Option<toml::Value>)> =
-        vec![("enabled", Some(toml::Value::Boolean(true)))];
-    if api_listen.is_some() {
-        // Only when the operator asked. Absence must preserve whatever the
-        // master already carries — the same rule `join` follows for
-        // `peer_cert`, and for the same reason: a flag's absence is not an
-        // instruction to overwrite.
-        api_fields.push(("listen", Some(toml::Value::String(listen.to_string()))));
-    }
-    if minted.is_some() {
-        api_fields.push((
-            "tls_cert",
-            Some(toml::Value::String(crt.display().to_string())),
-        ));
-        api_fields.push((
-            "tls_key",
-            Some(toml::Value::String(key.display().to_string())),
-        ));
-    }
-    // Certificate first, then the config, and the order is not arbitrary.
-    // `check_api` only checks `is_some()` on the TLS pair — nothing in the
-    // loader stats the file — so a config-first order can leave a node whose
-    // master says `api.enabled = true` pointing at a certificate that does
-    // not exist. That node cannot bind, and no verb undoes it. Orphaned files
-    // are the recoverable failure; a non-bootable master is not.
-    let mut created: Vec<std::path::PathBuf> = Vec::new();
-    let outcome = (|| -> anyhow::Result<()> {
-        if let Some(m) = &minted {
-            // The master is the ownership reference: it is what the daemon
-            // loads, so its owner is the identity that has to be able to read
-            // the key sitting next to it. See `create_exclusive`.
-            create_exclusive(&crt, m.cert_pem.as_bytes(), 0o644, &crt, &key, config_path)?;
-            created.push(crt.clone());
-            // 0600 AT CREATION, never write-then-`set_permissions`: that
-            // leaves a world-readable window on a private key, which is the
-            // exact race `hardened_atomic_write` exists to close for config.
-            create_exclusive(&key, m.key_pem.as_bytes(), 0o600, &crt, &key, config_path)?;
-            created.push(key.clone());
+        // Validate the exact final master before publishing either companion
+        // artifact. The master promotion remains the last durable step.
+        let prepared = prepare_master_sections(
+            &guard,
+            config_path,
+            &cluster_fields,
+            &api_fields,
+            None,
+            false,
+        )?;
+
+        let mut cert_receipt = None;
+        let mut key_receipt = None;
+        if let Some(minted) = minted.as_ref() {
+            let crt = crt.as_ref().expect("minted pair has a certificate path");
+            let key = key.as_ref().expect("minted pair has a key path");
+            let owner = owner.expect("minted pair has master ownership");
+            let cert_target = cert_plan
+                .expect("minted pair has a certificate plan")
+                .materialize()?;
+            let key_target = key_plan
+                .expect("minted pair has a key plan")
+                .materialize()?;
+            let cert = publish_certificate(
+                cert_target,
+                minted.cert_pem.as_bytes(),
+                0o644,
+                owner,
+                crt,
+                key,
+            )?;
+            cert_receipt = Some(cert);
+
+            let key_result = publish_certificate(
+                key_target,
+                minted.key_pem.as_bytes(),
+                0o600,
+                owner,
+                crt,
+                key,
+            );
+            let key_receipt_value = match key_result {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(with_certificate_cleanup(error, None, cert_receipt.take()));
+                }
+            };
+            key_receipt = Some(key_receipt_value);
         }
-        write_cluster_and_api_fields_to_master(config_path, &cluster_fields, &api_fields, now)
-    })();
 
-    if let Err(e) = outcome {
-        // Undo only what THIS call created. Without it a validator refusal on
-        // the staged write leaves the pair on disk, and the operator's retry
-        // hits R6 — with no `--force`, a dead end produced by our own
-        // half-finished attempt.
-        return Err(match unwind_created(&created) {
-            Ok(()) => e,
-            Err(paths) => e.context(format!(
-                "could not remove the certificate material this attempt created — \
-                 remove it by hand before re-running: {paths}"
-            )),
-        });
-    }
+        settle_enable_commit(
+            commit_prevalidated_single_write(prepared),
+            key_receipt.take(),
+            cert_receipt.take(),
+        )?;
+
+        EnableOutcome {
+            listen,
+            minted,
+            existing_cert: api.tls_cert.clone(),
+            crt,
+            key,
+        }
+    };
 
     println!("Cluster enabled — this node is now a primary.");
     println!("  role:       primary");
-    println!("  api.listen: {listen}");
-    if let Some(m) = &minted {
+    println!("  api.listen: {}", outcome.listen);
+    if let Some(m) = &outcome.minted {
+        let crt = outcome
+            .crt
+            .as_ref()
+            .expect("minted pair has a certificate path");
+        let key = outcome.key.as_ref().expect("minted pair has a key path");
         println!("  certificate: {}", crt.display());
         println!("  private key: {} (mode 0600)", key.display());
         println!("  expires:     {}", m.not_after);
@@ -1153,7 +1287,7 @@ pub fn run_enable(
         println!("Copy {} to the secondary and run there:", crt.display());
         println!(
             "  warden cluster join --peer https://<this node>:{} \\",
-            listen.port()
+            outcome.listen.port()
         );
         println!("      --token-file <path> --peer-cert <copy of api.crt>");
         println!();
@@ -1162,7 +1296,7 @@ pub fn run_enable(
         println!("print the same digest. The pin is the only thing authenticating the");
         println!("channel; a certificate that arrived over a channel you have not checked");
         println!("pins whatever an interceptor substituted.");
-    } else if let Some(own) = api.tls_cert.as_ref() {
+    } else if let Some(own) = outcome.existing_cert.as_ref() {
         // No trailing `else`: the only way here with `tls_cert` unset is a
         // half pair (`tls_key` alone), and that post state is refused by
         // `API_TLS_PAIR_INCOMPLETE` in the staged write above — so this
@@ -1178,92 +1312,80 @@ pub fn run_enable(
     Ok(())
 }
 
+struct EnableOutcome {
+    listen: std::net::SocketAddr,
+    minted: Option<MintedPair>,
+    existing_cert: Option<PathBuf>,
+    crt: Option<PathBuf>,
+    key: Option<PathBuf>,
+}
+
 /// Non-blank, the way `check_api` and `check_cluster` both read a hash.
 fn is_set(v: Option<&str>) -> bool {
     v.is_some_and(|h| !h.trim().is_empty())
 }
 
-/// The directory the master config lives in, absolute.
-///
-/// `Path::new("config.toml").parent()` is `Some("")`, not `None` — and
-/// CLAUDE.md documents `./config.toml` as the development path, so the empty
-/// parent is reachable, not theoretical. Left relative it would put
-/// `tls_cert = "api.crt"` in the master, which the daemon then resolves
-/// against ITS working directory rather than the config's. A test suite built
-/// on `tempfile::tempdir()` cannot see this: every path there is already
-/// absolute.
-fn config_dir(config_path: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new(""));
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    parent
-        .canonicalize()
-        .with_context(|| format!("cannot resolve the config directory {}", parent.display()))
+/// An inode-bound TLS artifact created by this invocation only.
+struct CreatedCertificate<'g> {
+    target: PinnedTarget<'g>,
 }
 
-/// The uid/gid owning `path`, or `None` if it cannot be stat'd.
-///
-/// The reference for the TLS pair's ownership is the **config master**: the
-/// process that has to read the key is the daemon, and the daemon runs as the
-/// user that owns the config it loads. Deriving the owner from anything else
-/// (the caller's uid, a hardcoded name) re-opens exactly the hole this closes.
-#[cfg(unix)]
-fn owner_of(path: &Path) -> Option<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+impl CreatedCertificate<'_> {
+    fn rollback(self) -> anyhow::Result<()> {
+        self.target.rollback_target()?.unlink()?;
+        Ok(())
+    }
+
+    fn display(&self) -> &Path {
+        self.target.display()
+    }
 }
 
-/// Create `path` with `mode` **at creation**, refusing if it already exists.
-///
-/// `create_new(true)` is what makes R6 a guarantee rather than a check: an
-/// existence test followed by a write is a TOCTOU window, and the thing on the
-/// other side of it is a private key. `r6_crt`/`r6_key` are carried only so
-/// the collision reports the same frozen message the pre-check does — the
-/// operator must not get two different stories for one condition.
-///
-/// `owner_ref` is the file whose uid/gid the created file must inherit — the
-/// **config master**. It is taken as a path, not as an `Option<(uid, gid)>`, on
-/// purpose: with the tuple there is a spelling (`None`) that silently restores
-/// the bug, and nothing in the type system objects to it. A required path has
-/// no such spelling, and the effect this guards is invisible to any test that
-/// does not run as root — so the defence has to be structural, not asserted.
-///
-/// **What it guards.** Run as root without it, `enable` mints `api.key` as
-/// `0600 root:root` while the daemon runs as `purge-warden`: the key the master
-/// now points at is one the daemon cannot open, `api.enabled = true` is already
-/// written, and the node no longer starts. The config writer learned this
-/// already — `atomic_write.rs` captures and re-applies the owner — and this is
-/// the same lesson on the sibling path.
-///
-/// **Why `geteuid() == 0` is the right gate, not a lazy one.** `lchown` needs
-/// CAP_CHOWN when the target differs from the caller, and the daemon's seccomp
-/// filter excludes `@chown`, so an unconditional call dies on SIGSYS. The
-/// non-root case cannot go wrong regardless: the config directory is
-/// `drwxr-x---` owned by the daemon user, so a caller who is neither root nor
-/// that user cannot create anything here at all — either the owner already
-/// matches, or the open fails long before this.
-fn create_exclusive(
-    path: &Path,
+/// Publish a TLS artifact through an unlinked spool. A post-rename error must
+/// prove removal of the inode it promoted; pathname removal could delete a
+/// replacement installed by another actor.
+fn publish_certificate<'g>(
+    target: PinnedTarget<'g>,
     bytes: &[u8],
     mode: u32,
+    owner: (u32, u32),
     r6_crt: &Path,
     r6_key: &Path,
-    owner_ref: &Path,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+) -> anyhow::Result<CreatedCertificate<'g>> {
+    publish_certificate_with_opts(
+        target,
+        bytes,
+        r6_crt,
+        r6_key,
+        AtomicCreateOnlyAtOpts {
+            mode: Some(mode),
+            owner: Some(owner),
+            #[cfg(test)]
+            test_failure: None,
+        },
+    )
+}
 
-    let mut f = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+/// Inner form keeps fault injection operation-scoped in the unit tests.
+fn publish_certificate_with_opts<'g>(
+    target: PinnedTarget<'g>,
+    bytes: &[u8],
+    r6_crt: &Path,
+    r6_key: &Path,
+    opts: AtomicCreateOnlyAtOpts,
+) -> anyhow::Result<CreatedCertificate<'g>> {
+    use std::io::Write;
+
+    let path = target.display().to_path_buf();
+    let mut spool = tempfile::tempfile()
+        .with_context(|| format!("create private spool for {}", path.display()))?;
+    spool
+        .write_all(bytes)
+        .with_context(|| format!("write private spool for {}", path.display()))?;
+    let result = hardened_atomic_create_only_at(&target, &mut spool, bytes.len() as u64, opts);
+    match result {
+        Ok(()) => Ok(CreatedCertificate { target }),
+        Err(error) if matches!(&error, AtomicWriteError::TargetExists { .. }) => {
             anyhow::bail!(
                 crate::config::schema::cluster::format_cluster_enable_cert_already_exists(&[
                     r6_crt.to_path_buf(),
@@ -1271,57 +1393,64 @@ fn create_exclusive(
                 ])
             );
         }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("cannot create {}", path.display())))
-        }
-    };
-    f.write_all(bytes)
-        .with_context(|| format!("cannot write {}", path.display()))?;
-
-    // Owner BEFORE the fsync below, so the metadata is made durable with the
-    // bytes rather than in a second, unsynced step — same ordering, and same
-    // reason, as `atomic_write`'s chmod/lchown-then-fsync.
-    #[cfg(unix)]
-    if let Some((uid, gid)) = owner_of(owner_ref) {
-        // SAFETY: geteuid takes no arguments, cannot fail, and is
-        // async-signal-safe.
-        if unsafe { libc::geteuid() } == 0 {
-            if let Err(e) = std::os::unix::fs::lchown(path, Some(uid), Some(gid)) {
-                // Leave nothing behind: a key the daemon cannot read is the
-                // failure this whole function exists to prevent, so a
-                // half-applied one must not survive to be picked up by R6 on
-                // the operator's retry.
-                drop(f);
-                let _ = std::fs::remove_file(path);
-                return Err(anyhow::Error::new(e).context(format!(
-                    "cannot set ownership {uid}:{gid} on {}",
+        Err(error) if error.rename_landed() => {
+            let receipt = CreatedCertificate { target };
+            match receipt.rollback() {
+                Ok(()) => Err(anyhow::Error::new(error)
+                    .context(format!("cannot durably create {}", path.display()))),
+                Err(rollback) => anyhow::bail!(
+                    "creating {} left uncertain state; recovery required: the create may have \
+                     been published after {error}; rollback could not be proved durable: {rollback:#}",
                     path.display()
-                )));
+                ),
             }
         }
+        Err(error) => {
+            Err(anyhow::Error::new(error).context(format!("cannot create {}", path.display())))
+        }
     }
-
-    // Durability matters here for the same reason it does for config: the pin
-    // is copied off this file, and a truncated certificate that survives a
-    // crash is a node that cannot be joined.
-    f.sync_all()
-        .with_context(|| format!("cannot flush {}", path.display()))?;
-    Ok(())
 }
 
-/// Best-effort removal of the files this invocation created. Returns the
-/// paths it could NOT remove, so the caller can name them — a cleanup that
-/// fails silently reproduces exactly the dead end it exists to prevent.
-fn unwind_created(created: &[std::path::PathBuf]) -> Result<(), String> {
-    let left: Vec<String> = created
-        .iter()
-        .filter(|p| std::fs::remove_file(p).is_err() && p.exists())
-        .map(|p| p.display().to_string())
-        .collect();
-    if left.is_empty() {
-        Ok(())
+/// Apply the typed master-commit disposition to certificates already created
+/// by this invocation. Only an uncertain commit can leave a visible master.
+fn settle_enable_commit(
+    result: Result<(), super::target::ConfigCommitFailure>,
+    key: Option<CreatedCertificate<'_>>,
+    cert: Option<CreatedCertificate<'_>>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.disposition() == ConfigCommitDisposition::Uncertain => {
+            Err(anyhow::Error::new(failure))
+        }
+        Err(failure) => Err(with_certificate_cleanup(
+            anyhow::Error::new(failure),
+            key,
+            cert,
+        )),
+    }
+}
+
+/// Roll back key before certificate and name every inode that could remain.
+fn with_certificate_cleanup(
+    error: anyhow::Error,
+    key: Option<CreatedCertificate<'_>>,
+    cert: Option<CreatedCertificate<'_>>,
+) -> anyhow::Error {
+    let mut retained = Vec::new();
+    for receipt in [key, cert].into_iter().flatten() {
+        let path = receipt.display().to_path_buf();
+        if let Err(rollback) = receipt.rollback() {
+            retained.push(format!("{} ({rollback:#})", path.display()));
+        }
+    }
+    if retained.is_empty() {
+        error
     } else {
-        Err(left.join(", "))
+        error.context(format!(
+            "could not remove certificate material this attempt created; retained paths: {}",
+            retained.join(", ")
+        ))
     }
 }
 
@@ -1404,54 +1533,27 @@ fn ensure_can_enable() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ensure the master's top-level `includes` contains the sync-owned
-/// `cluster.d/*.toml` drop-in glob, then atomically re-write the
-/// master. Idempotent — a re-join does not duplicate the entry. The glob's
-/// zero-match-is-allowed rule means the master still loads before any bundle
-/// has been synced into `cluster.d/`.
-#[cfg(feature = "cluster")]
-fn ensure_cluster_include(config_path: &Path, now: time::OffsetDateTime) -> anyhow::Result<()> {
-    const PATTERN: &str = CLUSTER_INCLUDE;
-
-    let mut already_present = false;
-    let content = super::toml_write::edit_document(config_path, |doc| {
-        let includes = doc
-            .entry("includes")
-            .or_insert(toml_edit::value(toml_edit::Array::new()));
-        let arr = includes
-            .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("`includes` must be a TOML array of strings"))?;
-        if arr.iter().any(|v| v.as_str() == Some(PATTERN)) {
-            already_present = true; // idempotent re-join
-            return Ok(());
-        }
-        arr.push(PATTERN);
-        Ok(())
-    })?;
-    if already_present {
-        return Ok(());
+/// Insert the sync-owned include into an already-guarded raw master document.
+/// Returns whether a new element was appended. No independent write is
+/// permitted: `join` must publish its cluster fields and this include in one
+/// master rename.
+fn ensure_cluster_include(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    doc: &mut toml_edit::DocumentMut,
+) -> anyhow::Result<bool> {
+    guard.verify_master(config_path)?;
+    let includes = doc
+        .entry("includes")
+        .or_insert(toml_edit::value(toml_edit::Array::new()));
+    let arr = includes
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("`includes` must be a TOML array of strings"))?;
+    if arr.iter().any(|v| v.as_str() == Some(CLUSTER_INCLUDE)) {
+        return Ok(false);
     }
-    atomic_write_and_validate(
-        config_path,
-        &content,
-        |staged: &Path| -> Result<(), String> {
-            loader::load_config(staged, now)
-                .map(|_| ())
-                .map_err(|e| format_config_errors_flat(&e))
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-/// Flatten loader errors into one operator-facing message.
-///
-/// The wrapper is per-verb because the text names the operation; the
-/// flattener underneath is shared with `token`.
-fn format_load_errs(errs: Vec<crate::config::error::ConfigError>) -> anyhow::Error {
-    anyhow::anyhow!(
-        "cannot load config for cluster operation: {}",
-        crate::cli::commands::token::format_errs_flat(errs)
-    )
+    arr.push(CLUSTER_INCLUDE);
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1488,7 +1590,7 @@ mod tests {
         }
     }
 
-    const MASTER: &str = r#"schema_version = 3
+    const MASTER: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1521,7 +1623,7 @@ servers = ["192.0.2.1:53"]
     /// only a node that is actually syncing earns the missing-`[upstream]`
     /// exemption. An unvalidated `std::fs::write` followed by a validating
     /// cluster write is exactly the sequence a real join performs.
-    const SECONDARY_MASTER: &str = r#"schema_version = 3
+    const SECONDARY_MASTER: &str = r#"schema_version = 4
 
 [server]
 default_blocked_ttl_secs = 60
@@ -1565,6 +1667,14 @@ token_hash = ""
         loader::load_config(path, now).unwrap().config.cluster
     }
 
+    fn block_until_contended(receiver: &std::sync::mpsc::Receiver<()>, operation: &str) {
+        use std::time::Duration;
+
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("{operation} did not contend before loading: {error}"));
+    }
+
     #[test]
     fn token_writes_hash_without_enabling() {
         let dir = tempfile::tempdir().unwrap();
@@ -1577,6 +1687,55 @@ token_hash = ""
         assert_eq!(c.token_hash.as_deref().unwrap().len(), 64);
         assert!(!c.enabled);
         assert_eq!(c.role, ClusterRole::Primary);
+    }
+
+    #[test]
+    fn token_and_leave_refuse_a_migration_fence_before_live_tree_reads() {
+        use crate::config::migration_journal::create_fence;
+        use crate::config::write_lock::acquire_for_migration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_master(&dir);
+        let before = std::fs::read_to_string(&master).unwrap();
+        let migration = acquire_for_migration(&master).unwrap();
+        create_fence(&migration).unwrap();
+        drop(migration);
+
+        for result in [run_token(&master), run_leave(&master, None)] {
+            let error = result.expect_err("a normal mutation must refuse the fence");
+            assert!(error.to_string().contains("unfinished v3-to-v4 migration"));
+        }
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn stock_join_and_enable_refuse_the_build_before_a_migration_fence() {
+        use crate::config::migration_journal::create_fence;
+        use crate::config::write_lock::acquire_for_migration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_master(&dir);
+        let migration = acquire_for_migration(&master).unwrap();
+        create_fence(&migration).unwrap();
+        drop(migration);
+
+        let join = run_join(&master, "https://192.0.2.1:8053", Some("ps_token"), None)
+            .expect_err("stock build must refuse join before lock acquisition");
+        assert!(join
+            .to_string()
+            .contains("built without the `cluster` feature"));
+        let enable = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &["192.0.2.10".to_owned()],
+            Some("192.0.2.10:8053".parse().unwrap()),
+            3650,
+        )
+        .expect_err("stock build must refuse enable before lock acquisition");
+        assert!(enable
+            .to_string()
+            .contains("built without the `cluster` feature"));
     }
 
     // The four `run_join` tests below exercise paths that only exist on a
@@ -1967,7 +2126,9 @@ token_hash = ""
         // policy.
         let sec_dir = tempfile::tempdir().unwrap();
         let master = write_secondary_master(&sec_dir);
+        let guard = acquire_for_write(&master).unwrap();
         write_cluster_fields_to_master(
+            &guard,
             &master,
             &[
                 ("enabled", Some(toml::Value::Boolean(true))),
@@ -1981,9 +2142,9 @@ token_hash = ""
                     Some(toml::Value::String(hash_token("ps_tok"))),
                 ),
             ],
-            time::OffsetDateTime::now_utc(),
         )
         .unwrap();
+        drop(guard);
         print_config_status(&master).unwrap();
     }
 
@@ -1991,12 +2152,175 @@ token_hash = ""
     fn other_sections_survive_cluster_write() {
         let dir = tempfile::tempdir().unwrap();
         let master = write_master(&dir);
+        let raw = std::fs::read_to_string(&master).unwrap().replacen(
+            "servers = [\"192.0.2.1:53\"]",
+            "servers = [\n    \"192.0.2.1:53\", # keep internal array comment\n]",
+            1,
+        );
+        std::fs::write(&master, raw).unwrap();
         run_token(&master).unwrap();
         let now = time::OffsetDateTime::now_utc();
         let cfg = loader::load_config(&master, now).unwrap().config;
         // the [api] and [profiles.default] sections are untouched.
         assert!(cfg.profiles.contains_key("default"));
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
+        assert!(std::fs::read_to_string(&master)
+            .unwrap()
+            .contains("# keep internal array comment"));
+    }
+
+    #[test]
+    fn guarded_helpers_propagate_a_wrong_tree_before_tolerating_a_bad_load() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let master = write_master(&left);
+        let wrong = write_master(&right);
+        let guard = acquire_for_write(&master).unwrap();
+        let before = std::fs::read_to_string(&wrong).unwrap();
+
+        assert!(ensure_master_carries_no_policy(&guard, &wrong).is_err());
+        assert!(own_upstream(&guard, &wrong).is_err());
+        assert!(bail_if_an_include_holds_membership(&guard, &wrong).is_err());
+        assert!(write_cluster_fields_to_master(
+            &guard,
+            &wrong,
+            &[("enabled", Some(toml::Value::Boolean(true)))],
+        )
+        .is_err());
+
+        let mut doc: toml_edit::DocumentMut = "schema_version = 4\n".parse().unwrap();
+        let original = doc.to_string();
+        assert!(ensure_cluster_include(&guard, &wrong, &mut doc).is_err());
+        assert_eq!(
+            doc.to_string(),
+            original,
+            "wrong-tree include must not mutate"
+        );
+        assert_eq!(std::fs::read_to_string(&wrong).unwrap(), before);
+    }
+
+    #[test]
+    fn token_through_an_external_master_alias_writes_only_the_canonical_tree() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let alias_dir = tempfile::tempdir().unwrap();
+        let master = write_master(&canonical_dir);
+        let alias = alias_dir.path().join("master-alias.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+        run_token(&alias).unwrap();
+
+        assert!(reload(&master).token_hash.is_some());
+        assert!(
+            !alias_dir.path().join(".warden-config.lock").exists(),
+            "an external alias must not acquire or leave a lock beside itself"
+        );
+        assert!(canonical_dir.path().join(".warden-config.lock").exists());
+    }
+
+    #[test]
+    fn leave_through_an_external_master_alias_mutates_only_the_canonical_tree() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let alias_dir = tempfile::tempdir().unwrap();
+        let master = write_joined_master(&canonical_dir, "config.toml");
+        let alias = alias_dir.path().join("master-alias.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+        run_leave(&alias, None).unwrap();
+
+        assert!(!reload(&master).enabled);
+        assert!(
+            !alias_dir.path().join(".warden-config.lock").exists(),
+            "leave must not leave lock artifacts beside an external alias"
+        );
+    }
+
+    #[test]
+    fn source_tripwire_keeps_plaintext_output_and_sidecar_after_guard_scopes() {
+        let source = include_str!("cluster.rs");
+        let token_guard = source.find("let plaintext = {").unwrap();
+        let token_output = source.find("println!(\"Cluster token:").unwrap();
+        assert!(
+            token_guard < token_output,
+            "token output must follow its guard scope"
+        );
+
+        let join_guard = source.find("let canonical_master = {").unwrap();
+        let sidecar = source
+            .find("let token_path = save_join_token_after_unlock")
+            .unwrap();
+        let join_output = source
+            .find("println!(\"Joined cluster as a secondary.")
+            .unwrap();
+        assert!(join_guard < sidecar && sidecar < join_output);
+    }
+
+    #[test]
+    fn token_and_leave_read_after_their_contended_guard_acquisition() {
+        use std::sync::mpsc;
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_master = write_master(&token_dir);
+        let held = acquire_for_write(&token_master).unwrap();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_master = token_master.clone();
+            let worker = scope.spawn(move || {
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || run_token(&worker_master),
+                )
+            });
+            block_until_contended(&contended_rx, "cluster token");
+            let peer_edit = format!("{}\n# peer edit while token waited\n", MASTER);
+            std::fs::write(&token_master, peer_edit).unwrap();
+            drop(held);
+            worker.join().unwrap().unwrap();
+        });
+        assert!(
+            std::fs::read_to_string(&token_master)
+                .unwrap()
+                .contains("# peer edit while token waited"),
+            "token must render from the post-contention master"
+        );
+
+        let leave_dir = tempfile::tempdir().unwrap();
+        let leave_master = write_master(&leave_dir);
+        let held = acquire_for_write(&leave_master).unwrap();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_master = leave_master.clone();
+            let worker = scope.spawn(move || {
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || run_leave(&worker_master, None),
+                )
+            });
+            block_until_contended(&contended_rx, "cluster leave");
+            std::fs::write(
+                &leave_master,
+                format!(
+                    "{MASTER}\n# peer edit while leave waited\n\n[cluster]\nenabled = true\nrole = \"secondary\"\npeer = \"https://192.0.2.1:8053\"\ntoken_hash = \"{}\"\n",
+                    hash_token("ps_wait")
+                ),
+            )
+            .unwrap();
+            drop(held);
+            worker.join().unwrap().unwrap();
+        });
+        let raw = std::fs::read_to_string(&leave_master).unwrap();
+        assert!(raw.contains("# peer edit while leave waited"));
+        assert!(
+            !reload(&leave_master).enabled,
+            "leave must observe peer membership"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -2032,6 +2356,146 @@ token_hash = ""
                 .as_deref(),
             Some("ps_plainsecret"),
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn join_sidecar_hook_proves_the_guard_was_released() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_secondary_master(&dir);
+        let hook_master = master.clone();
+        let ran = Rc::new(Cell::new(false));
+        let ran_by_hook = Rc::clone(&ran);
+        JOIN_SIDECAR_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                ran_by_hook.set(true);
+                let probe = crate::config::write_lock::with_test_hook(
+                    |event| {
+                        assert_ne!(
+                            event,
+                            crate::config::write_lock::TestEvent::Contended,
+                            "the sidecar boundary retained the config write lock"
+                        );
+                    },
+                    || acquire_for_write(&hook_master).expect("sidecar boundary is unlocked"),
+                );
+                drop(probe);
+            }));
+        });
+
+        run_join(
+            &master,
+            "https://192.0.2.1:8053",
+            Some("ps_plainsecret"),
+            None,
+        )
+        .unwrap();
+        assert!(ran.get(), "the sidecar hook must run");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn join_promotes_membership_and_include_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_secondary_master(&dir);
+        let before = std::fs::read_to_string(&master).unwrap();
+        let phases = Rc::new(Cell::new((0, 0, 0)));
+        let seen = Rc::clone(&phases);
+        let watched = master.clone();
+        crate::config::write_lock::with_test_hook(
+            move |event| {
+                let (mut acquisitions, mut overlays, mut promotions) = seen.get();
+                match event {
+                    crate::config::write_lock::TestEvent::WriteRootLocked => acquisitions += 1,
+                    crate::config::write_lock::TestEvent::BeforeOverlay => overlays += 1,
+                    crate::config::write_lock::TestEvent::BeforePromotion => {
+                        promotions += 1;
+                        assert_eq!(
+                            std::fs::read_to_string(&watched).unwrap(),
+                            before,
+                            "the old master must remain whole before the one promotion"
+                        );
+                    }
+                    _ => {}
+                }
+                seen.set((acquisitions, overlays, promotions));
+            },
+            || {
+                run_join(
+                    &master,
+                    "https://192.0.2.1:8053",
+                    Some("ps_atomicjoin"),
+                    None,
+                )
+                .unwrap();
+            },
+        );
+        assert_eq!(
+            phases.get(),
+            (1, 1, 1),
+            "join must acquire, overlay-validate, and promote exactly once"
+        );
+
+        let raw: toml::Value = std::fs::read_to_string(&master).unwrap().parse().unwrap();
+        assert_eq!(
+            raw.get("cluster")
+                .and_then(toml::Value::as_table)
+                .and_then(|table| table.get("role"))
+                .and_then(toml::Value::as_str),
+            Some("secondary")
+        );
+        assert_eq!(
+            raw.get("includes")
+                .and_then(toml::Value::as_array)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == Some(CLUSTER_INCLUDE))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn join_alias_uses_the_canonical_master_for_sidecar_and_include() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let alias_dir = tempfile::tempdir().unwrap();
+        let master = write_secondary_master(&canonical_dir);
+        let alias = alias_dir.path().join("master-alias.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+        run_join(
+            &alias,
+            "https://192.0.2.1:8053",
+            Some("ps_aliassecret"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::cluster::secret::load_cluster_token(&master)
+                .unwrap()
+                .as_deref(),
+            Some("ps_aliassecret"),
+        );
+        assert!(
+            !alias_dir.path().join("cluster_token").exists(),
+            "plaintext must not be saved next to an external alias"
+        );
+        assert_eq!(
+            crate::cluster::secret::load_cluster_token(&alias)
+                .unwrap()
+                .as_deref(),
+            Some("ps_aliassecret"),
+            "startup through the alias must resolve the canonical sidecar"
+        );
+        assert!(reload(&master).enabled);
     }
 
     // ── `cluster leave` ────────────────────────────────────────────
@@ -2152,6 +2616,17 @@ token_hash = ""
         );
     }
 
+    #[test]
+    fn leave_refuses_a_missing_master_instead_of_reporting_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("missing.toml");
+
+        let error = run_leave(&master, None).expect_err("a missing master is not a clean no-op");
+
+        assert!(error.to_string().contains("cannot read"), "{error:#}");
+        assert!(error.to_string().contains("missing.toml"), "{error:#}");
+    }
+
     /// A clean master plus an INCLUDE that switches clustering on must NOT
     /// report "nothing to leave" — that is a false all-clear for an operator
     /// whose daemon is still refusing to boot. `leave` only rewrites the
@@ -2164,7 +2639,7 @@ token_hash = ""
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 3\nincludes = [\"cluster.d/*.toml\"]\n\n\
+            "schema_version = 4\nincludes = [\"cluster.d/*.toml\"]\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"D\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
@@ -2228,7 +2703,7 @@ token_hash = ""
         let now = time::OffsetDateTime::now_utc();
         let cfg = loader::load_config(&master, now).unwrap().config;
         assert!(cfg.profiles.contains_key("default"));
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
         assert_eq!(
             cfg.cluster.token_hash.as_deref(),
             Some(hash_token("ps_tok").as_str())
@@ -2245,7 +2720,7 @@ token_hash = ""
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 3\n\n[server]\ndefault_profile = \"ghost\"\n\n\
+            "schema_version = 4\n\n[server]\ndefault_profile = \"ghost\"\n\n\
              [profiles.default]\ndisplay_name = \"D\"\n\n[cluster]\nenabled = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -2452,7 +2927,7 @@ token_hash = ""
     #[cfg(feature = "cluster")]
     fn write_primary_master(dir: &tempfile::TempDir, f: &PrimaryFixture) -> std::path::PathBuf {
         let mut s = String::from(
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
@@ -2489,6 +2964,144 @@ token_hash = ""
     }
 
     #[cfg(feature = "cluster")]
+    #[test]
+    fn join_and_enable_refuse_a_migration_fence_before_policy_or_r2() {
+        use crate::config::migration_journal::create_fence;
+        use crate::config::write_lock::acquire_for_migration;
+
+        let join_dir = tempfile::tempdir().unwrap();
+        let join_master = write_secondary_master(&join_dir);
+        let migration = acquire_for_migration(&join_master).unwrap();
+        create_fence(&migration).unwrap();
+        drop(migration);
+        let join = run_join(
+            &join_master,
+            "https://192.0.2.1:8053",
+            Some("ps_token"),
+            None,
+        )
+        .expect_err("join must hit the fence before its guarded policy probe");
+        assert!(join.to_string().contains("unfinished v3-to-v4 migration"));
+
+        let enable_dir = tempfile::tempdir().unwrap();
+        let enable_master = write_primary_master(
+            &enable_dir,
+            &PrimaryFixture {
+                no_cluster_token: true,
+                ..Default::default()
+            },
+        );
+        let migration = acquire_for_migration(&enable_master).unwrap();
+        create_fence(&migration).unwrap();
+        drop(migration);
+        let enable = run_enable(
+            &enable_master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .expect_err("enable must hit the fence before R2 inspects the loaded config");
+        assert!(enable.to_string().contains("unfinished v3-to-v4 migration"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn join_and_enable_read_the_post_contention_master() {
+        use std::sync::mpsc;
+
+        let join_dir = tempfile::tempdir().unwrap();
+        let join_master = write_secondary_master(&join_dir);
+        let held = acquire_for_write(&join_master).unwrap();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_master = join_master.clone();
+            let worker = scope.spawn(move || {
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || {
+                        run_join(
+                            &worker_master,
+                            "https://192.0.2.1:8053",
+                            Some("ps_wait"),
+                            None,
+                        )
+                    },
+                )
+            });
+            block_until_contended(&contended_rx, "cluster join");
+            std::fs::write(&join_master, format!("{MASTER}\n# policy peer edit\n")).unwrap();
+            drop(held);
+            let error = worker
+                .join()
+                .unwrap()
+                .expect_err("join must see the policy added while it waited");
+            assert!(error.to_string().contains("carries policy of its own"));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&join_master).unwrap(),
+            format!("{MASTER}\n# policy peer edit\n"),
+            "a post-contention policy refusal must not write membership"
+        );
+
+        let enable_dir = tempfile::tempdir().unwrap();
+        let enable_master = write_primary_master(
+            &enable_dir,
+            &PrimaryFixture {
+                no_cluster_token: true,
+                ..Default::default()
+            },
+        );
+        let held = acquire_for_write(&enable_master).unwrap();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_master = enable_master.clone();
+            let worker = scope.spawn(move || {
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || {
+                        run_enable(
+                            &worker_master,
+                            crate::cli::EnableRole::Primary,
+                            &good_sans(),
+                            None,
+                            3650,
+                        )
+                    },
+                )
+            });
+            block_until_contended(&contended_rx, "cluster enable");
+            let fresh = write_primary_master(
+                &enable_dir,
+                &PrimaryFixture {
+                    listen: Some("192.0.2.77:8053"),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(fresh, enable_master);
+            drop(held);
+            worker.join().unwrap().unwrap();
+        });
+        let loaded = loader::load_config(&enable_master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config;
+        assert!(loaded.cluster.enabled);
+        assert_eq!(
+            loaded.api.listen,
+            "192.0.2.77:8053".parse().unwrap(),
+            "enable must use the configured listen installed while it waited"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
     fn assert_refused(
         master: &Path,
         before: &str,
@@ -2519,76 +3132,190 @@ token_hash = ""
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
     }
 
-    #[test]
-    fn owner_of_reports_the_files_real_uid_gid() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("master.toml");
-        std::fs::write(&f, b"x").unwrap();
+    #[cfg(feature = "cluster")]
+    fn test_certificate_receipt<'g>(
+        guard: &'g ConfigWriteLock,
+        name: &str,
+        failure: Option<crate::config::atomic_write::AtomicWriteTestFailure>,
+    ) -> anyhow::Result<CreatedCertificate<'g>> {
+        use std::os::unix::fs::MetadataExt;
 
-        // Whatever uid the suite runs under — asserting against `getuid()`
-        // rather than a literal keeps this true as root and as anyone else.
-        let expected = unsafe { (libc::getuid(), libc::getgid()) };
-        assert_eq!(owner_of(&f), Some(expected));
+        let target = guard
+            .tree_io()
+            .plan_root_file_no_follow(Path::new(name))?
+            .materialize()?;
+        let master_plan = guard.tree_io().plan_master_target()?;
+        let master_meta = master_plan
+            .original_metadata()
+            .ok_or_else(|| anyhow::anyhow!("test master metadata is absent"))?;
+        let owner = (master_meta.uid(), master_meta.gid());
+        let root = guard.canonical_master().parent().unwrap();
+        publish_certificate_with_opts(
+            target,
+            b"test TLS material\n",
+            &root.join("api.crt"),
+            &root.join("api.key"),
+            AtomicCreateOnlyAtOpts {
+                mode: Some(if name == "api.key" { 0o600 } else { 0o644 }),
+                owner: Some(owner),
+                test_failure: failure,
+            },
+        )
     }
 
-    #[test]
-    fn owner_of_is_none_when_the_reference_cannot_be_stat_d() {
-        // The degradation path: an unstattable master must not abort the mint.
-        // `create_exclusive` then simply skips the lchown, which is the old
-        // behaviour — strictly no worse than before this guard existed.
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(owner_of(&dir.path().join("absent.toml")), None);
+    #[cfg(feature = "cluster")]
+    fn test_commit_failure(
+        guard: &ConfigWriteLock,
+        master: &Path,
+        uncertain: bool,
+    ) -> crate::cli::commands::target::ConfigCommitFailure {
+        let prepared = prepare_master_sections(guard, master, &[], &[], None, false).unwrap();
+        crate::cli::commands::target::commit_prevalidated_single_write_with_ops(
+            prepared,
+            |_, _| {
+                if uncertain {
+                    Err(AtomicWriteError::Stat {
+                        path: master.to_path_buf(),
+                        source: std::io::Error::other("injected uncertain commit"),
+                    })
+                } else {
+                    Err(AtomicWriteError::Fsync {
+                        path: master.to_path_buf(),
+                        source: std::io::Error::other("injected definite commit failure"),
+                    })
+                }
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err()
     }
 
-    /// The mutation guard for the lchown, and it can only run as root.
-    ///
-    /// Delete the `lchown` block in `create_exclusive` and this goes red — but
-    /// **only** in a root session, because the block is gated on
-    /// `geteuid() == 0` for the seccomp reason documented there. Under an
-    /// ordinary user there is nothing to observe: the created file is already
-    /// owned by the caller, so a correct implementation and a gutted one are
-    /// byte-identical on disk. That is why the primary defence is the required
-    /// `owner_ref: &Path` parameter and not this assertion — a test that skips
-    /// is not a test that protects.
-    ///
-    /// Feature-gated because `mode_of` above is: `create_exclusive` is only
-    /// *reachable* through `run_enable`, which is `#[cfg(feature = "cluster")]`,
-    /// so under the default build there is no live path to guard. Leaving this
-    /// ungated broke the default config of `make test` with E0425 while
-    /// `cargo test --features cluster` stayed green — the gate the other one
-    /// cannot see.
     #[cfg(feature = "cluster")]
     #[test]
-    fn a_file_created_as_root_inherits_the_reference_files_owner() {
-        // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!(
-                "SKIPPED a_file_created_as_root_inherits_the_reference_files_owner: \
-                 needs root; the lchown it checks is gated on geteuid() == 0"
-            );
-            return;
-        }
+    fn certificate_receipts_clean_definite_failures_and_retain_uncertain_commits() {
+        let definite_dir = tempfile::tempdir().unwrap();
+        let definite_master = write_primary_master(&definite_dir, &PrimaryFixture::default());
+        let guard = acquire_for_write(&definite_master).unwrap();
+        let cert = test_certificate_receipt(&guard, "api.crt", None).unwrap();
+        let key = test_certificate_receipt(&guard, "api.key", None).unwrap();
+        let failure = test_commit_failure(&guard, &definite_master, false);
+        let error = settle_enable_commit(Err(failure), Some(key), Some(cert)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("config commit failed before rename"));
+        assert!(!definite_dir.path().join("api.crt").exists());
+        assert!(!definite_dir.path().join("api.key").exists());
+        drop(guard);
 
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, b"# master").unwrap();
-
-        // `nobody` on Linux. Any uid that is NOT root's works — the point is
-        // that the created file must follow the REFERENCE, not the caller.
-        const NOBODY: u32 = 65534;
-        std::os::unix::fs::lchown(&master, Some(NOBODY), Some(NOBODY)).unwrap();
-
-        let crt = dir.path().join("api.crt");
-        let key = dir.path().join("api.key");
-        create_exclusive(&key, b"-----BEGIN-----\n", 0o600, &crt, &key, &master).unwrap();
-
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored_master = write_primary_master(&restored_dir, &PrimaryFixture::default());
+        let guard = acquire_for_write(&restored_master).unwrap();
+        let cert = test_certificate_receipt(&guard, "api.crt", None).unwrap();
+        let key = test_certificate_receipt(&guard, "api.key", None).unwrap();
+        let prepared =
+            prepare_master_sections(&guard, &restored_master, &[], &[], None, false).unwrap();
+        let failure = crate::cli::commands::target::commit_prevalidated_single_write_with_ops(
+            prepared,
+            |_, _| {
+                Err(AtomicWriteError::PostRenameFsync {
+                    path: restored_master.clone(),
+                    source: std::io::Error::other("injected post-rename failure"),
+                })
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(
-            owner_of(&key),
-            Some((NOBODY, NOBODY)),
-            "the key must be owned by the master's owner, not by root — \
-             otherwise the daemon cannot open the key it is told to load"
+            failure.disposition(),
+            ConfigCommitDisposition::RestoredDurably
         );
-        assert_eq!(mode_of(&key), 0o600, "the private key must stay 0600");
+        settle_enable_commit(Err(failure), Some(key), Some(cert)).unwrap_err();
+        assert!(!restored_dir.path().join("api.crt").exists());
+        assert!(!restored_dir.path().join("api.key").exists());
+        drop(guard);
+
+        let uncertain_dir = tempfile::tempdir().unwrap();
+        let uncertain_master = write_primary_master(&uncertain_dir, &PrimaryFixture::default());
+        let guard = acquire_for_write(&uncertain_master).unwrap();
+        let cert = test_certificate_receipt(&guard, "api.crt", None).unwrap();
+        let key = test_certificate_receipt(&guard, "api.key", None).unwrap();
+        let failure = test_commit_failure(&guard, &uncertain_master, true);
+        let error = settle_enable_commit(Err(failure), Some(key), Some(cert)).unwrap_err();
+        assert!(error.to_string().contains("recovery required"));
+        assert!(uncertain_dir.path().join("api.crt").exists());
+        assert!(uncertain_dir.path().join("api.key").exists());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn certificate_second_publish_and_replaced_receipt_never_remove_the_wrong_inode() {
+        use crate::config::atomic_write::AtomicWriteTestFailure;
+
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_master = write_primary_master(&second_dir, &PrimaryFixture::default());
+        let guard = acquire_for_write(&second_master).unwrap();
+        let cert = test_certificate_receipt(&guard, "api.crt", None).unwrap();
+        let key_error =
+            test_certificate_receipt(&guard, "api.key", Some(AtomicWriteTestFailure::ParentFsync))
+                .err()
+                .expect("post-rename key failure must be reported");
+        assert!(!second_dir.path().join("api.key").exists());
+        let _ = with_certificate_cleanup(key_error, None, Some(cert));
+        assert!(!second_dir.path().join("api.crt").exists());
+        drop(guard);
+
+        let replaced_dir = tempfile::tempdir().unwrap();
+        let replaced_master = write_primary_master(&replaced_dir, &PrimaryFixture::default());
+        let guard = acquire_for_write(&replaced_master).unwrap();
+        let cert = test_certificate_receipt(&guard, "api.crt", None).unwrap();
+        let cert_path = replaced_dir.path().join("api.crt");
+        std::fs::remove_file(&cert_path).unwrap();
+        std::fs::write(&cert_path, "replacement sentinel\n").unwrap();
+        let cleanup =
+            with_certificate_cleanup(anyhow::anyhow!("injected failure"), None, Some(cert));
+        assert!(cleanup
+            .to_string()
+            .contains(&cert_path.display().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&cert_path).unwrap(),
+            "replacement sentinel\n"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn enable_materializes_both_tls_targets_before_publishing_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let before = std::fs::read_to_string(&master).unwrap();
+        let (crt, key) = material(&dir);
+        let injected_key = key.clone();
+
+        let error = crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::BeforeOverlay {
+                    std::fs::write(&injected_key, "competing key\n").unwrap();
+                }
+            },
+            || {
+                run_enable(
+                    &master,
+                    crate::cli::EnableRole::Primary,
+                    &good_sans(),
+                    reachable(),
+                    3650,
+                )
+            },
+        )
+        .expect_err("a key target changed after planning must abort enable");
+
+        assert!(
+            error.to_string().contains("changed since its snapshot"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
+        assert!(!crt.exists(), "the certificate must not be published first");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "competing key\n");
     }
 
     /// R1 — `--role secondary` is refused by NAME, pointing at `cluster
@@ -2825,6 +3552,41 @@ token_hash = ""
         assert!(!key.exists(), "R6 must not have created the missing half");
     }
 
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_refuses_tls_artifacts_selected_by_a_config_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&dir, &PrimaryFixture::default());
+        let raw = std::fs::read_to_string(&master).unwrap();
+        std::fs::write(
+            &master,
+            raw.replacen(
+                "schema_version = 4\n",
+                "schema_version = 4\nincludes = [\"api.*\"]\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&master).unwrap();
+        let (crt, key) = material(&dir);
+
+        let error = run_enable(
+            &master,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .expect_err("TLS material must not become a config include after validation");
+
+        assert!(
+            error.to_string().contains("would match an include"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
+        assert!(!crt.exists() && !key.exists());
+    }
+
     /// R7 — `--san` with operator-supplied TLS material already configured:
     /// the minted certificate would be written and never used.
     #[test]
@@ -2904,6 +3666,36 @@ token_hash = ""
         // The certificate path written into the config must be absolute, or
         // the daemon resolves it against ITS working directory.
         assert!(loaded.config.api.tls_cert.as_ref().unwrap().is_absolute());
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn enable_through_an_alias_publishes_tls_only_beside_the_canonical_master() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let alias_dir = tempfile::tempdir().unwrap();
+        let master = write_primary_master(&canonical_dir, &PrimaryFixture::default());
+        let alias = alias_dir.path().join("master-alias.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+
+        run_enable(
+            &alias,
+            crate::cli::EnableRole::Primary,
+            &good_sans(),
+            reachable(),
+            3650,
+        )
+        .unwrap();
+
+        let (crt, key) = material(&canonical_dir);
+        assert!(crt.exists() && key.exists());
+        assert!(
+            !alias_dir.path().join("api.crt").exists()
+                && !alias_dir.path().join("api.key").exists(),
+            "TLS material must never be created beside an external alias"
+        );
+        let loaded = loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        assert_eq!(loaded.config.api.tls_cert.as_deref(), Some(crt.as_path()));
+        assert_eq!(loaded.config.api.tls_key.as_deref(), Some(key.as_path()));
     }
 
     /// The private key is `0600` **at creation** — never written first and
@@ -3016,22 +3808,5 @@ token_hash = ""
             loaded.config.api.listen,
             "192.0.2.11:9053".parse::<std::net::SocketAddr>().unwrap()
         );
-    }
-
-    /// `Path::new("config.toml").parent()` is `Some("")`, not `None`, and
-    /// CLAUDE.md documents `./config.toml` as the dev path — so the empty
-    /// parent is reachable. Left relative it would write `tls_cert =
-    /// "api.crt"`, which the daemon resolves against its own working
-    /// directory.
-    ///
-    /// Tested on the helper rather than through the verb on purpose: the only
-    /// way to reach the branch end-to-end is to change the process working
-    /// directory, which is global state and would race every other test in
-    /// this binary. Ungated — the helper is not feature-dependent.
-    #[test]
-    fn a_bare_config_filename_still_yields_an_absolute_directory() {
-        let d = config_dir(Path::new("config.toml")).unwrap();
-        assert!(d.is_absolute(), "{} must be absolute", d.display());
-        assert_eq!(d, std::env::current_dir().unwrap().canonicalize().unwrap());
     }
 }

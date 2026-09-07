@@ -2,8 +2,8 @@
 //!
 //! Every mutation locates the right `devices.d/*.toml` file (or the
 //! master on a single-file layout) via [`crate::cli::commands::target`]
-//! helpers, applies the edit through a `toml::Value` surgery, runs
-//! `loader::load_config`, and reverts on any validator error. This
+//! helpers, applies the edit through a `toml::Value` surgery, validates the
+//! staged tree, and reverts on any validator error. This
 //! module is the sole device-management surface.
 
 use std::net::IpAddr;
@@ -16,12 +16,14 @@ use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    read_or_empty, remove_id_keyed, resolve_existing_target_file, resolve_target_file,
-    upsert_id_keyed, upsert_profile, write_value_validated, EntityClass,
+    read_or_empty_locked, remove_id_keyed, resolve_existing_target_file_locked,
+    resolve_target_file_locked, upsert_id_keyed, upsert_profile, write_value_validated_locked,
+    EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::load_config;
-use crate::config::schema::{Device, Id, ScheduleTargetType};
+use crate::config::loader::{load_config, load_config_for_schema_under_guard};
+use crate::config::schema::{Device, Id, ScheduleTargetType, SCHEMA_VERSION_V1};
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 /// List configured devices against the on-disk config.
 ///
@@ -358,7 +360,9 @@ pub async fn run_add(
     // view. The validator will catch this too but we can give a better
     // message earlier.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!(
             "device \"{id}\" already exists. Use `warden device set {id} <field> <value>` to edit, \
@@ -404,8 +408,8 @@ pub async fn run_add(
         notes,
     )?;
 
-    let target_path = resolve_target_file(config_path, EntityClass::Devices, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_target_file_locked(&guard, config_path, EntityClass::Devices, into)?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     // A create, and the returned flag is what says so — `build_device_value`
     // writes a partial row and `upsert_id_keyed` replaces a matched one
     // outright, so a replace here would reset every field it does not write.
@@ -415,7 +419,8 @@ pub async fn run_add(
          nothing was changed",
         target_path.display()
     );
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
+    drop(guard);
 
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
@@ -450,7 +455,9 @@ pub async fn run_set(
     value: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let target_path = apply_set_inline(config_path, id, field, value, into)?;
+    let guard = acquire_for_write(config_path)?;
+    let target_path = apply_set_inline_locked(&guard, config_path, id, field, value, into)?;
+    drop(guard);
     let id_for_audit = id.to_string();
     let fields_after = format!("{field}={value}");
     persist_cli_mutation_audit(config_path, move || {
@@ -474,7 +481,8 @@ pub async fn run_set(
 /// so [`run_block`] / [`run_unblock`] can share the mutation logic with
 /// [`run_set`] while emitting a single reload after the compound write:
 /// reload fires ONCE at the end of the compound mutation, not twice.
-fn apply_set_inline(
+fn apply_set_inline_locked(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     id: &str,
     field: &str,
@@ -485,8 +493,9 @@ fn apply_set_inline(
     // operator's explicit choice wins; otherwise resolve the owning file
     // via the include graph so a `set` works even when the device lives in
     // a non-auto-selected slice.
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Devices, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Devices, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
 
     let entry =
         find_id_entry_mut(&mut doc, EntityClass::Devices.toml_key(), id)?.ok_or_else(|| {
@@ -499,7 +508,7 @@ fn apply_set_inline(
 
     apply_device_field(entry, field, value)?;
 
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     Ok(target_path)
 }
 
@@ -513,7 +522,9 @@ pub async fn run_remove(
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     let referenced_by: Vec<&str> = loaded
         .config
         .groups
@@ -546,15 +557,17 @@ pub async fn run_remove(
         );
     }
 
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Devices, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path =
+        resolve_existing_target_file_locked(&guard, config_path, EntityClass::Devices, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     let removed = remove_id_keyed(&mut doc, EntityClass::Devices.toml_key(), id)?;
     if !removed {
         // Remove of an absent entity is idempotent (exit 0).
         println!("device \"{id}\" not found — nothing to remove");
         return Ok(());
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
+    drop(guard);
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
     persist_cli_mutation_audit(config_path, move || {
@@ -599,7 +612,9 @@ pub async fn run_block(
     // compound mutation is all-or-nothing: either both writes land, or
     // neither does.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if !loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!(
             "device \"{id}\" not found. Run `warden device list` to see configured devices, \
@@ -621,7 +636,7 @@ pub async fn run_block(
     // the write — unusable on exactly the layout `warden migrate`
     // produces by default. Existence questions go to the merged view;
     // only the write target stays the master.
-    let (mut master_doc, _) = read_or_empty(config_path)?;
+    let (mut master_doc, _) = read_or_empty_locked(&guard, config_path, config_path)?;
     let blocked_existed = loaded.config.profiles.contains_key("blocked");
     if !blocked_existed {
         let profile_entry: Value = toml::from_str(
@@ -631,13 +646,14 @@ block_all = true
         )
         .context("building blocked profile")?;
         upsert_profile(&mut master_doc, "blocked", profile_entry)?;
-        write_value_validated(config_path, config_path, &master_doc)?;
+        write_value_validated_locked(&guard, config_path, config_path, &master_doc)?;
     }
 
     // Step 2: point the device at the blocked profile. Use the
     // reload-less inline helper so the compound mutation emits a SINGLE
     // reload at the end (not one per sub-step).
-    let target_path = apply_set_inline(config_path, id, "profile", "blocked", into)?;
+    let target_path = apply_set_inline_locked(&guard, config_path, id, "profile", "blocked", into)?;
+    drop(guard);
     let id_for_audit = id.to_string();
     persist_cli_mutation_audit(config_path, move || {
         AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
@@ -669,7 +685,9 @@ pub async fn run_unblock(
     profile: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let target_path = apply_set_inline(config_path, id, "profile", profile, into)?;
+    let guard = acquire_for_write(config_path)?;
+    let target_path = apply_set_inline_locked(&guard, config_path, id, "profile", profile, into)?;
+    drop(guard);
     let id_for_audit = id.to_string();
     let profile_for_audit = profile.to_string();
     persist_cli_mutation_audit(config_path, move || {
@@ -891,7 +909,9 @@ pub async fn run_set_unfiltered(
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     let dev = loaded
         .config
         .devices
@@ -906,8 +926,9 @@ pub async fn run_set_unfiltered(
         return Ok(());
     }
 
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Devices, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path =
+        resolve_existing_target_file_locked(&guard, config_path, EntityClass::Devices, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     let entry = find_id_entry_mut(&mut doc, EntityClass::Devices.toml_key(), id)?
         .ok_or_else(|| anyhow::anyhow!("device '{id}' not found in {}", target_path.display()))?;
     let tbl = entry
@@ -918,7 +939,8 @@ pub async fn run_set_unfiltered(
         // Clear tags atomically so the post-write state is consistent.
         tbl.insert("tags".into(), Value::Array(toml::value::Array::new()));
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
+    drop(guard);
 
     let id_for_audit = id.to_string();
     let value_for_audit = value.to_string();
@@ -1061,7 +1083,9 @@ pub async fn run_quiet(
 
     // Device existence check up front.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if !loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!("no device named \"{id}\". Run `warden device list` to see configured devices.");
     }
@@ -1070,7 +1094,7 @@ pub async fn run_quiet(
     // one, so repeated quiets never accumulate dead rows even when the
     // daemon (and its 60 s tick prune) isn't running. Best-effort —
     // expired rows are inert, so a prune failure must not block the quiet.
-    match super::schedules::prune_expired_schedules(config_path, &loaded, now) {
+    match super::schedules::prune_expired_schedules_locked(&guard, config_path, now) {
         Ok(pruned) if !pruned.is_empty() => {
             println!(
                 "pruned {} expired schedule(s): {}",
@@ -1094,7 +1118,7 @@ pub async fn run_quiet(
     // Ensure blocked profile exists.
     let blocked_existed = loaded.config.profiles.contains_key("blocked");
     if !blocked_existed {
-        let (mut master_doc, _) = read_or_empty(config_path)?;
+        let (mut master_doc, _) = read_or_empty_locked(&guard, config_path, config_path)?;
         let blocked_tbl: Value = toml::from_str(
             r#"display_name = "Blocked"
 block_all = true
@@ -1102,7 +1126,7 @@ block_all = true
         )
         .context("building blocked profile")?;
         upsert_profile(&mut master_doc, "blocked", blocked_tbl)?;
-        write_value_validated(config_path, config_path, &master_doc)?;
+        write_value_validated_locked(&guard, config_path, config_path, &master_doc)?;
     }
 
     // Append the schedule. Schedule id must be unique + valid — we derive
@@ -1136,12 +1160,13 @@ expires_at = "{ts}"
     ))
     .context("building quiet schedule")?;
 
-    let target_path = resolve_target_file(
+    let target_path = resolve_target_file_locked(
+        &guard,
         config_path,
         EntityClass::Schedules,
         into.map(|p| p.as_path()),
     )?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     // The one whole-row writer here that deliberately does NOT assert it
     // created a row: `sched_id` carries a six-digit slice of the expiry
     // timestamp, so re-quieting the same device inside the same second
@@ -1149,7 +1174,8 @@ expires_at = "{ts}"
     // Safe because this builder writes every `Schedule` field — pinned by the
     // exhaustive destructuring test in this module, not by this sentence.
     upsert_id_keyed(&mut doc, "schedules", &sched_id, sched_entry)?;
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
+    drop(guard);
 
     let id_for_audit = id.to_string();
     let sched_for_audit = sched_id.clone();
@@ -1184,7 +1210,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1231,7 +1257,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 includes = ["profiles.d/*.toml"]
 
 [server]
@@ -1666,7 +1692,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2035,7 +2061,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"

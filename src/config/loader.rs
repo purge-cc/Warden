@@ -18,11 +18,9 @@
 //!   is merged by sub-key with duplicate-key detection; every other
 //!   table is treated as a singleton (duplicate across files → error
 //!   with both file:line citations).
-//! - **Path security.** Include patterns must be relative
-//!   and free of `..`. Resolved paths are canonicalised with the
-//!   parent-dir + leaf trick so freshly-created-but-missing files still
-//!   surface a precise error. Symlink targets that escape the config
-//!   root are rejected.
+//! - **Path security.** Include patterns must be relative and free of `..`.
+//!   Descriptor-relative resolution keeps all reads beneath the locked root,
+//!   including glob enumeration and followed in-tree symlinks.
 //! - **Load limits.** 1000 files, 50 MB aggregate bytes;
 //!   either cap is a hard error carrying the count / size.
 //! - **Cycle detection.** Visited-set on canonical paths +
@@ -33,17 +31,24 @@
 //!   merged [`ConfigV1`] are enriched via this map so downstream CLI
 //!   tooling can point the operator at the offending source file.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
 
 use super::error::{ConfigError, ErrorContext};
+use super::migration_journal::{self, FenceRefusal};
 use super::schema::{
-    load::load_from_str_collect,
-    validator::{validate_collect, AuditWarnings},
-    ConfigV1,
+    load::load_from_str_collect_for_schema,
+    validator::{validate_collect_for_schema, AuditWarnings},
+    ConfigV1, SCHEMA_VERSION_V1,
 };
+use super::tree_io::{
+    for_each_dir_name, DestinationIdentity, MasterIdentityChanged, MemberKey, ResolvedEntry,
+    TargetPlan, TreeIo,
+};
+use super::write_lock::{self, ConfigReadLock, ConfigWriteLock, MigrationWriteLock};
 
 /// Hard cap on the number of files reachable via `includes`.
 pub const MAX_INCLUDE_FILES: usize = 1000;
@@ -97,7 +102,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "local_dns",
     "ip_blocklists",
     // DEPRECATED legacy alias for `ip_blocklists` — accepted at load time
-    // with a `tracing::warn!`. Remove at schema_version = 3.
+    // with a `tracing::warn!`.
     "ip_denylists",
     "lists",
     "resource_budget",
@@ -107,7 +112,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     // default). Singleton section, so NOT in ARRAY_OF_TABLES_KEYS / NAMED_MAP_KEYS.
     "cluster",
     // DEPRECATED legacy alias for `[[devices]]` — accepted at load
-    // time with a `tracing::warn!`. Remove at schema_version = 3.
+    // time with a `tracing::warn!`.
     "clients",
 ];
 
@@ -208,7 +213,8 @@ pub struct LoadedConfig {
     pub custom_lists: crate::config::custom_list::CustomListStore,
 }
 
-/// A read-substitution + extra-member overlay for [`load_config_with_overlay`].
+/// A read-substitution + extra-member + omission overlay for
+/// [`load_config_with_overlay`].
 ///
 /// Lets a validating writer run the full multi-file load + validation against
 /// STAGED bytes — the bytes a CLI/IPC mutation is about to promote — *before*
@@ -228,15 +234,30 @@ pub struct LoadedConfig {
 pub struct LoaderOverlay {
     substitutions: BTreeMap<PathBuf, String>,
     extra_members: Vec<PathBuf>,
+    members: BTreeMap<MemberKey, StagedPlanMember>,
+    destinations: BTreeMap<MemberKey, DestinationIdentity>,
+    omissions: BTreeMap<MemberKey, DestinationIdentity>,
+}
+
+#[derive(Debug)]
+struct StagedPlanMember {
+    bytes: String,
+    admits_new: bool,
+    force_extra: bool,
+}
+
+struct BoundLoaderOverlay<'a> {
+    substitutions: BTreeMap<MemberKey, &'a str>,
+    admitted_new_members: BTreeSet<MemberKey>,
+    forced_extra_members: Vec<MemberKey>,
+    destinations: BTreeMap<MemberKey, DestinationIdentity>,
+    omissions: BTreeMap<MemberKey, DestinationIdentity>,
 }
 
 impl LoaderOverlay {
     /// Stage `bytes` to be read in place of `canonical`'s on-disk contents.
-    /// `new_file` = the path is not yet on disk / not glob-visible, so also
-    /// load it as an extra include member. `canonical` MUST be canonicalised
-    /// with [`canonicalize_path`] (the same function the loader keys reads on)
-    /// or the substitution will silently miss and the loader will read stale
-    /// disk bytes.
+    /// New files also enter the include graph before they exist on disk.
+    /// Paths bind to member keys beneath the held guard before validation.
     pub fn stage(&mut self, canonical: PathBuf, bytes: String, new_file: bool) {
         if new_file {
             self.extra_members.push(canonical.clone());
@@ -244,10 +265,240 @@ impl LoaderOverlay {
         self.substitutions.insert(canonical, bytes);
     }
 
-    /// Bytes to read in place of `canonical`, if staged.
-    fn substitution(&self, canonical: &Path) -> Option<&str> {
-        self.substitutions.get(canonical).map(String::as_str)
+    pub(crate) fn stage_plan(
+        &mut self,
+        plan: &TargetPlan<'_>,
+        bytes: String,
+    ) -> anyhow::Result<()> {
+        self.stage_plan_with_admission(plan, bytes, plan.is_new(), plan.is_new())
     }
+
+    /// Stage descriptor-pinned bytes that must be selected by an include.
+    ///
+    /// A new member is admitted while resolving an exact include or a
+    /// matching final-segment wildcard, but is not appended after the master
+    /// traversal. This makes the overlay validate only a final tree that can
+    /// actually select the member.
+    pub(crate) fn stage_plan_reachable_only(
+        &mut self,
+        plan: &TargetPlan<'_>,
+        bytes: String,
+    ) -> anyhow::Result<()> {
+        self.stage_plan_with_admission(plan, bytes, plan.is_new(), false)
+    }
+
+    fn stage_plan_with_admission(
+        &mut self,
+        plan: &TargetPlan<'_>,
+        bytes: String,
+        admits_new: bool,
+        force_extra: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.omissions.contains_key(plan.key()),
+            "overlay cannot stage and omit the same member: {}",
+            plan.display().display()
+        );
+        self.destinations
+            .insert(plan.key().clone(), plan.destination()?);
+        self.members.insert(
+            plan.key().clone(),
+            StagedPlanMember {
+                bytes,
+                admits_new,
+                force_extra,
+            },
+        );
+        Ok(())
+    }
+
+    /// Model removal of an existing descriptor-pinned member after validation.
+    /// A path spelling could change before unlink, so omissions only accept a
+    /// [`TargetPlan`].
+    #[cfg(any(feature = "cluster", test))]
+    pub(crate) fn omit_plan(&mut self, plan: &TargetPlan<'_>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !plan.is_new(),
+            "overlay cannot omit an absent member: {}",
+            plan.display().display()
+        );
+        anyhow::ensure!(
+            !self.members.contains_key(plan.key()),
+            "overlay cannot stage and omit the same member: {}",
+            plan.display().display()
+        );
+        let destination = plan.destination()?;
+        if let Some(previous) = self
+            .omissions
+            .insert(plan.key().clone(), destination.clone())
+        {
+            anyhow::ensure!(
+                previous == destination,
+                "conflicting omitted overlay destinations for {}",
+                plan.display().display()
+            );
+        }
+        Ok(())
+    }
+
+    fn bind(&self, tree: TreeIo<'_>) -> Result<BoundLoaderOverlay<'_>, Vec<ConfigError>> {
+        let mut bound = BoundLoaderOverlay {
+            substitutions: BTreeMap::new(),
+            admitted_new_members: BTreeSet::new(),
+            forced_extra_members: Vec::new(),
+            destinations: self.destinations.clone(),
+            omissions: self.omissions.clone(),
+        };
+        for (key, destination) in &bound.omissions {
+            if let Some(previous) = bound.destinations.insert(key.clone(), destination.clone()) {
+                if previous != *destination {
+                    return Err(tree_errors(
+                        &tree.display(key),
+                        anyhow::anyhow!("overlay stages and omits the same member"),
+                    ));
+                }
+            }
+        }
+        for (key, member) in &self.members {
+            bound
+                .substitutions
+                .insert(key.clone(), member.bytes.as_str());
+            if member.admits_new {
+                bound.admitted_new_members.insert(key.clone());
+            }
+            if member.force_extra {
+                bound.forced_extra_members.push(key.clone());
+            }
+        }
+        for (path, bytes) in &self.substitutions {
+            let entry = tree
+                .resolve_member(path)
+                .map_err(|e| tree_errors(path, e))?;
+            if bound.omissions.contains_key(entry.key()) {
+                return Err(tree_errors(
+                    path,
+                    anyhow::anyhow!(
+                        "overlay cannot stage and omit the same member: {}",
+                        entry.display().display()
+                    ),
+                ));
+            }
+            if let Some(previous) = bound.substitutions.insert(entry.key().clone(), bytes) {
+                if previous != bytes {
+                    return Err(tree_errors(
+                        path,
+                        anyhow::anyhow!(
+                            "conflicting overlay aliases for {}",
+                            entry.display().display()
+                        ),
+                    ));
+                }
+            }
+            if self.extra_members.contains(path) {
+                bound.admitted_new_members.insert(entry.key().clone());
+                bound.forced_extra_members.push(entry.key().clone());
+            }
+            let destination = entry
+                .destination()
+                .map_err(|e| tree_errors(path, e.into()))?;
+            if let Some(expected) = bound
+                .destinations
+                .insert(entry.key().clone(), destination.clone())
+            {
+                if expected != destination {
+                    return Err(tree_errors(
+                        path,
+                        anyhow::anyhow!("overlay destination changed"),
+                    ));
+                }
+            }
+        }
+        Ok(bound)
+    }
+}
+
+/// Read only the master's top-level `schema_version`, without selecting a
+/// schema or loading the configuration.
+///
+/// Parses TOML as a version-neutral table: no `ConfigV1` deserialisation,
+/// include resolution, deprecated-key normalisation, or current-schema check.
+/// A missing declaration is an error even if an include could supply it.
+/// The master must be a regular file within [`MAX_TOTAL_BYTES`], and the read
+/// is capped just as it is in the full loader.
+pub fn probe_declared_schema_version(master_path: &Path) -> Result<u32, Vec<ConfigError>> {
+    let guard =
+        write_lock::acquire_for_read(master_path).map_err(|err| lock_errors(master_path, err))?;
+    probe_declared_schema_version_inner(guard.tree_io())
+}
+
+#[allow(dead_code, reason = "migration-only schema probe")]
+pub(crate) fn probe_declared_schema_version_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+) -> Result<u32, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    probe_declared_schema_version_inner(guard.tree_io())
+}
+
+/// Migration preflight probe through an already-held shared tree lock.
+pub(crate) fn probe_declared_schema_version_under_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+) -> Result<u32, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    probe_declared_schema_version_inner(guard.tree_io())
+}
+
+fn probe_declared_schema_version_inner(tree: TreeIo<'_>) -> Result<u32, Vec<ConfigError>> {
+    let master_path = &tree.identity.canonical_master;
+    let entry = tree
+        .resolve_key(&tree.master_key())
+        .map_err(|e| tree_errors(master_path, e))?;
+    let (file, meta) = tree
+        .open_regular(&entry)
+        .map_err(|e| tree_errors(master_path, e))?;
+    let file_len = meta.len();
+    if file_len > MAX_TOTAL_BYTES {
+        return Err(vec![ConfigError::ValidationFailed(
+            ErrorContext::new(format!(
+                "master config size would exceed {MAX_TOTAL_BYTES} bytes ({file_len} bytes)"
+            ))
+            .with_file(master_path.to_path_buf()),
+        )]);
+    }
+    let src = read_open_config_to_string_capped(file, master_path, MAX_TOTAL_BYTES)?;
+    let table: toml::Table = toml::from_str(&src).map_err(|err: toml::de::Error| {
+        let mut ctx = ErrorContext::new(
+            super::error::truncate_for_error(&format!("toml parse error: {err}")).into_owned(),
+        )
+        .with_file(master_path.to_path_buf());
+        if let Some(span) = err.span() {
+            ctx = ctx.with_line(line_of(&src, span.start));
+        }
+        vec![ConfigError::Parse(ctx)]
+    })?;
+    let value = table.get("schema_version").ok_or_else(|| {
+        vec![ConfigError::MissingRequired(
+            ErrorContext::new("master config must declare schema_version")
+                .with_file(master_path.to_path_buf())
+                .with_entity("schema_version")
+                .with_suggestion("declare schema_version at the top of the master config"),
+        )]
+    })?;
+    declared_schema_version(value, master_path).map_err(|errs| {
+        errs.into_iter()
+            .map(|mut err| {
+                err.context_mut().line = line_of_top_key(&src, "schema_version");
+                err
+            })
+            .collect()
+    })
 }
 
 /// Load and validate a v1 configuration starting from `master_path`.
@@ -256,7 +507,7 @@ impl LoaderOverlay {
 /// - Enforces path security, load limits, and cycle detection
 ///   before deserialisation.
 /// - Merges singleton / array-of-tables / named-map sections.
-/// - Runs [`validate_collect`] on the merged config; any
+/// - Runs [`validate_collect_for_schema`] on the merged config; any
 ///   [`ConfigError::context`] whose `entity` matches a provenance key
 ///   is stamped with the corresponding `(file, line)`.
 ///
@@ -266,7 +517,20 @@ pub fn load_config(
     master_path: &Path,
     now: OffsetDateTime,
 ) -> Result<LoadedConfig, Vec<ConfigError>> {
-    load_config_with_overlay(master_path, now, None)
+    load_config_for_schema(master_path, SCHEMA_VERSION_V1, now)
+}
+
+/// [`load_config`] with an explicit required schema version.
+///
+/// `expected_schema` follows the master path. The master must declare it;
+/// includes may omit the version or echo the master's declaration. This does
+/// not change the schema accepted by the current-schema loaders.
+pub fn load_config_for_schema(
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    load_config_with_overlay_for_schema(master_path, expected_schema, now, None)
 }
 
 /// [`load_config`] that also hands back the validator's operator-facing
@@ -289,8 +553,12 @@ pub fn load_config_collect(
     master_path: &Path,
     now: OffsetDateTime,
 ) -> (Result<LoadedConfig, Vec<ConfigError>>, Vec<String>) {
+    let guard = match write_lock::acquire_for_read(master_path) {
+        Ok(guard) => guard,
+        Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
+    };
     let mut warns = AuditWarnings::emitting();
-    let result = load_config_inner(master_path, now, None, &mut warns);
+    let result = load_config_inner(guard.tree_io(), SCHEMA_VERSION_V1, now, None, &mut warns);
     match result {
         Ok(loaded) => (Ok(loaded), warns.into_messages()),
         Err(errs) => (Err(errs), Vec::new()),
@@ -303,7 +571,7 @@ pub fn load_config_collect(
 /// inject brand-new include members not yet on disk), so the full multi-file
 /// load + validation runs against STAGED bytes before they are promoted. The
 /// CLI/IPC validating writers
-/// ([`crate::cli::commands::target::write_value_validated`]) use this to refuse
+/// (`crate::cli::commands::target::write_value_validated_locked`) use this to refuse
 /// a cross-reference-invalid mutation before the rename (rev2606 target-01).
 ///
 /// With `overlay = None` this is byte-for-byte identical to the pre-overlay
@@ -315,7 +583,417 @@ pub fn load_config_with_overlay(
     now: OffsetDateTime,
     overlay: Option<&LoaderOverlay>,
 ) -> Result<LoadedConfig, Vec<ConfigError>> {
-    load_config_inner(master_path, now, overlay, &mut AuditWarnings::emitting())
+    load_config_with_overlay_for_schema(master_path, SCHEMA_VERSION_V1, now, overlay)
+}
+
+/// [`load_config_with_overlay`] validated against `expected_schema`, placed
+/// immediately after the master path, as in [`load_config_for_schema`].
+///
+/// Both substituted bytes and extra include members follow the same version,
+/// provenance, deprecation and security checks as an ordinary load.
+pub fn load_config_with_overlay_for_schema(
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    let guard =
+        write_lock::acquire_for_read(master_path).map_err(|err| lock_errors(master_path, err))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        &mut AuditWarnings::emitting(),
+    )
+}
+
+/// The editor seam keeps typed admission and identity failures distinct from
+/// saved configuration diagnostics until the CLI chooses its exit class.
+pub(crate) enum EditorGuardedLoadFailure {
+    Diagnostics(Vec<ConfigError>),
+    Operational(anyhow::Error),
+}
+
+thread_local! {
+    static EDITOR_LOAD_PROVENANCE: RefCell<Option<Cell<bool>>> = const { RefCell::new(None) };
+}
+
+struct EditorLoadProvenance(Option<bool>);
+
+impl Drop for EditorLoadProvenance {
+    fn drop(&mut self) {
+        EDITOR_LOAD_PROVENANCE.with(|slot| {
+            *slot.borrow_mut() = self.0.take().map(Cell::new);
+        });
+    }
+}
+
+fn editor_load_provenance() -> EditorLoadProvenance {
+    let previous =
+        EDITOR_LOAD_PROVENANCE.with(|slot| slot.borrow_mut().take().map(|marker| marker.get()));
+    EDITOR_LOAD_PROVENANCE.with(|slot| *slot.borrow_mut() = Some(Cell::new(false)));
+    EditorLoadProvenance(previous)
+}
+
+fn mark_editor_identity_failure(err: &anyhow::Error) {
+    if err.downcast_ref::<MasterIdentityChanged>().is_some() {
+        EDITOR_LOAD_PROVENANCE.with(|slot| {
+            if let Some(marker) = slot.borrow().as_ref() {
+                marker.set(true);
+            }
+        });
+    }
+}
+
+fn editor_identity_failure_observed() -> bool {
+    EDITOR_LOAD_PROVENANCE.with(|slot| slot.borrow().as_ref().is_some_and(Cell::get))
+}
+
+fn editor_operational_error(errs: Vec<ConfigError>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "edited config tree changed during validation: {}",
+        errs.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn with_editor_load_provenance<T>(
+    load: impl FnOnce() -> Result<T, Vec<ConfigError>>,
+) -> Result<T, EditorGuardedLoadFailure> {
+    let _scope = editor_load_provenance();
+    match load() {
+        Ok(value) => Ok(value),
+        Err(errors) if editor_identity_failure_observed() => Err(
+            EditorGuardedLoadFailure::Operational(editor_operational_error(errors)),
+        ),
+        Err(errors) => Err(EditorGuardedLoadFailure::Diagnostics(errors)),
+    }
+}
+
+#[allow(dead_code, reason = "guarded read-modify-write API")]
+pub(crate) fn load_config_for_schema_under_guard(
+    guard: &ConfigWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    load_config_with_overlay_for_schema_under_guard(guard, master_path, expected_schema, now, None)
+}
+
+pub(crate) fn load_config_for_schema_under_editor_guard(
+    guard: &ConfigWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, EditorGuardedLoadFailure> {
+    guard
+        .verify_master(master_path)
+        .map_err(EditorGuardedLoadFailure::Operational)?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(EditorGuardedLoadFailure::Operational)?;
+    with_editor_load_provenance(|| {
+        load_config_inner(
+            guard.tree_io(),
+            expected_schema,
+            now,
+            None,
+            &mut AuditWarnings::emitting(),
+        )
+    })
+}
+
+pub(crate) fn load_config_with_overlay_for_schema_under_guard(
+    guard: &ConfigWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        &mut AuditWarnings::emitting(),
+    )
+}
+
+/// Load through an already-held shared config-tree capability.
+///
+/// The caller owns the guard lifetime, so this must not acquire a second
+/// directory flock. Recheck the migration fence because it is the normal
+/// admission boundary, not merely an acquisition-time condition.
+#[allow(dead_code, reason = "guarded backup seam")]
+pub(crate) fn load_config_for_schema_under_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        None,
+        &mut AuditWarnings::emitting(),
+    )
+}
+
+/// Overlay-aware schema load through an already-held shared tree lock.
+///
+/// This keeps candidate bytes in memory while retaining normal-reader fence
+/// admission and avoiding a second lock acquisition.
+pub(crate) fn load_config_with_overlay_for_schema_under_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        &mut AuditWarnings::emitting(),
+    )
+}
+
+/// Return the loaded document whose declared include would select an exact
+/// root-relative candidate.  The candidate is planned without following
+/// aliases, whether it is absent or is a retained crash-retry body.
+///
+/// Import-local uses this before publishing `lists/<id>.txt`: otherwise a
+/// wildcard include could make the body a TOML input between its publication
+/// and the config commit. Matching follows the loader's supported grammar and
+/// resolves each candidate through the declaring document, so in-tree
+/// directory aliases are compared by their resolved member identity.
+pub(crate) fn loaded_include_matches_root_file(
+    guard: &ConfigWriteLock,
+    master_path: &Path,
+    loaded: &LoadedConfig,
+    candidate: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    guard.verify_master(master_path)?;
+    let tree = guard.tree_io();
+    let candidate = tree.plan_root_file_no_follow(candidate)?;
+    let candidate_key = candidate.key().clone();
+
+    for file in &loaded.files_loaded {
+        let declaring = tree.plan_target(file)?;
+        anyhow::ensure!(
+            declaring.key() != &candidate_key,
+            "candidate {} aliases an already-loaded config member {}",
+            candidate.display().display(),
+            declaring.display().display()
+        );
+    }
+
+    for file in &loaded.files_loaded {
+        let declaring = tree.plan_target(file)?;
+        let declared_by = declaring.display().to_path_buf();
+        let source = declaring.read_original()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "loaded config member disappeared: {}",
+                declared_by.display()
+            )
+        })?;
+        let document: toml::Value = source.parse().map_err(|error| {
+            anyhow::anyhow!(
+                "loaded config member is no longer valid TOML ({}): {error}",
+                declared_by.display()
+            )
+        })?;
+        let Some(includes) = document.get("includes") else {
+            continue;
+        };
+        let includes = includes.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "loaded config member has a non-array `includes`: {}",
+                declared_by.display()
+            )
+        })?;
+        for pattern in includes {
+            let pattern = pattern.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "loaded config member has a non-string include: {}",
+                    declared_by.display()
+                )
+            })?;
+            if include_pattern_matches_root_member(tree, declaring.key(), pattern, &candidate_key)?
+            {
+                return Ok(Some(declared_by));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Mirror the loader's intentionally small wildcard grammar for one exact
+/// candidate. The regular loader has already validated these declarations;
+/// retaining the checks here keeps future grammar changes from silently
+/// widening import-local's safety decision.
+fn include_pattern_matches_root_member(
+    tree: TreeIo<'_>,
+    declaring: &MemberKey,
+    pattern: &str,
+    candidate: &MemberKey,
+) -> anyhow::Result<bool> {
+    let pattern_path = Path::new(pattern);
+    anyhow::ensure!(!pattern.is_empty(), "empty include pattern");
+    anyhow::ensure!(
+        !pattern_path.is_absolute(),
+        "include pattern must be relative: {pattern}"
+    );
+    anyhow::ensure!(
+        !pattern_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "include pattern must not contain `..`: {pattern}"
+    );
+
+    let has_wildcard = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
+    if !has_wildcard {
+        return Ok(tree.resolve_from(declaring, pattern_path)?.key() == candidate);
+    }
+
+    let parts: Vec<_> = pattern.split('/').collect();
+    let wild_idx = parts
+        .iter()
+        .position(|part| part.contains('*') || part.contains('?') || part.contains('['))
+        .expect("wildcard was checked above");
+    anyhow::ensure!(
+        wild_idx == parts.len() - 1,
+        "wildcard is only supported in the final path segment, got: {pattern}"
+    );
+    let wildcard = parts[wild_idx];
+    anyhow::ensure!(
+        wildcard.matches('*').count() <= 1,
+        "only one `*` per path segment is supported, got: {pattern}"
+    );
+    anyhow::ensure!(
+        !wildcard.contains('?') && !wildcard.contains('['),
+        "`?` and `[` glob metacharacters are not supported, got: {pattern}"
+    );
+
+    let star = wildcard
+        .find('*')
+        .ok_or_else(|| anyhow::anyhow!("include wildcard must contain `*`: {pattern}"))?;
+    let prefix = &wildcard[..star];
+    let suffix = &wildcard[star + 1..];
+    let candidate_name = candidate_display_name(tree, candidate)
+        .ok_or_else(|| anyhow::anyhow!("candidate filename is not valid UTF-8"))?;
+    // This is deliberately before resolve_from: the real wildcard loader
+    // filters lexical directory-entry names before opening a candidate.  In
+    // particular, hidden files do not match `*` unless the pattern asks for
+    // a leading dot.
+    if (candidate_name.starts_with('.') && !prefix.starts_with('.'))
+        || !candidate_name.starts_with(prefix)
+        || !candidate_name.ends_with(suffix)
+        || candidate_name.len() < prefix.len() + suffix.len()
+    {
+        return Ok(false);
+    }
+    let relative_candidate = Path::new(&parts[..wild_idx].join("/")).join(candidate_name);
+    let candidate_entry = tree.resolve_from(declaring, &relative_candidate)?;
+    if candidate_entry.key() != candidate {
+        return Ok(false);
+    }
+    let name = candidate_entry
+        .display()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("candidate filename is not valid UTF-8"))?;
+    Ok(name.starts_with(prefix)
+        && name.ends_with(suffix)
+        && name.len() >= prefix.len() + suffix.len())
+}
+
+fn candidate_display_name(tree: TreeIo<'_>, candidate: &MemberKey) -> Option<String> {
+    tree.display(candidate)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+}
+
+#[allow(dead_code, reason = "migration-only schema loader")]
+pub(crate) fn load_config_for_schema_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    load_config_with_overlay_for_schema_under_migration_guard(
+        guard,
+        master_path,
+        expected_schema,
+        now,
+        None,
+    )
+}
+
+#[allow(dead_code, reason = "migration-only overlay loader")]
+pub(crate) fn load_config_with_overlay_for_schema_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        &mut AuditWarnings::emitting(),
+    )
+}
+
+fn tree_errors(path: &Path, err: anyhow::Error) -> Vec<ConfigError> {
+    mark_editor_identity_failure(&err);
+    let ctx = ErrorContext::new(format!("{err:#}")).with_file(path.to_path_buf());
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        vec![ConfigError::Parse(ctx)]
+    } else {
+        vec![ConfigError::ValidationFailed(ctx)]
+    }
+}
+
+fn lock_errors(master: &Path, err: anyhow::Error) -> Vec<ConfigError> {
+    if let Some(fence) = err.downcast_ref::<FenceRefusal>() {
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new(fence.to_string()).with_file(fence.journal.clone()),
+        )]
+    } else if let Some(non_regular) = err.downcast_ref::<write_lock::NonRegularMaster>() {
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new(non_regular.to_string()).with_file(non_regular.0.clone()),
+        )]
+    } else {
+        vec![ConfigError::Parse(
+            ErrorContext::new(format!("{err:#}")).with_file(master.to_path_buf()),
+        )]
+    }
 }
 
 /// Shared body of [`load_config_with_overlay`] and [`load_config_collect`].
@@ -324,27 +1002,17 @@ pub fn load_config_with_overlay(
 /// passes an [`AuditWarnings::emitting`] collector and discards it, so
 /// journald behaviour is exactly what it was before the collector existed.
 fn load_config_inner(
-    master_path: &Path,
+    tree: TreeIo<'_>,
+    expected_schema: u32,
     now: OffsetDateTime,
     overlay: Option<&LoaderOverlay>,
     warns: &mut AuditWarnings,
 ) -> Result<LoadedConfig, Vec<ConfigError>> {
-    let canonical_master = canonicalize_path(master_path).map_err(|e| vec![e])?;
-    let root = canonical_master
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| {
-            vec![ConfigError::ValidationFailed(
-                ErrorContext::new(format!(
-                    "master config path has no parent directory: {}",
-                    canonical_master.display(),
-                ))
-                .with_file(canonical_master.clone()),
-            )]
-        })?;
+    let canonical_master = tree.identity.canonical_master.clone();
+    let overlay = overlay.map(|ov| ov.bind(tree)).transpose()?;
 
     let mut ctx = LoadCtx {
-        root,
+        tree,
         master_schema_version: None,
         loaded: BTreeSet::new(),
         loading_stack: Vec::new(),
@@ -358,7 +1026,10 @@ fn load_config_inner(
     };
 
     // Master file is loaded first; its directory is the config root.
-    load_file(&canonical_master, &mut ctx, 0, now)?;
+    let master = tree
+        .resolve_key(&tree.master_key())
+        .map_err(|e| tree_errors(&canonical_master, e))?;
+    load_file(master, &mut ctx, 0, now)?;
 
     // Overlay extra members: brand-new include slices a validating writer is
     // creating. Load each as if a glob had matched it (depth 1) so the merged
@@ -366,11 +1037,30 @@ fn load_config_inner(
     // the multi-file merge path below (a new member means the tree is no
     // longer single-file). With `None` / empty this loop never runs, so the
     // fast-path decision and everything downstream stay byte-identical.
-    if let Some(ov) = ctx.overlay {
-        for member in &ov.extra_members {
-            let canonical_member = canonicalize_path(member).map_err(|e| vec![e])?;
-            ensure_inside_root(&canonical_member, &ctx.root, &canonical_master)?;
-            load_file(&canonical_member, &mut ctx, 1, now)?;
+    let extras = ctx
+        .overlay
+        .as_ref()
+        .map(|ov| ov.forced_extra_members.clone())
+        .unwrap_or_default();
+    for key in extras {
+        let entry = tree
+            .resolve_key(&key)
+            .map_err(|e| tree_errors(&tree.display(&key), e))?;
+        load_file(entry, &mut ctx, 1, now)?;
+    }
+
+    #[cfg(test)]
+    write_lock::test_event(write_lock::TestEvent::OverlayResolved);
+    if let Some(overlay) = &ctx.overlay {
+        for key in overlay.substitutions.keys() {
+            if !ctx.loaded.contains(key) {
+                return Err(tree_errors(
+                    &tree.display(key),
+                    anyhow::anyhow!(
+                        "staged config document was not reached during overlay validation"
+                    ),
+                ));
+            }
         }
     }
 
@@ -399,10 +1089,7 @@ fn load_config_inner(
     // and on reload, and an unprivileged `warden config lint` that cannot
     // read a 0600 secrets file must still be able to lint everything else
     // rather than fail wholesale on a check it cannot perform.
-    let secrets = crate::config::secrets::load_secrets(&crate::config::secrets::secrets_path_for(
-        &canonical_master,
-    ))
-    .ok();
+    let secrets = crate::config::secrets::load_secrets_under_tree(tree).ok();
 
     // ── single-file fast-path ────────────────────────────────────
     //
@@ -434,8 +1121,9 @@ fn load_config_inner(
         // `tracing`, unable to take a collector) followed by a second
         // `validate_collect` in silent mode purely to harvest the same
         // messages as data — on the fast path, which is the shipped layout.
-        let config = load_from_str_collect(
+        let config = load_from_str_collect_for_schema(
             &src,
+            expected_schema,
             Some(&canonical_master),
             now,
             warns,
@@ -445,7 +1133,7 @@ fn load_config_inner(
         // The `auth_token_ref` cross-check is preserved: it rides
         // on the `secrets` argument above, which the single pass now carries.
         // That check fires on the shipped single-file layout or on nobody.
-        let custom_lists = build_custom_list_store(&ctx.root, &config)?;
+        let custom_lists = build_custom_list_store(tree, &config)?;
         return Ok(LoadedConfig {
             config,
             master_path: canonical_master,
@@ -465,10 +1153,17 @@ fn load_config_inner(
     // Bound to a `let` rather than matched inline: `Some(&ctx.provenance)` is
     // a temporary whose lifetime would otherwise extend over the whole `match`,
     // and the `Ok` arm MOVES `ctx.provenance` into the returned `LoadedConfig`.
-    let verdict = validate_collect(&config, now, warns, secrets.as_ref(), Some(&ctx.provenance));
+    let verdict = validate_collect_for_schema(
+        &config,
+        expected_schema,
+        now,
+        warns,
+        secrets.as_ref(),
+        Some(&ctx.provenance),
+    );
     match verdict {
         Ok(()) => {
-            let custom_lists = build_custom_list_store(&ctx.root, &config)?;
+            let custom_lists = build_custom_list_store(tree, &config)?;
             Ok(LoadedConfig {
                 config,
                 master_path: canonical_master,
@@ -497,11 +1192,11 @@ fn load_config_inner(
 /// needs no branch of its own, and a cold start refuses rather than starting
 /// with a policy quietly smaller than the file says.
 fn build_custom_list_store(
-    root: &Path,
+    tree: TreeIo<'_>,
     config: &ConfigV1,
 ) -> Result<crate::config::custom_list::CustomListStore, Vec<ConfigError>> {
-    crate::config::custom_list::build_store(
-        root,
+    crate::config::custom_list::build_store_under_tree(
+        tree,
         &config.custom_lists,
         config.custom_list_limits.max_file_bytes,
     )
@@ -521,11 +1216,11 @@ fn build_custom_list_store(
 
 // ── internal state ──────────────────────────────────────────────────
 
-struct LoadCtx<'o> {
-    root: PathBuf,
+struct LoadCtx<'g, 'o> {
+    tree: TreeIo<'g>,
     master_schema_version: Option<i64>,
-    loaded: BTreeSet<PathBuf>,
-    loading_stack: Vec<PathBuf>,
+    loaded: BTreeSet<MemberKey>,
+    loading_stack: Vec<MemberKey>,
     files_loaded: Vec<PathBuf>,
     total_bytes: u64,
     merged: toml::Table,
@@ -548,21 +1243,61 @@ struct LoadCtx<'o> {
     deprecations: Vec<String>,
     /// Optional read-substitution + extra-member overlay. `None` on every
     /// daemon load; `Some` only under a validating writer (cold CLI/IPC path).
-    overlay: Option<&'o LoaderOverlay>,
+    overlay: Option<BoundLoaderOverlay<'o>>,
+}
+
+/// An omission still verifies the descriptor snapshot: treating a replacement
+/// as absent would validate a different final tree than the one we pinned.
+fn overlay_omits(
+    entry: &ResolvedEntry<'_>,
+    overlay: Option<&BoundLoaderOverlay<'_>>,
+) -> anyhow::Result<bool> {
+    let Some(expected) = overlay.and_then(|overlay| overlay.omissions.get(entry.key())) else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        entry.destination()? == *expected,
+        "omitted overlay destination changed since its snapshot"
+    );
+    Ok(true)
+}
+
+fn overlay_admits_new(entry: &ResolvedEntry<'_>, overlay: Option<&BoundLoaderOverlay<'_>>) -> bool {
+    overlay.is_some_and(|overlay| overlay.admitted_new_members.contains(entry.key()))
 }
 
 #[allow(clippy::only_used_in_recursion)]
-fn load_file(
-    canonical: &Path,
-    ctx: &mut LoadCtx<'_>,
+fn load_file<'g>(
+    entry: ResolvedEntry<'g>,
+    ctx: &mut LoadCtx<'g, '_>,
     depth: usize,
     // `now` is threaded to keep the same reference time across the
     // whole include graph (sub-files recurse with the caller's clock,
     // not a fresh one) even though this frame doesn't consume it.
     now: OffsetDateTime,
 ) -> Result<(), Vec<ConfigError>> {
+    let canonical = entry.display();
+    let key = entry.key();
+    if let Some(expected) = ctx.overlay.as_ref().and_then(|o| o.destinations.get(key)) {
+        if entry
+            .destination()
+            .map_err(|e| tree_errors(canonical, e.into()))?
+            != *expected
+        {
+            return Err(tree_errors(
+                canonical,
+                anyhow::anyhow!("overlay destination changed since its snapshot"),
+            ));
+        }
+    }
+    if overlay_omits(&entry, ctx.overlay.as_ref()).map_err(|e| tree_errors(canonical, e))? {
+        return Err(tree_errors(
+            canonical,
+            anyhow::anyhow!("staged config member is omitted from the final tree"),
+        ));
+    }
     if depth > MAX_INCLUDE_DEPTH {
-        let chain = include_chain(&ctx.loading_stack, canonical);
+        let chain = include_chain(ctx.tree, &ctx.loading_stack, key);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
                 "include depth limit exceeded ({} > {}). chain: {}",
@@ -572,61 +1307,39 @@ fn load_file(
         )]);
     }
 
-    if ctx.loading_stack.iter().any(|p| p == canonical) {
-        let chain = include_chain(&ctx.loading_stack, canonical);
+    if ctx.loading_stack.iter().any(|p| p == key) {
+        let chain = include_chain(ctx.tree, &ctx.loading_stack, key);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!("include cycle detected. chain: {chain}"))
                 .with_file(canonical.to_path_buf()),
         )]);
     }
 
-    if ctx.loaded.contains(canonical) {
+    if ctx.loaded.contains(key) {
         // Same file reachable via two different include paths — load
         // once, merge once. Cycle detection above excludes self-loops.
         return Ok(());
     }
 
-    ctx.loading_stack.push(canonical.to_path_buf());
+    ctx.loading_stack.push(key.clone());
 
-    // Per-file size guard: stat BEFORE reading so a single oversized
-    // include — malicious, a stray log redirect, or a glob that captured a
-    // huge generated file — cannot be slurped fully into memory and OOM
-    // the process before the aggregate cap (below) is ever consulted.
-    // Reject when this file alone would bust the remaining budget; peak
-    // memory then stays bounded by `MAX_TOTAL_BYTES`, not by the largest
-    // single member.
-    // When the overlay substitutes this path's bytes, account the staged
-    // byte length and skip the on-disk stat — the file may not exist yet
-    // (new-slice creation) or may differ in size from what will be loaded.
-    let file_len = match ctx.overlay.and_then(|o| o.substitution(canonical)) {
-        Some(bytes) => bytes.len() as u64,
-        None => {
-            let md = std::fs::metadata(canonical).map_err(|io_err| {
-                vec![ConfigError::Parse(
-                    ErrorContext::new(format!("cannot stat config: {io_err}"))
-                        .with_file(canonical.to_path_buf()),
-                )]
-            })?;
-            // Reject a non-regular file (FIFO, socket, device,
-            // directory) BEFORE `read_to_string` below can block forever on
-            // it. `metadata` follows symlinks (and never blocks — it's a
-            // stat), so a glob symlink pointing at a FIFO inside the config
-            // root is caught here too, covering both include branches.
-            if !md.file_type().is_file() {
-                return Err(vec![ConfigError::ValidationFailed(
-                    ErrorContext::new(format!(
-                        "include path is not a regular file: {}",
-                        canonical.display()
-                    ))
-                    .with_file(canonical.to_path_buf())
-                    .with_suggestion(
-                        "includes must resolve to regular files (no FIFOs, sockets, or directories)",
-                    ),
-                )]);
-            }
-            md.len()
-        }
+    let substitution = ctx
+        .overlay
+        .as_ref()
+        .and_then(|o| o.substitutions.get(key))
+        .copied();
+    let opened = if substitution.is_none() {
+        Some(
+            ctx.tree
+                .open_regular(&entry)
+                .map_err(|e| tree_errors(canonical, e))?,
+        )
+    } else {
+        None
     };
+    let file_len = substitution
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or_else(|| opened.as_ref().expect("unstaged file opened").1.len());
     if ctx.total_bytes.saturating_add(file_len) > MAX_TOTAL_BYTES {
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
@@ -640,17 +1353,13 @@ fn load_file(
         )]);
     }
 
-    let src = match ctx.overlay.and_then(|o| o.substitution(canonical)) {
+    let src = match substitution {
         Some(bytes) => bytes.to_string(),
-        None => {
-            // Bound the read by the REMAINING aggregate budget so a
-            // file that grew past `file_len` in the stat->read TOCTOU window
-            // can't be slurped unbounded (the post-read aggregate check only
-            // fires AFTER allocation). `take(remaining + 1)` caps peak memory
-            // and lets us detect the overrun.
-            let remaining = MAX_TOTAL_BYTES.saturating_sub(ctx.total_bytes);
-            read_to_string_capped(canonical, remaining)?
-        }
+        None => read_open_config_to_string_capped(
+            opened.expect("unstaged file opened").0,
+            canonical,
+            MAX_TOTAL_BYTES.saturating_sub(ctx.total_bytes),
+        )?,
     };
 
     ctx.total_bytes = ctx.total_bytes.saturating_add(src.len() as u64);
@@ -708,8 +1417,7 @@ fn load_file(
     // before the merge/deserialise pipeline runs — so multi-file loads
     // mixing `ip_denylists` and `ip_blocklists` across files collapse
     // into a single section (duplicate → the same singleton conflict
-    // path the merger uses for every other section). Remove at
-    // schema_version = 3.
+    // path the merger uses for every other section).
     normalise_deprecated_keys(&mut table, canonical, &src, &mut ctx.deprecations)?;
 
     // Per-file provenance: record each top-level key and (where
@@ -728,26 +1436,10 @@ fn load_file(
 
     // Take this file's schema_version out — the master dictates it;
     // sub-files may echo it if they want but must not disagree.
+    // Keep this check against the master's declaration, not the requested
+    // target: target equality is checked after merge, preserving error order.
     if let Some(v) = table.remove("schema_version") {
-        let this_version = v.as_integer().ok_or_else(|| {
-            vec![ConfigError::Parse(
-                ErrorContext::new("schema_version must be an integer")
-                    .with_file(canonical.to_path_buf())
-                    .with_entity("schema_version"),
-            )]
-        })?;
-        // `ConfigV1.schema_version` is a `u32` — reject a negative
-        // or oversized value HERE, where we still have the precise file:line,
-        // instead of losing provenance to the post-merge `try_into`.
-        if this_version < 0 || this_version > i64::from(u32::MAX) {
-            return Err(vec![ConfigError::Parse(
-                ErrorContext::new(format!(
-                    "schema_version must be a non-negative integer that fits u32 (got {this_version})"
-                ))
-                .with_file(canonical.to_path_buf())
-                .with_entity("schema_version"),
-            )]);
-        }
+        let this_version = i64::from(declared_schema_version(&v, canonical)?);
         match ctx.master_schema_version {
             None if depth == 0 => {
                 // The master (depth 0) is the authority — record + carry into
@@ -810,20 +1502,25 @@ fn load_file(
 
     // Recurse into this file's own includes. Glob base = this file's
     // directory — paths are relative to the file that declares the includes.
-    let this_dir = canonical.parent().unwrap_or(&ctx.root).to_path_buf();
     for pattern in &child_includes {
-        let matched = resolve_include_pattern(pattern, &this_dir, &ctx.root, canonical)?;
-        for matched_path in matched {
-            let canonical_child = canonicalize_path(&matched_path).map_err(|e| vec![e])?;
-            ensure_inside_root(&canonical_child, &ctx.root, canonical)?;
-            load_file(&canonical_child, ctx, depth + 1, now)?;
+        for child_key in resolve_include_pattern(pattern, ctx, key)? {
+            let child = ctx
+                .tree
+                .resolve_key(&child_key)
+                .map_err(|e| tree_errors(&ctx.tree.display(&child_key), e))?;
+            if child.key() != &child_key {
+                return Err(tree_errors(
+                    child.display(),
+                    anyhow::anyhow!("include reachability changed during resolution"),
+                ));
+            }
+            load_file(child, ctx, depth + 1, now)?;
         }
     }
 
     let popped = ctx.loading_stack.pop();
-    debug_assert_eq!(popped.as_deref(), Some(canonical));
-
-    ctx.loaded.insert(canonical.to_path_buf());
+    debug_assert_eq!(popped.as_ref(), Some(key));
+    ctx.loaded.insert(key.clone());
 
     Ok(())
 }
@@ -866,10 +1563,12 @@ fn parse_include_patterns(
 
 fn resolve_include_pattern(
     pattern: &str,
-    base_dir: &Path,
-    root: &Path,
-    declared_by: &Path,
-) -> Result<Vec<PathBuf>, Vec<ConfigError>> {
+    ctx: &LoadCtx<'_, '_>,
+    declaring_key: &MemberKey,
+) -> Result<Vec<MemberKey>, Vec<ConfigError>> {
+    let tree = ctx.tree;
+    let display = tree.display(declaring_key);
+    let declared_by = display.as_path();
     if pattern.is_empty() {
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new("empty include pattern").with_file(declared_by.to_path_buf()),
@@ -896,24 +1595,31 @@ fn resolve_include_pattern(
 
     let has_wildcard = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
 
-    let matches = if !has_wildcard {
-        let full = base_dir.join(pattern);
-        if !full.exists() {
+    if !has_wildcard {
+        let entry = tree
+            .resolve_from(declaring_key, pb)
+            .map_err(|e| tree_errors(declared_by, e))?;
+        // An omitted exact include is indistinguishable from a genuinely
+        // absent file to the final loader, so retain its normal hard error.
+        if overlay_omits(&entry, ctx.overlay.as_ref()).map_err(|e| tree_errors(declared_by, e))?
+            || (!overlay_admits_new(&entry, ctx.overlay.as_ref())
+                && entry
+                    .metadata()
+                    .map_err(|e| tree_errors(declared_by, e.into()))?
+                    .is_none())
+        {
             return Err(vec![ConfigError::Parse(
-                ErrorContext::new(format!("include file not found: {}", full.display(),))
-                    .with_file(declared_by.to_path_buf()),
+                ErrorContext::new(format!(
+                    "include file not found: {}",
+                    entry.display().display()
+                ))
+                .with_file(display),
             )]);
         }
-        vec![full]
+        Ok(vec![entry.key().clone()])
     } else {
-        expand_wildcard(pattern, base_dir, declared_by, root)?
-    };
-
-    // Byte-wise sort for deterministic cross-platform ordering.
-    let mut sorted = matches;
-    sorted.sort();
-    sorted.dedup();
-    Ok(sorted)
+        expand_wildcard(pattern, ctx, declaring_key)
+    }
 }
 
 /// Expand a single include pattern with wildcards. Only supports one
@@ -921,17 +1627,19 @@ fn resolve_include_pattern(
 /// more adventurous is rejected until a concrete need arises.
 fn expand_wildcard(
     pattern: &str,
-    base_dir: &Path,
-    declared_by: &Path,
-    _root: &Path,
-) -> Result<Vec<PathBuf>, Vec<ConfigError>> {
+    ctx: &LoadCtx<'_, '_>,
+    declaring_key: &MemberKey,
+) -> Result<Vec<MemberKey>, Vec<ConfigError>> {
+    let tree = ctx.tree;
+    let display = tree.display(declaring_key);
+    let declared_by = display.as_path();
     let parts: Vec<&str> = pattern.split('/').collect();
     let wild_idx = parts
         .iter()
         .position(|p| p.contains('*') || p.contains('?') || p.contains('['));
     let Some(wild_idx) = wild_idx else {
         // Shouldn't happen — caller checked for wildcards. Defensive.
-        return Ok(vec![base_dir.join(pattern)]);
+        return resolve_include_pattern(pattern, ctx, declaring_key);
     };
     if wild_idx != parts.len() - 1 {
         return Err(vec![ConfigError::ValidationFailed(
@@ -959,88 +1667,147 @@ fn expand_wildcard(
         )]);
     }
 
-    let dir = if wild_idx == 0 {
-        base_dir.to_path_buf()
+    let directory = parts[..wild_idx].join("/");
+    let dir = tree
+        .directory_from(declaring_key, Path::new(&directory))
+        .map_err(|e| tree_errors(declared_by, e))?;
+    // Use the same pinned resolution for on-disk enumeration and staged
+    // admission. Only an absent directory needs a key-only resolution.
+    let canonical_directory = if let Some(directory) = &dir {
+        tree.directory_display(directory)
     } else {
-        base_dir.join(parts[..wild_idx].join(std::path::MAIN_SEPARATOR_STR))
+        tree.resolve_from(declaring_key, Path::new(&directory))
+            .map_err(|e| tree_errors(declared_by, e))?
+            .display()
+            .to_path_buf()
     };
     let wildcard = parts[wild_idx];
     let star = wildcard.find('*').unwrap();
     let prefix = &wildcard[..star];
     let suffix = &wildcard[star + 1..];
 
-    let mut out = Vec::new();
-    if dir.is_dir() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| {
-            vec![ConfigError::Parse(
-                ErrorContext::new(format!("cannot read {}: {e}", dir.display()))
-                    .with_file(declared_by.to_path_buf()),
-            )]
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                vec![ConfigError::Parse(
-                    ErrorContext::new(format!("cannot read directory entry: {e}"))
-                        .with_file(declared_by.to_path_buf()),
-                )]
-            })?;
-            let ft = entry.file_type().map_err(|e| {
-                vec![ConfigError::Parse(
-                    ErrorContext::new(format!("cannot stat entry: {e}"))
-                        .with_file(declared_by.to_path_buf()),
-                )]
-            })?;
-            if !(ft.is_file() || ft.is_symlink()) {
-                continue;
-            }
-            // Skip a glob self-match — the declaring file caught by
-            // its own `*.toml` — so it doesn't recurse into a spurious
-            // "include cycle detected" error (logrotate/systemd self-skip
-            // semantics). Compare canonically since `entry.path()` and
-            // `declared_by` can differ in form.
-            if let (Ok(a), Ok(b)) = (entry.path().canonicalize(), declared_by.canonicalize()) {
-                if a == b {
-                    continue;
-                }
-            }
-            let name = entry.file_name();
-            let name_s = match name.to_str() {
-                Some(s) => s,
-                None => continue, // non-UTF-8 filename, skip
+    let mut out = BTreeSet::new();
+    let mut new_members = 0;
+    if let Some(dir) = dir {
+        #[cfg(test)]
+        write_lock::test_event(write_lock::TestEvent::IncludeDirectoryPinned);
+        for_each_dir_name(&dir, |name| {
+            let Some(name_s) = name.to_str() else {
+                return Ok(());
             };
-            // A bare `*` has an empty prefix, so `*.toml` would
-            // match `.disabled.toml` — defeating the rename-to-dotfile disable
-            // convention (and could transiently catch staged temps). Skip
-            // dotfiles unless the pattern's prefix explicitly opts in with a
-            // leading dot.
             if name_s.starts_with('.') && !prefix.starts_with('.') {
-                continue;
+                return Ok(());
             }
-            if name_s.starts_with(prefix)
-                && name_s.ends_with(suffix)
-                && name_s.len() >= prefix.len() + suffix.len()
+            if !name_s.starts_with(prefix)
+                || !name_s.ends_with(suffix)
+                || name_s.len() < prefix.len() + suffix.len()
             {
-                out.push(entry.path());
+                return Ok(());
             }
-        }
+            if !dir.file_candidate(name)? {
+                return Ok(());
+            }
+            let selected_key = dir.entry_key(name)?;
+            let entry = tree.resolve_in_directory(&dir, name)?;
+            if entry.key() == declaring_key {
+                return Ok(());
+            }
+            // Skip only the directory entry being removed. A surviving alias
+            // to that target will dangle after commit and must fail validation.
+            if overlay_omits(&entry, ctx.overlay.as_ref())? {
+                anyhow::ensure!(
+                    &selected_key == entry.key(),
+                    "included alias {} resolves to an omitted member",
+                    tree.display(&selected_key).display()
+                );
+                return Ok(());
+            }
+            track_include_member(entry.key().clone(), &mut out, &mut new_members, ctx)?;
+            Ok(())
+        })
+        .map_err(|e| tree_errors(declared_by, e))?;
     }
-    // Empty match is allowed — supports a fresh install with an empty .d dir.
-    Ok(out)
+
+    // A descriptor-planned reachable-only member has no directory entry yet,
+    // so native enumeration cannot see it. Forced extras retain their legacy
+    // post-traversal ordering; inject only an admitted non-forced member whose
+    // final canonical directory and filename satisfy this exact loader
+    // grammar.
+    let admitted_members = ctx
+        .overlay
+        .as_ref()
+        .map(|overlay| {
+            overlay
+                .admitted_new_members
+                .iter()
+                .filter(|key| !overlay.forced_extra_members.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for key in admitted_members {
+        if key == *declaring_key
+            || !staged_member_matches_wildcard(tree, &key, &canonical_directory, prefix, suffix)
+        {
+            continue;
+        }
+        track_include_member(key, &mut out, &mut new_members, ctx)
+            .map_err(|e| tree_errors(declared_by, e))?;
+    }
+    Ok(out.into_iter().collect())
 }
 
-/// Read a file to a `String`, capping the read at `cap + 1` bytes so a
-/// file that grew past the remaining aggregate size budget in the
-/// stat->read TOCTOU window can't be slurped unbounded.
-/// Returns a `ValidationFailed` when the file exceeds `cap`; peak memory
-/// stays bounded by `cap + 1`.
-fn read_to_string_capped(path: &Path, cap: u64) -> Result<String, Vec<ConfigError>> {
+/// Match a planned new member using the loader's final-segment wildcard
+/// grammar. The parent comparison is over the resolved directory display, not
+/// the spelling in the include declaration, so staged and on-disk members
+/// share one identity even when the include path traverses a directory alias.
+fn staged_member_matches_wildcard(
+    tree: TreeIo<'_>,
+    key: &MemberKey,
+    canonical_directory: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> bool {
+    let path = tree.display(key);
+    if path.parent() != Some(canonical_directory) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    (!name.starts_with('.') || prefix.starts_with('.'))
+        && name.starts_with(prefix)
+        && name.ends_with(suffix)
+        && name.len() >= prefix.len() + suffix.len()
+}
+
+/// Keep staged-new wildcard injection subject to the same deduplication,
+/// cycle accounting, and hard file limit as entries found on disk.
+fn track_include_member(
+    key: MemberKey,
+    out: &mut BTreeSet<MemberKey>,
+    new_members: &mut usize,
+    ctx: &LoadCtx<'_, '_>,
+) -> anyhow::Result<()> {
+    if out.insert(key.clone()) && !ctx.loaded.contains(&key) && !ctx.loading_stack.contains(&key) {
+        *new_members += 1;
+        anyhow::ensure!(
+            ctx.files_loaded.len() + *new_members <= MAX_INCLUDE_FILES,
+            "include file count exceeded {} (hard cap {})",
+            ctx.files_loaded.len() + *new_members,
+            MAX_INCLUDE_FILES
+        );
+    }
+    Ok(())
+}
+
+fn read_open_config_to_string_capped(
+    file: std::fs::File,
+    path: &Path,
+    cap: u64,
+) -> Result<String, Vec<ConfigError>> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|io_err| {
-        vec![ConfigError::Parse(
-            ErrorContext::new(format!("cannot read config: {io_err}"))
-                .with_file(path.to_path_buf()),
-        )]
-    })?;
+
     let mut buf = String::new();
     let read = file
         .take(cap.saturating_add(1))
@@ -1062,63 +1829,37 @@ fn read_to_string_capped(path: &Path, cap: u64) -> Result<String, Vec<ConfigErro
     Ok(buf)
 }
 
-// ── path security ───────────────────────────────────────────────────
-
-/// Canonicalise a path with the "parent + leaf" trick so files that
-/// don't yet exist still produce a deterministic canonical form.
-/// Returns a Parse error if neither the path nor its parent exist.
-pub(crate) fn canonicalize_path(p: &Path) -> Result<PathBuf, ConfigError> {
-    if p.exists() {
-        p.canonicalize().map_err(|e| {
-            ConfigError::Parse(
-                ErrorContext::new(format!("cannot canonicalise {}: {e}", p.display()))
-                    .with_file(p.to_path_buf()),
-            )
-        })
-    } else {
-        let parent = p.parent().ok_or_else(|| {
-            ConfigError::Parse(
-                ErrorContext::new(format!("path has no parent: {}", p.display()))
-                    .with_file(p.to_path_buf()),
-            )
-        })?;
-        let leaf = p.file_name().ok_or_else(|| {
-            ConfigError::Parse(
-                ErrorContext::new(format!("path has no file name: {}", p.display()))
-                    .with_file(p.to_path_buf()),
-            )
-        })?;
-        let parent_c = parent.canonicalize().map_err(|e| {
-            ConfigError::Parse(
-                ErrorContext::new(format!(
-                    "cannot canonicalise parent {}: {e}",
-                    parent.display(),
-                ))
-                .with_file(p.to_path_buf()),
-            )
-        })?;
-        Ok(parent_c.join(leaf))
-    }
+/// Version-neutral type/range check shared by the probe and each loaded file.
+/// Equality with the master or requested target is the caller's responsibility.
+fn declared_schema_version(value: &toml::Value, file: &Path) -> Result<u32, Vec<ConfigError>> {
+    let version = value.as_integer().ok_or_else(|| {
+        vec![ConfigError::Parse(
+            ErrorContext::new("schema_version must be an integer")
+                .with_file(file.to_path_buf())
+                .with_entity("schema_version"),
+        )]
+    })?;
+    u32::try_from(version).map_err(|_| {
+        vec![ConfigError::Parse(
+            ErrorContext::new(format!(
+                "schema_version must be a non-negative integer that fits u32 (got {version})"
+            ))
+            .with_file(file.to_path_buf())
+            .with_entity("schema_version"),
+        )]
+    })
 }
 
-fn ensure_inside_root(
-    candidate: &Path,
-    root: &Path,
-    declared_by: &Path,
-) -> Result<(), Vec<ConfigError>> {
-    if candidate.starts_with(root) {
-        Ok(())
-    } else {
-        Err(vec![ConfigError::ValidationFailed(
-            ErrorContext::new(format!(
-                "include target {} escapes config root {}",
-                candidate.display(),
-                root.display(),
-            ))
-            .with_file(declared_by.to_path_buf())
-            .with_suggestion("move the target inside the config directory or remove the include"),
-        )])
-    }
+// ── path security ───────────────────────────────────────────────────
+
+/// Sharing resolution with the guards prevents overlays from missing aliased targets.
+pub(crate) fn canonicalize_path(p: &Path) -> Result<PathBuf, ConfigError> {
+    write_lock::resolve_path(p).map_err(|err| {
+        ConfigError::Parse(
+            ErrorContext::new(format!("cannot canonicalise {}: {err:#}", p.display()))
+                .with_file(p.to_path_buf()),
+        )
+    })
 }
 
 // ── merge logic ─────────────────────────────────────────────────────
@@ -1384,7 +2125,7 @@ fn deprecated_key_conflict(file: &Path, line: usize, legacy: &str, canonical: &s
 /// cross-file case already hard-errors as a duplicate singleton, so the
 /// same-file case must be just as loud.
 ///
-/// DEPRECATED — remove at schema_version = 3.
+/// DEPRECATED — rewrite to the canonical key.
 /// Emit one key-deprecation notice on **both** channels.
 ///
 /// Both channels matter: `tracing::warn!` is a different channel from the
@@ -1392,8 +2133,8 @@ fn deprecated_key_conflict(file: &Path, line: usize, legacy: &str, canonical: &s
 /// deprecation warnings reach journald at boot; `warden config lint`
 /// installs none and takes its warnings only from `load_config_collect`'s
 /// return value. A notice pushed to only one channel is invisible on the
-/// other path — silently under-reporting exactly the "this key disappears
-/// at schema_version = 3" notices a deploy gate relies on.
+/// other path — silently under-reporting exactly the deprecation notices a
+/// deploy gate relies on.
 ///
 /// The fix is to feed the existing notices into the channel lint already
 /// reads, **not** to restate them in the validator: two copies of the same
@@ -1499,7 +2240,12 @@ fn normalise_deprecated_keys(
                 "ip_blocklists",
             ));
         } else {
-            note_deprecation(deprecations, file, line, "config key '[ip_denylists]' deprecated, use '[ip_blocklists]' (removal at schema_version = 3)");
+            note_deprecation(
+                deprecations,
+                file,
+                line,
+                "config key '[ip_denylists]' deprecated, use '[ip_blocklists]'",
+            );
             table.insert("ip_blocklists".to_string(), legacy);
         }
     }
@@ -1512,7 +2258,12 @@ fn normalise_deprecated_keys(
         if table.contains_key("devices") {
             errs.push(deprecated_key_conflict(file, line, "clients", "devices"));
         } else {
-            note_deprecation(deprecations, file, line, "config key '[[clients]]' deprecated, use '[[devices]]' (removal at schema_version = 3)");
+            note_deprecation(
+                deprecations,
+                file,
+                line,
+                "config key '[[clients]]' deprecated, use '[[devices]]'",
+            );
             table.insert("devices".to_string(), legacy);
         }
     }
@@ -1571,7 +2322,7 @@ fn normalise_deprecated_keys(
                     "lists.update_interval_secs",
                 ));
             } else {
-                note_deprecation(deprecations, file, line, "config key 'lists.refresh_interval_secs' deprecated, use 'lists.update_interval_secs' (removal at schema_version = 3)");
+                note_deprecation(deprecations, file, line, "config key 'lists.refresh_interval_secs' deprecated, use 'lists.update_interval_secs'");
                 lists_table.insert("update_interval_secs".to_string(), legacy);
             }
         }
@@ -1589,7 +2340,12 @@ fn normalise_deprecated_keys(
                     "tracking.max_devices",
                 ));
             } else {
-                note_deprecation(deprecations, file, line, "config key 'tracking.max_clients' deprecated, use 'tracking.max_devices' (removal at schema_version = 3)");
+                note_deprecation(
+                    deprecations,
+                    file,
+                    line,
+                    "config key 'tracking.max_clients' deprecated, use 'tracking.max_devices'",
+                );
                 tracking_table.insert("max_devices".to_string(), legacy);
             }
         }
@@ -1607,7 +2363,7 @@ fn normalise_deprecated_keys(
                     "server.enforce_device_mac",
                 ));
             } else {
-                note_deprecation(deprecations, file, line, "config key 'server.enforce_client_mac' deprecated, use 'server.enforce_device_mac' (removal at schema_version = 3)");
+                note_deprecation(deprecations, file, line, "config key 'server.enforce_client_mac' deprecated, use 'server.enforce_device_mac'");
                 server_table.insert("enforce_device_mac".to_string(), legacy);
             }
         }
@@ -1638,7 +2394,7 @@ fn normalise_deprecated_keys(
                     ));
                 } else {
                     let msg = format!(
-                        "blocklist '{id_hint}' field 'refresh_interval_hours' deprecated, use 'update_interval_hours' (removal at schema_version = 3)"
+                        "blocklist '{id_hint}' field 'refresh_interval_hours' deprecated, use 'update_interval_hours'"
                     );
                     note_deprecation(deprecations, file, anchor_line, &msg);
                     entry_table.insert("update_interval_hours".to_string(), legacy);
@@ -1919,9 +2675,12 @@ fn line_of(src: &str, offset: usize) -> usize {
     src[..clamped].bytes().filter(|b| *b == b'\n').count() + 1
 }
 
-fn include_chain(stack: &[PathBuf], next: &Path) -> String {
-    let mut chain: Vec<String> = stack.iter().map(|p| p.display().to_string()).collect();
-    chain.push(next.display().to_string());
+fn include_chain(tree: TreeIo<'_>, stack: &[MemberKey], next: &MemberKey) -> String {
+    let mut chain: Vec<String> = stack
+        .iter()
+        .map(|p| tree.display(p).display().to_string())
+        .collect();
+    chain.push(tree.display(next).display().to_string());
     chain.join(" → ")
 }
 
@@ -1994,3 +2753,7 @@ fn classify_merged_error(err: toml::de::Error, _provenance: &ProvenanceMap) -> C
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "loader/locking_tests.rs"]
+mod locking_tests;

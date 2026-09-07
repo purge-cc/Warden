@@ -12,7 +12,7 @@ fn base_config() -> ConfigV1 {
     // Two profiles (default + strict), two devices, one group,
     // one subnet, no schedules. Reused across most level tests.
     let mut c = ConfigV1::test_scaffold();
-    c.schema_version = 3;
+    c.schema_version = 4;
     c.profiles.insert(
         "default".into(),
         Profile {
@@ -779,7 +779,7 @@ fn mac_alias_matches_device_via_arp() {
     // Device pinned by MAC only; ARP maps an IP to the alias MAC —
     // the resolver must still treat it as the device.
     let mut cfg = ConfigV1::test_scaffold();
-    cfg.schema_version = 3;
+    cfg.schema_version = 4;
     cfg.profiles.insert(
         "kids".into(),
         Profile {
@@ -824,7 +824,7 @@ fn mac_alias_matches_device_via_arp() {
 #[test]
 fn subnet_longest_prefix_handles_ipv6() {
     let mut cfg = ConfigV1::test_scaffold();
-    cfg.schema_version = 3;
+    cfg.schema_version = 4;
     cfg.profiles.insert(
         "corp".into(),
         Profile {
@@ -855,7 +855,7 @@ fn empty_config_refuses_every_source() {
     // No devices, no subnets, no default_profile → level 5 with
     // `default_profile = None` → REFUSED.
     let mut cfg = ConfigV1::test_scaffold();
-    cfg.schema_version = 3;
+    cfg.schema_version = 4;
     let resolver = ProfileResolver::build(
         &cfg,
         &SourceBitMap::default(),
@@ -936,7 +936,7 @@ fn swap_rebuilds_map() {
 fn block_response_and_ttl_propagate_through_n6_fallback() {
     // Profile omits the N6 fields → must pick up ServerGlobals defaults.
     let mut cfg = ConfigV1::test_scaffold();
-    cfg.schema_version = 3;
+    cfg.schema_version = 4;
     cfg.profiles.insert(
         "default".into(),
         Profile {
@@ -971,8 +971,8 @@ fn config_with_blocklists(ids: &[&str]) -> ConfigV1 {
             display_name: format!("Display {id}"),
             url: format!("https://example.com/{id}.txt"),
             format: BlocklistFormat::Domains,
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base: Default::default(),

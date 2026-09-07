@@ -56,17 +56,20 @@ async fn forget_via_command_channel_unlinks_disk_files_and_drops_memory() {
     // the 3600s interval is far longer than the test runtime.
     let (tx, rx) = tokio::sync::mpsc::channel::<ListManagerCommand>(4);
     mgr.set_command_channel(rx);
-    let _join = mgr.spawn_refresh_loop();
+    let join = mgr.spawn_refresh_loop();
 
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     tx.send(ListManagerCommand::Forget {
         source: "privacy/ads".to_string(),
-        ack: ack_tx,
+        accepted: accepted_tx,
+        completion: completion_tx,
     })
     .await
     .expect("channel send");
 
-    let was_cached = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+    accepted_rx.await.expect("forget acceptance channel closed");
+    let was_cached = tokio::time::timeout(Duration::from_secs(2), completion_rx)
         .await
         .expect("forget ack timed out")
         .expect("ack channel closed before reply");
@@ -85,14 +88,19 @@ async fn forget_via_command_channel_unlinks_disk_files_and_drops_memory() {
 
     // Idempotency: a second forget on the now-empty source returns
     // false but never errors out.
-    let (ack_tx2, ack_rx2) = tokio::sync::oneshot::channel();
+    let (accepted_tx2, accepted_rx2) = tokio::sync::oneshot::channel();
+    let (completion_tx2, completion_rx2) = tokio::sync::oneshot::channel();
     tx.send(ListManagerCommand::Forget {
         source: "privacy/ads".to_string(),
-        ack: ack_tx2,
+        accepted: accepted_tx2,
+        completion: completion_tx2,
     })
     .await
     .expect("channel send");
-    let was_cached2 = tokio::time::timeout(Duration::from_secs(2), ack_rx2)
+    accepted_rx2
+        .await
+        .expect("second forget acceptance channel closed");
+    let was_cached2 = tokio::time::timeout(Duration::from_secs(2), completion_rx2)
         .await
         .expect("second forget ack timed out")
         .expect("second ack channel closed");
@@ -100,4 +108,5 @@ async fn forget_via_command_channel_unlinks_disk_files_and_drops_memory() {
         !was_cached2,
         "second forget on already-cleared source must report was_cached = false"
     );
+    join.retire().await.expect("manager retirement");
 }

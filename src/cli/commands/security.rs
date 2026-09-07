@@ -8,7 +8,7 @@
 //!
 //! Follows CLAUDE.md design rule 6 — the config file stays the single
 //! source of truth. `set` edits the TOML through
-//! [`write_value_validated`] (which validates the COMBINED master +
+//! the guarded target writer (which validates the COMBINED master +
 //! includes state before promoting anything) and then asks the daemon to
 //! reload, exactly like `local-dns` and `rewrite` do. There is no separate
 //! runtime state to keep in step.
@@ -20,7 +20,7 @@ use toml::Value;
 
 use crate::config::loader::load_config;
 
-use super::target::{read_or_empty, write_value_validated};
+use super::target::{read_or_empty_locked, write_value_validated_locked};
 
 /// One tunable, its config path, and how to parse an operator's string.
 ///
@@ -312,7 +312,8 @@ pub async fn run_tunneling_exempt(
         );
     }
 
-    let (mut doc, _orig) = read_or_empty(config_path)?;
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let (mut doc, _orig) = read_or_empty_locked(&guard, config_path, config_path)?;
     let table = doc
         .as_table_mut()
         .context("config root is not a TOML table")?;
@@ -362,7 +363,7 @@ pub async fn run_tunneling_exempt(
         Value::Array(entries.iter().map(|e| Value::String(e.clone())).collect()),
     );
 
-    write_value_validated(config_path, config_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, config_path, &doc)?;
 
     if remove {
         println!("security.tunneling.exempt_domains: removed '{normalized}'");
@@ -384,6 +385,7 @@ pub async fn run_tunneling_exempt(
         );
     }
 
+    drop(guard);
     let outcome = super::ipc_reload::attempt_reload(socket_path).await;
     super::ipc_reload::report_reload_outcome(&outcome);
     Ok(())
@@ -403,10 +405,11 @@ pub async fn run_set(
 
     let parsed = parse_value(knob, value)?;
 
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
     // `[security]` lives in the master, not an include — same shape as
     // `lists.rs` / `devices.rs`, which pass the master as both the
     // validation root and the write target.
-    let (mut doc, _orig) = read_or_empty(config_path)?;
+    let (mut doc, _orig) = read_or_empty_locked(&guard, config_path, config_path)?;
     let table = doc
         .as_table_mut()
         .context("config root is not a TOML table")?;
@@ -434,13 +437,14 @@ pub async fn run_set(
     // Validates master + every include as one combined state BEFORE any
     // file is promoted, so an out-of-range value is refused with the
     // config untouched rather than written and then rejected at load.
-    write_value_validated(config_path, config_path, &doc)?;
+    write_value_validated_locked(&guard, config_path, config_path, &doc)?;
 
     match previous {
         Some(p) => println!("security.{key}: {p} → {value}"),
         None => println!("security.{key} = {value} (was unset, using the built-in default)"),
     }
 
+    drop(guard);
     let outcome = super::ipc_reload::attempt_reload(socket_path).await;
     super::ipc_reload::report_reload_outcome(&outcome);
 

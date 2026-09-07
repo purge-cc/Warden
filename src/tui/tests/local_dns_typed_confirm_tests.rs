@@ -1,9 +1,10 @@
 use super::*;
-use crate::cli::commands::local_dns::LocalRecordScope;
+use crate::cli::commands::local_dns::{LocalRecordScope, LocalRecordSpec};
 use crate::config::settings::{LocalDnsRecord, LocalDnsRecordType};
 use crate::tui::app::App;
-use crate::tui::local_dns_modal::{ConfirmTier, LocalDnsModal, Stage};
+use crate::tui::local_dns_modal::{ConfirmTier, LocalDnsModal, Stage, SubmitOutcome};
 use ratatui::layout::Rect;
+use std::path::PathBuf;
 
 fn k(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -41,6 +42,31 @@ fn wildcard_modal() -> LocalDnsModal {
         other => panic!("expected ConfirmingRemove, got {other:?}"),
     }
     modal
+}
+
+fn edit_master(dir: &tempfile::TempDir) -> PathBuf {
+    let master = dir.path().join("config.toml");
+    std::fs::write(
+        &master,
+        r#"schema_version = 4
+
+[upstream]
+servers = ["192.0.2.1:53"]
+
+[server]
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+
+[[local_dns.records]]
+domain = "old.home"
+type = "A"
+value = "192.0.2.10"
+"#,
+    )
+    .unwrap();
+    master
 }
 
 /// Draw the modal the way the tab does and reconstruct the screen.
@@ -236,4 +262,63 @@ async fn a_refusal_does_not_loosen_the_gate() {
         matches!(modal.stage, Stage::ConfirmingRemove(_)),
         "a wrong phrase left the confirm stage"
     );
+}
+
+#[test]
+fn local_dns_edit_uses_one_guard_and_restores_with_that_guard() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = edit_master(&dir);
+    let acquisitions = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&acquisitions);
+    let old = LocalRecordSpec {
+        domain: "old.home".into(),
+        record_type: LocalDnsRecordType::A,
+        value: "192.0.2.10".into(),
+        match_subdomains: false,
+        ttl_secs: None,
+    };
+    let invalid_new = LocalRecordSpec {
+        domain: "new.home".into(),
+        record_type: LocalDnsRecordType::A,
+        value: "0.0.0.0".into(),
+        match_subdomains: false,
+        ttl_secs: None,
+    };
+
+    let outcome = crate::config::write_lock::with_test_hook(
+        move |event| {
+            if event == crate::config::write_lock::TestEvent::Contended {
+                panic!("Local DNS edit must not acquire a second guard");
+            }
+            if event == crate::config::write_lock::TestEvent::WriteRootLocked {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+        || {
+            submit_local_dns_edit(
+                &master,
+                &LocalRecordScope::Global,
+                &old,
+                &LocalRecordScope::Global,
+                &invalid_new,
+            )
+        },
+    );
+
+    let SubmitOutcome::Failed(message) = outcome else {
+        panic!("invalid replacement must fail and restore the old row");
+    };
+    assert!(
+        message.contains("restored the original record"),
+        "got: {message}"
+    );
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
+    let loaded = load_v1_config(&master).unwrap();
+    assert_eq!(loaded.config.local_dns.records.len(), 1);
+    assert_eq!(loaded.config.local_dns.records[0].domain, "old.home");
 }

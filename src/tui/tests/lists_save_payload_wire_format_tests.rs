@@ -71,20 +71,21 @@ fn save_payload_round_trips_for_every_enum_variant() {
 
 /// Step-2 probe from the brief, kept as the end-to-end fence: drive the
 /// modal's payload through the *whole* save pipeline
-/// (`build_blocklist_value` → `upsert_id_keyed` → `write_value_validated`)
+/// (`build_blocklist_value` → `upsert_id_keyed` → `write_value_validated_locked`)
 /// against a hand-written minimal config. This is the closest local
 /// equivalent of the operator pressing Save.
 #[test]
 fn save_pipeline_lands_an_edit_on_a_minimal_config() {
     use crate::cli::commands::target::{
-        read_or_empty, resolve_target_file, upsert_id_keyed, write_value_validated, EntityClass,
+        read_or_empty_locked, resolve_target_file_locked, upsert_id_keyed,
+        write_value_validated_locked, EntityClass,
     };
 
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -116,8 +117,10 @@ tags = ["uncategorized"]
     modal.display_name = "Privacy: Ads (renamed)".to_string();
 
     let value = build_blocklist_value(&modal).expect("payload builds");
-    let target = resolve_target_file(&master, EntityClass::Blocklists, None).unwrap();
-    let (mut doc, _) = read_or_empty(&target).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let target =
+        resolve_target_file_locked(&guard, &master, EntityClass::Blocklists, None).unwrap();
+    let (mut doc, _) = read_or_empty_locked(&guard, &master, &target).unwrap();
     upsert_id_keyed(
         &mut doc,
         EntityClass::Blocklists.toml_key(),
@@ -125,7 +128,7 @@ tags = ["uncategorized"]
         value,
     )
     .unwrap();
-    write_value_validated(&master, &target, &doc)
+    write_value_validated_locked(&guard, &master, &target, &doc)
         .expect("the TUI's own payload must survive the validator");
 
     let on_disk = std::fs::read_to_string(&target).unwrap();
@@ -139,17 +142,9 @@ tags = ["uncategorized"]
     );
 }
 
-/// `lists-s3-surface-5m`: `build_add_modal`'s `original.max_entries`
-/// used to hardcode `5_000_000` — a stale copy of the daemon-wide
-/// default (raised to 10M) that the modal's comment claimed was "the
-/// daemon-wide default" while no longer reading it. Since the
-/// fail-closed corpus guard, exceeding `max_entries` refuses the
-/// whole source (keeping the previous generation) instead of
-/// truncating it, so this is what actually reaches the operator's
-/// TOML on save, not just what the builder's struct holds — the bug
-/// lived in the emitted bytes, so this asserts those bytes.
+/// A fresh modal does not invent a per-row cap.
 #[test]
-fn add_modal_save_payload_writes_the_shared_default_max_entries() {
+fn add_modal_save_payload_omits_inherited_max_entries() {
     let mut modal = tabs::lists::build_add_modal();
     modal.blocklist_id = "fresh-list".to_string();
     modal.display_name = "Fresh List".to_string();
@@ -159,19 +154,13 @@ fn add_modal_save_payload_writes_the_shared_default_max_entries() {
     let text = toml::to_string_pretty(&value).expect("payload serialises");
 
     assert!(
-        text.contains(&format!(
-            "max_entries = {}",
-            crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES
-        )),
-        "modal save payload must emit the shared default, not a stale \
-             5M copy:\n{text}"
+        !text.contains("max_entries"),
+        "payload must inherit:\n{text}"
     );
 
     let back: Blocklist = toml::from_str(&text).expect("payload deserialises");
     assert_eq!(
-        back.max_entries,
-        crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES as u64,
-        "value that reaches the schema after a round-trip must match \
-             the shared default"
+        back.max_entries, None,
+        "omitted values remain inherited after a round-trip"
     );
 }

@@ -1,8 +1,14 @@
 use super::*;
 use crate::config::schema::{
-    blocklist::Blocklist, device::Device, group::Group, profile::Profile, schedule::Schedule,
-    subnet::Subnet, ServerGlobals,
+    blocklist::{Blocklist, BlocklistFormat},
+    device::Device,
+    group::Group,
+    profile::Profile,
+    schedule::Schedule,
+    subnet::Subnet,
+    ServerGlobals,
 };
+use std::collections::BTreeMap;
 use time::macros::datetime;
 
 fn now() -> OffsetDateTime {
@@ -15,8 +21,8 @@ fn blocklist(id: &str) -> Blocklist {
         display_name: id.into(),
         url: "https://example.com/list.txt".into(),
         format: super::super::blocklist::BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: 1000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: super::super::blocklist::BlocklistBase::default(),
@@ -679,6 +685,117 @@ fn api_enabled_no_token_fails_full_validate() {
 }
 
 // ── schema_version ────────────────────────────────────
+
+#[test]
+fn explicit_schema_validator_matrix_and_current_wrappers() {
+    assert_eq!(SCHEMA_VERSION_V1, 4, "current wrappers must target v4");
+    for declared in [2, 3, 4, 5] {
+        let mut c = basic_config();
+        c.schema_version = declared;
+        for expected in [3, 4] {
+            let result = validate_collect_for_schema(
+                &c,
+                expected,
+                now(),
+                &mut AuditWarnings::silent(),
+                None,
+                None,
+            );
+            if declared == expected {
+                result.unwrap();
+            } else {
+                let errs = result.unwrap_err();
+                assert_eq!(errs.len(), 1, "{errs:?}");
+                assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                let ctx = errs[0].context();
+                assert_eq!(ctx.entity.as_deref(), Some("schema_version"));
+                if expected == SCHEMA_VERSION_V1 {
+                    assert!(ctx.reason.contains("this binary supports only"));
+                } else {
+                    assert!(ctx
+                        .reason
+                        .contains(&format!("expected schema_version = {expected}")));
+                }
+                let suggestion = ctx.suggestion.as_ref().unwrap();
+                if expected == 4 && declared == 3 {
+                    assert_eq!(
+                        ctx.reason,
+                        "schema_version = 3; this binary supports only schema_version = 4"
+                    );
+                    assert!(
+                        suggestion.contains("warden migrate v3-to-v4 --from-config <config.toml>")
+                    );
+                    assert!(suggestion.contains("do not change schema_version by hand"));
+                } else {
+                    assert!(suggestion.contains(&format!("schema_version = {expected}")));
+                    assert!(!suggestion.contains("migrate v3-to-v4"));
+                }
+            }
+        }
+        assert_eq!(validate(&c, now()).is_ok(), declared == SCHEMA_VERSION_V1);
+        let current = validate_collect(&c, now(), &mut AuditWarnings::silent(), None, None);
+        assert_eq!(current.is_ok(), declared == SCHEMA_VERSION_V1);
+        if declared == 3 {
+            assert!(current.unwrap_err()[0]
+                .context()
+                .reason
+                .contains("this binary supports only schema_version = 4"));
+        }
+    }
+}
+
+#[test]
+fn explicit_schema_row_controls_follow_declared_version_even_on_mismatch() {
+    use crate::lists::source_key::{effective_update_interval_secs, RowControlMode};
+
+    let mut c = basic_config();
+    c.lists.update_interval_secs = 3600;
+    c.blocklists = vec![blocklist("ads-a"), blocklist("ads-b")];
+    c.blocklists[0].update_interval_hours = Some(1);
+    c.blocklists[1].update_interval_hours = Some(2);
+    for declared in [3, 4] {
+        c.schema_version = declared;
+        let interval = effective_update_interval_secs(
+            c.blocklists[1].update_interval_hours,
+            c.lists.update_interval_secs,
+            RowControlMode::for_schema_version(c.schema_version),
+        );
+        assert_eq!(interval, if declared == 3 { 3600 } else { 7200 });
+        for expected in [3, 4] {
+            let errs = validate_collect_for_schema(
+                &c,
+                expected,
+                now(),
+                &mut AuditWarnings::silent(),
+                None,
+                None,
+            )
+            .err()
+            .unwrap_or_default();
+            assert_eq!(
+                errs.iter()
+                    .any(|e| matches!(e, ConfigError::VersionMismatch(_))),
+                declared != expected
+            );
+            assert_eq!(
+                errs.iter()
+                    .any(|e| e.to_string().contains("effective update interval")),
+                declared == 4
+            );
+            assert_eq!(
+                errs.len(),
+                usize::from(declared != expected) + usize::from(declared == 4),
+                "{errs:?}"
+            );
+            if declared != expected {
+                assert!(
+                    matches!(errs[0], ConfigError::VersionMismatch(_)),
+                    "schema equality stays first"
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn schema_version_0_rejected() {
@@ -1478,11 +1595,21 @@ fn blocklist_missing_scheme_rejected() {
 #[test]
 fn blocklist_zero_update_interval_rejected() {
     let mut c = basic_config();
-    c.blocklists[0].update_interval_hours = 0;
+    c.blocklists[0].update_interval_hours = Some(0);
     let errs = validate(&c, now()).unwrap_err();
     assert!(errs
         .iter()
         .any(|e| matches!(e, ConfigError::ValidationFailed(ctx) if ctx.reason.contains("update_interval_hours"))));
+}
+
+#[test]
+fn blocklist_zero_max_entries_rejected_but_inheritance_is_accepted() {
+    let mut c = basic_config();
+    c.blocklists[0].max_entries = Some(0);
+    assert!(validate(&c, now()).is_err());
+
+    c.blocklists[0].max_entries = None;
+    assert!(validate(&c, now()).is_ok());
 }
 
 // ── deny_unknown_fields walker ───────────────────────
@@ -1501,11 +1628,11 @@ fn every_schema_struct_denies_unknown_fields() {
     let cases: &[(&str, &str)] = &[
         (
             "ConfigV1",
-            "schema_version = 3\nextra = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\nextra = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         ),
         (
             "ServerGlobals (inside ConfigV1)",
-            "schema_version = 3\n[server]\nextra_field = 1\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[server]\nextra_field = 1\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         ),
         (
             "Blocklist",
@@ -2032,6 +2159,7 @@ fn whitespace_only_control_chars_are_refused() {
 fn blocklist_zero_max_consecutive_failures_rejected() {
     let mut c = basic_config();
     let mut b = blocklist("zero-tolerance");
+    b.url = "https://example.com/zero-tolerance.txt".to_string();
     b.max_consecutive_failures = 0;
     c.blocklists.push(b);
     let errs = validate(&c, now()).unwrap_err();
@@ -3390,6 +3518,86 @@ fn tmc_duplicate_url_is_warn_never_a_load_error() {
     );
 }
 
+#[test]
+fn duplicate_url_aliases_with_conflicting_base_are_errors_without_the_warning() {
+    let mut c = basic_config();
+    c.blocklists = vec![blocklist("ads-a"), blocklist("ads-b")];
+    c.blocklists[0].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].base = BlocklistBase::Allow;
+    c.blocklists[1].trust = BlocklistTrust::Local;
+    let (errs, warns) = validate_rows(&c);
+    assert!(errs
+        .iter()
+        .any(|err| err.to_string().contains("base direction")));
+    assert!(
+        !warns
+            .iter()
+            .any(|warning| warning.contains("resolve to the same source URL")),
+        "a conflict must not emit the harmless-alias warning: {warns:?}"
+    );
+}
+
+#[test]
+fn duplicate_url_aliases_compare_effective_profile_direction_and_name_the_profile() {
+    let mut c = basic_config();
+    c.blocklists = vec![blocklist("ads-a"), blocklist("ads-b")];
+    c.blocklists[0].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].url = "https://lists.purge.cc/ads.txt".into();
+    c.profiles.insert(
+        "children".into(),
+        Profile {
+            lists: BTreeMap::from([(Id::new("ads-b").unwrap(), ListPolicy::Allow)]),
+            ..Default::default()
+        },
+    );
+    let (errs, _) = validate_rows(&c);
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("profile \"children\"")),
+        "effective policy conflict must name its profile: {errs:?}"
+    );
+}
+
+#[test]
+fn duplicate_url_alias_cadence_uses_the_schema_selected_effective_value() {
+    let mut c = basic_config();
+    c.lists.update_interval_secs = 3600;
+    c.blocklists = vec![blocklist("ads-a"), blocklist("ads-b")];
+    c.blocklists[0].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[0].update_interval_hours = Some(1);
+    c.blocklists[1].update_interval_hours = Some(2);
+
+    c.schema_version = 3;
+    let mut v3_errs = Vec::new();
+    assert!(check_blocklist_alias_conflicts(&c, &mut v3_errs).is_empty());
+    assert!(v3_errs.is_empty(), "schema 3 cadence overrides are inert");
+
+    c.schema_version = 4;
+    let mut v4_errs = Vec::new();
+    assert!(!check_blocklist_alias_conflicts(&c, &mut v4_errs).is_empty());
+    assert!(v4_errs
+        .iter()
+        .any(|err| err.to_string().contains("effective update interval")));
+}
+
+#[test]
+fn duplicate_url_aliases_ignore_disabled_conflicts() {
+    let mut c = basic_config();
+    c.blocklists = vec![blocklist("ads-a"), blocklist("ads-b")];
+    c.blocklists[0].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].url = "https://lists.purge.cc/ads.txt".into();
+    c.blocklists[1].format = BlocklistFormat::Hosts;
+    c.blocklists[1].enabled = false;
+    assert!(validate_rows(&c).0.is_empty());
+    c.blocklists[1].enabled = true;
+    assert!(validate_rows(&c)
+        .0
+        .iter()
+        .any(|err| err.to_string().contains("parser format")));
+}
+
 // ── the W2.1 truth table, row by row ───────────────────────────
 //
 // | kind  | trust           | accept_unsigned_allow | outcome            |
@@ -3762,7 +3970,7 @@ fn unsigned_allow_refusal_carries_frozen_text_and_suggestion() {
 #[test]
 fn a_hand_written_allow_list_tagged_with_the_sentinel_now_loads() {
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -3797,7 +4005,7 @@ tags = ["uncategorized"]
 #[test]
 fn the_same_hand_written_list_loads_as_a_deny_list() {
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -4576,7 +4784,7 @@ fn n1_anti_bypass_warning_points_at_extra_domains_only() {
 fn custom_list_master(extra: &str) -> String {
     format!(
         r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]

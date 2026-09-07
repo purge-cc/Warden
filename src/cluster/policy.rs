@@ -218,7 +218,7 @@ mod tests {
     /// sentinel values (more robust than grepping field names).
     fn sample_config() -> ConfigV1 {
         let mut c = ConfigV1 {
-            schema_version: 3,
+            schema_version: 4,
             ..Default::default()
         };
         // ── policy (must survive) ──
@@ -323,11 +323,11 @@ mod tests {
         // received bundle carrying ANY node-local section/field fails to parse
         // as a ClusterPolicyBundle — so it can never be staged into cluster.d.
         for hostile in [
-            "schema_version = 3\n[api]\ntoken_hash = \"attacker\"\nenabled = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-            "schema_version = 3\nincludes = [\"/etc/passwd\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-            "schema_version = 3\n[socket]\npath = \"/run/evil.sock\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-            "schema_version = 3\n[cluster]\nrole = \"primary\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
-            "schema_version = 3\n[server]\nlisten = \"0.0.0.0:53\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[api]\ntoken_hash = \"attacker\"\nenabled = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\nincludes = [\"/etc/passwd\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[socket]\npath = \"/run/evil.sock\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[cluster]\nrole = \"primary\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n[server]\nlisten = \"0.0.0.0:53\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         ] {
             assert!(
                 toml::from_str::<ClusterPolicyBundle>(hostile).is_err(),
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn a_bundle_server_table_missing_enforce_device_mac_defaults_it_on() {
         let toml = r#"
-schema_version = 3
+schema_version = 4
 
 [server]
 allow_from = []

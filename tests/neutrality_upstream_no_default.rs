@@ -49,7 +49,7 @@ fn now() -> OffsetDateTime {
 /// Deliberately minimal: every section present is one the validator
 /// requires, so a failure here can only come from the upstream gate.
 const BASE: &str = "\
-schema_version = 3
+schema_version = 4
 
 [server]
 default_profile = \"default\"

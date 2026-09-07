@@ -8,7 +8,7 @@
 //!    master so every validator error is caught before the live tree
 //!    is touched.
 //! 4. If clean, atomically replace the live config file and every
-//!    sibling `*.d/` directory, move the previous master aside as
+//!    sibling `*.d/` directory, copy the previous master aside as
 //!    `<name>.pre-restore-<ts>` for trivial rollback.
 //! 5. Optionally send `SIGHUP` to the running daemon (via its PID file)
 //!    so the swap is observable without a manual restart.
@@ -16,13 +16,22 @@
 //! Failure at step 3 leaves the live tree untouched and returns a
 //! non-zero exit code. The staging directory is dropped on exit.
 
-use std::io::Write;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use crate::config::atomic_write::atomic_write_and_validate;
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
+    AtomicWriteAtOpts, AtomicWriteError,
+};
 use crate::config::loader;
-
-use super::TIMESTAMP_FORMAT;
+use crate::config::migration_journal;
+use crate::config::tree_io::{inspect_at, rename_noreplace_at, same_optional_inode};
+use crate::config::write_lock::{self, ConfigWriteLock};
+use anyhow::Context;
 
 use super::backup::include_roots;
 
@@ -72,73 +81,15 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
         }
     };
     let staged_files = staged_loaded.files_loaded.clone();
-
-    let live_parent = live_config.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "live config {} has no parent directory",
-            live_config.display()
-        )
-    })?;
-    std::fs::create_dir_all(live_parent).ok();
-
-    // Save the previous master with a `.pre-restore-<ts>` suffix so the
-    // operator has a trivial rollback path — and so we can roll the
-    // master back if the include-dir swap below fails.
-    let pre_restore_master: Option<PathBuf> = if live_config.exists() {
-        let ts = time::OffsetDateTime::now_utc()
-            .format(&TIMESTAMP_FORMAT)
-            .map_err(|e| anyhow::anyhow!("failed to format timestamp: {}", e))?;
-        // Bump the name on a same-second collision so a rapid restore retry
-        // can't silently clobber the rollback copy it just wrote.
-        let backup = crate::cli::commands::make_unique_path(
-            live_config.with_extension(format!("toml.pre-restore-{ts}")),
-        );
-        std::fs::rename(live_config, &backup)
-            .map_err(|e| anyhow::anyhow!("cannot move {} aside: {}", live_config.display(), e))?;
-        Some(backup)
-    } else {
-        None
-    };
-
-    // Atomic install: read the staged master once, then write-temp +
-    // validate + rename into place. Rename is atomic on POSIX within a
-    // single filesystem; the temp + validate sequence guarantees that a
-    // mid-operation crash never exposes a partially-written master to the
-    // next reader. The validator here is a cheap TOML parse — the full
-    // cross-reference load already ran above against `staged_master`;
-    // re-running it after the copy would fail in the split-file layout
-    // until the sibling `.d/` directories are swapped below, and the
-    // upstream validation is the authoritative gate for installation
-    // anyway.
-    let staged_bytes = std::fs::read_to_string(&staged_master).map_err(|e| {
+    // Read and bound the whole staged install set before acquiring the live
+    // tree. Nothing below this point needs to inspect the caller's path.
+    let staged_bytes = std::fs::read(&staged_master).map_err(|e| {
         anyhow::anyhow!(
             "cannot read staged master {}: {}",
             staged_master.display(),
             e
         )
     })?;
-    atomic_write_and_validate(
-        live_config,
-        &staged_bytes,
-        |staged: &Path| -> Result<(), String> {
-            let raw = std::fs::read_to_string(staged).map_err(|e| e.to_string())?;
-            raw.parse::<toml::Value>()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        },
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "failed to install staged config at {}: {}",
-            live_config.display(),
-            e
-        )
-    })?;
-
-    // Swap each include entry the staged config declares. The swap is
-    // crash-safe: staged entries are copied to side paths first
-    // (non-destructive), then promoted via metadata-only renames with
-    // full rollback on failure. See `install_include_entries`.
     let staged_root = staged_master
         .parent()
         .ok_or_else(|| anyhow::anyhow!("staged master has no parent"))?;
@@ -187,33 +138,182 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
     if promote_packs && !include_entries.iter().any(|e| e == "packs") {
         include_entries.push("packs".to_string());
     }
-    if let Err(e) = install_include_entries(
+
+    // The guard creates/adopts the canonical root, binds aliases, and is the
+    // sole live-tree capability. Its scope deliberately ends before callers
+    // print, signal, or await.
+    {
+        let guard = write_lock::acquire_for_write(live_config)?;
+        migration_journal::refuse_normal_access(guard.tree_io())?;
+        restore_staged_locked(
+            &guard,
+            live_config,
+            staged_root,
+            &staged_bytes,
+            &include_entries,
+        )
+    }
+}
+
+fn restore_staged_locked(
+    guard: &ConfigWriteLock,
+    requested_master: &Path,
+    staged_root: &Path,
+    staged_bytes: &[u8],
+    include_entries: &[String],
+) -> anyhow::Result<RestoreOutcome> {
+    guard.verify_master(requested_master)?;
+    // This is the first restore-specific observation of the live tree.
+    let master_plan = guard.tree_io().plan_master_target()?;
+    let original_meta = master_plan.original_metadata().cloned();
+    let master_target = master_plan.materialize()?;
+    let root = guard.tree_io().backup_root_fd()?;
+    let owner = guard.admitted_side_lock_owner()?;
+    let canonical_root = guard
+        .canonical_master()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("canonical config master has no parent"))?;
+
+    let mut original_source = None;
+    let mut original_bytes = None;
+    if let (Some(original), Some(meta)) = (master_target.original.as_ref(), original_meta.as_ref())
+    {
+        let mut source = write_lock::reopen_inspected(original, libc::O_RDONLY)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+        source.read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == meta.len(),
+            "canonical master changed while capturing its recovery copy"
+        );
+        original_source = Some(source);
+        original_bytes = Some(bytes);
+    }
+
+    let mut pre_restore = match (original_source.as_mut(), original_meta.as_ref()) {
+        (Some(source), Some(meta)) => Some(create_pre_restore_copy(guard, source, meta)?),
+        _ => None,
+    };
+
+    // Phase A is additive and completes before the master changes.
+    let mut swap = match prepare_include_entries(
         &mut std::io::stderr(),
         staged_root,
-        live_parent,
-        &include_entries,
-        copy_dir_recursive,
-        |from, to| std::fs::rename(from, to),
+        &root,
+        canonical_root,
+        include_entries,
+        owner,
     ) {
-        // Roll the master back so we never leave a post-restore master
-        // paired with the pre-restore `.d/` — an inconsistent window this
-        // restore must never produce. Best-effort: if the rollback rename itself
-        // fails, the master's `.pre-restore-<ts>` aside is still on disk
-        // for manual recovery.
-        if let Some(prev) = &pre_restore_master {
-            if let Err(re) = std::fs::rename(prev, live_config) {
-                return Err(e.context(format!(
-                    "include-dir swap failed and master rollback also failed ({re}); \
-                     recover the master manually from {}",
-                    prev.display()
+        Ok(swap) => swap,
+        Err(error) => {
+            let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
+            return match cleanup_pre_restore(pre_restore.take()) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "cleanup of pre-restore artifact was incomplete: {cleanup:#}; inspect {artifact}"
+                ))),
+            };
+        }
+    };
+
+    if let Err(error) = hardened_atomic_write_at(
+        &master_target,
+        staged_bytes,
+        AtomicWriteAtOpts {
+            owner: Some(owner),
+            ..Default::default()
+        },
+    ) {
+        let landed = error.rename_landed();
+        let mut recovery_errors = Vec::new();
+        if landed {
+            if let Err(rollback) =
+                rollback_published_master(&master_target, original_bytes.as_deref())
+            {
+                recovery_errors.push(format!("canonical-master rollback failed: {rollback:#}"));
+            }
+        }
+        if let Err(cleanup) = swap.cleanup_incoming(&root) {
+            recovery_errors.push(format!("incoming cleanup failed: {cleanup:#}"));
+        }
+        let cause = anyhow::Error::new(error).context(format!(
+            "failed to install staged config at {}",
+            guard.canonical_master().display()
+        ));
+        if recovery_errors.is_empty() {
+            let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
+            if let Err(cleanup) = cleanup_pre_restore(pre_restore.take()) {
+                return Err(cause.context(format!(
+                    "cleanup of pre-restore artifact failed: {cleanup:#}; inspect {artifact}"
+                )));
+            }
+            return Err(cause);
+        }
+        return Err(cause.context(format!(
+            "restore recovery is incomplete ({}); retain and inspect {}",
+            recovery_errors.join("; "),
+            recovery_inventory(
+                &pre_restore,
+                guard.canonical_master(),
+                &swap,
+                &root,
+                canonical_root,
+            ),
+        )));
+    }
+
+    if let Err(error) = swap.promote(&root, |from_parent, from, to_parent, to| {
+        rename_noreplace_at(from_parent, from, to_parent, to)
+    }) {
+        let include_rollback = swap.rollback(&root);
+        let master_rollback = rollback_published_master(&master_target, original_bytes.as_deref());
+        match (include_rollback, master_rollback) {
+            (Ok(()), Ok(())) => {
+                let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
+                if let Err(cleanup) = cleanup_pre_restore(pre_restore.take()) {
+                    return Err(error.context(format!(
+                        "restore rolled back, but cleanup of pre-restore artifact failed: \
+                         {cleanup:#}; inspect {artifact}"
+                    )));
+                }
+                return Err(error.context("restore aborted; live config rolled back"));
+            }
+            (include, master) => {
+                let mut failures = Vec::new();
+                if let Err(include) = include {
+                    failures.push(format!("include rollback failed: {include:#}"));
+                }
+                if let Err(master) = master {
+                    failures.push(format!("canonical-master rollback failed: {master:#}"));
+                }
+                return Err(error.context(format!(
+                    "restore recovery is incomplete ({}); retain and inspect {}",
+                    failures.join("; "),
+                    recovery_inventory(
+                        &pre_restore,
+                        guard.canonical_master(),
+                        &swap,
+                        &root,
+                        canonical_root,
+                    ),
                 )));
             }
         }
-        return Err(e.context(aborted_restore_context(pre_restore_master.as_ref())));
     }
 
+    if let Err(error) = swap.finalize(&root) {
+        let artifacts = swap.recovery_artifacts(&root, canonical_root);
+        let retained = if artifacts.is_empty() {
+            format!("the include root {}", canonical_root.display())
+        } else {
+            artifacts.join(", ")
+        };
+        eprintln!(
+            "warning: restore committed, but cleanup retained {}: {error:#}",
+            retained
+        );
+    }
     Ok(RestoreOutcome::Restored {
-        pre_restore: pre_restore_master,
+        pre_restore: pre_restore.map(|(path, _)| path),
     })
 }
 
@@ -383,8 +483,8 @@ fn reject_hostile_members(archive: &Path) -> anyhow::Result<()> {
     // (`p`), socket (`s`). A blacklist that only catches `l`/`h` lets a
     // device/fifo/socket member through. A legit backup
     // (`tar -czf` of the config dir) holds only files and dirs, so this is a
-    // fail-fast on obviously-hostile archives; copy_dir_recursive re-checks the
-    // actually-extracted bytes as the authoritative, TOCTOU-immune gate.
+    // fail-fast on obviously-hostile archives; the descriptor-rooted copy
+    // re-checks extracted entries before they enter the live tree.
     for line in run_tar_list(archive, &["-tvzf"])?.lines() {
         match line.as_bytes().first() {
             None => {}                    // blank line
@@ -430,306 +530,619 @@ fn is_unsafe_member_path(name: &str) -> bool {
     })
 }
 
-/// What to tell the operator when the include swap failed and the
-/// restore was abandoned.
-///
-/// `pre_restore_master` is `None` whenever there was no live master to
-/// begin with — a rebuild, or a fresh install being seeded from a backup.
-/// In that case the new master has already been installed by the atomic
-/// write above, nothing was rolled back, and the tree is half-swapped. On
-/// a recovery tool a false claim about the tree's state is worse than the
-/// failure it reports: it tells the operator not to look at exactly the
-/// thing they must now inspect.
-fn aborted_restore_context(pre_restore_master: Option<&PathBuf>) -> &'static str {
-    match pre_restore_master {
-        Some(_) => "restore aborted; live config rolled back",
-        None => {
-            "restore aborted; the new master is installed but its include \
-                 entries are NOT — remove it or re-run the restore"
-        }
-    }
+fn recovery_artifact(
+    pre_restore: &Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
+    canonical_master: &Path,
+) -> String {
+    pre_restore
+        .as_ref()
+        .map(|(path, _)| path.display().to_string())
+        .unwrap_or_else(|| canonical_master.display().to_string())
 }
 
-/// Find the staged master config by matching the live master's file
-/// name inside the staged tree. Falls back to the lexicographically
-/// first non-secrets `*.toml` at the staging root.
+fn recovery_inventory(
+    pre_restore: &Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
+    canonical_master: &Path,
+    swap: &IncludeSwap,
+    root: &File,
+    canonical_root: &Path,
+) -> String {
+    let mut artifacts = vec![recovery_artifact(pre_restore, canonical_master)];
+    artifacts.extend(swap.recovery_artifacts(root, canonical_root));
+    artifacts.join(", ")
+}
+
+/// Select one safe root-level staged master. Hints preserve old archives;
+/// ambiguity is never resolved by filesystem enumeration order.
 fn locate_staged_master(staging: &Path, live_config: &Path) -> anyhow::Result<PathBuf> {
-    let name = live_config
+    let requested_name = live_config
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("live config has no file name"))?;
-    let direct = staging.join(name);
-    if direct.exists() {
-        return Ok(direct);
-    }
-    // Fallback: the archive may have been produced with a different master
-    // name. `read_dir` order is filesystem-dependent, so the candidates are
-    // sorted — taking the first unordered hit let the same archive restore
-    // on one run and fail validation on the next, on two hosts or on two
-    // attempts, in the middle of an incident.
-    //
-    // `secrets.toml` is excluded by name rather than by luck: `backup.rs`'s
-    // sweep captures every non-dot top-level entry, so a real archive always
-    // carries it beside the master. It is a candidate here and never a
-    // master, and picking it hands the operator validator errors about a
-    // secrets file while they are trying to restore a config.
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(staging)?
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .ok_or_else(|| anyhow::anyhow!("live config has no file name"))?
+        .to_os_string();
+    let canonical_name = write_lock::ConfigTreeIdentity::resolve(live_config)
+        .ok()
+        .and_then(|identity| {
+            identity
+                .canonical_master
+                .file_name()
+                .map(OsStr::to_os_string)
+        });
+
+    let entries: Vec<PathBuf> = std::fs::read_dir(staging)?
+        .map(|entry| entry.map_err(anyhow::Error::from))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        // `file_type` is lstat-based, so a staged symlink never becomes a
+        // master hint merely because its destination is a regular file.
+        .filter(|entry| entry.file_type().map(|ty| ty.is_file()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "toml"))
         .filter(|p| {
             p.file_name().and_then(|n| n.to_str()) != Some(crate::config::secrets::SECRETS_FILENAME)
         })
         .collect();
+    if let Some(path) = entries
+        .iter()
+        .find(|path| path.file_name() == Some(requested_name.as_os_str()))
+    {
+        return Ok(path.clone());
+    }
+    if let Some(canonical_name) = canonical_name {
+        if let Some(path) = entries
+            .iter()
+            .find(|path| path.file_name() == Some(canonical_name.as_os_str()))
+        {
+            return Ok(path.clone());
+        }
+    }
+    let mut candidates: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+        .collect();
     candidates.sort();
-    if let Some(first) = candidates.into_iter().next() {
-        return Ok(first);
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "no master *.toml found in staged archive at {}",
+            staging.display()
+        );
     }
     anyhow::bail!(
-        "no master *.toml found in staged archive at {}",
-        staging.display()
+        "ambiguous staged archive at {}: multiple non-secrets root TOML files ({})",
+        staging.display(),
+        candidates
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
-pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    // Create the destination at 0o750 rather than the umask default so a
-    // restored `.d/` tree can't end up world-listable. recursive(true) makes
-    // this a no-op on an existing dir (like create_dir_all), applying the mode
-    // only to dirs we actually create.
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o750)
-        .create(dst)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {}", dst.display(), e))?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        // `file_type()` is lstat-based (does NOT follow symlinks), so it sees
-        // the member as it actually landed in the staging tree. This is the
-        // TOCTOU-immune gate: whatever the pre-extraction archive scan missed
-        // (or a swapped archive slipped past), we re-check the *extracted*
-        // bytes and refuse anything that isn't a plain file or directory — a
-        // symlink/fifo/device/socket here could redirect the copy outside the
-        // live tree (fs::copy follows symlinks) or hang it.
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if ft.is_file() {
-            std::fs::copy(&src_path, &dst_path)?;
-            // Normalise to the house DEFAULT_TARGET_MODE instead of trusting
-            // the archive's stored bits (a crafted/lax-umask backup could carry
-            // 0o644/0o666 device-inventory slices).
-            std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o640))
-                .map_err(|e| anyhow::anyhow!("cannot set mode on {}: {}", dst_path.display(), e))?;
-        } else {
-            anyhow::bail!(
-                "refusing to restore {}: not a regular file or directory \
-                 (symlink/device/fifo/socket members are rejected)",
-                src_path.display()
-            );
-        }
-    }
-    Ok(())
+struct PreparedInclude {
+    incoming: OsString,
+    incoming_receipt: File,
+    live: OsString,
+    original: Option<File>,
 }
 
-/// Same-directory side-path name for a transient `.d/` swap artifact,
-/// unique across concurrent restores in this process (pid + a
-/// process-local counter — a wall-clock timestamp at second resolution
-/// would collide on a same-second retry, the lesson `StagingDir::create`
-/// already learned). The leading `.` plus a non-`.d` suffix keeps it out
-/// of the `*.d/` include glob, so a mid-swap reader never mistakes it for
-/// live config.
-fn swap_side_path(live_parent: &Path, dir: &str, kind: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    live_parent.join(format!(".{dir}.{kind}-{pid}-{seq}"))
+struct Aside {
+    name: OsString,
+    live: OsString,
+    receipt: File,
 }
 
-/// Crash-safe replacement of the live include entries with the staged
-/// copies. A two-phase transaction:
-///
-/// * **Phase A (non-destructive):** copy each staged entry into a fresh
-///   same-directory `…incoming…` side path. The live tree is untouched,
-///   so a failure here aborts with the live includes fully intact.
-/// * **Phase B (metadata-only):** for each prepared entry, rename the
-///   live one aside to `…pre-restore…`, then rename the incoming into
-///   place. These are intra-filesystem renames (microseconds), shrinking
-///   the crash window from the whole recursive copy down to two
-///   `rename(2)`s.
-///
-/// On any Phase B failure the transaction rolls back — promoted entries
-/// are dropped and every aside renamed back — leaving the live tree
-/// exactly as it was so the caller can roll the master back too.
-///
-/// **Mirror semantics:** a restored include directory ends up equal to
-/// the archive; a file an operator hand-dropped into the live `.d/` that
-/// is absent from the archive is removed (whole-dir replacement). (Contrast
-/// `migrate.rs::promote_recursive`, which deliberately chose file-granular
-/// *overlay* so unmanaged files survive a migration.)
-///
-/// Entries are derived from the staged config's own includes rather than
-/// a hardcoded `<class>.d` list, so an entry can be a plain FILE —
-/// `includes = ["extra.toml"]` is legal, and backup captures it. Dropping
-/// it here would have made a capturable include un-restorable, which is
-/// the same silent omission one layer down.
-///
-/// `copy` / `rename` are injectable so the regression test can force a
-/// Phase B `rename` failure and assert the rollback restores the live
-/// tree; production passes [`copy_dir_recursive`] and [`std::fs::rename`].
-/// `notices` carries operator warnings — stderr in production, a buffer in
-/// tests. It is a sink rather than a `tracing` event because no CLI
-/// dispatch installs a global subscriber, so a `tracing` warning on this
-/// path would reach nobody.
-fn install_include_entries<C, R>(
+struct Promoted {
+    name: OsString,
+    receipt: File,
+}
+
+struct IncludeSwap {
+    prepared: Vec<PreparedInclude>,
+    asides: Vec<Aside>,
+    promoted: Vec<Promoted>,
+}
+
+/// Phase A is entirely additive.  All later names are root-relative to the
+/// held descriptor, never to the caller's spelling of the config path.
+fn prepare_include_entries(
     notices: &mut dyn Write,
     staged_root: &Path,
-    live_parent: &Path,
+    root: &File,
+    canonical_root: &Path,
     entries: &[String],
-    copy: C,
-    rename: R,
-) -> anyhow::Result<()>
-where
-    C: Fn(&Path, &Path) -> anyhow::Result<()>,
-    R: Fn(&Path, &Path) -> std::io::Result<()>,
-{
-    // Phase A — stage every present entry into a side path. Pure additive;
-    // the live tree is not touched until Phase B.
-    let mut prepared: Vec<(PathBuf, PathBuf)> = Vec::new(); // (incoming, live_sub)
+    owner: (u32, u32),
+) -> anyhow::Result<IncludeSwap> {
+    let mut receipts = std::collections::HashMap::new();
     for entry in entries {
-        let staged_sub = staged_root.join(entry);
-        // `symlink_metadata` (lstat) so a symlinked entry is seen as a
-        // symlink and rejected below, not silently followed.
-        let meta = match std::fs::symlink_metadata(&staged_sub) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // The staged master DECLARES this entry and the archive
-                // does not populate it. The live directory of that name is
-                // then left exactly as it was while the restored master
-                // still globs it — so devices the operator removed before
-                // taking the backup come back, against the mirror
-                // semantics documented above. Replacing it with an empty
-                // directory would delete live operator config, which is a
-                // decision to take deliberately and not here; what this
-                // must not do is be silent about it.
+        let name = checked_live_entry_name(entry)?;
+        let current = inspect_at(root, name)?;
+        if let Some(current) = &current {
+            let meta = current.metadata()?;
+            anyhow::ensure!(
+                !meta.file_type().is_symlink()
+                    && (meta.is_dir() || (meta.is_file() && meta.nlink() == 1)),
+                "unsafe live include entry: {}",
+                canonical_root.join(entry).display()
+            );
+        }
+        receipts.insert(entry.clone(), current);
+    }
+
+    let mut swap = IncludeSwap {
+        prepared: Vec::new(),
+        asides: Vec::new(),
+        promoted: Vec::new(),
+    };
+    for entry in entries {
+        let staged = staged_root.join(entry);
+        let meta = match std::fs::symlink_metadata(&staged) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let _ = writeln!(
                     notices,
-                    "warning: the restored config declares include entry {entry}, which the \
-                     archive does not contain; {} is left as it stands and may still hold \
-                     entries the archive does not",
-                    live_parent.join(entry).display()
+                    "warning: the restored config declares include entry {entry}, which the archive \
+                     does not contain; {} is left as it stands",
+                    canonical_root.join(entry).display()
                 );
                 continue;
             }
-            Err(e) => {
-                // Anything other than "absent" — EACCES, ENOTDIR — was
-                // swallowed by the same skip, so an unreadable staged entry
-                // silently produced a half-restored tree reported as success.
-                for (inc, _) in &prepared {
-                    remove_any(inc);
-                }
-                return Err(
-                    anyhow::Error::from(e).context(format!("staging include entry {entry}"))
-                );
+            Err(error) => {
+                let error =
+                    anyhow::Error::from(error).context(format!("staging include entry {entry}"));
+                return Err(abort_include_preparation(&mut swap, root, error));
             }
         };
-        let incoming = swap_side_path(live_parent, entry, "incoming");
-        let staged_result = if meta.is_dir() {
-            copy(&staged_sub, &incoming)
-        } else if meta.is_file() {
-            copy_regular_file(&staged_sub, &incoming)
+        if !meta.is_dir() && !meta.is_file() {
+            let error = anyhow::anyhow!(
+                "refusing to restore {}: not a regular file or directory",
+                staged.display()
+            );
+            return Err(abort_include_preparation(&mut swap, root, error));
+        }
+        let live = checked_live_entry_name(entry)?.to_os_string();
+        let incoming = match reserve_side_name(root, &live, "incoming") {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                return Err(abort_include_preparation(&mut swap, root, error));
+            }
+        };
+        let incoming_receipt = match copy_staged_entry_at(&staged, root, &incoming, owner) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let error = error.context(format!(
+                    "staging include entry {entry} at {}",
+                    canonical_root.join(&incoming).display()
+                ));
+                return Err(abort_include_preparation(&mut swap, root, error));
+            }
+        };
+        swap.prepared.push(PreparedInclude {
+            incoming,
+            incoming_receipt,
+            live,
+            original: receipts.remove(entry).expect("entry receipt"),
+        });
+    }
+    Ok(swap)
+}
+
+fn abort_include_preparation(
+    swap: &mut IncludeSwap,
+    root: &File,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match swap.cleanup_incoming(root) {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "cleanup after include preparation failure was incomplete: {cleanup:#}"
+        )),
+    }
+}
+
+impl IncludeSwap {
+    fn promote(
+        &mut self,
+        root: &File,
+        rename: impl Fn(&File, &OsStr, &File, &OsStr) -> std::io::Result<()>,
+    ) -> anyhow::Result<()> {
+        for item in &self.prepared {
+            let incoming = inspect_at(root, &item.incoming)
+                .map_err(anyhow::Error::from)
+                .context("inspecting staged include before promotion")?;
+            anyhow::ensure!(
+                same_optional_inode(Some(&item.incoming_receipt), incoming.as_ref())?,
+                "staged include entry changed before promotion: {:?}",
+                item.incoming
+            );
+            let current = inspect_at(root, &item.live)
+                .map_err(anyhow::Error::from)
+                .context("inspecting live include before promotion")?;
+            anyhow::ensure!(
+                same_optional_inode(item.original.as_ref(), current.as_ref())?,
+                "live include entry changed since its snapshot: {:?}",
+                item.live
+            );
+            if let Some(original) = &item.original {
+                let aside = reserve_side_name(root, &item.live, "pre-restore")?;
+                let receipt = original.try_clone()?;
+                rename(root, &item.live, root, &aside)
+                    .map_err(anyhow::Error::from)
+                    .context("moving live include aside")?;
+                self.asides.push(Aside {
+                    name: aside,
+                    live: item.live.clone(),
+                    receipt,
+                });
+            }
+            let receipt = item.incoming_receipt.try_clone()?;
+            rename(root, &item.incoming, root, &item.live)
+                .map_err(anyhow::Error::from)
+                .context("promoting staged include")?;
+            self.promoted.push(Promoted {
+                name: item.live.clone(),
+                receipt,
+            });
+            let installed = inspect_at(root, &item.live)
+                .map_err(anyhow::Error::from)
+                .context("inspecting promoted include")?;
+            anyhow::ensure!(
+                same_optional_inode(Some(&item.incoming_receipt), installed.as_ref())?,
+                "staged include entry changed during promotion: {:?}",
+                item.live
+            );
+        }
+        root.sync_all().context("sync restored include root")?;
+        self.verify_promoted(root)?;
+        Ok(())
+    }
+
+    fn finalize(&mut self, root: &File) -> anyhow::Result<()> {
+        self.verify_promoted(root)?;
+        for aside in &self.asides {
+            remove_owned_entry_at(root, &aside.name, &aside.receipt)
+                .with_context(|| format!("cleaning restore aside {:?}", aside.name))?;
+        }
+        root.sync_all()?;
+        Ok(())
+    }
+
+    fn verify_promoted(&self, root: &File) -> anyhow::Result<()> {
+        for promoted in &self.promoted {
+            let current = inspect_at(root, &promoted.name)?;
+            anyhow::ensure!(
+                same_optional_inode(Some(&promoted.receipt), current.as_ref())?,
+                "promoted include entry was replaced: {:?}",
+                promoted.name
+            );
+        }
+        Ok(())
+    }
+
+    fn cleanup_incoming(&mut self, root: &File) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for item in self.prepared.iter().rev() {
+            if let Err(error) = remove_owned_entry_at(root, &item.incoming, &item.incoming_receipt)
+            {
+                errors.push(format!("{:?}: {error:#}", item.incoming));
+            }
+        }
+        if let Err(error) = root.sync_all() {
+            errors.push(format!("include-root sync: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
         } else {
-            Err(anyhow::anyhow!(
-                "refusing to restore {}: not a regular file or directory \
-                 (symlink/device/fifo/socket members are rejected)",
-                staged_sub.display()
-            ))
-        };
-        if let Err(e) = staged_result {
-            remove_any(&incoming);
-            for (inc, _) in &prepared {
-                remove_any(inc);
-            }
-            return Err(e.context(format!("staging include entry {entry}")));
+            anyhow::bail!("incoming cleanup failures: {}", errors.join("; "))
         }
-        prepared.push((incoming, live_parent.join(entry)));
     }
 
-    // Phase B — promote via renames, recording undo state.
-    let mut asides: Vec<(PathBuf, PathBuf)> = Vec::new(); // (aside, live_sub)
-    let mut promoted: Vec<PathBuf> = Vec::new(); // live_subs now holding new content
-    for (incoming, live_sub) in &prepared {
-        if live_sub.exists() {
-            let name = live_sub.file_name().and_then(|s| s.to_str()).unwrap_or("d");
-            let aside = swap_side_path(live_parent, name, "pre-restore");
-            if let Err(e) = rename(live_sub, &aside) {
-                rollback_include_entries(&promoted, &asides, &prepared);
-                return Err(anyhow::Error::new(e)
-                    .context(format!("moving live {} aside", live_sub.display())));
+    fn rollback(&mut self, root: &File) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for promoted in self.promoted.iter().rev() {
+            if let Err(error) = remove_owned_entry_at(root, &promoted.name, &promoted.receipt) {
+                errors.push(format!("promoted {:?}: {error:#}", promoted.name));
             }
-            asides.push((aside, live_sub.clone()));
         }
-        if let Err(e) = rename(incoming, live_sub) {
-            rollback_include_entries(&promoted, &asides, &prepared);
-            return Err(anyhow::Error::new(e)
-                .context(format!("promoting include entry {}", live_sub.display())));
+        for aside in self.asides.iter().rev() {
+            let restore = (|| -> anyhow::Result<()> {
+                let current = inspect_at(root, &aside.name)?;
+                anyhow::ensure!(
+                    same_optional_inode(Some(&aside.receipt), current.as_ref())?,
+                    "restore aside was replaced: {:?}",
+                    aside.name
+                );
+                rename_noreplace_at(root, &aside.name, root, &aside.live)?;
+                Ok(())
+            })();
+            if let Err(error) = restore {
+                errors.push(format!("aside {:?}: {error:#}", aside.name));
+            }
         }
-        promoted.push(live_sub.clone());
+        for item in self.prepared.iter().rev() {
+            if let Err(error) = remove_owned_entry_at(root, &item.incoming, &item.incoming_receipt)
+            {
+                errors.push(format!("incoming {:?}: {error:#}", item.incoming));
+            }
+        }
+        if let Err(error) = root.sync_all() {
+            errors.push(format!("include-root sync: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("include rollback failures: {}", errors.join("; "))
+        }
     }
 
-    // Phase C — success: drop the transient `…pre-restore…` asides.
-    // (The master's own `.pre-restore-<ts>` stays as the rollback point.)
-    for (aside, _) in &asides {
-        remove_any(aside);
+    fn recovery_artifacts(&self, root: &File, canonical_root: &Path) -> Vec<String> {
+        let mut artifacts = Vec::new();
+        for (name, receipt) in self
+            .prepared
+            .iter()
+            .map(|item| (&item.incoming, &item.incoming_receipt))
+            .chain(
+                self.asides
+                    .iter()
+                    .map(|aside| (&aside.name, &aside.receipt)),
+            )
+        {
+            let display = canonical_root.join(name).display().to_string();
+            match inspect_at(root, name) {
+                Ok(None) => {}
+                Ok(Some(current)) => match same_optional_inode(Some(receipt), Some(&current)) {
+                    Ok(true) => artifacts.push(display),
+                    Ok(false) => artifacts.push(format!("{display} (replacement preserved)")),
+                    Err(error) => artifacts.push(format!("{display} (unverifiable: {error})")),
+                },
+                Err(error) => artifacts.push(format!("{display} (unverifiable: {error})")),
+            }
+        }
+        artifacts
+    }
+}
+
+fn checked_live_entry_name(entry: &str) -> anyhow::Result<&OsStr> {
+    let name = OsStr::new(entry);
+    crate::config::tree_io::check_basename(name)?;
+    anyhow::ensure!(
+        !write_lock::reserved_component(name),
+        "restore include entry uses reserved config namespace: {entry}"
+    );
+    Ok(name)
+}
+
+fn reserve_side_name(root: &File, entry: &OsStr, kind: &str) -> anyhow::Result<OsString> {
+    use rand_core::{OsRng, RngCore};
+    for _ in 0..8 {
+        let name = OsString::from(format!(
+            ".{}.{}-{}-{:016x}",
+            entry.to_string_lossy(),
+            kind,
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        if inspect_at(root, &name)?.is_none() {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("cannot reserve a unique restore side entry")
+}
+
+fn create_pre_restore_copy<'g>(
+    guard: &'g ConfigWriteLock,
+    source: &mut File,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<(PathBuf, crate::config::tree_io::PinnedTarget<'g>)> {
+    source.seek(SeekFrom::Start(0))?;
+    let timestamp = time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to format timestamp: {e}"))?;
+    for suffix in 0_u32.. {
+        let mut side = guard
+            .canonical_master()
+            .with_extension(format!("toml.pre-restore-{timestamp}"))
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("canonical master has no filename"))?
+            .to_os_string();
+        if suffix != 0 {
+            side.push(format!("-{suffix}"));
+        }
+        let plan = guard.tree_io().plan_root_file_no_follow(Path::new(&side))?;
+        if !plan.is_new() {
+            continue;
+        }
+        let target = plan.materialize()?;
+        match hardened_atomic_create_only_at(
+            &target,
+            source,
+            metadata.len(),
+            AtomicCreateOnlyAtOpts {
+                mode: Some(metadata.mode() & 0o7777),
+                owner: Some((metadata.uid(), metadata.gid())),
+                #[cfg(test)]
+                test_failure: None,
+            },
+        ) {
+            Ok(()) => return Ok((target.display().to_path_buf(), target)),
+            Err(AtomicWriteError::TargetExists { .. }) => continue,
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+    }
+    unreachable!("u32 pre-restore copy suffix space exhausted")
+}
+
+fn cleanup_pre_restore(
+    pre_restore: Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
+) -> anyhow::Result<()> {
+    if let Some((_, target)) = pre_restore {
+        target.rollback_target()?.unlink()?;
     }
     Ok(())
 }
 
-/// Copy one regular file to `dst`, normalising the mode to the house
-/// 0o640 rather than trusting the archive's stored bits — the same policy
-/// [`copy_dir_recursive`] applies to every file it copies. Used for a
-/// top-level include that is a plain file.
-fn copy_regular_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::copy(src, dst)
-        .map_err(|e| anyhow::anyhow!("cannot copy {} to {}: {e}", src.display(), dst.display()))?;
-    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o640))
-        .map_err(|e| anyhow::anyhow!("cannot set mode on {}: {e}", dst.display()))
+fn rollback_published_master(
+    target: &crate::config::tree_io::PinnedTarget<'_>,
+    original: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    let rollback = target.rollback_target()?;
+    match original {
+        Some(bytes) => hardened_atomic_write_at(&rollback, bytes, AtomicWriteAtOpts::default())?,
+        None => rollback.unlink()?,
+    }
+    Ok(())
 }
 
-/// Best-effort removal of a path that may be a directory or a plain file.
-/// Every caller is either cleaning up a transient side-path artifact or is
-/// already on an error path, so a failure is not worth propagating — the
-/// leftover `…incoming…` / `…pre-restore…` name is inert (the leading `.`
-/// plus a non-`.d` suffix keeps it outside every include glob).
-fn remove_any(path: &Path) {
-    if std::fs::remove_dir_all(path).is_err() {
-        let _ = std::fs::remove_file(path);
+fn copy_staged_entry_at(
+    source: &Path,
+    parent: &File,
+    name: &OsStr,
+    owner: (u32, u32),
+) -> anyhow::Result<File> {
+    let meta = std::fs::symlink_metadata(source)?;
+    if meta.is_dir() {
+        let destination = mkdir_new_at(parent, name, owner)?;
+        if let Err(error) = (|| -> anyhow::Result<()> {
+            copy_dir_contents_at(source, &destination, owner)?;
+            destination.sync_all()?;
+            parent.sync_all()?;
+            Ok(())
+        })() {
+            if let Err(cleanup) = remove_owned_entry_at(parent, name, &destination) {
+                return Err(error.context(format!(
+                    "removing failed incoming directory {:?}: {cleanup:#}",
+                    name
+                )));
+            }
+            return Err(error);
+        }
+        Ok(destination)
+    } else if meta.is_file() {
+        copy_regular_file_at(source, parent, name, owner)
+    } else {
+        anyhow::bail!(
+            "refusing to restore {}: not a regular file or directory",
+            source.display()
+        )
     }
 }
 
-/// Best-effort undo of a partially-applied Phase B swap: drop the
-/// freshly-promoted entries, rename every recorded aside back over its
-/// live path, and remove any leftover incomings. Best-effort because we
-/// are already on an error path — an aside that cannot be renamed back is
-/// left on disk as a `…pre-restore…` artifact for manual recovery.
-fn rollback_include_entries(
-    promoted: &[PathBuf],
-    asides: &[(PathBuf, PathBuf)],
-    prepared: &[(PathBuf, PathBuf)],
-) {
-    for live_sub in promoted {
-        remove_any(live_sub);
+fn copy_dir_contents_at(
+    source: &Path,
+    destination: &File,
+    owner: (u32, u32),
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source = entry.path();
+        let name = entry.file_name();
+        crate::config::tree_io::check_basename(&name)?;
+        let meta = entry.file_type()?;
+        if meta.is_dir() {
+            let child = mkdir_new_at(destination, &name, owner)?;
+            copy_dir_contents_at(&source, &child, owner)?;
+            child.sync_all()?;
+        } else if meta.is_file() {
+            copy_regular_file_at(&source, destination, &name, owner)?;
+        } else {
+            anyhow::bail!(
+                "refusing to restore {}: not a regular file or directory",
+                source.display()
+            )
+        }
     }
-    for (aside, live_sub) in asides {
-        let _ = std::fs::rename(aside, live_sub);
+    destination.sync_all()?;
+    Ok(())
+}
+
+fn mkdir_new_at(parent: &File, name: &OsStr, owner: (u32, u32)) -> anyhow::Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    crate::config::tree_io::check_basename(name)?;
+    let name_c = std::ffi::CString::new(name.as_bytes())?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o750) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
-    for (incoming, _) in prepared {
-        remove_any(incoming);
+    let dir = write_lock::open_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    if let Err(error) = set_restore_owner_and_mode(&dir, owner, 0o750) {
+        if let Err(cleanup) = remove_owned_entry_at(parent, name, &dir) {
+            return Err(error.context(format!("removing failed incoming directory: {cleanup:#}")));
+        }
+        return Err(error);
     }
+    Ok(dir)
+}
+
+fn copy_regular_file_at(
+    source: &Path,
+    parent: &File,
+    name: &OsStr,
+    owner: (u32, u32),
+) -> anyhow::Result<File> {
+    let mut input = File::open(source)?;
+    let mut output = write_lock::open_at(
+        parent,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    if let Err(error) = (|| -> anyhow::Result<()> {
+        std::io::copy(&mut input, &mut output)?;
+        set_restore_owner_and_mode(&output, owner, 0o640)?;
+        output.sync_all()?;
+        Ok(())
+    })() {
+        if let Err(cleanup) = remove_owned_entry_at(parent, name, &output) {
+            return Err(error.context(format!(
+                "removing failed incoming file {:?}: {cleanup:#}",
+                name
+            )));
+        }
+        return Err(error);
+    }
+    Ok(output)
+}
+
+fn set_restore_owner_and_mode(file: &File, owner: (u32, u32), mode: u32) -> anyhow::Result<()> {
+    if unsafe { libc::geteuid() } == 0
+        && unsafe { libc::fchown(file.as_raw_fd(), owner.0, owner.1) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        (meta.uid(), meta.gid()) == owner,
+        "cannot preserve admitted config-tree ownership"
+    );
+    Ok(())
+}
+
+fn remove_owned_entry_at(root: &File, name: &OsStr, receipt: &File) -> anyhow::Result<()> {
+    let Some(entry) = inspect_at(root, name)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        same_optional_inode(Some(receipt), Some(&entry))?,
+        "restore side entry was replaced; retaining {:?}",
+        name
+    );
+    let meta = entry.metadata()?;
+    anyhow::ensure!(
+        !meta.file_type().is_symlink() && (meta.is_dir() || meta.is_file()),
+        "refusing to remove unsafe restore side entry: {:?}",
+        name
+    );
+    if meta.is_dir() {
+        let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd())).join(name);
+        std::fs::remove_dir_all(path)?;
+    } else {
+        crate::config::tree_io::unlink_at(root, name)?;
+    }
+    root.sync_all()?;
+    Ok(())
 }
 
 fn send_sighup_from_pid(pid_file: &Path) -> anyhow::Result<()> {
@@ -777,7 +1190,7 @@ mod tests {
     use super::*;
     use crate::cli::commands::config::backup::run_backup;
 
-    const BASE: &str = r#"schema_version = 3
+    const BASE: &str = r#"schema_version = 4
 
 [server]
 listen = "127.0.0.1:15353"
@@ -814,6 +1227,121 @@ servers = ["192.0.2.1:53"]
         assert_eq!(reloaded, BASE);
     }
 
+    #[test]
+    fn restore_uses_one_write_guard_and_releases_it_before_return() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_config = source.path().join("config.toml");
+        std::fs::write(&source_config, BASE).unwrap();
+        let archive = run_backup(&source_config, None).unwrap();
+
+        let live = tempfile::tempdir().unwrap();
+        let live_config = live.path().join("config.toml");
+        std::fs::write(&live_config, "old = true\n").unwrap();
+        let acquisitions = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&acquisitions);
+        let outcome = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    seen.set(seen.get() + 1);
+                }
+            },
+            || restore_archive(&live_config, &archive),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RestoreOutcome::Restored { .. }));
+        assert_eq!(acquisitions.get(), 1);
+
+        let probe =
+            write_lock::acquire_for_write_with_timeout(&live_config, Duration::from_millis(50))
+                .expect("restore must release its guard before returning");
+        drop(probe);
+    }
+
+    #[test]
+    fn restore_refuses_a_migration_fence_before_live_effects() {
+        let source = tempfile::tempdir().unwrap();
+        let source_config = source.path().join("config.toml");
+        std::fs::write(&source_config, BASE).unwrap();
+        let archive = run_backup(&source_config, None).unwrap();
+
+        let live = tempfile::tempdir().unwrap();
+        let live_config = live.path().join("config.toml");
+        let old = b"old = true\n";
+        std::fs::write(&live_config, old).unwrap();
+        let fence = live.path().join(migration_journal::TXN_DIR_NAME);
+
+        let error = match write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    std::fs::create_dir(&fence).unwrap();
+                }
+            },
+            || restore_archive(&live_config, &archive),
+        ) {
+            Ok(_) => panic!("a fenced destination must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unfinished v3-to-v4 migration"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&live_config).unwrap(), old);
+        assert!(std::fs::read_dir(live.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("pre-restore")
+        }));
+    }
+
+    #[test]
+    fn restore_through_an_alias_updates_only_the_canonical_master() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().unwrap();
+        let source_config = source.path().join("config.toml");
+        std::fs::write(&source_config, BASE).unwrap();
+        let archive = run_backup(&source_config, None).unwrap();
+
+        let live = tempfile::tempdir().unwrap();
+        let real = live.path().join("real");
+        let front = live.path().join("front");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&front).unwrap();
+        let canonical = real.join("config.toml");
+        std::fs::write(&canonical, "old = true\n").unwrap();
+        let alias = front.join("active.toml");
+        symlink("../real/config.toml", &alias).unwrap();
+
+        let pre_restore = match restore_archive(&alias, &archive).unwrap() {
+            RestoreOutcome::Restored { pre_restore } => pre_restore.unwrap(),
+            RestoreOutcome::ValidationFailed(errors) => {
+                panic!("valid archive failed validation: {errors:?}")
+            }
+        };
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), BASE);
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), BASE);
+        assert_eq!(pre_restore.parent(), Some(real.as_path()));
+        assert!(pre_restore
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("config.toml.pre-restore-"));
+        assert_eq!(
+            std::fs::read_to_string(pre_restore).unwrap(),
+            "old = true\n"
+        );
+    }
+
     /// An include that does NOT live in a `<class>.d/` directory must
     /// survive backup and come back on restore.
     ///
@@ -833,7 +1361,7 @@ servers = ["192.0.2.1:53"]
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 3\nincludes = [\"custom/*.toml\"]\n\n\
+            "schema_version = 4\nincludes = [\"custom/*.toml\"]\n\n\
              [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -887,7 +1415,7 @@ servers = ["192.0.2.1:53"]
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 3\nincludes = [\"extra.toml\"]\n\n\
+            "schema_version = 4\nincludes = [\"extra.toml\"]\n\n\
              [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1052,7 +1580,7 @@ servers = ["192.0.2.1:53"]
         let bad_config = bad_dir.path().join("config.toml");
         std::fs::write(
             &bad_config,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "missing-profile"
@@ -1157,25 +1685,28 @@ servers = ["192.0.2.1:53"]
         // `incoming → live_sub` rename whose target is `…/profiles.d`).
         // The aside rename (target `…/.profiles.d.pre-restore-…`) and
         // every devices.d rename run for real.
-        let rename = |from: &Path, to: &Path| -> std::io::Result<()> {
-            if to.file_name().and_then(|s| s.to_str()) == Some("profiles.d") {
-                return Err(std::io::Error::other("injected"));
-            }
-            std::fs::rename(from, to)
-        };
-
-        let res = install_include_entries(
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
             &mut Vec::new(),
             staged.path(),
+            &root,
             live.path(),
             &["devices.d".to_string(), "profiles.d".to_string()],
-            copy_dir_recursive,
-            rename,
-        );
+            (meta.uid(), meta.gid()),
+        )
+        .unwrap();
+        let res = swap.promote(&root, |from_parent, from, to_parent, to| {
+            if to == OsStr::new("profiles.d") {
+                return Err(std::io::Error::other("injected"));
+            }
+            rename_noreplace_at(from_parent, from, to_parent, to)
+        });
         assert!(
             res.is_err(),
             "injected Phase B failure must surface as an error"
         );
+        swap.rollback(&root).unwrap();
 
         for d in ["devices.d", "profiles.d"] {
             let got = std::fs::read_to_string(live.path().join(d).join("e.toml")).unwrap();
@@ -1188,6 +1719,132 @@ servers = ["192.0.2.1:53"]
                 "leftover swap artifact in config dir: {name}"
             );
         }
+    }
+
+    #[test]
+    fn rollback_preserves_a_replacement_at_a_promoted_name() {
+        let live = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        for name in ["devices.d", "profiles.d"] {
+            std::fs::create_dir(live.path().join(name)).unwrap();
+            std::fs::write(live.path().join(name).join("entry.toml"), "old").unwrap();
+            std::fs::create_dir(staged.path().join(name)).unwrap();
+            std::fs::write(staged.path().join(name).join("entry.toml"), "new").unwrap();
+        }
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
+            &mut Vec::new(),
+            staged.path(),
+            &root,
+            live.path(),
+            &["devices.d".to_string(), "profiles.d".to_string()],
+            (meta.uid(), meta.gid()),
+        )
+        .unwrap();
+        let visible_root = live.path().to_path_buf();
+        let error = swap
+            .promote(&root, |from_parent, from, to_parent, to| {
+                if to == OsStr::new("profiles.d") {
+                    std::fs::remove_dir_all(visible_root.join("devices.d"))?;
+                    std::fs::write(visible_root.join("devices.d"), "replacement")?;
+                    return Err(std::io::Error::other("injected"));
+                }
+                rename_noreplace_at(from_parent, from, to_parent, to)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("promoting staged include"));
+        assert!(swap.rollback(&root).is_err());
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("devices.d")).unwrap(),
+            "replacement",
+            "rollback must not delete an inode it did not create"
+        );
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("profiles.d/entry.toml")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn promotion_refuses_replaced_incoming_entries_and_reports_each_artifact() {
+        let live = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        for name in ["devices.d", "profiles.d"] {
+            std::fs::create_dir(live.path().join(name)).unwrap();
+            std::fs::write(live.path().join(name).join("entry.toml"), "old").unwrap();
+            std::fs::create_dir(staged.path().join(name)).unwrap();
+            std::fs::write(staged.path().join(name).join("entry.toml"), "new").unwrap();
+        }
+        let root = File::open(live.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
+            &mut Vec::new(),
+            staged.path(),
+            &root,
+            live.path(),
+            &["devices.d".to_string(), "profiles.d".to_string()],
+            (metadata.uid(), metadata.gid()),
+        )
+        .unwrap();
+        let incoming = swap
+            .prepared
+            .iter()
+            .map(|item| item.incoming.clone())
+            .collect::<Vec<_>>();
+        for name in &incoming {
+            std::fs::remove_dir_all(live.path().join(name)).unwrap();
+            std::fs::write(live.path().join(name), "replacement").unwrap();
+        }
+
+        let error = swap
+            .promote(&root, rename_noreplace_at)
+            .expect_err("a replaced incoming inode must not be promoted");
+        assert!(error.to_string().contains("changed before promotion"));
+        for name in ["devices.d", "profiles.d"] {
+            assert_eq!(
+                std::fs::read_to_string(live.path().join(name).join("entry.toml")).unwrap(),
+                "old"
+            );
+        }
+
+        let artifacts = swap.recovery_artifacts(&root, live.path()).join("; ");
+        let cleanup = swap.cleanup_incoming(&root).unwrap_err().to_string();
+        for name in incoming {
+            let name = name.to_string_lossy();
+            assert!(artifacts.contains(name.as_ref()), "{artifacts}");
+            assert!(artifacts.contains("replacement preserved"), "{artifacts}");
+            assert!(cleanup.contains(name.as_ref()), "{cleanup}");
+        }
+    }
+
+    #[test]
+    fn production_include_copy_normalizes_modes_and_refuses_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let staged = tempfile::tempdir().unwrap();
+        let source = staged.path().join("entry.toml");
+        std::fs::write(&source, "value = true\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let owner = (meta.uid(), meta.gid());
+
+        copy_staged_entry_at(&source, &root, OsStr::new("incoming.toml"), owner).unwrap();
+        assert_eq!(
+            std::fs::metadata(live.path().join("incoming.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        let link = staged.path().join("link.toml");
+        symlink(&source, &link).unwrap();
+        assert!(copy_staged_entry_at(&link, &root, OsStr::new("link.toml"), owner).is_err());
+        assert!(!live.path().join("link.toml").exists());
     }
 
     /// Mirror semantics: a successful swap makes the live `.d/`
@@ -1205,15 +1862,19 @@ servers = ["192.0.2.1:53"]
         std::fs::create_dir(&staged_d).unwrap();
         std::fs::write(staged_d.join("managed.toml"), "v2").unwrap();
 
-        install_include_entries(
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
             &mut Vec::new(),
             staged.path(),
+            &root,
             live.path(),
             &["devices.d".to_string()],
-            copy_dir_recursive,
-            |from, to| std::fs::rename(from, to),
+            (meta.uid(), meta.gid()),
         )
         .unwrap();
+        swap.promote(&root, rename_noreplace_at).unwrap();
+        swap.finalize(&root).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(live_d.join("managed.toml")).unwrap(),
@@ -1264,67 +1925,6 @@ servers = ["192.0.2.1:53"]
             "fifo member must be rejected: {err}"
         );
         assert_eq!(std::fs::read_to_string(&live).unwrap(), BASE);
-    }
-
-    #[test]
-    fn copy_dir_recursive_rejects_symlink_member() {
-        use std::os::unix::fs::PermissionsExt;
-        // A symlink that reaches the copy step (e.g. slipped past the archive
-        // scan) must be refused, not silently followed by fs::copy.
-        let src = tempfile::tempdir().unwrap();
-        std::fs::write(src.path().join("ok.toml"), "x").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", src.path().join("evil")).unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let dst_path = dst.path().join("out");
-
-        let err = copy_dir_recursive(src.path(), &dst_path).unwrap_err();
-        assert!(
-            err.to_string().contains("not a regular file or directory"),
-            "symlink member must be rejected: {err}"
-        );
-        // It must NOT have followed the symlink (no /etc/passwd content copied).
-        if let Ok(meta) = std::fs::symlink_metadata(dst_path.join("evil")) {
-            assert!(
-                meta.file_type().is_symlink() || !meta.is_file(),
-                "symlink must not be dereferenced into a regular copy"
-            );
-        }
-        // Sanity: the destination dir itself was created at 0o750.
-        let mode = std::fs::metadata(&dst_path).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o750, "restored dir must be 0o750");
-    }
-
-    #[test]
-    fn copy_dir_recursive_normalises_file_mode_to_0640() {
-        use std::os::unix::fs::PermissionsExt;
-        // A world-readable slice in the source (crafted or lax-umask archive)
-        // must land 0o640 after restore, not inherit the source bits.
-        let src = tempfile::tempdir().unwrap();
-        let sub = src.path().join("devices.d");
-        std::fs::create_dir(&sub).unwrap();
-        let f = sub.join("auto.toml");
-        std::fs::write(&f, "id='x'").unwrap();
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
-
-        let dst = tempfile::tempdir().unwrap();
-        let out = dst.path().join("out");
-        copy_dir_recursive(src.path(), &out).unwrap();
-
-        let file_mode = std::fs::metadata(out.join("devices.d").join("auto.toml"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777;
-        assert_eq!(
-            file_mode, 0o640,
-            "restored file must be normalised to 0o640"
-        );
-        let dir_mode = std::fs::metadata(out.join("devices.d"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777;
-        assert_eq!(dir_mode, 0o750, "restored .d dir must be 0o750");
     }
 
     #[test]
@@ -1436,7 +2036,7 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn the_staged_master_fallback_never_picks_secrets_toml() {
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(staging.path().join("config.toml"), "schema_version = 3\n").unwrap();
+        std::fs::write(staging.path().join("config.toml"), "schema_version = 4\n").unwrap();
         std::fs::write(staging.path().join("secrets.toml"), "token = \"x\"\n").unwrap();
         // Live master named something else, so the direct hit misses and
         // the fallback runs.
@@ -1450,18 +2050,20 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// The pick must not depend on `read_dir` order, or the same archive
-    /// restores on one host and fails validation on another.
+    /// Multiple unhinted root TOMLs are ambiguous; sorting only stabilizes
+    /// the diagnostic and never chooses what gets installed.
     #[test]
-    fn the_staged_master_fallback_is_deterministic() {
+    fn the_staged_master_fallback_refuses_ambiguity() {
         let staging = tempfile::tempdir().unwrap();
         for name in ["zulu.toml", "alpha.toml", "mike.toml"] {
-            std::fs::write(staging.path().join(name), "schema_version = 3\n").unwrap();
+            std::fs::write(staging.path().join(name), "schema_version = 4\n").unwrap();
         }
         let live = staging.path().join("warden.toml");
 
-        let picked = locate_staged_master(staging.path(), &live).unwrap();
-        assert_eq!(picked.file_name().unwrap(), "alpha.toml");
+        let error = locate_staged_master(staging.path(), &live).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ambiguous staged archive"), "{message}");
+        assert!(message.contains("alpha.toml"), "{message}");
     }
 
     /// The direct name match still wins — the fallback must not have
@@ -1469,42 +2071,23 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn the_staged_master_prefers_the_live_masters_own_name() {
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(staging.path().join("alpha.toml"), "schema_version = 3\n").unwrap();
-        std::fs::write(staging.path().join("warden.toml"), "schema_version = 3\n").unwrap();
+        std::fs::write(staging.path().join("alpha.toml"), "schema_version = 4\n").unwrap();
+        std::fs::write(staging.path().join("warden.toml"), "schema_version = 4\n").unwrap();
         let live = staging.path().join("warden.toml");
 
         let picked = locate_staged_master(staging.path(), &live).unwrap();
         assert_eq!(picked.file_name().unwrap(), "warden.toml");
     }
 
-    // ── what an aborted restore claims about the tree ────────────────
-
-    /// With no prior master there is nothing to roll back to: the new one
-    /// is already installed and only its includes are missing. Saying
-    /// "rolled back" there tells the operator not to look at the one tree
-    /// they must now inspect.
     #[test]
-    fn an_aborted_restore_onto_a_bare_host_does_not_claim_a_rollback() {
-        let msg = aborted_restore_context(None);
-        assert!(
-            !msg.contains("rolled back"),
-            "nothing was rolled back: {msg:?}"
-        );
-        assert!(
-            msg.contains("installed") && msg.contains("NOT"),
-            "the operator must be told the tree is half-swapped: {msg:?}"
-        );
-    }
+    fn the_staged_master_accepts_a_safe_exact_non_toml_name() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("warden.conf"), "schema_version = 4\n").unwrap();
+        std::fs::write(staging.path().join("other.toml"), "schema_version = 4\n").unwrap();
+        let live = staging.path().join("warden.conf");
 
-    /// Negative control: where a rollback did happen, it is still
-    /// reported as one.
-    #[test]
-    fn an_aborted_restore_over_an_existing_master_still_reports_the_rollback() {
-        let prev = PathBuf::from("/tmp/config.toml.pre-restore-1");
-        assert_eq!(
-            aborted_restore_context(Some(&prev)),
-            "restore aborted; live config rolled back"
-        );
+        let picked = locate_staged_master(staging.path(), &live).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "warden.conf");
     }
 
     // ── a declared include the archive does not contain ──────────────
@@ -1528,15 +2111,19 @@ servers = ["192.0.2.1:53"]
         // `staged/devices.d` deliberately absent.
 
         let mut notices: Vec<u8> = Vec::new();
-        install_include_entries(
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
             &mut notices,
             staged.path(),
+            &root,
             live.path(),
             &["devices.d".to_string()],
-            copy_dir_recursive,
-            |from, to| std::fs::rename(from, to),
+            (meta.uid(), meta.gid()),
         )
         .unwrap();
+        swap.promote(&root, rename_noreplace_at).unwrap();
+        swap.finalize(&root).unwrap();
 
         let seen = String::from_utf8(notices).unwrap();
         assert!(
@@ -1561,15 +2148,19 @@ servers = ["192.0.2.1:53"]
         std::fs::write(staged_d.join("kid-tablet.toml"), "v2").unwrap();
 
         let mut notices: Vec<u8> = Vec::new();
-        install_include_entries(
+        let root = File::open(live.path()).unwrap();
+        let meta = root.metadata().unwrap();
+        let mut swap = prepare_include_entries(
             &mut notices,
             staged.path(),
+            &root,
             live.path(),
             &["devices.d".to_string()],
-            copy_dir_recursive,
-            |from, to| std::fs::rename(from, to),
+            (meta.uid(), meta.gid()),
         )
         .unwrap();
+        swap.promote(&root, rename_noreplace_at).unwrap();
+        swap.finalize(&root).unwrap();
 
         assert!(
             notices.is_empty(),
@@ -1579,33 +2170,6 @@ servers = ["192.0.2.1:53"]
         assert_eq!(
             std::fs::read_to_string(live.path().join("devices.d/kid-tablet.toml")).unwrap(),
             "v2"
-        );
-    }
-
-    /// The old `let Ok(meta) = … else { continue }` swallowed EACCES and
-    /// ENOTDIR too, so an unreadable staged entry produced a half-restored
-    /// tree reported as success. Only "absent" may be non-fatal.
-    ///
-    /// `staged/plain.toml` is a regular file, so `staged/plain.toml/inner`
-    /// fails with ENOTDIR rather than NotFound.
-    #[test]
-    fn a_staged_entry_that_is_unreadable_for_any_other_reason_is_fatal() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        std::fs::write(staged.path().join("plain.toml"), "x").unwrap();
-
-        let mut notices: Vec<u8> = Vec::new();
-        let res = install_include_entries(
-            &mut notices,
-            staged.path(),
-            live.path(),
-            &["plain.toml/inner".to_string()],
-            copy_dir_recursive,
-            |from, to| std::fs::rename(from, to),
-        );
-        assert!(
-            res.is_err(),
-            "a non-NotFound stat failure must not be skipped"
         );
     }
 }

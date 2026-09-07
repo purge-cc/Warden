@@ -510,12 +510,6 @@ fn cursor_glyph(focused: bool) -> &'static str {
 /// Why a pack could not be reached or written.
 #[derive(Debug, thiserror::Error)]
 pub enum PackAccessError {
-    /// The loaded config has no parent directory. Unreachable through the
-    /// loader, which refuses such a master outright — named rather than
-    /// unwrapped so a future caller holding a hand-built `LoadedConfig`
-    /// gets a diagnostic instead of a panic on a key press.
-    #[error("the loaded config has no parent directory, so packs/ cannot be located")]
-    NoConfigRoot,
     #[error(transparent)]
     Write(#[from] crate::config::custom_list::PackWriteError),
     /// Another writer holds the tree, or the config directory is not
@@ -537,14 +531,6 @@ pub fn max_pack_bytes(loaded: &LoadedConfig) -> u64 {
     loaded.config.custom_list_limits.max_file_bytes
 }
 
-fn pack_file(loaded: &LoadedConfig, id: &Id) -> Result<std::path::PathBuf, PackAccessError> {
-    let root = loaded
-        .master_path
-        .parent()
-        .ok_or(PackAccessError::NoConfigRoot)?;
-    Ok(crate::config::custom_list::pack_path(root, id))
-}
-
 /// Claim the config tree for one pack write. **The only seat that takes
 /// this lock for a pack.**
 ///
@@ -552,17 +538,34 @@ fn pack_file(loaded: &LoadedConfig, id: &Id) -> Result<std::path::PathBuf, PackA
 /// `[[custom_lists]]` promotion serialise against each other rather than
 /// only against their own kind.
 ///
-/// **The guard must be dead before a config promotion runs.** `flock`
-/// attaches to the open file description and not to the process, so a
-/// promotion contends with a guard this process is still holding and
-/// stalls for the whole lock deadline before failing. A caller doing both
-/// scopes this one closed first.
-pub fn claim_tree(loaded: &LoadedConfig) -> Result<ConfigWriteLock, PackAccessError> {
-    crate::config::write_lock::acquire(&loaded.master_path)
+/// A caller may retain the guard through a matching config promotion, but
+/// must end its synchronous guarded scope before any await or reload.
+pub fn claim_tree(master: &std::path::Path) -> Result<ConfigWriteLock, PackAccessError> {
+    crate::config::write_lock::acquire_for_write(master)
         .map_err(|e| PackAccessError::Lock(format!("{e:#}")))
 }
 
-/// Append one rule. **The only way this leaf grows a pack.**
+/// Derive a managed pack path from the pinned canonical config root.
+///
+/// `loaded` is a freshly guarded UI snapshot. It contributes the declared
+/// id/cap at the call site, but never its master-parent path: an alias used
+/// to launch the TUI must not redirect pack writes beside the alias.
+pub(crate) fn pack_file_locked(
+    guard: &ConfigWriteLock,
+    loaded: &LoadedConfig,
+    id: &Id,
+) -> Result<std::path::PathBuf, PackAccessError> {
+    guard
+        .verify_master(&loaded.master_path)
+        .map_err(|e| PackAccessError::Lock(format!("{e:#}")))?;
+    Ok(crate::config::custom_list::pack_path(
+        &guard.identity().root,
+        id,
+    ))
+}
+
+/// Append one rule while the caller retains the tree guard. **The only way
+/// this leaf grows a pack.**
 ///
 /// The choke point is the point. `write_pack` validates every line and
 /// rejects the whole file on the first bad one, so a surface that rebuilt a
@@ -573,16 +576,16 @@ pub fn claim_tree(loaded: &LoadedConfig) -> Result<ConfigWriteLock, PackAccessEr
 /// Serialised on the tree write lock, because the append is a
 /// read-modify-write: two of them reading the same pre-state each rewrite
 /// from it, and the second drops the first operator's rule silently.
-pub fn append_rule(
+pub(crate) fn append_rule_locked(
+    guard: &ConfigWriteLock,
     loaded: &LoadedConfig,
     id: &Id,
     domain: &str,
     allow: bool,
 ) -> Result<crate::config::custom_list::AddOutcome, PackAccessError> {
-    let path = pack_file(loaded, id)?;
-    let lock = claim_tree(loaded)?;
+    let path = pack_file_locked(guard, loaded, id)?;
     Ok(crate::config::custom_list::add_rule(
-        &lock,
+        guard,
         &path,
         domain,
         allow,
@@ -601,7 +604,8 @@ pub fn append_rule(
 /// re-read when the selection changes, so any write it did not see moves
 /// the numbering; the writer refuses on the mismatch rather than editing
 /// whatever now sits there.
-pub fn replace_rule(
+pub(crate) fn replace_rule_locked(
+    guard: &ConfigWriteLock,
     loaded: &LoadedConfig,
     id: &Id,
     line: usize,
@@ -609,10 +613,9 @@ pub fn replace_rule(
     domain: &str,
     allow: bool,
 ) -> Result<(), PackAccessError> {
-    let path = pack_file(loaded, id)?;
-    let lock = claim_tree(loaded)?;
+    let path = pack_file_locked(guard, loaded, id)?;
     Ok(crate::config::custom_list::replace_rule_at_line(
-        &lock,
+        guard,
         &path,
         line,
         expect,
@@ -628,11 +631,15 @@ pub fn replace_rule(
 /// an allow and a deny loses both lines in one call. Every confirm that
 /// reaches here has to say so: the row under the cursor shows one direction
 /// and nothing on it hints at the other.
-pub fn delete_rule(loaded: &LoadedConfig, id: &Id, domain: &str) -> Result<bool, PackAccessError> {
-    let path = pack_file(loaded, id)?;
-    let lock = claim_tree(loaded)?;
+pub(crate) fn delete_rule_locked(
+    guard: &ConfigWriteLock,
+    loaded: &LoadedConfig,
+    id: &Id,
+    domain: &str,
+) -> Result<bool, PackAccessError> {
+    let path = pack_file_locked(guard, loaded, id)?;
     Ok(crate::config::custom_list::remove_rule(
-        &lock,
+        guard,
         &path,
         domain,
         max_pack_bytes(loaded),
@@ -1140,6 +1147,28 @@ mod tests {
         pack
     }
 
+    /// A separate TUI session's complete append gesture. Production callers
+    /// that also mutate declarations retain the guard themselves; these race
+    /// tests deliberately model independent sessions.
+    fn append_for_test(
+        loaded: &LoadedConfig,
+        id: &Id,
+        domain: &str,
+        allow: bool,
+    ) -> Result<crate::config::custom_list::AddOutcome, PackAccessError> {
+        let guard = claim_tree(&loaded.master_path)?;
+        append_rule_locked(&guard, loaded, id, domain, allow)
+    }
+
+    fn delete_for_test(
+        loaded: &LoadedConfig,
+        id: &Id,
+        domain: &str,
+    ) -> Result<bool, PackAccessError> {
+        let guard = claim_tree(&loaded.master_path)?;
+        delete_rule_locked(&guard, loaded, id, domain)
+    }
+
     /// **Concurrent appends to one pack must not lose each other.**
     ///
     /// `add_rule` is a read-modify-write: it reads the whole file, appends
@@ -1163,7 +1192,7 @@ mod tests {
                 let (l, id) = (&l, &id);
                 s.spawn(move || {
                     for n in 0..PER_THREAD {
-                        append_rule(l, id, &format!("d{t}x{n}.example.com"), false)
+                        append_for_test(l, id, &format!("d{t}x{n}.example.com"), false)
                             .expect("every append must land");
                     }
                 });
@@ -1196,16 +1225,16 @@ mod tests {
         let id = Id::new("videogames").unwrap();
 
         // Present before the race, and removed during it by one thread.
-        append_rule(&l, &id, "doomed.example.com", false).unwrap();
+        append_for_test(&l, &id, "doomed.example.com", false).unwrap();
 
         std::thread::scope(|s| {
             s.spawn(|| {
-                delete_rule(&l, &id, "doomed.example.com").expect("the removal must land");
+                delete_for_test(&l, &id, "doomed.example.com").expect("the removal must land");
             });
             for t in 0..THREADS {
                 let (l, id) = (&l, &id);
                 s.spawn(move || {
-                    append_rule(l, id, &format!("k{t}.example.com"), false)
+                    append_for_test(l, id, &format!("k{t}.example.com"), false)
                         .expect("every append must land");
                 });
             }
@@ -1221,6 +1250,53 @@ mod tests {
         assert!(
             !text.contains("doomed.example.com"),
             "a concurrent append rewrote the removal away; file:\n{text}"
+        );
+    }
+
+    /// The locked primitive is deliberately no-acquire: a custom-list
+    /// declaration operation owns this same guard and would self-contend if
+    /// the pack layer tried to claim it again.
+    #[test]
+    fn locked_append_does_not_reacquire_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_pack(dir.path());
+        let loaded = loaded_at(dir.path());
+        let id = Id::new("videogames").unwrap();
+        let guard = claim_tree(&loaded.master_path).unwrap();
+
+        crate::config::write_lock::with_test_hook(
+            |event| {
+                if event == crate::config::write_lock::TestEvent::Contended
+                    || event == crate::config::write_lock::TestEvent::RootLocked
+                    || event == crate::config::write_lock::TestEvent::WriteRootLocked
+                {
+                    panic!("the locked helper must not acquire a second guard");
+                }
+            },
+            || {
+                append_rule_locked(&guard, &loaded, &id, "new.example.com", false)
+                    .expect("the caller-owned guard is sufficient");
+            },
+        );
+    }
+
+    /// A loaded snapshot from another tree is rendering data, never an
+    /// authority for a caller-owned guard.  Reject it before deriving or
+    /// creating a managed `packs/` path.
+    #[test]
+    fn locked_pack_path_rejects_a_loaded_config_from_another_tree() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let guard = claim_tree(&first.path().join("config.toml")).unwrap();
+        let foreign = loaded_at(second.path());
+        let id = Id::new("videogames").unwrap();
+
+        let error = pack_file_locked(&guard, &foreign, &id)
+            .expect_err("a guard must reject a foreign loaded-config snapshot");
+        assert!(error.to_string().contains("guard belongs to"));
+        assert!(
+            !second.path().join("packs").exists(),
+            "wrong-tree rejection must not create a pack directory"
         );
     }
 }

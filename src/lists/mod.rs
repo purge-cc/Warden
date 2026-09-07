@@ -7,6 +7,7 @@
 //! - [`readiness`] — The latching "a generation has been installed" gate the
 //!   manager opens and the DNS handler reads
 
+mod cancellation;
 pub mod catalog;
 pub mod detector;
 pub mod http_client;

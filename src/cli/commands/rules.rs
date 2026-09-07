@@ -17,7 +17,7 @@
 //! `[[admin_rules]]`, and the entity file holding the reference
 //! (`Profile.admin_rules` / `Device.allow_rules` / `Device.deny_rules`).
 //! Both slices are staged in memory and handed to
-//! [`super::target::write_values_validated`], which validates the merged
+//! [`super::target::write_values_validated_locked`], which validates the merged
 //! `{master + includes + both staged slices}` BEFORE promoting either.
 //! Nothing cross-reference-invalid is ever renamed into place, so the
 //! orphan-rule window (a master row with no entity reference) never
@@ -51,7 +51,6 @@ use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
 use crate::config::loader::load_config;
 use crate::config::schema::admin_rule::{format_rule_invalid_domain, validate_domain};
 use crate::config::schema::id::Id;
-#[cfg(test)]
 use crate::config::schema::ConfigV1;
 use crate::filter::engine::domain_matches_set;
 use crate::filter::rules::{parse_rules, RuleAction as ParsedRuleAction};
@@ -62,13 +61,18 @@ use crate::ipc::socket_client::send_command;
 use super::audit::audit_log_path_for;
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::ipc_reload;
+#[cfg(test)]
+use super::local_dns::profile_scoped::load_for_resolution;
 use super::local_dns::profile_scoped::{
-    ensure_profile_exists, find_profile_entry_mut, find_profile_target_file, load_for_resolution,
+    ensure_profile_exists_in, find_profile_entry_mut, find_profile_target_file_locked,
+    load_for_resolution_locked,
 };
 use super::target::{
-    self, count_devices_on_profile, effective_profile_for_device, read_or_empty,
-    resolve_target_file, write_value_validated, write_values_validated, EntityClass, StagedWrite,
+    self, count_devices_on_profile, effective_profile_for_device, guarded_master_locked,
+    read_or_empty_locked, resolve_explicit_into_under_locked, write_value_validated_locked,
+    write_values_validated_locked, EntityClass, StagedWrite,
 };
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 // ── public types ──────────────────────────────────────────────────────
 
@@ -293,18 +297,40 @@ pub(crate) fn add_inner(
     explicit_id: Option<&str>,
     into: Option<&Path>,
 ) -> anyhow::Result<ChangeOutcome> {
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(
+        &guard,
+        config_path,
+        scope,
+        action,
+        domain_input,
+        explicit_id,
+        into,
+    )
+}
+
+/// Guarded add entry point for compound callers.
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    scope: Scope<'_>,
+    action: Action,
+    domain_input: &str,
+    explicit_id: Option<&str>,
+    into: Option<&Path>,
+) -> anyhow::Result<ChangeOutcome> {
     // 1. Validate domain → canonical lowercase form.
     let canonical = validate_domain(domain_input)
         .map_err(|reason| anyhow::anyhow!(format_rule_invalid_domain(domain_input, &reason)))?;
     let rule_string = action.rule_string(&canonical);
 
     // 2. Resolve scope → entity target (profile or device) + file.
-    let resolution = resolve_scope_target(config_path, &scope, into)?;
+    let resolution = resolve_scope_target_locked(guard, config_path, &scope, into)?;
 
     // 3. RULE_REFUSED_OVERRIDE write-time gate (Device + Allow only).
     let mut override_used = false;
     if let (EntityTarget::Device { device_id, .. }, Action::Allow) = (&resolution.target, action) {
-        let outcome = check_override_required(config_path, device_id, &canonical)?;
+        let outcome = check_override_required_locked(guard, config_path, device_id, &canonical)?;
         match outcome {
             OverrideCheck::Ok { override_used: u } => override_used = u,
             OverrideCheck::Refused {
@@ -325,7 +351,7 @@ pub(crate) fn add_inner(
     // have ANY rule for (action, domain)?", which must not be narrowed to
     // the id the operator proposed for the new rule.
     if let Some(existing_id) =
-        find_existing_reference(config_path, &resolution, action, &canonical, None)?
+        find_existing_reference_locked(guard, config_path, &resolution, action, &canonical, None)?
     {
         return Ok(ChangeOutcome::NoOp(NoOpReason::AlreadyPresent {
             rule_id: existing_id,
@@ -337,7 +363,7 @@ pub(crate) fn add_inner(
         Some(s) => {
             Id::new(s.to_string()).map_err(|e| anyhow::anyhow!("invalid --id \"{s}\": {e}"))?;
             // Reject collisions with existing ids.
-            if rule_id_exists(config_path, s)? {
+            if rule_id_exists_locked(guard, config_path, s)? {
                 bail!(
                     "rule id \"{s}\" already exists. Pick a different `--id` or omit \
                      it to auto-generate."
@@ -345,7 +371,7 @@ pub(crate) fn add_inner(
             }
             s.to_string()
         }
-        None => generate_unique_rule_id(config_path, action)?,
+        None => generate_unique_rule_id_locked(guard, config_path, action)?,
     };
 
     // 6. Stage the new master [[admin_rules]] row + the entity reference,
@@ -353,12 +379,13 @@ pub(crate) fn add_inner(
     //    Row-before-reference order keeps every inter-rename
     //    intermediate valid: an unreferenced admin_rules row is fine; a
     //    reference pointing at a missing row would dangle.
-    let master = config_path.to_path_buf();
-    let (mut master_doc, _) = read_or_empty(&master)?;
+    let master_target = guarded_master_locked(guard, config_path)?;
+    let master = master_target.display().to_path_buf();
+    let (mut master_doc, _) = read_or_empty_locked(guard, config_path, &master)?;
     append_admin_rule(&mut master_doc, &rule_id, &rule_string)?;
 
     let entity_path = resolution.file_path.clone();
-    let same_file = entity_path == master;
+    let same_file = master_target.matches_path(guard, &entity_path)?;
 
     let writes: Vec<StagedWrite> = if same_file {
         // Single-file layout: the row and the reference land in one doc.
@@ -374,7 +401,7 @@ pub(crate) fn add_inner(
                 .with_context(|| format!("serialise {}", master.display()))?,
         }]
     } else {
-        let (mut entity_doc, _) = read_or_empty(&entity_path)?;
+        let (mut entity_doc, _) = read_or_empty_locked(guard, config_path, &entity_path)?;
         let appended = append_entity_reference(&mut entity_doc, &resolution, action, &rule_id)?;
         if !appended {
             return Ok(ChangeOutcome::NoOp(NoOpReason::AlreadyPresent { rule_id }));
@@ -393,7 +420,7 @@ pub(crate) fn add_inner(
             },
         ]
     };
-    write_values_validated(&master, &writes)?;
+    write_values_validated_locked(guard, &master, &writes)?;
 
     let report = AddInnerReport {
         rule_id,
@@ -445,7 +472,20 @@ pub(crate) fn remove_inner(
     domain_input: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
-    remove_inner_matching(config_path, scope, action, domain_input, into, None)
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, scope, action, domain_input, into)
+}
+
+/// Guarded counterpart to [`remove_inner`] for compound callers.
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    scope: Scope<'_>,
+    action: Action,
+    domain_input: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<RemoveOutcome> {
+    remove_inner_matching_locked(guard, config_path, scope, action, domain_input, into, None)
 }
 
 /// Drop a rule's reference from the resolved scope's entity. When no
@@ -471,33 +511,62 @@ pub(crate) fn remove_inner_matching(
     into: Option<&Path>,
     id_filter: Option<&str>,
 ) -> anyhow::Result<RemoveOutcome> {
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_matching_locked(
+        &guard,
+        config_path,
+        scope,
+        action,
+        domain_input,
+        into,
+        id_filter,
+    )
+}
+
+/// Guarded remove entry point for compound callers.
+pub(crate) fn remove_inner_matching_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    scope: Scope<'_>,
+    action: Action,
+    domain_input: &str,
+    into: Option<&Path>,
+    id_filter: Option<&str>,
+) -> anyhow::Result<RemoveOutcome> {
     let canonical = validate_domain(domain_input)
         .map_err(|reason| anyhow::anyhow!(format_rule_invalid_domain(domain_input, &reason)))?;
     let rule_string = action.rule_string(&canonical);
-    let resolution = resolve_scope_target(config_path, &scope, into)?;
+    let resolution = resolve_scope_target_locked(guard, config_path, &scope, into)?;
 
     // Find the rule id this entity uses for (action, canonical_domain),
     // narrowed to `id_filter` when the operator named one.
-    let Some(rule_id) =
-        find_existing_reference(config_path, &resolution, action, &canonical, id_filter)?
+    let Some(rule_id) = find_existing_reference_locked(
+        guard,
+        config_path,
+        &resolution,
+        action,
+        &canonical,
+        id_filter,
+    )?
     else {
         return Ok(RemoveOutcome::NotFound);
     };
 
-    let master = config_path.to_path_buf();
+    let master_target = guarded_master_locked(guard, config_path)?;
+    let master = master_target.display().to_path_buf();
     let entity_path = resolution.file_path.clone();
-    let same_file = entity_path == master;
+    let same_file = master_target.matches_path(guard, &entity_path)?;
 
     // Determine if we should also drop the [[admin_rules]] row by counting
     // references across the whole loaded config.
-    let other_refs = count_refs_excluding(config_path, &rule_id, &resolution)?;
+    let other_refs = count_refs_excluding_locked(guard, config_path, &rule_id, &resolution)?;
     let drop_admin_rule = other_refs == 0;
 
     // Stage the reference removal (and the row drop when this was the last
     // reference), then validate the merged tree before promoting anything.
     if same_file {
         // Single-file layout: reference + row drop in one doc, one slice.
-        let (mut doc, _) = read_or_empty(&master)?;
+        let (mut doc, _) = read_or_empty_locked(guard, config_path, &master)?;
         let removed_ref = remove_entity_reference(&mut doc, &resolution, action, &rule_id)?;
         if !removed_ref {
             return Ok(RemoveOutcome::NotFound);
@@ -505,12 +574,12 @@ pub(crate) fn remove_inner_matching(
         if drop_admin_rule {
             drop_admin_rule_row(&mut doc, &rule_id)?;
         }
-        write_value_validated(&master, &master, &doc)?;
+        write_value_validated_locked(guard, &master, &master, &doc)?;
     } else {
         // Multi-file layout: reference-before-row order keeps every
         // inter-rename intermediate valid (the row may briefly stay with no
         // reference — valid; a reference must never outlive its row).
-        let (mut entity_doc, _) = read_or_empty(&entity_path)?;
+        let (mut entity_doc, _) = read_or_empty_locked(guard, config_path, &entity_path)?;
         let removed_ref = remove_entity_reference(&mut entity_doc, &resolution, action, &rule_id)?;
         if !removed_ref {
             return Ok(RemoveOutcome::NotFound);
@@ -521,7 +590,7 @@ pub(crate) fn remove_inner_matching(
                 .with_context(|| format!("serialise {}", entity_path.display()))?,
         }];
         if drop_admin_rule {
-            let (mut master_doc, _) = read_or_empty(&master)?;
+            let (mut master_doc, _) = read_or_empty_locked(guard, config_path, &master)?;
             drop_admin_rule_row(&mut master_doc, &rule_id)?;
             writes.push(StagedWrite {
                 final_path: master.clone(),
@@ -529,7 +598,7 @@ pub(crate) fn remove_inner_matching(
                     .with_context(|| format!("serialise {}", master.display()))?,
             });
         }
-        write_values_validated(&master, &writes)?;
+        write_values_validated_locked(guard, &master, &writes)?;
     }
 
     Ok(RemoveOutcome::Removed(RemoveReport {
@@ -547,13 +616,8 @@ pub(crate) fn remove_inner_matching(
 /// in the loaded config, **excluding** the entity that the current
 /// remove targets (so the caller can ask "would the rule still be
 /// referenced after I unlink THIS entity?").
-fn count_refs_excluding(
-    config_path: &Path,
-    rule_id: &str,
-    resolution: &Resolution,
-) -> anyhow::Result<usize> {
-    let cfg = load_for_resolution(config_path)?;
-    let mut count = 0usize;
+fn count_refs_excluding_in(cfg: &ConfigV1, rule_id: &str, resolution: &Resolution) -> usize {
+    let mut count = 0;
 
     let exclude_profile_id: Option<&str> = match &resolution.target {
         EntityTarget::Profile { profile_id } => Some(profile_id.as_str()),
@@ -589,7 +653,17 @@ fn count_refs_excluding(
             .filter(|i| i.as_str() == rule_id)
             .count();
     }
-    Ok(count)
+    count
+}
+
+fn count_refs_excluding_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    rule_id: &str,
+    resolution: &Resolution,
+) -> anyhow::Result<usize> {
+    let cfg = load_for_resolution_locked(guard, config_path)?;
+    Ok(count_refs_excluding_in(&cfg, rule_id, resolution))
 }
 
 fn remove_entity_reference(
@@ -670,72 +744,72 @@ enum EntityTarget {
     Device { device_id: String },
 }
 
-fn resolve_scope_target(
+fn resolve_scope_target_locked(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     scope: &Scope<'_>,
     into: Option<&Path>,
 ) -> anyhow::Result<Resolution> {
+    let cfg = load_for_resolution_locked(guard, config_path)?;
+    let profile_path = |id: &str| match into {
+        Some(p) => resolve_explicit_into_under_locked(guard, config_path, p),
+        None => find_profile_target_file_locked(guard, config_path, id),
+    };
     match scope {
         Scope::Profile(id) => {
-            ensure_profile_exists(config_path, id, format_rules_profile_not_found)?;
-            let file_path = locate_profile_file(config_path, id, into)?;
+            ensure_profile_exists_in(&cfg, id, format_rules_profile_not_found)?;
             Ok(Resolution {
                 target: EntityTarget::Profile {
                     profile_id: (*id).to_string(),
                 },
-                file_path,
+                file_path: profile_path(id)?,
                 effective_profile: Some((*id).to_string()),
             })
         }
         Scope::Device(id) => {
-            ensure_device_exists(config_path, id)?;
-            let file_path = locate_device_file(config_path, id, into)?;
+            ensure_device_exists_in(&cfg, id)?;
             Ok(Resolution {
                 target: EntityTarget::Device {
                     device_id: (*id).to_string(),
                 },
-                file_path,
+                file_path: locate_device_file_locked(guard, config_path, id, into)?,
                 effective_profile: None,
             })
         }
         Scope::Group(id) => {
-            let profile_id = resolve_group_profile(config_path, id)?;
-            let file_path = locate_profile_file(config_path, &profile_id, into)?;
+            let profile_id = resolve_group_profile_in(&cfg, id)?;
             Ok(Resolution {
                 target: EntityTarget::Profile {
                     profile_id: profile_id.clone(),
                 },
-                file_path,
+                file_path: profile_path(&profile_id)?,
                 effective_profile: Some(profile_id),
             })
         }
         Scope::Subnet(id_or_cidr) => {
-            let profile_id = resolve_subnet_profile(config_path, id_or_cidr)?;
-            let file_path = locate_profile_file(config_path, &profile_id, into)?;
+            let profile_id = resolve_subnet_profile_in(&cfg, id_or_cidr)?;
             Ok(Resolution {
                 target: EntityTarget::Profile {
                     profile_id: profile_id.clone(),
                 },
-                file_path,
+                file_path: profile_path(&profile_id)?,
                 effective_profile: Some(profile_id),
             })
         }
         Scope::Default => {
-            let profile_id = resolve_default_profile(config_path)?;
-            let file_path = locate_profile_file(config_path, &profile_id, into)?;
+            let profile_id = resolve_default_profile_in(&cfg, config_path)?;
             Ok(Resolution {
                 target: EntityTarget::Profile {
                     profile_id: profile_id.clone(),
                 },
-                file_path,
+                file_path: profile_path(&profile_id)?,
                 effective_profile: Some(profile_id),
             })
         }
     }
 }
 
-fn ensure_device_exists(config_path: &Path, device_id: &str) -> anyhow::Result<()> {
-    let cfg = load_for_resolution(config_path)?;
+fn ensure_device_exists_in(cfg: &ConfigV1, device_id: &str) -> anyhow::Result<()> {
     if !cfg.devices.iter().any(|d| d.id.as_str() == device_id) {
         bail!(
             "device \"{device_id}\" not found. Run `warden device list` to see configured devices."
@@ -744,8 +818,7 @@ fn ensure_device_exists(config_path: &Path, device_id: &str) -> anyhow::Result<(
     Ok(())
 }
 
-fn resolve_group_profile(config_path: &Path, group_id: &str) -> anyhow::Result<String> {
-    let cfg = load_for_resolution(config_path)?;
+fn resolve_group_profile_in(cfg: &ConfigV1, group_id: &str) -> anyhow::Result<String> {
     let group = cfg
         .groups
         .iter()
@@ -758,8 +831,9 @@ fn resolve_group_profile(config_path: &Path, group_id: &str) -> anyhow::Result<S
     Ok(group.profile.as_str().to_string())
 }
 
-fn resolve_subnet_profile(config_path: &Path, id_or_cidr: &str) -> anyhow::Result<String> {
-    let cfg = load_for_resolution(config_path)?;
+/// Baseline-compatible subnet resolution: an exact id always wins before a
+/// CIDR lookup, and an ambiguous CIDR reports both its count and ids.
+fn resolve_subnet_profile_in(cfg: &ConfigV1, id_or_cidr: &str) -> anyhow::Result<String> {
     // Try id match first.
     if let Some(s) = cfg.subnets.iter().find(|s| s.id.as_str() == id_or_cidr) {
         return Ok(s.profile.as_str().to_string());
@@ -787,8 +861,7 @@ fn resolve_subnet_profile(config_path: &Path, id_or_cidr: &str) -> anyhow::Resul
     }
 }
 
-fn resolve_default_profile(config_path: &Path) -> anyhow::Result<String> {
-    let cfg = load_for_resolution(config_path)?;
+fn resolve_default_profile_in(cfg: &ConfigV1, config_path: &Path) -> anyhow::Result<String> {
     cfg.server
         .default_profile
         .as_ref()
@@ -804,78 +877,31 @@ fn resolve_default_profile(config_path: &Path) -> anyhow::Result<String> {
 
 // ── file walkers ──────────────────────────────────────────────────────
 
-/// Resolve the file that owns `[profiles.<profile_id>]`, or the file the
-/// operator named with `--into`.
-///
-/// The owner walk is the shared profile-resolution seat, which also owns
-/// the not-found wording every profile-scoped verb emits. A private walk
-/// here would visit the same candidates and answer identically, so the
-/// only thing it can do differently is word the failure differently.
-fn locate_profile_file(
-    config_path: &Path,
-    profile_id: &str,
-    into: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
-    if let Some(p) = into {
-        return resolve_target_file(config_path, EntityClass::Profiles, Some(p));
-    }
-    find_profile_target_file(config_path, profile_id)
-}
-
-/// Locate the file owning the `[[devices]]` row for `device_id`.
-///
-/// Deliberately not the profile walker's twin: devices have no shared
-/// resolution seat, so this walk and its wording live here. Harmonising
-/// the two texts without a seat to hold the shared one just recreates
-/// the copy that drifted.
-fn locate_device_file(
+/// Guarded device owner lookup. `find_target_for_id_locked` cannot be used:
+/// it only knows the canonical `[[devices]]` key, while editable v1 trees may
+/// still use the legacy `[[clients]]` alias.
+fn locate_device_file_locked(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     device_id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
-    if let Some(p) = into {
-        return resolve_target_file(config_path, EntityClass::Devices, Some(p));
+    if let Some(path) = into {
+        return resolve_explicit_into_under_locked(guard, config_path, path);
     }
-    let candidates = candidate_files(config_path, EntityClass::Devices);
-
+    let candidates =
+        target::owner_candidate_files_locked(guard, config_path, &[EntityClass::Devices])?;
     for path in &candidates {
-        if let Some(value) = read_toml(path) {
-            let hit = value
-                .get("devices")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().any(|item| {
-                        item.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s == device_id)
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if hit {
+        match read_or_empty_locked(guard, config_path, path) {
+            Ok((value, _)) if document_defines_device(&value, device_id) => {
                 return Ok(path.clone());
             }
-            // Also check the legacy `[[clients]]` key — the loader still
-            // accepts it as an alias, so the on-disk slice may still
-            // carry it until the operator runs `warden migrate`.
-            let legacy = value
-                .get("clients")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().any(|item| {
-                        item.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s == device_id)
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if legacy {
-                return Ok(path.clone());
-            }
+            Ok(_) => {}
+            // Match the legacy probe: an unreadable or malformed candidate
+            // is not an owner, so continue to the next pinned candidate.
+            Err(_) => {}
         }
     }
-
     bail!(
         "device \"{device_id}\" not found in any of the {} config file(s) \
          reachable from {}. Pass `--into <file>` to target a specific include.",
@@ -884,29 +910,35 @@ fn locate_device_file(
     )
 }
 
-/// Every file that could own an entity of `class`, master first.
-///
-/// Delegates to [`target::owner_candidate_files`], which reads the
-/// loader's own include graph rather than assuming a `<class>.d/*.toml`
-/// naming convention: an operator whose `includes` names another
-/// directory has a profile/device that the merged view sees, and a scan
-/// hardcoded to the convention would report "not found … pass `--into`"
-/// for an entity that plainly exists.
-fn candidate_files(config_path: &Path, class: EntityClass) -> Vec<PathBuf> {
-    target::owner_candidate_files(config_path, &[class])
-}
-
-fn read_toml(path: &Path) -> Option<Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.parse::<Value>().ok())
+/// Accept both the canonical v1 `[[devices]]` rows and the still-supported
+/// legacy `[[clients]]` alias. This pure detector keeps guarded and legacy
+/// owner walks on exactly the same interpretation of a slice.
+fn document_defines_device(doc: &Value, device_id: &str) -> bool {
+    ["devices", "clients"].into_iter().any(|key| {
+        doc.get(key).and_then(Value::as_array).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.get("id").and_then(Value::as_str) == Some(device_id))
+        })
+    })
 }
 
 // ── existence + idempotency probes ────────────────────────────────────
 
-fn rule_id_exists(config_path: &Path, rule_id: &str) -> anyhow::Result<bool> {
-    let cfg = load_for_resolution(config_path)?;
-    Ok(cfg.admin_rules.iter().any(|r| r.id.as_str() == rule_id))
+fn rule_id_exists_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    rule_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(rule_id_exists_in(
+        &load_for_resolution_locked(guard, config_path)?,
+        rule_id,
+    ))
+}
+
+fn rule_id_exists_in(cfg: &ConfigV1, rule_id: &str) -> bool {
+    cfg.admin_rules
+        .iter()
+        .any(|rule| rule.id.as_str() == rule_id)
 }
 
 /// Find the rule id this entity uses for `(action, canonical_domain)`.
@@ -918,14 +950,13 @@ fn rule_id_exists(config_path: &Path, rule_id: &str) -> anyhow::Result<bool> {
 /// `profiles.d` slices merged by the include graph can and do. Without the
 /// filter this returns whichever id comes first in the entity's list, so
 /// `--remove --id r2` removed `r1` and reported `r1` while `r2` survived.
-fn find_existing_reference(
-    config_path: &Path,
+fn find_existing_reference_in(
+    cfg: &ConfigV1,
     resolution: &Resolution,
     action: Action,
     canonical_domain: &str,
     id_filter: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let cfg = load_for_resolution(config_path)?;
+) -> Option<String> {
     let id_to_rule: HashMap<&str, &str> = cfg
         .admin_rules
         .iter()
@@ -965,30 +996,46 @@ fn find_existing_reference(
             }
             if let Some(d) = parsed.exact_domain() {
                 if d.as_str() == canonical_domain {
-                    return Ok(Some(rid.to_string()));
+                    return Some(rid.to_string());
                 }
             }
         }
     }
-    Ok(None)
+    None
+}
+
+fn find_existing_reference_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    resolution: &Resolution,
+    action: Action,
+    canonical_domain: &str,
+    id_filter: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let cfg = load_for_resolution_locked(guard, config_path)?;
+    Ok(find_existing_reference_in(
+        &cfg,
+        resolution,
+        action,
+        canonical_domain,
+        id_filter,
+    ))
 }
 
 // ── id generation ─────────────────────────────────────────────────────
 
-/// Generate `auto-{action}-{8hex}` via [`OsRng`] (CSPRNG, per CLAUDE.md
-/// rule 9 — never `rand` for security-sensitive ids). Tries up to 4
-/// times to dodge a collision with an existing id.
-fn generate_unique_rule_id(config_path: &Path, action: Action) -> anyhow::Result<String> {
+fn generate_unique_rule_id_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    action: Action,
+) -> anyhow::Result<String> {
     for _ in 0..4 {
         let id = generate_rule_id_random(action);
-        if !rule_id_exists(config_path, &id)? {
+        if !rule_id_exists_locked(guard, config_path, &id)? {
             return Ok(id);
         }
     }
-    bail!(
-        "could not generate a unique auto-id after 4 tries (32-bit collision space exhausted? \
-         supply `--id <name>` to override)"
-    )
+    bail!("could not generate a unique auto-id after 4 tries (32-bit collision space exhausted? supply `--id <name>` to override)")
 }
 
 fn generate_rule_id_random(action: Action) -> String {
@@ -1172,9 +1219,10 @@ pub(crate) async fn move_admin_rule(
     new_scope: Scope<'_>,
     new_action: Action,
 ) -> anyhow::Result<MoveOutcome> {
+    let guard = acquire_for_write(config_path)?;
     let action_changed = old_action != new_action;
-    let old_resolution = resolve_scope_target(config_path, &old_scope, None)?;
-    let new_resolution = resolve_scope_target(config_path, &new_scope, None)?;
+    let old_resolution = resolve_scope_target_locked(&guard, config_path, &old_scope, None)?;
+    let new_resolution = resolve_scope_target_locked(&guard, config_path, &new_scope, None)?;
 
     // Scope is "the same storage location" iff the resolved entity
     // matches AND the field within that entity matches. For Device
@@ -1199,20 +1247,34 @@ pub(crate) async fn move_admin_rule(
     // constrain reference polarity, so a transient allow/deny field
     // mismatch stays valid.
     use std::collections::BTreeMap;
-    let master = config_path.to_path_buf();
+    let master = guarded_master_locked(&guard, config_path)?
+        .display()
+        .to_path_buf();
     let mut docs: BTreeMap<PathBuf, Value> = BTreeMap::new();
     let mut order: Vec<PathBuf> = Vec::new();
     let mut master_rewritten = false;
 
     if action_changed {
-        let doc = stage_doc(&mut docs, &mut order, &master)?;
+        let doc = stage_doc_locked(&guard, config_path, &mut docs, &mut order, &master)?;
         flip_master_rule_in_doc(doc, rule_id)?;
         master_rewritten = true;
     }
     if storage_changed {
-        let old_doc = stage_doc(&mut docs, &mut order, &old_resolution.file_path)?;
+        let old_doc = stage_doc_locked(
+            &guard,
+            config_path,
+            &mut docs,
+            &mut order,
+            &old_resolution.file_path,
+        )?;
         remove_entity_reference(old_doc, &old_resolution, old_action, rule_id)?;
-        let new_doc = stage_doc(&mut docs, &mut order, &new_resolution.file_path)?;
+        let new_doc = stage_doc_locked(
+            &guard,
+            config_path,
+            &mut docs,
+            &mut order,
+            &new_resolution.file_path,
+        )?;
         append_entity_reference(new_doc, &new_resolution, new_action, rule_id)?;
     }
 
@@ -1226,7 +1288,8 @@ pub(crate) async fn move_admin_rule(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    write_values_validated(&master, &writes)?;
+    write_values_validated_locked(&guard, &master, &writes)?;
+    drop(guard);
 
     let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
     Ok(MoveOutcome::Applied {
@@ -1275,13 +1338,15 @@ fn flip_master_rule_in_doc(doc: &mut Value, rule_id: &str) -> anyhow::Result<()>
 /// Read `path` into the per-file doc map on first touch (so multiple
 /// mutations to the same file coalesce into one staged slice) and return a
 /// mutable handle. Backs [`move_admin_rule`]'s combined staging.
-fn stage_doc<'a>(
+fn stage_doc_locked<'a>(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
     docs: &'a mut std::collections::BTreeMap<PathBuf, Value>,
     order: &mut Vec<PathBuf>,
     path: &Path,
 ) -> anyhow::Result<&'a mut Value> {
     if !docs.contains_key(path) {
-        let (doc, _) = read_or_empty(path)?;
+        let (doc, _) = read_or_empty_locked(guard, config_path, path)?;
         docs.insert(path.to_path_buf(), doc);
         order.push(path.to_path_buf());
     }
@@ -1318,7 +1383,8 @@ pub(crate) async fn remove_admin_rule_by_id(
     socket_path: &Path,
     rule_id: &str,
 ) -> anyhow::Result<RemoveByIdOutcome> {
-    let cfg = load_for_resolution(config_path)?;
+    let guard = acquire_for_write(config_path)?;
+    let cfg = load_for_resolution_locked(&guard, config_path)?;
     let cfg = &cfg;
 
     // Confirm the master entry exists. NotFound is an Ok variant (the
@@ -1340,7 +1406,12 @@ pub(crate) async fn remove_admin_rule_by_id(
 
     for device in &cfg.devices {
         if device.allow_rules.iter().any(|id| id.as_str() == rule_id) {
-            let res = resolve_scope_target(config_path, &Scope::Device(device.id.as_str()), None)?;
+            let res = resolve_scope_target_locked(
+                &guard,
+                config_path,
+                &Scope::Device(device.id.as_str()),
+                None,
+            )?;
             drops.push(PendingRefDrop {
                 file_path: res.file_path.clone(),
                 resolution: res,
@@ -1348,7 +1419,12 @@ pub(crate) async fn remove_admin_rule_by_id(
             });
         }
         if device.deny_rules.iter().any(|id| id.as_str() == rule_id) {
-            let res = resolve_scope_target(config_path, &Scope::Device(device.id.as_str()), None)?;
+            let res = resolve_scope_target_locked(
+                &guard,
+                config_path,
+                &Scope::Device(device.id.as_str()),
+                None,
+            )?;
             drops.push(PendingRefDrop {
                 file_path: res.file_path.clone(),
                 resolution: res,
@@ -1358,8 +1434,12 @@ pub(crate) async fn remove_admin_rule_by_id(
     }
     for (profile_id, profile) in &cfg.profiles {
         if profile.admin_rules.iter().any(|id| id.as_str() == rule_id) {
-            let res =
-                resolve_scope_target(config_path, &Scope::Profile(profile_id.as_str()), None)?;
+            let res = resolve_scope_target_locked(
+                &guard,
+                config_path,
+                &Scope::Profile(profile_id.as_str()),
+                None,
+            )?;
             drops.push(PendingRefDrop {
                 file_path: res.file_path.clone(),
                 resolution: res,
@@ -1382,15 +1462,16 @@ pub(crate) async fn remove_admin_rule_by_id(
     // master also loses the [[admin_rules]] row and must be promoted LAST
     // (references-before-row: no entity may still point at the row at the
     // instant it's removed). The whole batch is validated before any rename.
-    let master = config_path.to_path_buf();
+    let master_target = guarded_master_locked(&guard, config_path)?;
+    let master = master_target.display().to_path_buf();
     let mut writes: Vec<StagedWrite> = Vec::new();
     let mut master_write: Option<StagedWrite> = None;
     for (file_path, file_drops) in &by_file {
-        let (mut doc, _) = read_or_empty(file_path)?;
+        let (mut doc, _) = read_or_empty_locked(&guard, config_path, file_path)?;
         for d in file_drops {
             remove_entity_reference(&mut doc, &d.resolution, d.action, rule_id)?;
         }
-        if file_path == &master {
+        if master_target.matches_path(&guard, file_path)? {
             // Master drops its own refs AND the row, in one slice, last.
             drop_admin_rule_row(&mut doc, rule_id)?;
             master_write = Some(StagedWrite {
@@ -1411,7 +1492,7 @@ pub(crate) async fn remove_admin_rule_by_id(
     match master_write {
         Some(sw) => writes.push(sw),
         None => {
-            let (mut doc, _) = read_or_empty(&master)?;
+            let (mut doc, _) = read_or_empty_locked(&guard, config_path, &master)?;
             drop_admin_rule_row(&mut doc, rule_id)?;
             writes.push(StagedWrite {
                 final_path: master.clone(),
@@ -1420,7 +1501,8 @@ pub(crate) async fn remove_admin_rule_by_id(
             });
         }
     }
-    write_values_validated(&master, &writes)?;
+    write_values_validated_locked(&guard, &master, &writes)?;
+    drop(guard);
 
     let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
     Ok(RemoveByIdOutcome::Removed {
@@ -1442,12 +1524,11 @@ enum OverrideCheck {
     },
 }
 
-fn check_override_required(
-    config_path: &Path,
+fn check_override_required_in(
+    cfg: &ConfigV1,
     device_id: &str,
     canonical_domain: &str,
 ) -> anyhow::Result<OverrideCheck> {
-    let cfg = load_for_resolution(config_path)?;
     let device = cfg
         .devices
         .iter()
@@ -1456,7 +1537,7 @@ fn check_override_required(
 
     // No effective profile → nothing to conflict with. (Default profile
     // unset, no group, no direct profile.) Allow the write.
-    let Some(profile_id) = effective_profile_for_device(&cfg, device) else {
+    let Some(profile_id) = effective_profile_for_device(cfg, device) else {
         return Ok(OverrideCheck::Ok {
             override_used: false,
         });
@@ -1508,6 +1589,16 @@ fn check_override_required(
             device_id: device_id.to_string(),
         })
     }
+}
+
+fn check_override_required_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    device_id: &str,
+    canonical_domain: &str,
+) -> anyhow::Result<OverrideCheck> {
+    let cfg = load_for_resolution_locked(guard, config_path)?;
+    check_override_required_in(&cfg, device_id, canonical_domain)
 }
 
 // ── public CLI handlers ────────────────────────────────
@@ -1906,6 +1997,14 @@ fn master_last_admin_rule(master_doc: &Value) -> Option<(String, String)> {
 /// layouts are handled via a per-file walker, mirroring the cascade
 /// used elsewhere in this module.
 pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
+    let guard = acquire_for_write(config_path)?;
+    undo_inner_locked(&guard, config_path)
+}
+
+pub(crate) fn undo_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+) -> anyhow::Result<UndoOutcome> {
     // Pick the victim from the MASTER's own top-level
     // `[[admin_rules]]` tail. `add_inner` always appends the new row there,
     // so undo must pop from the same place add pushes. The merged view
@@ -1916,10 +2015,13 @@ pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
     // `[[admin_rules]]` of its own do we fall back to the merged tail (a
     // hand-authored slice-only layout — unreachable straight after a CLI
     // add, which writes the master).
-    let (master_doc, _) = read_or_empty(config_path)?;
+    let (master_doc, _) = read_or_empty_locked(guard, config_path, config_path)?;
     let (rule_id, rule_string) = match master_last_admin_rule(&master_doc) {
         Some(pair) => pair,
-        None => match load_for_resolution(config_path)?.admin_rules.last() {
+        None => match load_for_resolution_locked(guard, config_path)?
+            .admin_rules
+            .last()
+        {
             Some(r) => (r.id.as_str().to_string(), r.rule.clone()),
             None => return Ok(UndoOutcome::Empty),
         },
@@ -1940,14 +2042,15 @@ pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
     // referencing it) living under `includes = ["custom/*.toml"]` would
     // be invisible to a convention-based scan, so undo would remove the
     // master row and leave dangling references behind.
-    let all_files = target::owner_candidate_files(
+    let all_files = target::owner_candidate_files_locked(
+        guard,
         config_path,
         &[
             EntityClass::Profiles,
             EntityClass::Devices,
             EntityClass::AdminRules,
         ],
-    );
+    )?;
 
     // Stage the cascade: each touched file loses every reference to the rule
     // id (and `drop_rule_id_from_doc` also drops the [[admin_rules]] row from
@@ -1955,12 +2058,14 @@ pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
     // slice in a hand-authored layout). Partition so the row-bearing file
     // promotes LAST (references-before-row: no reference may outlive its
     // row). The whole batch is validated before any rename;
-    // `write_values_validated` owns the rollback.
-    let master = config_path.to_path_buf();
+    // The locked batch writer owns the rollback.
+    let master = guarded_master_locked(guard, config_path)?
+        .display()
+        .to_path_buf();
     let mut ref_writes: Vec<StagedWrite> = Vec::new();
     let mut row_writes: Vec<StagedWrite> = Vec::new();
     for path in &all_files {
-        let (mut doc, _) = match read_or_empty(path) {
+        let (mut doc, _) = match read_or_empty_locked(guard, config_path, path) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -1995,7 +2100,7 @@ pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
     let mut writes = ref_writes;
     writes.extend(row_writes);
     if !writes.is_empty() {
-        write_values_validated(&master, &writes)?;
+        write_values_validated_locked(guard, &master, &writes)?;
     }
 
     cascaded_profiles.sort();
@@ -2102,7 +2207,17 @@ pub(crate) fn prune_inner(
     device_id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<PruneOutcome> {
-    let cfg = load_for_resolution(config_path)?;
+    let guard = acquire_for_write(config_path)?;
+    prune_inner_locked(&guard, config_path, device_id, into)
+}
+
+pub(crate) fn prune_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    device_id: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<PruneOutcome> {
+    let cfg = load_for_resolution_locked(guard, config_path)?;
     let known_ids: HashSet<String> = cfg
         .admin_rules
         .iter()
@@ -2133,8 +2248,8 @@ pub(crate) fn prune_inner(
         return Ok(PruneOutcome::Clean);
     }
 
-    let entity_path = locate_device_file(config_path, device_id, into)?;
-    let (mut doc, _) = read_or_empty(&entity_path)?;
+    let entity_path = locate_device_file_locked(guard, config_path, device_id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &entity_path)?;
     let entry = find_device_entry_mut(&mut doc, device_id)?
         .ok_or_else(|| anyhow::anyhow!("device \"{device_id}\" not in document"))?;
     for id in &dangling_allow {
@@ -2146,7 +2261,7 @@ pub(crate) fn prune_inner(
     // Single-file prune: dropping dangling ids only makes the tree more
     // valid, but route through the pre-promote validator for one uniform
     // write path.
-    write_value_validated(config_path, &entity_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &entity_path, &doc)?;
 
     let after_n = before_n - dangling_allow.len() - dangling_deny.len();
     let mut dropped_ids = dangling_allow;

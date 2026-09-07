@@ -581,6 +581,19 @@ pub struct SortedShard {
     policy: Arc<ListPolicy>,
 }
 
+/// Test-only summary of one installed shard's allocation-relevant shape.
+///
+/// It deliberately contains no domain contents, and is compiled out of the
+/// production engine.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestShardMemoryShape {
+    pub(crate) entry_count: usize,
+    pub(crate) entry_size: usize,
+    pub(crate) heap_capacity: usize,
+    pub(crate) policy_generation: u64,
+}
+
 /// Reports shape, never contents.
 ///
 /// **Deliberately hand-written rather than `#[derive(Debug)]`.** A production
@@ -1215,6 +1228,37 @@ impl FilterEngine {
     #[must_use]
     pub fn new() -> Self {
         Self::from_shard_maps(std::array::from_fn(|_| SortedShard::empty()))
+    }
+
+    /// Return allocation-relevant installed-shard shapes for deterministic
+    /// tests. ArcSwap guards are reduced to plain values before returning.
+    #[cfg(test)]
+    pub(crate) fn memory_shapes_for_test(&self) -> Vec<TestShardMemoryShape> {
+        let mut shapes = Vec::with_capacity(DOMAIN_SHARDS);
+        for domain_shard in &self.shards {
+            let shape = {
+                let guard = domain_shard.0.load();
+                let shard: &SortedShard = &guard;
+                TestShardMemoryShape {
+                    entry_count: shard.entries.len(),
+                    entry_size: shard
+                        .entries
+                        .first()
+                        .map_or(std::mem::size_of::<(CompactString, u64)>(), |entry| {
+                            std::mem::size_of_val(entry)
+                        }),
+                    heap_capacity: shard
+                        .entries
+                        .iter()
+                        .filter(|(domain, _)| domain.is_heap_allocated())
+                        .map(|(domain, _)| domain.capacity())
+                        .sum(),
+                    policy_generation: shard.policy.gen_id(),
+                }
+            };
+            shapes.push(shape);
+        }
+        shapes
     }
 
     /// Create filter engine pre-loaded with a single-mask domain map.

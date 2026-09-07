@@ -14,8 +14,7 @@
 //! # Exit codes
 //!
 //! - [`SUCCESS`] — resolution succeeded (any level 1-5 matched).
-//! - [`FAILURE`](crate::cli::exit_codes::FAILURE) — the resolver could not be built (e.g. the list bitmap
-//!   failed to assemble). No verdict was reached.
+//! - [`FAILURE`](crate::cli::exit_codes::FAILURE) — resolution could not be completed. No verdict was reached.
 //! - [`CONFIG`] — config load failed (syntax / validation error).
 //! - [`NEGATIVE`] — the source IP is REFUSED: level 5 reached with
 //!   `server.default_profile` unset.
@@ -31,8 +30,6 @@ use std::path::Path;
 
 use crate::cli::exit_codes::{CONFIG, NEGATIVE, SUCCESS};
 use crate::config::loader;
-use crate::lists::manager::merge_sources_with_blocklists;
-use crate::lists::source_key::SourceBitMap;
 use crate::profiles::ProfileResolver;
 
 /// Run the offline resolver query. Returns a `Result<i32, anyhow::Error>`
@@ -56,11 +53,7 @@ pub fn run_resolve(config_path: &Path, ip: IpAddr) -> anyhow::Result<i32> {
         }
     };
 
-    let (merged_sources, _trust) =
-        merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-    let source_bits = SourceBitMap::build(&merged_sources, &loaded.config.blocklists)
-        .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
-    let resolver = ProfileResolver::build(&loaded.config, &source_bits, &loaded.custom_lists);
+    let resolver = ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
     let resolution = resolver.resolve(&ip);
 
     println!("Source IP:      {ip}");
@@ -223,11 +216,8 @@ mod tests {
     ) -> (crate::config::schema::ConfigV1, crate::profiles::Resolution) {
         let now = time::OffsetDateTime::now_utc();
         let loaded = loader::load_config(path, now).expect("test config should load");
-        let (merged_sources, _trust) =
-            merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-        let source_bits = SourceBitMap::build(&merged_sources, &loaded.config.blocklists)
-            .expect("test source bitmap should build");
-        let resolver = ProfileResolver::build(&loaded.config, &source_bits, &loaded.custom_lists);
+        let resolver =
+            ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
         let resolution = resolver.resolve(&ip);
         (loaded.config, resolution)
     }
@@ -254,7 +244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let code = run_resolve(&p, "10.0.0.1".parse().unwrap()).unwrap();
         assert_eq!(code, NEGATIVE);
@@ -266,7 +256,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let code = run_resolve(&p, "10.0.0.1".parse().unwrap()).unwrap();
@@ -282,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let refused = write_cfg(
             &dir,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let refused_code = run_resolve(&refused, "10.0.0.1".parse().unwrap()).unwrap();
 
@@ -310,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -345,15 +335,13 @@ mod tests {
     /// A tag-matching but `enabled = false` list must NOT appear:
     /// `list_applies` only checks tag intersection, not `enabled` (by
     /// design — `blocklist show`'s enforcement report needs the disabled
-    /// case too), and a disabled list never gets a source bit
-    /// (`merge_sources_with_blocklists` skips it), so it provably cannot
-    /// be part of what "actually resolves".
+    /// case too), but disabled lists are never active fetch sources.
     #[test]
     fn resolve_excludes_disabled_lists_even_when_tags_match() {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -387,7 +375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -425,7 +413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\
              lists = { tracking-block = \"ignore\" }\n\n\
@@ -455,7 +443,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"guest\"\ndisplay_name = \"Guest\"\n\

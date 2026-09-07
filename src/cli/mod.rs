@@ -477,6 +477,21 @@ pub enum TunnelingAction {
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
+    /// Migrate a schema-3 config tree in place to schema 4.
+    V3ToV4 {
+        /// Path to the schema-3 master config.
+        #[arg(long)]
+        from_config: PathBuf,
+        /// Validate the migration candidate without changing the config tree.
+        #[arg(long, conflicts_with_all = ["rollback", "finalize"])]
+        check: bool,
+        /// Restore the retained schema-3 rollback snapshot.
+        #[arg(long, conflicts_with_all = ["check", "finalize"])]
+        rollback: bool,
+        /// Validate schema 4 and discard the retained rollback snapshot.
+        #[arg(long, conflicts_with_all = ["check", "rollback"])]
+        finalize: bool,
+    },
     /// Translate the legacy single-file config into the v1 multi-file
     /// layout. Default output: split under `<target>/<entity>.d/` files.
     /// Use `--single-file` to emit one monolithic master instead.
@@ -588,6 +603,109 @@ pub enum MigrateAction {
     },
 }
 
+#[cfg(test)]
+mod migrate_v3_to_v4_cli_tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Commands, MigrateAction};
+
+    #[test]
+    fn v3_to_v4_requires_from_config_and_rejects_other_options() {
+        let parsed = Cli::try_parse_from([
+            "warden",
+            "migrate",
+            "v3-to-v4",
+            "--from-config",
+            "master.toml",
+        ])
+        .expect("v3-to-v4 form must parse");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Migrate {
+                action: MigrateAction::V3ToV4 {
+                    from_config,
+                    check: false,
+                    rollback: false,
+                    finalize: false,
+                }
+            }) if from_config.as_path() == std::path::Path::new("master.toml")
+        ));
+
+        for argv in [
+            vec!["warden", "migrate", "v3-to-v4"],
+            vec![
+                "warden",
+                "migrate",
+                "v3-to-v4",
+                "--from-config",
+                "master.toml",
+                "--force",
+            ],
+            vec![
+                "warden",
+                "migrate",
+                "v3-to-v4",
+                "--from-config",
+                "master.toml",
+                "--target",
+                "other.toml",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn v3_to_v4_parses_each_mode_and_rejects_combinations() {
+        for mode in ["--check", "--rollback", "--finalize"] {
+            assert!(Cli::try_parse_from([
+                "warden",
+                "migrate",
+                "v3-to-v4",
+                "--from-config",
+                "master.toml",
+                mode,
+            ])
+            .is_ok());
+        }
+
+        for modes in [
+            vec!["--check", "--rollback"],
+            vec!["--check", "--finalize"],
+            vec!["--rollback", "--finalize"],
+            vec!["--check", "--rollback", "--finalize"],
+        ] {
+            let mut argv = vec![
+                "warden",
+                "migrate",
+                "v3-to-v4",
+                "--from-config",
+                "master.toml",
+            ];
+            argv.extend(modes);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn v3_to_v4_help_names_modes_and_no_unsafe_options() {
+        let mut command = Cli::command();
+        let migrate = command
+            .find_subcommand_mut("migrate")
+            .expect("migrate command");
+        let action = migrate
+            .find_subcommand_mut("v3-to-v4")
+            .expect("v3-to-v4 command");
+        let help = action.render_long_help().to_string();
+        assert!(help.contains("v3-to-v4 [OPTIONS] --from-config <FROM_CONFIG>"));
+        assert!(help.contains("--check"));
+        assert!(help.contains("--rollback"));
+        assert!(help.contains("--finalize"));
+        assert!(!help.contains("--force"));
+        assert!(!help.contains("--target"));
+    }
+}
+
 #[derive(Subcommand)]
 pub enum ListsAction {
     /// Add a list source to configuration
@@ -615,12 +733,12 @@ pub enum ListsAction {
         value: String,
     },
     /// Re-download every subscribed list now and rebuild the filter.
-    /// Signals a running daemon over SIGHUP; with no daemon up, runs
-    /// the download in the foreground.
+    /// Requests a running daemon over authenticated IPC; with no daemon up,
+    /// runs the download in the foreground.
     ///
-    /// Exit code: 0 the refresh was triggered or completed (a foreground
-    /// download with no daemon running is still success) · 2 the config
-    /// could not be loaded.
+    /// Exit code: 0 only for a completed healthy cycle (a zero-source
+    /// foreground refresh is healthy) · 1 for a refused/degraded/unknown
+    /// cycle · 2 when the config could not be loaded.
     Refresh,
     /// Browse available purge.cc lists
     Catalog {
@@ -1303,8 +1421,8 @@ pub enum BlocklistAction {
         /// Update interval in hours. Default: 12.
         #[arg(long)]
         update_interval_hours: Option<u32>,
-        /// Entry cap recorded on this list. The daemon enforces the global
-        /// `[lists] max_entries` (default 20_000_000), not this value.
+        /// Schema-v4 per-list entry cap. It can narrow `[lists] max_entries`
+        /// but never exceed that global hard ceiling.
         #[arg(long)]
         max_entries: Option<u64>,
         /// Whether this list is active.

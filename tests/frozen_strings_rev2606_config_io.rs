@@ -13,7 +13,7 @@ use purge_warden::config::error::ConfigError;
 use purge_warden::config::loader::load_config;
 use time::macros::datetime;
 
-const BASE: &str = "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+const BASE: &str = "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
 
 fn errors_for(extra: &str) -> Vec<ConfigError> {
     let tmp = tempfile::tempdir().unwrap();

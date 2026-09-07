@@ -20,7 +20,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -246,6 +246,21 @@ fn archive_count(backup_dir: &Path) -> usize {
         .count()
 }
 
+fn private_archive_count(backup_dir: &Path) -> usize {
+    if !backup_dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(backup_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".warden-backup-")
+        })
+        .count()
+}
+
 /// tui-14, the headline regression and the exact mirror of
 /// `restore_confirm_hands_off_to_a_background_job`. `y` on the confirm card
 /// must RETURN with the backup still in flight. Before the fix the tar+gzip
@@ -323,12 +338,10 @@ async fn backup_confirm_hands_off_to_a_background_job() {
     );
 }
 
-/// The `Running` card owns the keyboard. A second `y` must not start a
-/// second `create_backup`: the TUI path takes no lock (unlike the
-/// `run_backup_managed` CLI path), so two archives could collide on the same
-/// second-granularity filename. Esc must not close the card either — the
-/// outcome is still coming, and `apply_job_result` would have nowhere to
-/// land it.
+/// The `Running` card owns the keyboard. The output lock serializes owners;
+/// swallowing keys is defense in depth against duplicate jobs and orphaned
+/// outcomes. Esc must not close the card either — the outcome is still coming,
+/// and `apply_job_result` would have nowhere to land it.
 #[tokio::test]
 async fn running_card_swallows_keys_and_starts_no_second_backup() {
     use backup_restore_modal::BackupModal;
@@ -367,5 +380,86 @@ async fn running_card_swallows_keys_and_starts_no_second_backup() {
         archive_count(&backup_dir),
         0,
         "a swallowed key must not write an archive"
+    );
+}
+
+#[tokio::test]
+async fn tui_backup_reports_common_output_contention() {
+    use backup_restore_modal::BackupModal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let backup_dir = crate::cli::commands::config::resolved_backup_dir(&master);
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let legacy_lock = b"99999:2026-05-28T11:59:30Z\n";
+    std::fs::write(backup_dir.join(".lock"), legacy_lock).unwrap();
+    let (mut app, mut rx) = app_with_backup_modal(BackupModal::Confirm {
+        dir: backup_dir.clone(),
+    });
+    app.settings.auto_backup = app::AutoBackupView {
+        last_archive: Some(time::OffsetDateTime::UNIX_EPOCH),
+        consecutive_failures: 7,
+        last_error: Some("stale cache".into()),
+        disabled: true,
+    };
+
+    handle_key(&mut app, key_char('y'), &dummy_poller(), &master).await;
+
+    let job = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .expect("the contention result must arrive through job_rx")
+        .expect("job channel open");
+    let app::UiJob::BackupFinished {
+        outcome,
+        auto_backup,
+    } = job
+    else {
+        panic!("expected UiJob::BackupFinished");
+    };
+    assert!(
+        matches!(&outcome, SubmitOutcome::Failed(msg) if msg.contains("backup in progress")),
+        "a held output lock must become a failed backup outcome: {outcome:?}"
+    );
+    let refreshed = auto_backup.expect("ordinary backup failures refresh the Settings view");
+    assert!(refreshed.last_archive.is_none());
+    assert_eq!(refreshed.consecutive_failures, 0);
+    assert!(refreshed.last_error.is_none());
+    assert!(!refreshed.disabled);
+
+    apply_job_result(
+        &mut app,
+        app::UiJob::BackupFinished {
+            outcome,
+            auto_backup: Some(refreshed),
+        },
+    );
+    match &app.settings.backup_modal {
+        Some(BackupModal::Submitted { msg, ok }) => {
+            assert!(!ok, "contention must land on the red submitted card");
+            assert!(msg.contains("backup in progress"), "got: {msg}");
+        }
+        other => panic!("applying contention must land the failed card, got {other:?}"),
+    }
+    assert!(app.settings.auto_backup.last_archive.is_none());
+    assert_eq!(app.settings.auto_backup.consecutive_failures, 0);
+    assert!(app.settings.auto_backup.last_error.is_none());
+    assert!(!app.settings.auto_backup.disabled);
+    assert_eq!(
+        archive_count(&backup_dir),
+        0,
+        "contention must write no archive"
+    );
+    assert_eq!(
+        private_archive_count(&backup_dir),
+        0,
+        "contention must write no private archive"
+    );
+    assert!(
+        !backup_dir.join(".auto_state").exists(),
+        "the direct TUI backup must not create scheduler state"
+    );
+    assert_eq!(
+        std::fs::read(backup_dir.join(".lock")).unwrap(),
+        legacy_lock
     );
 }

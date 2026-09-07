@@ -72,6 +72,168 @@ fn response_status_roundtrip() {
     assert_eq!(parsed, resp);
 }
 
+#[test]
+fn status_cycle_qualifiers_remain_wire_compatible() {
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    enum HistoricalCycleOutcome {
+        Installed,
+        Refused,
+        SpillRollbackFailed,
+        SkippedUnchanged,
+        ClearedNoSources,
+        ConfigRejected,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct HistoricalCycleMark {
+        seq: u64,
+        outcome: Option<HistoricalCycleOutcome>,
+    }
+
+    /// Every Status field that existed before CycleMark gained its qualifiers.
+    /// This mirrors a real older reader rather than accepting a
+    /// two-field projection that could hide an outer-wire regression.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum HistoricalResponse {
+        Status {
+            pid: u32,
+            listen: String,
+            upstream_mode: String,
+            upstream_count: usize,
+            domain_count: usize,
+            cache_entries: u64,
+            list_count: usize,
+            uptime_secs: u64,
+            query_log_drops: Option<crate::tracking::query_log::QueryLogDropSnapshot>,
+            version: String,
+            cache_cap: u64,
+            cache_weighted_size: u64,
+            lists_active: u32,
+            lists_total: u32,
+            lists_truncated: u32,
+            lists_corpus_refusal: Option<crate::lists::status::CorpusRefusal>,
+            lists_cycle: Option<HistoricalCycleMark>,
+            lists_corpus_freeze: Option<crate::lists::status::CorpusFreeze>,
+            lc2_list_diagnostics: ListDiagnostics,
+            resource_budget: Option<crate::resource_budget::ResourceBudgetSnapshot>,
+            upstream_servers: Vec<UpstreamServerInfo>,
+        },
+    }
+
+    let current = IpcResponse::Status {
+        pid: 1234,
+        listen: "127.0.0.1:15353".into(),
+        upstream_mode: "plain".into(),
+        upstream_count: 2,
+        upstream_servers: Vec::new(),
+        domain_count: 500_000,
+        cache_entries: 1234,
+        list_count: 3,
+        uptime_secs: 3600,
+        query_log_drops: None,
+        version: String::new(),
+        cache_cap: 0,
+        cache_weighted_size: 0,
+        lists_active: 0,
+        lists_total: 0,
+        lists_truncated: 0,
+        lists_corpus_refusal: None,
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 9,
+            outcome: Some(crate::lists::status::CycleOutcome::SpillRollbackFailed),
+            source_coverage_incomplete: true,
+            generation_degraded: true,
+            served_state: crate::lists::status::ServedState::Partial,
+        }),
+        lists_corpus_freeze: None,
+        lc2_list_diagnostics: ListDiagnostics::default(),
+        resource_budget: None,
+    };
+    let wire = serde_json::to_string(&current).unwrap();
+    match serde_json::from_str::<HistoricalResponse>(&wire).unwrap() {
+        HistoricalResponse::Status {
+            pid,
+            listen,
+            upstream_mode,
+            upstream_count,
+            domain_count,
+            cache_entries,
+            list_count,
+            uptime_secs,
+            query_log_drops,
+            version,
+            cache_cap,
+            cache_weighted_size,
+            lists_active,
+            lists_total,
+            lists_truncated,
+            lists_corpus_refusal,
+            lists_cycle,
+            lists_corpus_freeze,
+            lc2_list_diagnostics,
+            resource_budget,
+            upstream_servers,
+        } => {
+            assert_eq!(pid, 1234);
+            assert_eq!(listen, "127.0.0.1:15353");
+            assert_eq!(upstream_mode, "plain");
+            assert_eq!(upstream_count, 2);
+            assert_eq!(domain_count, 500_000);
+            assert_eq!(cache_entries, 1234);
+            assert_eq!(list_count, 3);
+            assert_eq!(uptime_secs, 3600);
+            assert!(query_log_drops.is_none());
+            assert_eq!(version, "");
+            assert_eq!(cache_cap, 0);
+            assert_eq!(cache_weighted_size, 0);
+            assert_eq!(lists_active, 0);
+            assert_eq!(lists_total, 0);
+            assert_eq!(lists_truncated, 0);
+            assert!(lists_corpus_refusal.is_none());
+            let cycle = lists_cycle.expect("old status reader lost nested cycle");
+            assert_eq!(cycle.seq, 9);
+            assert_eq!(
+                cycle.outcome,
+                Some(HistoricalCycleOutcome::SpillRollbackFailed)
+            );
+            assert!(lists_corpus_freeze.is_none());
+            assert_eq!(lc2_list_diagnostics, ListDiagnostics::default());
+            assert!(resource_budget.is_none());
+            assert!(upstream_servers.is_empty());
+        }
+    }
+
+    const HISTORICAL_STATUS_PAYLOAD: &str = r#"{"type":"status","pid":5678,"listen":"[::1]:53","upstream_mode":"doh","upstream_count":1,"domain_count":42,"cache_entries":17,"list_count":4,"uptime_secs":99,"query_log_drops":null,"version":"0.8.0","cache_cap":100,"cache_weighted_size":10,"lists_active":3,"lists_total":4,"lists_truncated":1,"lists_corpus_refusal":null,"lists_cycle":{"seq":8,"outcome":"installed"},"lists_corpus_freeze":null,"lc2_list_diagnostics":{"active":0,"pending":0,"failed":0,"stale_over_7d":0},"resource_budget":null,"upstream_servers":[]}"#;
+    match serde_json::from_str::<IpcResponse>(HISTORICAL_STATUS_PAYLOAD).unwrap() {
+        IpcResponse::Status {
+            pid,
+            lists_cycle:
+                Some(crate::lists::status::CycleMark {
+                    seq,
+                    outcome,
+                    source_coverage_incomplete,
+                    generation_degraded,
+                    served_state,
+                }),
+            ..
+        } => {
+            assert_eq!(pid, 5678);
+            assert_eq!(seq, 8);
+            assert_eq!(outcome, Some(crate::lists::status::CycleOutcome::Installed));
+            assert!(!source_coverage_incomplete);
+            assert!(!generation_degraded);
+            assert_eq!(
+                served_state,
+                crate::lists::status::ServedState::Unknown,
+                "an absent historical qualifier must not infer served state from a count"
+            );
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
 /// T2.9 / H-20: a pre-T2.9 daemon's `Status` payload (without
 /// `query_log_drops`) must still decode into the new struct shape
 /// thanks to `#[serde(default)]`. Pins the wire-back-compat
@@ -335,6 +497,43 @@ fn forget_list_command_and_response_serde_round_trip() {
 }
 
 #[test]
+fn force_list_refresh_wire_shape_is_frozen() {
+    let command = IpcCommand::ForceListRefresh { token: None };
+    assert_eq!(
+        serde_json::to_string(&command).unwrap(),
+        r#"{"type":"force_list_refresh"}"#
+    );
+    assert_eq!(command.tier(), CommandTier::Mutating);
+    assert_eq!(command.with_token(Some("tok".into())).token(), Some("tok"));
+
+    let response = IpcResponse::ListRefreshCompleted {
+        disposition: crate::lists::manager::ListManagerCommandDisposition::Started,
+        snapshot: ListRegistrySnapshotDto {
+            rows: vec![ListRegistryRowDto {
+                source: "example".into(),
+                status: crate::lists::status::ListStatus::default(),
+            }],
+            corpus_refusal: None,
+            corpus_freeze: None,
+            domain_count: 7,
+            cycle: crate::lists::status::CycleMark {
+                seq: 3,
+                outcome: Some(crate::lists::status::CycleOutcome::Installed),
+                source_coverage_incomplete: false,
+                generation_degraded: false,
+                served_state: crate::lists::status::ServedState::Complete,
+            },
+        },
+        max_total_domains: Some(10),
+    };
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(wire.starts_with(r#"{"type":"list_refresh_completed","disposition":"started","snapshot":{"rows":[{"source":"example","status":"#));
+    assert!(wire.ends_with(r#"},"max_total_domains":10}"#));
+    let decoded: IpcResponse = serde_json::from_str(&wire).unwrap();
+    assert_eq!(decoded, response);
+}
+
+#[test]
 fn response_domain_count_roundtrip() {
     let resp = IpcResponse::DomainCount { count: 123456 };
     let json = serde_json::to_string(&resp).unwrap();
@@ -349,6 +548,7 @@ fn all_command_variants_deserialize() {
         r#"{"type":"query","domain":"test.com"}"#,
         r#"{"type":"cache_flush","domain":null}"#,
         r#"{"type":"reload"}"#,
+        r#"{"type":"force_list_refresh"}"#,
         r#"{"type":"shutdown"}"#,
         r#"{"type":"domain_count"}"#,
         r#"{"type":"tracking_stats"}"#,

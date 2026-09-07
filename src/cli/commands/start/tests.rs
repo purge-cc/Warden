@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::BTreeMap;
+
 use crate::config::schema::{ConfigV1, Profile};
 use crate::config::settings::DnssecMode;
 
@@ -10,8 +12,8 @@ fn wiring_blocklist(id: &str, url: &str, enabled: bool) -> crate::config::schema
         display_name: id.to_string(),
         url: url.to_string(),
         format: crate::config::schema::BlocklistFormat::Hosts,
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled,
         auth_token_ref: None,
         base: crate::config::schema::BlocklistBase::Deny,
@@ -32,7 +34,14 @@ fn build_source_maps_keys_every_shape_a_source_arrives_in() {
         "https://lists.example.test/tracking.txt",
         true,
     )];
-    let (by_source, formats) = build_source_maps(&lists);
+    let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+        &crate::lists::catalog::Catalog::fallback(),
+        &[],
+        &lists,
+        &BTreeMap::new(),
+    )
+    .expect("source plan");
+    let (by_source, formats, caps) = plan.manager_source_maps();
 
     let id = crate::config::schema::Id::new("privacy-tracking").unwrap();
     for key in [
@@ -50,6 +59,7 @@ fn build_source_maps_keys_every_shape_a_source_arrives_in() {
             Some(&crate::lists::detector::ListFormat::Hosts),
             "{key} must carry the declared parse format"
         );
+        assert_eq!(caps.get(key), Some(&20_000_000));
     }
 }
 
@@ -62,7 +72,14 @@ fn build_source_maps_omits_undeclared_formats_and_disabled_rows() {
     let mut plain = wiring_blocklist("ads-basic", "https://lists.example.test/ads.txt", true);
     plain.format = crate::config::schema::BlocklistFormat::Domains;
     let off = wiring_blocklist("ads-off", "https://lists.example.test/off.txt", false);
-    let (by_source, formats) = build_source_maps(&[plain, off]);
+    let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+        &crate::lists::catalog::Catalog::fallback(),
+        &[],
+        &[plain, off],
+        &BTreeMap::new(),
+    )
+    .expect("source plan");
+    let (by_source, formats, caps) = plan.manager_source_maps();
 
     assert!(by_source.contains_key("https://lists.example.test/ads.txt"));
     assert!(
@@ -73,17 +90,74 @@ fn build_source_maps_omits_undeclared_formats_and_disabled_rows() {
         !by_source.contains_key("https://lists.example.test/off.txt"),
         "a disabled row is never refreshed and must not be mapped"
     );
+    assert_eq!(
+        caps.get("https://lists.example.test/ads.txt"),
+        Some(&20_000_000)
+    );
+}
+
+#[test]
+fn declared_empty_plan_is_rejected_but_partial_and_operator_empty_plans_are_not() {
+    let catalog =
+        crate::lists::catalog::Catalog::from_entries(vec![crate::lists::catalog::CatalogEntry {
+            scope: "team".to_string(),
+            topic: Some("live".to_string()),
+            name: "Live".to_string(),
+            url: "https://lists.test/live.txt".to_string(),
+            entries: 1,
+            updated_at: String::new(),
+            format: crate::config::schema::BlocklistFormat::Domains,
+        }]);
+    let mut partial_config = ConfigV1::test_scaffold();
+    partial_config.lists.sources = vec!["team/live".to_string(), "team/orphan".to_string()];
+    let partial = ResolvedSourcePlan::build(
+        &catalog,
+        &partial_config.lists.sources,
+        &partial_config.blocklists,
+        &partial_config.profiles,
+    )
+    .unwrap();
+    assert!(
+        !rejects_declared_empty_plan(&partial_config, &partial),
+        "an unmatched legacy source retains its warning-only compatibility while another source is usable"
+    );
+
+    let mut broken_config = ConfigV1::test_scaffold();
+    broken_config.lists.sources = vec!["team/orphan".to_string()];
+    let broken = ResolvedSourcePlan::build(
+        &catalog,
+        &broken_config.lists.sources,
+        &broken_config.blocklists,
+        &broken_config.profiles,
+    )
+    .unwrap();
+    assert!(broken.is_empty());
+    assert!(
+        rejects_declared_empty_plan(&broken_config, &broken),
+        "a catalog outage or empty catalog must not clear a live generation"
+    );
+
+    let empty_config = ConfigV1::test_scaffold();
+    assert!(
+        !rejects_declared_empty_plan(&empty_config, &ResolvedSourcePlan::default()),
+        "only a genuinely empty configuration may request ClearedNoSources"
+    );
 }
 
 fn wiring_for(config: &ConfigV1, config_path: &Path, wb: ListStateWriteback) -> ManagerWiring {
-    let sources: Vec<String> = config.blocklists.iter().map(|b| b.url.clone()).collect();
-    let bits = crate::lists::source_key::SourceBitMap::build(&sources, &config.blocklists)
-        .expect("bit assignment");
+    let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+        &crate::lists::catalog::Catalog::fallback(),
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+    )
+    .expect("source plan");
+    let bits = crate::lists::source_key::SourceBitMap::from_plan(&plan).expect("bit assignment");
     let masks = bits.project_policy(&config.blocklists, &config.profiles);
     ManagerWiring::from_config(
         config,
         config_path,
-        crate::lists::source_key::SourceTrustMap::build(&config.blocklists),
+        &plan,
         config_path.parent().unwrap().to_path_buf(),
         masks,
         wb,
@@ -118,8 +192,12 @@ fn manager_wiring_derives_every_field_from_config() {
         max_total_domains,
         source_to_blocklist,
         source_to_format,
+        source_to_max_entries,
         list_state,
         list_state_path: state_path,
+        schedule_state,
+        schedule_state_path,
+        schedule_state_allows_legacy_seed,
     } = wiring_for(&config, &config_path, ListStateWriteback::Persist);
 
     assert!(shrink_guard_enabled);
@@ -127,11 +205,89 @@ fn manager_wiring_derives_every_field_from_config() {
     assert_eq!(max_total_domains, 4_242_424);
     assert!(!source_to_blocklist.is_empty(), "token fallback needs this");
     assert!(!source_to_format.is_empty(), "parse dispatch needs this");
+    assert!(
+        !source_to_max_entries.is_empty(),
+        "per-source caps need this"
+    );
     assert_eq!(state_path, Some(list_state_path(&config_path)));
+    assert!(schedule_state.schedules.is_empty());
+    assert_eq!(
+        schedule_state_path,
+        Some(list_schedule_state_path(&config_path))
+    );
+    assert!(schedule_state_allows_legacy_seed);
     assert_eq!(bridge_config_dir.as_path(), dir.path());
     // Bound so the pattern stays exhaustive; these carry no cheap
     // assertion of their own.
     let _ = (source_trust, policy_masks, list_state);
+}
+
+#[test]
+fn corrupt_schedule_sidecar_suppresses_compatibility_seeding() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let schedule_path = list_schedule_state_path(&config_path);
+    std::fs::create_dir_all(schedule_path.parent().unwrap()).unwrap();
+    std::fs::write(&schedule_path, "[schedules.bad]\noutcome = \"success\"\n").unwrap();
+
+    let wiring = wiring_for(
+        &ConfigV1::test_scaffold(),
+        &config_path,
+        ListStateWriteback::Persist,
+    );
+
+    assert!(wiring.schedule_state.schedules.is_empty());
+    assert!(!wiring.schedule_state_allows_legacy_seed);
+}
+
+#[test]
+fn schema4_row_cap_reaches_manager_through_shared_wiring() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let mut config = ConfigV1::test_scaffold();
+    config.schema_version = 4;
+    config.lists.max_entries = 10;
+    let mut row = wiring_blocklist("ads", "https://lists.example.test/ads.txt", true);
+    row.max_entries = Some(3);
+    config.blocklists = vec![row];
+    let plan = crate::lists::source_key::ResolvedSourcePlan::build_for_schema(
+        &crate::lists::catalog::Catalog::fallback(),
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    )
+    .unwrap();
+    let bits = crate::lists::source_key::SourceBitMap::from_plan(&plan).unwrap();
+    let masks = bits.project_policy(&config.blocklists, &config.profiles);
+    let mut mgr = crate::lists::manager::ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        std::sync::Arc::new(crate::filter::FilterEngine::new()),
+        plan.clone(),
+        std::time::Duration::from_secs(3600),
+        bits,
+        crate::lists::source_key::SourceTokenMap::default(),
+        config.lists.max_body_bytes,
+        config.lists.max_entries,
+        None,
+    );
+    ManagerWiring::from_config(
+        &config,
+        &config_path,
+        &plan,
+        dir.path().to_path_buf(),
+        masks,
+        ListStateWriteback::ReadOnly,
+    )
+    .apply(&mut mgr);
+    assert_eq!(
+        mgr.source_max_entries_for("https://lists.example.test/ads.txt"),
+        3
+    );
 }
 
 /// The foreground refresh reads list state but must not write it
@@ -170,6 +326,7 @@ fn shared_manager_setters_have_exactly_one_call_site() {
         "max_total_domains",
         "source_blocklist_map",
         "source_format_map",
+        "source_max_entries",
         "list_state",
     ] {
         // Assembled at runtime so the needle cannot match itself in
@@ -318,7 +475,7 @@ fn check_dnssec_build_accepts_mode_when_feature_on() {
 #[test]
 fn profiles_with_empty_lists_pinned_to_sprint_a_stub() {
     let mut config = ConfigV1::test_scaffold();
-    config.schema_version = 3;
+    config.schema_version = 4;
     config.profiles.insert("default".into(), Profile::default());
     config.profiles.insert("kids".into(), Profile::default());
 
@@ -485,7 +642,7 @@ fn write_reload_master(dir: &Path) -> PathBuf {
     let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
          [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"default\"\n\
          allow_from = [\"10.0.0.0/24\"]\n\n\
          [api]\ntoken_hash = \"NEWHASH\"\n\n\
@@ -522,8 +679,10 @@ async fn reload_rejected_secrets_leaves_token_hash_unchanged() {
     let filter = Arc::new(FilterEngine::new());
     let audit_writer = AuditWriter::open(dir.path().join("audit.log")).unwrap();
     let (notification_tx, _rx) = tokio::sync::broadcast::channel(8);
-    let list_cmd_tx_swap = Arc::new(arc_swap::ArcSwap::from_pointee(None));
-    let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let list_cmd_tx_swap = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+    ));
+    let mut refresh_handle: Option<crate::lists::manager::ListManagerTask> = None;
     let mut current_files: Vec<PathBuf> = Vec::new();
     let mut current_hash: Option<String> = None;
 
@@ -547,7 +706,8 @@ async fn reload_rejected_secrets_leaves_token_hash_unchanged() {
         std::marker::PhantomData,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         api_token_hash.load_full().as_ref(),
@@ -581,8 +741,10 @@ async fn reload_accepted_rotates_token_hash() {
     let filter = Arc::new(FilterEngine::new());
     let audit_writer = AuditWriter::open(dir.path().join("audit.log")).unwrap();
     let (notification_tx, _rx) = tokio::sync::broadcast::channel(8);
-    let list_cmd_tx_swap = Arc::new(arc_swap::ArcSwap::from_pointee(None));
-    let mut refresh_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let list_cmd_tx_swap = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+    ));
+    let mut refresh_handle: Option<crate::lists::manager::ListManagerTask> = None;
     let mut current_files: Vec<PathBuf> = Vec::new();
     let mut current_hash: Option<String> = None;
 
@@ -606,7 +768,8 @@ async fn reload_accepted_rotates_token_hash() {
         std::marker::PhantomData,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         api_token_hash.load_full().as_ref(),
@@ -624,6 +787,131 @@ async fn reload_accepted_rotates_token_hash() {
         1,
         "reloaded ACL must carry the single configured CIDR"
     );
+}
+
+#[cfg(not(feature = "cluster"))]
+#[tokio::test]
+async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config_path, _) = load_fixture(
+        dir.path(),
+        &gate_master("[\"https://lists.example.invalid/a.txt\"]", 100_000, false),
+    );
+    // The local proxy rejects catalog traffic; the injected worker must panic
+    // before any list request, and the test never reaches a public network.
+    let (addr, _) = spawn_connection_counter();
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{addr}")).unwrap())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let filter = Arc::new(FilterEngine::new());
+    let mut old_manager = ListManager::new(
+        client.clone(),
+        filter.clone(),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        SourceBitMap::default(),
+        1024,
+        1000,
+        None,
+    );
+    let (old_tx, old_rx) = mpsc::channel(8);
+    old_manager.set_command_channel(old_rx);
+    let mut refresh_handle = Some(old_manager.spawn_refresh_loop_after_refresh());
+    let endpoint = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::running(old_tx.clone()),
+    ));
+    let mut fingerprint = None;
+    let audit_path = dir.path().join("audit.log");
+    let audit_writer = AuditWriter::open(audit_path.clone()).unwrap();
+    let mut files = vec![config_path.clone()];
+    let mut hash = Some("last-complete-config".to_string());
+    let attempted_hash = audit::tree_hash(collect_loaded_files(&config_path).iter()).unwrap();
+    let token_hash = Arc::new(arc_swap::ArcSwap::from_pointee(None));
+    let acl = Arc::new(arc_swap::ArcSwapOption::empty());
+    let registry = Arc::new(ListStatusRegistry::new(&[]));
+    let (notifications, _) = tokio::sync::broadcast::channel(8);
+    let (_shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let (reload_tx, mut reload_rx) = mpsc::channel(1);
+    reload_tx.send(Some(1234)).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        PANIC_RELOAD_WORKER.scope(
+            true,
+            signal_loop(
+                &config_path,
+                &client,
+                &filter,
+                None,
+                &mut refresh_handle,
+                &mut fingerprint,
+                false,
+                &mut shutdown_rx,
+                &mut reload_rx,
+                &audit_writer,
+                &mut files,
+                &mut hash,
+                &token_hash,
+                &acl,
+                None,
+                Some(&registry),
+                &notifications,
+                &endpoint,
+                std::marker::PhantomData,
+                None,
+                &mut None,
+            ),
+        ),
+    )
+    .await
+    .expect("fatal reload must exit the signal loop");
+    let error = result.expect_err("worker panic must trigger daemon teardown");
+    assert!(error
+        .to_string()
+        .contains("fatal reload replacement list worker failure"));
+    assert!(error
+        .downcast_ref::<tokio::task::JoinError>()
+        .unwrap()
+        .is_panic());
+    assert!(refresh_handle.is_none());
+    assert!(old_tx.is_closed());
+    assert!(fingerprint.is_none());
+    assert!(matches!(
+        endpoint.load().as_ref(),
+        ListManagerEndpoint::Transitioning
+    ));
+    assert!(
+        hash.is_none(),
+        "a half-applied config has no known live tree hash"
+    );
+    assert_eq!(registry.cycle().seq, 0);
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record["event"], "reload");
+    assert_eq!(record["result"], "rejected");
+    assert_eq!(record["uid"], 1234);
+    assert_eq!(record["pre_hash"], "last-complete-config");
+    assert!(record["post_hash"].is_null());
+    assert!(record["errors"][0]
+        .as_str()
+        .unwrap()
+        .contains(&attempted_hash));
+    assert!(record["errors"][0]
+        .as_str()
+        .unwrap()
+        .contains("partially applied"));
+    assert!(record["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == config_path.to_str().unwrap()));
 }
 
 // ── reload-gate (incident 2026-07-27 F2) ────────────────────────
@@ -665,7 +953,7 @@ fn gate_master(sources: &str, max_entries: u64, extra_allow: bool) -> String {
         "[\"allow-one\"]"
     };
     format!(
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
          [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"default\"\n\n\
          [lists]\nsources = {sources}\nmax_entries = {max_entries}\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\n\n\
@@ -715,7 +1003,7 @@ fn the_boot_resolver_carries_the_custom_list_store() {
     use compact_str::CompactString;
 
     let mut config = crate::config::schema::ConfigV1 {
-        schema_version: 3,
+        schema_version: 4,
         ..Default::default()
     };
     config.profiles.insert(
@@ -737,7 +1025,7 @@ fn the_boot_resolver_carries_the_custom_list_store() {
         },
     );
 
-    let resolver = build_profile_resolver(&config, &SourceBitMap::default(), &store);
+    let resolver = build_profile_resolver(&config, &store);
     let rp = resolver
         .default_profile()
         .expect("default_profile must resolve to kids");
@@ -770,7 +1058,7 @@ fn a_custom_list_edit_does_not_invalidate_the_list_fingerprint() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
          [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"kids\"\n\n\
          [lists]\nsources = [\"https://lists.example.invalid/a.txt\"]\n\n\
          [[custom_lists]]\nid = \"minecraft\"\n\n\
@@ -840,6 +1128,90 @@ fn lists_fingerprint_changes_when_a_source_is_added() {
         ListsFingerprint::from_config(&cfg_b, &secrets, &after),
         "a new list source must invalidate the fingerprint"
     );
+}
+
+#[test]
+fn lists_fingerprint_changes_when_only_exact_catalog_fetch_url_changes() {
+    let mut config = ConfigV1::test_scaffold();
+    config.lists.sources = vec!["privacy/ads".to_string()];
+    let entry = |url: &str| crate::lists::catalog::CatalogEntry {
+        scope: "privacy".to_string(),
+        topic: Some("ads".to_string()),
+        name: "Ads".to_string(),
+        url: url.to_string(),
+        entries: 1,
+        updated_at: String::new(),
+        format: crate::config::schema::BlocklistFormat::Domains,
+    };
+    let first = crate::lists::catalog::Catalog::from_entries(vec![entry(
+        "https://LISTS.example.test:443/ads.txt/",
+    )]);
+    let second = crate::lists::catalog::Catalog::from_entries(vec![entry(
+        "https://lists.example.test/ads.txt",
+    )]);
+    let first_plan = ResolvedSourcePlan::build(
+        &first,
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+    )
+    .unwrap();
+    let second_plan = ResolvedSourcePlan::build(
+        &second,
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+    )
+    .unwrap();
+    assert_eq!(
+        first_plan.sources().next().unwrap().canonical_url(),
+        second_plan.sources().next().unwrap().canonical_url(),
+        "precondition: these URLs differ only in canonical-equivalent bytes"
+    );
+    let secrets = crate::config::secrets::Secrets::default();
+    let dir = tempfile::tempdir().unwrap();
+    let live = ListsFingerprint::compute(
+        &config,
+        &first_plan,
+        &SourceTokenMap::from_plan(&first_plan, &secrets),
+        dir.path(),
+    );
+    let reloaded = ListsFingerprint::compute(
+        &config,
+        &second_plan,
+        &SourceTokenMap::from_plan(&second_plan, &secrets),
+        dir.path(),
+    );
+    assert_ne!(live, reloaded);
+    assert!(!should_reuse_live_lists(true, Some(&live), &reloaded));
+}
+
+#[test]
+fn lists_fingerprint_changes_when_only_a_profile_override_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut before = ConfigV1::test_scaffold();
+    before.blocklists = vec![wiring_blocklist(
+        "privacy-ads",
+        "https://lists.example.test/ads.txt",
+        true,
+    )];
+    before.profiles.insert(
+        "default".into(),
+        Profile {
+            display_name: "Default".into(),
+            ..Default::default()
+        },
+    );
+    let mut after = before.clone();
+    after.profiles.get_mut("default").unwrap().lists.insert(
+        crate::config::schema::Id::new("privacy-ads").unwrap(),
+        crate::config::schema::ListPolicy::Allow,
+    );
+    let secrets = crate::config::secrets::Secrets::default();
+    let live = ListsFingerprint::from_config(&before, &secrets, dir.path());
+    let reloaded = ListsFingerprint::from_config(&after, &secrets, dir.path());
+    assert_ne!(live, reloaded);
+    assert!(!should_reuse_live_lists(true, Some(&live), &reloaded));
 }
 
 /// Trap #1 of the incident brief: `lists.max_entries` changes what
@@ -921,7 +1293,7 @@ fn lists_fingerprint_changes_when_only_max_total_domains_changes() {
 #[cfg(not(feature = "cluster"))]
 fn local_source_master(list_id: &str) -> String {
     format!(
-        "schema_version = 3\n\n\
+        "schema_version = 4\n\n\
          [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"default\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\n\n\
          [[blocklists]]\nid = \"{list_id}\"\ndisplay_name = \"Local\"\n\
@@ -1053,6 +1425,119 @@ fn reuse_gate_rebuilds_when_the_pipeline_inputs_moved() {
     );
 }
 
+#[test]
+fn fingerprint_uses_resolved_row_cap_mode_and_effective_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = crate::config::secrets::Secrets::default();
+    let mut v3 = ConfigV1::test_scaffold();
+    v3.schema_version = 3;
+    v3.lists.max_entries = 10;
+    v3.blocklists = vec![wiring_blocklist(
+        "ads",
+        "https://lists.example.test/ads.txt",
+        true,
+    )];
+    v3.blocklists[0].max_entries = Some(5);
+    let mut v3_changed = v3.clone();
+    v3_changed.blocklists[0].max_entries = Some(4);
+    assert_eq!(
+        ListsFingerprint::from_config(&v3, &secrets, dir.path()),
+        ListsFingerprint::from_config(&v3_changed, &secrets, dir.path()),
+        "schema 3 resolves both rows to the inherited global cap"
+    );
+
+    let mut v4 = v3;
+    v4.schema_version = 4;
+    let mut v4_changed = v4.clone();
+    v4_changed.blocklists[0].max_entries = Some(4);
+    assert_ne!(
+        ListsFingerprint::from_config(&v4, &secrets, dir.path()),
+        ListsFingerprint::from_config(&v4_changed, &secrets, dir.path()),
+        "an honored row cap is parser input and must rebuild"
+    );
+}
+
+#[test]
+fn schema3_fingerprint_ignores_row_update_interval_hours() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = crate::config::secrets::Secrets::default();
+    let mut configured = ConfigV1::test_scaffold();
+    configured.schema_version = 3;
+    configured.blocklists = vec![wiring_blocklist(
+        "ads",
+        "https://lists.example.test/ads.txt",
+        true,
+    )];
+    configured.blocklists[0].update_interval_hours = Some(1);
+    let mut changed = configured.clone();
+    changed.blocklists[0].update_interval_hours = Some(24);
+
+    assert_eq!(
+        ListsFingerprint::from_config(&configured, &secrets, dir.path()),
+        ListsFingerprint::from_config(&changed, &secrets, dir.path()),
+        "schema 3 row cadence is modeled but not yet consumed by the runtime"
+    );
+}
+
+#[test]
+fn fingerprint_compares_effective_cadence_not_schema_control_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = crate::config::secrets::Secrets::default();
+    let mut schema3 = ConfigV1::test_scaffold();
+    schema3.schema_version = 3;
+    schema3.lists.update_interval_secs = 7_200;
+    schema3.blocklists = vec![wiring_blocklist(
+        "ads",
+        "https://lists.example.test/ads.txt",
+        true,
+    )];
+    schema3.blocklists[0].update_interval_hours = Some(1);
+
+    let mut schema4_equivalent = schema3.clone();
+    schema4_equivalent.schema_version = 4;
+    schema4_equivalent.blocklists[0].update_interval_hours = Some(2);
+    assert_eq!(
+        ListsFingerprint::from_config(&schema3, &secrets, dir.path()),
+        ListsFingerprint::from_config(&schema4_equivalent, &secrets, dir.path()),
+        "equal resolved cadence vectors must reuse across schema controls"
+    );
+
+    let mut schema4_changed = schema4_equivalent.clone();
+    schema4_changed.blocklists[0].update_interval_hours = Some(1);
+    assert_ne!(
+        ListsFingerprint::from_config(&schema4_equivalent, &secrets, dir.path()),
+        ListsFingerprint::from_config(&schema4_changed, &secrets, dir.path()),
+        "a schema-4 effective cadence change must rebuild"
+    );
+}
+
+#[test]
+fn fingerprint_keeps_effective_cadence_in_fixed_source_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = crate::config::secrets::Secrets::default();
+    let mut config = ConfigV1::test_scaffold();
+    config.schema_version = 4;
+    config.lists.sources = vec![
+        "https://lists.example.test/one.txt".to_string(),
+        "https://lists.example.test/two.txt".to_string(),
+    ];
+    config.blocklists = vec![
+        wiring_blocklist("one", "https://lists.example.test/one.txt", true),
+        wiring_blocklist("two", "https://lists.example.test/two.txt", true),
+    ];
+    config.blocklists[0].update_interval_hours = Some(1);
+    config.blocklists[1].update_interval_hours = Some(2);
+    let mut swapped = config.clone();
+    swapped.blocklists[0].update_interval_hours = Some(2);
+    swapped.blocklists[1].update_interval_hours = Some(1);
+
+    assert_ne!(
+        ListsFingerprint::from_config(&config, &secrets, dir.path()),
+        ListsFingerprint::from_config(&swapped, &secrets, dir.path()),
+        "fixed source identities with swapped cadence assignments must rebuild"
+    );
+}
+
 /// With no live refresh loop there is no live `ListManager` to
 /// reuse, so a matching fingerprint must NOT be enough to skip.
 /// Fail-safe direction: when in doubt, rebuild.
@@ -1081,6 +1566,20 @@ fn reuse_gate_rebuilds_when_no_live_refresh_loop_exists() {
     assert!(
         !should_reuse_live_lists(true, None, &fp),
         "an unseeded fingerprint must rebuild"
+    );
+}
+
+/// A controller that has already exited can still occupy the `Option` until
+/// reload inspects it. It is not a reusable manager generation.
+#[cfg(not(feature = "cluster"))]
+#[tokio::test]
+async fn reload_reuse_gate_rejects_a_finished_manager_task() {
+    let task = crate::lists::manager::ListManagerTask::finished_for_test();
+    tokio::task::yield_now().await;
+    assert!(task.is_finished(), "fixture task must have exited");
+    assert!(
+        !has_live_list_manager(Some(&task)),
+        "Some(finished task) must rebuild rather than claim a live manager"
     );
 }
 
@@ -1115,12 +1614,27 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
         ListsFingerprint::from_config(&seed_cfg, &crate::config::secrets::Secrets::default(), dir);
     std::fs::write(&config_path, reload_body).unwrap();
 
-    // Stand-ins for the state a live `ListManager` owns. The refresh
-    // task never completes on its own, so `is_finished()` afterwards
-    // reads exactly one thing: did the reload abort the live loop?
-    let mut refresh_handle = Some(tokio::spawn(std::future::pending::<()>()));
+    // Stand-in for a live manager generation. Its long cadence keeps the
+    // test off the network; `is_finished()` afterwards tells us whether a
+    // reuse-gated reload retired it.
+    let mut seed_manager = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        vec![],
+        Catalog::fallback(),
+        Duration::from_secs(12 * 60 * 60),
+        SourceBitMap::default(),
+        200 * 1024 * 1024,
+        crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES,
+        None,
+    );
+    let (_seed_tx, seed_rx) = tokio::sync::mpsc::channel(1);
+    seed_manager.set_command_channel(seed_rx);
+    let mut refresh_handle = Some(seed_manager.spawn_refresh_loop());
     let (list_cmd_tx, _list_cmd_rx) = tokio::sync::mpsc::channel(16);
-    let seeded_tx = Arc::new(Some(list_cmd_tx));
+    let seeded_tx = Arc::new(crate::ipc::socket_server::ListManagerEndpoint::running(
+        list_cmd_tx,
+    ));
     let list_cmd_tx_swap = Arc::new(arc_swap::ArcSwap::from(seeded_tx.clone()));
     let mut lists_fingerprint = Some(seed_fp);
 
@@ -1162,7 +1676,8 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
         ),
     )
     .await
-    .expect("skip path must not reach the network: handle_reload did not return promptly");
+    .expect("skip path must not reach the network: handle_reload did not return promptly")
+    .expect("reload must not fail fatally");
 
     let audit_ok_records = std::fs::read_to_string(&audit_path)
         .unwrap_or_default()
@@ -1174,11 +1689,11 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
         returned,
         refresh_alive: refresh_handle.as_ref().is_some_and(|h| !h.is_finished()),
         cmd_tx_preserved: Arc::ptr_eq(&seeded_tx, &list_cmd_tx_swap.load_full()),
-        cmd_tx_open: list_cmd_tx_swap
-            .load()
-            .as_ref()
-            .as_ref()
-            .is_some_and(|tx| !tx.is_closed()),
+        cmd_tx_open: matches!(
+            list_cmd_tx_swap.load().as_ref(),
+            crate::ipc::socket_server::ListManagerEndpoint::Running { sender, .. }
+            if !sender.is_closed()
+        ),
         audit_ok_records,
         hash_written: current_hash.is_some(),
     }
@@ -1367,6 +1882,36 @@ async fn boot_loads_the_disk_cache_without_attempting_a_download() {
     );
 }
 
+#[tokio::test]
+async fn boot_returns_from_an_accepted_empty_disk_corpus() {
+    use time::format_description::well_known::Rfc3339;
+
+    let dir = tempfile::tempdir().unwrap();
+    let stem = crate::lists::manager::source_to_cache_stem(DEAD_SOURCE);
+    std::fs::write(dir.path().join(format!("{stem}.cache")), "# no domains\n").unwrap();
+    let stale_fetch = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    std::fs::write(
+        dir.path().join(format!("{stem}.meta")),
+        format!("fetched-at={}\n", stale_fetch.format(&Rfc3339).unwrap()),
+    )
+    .unwrap();
+
+    let mut mgr = boot_test_manager(dir.path(), DEAD_SOURCE);
+    let reg = mgr.status_registry();
+    let count = tokio::time::timeout(
+        Duration::from_secs(20),
+        load_corpus_before_bind(&mut mgr, Duration::from_secs(3600)),
+    )
+    .await
+    .expect("an accepted empty cache must let boot bind");
+
+    assert_eq!(count, 0);
+    assert_eq!(
+        reg.cycle().served_state,
+        crate::lists::status::ServedState::IntentionalEmpty
+    );
+}
+
 /// Branch (c): with lists configured and nothing obtainable from either
 /// disk or network, the pre-bind load **never returns**, so the caller
 /// never reaches the bind. §2.4's primary guard.
@@ -1385,7 +1930,7 @@ async fn boot_loads_the_disk_cache_without_attempting_a_download() {
 /// from "installed after branch (b)'s Network cycle but before the
 /// sleep": both leave the client bulk by the time this test looks.
 ///
-/// Mutations caught: (1) branch (c)'s `while count == 0` loop removed —
+/// Mutations caught: (1) branch (c)'s readiness loop removed —
 /// the timeout returns `Ok(0)`; (2) `install_bulk_download_client`
 /// deleted, or moved to after the `tokio::time::sleep` this test parks
 /// in — the client observed is still the tight one, because that
@@ -1394,6 +1939,7 @@ async fn boot_loads_the_disk_cache_without_attempting_a_download() {
 async fn boot_refuses_to_return_when_no_map_can_be_built() {
     let dir = tempfile::tempdir().unwrap();
     let mut mgr = boot_test_manager(dir.path(), DEAD_SOURCE);
+    let reg = mgr.status_registry();
 
     let tight = format!(
         "{:?}",
@@ -1428,6 +1974,11 @@ async fn boot_refuses_to_return_when_no_map_can_be_built() {
         bulk,
         "the bulk client must already be installed before branch (c) \
          parks (§4.8)"
+    );
+    assert_eq!(
+        reg.cycle().served_state,
+        crate::lists::status::ServedState::Uninitialized,
+        "an unavailable configured source must not become an empty generation"
     );
 }
 
@@ -1482,7 +2033,7 @@ async fn the_background_loop_does_not_discard_its_first_tick() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    handle.abort();
+    handle.retire().await.unwrap();
 
     assert!(
         stamped,
@@ -1732,6 +2283,14 @@ fn empty_fetched_catalog_is_not_worth_persisting() {
         "an HTTP 200 carrying zero entries must not be persisted — it \
          would freeze every later boot onto an empty catalog"
     );
+    let selected =
+        admit_fetched_catalog(Catalog::from_entries(vec![]), Some(probe_catalog()), |_| {
+            panic!("an unusable fetched catalog must never reach the save boundary")
+        });
+    assert!(
+        selected.resolve("probe/marker").is_some(),
+        "the unusable fetch must fall back to the persisted viable catalog"
+    );
 }
 
 /// Companion to the above: a normal non-empty fetch must still be
@@ -1742,6 +2301,37 @@ fn nonempty_fetched_catalog_is_worth_persisting() {
     assert!(
         catalog_worth_persisting(&probe_catalog()),
         "a non-empty fetched catalog must still be persisted"
+    );
+}
+
+#[test]
+fn failed_catalog_save_uses_the_prior_reproducible_catalog() {
+    let fetched = Catalog::from_entries(vec![crate::lists::catalog::CatalogEntry {
+        scope: "new".to_string(),
+        topic: Some("only".to_string()),
+        name: "New".to_string(),
+        url: "https://lists.test/new.txt".to_string(),
+        entries: 1,
+        updated_at: String::new(),
+        format: crate::config::schema::BlocklistFormat::Domains,
+    }]);
+    let selected = admit_fetched_catalog(fetched, Some(probe_catalog()), |_| {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    });
+    assert!(selected.resolve("probe/marker").is_some());
+    assert!(
+        selected.resolve("new/only").is_none(),
+        "a catalog that missed its save boundary must not select URLs for cache stamps"
+    );
+}
+
+#[test]
+fn empty_persisted_catalog_is_not_a_viable_disk_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("catalog.json"), b"[]").unwrap();
+    assert!(
+        Catalog::load_from_disk(dir.path()).is_none(),
+        "a zero-entry disk catalog must fall through to a viable fallback"
     );
 }
 
@@ -1849,4 +2439,37 @@ async fn api_task_exit_surfaces_a_panic_in_the_api_task() {
         err.is_panic(),
         "a panicking API task must report as a panic"
     );
+}
+
+/// Shutdown publication must close list-manager admission atomically.
+#[test]
+fn shutdown_publication_closes_list_manager_admission() {
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let endpoint = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::ipc::socket_server::ListManagerEndpoint::running(sender),
+    ));
+
+    publish_list_manager_transitioning(&endpoint);
+
+    assert!(matches!(
+        &**endpoint.load(),
+        crate::ipc::socket_server::ListManagerEndpoint::Transitioning
+    ));
+}
+
+/// Keep shutdown admission closed before audit and cleanup can yield.
+#[test]
+fn shutdown_unpublishes_list_manager_immediately_after_signal_loop() {
+    let source = include_str!("../start.rs");
+    let signal_loop = source
+        .find("let exit_result = signal_loop(")
+        .expect("run_server must await the signal loop");
+    let unpublish = source
+        .find("publish_list_manager_transitioning(&list_cmd_tx_swap);")
+        .expect("shutdown must unpublish the list manager");
+    let shutdown_audit = source
+        .find("// Audit the shutdown before we tear anything down")
+        .expect("shutdown audit anchor must remain present");
+
+    assert!(signal_loop < unpublish && unpublish < shutdown_audit);
 }

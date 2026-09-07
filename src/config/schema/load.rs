@@ -15,8 +15,8 @@ use super::super::error::{ConfigError, ErrorContext};
 use super::super::loader::ProvenanceMap;
 use super::super::secrets::Secrets;
 use super::retired_keys;
-use super::validator::{validate_collect, AuditWarnings};
-use super::ConfigV1;
+use super::validator::{validate_collect_for_schema, AuditWarnings};
+use super::{ConfigV1, SCHEMA_VERSION_V1};
 
 /// Parse and validate a v1 configuration from a raw string.
 ///
@@ -61,8 +61,40 @@ pub fn load_from_str_collect(
     secrets: Option<&Secrets>,
     provenance: Option<&ProvenanceMap>,
 ) -> Result<ConfigV1, Vec<ConfigError>> {
+    load_from_str_collect_for_schema(
+        src,
+        SCHEMA_VERSION_V1,
+        file,
+        now,
+        warns,
+        secrets,
+        provenance,
+    )
+}
+
+/// [`load_from_str_collect`] with an explicit required schema version.
+///
+/// `expected_schema` follows the source, as it does the config in
+/// [`validate_collect_for_schema`]. Parsing and retired-key handling are
+/// unchanged; the single semantic validation pass uses this target.
+pub fn load_from_str_collect_for_schema(
+    src: &str,
+    expected_schema: u32,
+    file: Option<&Path>,
+    now: OffsetDateTime,
+    warns: &mut AuditWarnings,
+    secrets: Option<&Secrets>,
+    provenance: Option<&ProvenanceMap>,
+) -> Result<ConfigV1, Vec<ConfigError>> {
     match parse_v1(src, file) {
-        Ok(config) => match validate_collect(&config, now, warns, secrets, provenance) {
+        Ok(config) => match validate_collect_for_schema(
+            &config,
+            expected_schema,
+            now,
+            warns,
+            secrets,
+            provenance,
+        ) {
             Ok(()) => Ok(config),
             Err(errs) => Err(errs.into_iter().map(|e| attach_file(e, file)).collect()),
         },
@@ -183,6 +215,66 @@ mod tests {
     // ── minimal-v1 fixture ────────────────────────────────
 
     const MINIMAL_V1: &str = include_str!("../../../tests/fixtures/minimal-v1/config.toml");
+
+    #[test]
+    fn explicit_schema_text_loader_matrix_and_current_wrappers() {
+        let file = Path::new("master.toml");
+        for declared in [3, 4] {
+            let src = MINIMAL_V1.replace(
+                "schema_version = 4",
+                &format!("schema_version = {declared}"),
+            );
+            for expected in [3, 4] {
+                let result = load_from_str_collect_for_schema(
+                    &src,
+                    expected,
+                    Some(file),
+                    now(),
+                    &mut AuditWarnings::silent(),
+                    None,
+                    None,
+                );
+                if declared == expected {
+                    assert_eq!(result.unwrap().schema_version, declared);
+                } else {
+                    let errs = result.unwrap_err();
+                    assert_eq!(errs.len(), 1, "{errs:?}");
+                    assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                    let ctx = errs[0].context();
+                    assert_eq!(ctx.file.as_deref(), Some(file));
+                    if expected == SCHEMA_VERSION_V1 {
+                        assert!(ctx.reason.contains("this binary supports only"));
+                    } else {
+                        assert!(ctx
+                            .reason
+                            .contains(&format!("expected schema_version = {expected}")));
+                    }
+                    let suggestion = ctx.suggestion.as_ref().unwrap();
+                    if expected == SCHEMA_VERSION_V1 && declared == 3 {
+                        assert!(suggestion.contains("migrate v3-to-v4"));
+                    } else {
+                        assert!(suggestion.contains(&format!("schema_version = {expected}")));
+                    }
+                }
+            }
+            assert_eq!(
+                load_from_str(&src, Some(file), now()).is_ok(),
+                declared == SCHEMA_VERSION_V1
+            );
+            assert_eq!(
+                load_from_str_collect(
+                    &src,
+                    Some(file),
+                    now(),
+                    &mut AuditWarnings::silent(),
+                    None,
+                    None
+                )
+                .is_ok(),
+                declared == SCHEMA_VERSION_V1
+            );
+        }
+    }
 
     #[test]
     fn minimal_v1_fixture_parses_and_validates() {
@@ -336,7 +428,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             tmp,
-            "schema_version = 3\n[profiles.default]\ndisplay_name = \"Default\"\n[[devices]]\nid = \"iphone\"\ndisplay_name = \"iPhone\"\nip = \"10.0.0.1\"\nprofile = \"ghost\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
+            "schema_version = 4\n[profiles.default]\ndisplay_name = \"Default\"\n[[devices]]\nid = \"iphone\"\ndisplay_name = \"iPhone\"\nip = \"10.0.0.1\"\nprofile = \"ghost\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
         )
         .unwrap();
         let errs = load_from_path(tmp.path(), now()).unwrap_err();

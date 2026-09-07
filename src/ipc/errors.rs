@@ -75,11 +75,25 @@ pub const IPC_ERROR_TOKEN_MISMATCH: &str = "the provided token does not match th
 
 pub const IPC_ERROR_LIST_MANAGER_NOT_RUNNING: &str =
     "list manager is not running (no `[lists].sources` configured)";
+pub const IPC_ERROR_LIST_MANAGER_UNAVAILABLE: &str =
+    "list manager is unavailable although list sources are configured; it may have stopped or be reloading";
+pub const IPC_ERROR_LIST_REFRESH_BUSY: &str =
+    "too many list refresh requests are already waiting; retry after one completes";
 pub const IPC_ERROR_LIST_MANAGER_CHANNEL_CLOSED: &str =
     "list manager command channel is closed (manager may have crashed; \
      try `warden reload`)";
 pub const IPC_ERROR_LIST_MANAGER_NO_ACK: &str =
     "list manager dropped the forget ack channel without responding";
+pub const IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT: &str =
+    "list refresh could not be queued within 1 second; it was not accepted";
+pub const IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT: &str =
+    "list refresh was queued but the manager did not acknowledge it within 5 seconds; work may still complete. Do not retry automatically.";
+pub const IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT: &str =
+    "list refresh is still running after 15 minutes; work may still complete. Do not retry automatically.";
+pub const IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED: &str =
+    "list manager dropped the refresh acceptance channel without responding; work may still complete. Do not retry automatically.";
+pub const IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED: &str =
+    "list manager dropped the refresh completion channel without responding; work may still complete. Do not retry automatically.";
 
 pub const IPC_ERROR_RELOAD_CHANNEL_CLOSED: &str = "reload channel closed";
 pub const IPC_ERROR_RELOAD_NOT_AVAILABLE: &str = "reload not available";
@@ -205,8 +219,15 @@ pub enum IpcError {
     NoTokenConfigured,
 
     ListManagerNotRunning,
+    ListManagerUnavailable,
+    ListRefreshBusy,
     ListManagerChannelClosed,
     ListManagerNoAck,
+    ListRefreshEnqueueTimeout,
+    ListRefreshAcceptanceTimeout,
+    ListRefreshCompletionTimeout,
+    ListRefreshAcceptanceDropped,
+    ListRefreshCompletionDropped,
 
     ReloadChannelClosed,
     ReloadNotAvailable,
@@ -294,8 +315,23 @@ impl IpcError {
             Self::TokenMismatch => IPC_ERROR_TOKEN_MISMATCH.to_string(),
             Self::NoTokenConfigured => super::auth_token::NO_TOKEN_CONFIGURED_MSG.to_string(),
             Self::ListManagerNotRunning => IPC_ERROR_LIST_MANAGER_NOT_RUNNING.to_string(),
+            Self::ListManagerUnavailable => IPC_ERROR_LIST_MANAGER_UNAVAILABLE.to_string(),
+            Self::ListRefreshBusy => IPC_ERROR_LIST_REFRESH_BUSY.to_string(),
             Self::ListManagerChannelClosed => IPC_ERROR_LIST_MANAGER_CHANNEL_CLOSED.to_string(),
             Self::ListManagerNoAck => IPC_ERROR_LIST_MANAGER_NO_ACK.to_string(),
+            Self::ListRefreshEnqueueTimeout => IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT.to_string(),
+            Self::ListRefreshAcceptanceTimeout => {
+                IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT.to_string()
+            }
+            Self::ListRefreshCompletionTimeout => {
+                IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT.to_string()
+            }
+            Self::ListRefreshAcceptanceDropped => {
+                IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED.to_string()
+            }
+            Self::ListRefreshCompletionDropped => {
+                IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED.to_string()
+            }
             Self::ReloadChannelClosed => IPC_ERROR_RELOAD_CHANNEL_CLOSED.to_string(),
             Self::ReloadNotAvailable => IPC_ERROR_RELOAD_NOT_AVAILABLE.to_string(),
             Self::ShutdownChannelClosed => IPC_ERROR_SHUTDOWN_CHANNEL_CLOSED.to_string(),

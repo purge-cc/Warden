@@ -29,7 +29,7 @@ use purge_warden::ipc::protocol::{EcsPatch, IpcCommand, IpcResponse, ProfileUpda
 use purge_warden::ipc::socket_client;
 use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 
-const MASTER_SEED: &str = r#"schema_version = 3
+const MASTER_SEED: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -93,7 +93,9 @@ async fn spawn_fixture() -> Fixture {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            purge_warden::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+        )),
         // §4.32: integration test uses the test process's own euid so
         // the peer-uid gate is a no-op (test connects through its own
         // uid).

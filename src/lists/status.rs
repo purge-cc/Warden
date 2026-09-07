@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use time::OffsetDateTime;
 
 use crate::config::schema::id::Id;
 use crate::config::schema::Blocklist;
+use crate::lists::source_key::ResolvedSourcePlan;
 
 /// Hard cap on the number of skipped-line samples retained per list.
 ///
@@ -42,7 +43,8 @@ pub const MAX_SKIPPED_SAMPLES: usize = 32;
 /// [`MAX_SKIPPED_SAMPLES`] bounds the *number* of samples; this bounds
 /// each sample's *length*. Without it, a hostile list body with no `\n`
 /// makes `str::lines()` yield the entire body (up to `max_body_bytes`,
-/// default 200 MB) as a single "line", and `push_skipped` would park
+/// default [`crate::config::settings::DEFAULT_MAX_LIST_BODY_BYTES`]) as a
+/// single "line", and `push_skipped` would park
 /// that whole blob in the `ArcSwap` status registry — re-cloned in full
 /// on every IPC stats read. A sample is only a diagnostic hint ("every
 /// line starts with `||`, wrong format detected"), so the first ~256
@@ -97,14 +99,9 @@ pub struct ParsedCounts {
     /// "wrong format detected" failure mode. Counter is unbounded; this
     /// vec is hard-capped.
     pub parsed_skipped_samples: Vec<String>,
-    /// Entries this source offered *after* `max_entries` was already
-    /// reached, i.e. domains the cap dropped on the floor.
+    /// Entries this parse offered after `max_entries` was reached.
     ///
-    /// Non-zero means the operator is under-covered by exactly this much
-    /// and every other counter still looks healthy: the source fetched,
-    /// parsed and reported `Ok`. Before this existed the live daemon
-    /// dropped 2,370,261 domains (19% of the corpus) while printing
-    /// `lists: 8/8 sources active`.
+    /// The manager rejects a source whole when this is non-zero.
     ///
     /// **Counts validated domains, never candidate lines.** The cap test
     /// sits after the format extractor and after `is_valid_domain`, so
@@ -191,9 +188,11 @@ pub struct ListStatus {
     pub parsed_skipped: u64,
     /// Up to [`MAX_SKIPPED_SAMPLES`] sample skipped lines.
     pub parsed_skipped_samples: Vec<String>,
-    /// Domains this source offered past `max_entries` and the cap threw
-    /// away (see [`ParsedCounts::parsed_truncated`]). `> 0` means the
-    /// operator is silently under-covered by that many entries.
+    /// Domains the last uncleared cap-refusal since this daemon started
+    /// offered past `max_entries` (see [`ParsedCounts::parsed_truncated`]).
+    /// `> 0` names that exact overshoot; later non-cap failures retain it
+    /// until a success clears it. It is runtime telemetry, not persisted
+    /// across a daemon restart.
     ///
     /// `#[serde(default)]` for the same reason as `unique_domains`: the
     /// live daemon's `data/list_stats.json` was written by a binary that
@@ -323,6 +322,25 @@ impl ListStatus {
         next.delta_pct_vs_prev = None;
         next
     }
+
+    /// Build a failure status for a global entry-cap refusal.
+    ///
+    /// Last-good measurements remain visible, while `parsed_truncated`
+    /// reports the rejected candidate's exact overshoot.
+    pub fn from_cap_refusal(
+        prev: Option<&ListStatus>,
+        max_entries: usize,
+        dropped: u64,
+        fetched_at: OffsetDateTime,
+    ) -> Self {
+        let mut next = Self::from_failure(
+            prev,
+            format_blocklist_truncation_refused(max_entries, dropped),
+            fetched_at,
+        );
+        next.parsed_truncated = dropped;
+        next
+    }
 }
 
 /// The supply-chain delta canary warning.
@@ -346,9 +364,9 @@ pub const DELTA_WARN_THRESHOLD_PCT: f32 = 50.0;
 /// in `warden blocklist show` (`failed: …`) and the TUI Lists tab.
 pub const BLOCKLIST_SHRINK_REFUSED: &str =
     "refresh refused: list shrank by {drop}% to {got} domains (was {kept}); \
-     keeping the previous list — run `warden lists forget <source>` to accept";
+     candidate not installed — run `warden lists forget <source>` to accept";
 
-/// Operator-facing `last_outcome` reason stamped when a source is
+/// Operator-facing `last_outcome` reason stamped when a candidate is
 /// refused for exceeding its `max_entries` cap. Frozen template — the
 /// live string substitutes the measured numbers.
 ///
@@ -360,8 +378,8 @@ pub const BLOCKLIST_SHRINK_REFUSED: &str =
 /// late-alphabet domain and be guaranteed through. Half a blocklist is
 /// not a degraded blocklist, it is a blocklist with a published bypass.
 pub const BLOCKLIST_TRUNCATION_REFUSED: &str =
-    "refresh refused: list exceeded max_entries ({cap}) and would have dropped {dropped} \
-     entries; keeping the previous list — raise `[lists] max_entries` (the global cap)";
+    "refresh refused: candidate not installed; max_entries ({cap}) would drop {dropped} \
+     entries — inspect effective_max_entries with `warden blocklist show <id>` and raise the limiting configured cap";
 
 /// Substitute the measured numbers into [`BLOCKLIST_TRUNCATION_REFUSED`].
 pub fn format_blocklist_truncation_refused(cap: usize, dropped: u64) -> String {
@@ -398,25 +416,23 @@ pub fn compute_delta_pct(entries: u64, prev_entries: u64) -> Option<f32> {
 /// Bridges the in-memory struct to a stable Serialize/Deserialize form.
 /// Serializes `fetched_at` as an RFC 3339 string for human readability
 /// (matches the `.meta` sidecar files). `id` is filled in by the IPC
-/// handler from `slug_to_id` so the operator can correlate the source
-/// string (legacy slug like `"privacy/ads"` or raw URL) with the v1
-/// `[[blocklists]].id`.
+/// handler from the registry routing snapshot so the operator can correlate
+/// a source spelling with its deterministic v1 `[[blocklists]].id`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BlocklistStatusDto {
     /// Source string as it appears in `[lists].sources` — legacy
     /// slug-form (`"privacy/ads"`) or raw URL.
     pub source: String,
-    /// Canonical `[[blocklists]].id` resolved via `slug_to_id`. `None`
-    /// when the source has no v1 entry (raw URL, or the slug isn't in
-    /// the map yet).
+    /// Deterministic canonical `[[blocklists]].id`, when this source has an
+    /// owning row.
     pub id: Option<String>,
     pub entries: u64,
     pub parsed_ok: u64,
     pub parsed_skipped: u64,
     pub parsed_skipped_samples: Vec<String>,
-    /// Entries the `max_entries` cap discarded on the last refresh (see
-    /// [`ListStatus::parsed_truncated`]). `> 0` means this source is
-    /// loaded only in part while still reporting `ok`.
+    /// Entries the `max_entries` cap found past the limit on the last
+    /// uncleared cap refusal (see [`ListStatus::parsed_truncated`]). A later
+    /// non-cap failure retains the value until a success clears it.
     ///
     /// `#[serde(default)]` so a new CLI reading a pre-truncation-counter
     /// daemon's response decodes `0` rather than failing the whole
@@ -469,25 +485,6 @@ impl BlocklistStatusDto {
     }
 }
 
-/// Per-source registry of [`ListStatus`] handles.
-///
-/// Seeded at boot from the configured `[lists].sources` and grown on
-/// demand when the reload pipeline introduces a new source through the
-/// merge bridge. Keys are the verbatim source strings the
-/// [`super::manager::ListManager`] uses internally — legacy slugs
-/// (`"privacy/ads"`) and raw URLs.
-///
-/// The outer `inner` map is wrapped in `ArcSwap<HashMap<...>>` so it can
-/// grow without blocking readers: writers do a copy-on-write `rcu`
-/// insert, readers go through `inner.load()` and walk the snapshot. Each
-/// source slot is itself an `ArcSwap` so per-list status updates remain
-/// lock-free even when the outer map is being grown.
-///
-/// The registry used to be a `HashMap` fixed at boot, so reloads that
-/// added a new `[[blocklists]].url`
-/// silently failed to surface stats for the new source until daemon
-/// restart. Now `update()` self-heals — first write to an unknown
-/// source materialises the slot.
 /// A whole refresh cycle was refused because the merged **deduplicated**
 /// corpus exceeded `[lists] max_total_domains`.
 ///
@@ -548,31 +545,36 @@ pub struct CorpusFreeze {
 ///
 /// Exists because [`CorpusRefusal`] cannot answer the question a caller
 /// actually has after triggering a refresh. It is an `Option`, so it has
-/// two values, but there are **four** states after a SIGHUP:
+/// two values, but there are **seven** states after a SIGHUP: six completed
+/// outcomes plus the unfinished state.
 ///
 /// | state | `corpus_refusal()` |
 /// |---|---|
 /// | finished, installed | `None` |
 /// | finished, refused | `Some(..)` |
+/// | finished, no complete generation installed | `None` |
+/// | skipped — unchanged input or retained fallback, live blocklist reused | `None` |
+/// | finished, no configured sources (blocklist cleared) | `None` |
+/// | finished, config rejected | `None` |
 /// | not finished yet | `None` |
-/// | skipped — inputs unchanged, live blocklist reused | `None` |
 ///
-/// Three of the four read `None`, so polling that field is a verdict built
-/// on absence: it cannot tell "installed" from "still running" from
-/// "there was nothing to do". This type makes the distinction explicit.
+/// Six of the seven read `None`, so polling that field is a verdict built
+/// on absence: it cannot tell an install from a degraded generation, a running
+/// refresh, or an unchanged skip. This type makes the distinction explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CycleOutcome {
     /// A new generation was built and installed.
     Installed,
-    /// The merged corpus exceeded the ceiling; the previous generation is
-    /// still being served, and it will keep being served until the corpus
-    /// shrinks or the ceiling rises. Filtering is not absent — it is FROZEN.
+    /// Hot retention refused a candidate and keeps the prior generation, or
+    /// a cold refusal left no corpus installed.
     Refused,
-    /// The pipeline inputs were byte-identical, so no rebuild happened and
-    /// the live blocklist was reused. A success, and information the caller
-    /// wants: "nothing changed" and "a new corpus installed" are different
-    /// answers to "what did my refresh do?".
+    /// No complete generation was installed. The engine may serve the prior
+    /// corpus, a shard hybrid, or nothing on a cold start; current readers use
+    /// `generation_degraded` to identify this conservative wire value.
+    SpillRollbackFailed,
+    /// Byte-identical inputs reused the live blocklist, or a failed candidate
+    /// had a usable retained fallback. No rebuild was installed.
     SkippedUnchanged,
     /// The config carried no list sources, so the blocklist was CLEARED.
     ///
@@ -589,6 +591,39 @@ pub enum CycleOutcome {
     /// waits out its whole timeout before reporting that it does not know —
     /// about a cycle the daemon closed, deliberately, and could describe.
     ConfigRejected,
+}
+
+/// What the filter is serving after the most recently completed cycle.
+///
+/// This is separate from [`CycleOutcome`]: an attempted refresh can fail
+/// while the prior complete corpus remains live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServedState {
+    /// The daemon did not report enough state to classify what it serves.
+    #[default]
+    Unknown,
+    /// No complete list generation has been installed since this daemon started.
+    Uninitialized,
+    /// Every configured source reached one complete installed generation.
+    Complete,
+    /// Only part of a generation is serving.
+    Partial,
+    /// Configured sources completed with an accepted empty corpus.
+    IntentionalEmpty,
+    /// The operator removed all configured sources.
+    Cleared,
+}
+
+impl ServedState {
+    /// A configured source set has produced a generation safe to serve.
+    #[must_use]
+    pub const fn is_ready_for_bind(self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Partial | Self::IntentionalEmpty
+        )
+    }
 }
 
 /// A completed cycle: what it did, plus a monotonic sequence number.
@@ -615,10 +650,71 @@ pub struct CycleMark {
     pub seq: u64,
     /// `None` iff `seq == 0`.
     pub outcome: Option<CycleOutcome>,
+    /// The standing coverage result from the most recent manager list
+    /// attempt. It is retained across config rejection and fingerprint-only
+    /// cycles, then replaced by the next manager attempt or an intentional
+    /// no-sources clear.
+    ///
+    /// This is a qualifier, rather than a new [`CycleOutcome`] variant, so
+    /// old clients with a closed outcome enum ignore this unknown struct
+    /// field. It supplements the current outcome; it does not say that a
+    /// `ConfigRejected` cycle itself had incomplete coverage.
+    #[serde(default)]
+    pub source_coverage_incomplete: bool,
+    /// The most recent manager attempt did not complete a whole-generation
+    /// install. The engine may therefore still serve the prior generation,
+    /// a shard hybrid, or nothing on a cold start; readers must use the
+    /// current domain count to distinguish those states.
+    ///
+    /// Kept as a defaulted qualifier so the closed serialized outcome enum
+    /// remains compatible with older clients.
+    #[serde(default)]
+    pub generation_degraded: bool,
+    /// The corpus state actually serving after this completed cycle.
+    ///
+    /// Defaulting preserves decoding of payloads emitted before this
+    /// qualifier existed without guessing from the domain count.
+    #[serde(default)]
+    pub served_state: ServedState,
 }
 
+/// One immutable completed-cycle status view.
+///
+/// The manager may update individual status slots while a refresh is running,
+/// but IPC and HTTP readers use this value rather than assembling those
+/// independent atomics. It is replaced only after the cycle mark and every
+/// row/payload/freeze mutation for that cycle are complete, so readers never
+/// spin or pair a new sequence number with stale state.
+#[derive(Clone)]
+pub struct RegistrySnapshot {
+    pub rows: Vec<(String, Arc<ListStatus>)>,
+    pub corpus_refusal: Option<CorpusRefusal>,
+    pub corpus_freeze: Option<CorpusFreeze>,
+    /// Domains in the generation represented by these completed rows.
+    pub domain_count: usize,
+    pub cycle: CycleMark,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CompletedPublicationHookPoint {
+    BeforeLock { manager: bool },
+    AfterSnapshotLoad { manager: bool },
+    AfterStore { manager: bool },
+}
+
+#[cfg(test)]
+type CompletedPublicationHook =
+    Arc<dyn Fn(CompletedPublicationHookPoint, &Mutex<()>) + Send + Sync>;
+
+/// Per-source status registry shared by the manager and IPC.
+///
+/// Slots and routing live in one immutable generation so a routed read or
+/// write never pairs aliases from one reload with slots from another. Slot
+/// values remain individually swappable: publishing a source plan is atomic,
+/// while a refresh does not need to clone the whole generation.
 pub struct ListStatusRegistry {
-    inner: ArcSwap<HashMap<String, Arc<ArcSwap<ListStatus>>>>,
+    generation: ArcSwap<RegistryGeneration>,
     /// Set when the last refresh cycle was refused by the global corpus
     /// guard, cleared whenever a cycle installs.
     ///
@@ -635,44 +731,57 @@ pub struct ListStatusRegistry {
     /// is nowhere in it for a fact that outlives the cycle. This is the
     /// only state in the reload path that deliberately accumulates.
     corpus_freeze: ArcSwap<Option<CorpusFreeze>>,
-    /// The last completed cycle, or `None` before the first one ends.
-    ///
-    /// Sits beside `corpus_refusal` rather than replacing it: that field
-    /// carries the refusal's *payload* (counts, worst contributor) which
-    /// every existing renderer reads. This one answers the orthogonal
-    /// question of whether a cycle happened at all, and which.
-    ///
-    /// Bumping the sequence is a read-modify-write, and it is sound because
-    /// reload cycles are serialised **structurally**, not by convention:
-    /// every reload request funnels through the single `ipc_reload_rx`
-    /// receiver that `signal_loop` borrows mutably, so exactly one runs at a
-    /// time. Signal-driven reloads bypass the coalescer but land in the same
-    /// channel.
-    ///
-    /// Do not soften that into "concurrent cycles are merely unlikely". If
-    /// two ever did run, one would read the other's `seq` before it stored,
-    /// an outcome would be lost, and a poller could pair a `seq` with the
-    /// WRONG cycle's outcome — a wrong verdict, not just a slow one. The
-    /// safety comes from the single receiver; keep it there.
-    cycle: ArcSwap<CycleMark>,
-    /// Secondary lookup-only index mapping a v1 canonical [`Id`] to
-    /// the slot key stored in `inner`. Lets
-    /// future id-keyed consumers (TUI Lists tab v2, audit attribution,
-    /// IPC handlers that pre-resolve `Id`) reach the slot without
-    /// monkey-patching a reverse lookup through the URL.
-    ///
-    /// Seeded automatically at construction from slash-form sources
-    /// (`"privacy/ads"` → `Id::new("privacy-ads")`). For pure-v1
-    /// configs (`[lists].sources = []` with rows in `[[blocklists]]`),
-    /// callers must invoke
-    /// [`populate_v1_id_index`](Self::populate_v1_id_index) once the
-    /// `[[blocklists]]` catalogue is available — typically right after
-    /// the daemon clones the registry handle out of the manager.
-    ///
-    /// Wrapped in [`ArcSwap`] for lock-free atomic replacement (mirror
-    /// of `inner`'s concurrency invariant). Writes happen on the
-    /// daemon-reload path only (single mutator); reads are wait-free.
-    by_v1_id_index: ArcSwap<HashMap<Id, String>>,
+    /// Complete IPC/API view. Kept separately from the live slots because a
+    /// refresh can take minutes; a seqlock held for that whole interval would
+    /// make status reads spin instead of returning the last completed view.
+    completed_snapshot: ArcSwap<RegistrySnapshot>,
+    /// Serializes short, synchronous completed-snapshot publications.
+    /// Live manager work runs outside this lock.
+    completed_publication: Mutex<()>,
+    /// Precise test-only publication interleaving control. It is per-registry
+    /// so parallel tests cannot affect one another.
+    #[cfg(test)]
+    completed_publication_hook: Mutex<Option<CompletedPublicationHook>>,
+}
+
+/// A status resolved through one registry generation.
+///
+/// The representative, primary Id, and slot value come from the same loaded
+/// routing snapshot, so a reload cannot combine old slots with new aliases.
+#[derive(Clone)]
+pub struct ResolvedListStatus {
+    pub representative: String,
+    pub primary_id: Option<Id>,
+    pub status: Arc<ListStatus>,
+}
+
+#[derive(Clone)]
+struct RegistryGeneration {
+    slots: HashMap<String, Arc<ArcSwap<ListStatus>>>,
+    routing: RoutingSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RoutingSnapshot {
+    source_aliases: HashMap<String, String>,
+    canonical_url_aliases: HashMap<String, String>,
+    id_aliases: HashMap<Id, String>,
+    primary_ids: HashMap<String, Id>,
+    /// Plan-backed managers must not recreate a retired slot from a late write.
+    strict: bool,
+}
+
+impl RoutingSnapshot {
+    fn representative_for_source(&self, source: &str) -> Option<&str> {
+        self.source_aliases
+            .get(source)
+            .or_else(|| {
+                self.canonical_url_aliases
+                    .get(&crate::lists::source_key::canonical_url_key(source))
+            })
+            .or_else(|| Id::new(source).ok().and_then(|id| self.id_aliases.get(&id)))
+            .map(String::as_str)
+    }
 }
 
 /// On-disk shape of a `list_stats.json` per-source baseline.
@@ -700,12 +809,8 @@ impl ListStatusRegistry {
     /// Build a registry covering every entry in `sources`. Each slot
     /// starts as `ListStatus::default()` (entries=0, NeverFetched).
     ///
-    /// The [`by_v1_id_index`](Self) is seeded with slash-form
-    /// translations from `sources` (`"privacy/ads"` →
-    /// `Id::new("privacy-ads")`); v1-row aliases get added by a
-    /// subsequent [`populate_v1_id_index`](Self::populate_v1_id_index)
-    /// call from the daemon, which has the `[[blocklists]]` catalogue
-    /// in scope.
+    /// This compatibility constructor permits unknown writes. Plan-backed
+    /// construction uses [`Self::from_plan`] and strict immutable routing.
     pub fn new(sources: &[String]) -> Self {
         let inner: HashMap<String, Arc<ArcSwap<ListStatus>>> = sources
             .iter()
@@ -716,25 +821,94 @@ impl ListStatusRegistry {
                 )
             })
             .collect();
-        let by_v1_id_index = Self::seed_v1_id_index_from_sources(sources);
+        let mut routing = RoutingSnapshot::default();
+        for source in sources {
+            routing
+                .source_aliases
+                .insert(source.clone(), source.clone());
+            routing.canonical_url_aliases.insert(
+                crate::lists::source_key::canonical_url_key(source),
+                source.clone(),
+            );
+            if !super::source_key::is_url_source(source) {
+                if let Ok(id) = Id::new(source.replace('/', "-")) {
+                    routing.id_aliases.insert(id.clone(), source.clone());
+                    routing.primary_ids.insert(source.clone(), id);
+                }
+            }
+        }
+        let initial_cycle = CycleMark {
+            seq: 0,
+            outcome: None,
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: ServedState::Uninitialized,
+        };
+        let initial_rows = inner
+            .iter()
+            .map(|(source, slot)| (source.clone(), slot.load_full()))
+            .collect();
         Self {
-            inner: ArcSwap::from_pointee(inner),
-            by_v1_id_index: ArcSwap::from_pointee(by_v1_id_index),
+            generation: ArcSwap::from_pointee(RegistryGeneration {
+                slots: inner,
+                routing,
+            }),
             corpus_refusal: ArcSwap::from_pointee(None),
             corpus_freeze: ArcSwap::from_pointee(None),
-            cycle: ArcSwap::from_pointee(CycleMark {
-                seq: 0,
-                outcome: None,
+            completed_snapshot: ArcSwap::from_pointee(RegistrySnapshot {
+                rows: initial_rows,
+                corpus_refusal: None,
+                corpus_freeze: None,
+                domain_count: 0,
+                cycle: initial_cycle,
             }),
+            completed_publication: Mutex::new(()),
+            #[cfg(test)]
+            completed_publication_hook: Mutex::new(None),
         }
+    }
+
+    /// Build a registry whose slots and aliases come from one source plan.
+    pub fn from_plan(plan: &ResolvedSourcePlan) -> Self {
+        let registry = Self::new(&[]);
+        registry.sync_plan(plan);
+        registry
+    }
+
+    /// Atomically publish one plan-backed status generation.
+    ///
+    /// Existing representatives retain their slot handles so prior status
+    /// survives a reload. Retired slots are omitted before publication: an old
+    /// writer may still update its detached handle, but cannot make it visible
+    /// in the newly routed generation.
+    pub fn sync_plan(&self, plan: &ResolvedSourcePlan) {
+        let representatives = plan.representatives();
+        self.generation.rcu(|current| RegistryGeneration {
+            slots: representatives
+                .iter()
+                .map(|source| {
+                    let slot =
+                        current.slots.get(source).cloned().unwrap_or_else(|| {
+                            Arc::new(ArcSwap::from_pointee(ListStatus::default()))
+                        });
+                    (source.clone(), slot)
+                })
+                .collect(),
+            routing: RoutingSnapshot {
+                source_aliases: plan.source_aliases().clone(),
+                canonical_url_aliases: plan.canonical_url_aliases().clone(),
+                id_aliases: plan.id_aliases().clone(),
+                primary_ids: plan.primary_ids().clone(),
+                strict: true,
+            },
+        });
     }
 
     /// Record — or clear, with `None` — the global corpus guard's verdict
     /// for the cycle that just ended.
     ///
-    /// Called on **every** completed cycle, not only on refusals: leaving
-    /// a stale refusal set after a later cycle installs successfully would
-    /// be the same class of lie in the opposite direction.
+    /// Called on every completed manager cycle. Leaving a stale refusal set
+    /// after a later manager install would be the same lie in reverse.
     pub fn set_corpus_refusal(&self, refusal: Option<CorpusRefusal>) {
         self.corpus_refusal.store(Arc::new(refusal));
     }
@@ -752,10 +926,8 @@ impl ListStatusRegistry {
     /// instant, or an operator correlating the log against `warden
     /// status` sees two times for one event.
     ///
-    /// Read-modify-write, and sound for the same structural reason
-    /// [`record_cycle`](Self::record_cycle) is: every reload funnels
-    /// through the single `ipc_reload_rx` receiver, so exactly one cycle
-    /// runs at a time. Two concurrent cycles would lose a count.
+    /// Manager-owned state is copied into the completed snapshot only when
+    /// its cycle finishes; readers never assemble it from these live cells.
     pub fn note_refused_cycle(&self, now: OffsetDateTime) -> CorpusFreeze {
         let next = match self.corpus_freeze.load().as_ref() {
             Some(prev) => CorpusFreeze {
@@ -782,86 +954,169 @@ impl ListStatusRegistry {
         self.corpus_freeze.store(Arc::new(None));
     }
 
+    /// Clear a standing freeze after an intentional corpus clear. This is not
+    /// an install, but it deliberately replaces the previously frozen
+    /// generation with the operator-requested empty corpus.
+    pub fn clear_corpus_freeze(&self) {
+        self.corpus_freeze.store(Arc::new(None));
+    }
+
     /// The standing freeze, or `None` when the corpus is current.
     pub fn corpus_freeze(&self) -> Option<CorpusFreeze> {
         self.corpus_freeze.load().as_ref().clone()
     }
 
-    /// Record a completed cycle, advancing the sequence number.
+    /// Record a non-manager completed cycle, advancing the sequence number.
     ///
-    /// **Must be called from every path that ends a cycle**, including the
-    /// ones that do no work. The rebuild-skip in `start.rs` returns before
-    /// it ever reaches the manager's install path, so a counter bumped only
-    /// there would sit still through a perfectly successful reload and leave
-    /// a poller reporting "still running" forever.
+    /// Config rejection and fingerprint skips never own live manager slots,
+    /// so they retain the prior completed rows and corpus payloads. The
+    /// rebuild-skip in `start.rs` still must publish one, or a poller waits
+    /// forever for a cycle that already ended.
     pub fn record_cycle(&self, outcome: CycleOutcome) {
-        let seq = self.cycle.load().seq + 1;
-        self.cycle.store(Arc::new(CycleMark {
-            seq,
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(CompletedPublicationHookPoint::BeforeLock {
+            manager: false,
+        });
+        let _publication = self
+            .completed_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = self.completed_snapshot.load_full();
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(
+            CompletedPublicationHookPoint::AfterSnapshotLoad { manager: false },
+        );
+        let cycle = CycleMark {
+            seq: previous.cycle.seq.saturating_add(1),
             outcome: Some(outcome),
+            source_coverage_incomplete: previous.cycle.source_coverage_incomplete,
+            generation_degraded: previous.cycle.generation_degraded,
+            served_state: previous.cycle.served_state,
+        };
+        // Config rejection and fingerprint skips do not own manager payloads.
+        // Preserve the last completed generation even while a refresh mutates
+        // its live slots.
+        self.completed_snapshot.store(Arc::new(RegistrySnapshot {
+            rows: previous.rows.clone(),
+            corpus_refusal: previous.corpus_refusal.clone(),
+            corpus_freeze: previous.corpus_freeze.clone(),
+            domain_count: previous.domain_count,
+            cycle,
         }));
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(CompletedPublicationHookPoint::AfterStore {
+            manager: false,
+        });
+    }
+
+    /// Record a manager cycle with its final installed-domain count.
+    pub fn record_cycle_with_source_coverage(
+        &self,
+        outcome: CycleOutcome,
+        source_coverage_incomplete: bool,
+        domain_count: usize,
+    ) {
+        self.record_cycle_with_qualifiers(outcome, source_coverage_incomplete, false, domain_count);
+    }
+
+    /// Record a manager cycle with its coverage and install-completeness
+    /// qualifiers and final installed-domain count. Call this only after all
+    /// rows, refusal payload, and freeze state for the cycle have been written.
+    pub fn record_cycle_with_qualifiers(
+        &self,
+        outcome: CycleOutcome,
+        source_coverage_incomplete: bool,
+        generation_degraded: bool,
+        domain_count: usize,
+    ) {
+        self.record_cycle_with_qualifiers_and_served_state(
+            outcome,
+            source_coverage_incomplete,
+            generation_degraded,
+            domain_count,
+            None,
+        );
+    }
+
+    /// Record a manager cycle with the state of the corpus that remains live.
+    pub fn record_cycle_with_qualifiers_and_served_state(
+        &self,
+        outcome: CycleOutcome,
+        source_coverage_incomplete: bool,
+        generation_degraded: bool,
+        domain_count: usize,
+        served_state: Option<ServedState>,
+    ) -> RegistrySnapshot {
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(CompletedPublicationHookPoint::BeforeLock {
+            manager: true,
+        });
+        let _publication = self
+            .completed_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = self.completed_snapshot.load_full();
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(
+            CompletedPublicationHookPoint::AfterSnapshotLoad { manager: true },
+        );
+        let served_state = served_state.unwrap_or_else(|| match outcome {
+            CycleOutcome::Installed => ServedState::Complete,
+            CycleOutcome::ClearedNoSources => ServedState::Cleared,
+            CycleOutcome::Refused
+            | CycleOutcome::SpillRollbackFailed
+            | CycleOutcome::SkippedUnchanged
+            | CycleOutcome::ConfigRejected => previous.cycle.served_state,
+        });
+        let cycle = CycleMark {
+            seq: previous.cycle.seq.saturating_add(1),
+            outcome: Some(outcome),
+            source_coverage_incomplete,
+            generation_degraded,
+            served_state,
+        };
+        // This is the external publication point. All manager mutations
+        // precede it; readers take this single immutable value rather than
+        // relying on an ordering between separate atomics.
+        let snapshot = self.publish_manager_snapshot(cycle, domain_count);
+        #[cfg(test)]
+        self.run_completed_publication_hook_for_test(CompletedPublicationHookPoint::AfterStore {
+            manager: true,
+        });
+        snapshot
     }
 
     /// The cycle counter. `seq == 0` means none has completed yet — which
     /// is NOT the same as a daemon that cannot report cycles at all; that
     /// distinction lives in the IPC field's own `Option`.
     pub fn cycle(&self) -> CycleMark {
-        **self.cycle.load()
+        self.completed_snapshot.load().cycle
     }
 
-    /// Seed-time helper: translate legacy slash-form source strings to
-    /// canonical [`Id`]s. Shares the [`is_url_source`](super::source_key::is_url_source) heuristic with
-    /// [`super::source_key::SourceBitMap::build`] so the rule cannot
-    /// drift.
-    fn seed_v1_id_index_from_sources(sources: &[String]) -> HashMap<Id, String> {
-        let mut out: HashMap<Id, String> = HashMap::new();
-        for s in sources {
-            if super::source_key::is_url_source(s) {
-                continue;
-            }
-            if let Ok(id) = Id::new(s.replace('/', "-")) {
-                out.insert(id, s.clone());
-            }
-        }
-        out
-    }
-
-    /// Rebuild the
-    /// [`by_v1_id_index`](Self) from the current `inner` slot keys
-    /// plus the v1 `[[blocklists]]` catalogue. Idempotent — atomically
-    /// replaces the whole index, so the post-call state is purely a
-    /// function of `(self.inner_keys, blocklists)`.
-    ///
-    /// The seeding mirrors
-    /// [`super::source_key::SourceBitMap::build`] for the v1-id
-    /// channel:
-    /// - Slash-form slot keys translate to ids (`"privacy/ads"` →
-    ///   `Id::new("privacy-ads")`) — preserved across rebuild for
-    ///   legacy `[lists].sources` configs.
-    /// - Enabled blocklist rows whose URL matches a slot key alias
-    ///   `Id → slot_key`. The blocklist pass runs after the slash-form
-    ///   pass and wins on collision — a typed lookup test pins this
-    ///   explicitly.
+    /// Compatibility helper rebuilding Id aliases from existing slots.
+    /// Plan-backed callers use [`Self::sync_plan`] for one routing snapshot.
     pub fn populate_v1_id_index(&self, blocklists: &[Blocklist]) {
-        let snapshot = self.inner.load();
-        let mut next: HashMap<Id, String> = HashMap::new();
-        for key in snapshot.keys() {
-            if super::source_key::is_url_source(key) {
-                continue;
+        self.generation.rcu(|current| {
+            let mut next = (**current).clone();
+            next.routing.id_aliases.clear();
+            next.routing.primary_ids.clear();
+            for key in next.slots.keys() {
+                if super::source_key::is_url_source(key) {
+                    continue;
+                }
+                if let Ok(id) = Id::new(key.replace('/', "-")) {
+                    next.routing.id_aliases.insert(id.clone(), key.clone());
+                    next.routing.primary_ids.insert(key.clone(), id);
+                }
             }
-            if let Ok(id) = Id::new(key.replace('/', "-")) {
-                next.insert(id, key.clone());
+            for b in blocklists {
+                if b.enabled && next.slots.contains_key(b.url.as_str()) {
+                    next.routing.id_aliases.insert(b.id.clone(), b.url.clone());
+                    next.routing.primary_ids.insert(b.url.clone(), b.id.clone());
+                }
             }
-        }
-        for b in blocklists {
-            if !b.enabled {
-                continue;
-            }
-            if snapshot.contains_key(b.url.as_str()) {
-                next.insert(b.id.clone(), b.url.clone());
-            }
-        }
-        self.by_v1_id_index.store(Arc::new(next));
+            next
+        });
     }
 
     /// Ensure a slot exists for `source`. Fast path: read-only check
@@ -870,15 +1125,15 @@ impl ListStatusRegistry {
     /// caller racing on the same key sees the slot already present and
     /// returns without further work.
     fn ensure_slot(&self, source: &str) {
-        if self.inner.load().contains_key(source) {
+        if self.generation.load().slots.contains_key(source) {
             return;
         }
-        self.inner.rcu(|current| {
-            if current.contains_key(source) {
+        self.generation.rcu(|current| {
+            if current.slots.contains_key(source) {
                 return (**current).clone();
             }
             let mut next = (**current).clone();
-            next.insert(
+            next.slots.insert(
                 source.to_string(),
                 Arc::new(ArcSwap::from_pointee(ListStatus::default())),
             );
@@ -886,29 +1141,45 @@ impl ListStatusRegistry {
         });
     }
 
-    /// Atomically replace the status for `source` (keyed by the
-    /// manager's source string — URL for v1 rows, slash-form for
-    /// legacy `[lists].sources`). Materialises the slot if it doesn't
-    /// exist yet — first write from a reload-time-added source
-    /// self-heals the registry instead of being silently dropped.
-    /// The materialised slot starts at
-    /// `ListStatus::default()` and is immediately replaced with the
-    /// new status, so readers never observe a stale "NeverFetched"
-    /// transient between materialise and update.
-    ///
-    /// Named to make the URL-vs-id contract explicit at the call
-    /// line. Future v1-id-keyed
-    /// consumers will reach for a parallel `update_for_v1_id` method
-    /// — out of scope until a concrete consumer surfaces.
+    /// Replace a status through this generation's routing snapshot.
+    /// Compatibility mode may materialise unknown slots; planned mode drops
+    /// them so late writers cannot recreate retired sources.
     pub fn update_for_url(&self, source: &str, new_status: ListStatus) {
-        self.ensure_slot(source);
-        if let Some(slot) = self.inner.load().get(source) {
+        let generation = self.generation.load_full();
+        self.update_with_generation(&generation, source, new_status);
+    }
+
+    fn update_with_generation(
+        &self,
+        generation: &RegistryGeneration,
+        source: &str,
+        new_status: ListStatus,
+    ) {
+        let representative = generation
+            .routing
+            .representative_for_source(source)
+            .map(str::to_string)
+            .or_else(|| (!generation.routing.strict).then(|| source.to_string()));
+        let Some(representative) = representative else {
+            return;
+        };
+        if !generation.routing.strict {
+            self.ensure_slot(&representative);
+            // Compatibility construction promises on-demand slots. Reload
+            // after publication only for that permissive legacy behavior.
+            if let Some(slot) = self.generation.load().slots.get(&representative) {
+                slot.store(Arc::new(new_status));
+            }
+            return;
+        }
+        // Use the captured generation for the write. A later `sync_plan`
+        // cannot redirect this status into a different source's slot.
+        if let Some(slot) = generation.slots.get(&representative) {
             slot.store(Arc::new(new_status));
         }
     }
 
-    /// Ensure registry slots exist for every source in `sources`. Called
-    /// from the reload pipeline right after `merge_sources_with_blocklists`
+    /// Ensure registry slots exist for every source in `sources`.
     /// so the IPC `snapshot()` returns a row for newly-added sources
     /// immediately — operators see the new list with `last_outcome =
     /// "never_fetched"` while the daemon is still downloading, which
@@ -925,54 +1196,39 @@ impl ListStatusRegistry {
     /// Drop every slot whose source string is NOT in `keep`. Symmetric
     /// to [`Self::ensure_slots`] and called right after it in the
     /// reload pipeline so the registry tracks exactly the current
-    /// merged source set.
-    ///
-    /// Deleting a `[[blocklists]]` entry causes
-    /// `merge_sources_with_blocklists` to drop its URL from the next
-    /// reload's source list, but the registry's grow path only adds
-    /// slots, never removes them — so without this, the slot lives on
-    /// forever and the TUI renders a permanent orphan row keyed on the
-    /// dead URL because the IPC `snapshot()` still returns it.
+    /// representative source set.
     pub fn retain_only(&self, keep: &[String]) {
         // Fast-path read: see if anything would actually be removed.
         // Skip the expensive rcu COW when the current map already
         // matches keep (common case during steady-state refreshes).
-        let snapshot = self.inner.load();
+        let snapshot = self.generation.load();
         let keep_set: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
-        let any_stale = snapshot.keys().any(|k| !keep_set.contains(k.as_str()));
+        let any_stale = snapshot
+            .slots
+            .keys()
+            .any(|k| !keep_set.contains(k.as_str()));
         if !any_stale {
             return;
         }
         drop(snapshot);
 
-        self.inner.rcu(|current| {
+        self.generation.rcu(|current| {
             let keep_set: std::collections::HashSet<&str> =
                 keep.iter().map(String::as_str).collect();
-            let mut next: HashMap<String, Arc<ArcSwap<ListStatus>>> =
-                HashMap::with_capacity(current.len());
-            for (k, v) in current.iter() {
-                if keep_set.contains(k.as_str()) {
-                    next.insert(k.clone(), v.clone());
-                }
-            }
-            next
-        });
-
-        // Retire stale `by_v1_id_index` entries pointing at slots we
-        // just dropped. Without this, a typed
-        // `status_for_v1_id` lookup would return `None` (because the
-        // chained inner lookup misses), but the index would still
-        // carry the dead id — leaking memory and confusing diagnostics.
-        // The rcu is cheap (the index is tiny vs `inner`).
-        self.by_v1_id_index.rcu(|current| {
-            let keep_set: std::collections::HashSet<&str> =
-                keep.iter().map(String::as_str).collect();
-            let mut next: HashMap<Id, String> = HashMap::with_capacity(current.len());
-            for (id, slot_key) in current.iter() {
-                if keep_set.contains(slot_key.as_str()) {
-                    next.insert(id.clone(), slot_key.clone());
-                }
-            }
+            let mut next = (**current).clone();
+            next.slots.retain(|key, _| keep_set.contains(key.as_str()));
+            next.routing
+                .source_aliases
+                .retain(|_, representative| keep_set.contains(representative.as_str()));
+            next.routing
+                .canonical_url_aliases
+                .retain(|_, representative| keep_set.contains(representative.as_str()));
+            next.routing
+                .id_aliases
+                .retain(|_, representative| keep_set.contains(representative.as_str()));
+            next.routing
+                .primary_ids
+                .retain(|representative, _| keep_set.contains(representative.as_str()));
             next
         });
     }
@@ -982,41 +1238,134 @@ impl ListStatusRegistry {
     /// legacy `[lists].sources` entries). See
     /// [`update_for_url`](Self::update_for_url) for the naming rationale.
     pub fn status_for_url(&self, source: &str) -> Option<Arc<ListStatus>> {
-        self.inner.load().get(source).map(|s| s.load_full())
+        let generation = self.generation.load();
+        let representative = generation
+            .routing
+            .representative_for_source(source)
+            .or_else(|| (!generation.routing.strict).then_some(source))?;
+        generation.slots.get(representative).map(|s| s.load_full())
     }
 
-    /// Snapshot the current status by canonical
-    /// v1 entity [`Id`]. Chains through the
-    /// [`by_v1_id_index`](Self) → slot key → slot lookup. Returns
-    /// `None` either when the id is unknown to the registry OR when
-    /// the slot it points at has been retired by
-    /// [`retain_only`](Self::retain_only) since the index was last
-    /// populated (defensive — `retain_only` already prunes the
-    /// index, but a race window could in theory leave a dangling
-    /// entry, which a typed consumer must not observe as a stale
-    /// hit).
+    /// Snapshot status by canonical v1 entity [`Id`]. A missing or retired
+    /// representative returns `None`.
     pub fn status_for_v1_id(&self, id: &Id) -> Option<Arc<ListStatus>> {
-        let slot_key = self.by_v1_id_index.load().get(id)?.clone();
-        self.inner.load().get(&slot_key).map(|s| s.load_full())
+        let generation = self.generation.load();
+        let slot_key = generation.routing.id_aliases.get(id)?;
+        generation.slots.get(slot_key).map(|s| s.load_full())
     }
 
-    /// Snapshot every (source, status) pair. Order is not guaranteed.
-    pub fn snapshot(&self) -> Vec<(String, Arc<ListStatus>)> {
-        self.inner
+    /// Resolve a configured URL, slug, or Id spelling to its representative.
+    pub fn representative_for_source(&self, source: &str) -> Option<String> {
+        self.generation
             .load()
+            .routing
+            .representative_for_source(source)
+            .map(str::to_string)
+    }
+
+    /// Resolve a URL, slug, or Id alias and load its status from one
+    /// generation.
+    pub fn resolve_alias(&self, source: &str) -> Option<ResolvedListStatus> {
+        let generation = self.generation.load();
+        Self::resolve_alias_from_generation(&generation, source)
+    }
+
+    fn resolve_alias_from_generation(
+        generation: &RegistryGeneration,
+        source: &str,
+    ) -> Option<ResolvedListStatus> {
+        let representative = generation.routing.representative_for_source(source)?;
+        let slot = generation.slots.get(representative)?;
+        Some(ResolvedListStatus {
+            representative: representative.to_string(),
+            primary_id: generation.routing.primary_ids.get(representative).cloned(),
+            status: slot.load_full(),
+        })
+    }
+
+    /// Return the deterministic primary Id for a source alias.
+    pub fn primary_id_for_source(&self, source: &str) -> Option<Id> {
+        let generation = self.generation.load();
+        let representative = generation.routing.representative_for_source(source)?;
+        generation.routing.primary_ids.get(representative).cloned()
+    }
+
+    /// Snapshot slots with their primary IDs from one loaded generation.
+    pub fn snapshot_with_ids(&self) -> Vec<(String, Option<Id>, Arc<ListStatus>)> {
+        let generation = self.generation.load();
+        generation
+            .slots
             .iter()
-            .map(|(k, v)| (k.clone(), v.load_full()))
+            .map(|(source, slot)| {
+                (
+                    source.clone(),
+                    generation.routing.primary_ids.get(source).cloned(),
+                    slot.load_full(),
+                )
+            })
             .collect()
+    }
+
+    /// Compatibility snapshot without routing metadata. Order is not
+    /// guaranteed; routed IPC rendering uses [`Self::snapshot_with_ids`].
+    pub fn snapshot(&self) -> Vec<(String, Arc<ListStatus>)> {
+        self.snapshot_with_ids()
+            .into_iter()
+            .map(|(source, _, status)| (source, status))
+            .collect()
+    }
+
+    /// Return the last fully published status view for IPC, HTTP, and metrics.
+    /// It never waits for an in-progress refresh.
+    pub fn consistent_snapshot(&self) -> RegistrySnapshot {
+        (*self.completed_snapshot.load_full()).clone()
+    }
+
+    #[cfg(test)]
+    fn set_completed_publication_hook_for_test(&self, hook: CompletedPublicationHook) {
+        let mut slot = self
+            .completed_publication_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            slot.is_none(),
+            "completed-publication test hook already armed"
+        );
+        *slot = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_completed_publication_hook_for_test(&self, point: CompletedPublicationHookPoint) {
+        let hook = self
+            .completed_publication_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(point, &self.completed_publication);
+        }
+    }
+
+    fn publish_manager_snapshot(&self, cycle: CycleMark, domain_count: usize) -> RegistrySnapshot {
+        let snapshot = RegistrySnapshot {
+            rows: self.snapshot(),
+            corpus_refusal: self.corpus_refusal(),
+            corpus_freeze: self.corpus_freeze(),
+            domain_count,
+            cycle,
+        };
+        self.completed_snapshot.store(Arc::new(snapshot.clone()));
+        snapshot
     }
 
     /// Number of source slots in the registry.
     pub fn len(&self) -> usize {
-        self.inner.load().len()
+        self.generation.load().slots.len()
     }
 
-    /// True when the registry has no slots (empty `[lists].sources`).
+    /// True when the current source plan has no status slots.
     pub fn is_empty(&self) -> bool {
-        self.inner.load().is_empty()
+        self.generation.load().slots.is_empty()
     }
 
     /// Reset a source's slot to the boot default (clearing the
@@ -1027,7 +1376,12 @@ impl ListStatusRegistry {
     /// NOT materialise a slot for an unknown / typo'd source, so it can't
     /// leave a phantom `NeverFetched` row the TUI would render.
     pub fn reset_baseline(&self, source: &str) -> bool {
-        if let Some(slot) = self.inner.load().get(source) {
+        let generation = self.generation.load();
+        let representative = generation
+            .routing
+            .representative_for_source(source)
+            .or_else(|| (!generation.routing.strict).then_some(source));
+        if let Some(slot) = representative.and_then(|key| generation.slots.get(key).cloned()) {
             slot.store(Arc::new(ListStatus::default()));
             true
         } else {
@@ -1048,8 +1402,8 @@ impl ListStatusRegistry {
     /// `parsed_skipped_samples` lingering forever.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut payload: BTreeMap<String, PersistedEntry> = BTreeMap::new();
-        let snapshot = self.inner.load();
-        for (source, slot) in snapshot.iter() {
+        let snapshot = self.generation.load();
+        for (source, slot) in &snapshot.slots {
             let status = slot.load();
             // entries baseline: prefer the live count, fall back to the
             // seeded `prev_entries` during the loaded-but-not-yet-
@@ -1091,8 +1445,10 @@ impl ListStatusRegistry {
     /// corrupted persistence file MUST NOT prevent the daemon from
     /// starting.
     ///
-    /// `max_entries` is the configured per-list cap. Both persisted
-    /// baselines are clamped to it on load (clamp-to-cap, not discard):
+    /// `default_max_entries` is the global safety ceiling; a plan-derived
+    /// source cap narrows it when the persisted row names that source. Both
+    /// persisted baselines are clamped to it on load (clamp-to-cap, not
+    /// discard):
     /// a planted `list_stats.json` cannot inject an arbitrarily large
     /// baseline to weaponise the retention guard (a huge baseline would
     /// make any honest refresh look like a catastrophic shrink and brick
@@ -1106,7 +1462,12 @@ impl ListStatusRegistry {
     /// unconditional overwrite would wipe live `entries`/`last_outcome`
     /// back to `NeverFetched` and disarm the guard for one cycle right
     /// when a reload-triggered refresh is about to fire.
-    pub fn load_persisted(&self, path: &Path, max_entries: u64) {
+    pub fn load_persisted(
+        &self,
+        path: &Path,
+        default_max_entries: usize,
+        source_max_entries: &std::collections::HashMap<String, usize>,
+    ) {
         let body = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -1127,6 +1488,10 @@ impl ListStatusRegistry {
             }
         };
         for (source, entry) in payload {
+            let max_entries = source_max_entries
+                .get(&source)
+                .copied()
+                .unwrap_or(default_max_entries) as u64;
             let (entries, unique_domains) = match entry {
                 PersistedEntry::V2 {
                     entries,
@@ -1140,7 +1505,8 @@ impl ListStatusRegistry {
             };
             let entries = entries.min(max_entries);
             let unique_domains = unique_domains.min(max_entries);
-            if let Some(slot) = self.inner.load().get(&source) {
+            let generation = self.generation.load();
+            if let Some(slot) = generation.slots.get(&source) {
                 let current = slot.load();
                 // Only seed a slot the live daemon has not already
                 // populated this run (see "Merge-don't-clobber" above).
@@ -1176,6 +1542,82 @@ mod tests {
     use tempfile::tempdir;
     use time::macros::datetime;
     use time::Duration;
+
+    #[derive(Default)]
+    struct PublicationRaceState {
+        manager_loaded: bool,
+        shared_lock_honored: Option<bool>,
+        non_manager_loaded: bool,
+        manager_stored: bool,
+    }
+
+    struct PublicationRace {
+        state: Mutex<PublicationRaceState>,
+        changed: std::sync::Condvar,
+    }
+
+    impl PublicationRace {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(PublicationRaceState::default()),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn hook(&self, point: CompletedPublicationHookPoint, publication_lock: &Mutex<()>) {
+            match point {
+                CompletedPublicationHookPoint::BeforeLock { manager: false } => {
+                    let mut state = self.state.lock().unwrap();
+                    while !state.manager_loaded {
+                        state = self.changed.wait(state).unwrap();
+                    }
+                    // The manager is paused after loading its prior snapshot.
+                    // This succeeds only if the two record paths do not share
+                    // the same publication lock.
+                    state.shared_lock_honored = Some(matches!(
+                        publication_lock.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    self.changed.notify_all();
+                }
+                CompletedPublicationHookPoint::AfterSnapshotLoad { manager: true } => {
+                    let mut state = self.state.lock().unwrap();
+                    state.manager_loaded = true;
+                    self.changed.notify_all();
+                    while state.shared_lock_honored.is_none() {
+                        state = self.changed.wait(state).unwrap();
+                    }
+                    // With no shared lock, force both paths to derive from the
+                    // same old snapshot before either stores it.
+                    if state.shared_lock_honored == Some(false) {
+                        while !state.non_manager_loaded {
+                            state = self.changed.wait(state).unwrap();
+                        }
+                    }
+                }
+                CompletedPublicationHookPoint::AfterSnapshotLoad { manager: false } => {
+                    let mut state = self.state.lock().unwrap();
+                    if state.shared_lock_honored == Some(false) {
+                        state.non_manager_loaded = true;
+                        self.changed.notify_all();
+                        while !state.manager_stored {
+                            state = self.changed.wait(state).unwrap();
+                        }
+                    }
+                }
+                CompletedPublicationHookPoint::AfterStore { manager: true } => {
+                    let mut state = self.state.lock().unwrap();
+                    state.manager_stored = true;
+                    self.changed.notify_all();
+                }
+                _ => {}
+            }
+        }
+
+        fn shared_lock_honored(&self) -> Option<bool> {
+            self.state.lock().unwrap().shared_lock_honored
+        }
+    }
 
     #[test]
     fn parsed_counts_default_is_zero() {
@@ -1400,12 +1842,12 @@ mod tests {
         assert_eq!(snap.last_outcome, LastOutcome::Ok);
     }
 
-    /// The cycle counter has to separate FOUR states that `corpus_refusal()`
-    /// collapses into two. Three of them read `None` there — installed,
-    /// still-running and skipped — so a caller polling that field cannot
-    /// tell a successful reload from one that has not started.
+    /// The cycle counter has to separate the six completed outcomes from
+    /// the unfinished state. Installed, rollback-failed, skipped, cleared,
+    /// rejected, and still-running all read `None` through
+    /// `corpus_refusal()`, so polling that field cannot identify a cycle.
     ///
-    /// Asserted as a sequence rather than as four isolated cases because
+    /// Asserted as a sequence rather than as isolated cases because
     /// the monotonicity is the property: a poller waits for `seq` to CHANGE,
     /// so a counter that resets, repeats, or fails to advance on one of the
     /// outcomes is exactly the bug that makes the wait meaningless.
@@ -1419,15 +1861,15 @@ mod tests {
         let start = reg.cycle();
         assert_eq!(start.seq, 0);
         assert_eq!(start.outcome, None);
+        assert_eq!(start.served_state, ServedState::Uninitialized);
 
         for (n, outcome) in [
             CycleOutcome::Installed,
             CycleOutcome::Refused,
-            // The one no naive implementation records: this path returns
-            // early in start.rs and never reaches the manager, so a counter
-            // wired only into the install path sits still through it.
+            CycleOutcome::SpillRollbackFailed,
             CycleOutcome::SkippedUnchanged,
-            CycleOutcome::Installed,
+            CycleOutcome::ClearedNoSources,
+            CycleOutcome::ConfigRejected,
         ]
         .into_iter()
         .enumerate()
@@ -1443,6 +1885,275 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cycle_mark_qualifier_keeps_existing_outcome_values_stable() {
+        let installed: CycleMark = serde_json::from_str(r#"{"seq":7,"outcome":"installed"}"#)
+            .expect("existing cycle mark must remain readable");
+        assert_eq!(installed.outcome, Some(CycleOutcome::Installed));
+        assert!(!installed.source_coverage_incomplete);
+        assert_eq!(installed.served_state, ServedState::Unknown);
+        assert!(!installed.generation_degraded);
+
+        let mark = CycleMark {
+            seq: 8,
+            outcome: Some(CycleOutcome::SpillRollbackFailed),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: ServedState::Uninitialized,
+        };
+        assert_eq!(
+            serde_json::to_string(&mark).expect("serialise new cycle mark"),
+            r#"{"seq":8,"outcome":"spill_rollback_failed","source_coverage_incomplete":false,"generation_degraded":false,"served_state":"uninitialized"}"#
+        );
+
+        let coverage = CycleMark {
+            seq: 9,
+            outcome: Some(CycleOutcome::SpillRollbackFailed),
+            source_coverage_incomplete: true,
+            generation_degraded: true,
+            served_state: ServedState::Uninitialized,
+        };
+        assert_eq!(
+            serde_json::to_string(&coverage).expect("serialise coverage mark"),
+            r#"{"seq":9,"outcome":"spill_rollback_failed","source_coverage_incomplete":true,"generation_degraded":true,"served_state":"uninitialized"}"#
+        );
+    }
+
+    #[test]
+    fn only_installed_generations_are_ready_for_bind() {
+        for state in [
+            ServedState::Complete,
+            ServedState::Partial,
+            ServedState::IntentionalEmpty,
+        ] {
+            assert!(state.is_ready_for_bind(), "{state:?} must bind");
+        }
+        for state in [
+            ServedState::Unknown,
+            ServedState::Uninitialized,
+            ServedState::Cleared,
+        ] {
+            assert!(!state.is_ready_for_bind(), "{state:?} must not bind");
+        }
+    }
+
+    #[test]
+    fn old_shaped_cycle_mark_ignores_the_coverage_qualifier() {
+        #[derive(Deserialize)]
+        struct LegacyCycleMark {
+            seq: u64,
+            outcome: Option<CycleOutcome>,
+        }
+
+        let legacy: LegacyCycleMark = serde_json::from_str(
+            r#"{"seq":9,"outcome":"spill_rollback_failed","source_coverage_incomplete":true}"#,
+        )
+        .expect("an old serde struct must ignore a newly added field");
+        assert_eq!(legacy.seq, 9);
+        assert_eq!(legacy.outcome, Some(CycleOutcome::SpillRollbackFailed));
+    }
+
+    #[test]
+    fn cycle_coverage_qualifier_has_the_documented_lifecycle() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+
+        // A degraded partial install sets both qualifiers. A config
+        // fingerprint skip and a config rejection keep describing the
+        // corpus they leave live.
+        reg.record_cycle_with_qualifiers_and_served_state(
+            CycleOutcome::Installed,
+            true,
+            true,
+            0,
+            Some(ServedState::Partial),
+        );
+        assert!(reg.cycle().source_coverage_incomplete);
+        assert!(reg.cycle().generation_degraded);
+        assert_eq!(reg.cycle().served_state, ServedState::Partial);
+        reg.record_cycle(CycleOutcome::SkippedUnchanged);
+        assert!(reg.cycle().source_coverage_incomplete);
+        assert!(reg.cycle().generation_degraded);
+        assert_eq!(reg.cycle().served_state, ServedState::Partial);
+        reg.record_cycle(CycleOutcome::ConfigRejected);
+        assert!(reg.cycle().source_coverage_incomplete);
+        assert!(reg.cycle().generation_degraded);
+        assert_eq!(reg.cycle().served_state, ServedState::Partial);
+
+        // A complete manager cycle clears it. Removing every source clears
+        // both qualifiers without becoming a configured empty generation.
+        reg.record_cycle_with_qualifiers(CycleOutcome::Installed, false, false, 0);
+        assert!(!reg.cycle().source_coverage_incomplete);
+        assert!(!reg.cycle().generation_degraded);
+        assert_eq!(reg.cycle().served_state, ServedState::Complete);
+        reg.record_cycle_with_qualifiers(CycleOutcome::Installed, true, true, 0);
+        reg.record_cycle_with_qualifiers(CycleOutcome::ClearedNoSources, false, false, 0);
+        assert!(!reg.cycle().source_coverage_incomplete);
+        assert!(!reg.cycle().generation_degraded);
+        assert_eq!(reg.cycle().served_state, ServedState::Cleared);
+    }
+
+    #[test]
+    fn completed_snapshot_never_exposes_unpublished_rows_or_payloads() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+        let now = OffsetDateTime::now_utc();
+        reg.update_for_url(
+            "a",
+            ListStatus::from_refresh(42, ParsedCounts::default(), None, now),
+        );
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 42,
+            ceiling: 10,
+            novel_by_source: vec![],
+        }));
+
+        // These are in-progress writes. A status reader receives the prior
+        // immutable view rather than mixing them with seq 0.
+        let before = reg.consistent_snapshot();
+        assert_eq!(before.cycle.seq, 0);
+        assert_eq!(before.rows[0].1.entries, 0);
+        assert!(before.corpus_refusal.is_none());
+
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 42);
+        let after = reg.consistent_snapshot();
+        assert_eq!(after.cycle.outcome, Some(CycleOutcome::Refused));
+        assert_eq!(after.rows[0].1.entries, 42);
+        assert_eq!(after.corpus_refusal.unwrap().unique, 42);
+        assert_eq!(after.domain_count, 42);
+    }
+
+    #[test]
+    fn non_manager_publication_keeps_the_last_completed_manager_view() {
+        let reg = ListStatusRegistry::new(&["a".into()]);
+        let now = OffsetDateTime::now_utc();
+        reg.update_for_url(
+            "a",
+            ListStatus::from_refresh(10, ParsedCounts::default(), None, now),
+        );
+        reg.note_refused_cycle(now);
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 10,
+            ceiling: 5,
+            novel_by_source: vec![],
+        }));
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, true, false, 10);
+
+        // Simulate a manager refresh after it has changed live slots but
+        // before it reaches its completed publication point.
+        reg.update_for_url(
+            "a",
+            ListStatus::from_refresh(20, ParsedCounts::default(), None, now),
+        );
+        reg.note_refused_cycle(now + Duration::seconds(1));
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 20,
+            ceiling: 5,
+            novel_by_source: vec![],
+        }));
+        reg.record_cycle(CycleOutcome::ConfigRejected);
+
+        let during = reg.consistent_snapshot();
+        assert_eq!(during.cycle.outcome, Some(CycleOutcome::ConfigRejected));
+        assert!(during.cycle.source_coverage_incomplete);
+        assert_eq!(during.rows[0].1.entries, 10);
+        assert_eq!(during.domain_count, 10);
+        assert_eq!(during.corpus_refusal.unwrap().unique, 10);
+        assert_eq!(during.corpus_freeze.unwrap().consecutive, 1);
+
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 20);
+        let finished = reg.consistent_snapshot();
+        assert_eq!(finished.rows[0].1.entries, 20);
+        assert_eq!(finished.domain_count, 20);
+        assert_eq!(finished.corpus_refusal.unwrap().unique, 20);
+        assert_eq!(finished.corpus_freeze.unwrap().consecutive, 2);
+    }
+
+    #[test]
+    fn concurrent_manager_and_non_manager_publications_are_serialized() {
+        let reg = Arc::new(ListStatusRegistry::new(&["a".into()]));
+        let now = OffsetDateTime::now_utc();
+        reg.update_for_url(
+            "a",
+            ListStatus::from_refresh(10, ParsedCounts::default(), None, now),
+        );
+        reg.note_refused_cycle(now);
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 10,
+            ceiling: 5,
+            novel_by_source: vec![],
+        }));
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, true, false, 10);
+
+        // These are live manager writes awaiting the manager publication.
+        reg.update_for_url(
+            "a",
+            ListStatus::from_refresh(20, ParsedCounts::default(), None, now),
+        );
+        reg.note_refused_cycle(now + Duration::seconds(1));
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 20,
+            ceiling: 5,
+            novel_by_source: vec![],
+        }));
+
+        let race = Arc::new(PublicationRace::new());
+        let hook_race = Arc::clone(&race);
+        reg.set_completed_publication_hook_for_test(Arc::new(move |point, lock| {
+            hook_race.hook(point, lock);
+        }));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let manager_reg = Arc::clone(&reg);
+        let manager_start = Arc::clone(&start);
+        let manager = std::thread::spawn(move || {
+            manager_start.wait();
+            manager_reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, true, 20);
+        });
+        let non_manager_reg = Arc::clone(&reg);
+        let non_manager_start = Arc::clone(&start);
+        let non_manager = std::thread::spawn(move || {
+            non_manager_start.wait();
+            non_manager_reg.record_cycle(CycleOutcome::ConfigRejected);
+        });
+
+        start.wait();
+        manager.join().expect("manager publication thread panicked");
+        non_manager
+            .join()
+            .expect("non-manager publication thread panicked");
+
+        assert_eq!(race.shared_lock_honored(), Some(true));
+        let snapshot = reg.consistent_snapshot();
+        assert_eq!(snapshot.cycle.seq, 3, "no publication increment was lost");
+        assert_eq!(snapshot.cycle.outcome, Some(CycleOutcome::ConfigRejected));
+        assert!(!snapshot.cycle.source_coverage_incomplete);
+        assert!(snapshot.cycle.generation_degraded);
+        assert_eq!(snapshot.rows[0].1.entries, 20);
+        assert_eq!(snapshot.corpus_refusal.unwrap().unique, 20);
+        assert_eq!(snapshot.corpus_freeze.unwrap().consecutive, 2);
+        assert_eq!(snapshot.domain_count, 20);
+    }
+
+    #[test]
+    fn intentional_clear_publishes_no_refusal_or_freeze() {
+        let reg = ListStatusRegistry::new(&[]);
+        reg.note_refused_cycle(OffsetDateTime::now_utc());
+        reg.set_corpus_refusal(Some(CorpusRefusal {
+            unique: 42,
+            ceiling: 10,
+            novel_by_source: vec![],
+        }));
+        reg.set_corpus_refusal(None);
+        reg.clear_corpus_freeze();
+        reg.record_cycle_with_source_coverage(CycleOutcome::ClearedNoSources, false, 0);
+
+        let snapshot = reg.consistent_snapshot();
+        assert_eq!(snapshot.cycle.outcome, Some(CycleOutcome::ClearedNoSources));
+        assert_eq!(snapshot.cycle.served_state, ServedState::Cleared);
+        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.domain_count, 0);
+        assert!(snapshot.corpus_refusal.is_none());
+        assert!(snapshot.corpus_freeze.is_none());
+    }
+
     /// A refusal and a cycle mark are written together but answer different
     /// questions, and the pairing is what a caller reads. Pinned because the
     /// tempting simplification — derive the outcome from `corpus_refusal()`
@@ -1455,7 +2166,7 @@ mod tests {
             ceiling: 14_000_000,
             novel_by_source: vec![],
         }));
-        reg.record_cycle(CycleOutcome::Refused);
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 0);
 
         // A later cycle that does no work must not announce a recovery: no
         // corpus was built, so what is installed is still the refused-era
@@ -1532,10 +2243,10 @@ mod tests {
             ceiling: 14_000_000,
             novel_by_source: vec![],
         }));
-        reg.record_cycle(CycleOutcome::Refused);
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 0);
 
         reg.note_refused_cycle(t0 + Duration::hours(24));
-        reg.record_cycle(CycleOutcome::Refused);
+        reg.record_cycle_with_qualifiers(CycleOutcome::Refused, false, false, 0);
         let frozen = reg.corpus_freeze().expect("still frozen");
         assert_eq!(frozen.since, Some(t0));
         assert_eq!(frozen.consecutive, 2);
@@ -1544,7 +2255,8 @@ mod tests {
         // method's to clear — the manager republishes it (as `None`) on
         // every cycle that installs — so only the freeze is asserted here.
         reg.note_installed_cycle();
-        reg.record_cycle(CycleOutcome::Installed);
+        reg.set_corpus_refusal(None);
+        reg.record_cycle_with_qualifiers(CycleOutcome::Installed, false, false, 0);
         assert!(reg.corpus_freeze().is_none());
     }
 
@@ -1606,11 +2318,7 @@ mod tests {
 
     #[test]
     fn registry_retain_only_drops_stale_slots() {
-        // Pin the leak fix: deleting a [[blocklists]] entry drops
-        // its URL from the next merged_sources, and the reload
-        // pipeline calls retain_only(merged_sources) to evict the
-        // matching registry slot. Without this the TUI would render a
-        // permanent orphan row keyed on the dead URL.
+        // Compatibility callers retire removed slots explicitly.
         let reg = ListStatusRegistry::new(&["a".into(), "b".into(), "c".into()]);
         // Simulate a refresh that wrote to all three.
         let now = OffsetDateTime::now_utc();
@@ -1622,7 +2330,7 @@ mod tests {
         }
         assert_eq!(reg.len(), 3);
 
-        // Operator deletes "b" — reload's merged_sources drops it.
+        // Simulate a removed source.
         reg.retain_only(&["a".into(), "c".into()]);
         assert_eq!(reg.len(), 2);
         assert!(reg.status_for_url("a").is_some());
@@ -1709,7 +2417,7 @@ mod tests {
         // Load into a fresh registry — must seed both `live` (from
         // entries) and `carried` (from prev_entries).
         let fresh = ListStatusRegistry::new(&["live".into(), "carried".into(), "untouched".into()]);
-        fresh.load_persisted(&path, u64::MAX);
+        fresh.load_persisted(&path, usize::MAX, &HashMap::new());
         assert_eq!(
             fresh.status_for_url("live").unwrap().prev_entries,
             Some(123)
@@ -1732,7 +2440,7 @@ mod tests {
         let path = dir.path().join("nonexistent.json");
         let reg = ListStatusRegistry::new(&["x".into()]);
         // Must not panic, must not log error — boot-from-nothing path.
-        reg.load_persisted(&path, u64::MAX);
+        reg.load_persisted(&path, usize::MAX, &HashMap::new());
         assert!(reg.status_for_url("x").unwrap().prev_entries.is_none());
     }
 
@@ -1743,7 +2451,7 @@ mod tests {
         std::fs::write(&path, b"not valid json").unwrap();
         let reg = ListStatusRegistry::new(&["x".into()]);
         // Must not panic; corrupted persistence MUST NOT block boot.
-        reg.load_persisted(&path, u64::MAX);
+        reg.load_persisted(&path, usize::MAX, &HashMap::new());
         assert!(reg.status_for_url("x").unwrap().prev_entries.is_none());
     }
 
@@ -1756,7 +2464,7 @@ mod tests {
         let path = dir.path().join("list_stats.json");
         std::fs::write(&path, br#"{"privacy/ads": 4242}"#).unwrap();
         let reg = ListStatusRegistry::new(&["privacy/ads".into()]);
-        reg.load_persisted(&path, u64::MAX);
+        reg.load_persisted(&path, usize::MAX, &HashMap::new());
         let s = reg.status_for_url("privacy/ads").unwrap();
         assert_eq!(s.prev_entries, Some(4242));
         // No unique baseline in v1 — guard falls back to prev_entries.
@@ -1778,7 +2486,7 @@ mod tests {
         reg.save(&path).unwrap();
 
         let fresh = ListStatusRegistry::new(&["src".into()]);
-        fresh.load_persisted(&path, u64::MAX);
+        fresh.load_persisted(&path, usize::MAX, &HashMap::new());
         let s = fresh.status_for_url("src").unwrap();
         assert_eq!(s.prev_entries, Some(900), "entries baseline round-trips");
         assert_eq!(s.unique_domains, 950, "unique baseline round-trips");
@@ -1798,10 +2506,30 @@ mod tests {
         )
         .unwrap();
         let reg = ListStatusRegistry::new(&["src".into()]);
-        reg.load_persisted(&path, 5000);
+        reg.load_persisted(&path, 5000, &HashMap::new());
         let s = reg.status_for_url("src").unwrap();
         assert_eq!(s.prev_entries, Some(5000));
         assert_eq!(s.unique_domains, 5000);
+    }
+
+    #[test]
+    fn load_persisted_clamps_each_source_to_its_effective_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("list_stats.json");
+        std::fs::write(
+            &path,
+            br#"{"narrow": {"entries": 9, "unique_domains": 9}, "wide": {"entries": 9, "unique_domains": 9}}"#,
+        )
+        .unwrap();
+        let reg = ListStatusRegistry::new(&["narrow".into(), "wide".into()]);
+        let caps = HashMap::from([("narrow".to_string(), 2usize), ("wide".to_string(), 7usize)]);
+        reg.load_persisted(&path, 10, &caps);
+        let narrow = reg.status_for_url("narrow").unwrap();
+        assert_eq!(narrow.prev_entries, Some(2));
+        assert_eq!(narrow.unique_domains, 2);
+        let wide = reg.status_for_url("wide").unwrap();
+        assert_eq!(wide.prev_entries, Some(7));
+        assert_eq!(wide.unique_domains, 7);
     }
 
     #[test]
@@ -1821,7 +2549,7 @@ mod tests {
             ..Default::default()
         };
         reg.update_for_url("src", ListStatus::from_refresh(5000, counts, None, now));
-        reg.load_persisted(&path, u64::MAX);
+        reg.load_persisted(&path, usize::MAX, &HashMap::new());
         let s = reg.status_for_url("src").unwrap();
         // Live data survives — NOT replaced by the stale disk baseline.
         assert!(matches!(s.last_outcome, LastOutcome::Ok));
@@ -1968,8 +2696,8 @@ mod tests {
             display_name: id.to_string(),
             url: url.to_string(),
             format: BlocklistFormat::Domains,
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled,
             auth_token_ref: None,
             base: BlocklistBase::Deny,
@@ -1981,10 +2709,7 @@ mod tests {
 
     #[test]
     fn status_for_v1_id_resolves_v1_row_via_url_alias() {
-        // A pure-v1 row in `[[blocklists]]` (URL
-        // in the source list, id known) — after
-        // `populate_v1_id_index`, the typed v1-id lookup must hit the
-        // same slot the URL lookup hits.
+        // Compatibility Id routing maps the row and URL to one slot.
         let url = "https://lists.purge.cc/ads.txt";
         let reg = ListStatusRegistry::new(&[url.to_string()]);
         reg.populate_v1_id_index(&[mk_v1_blocklist("privacy-ads", url, true)]);
@@ -2000,16 +2725,151 @@ mod tests {
             .expect("URL lookup hits the freshly-updated slot");
         let by_id = reg
             .status_for_v1_id(&Id::new("privacy-ads").unwrap())
-            .expect("v1-id lookup hits the same slot through by_v1_id_index");
+            .expect("v1-id lookup hits the same slot through compatibility routing");
         assert_eq!(by_url.entries, 42);
         assert_eq!(by_id.entries, 42);
     }
 
     #[test]
+    fn registry_plan_routes_url_slug_and_id_aliases_to_one_status() {
+        let legacy = vec!["privacy/ads".to_string()];
+        let rows = vec![mk_v1_blocklist(
+            "privacy-ads",
+            "https://lists.purge.cc/ads.txt",
+            true,
+        )];
+        let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+            &crate::lists::catalog::Catalog::fallback(),
+            &legacy,
+            &rows,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let reg = ListStatusRegistry::from_plan(&plan);
+        let now = OffsetDateTime::now_utc();
+        reg.update_for_url(
+            "privacy/ads",
+            ListStatus::from_refresh(42, ParsedCounts::default(), None, now),
+        );
+        let by_slug = reg.status_for_url("privacy/ads").unwrap();
+        let by_url = reg
+            .status_for_url("https://LISTS.PURGE.CC:443/ads.txt/")
+            .unwrap();
+        let by_id_alias = reg.status_for_url("privacy-ads").unwrap();
+        let by_id = reg
+            .status_for_v1_id(&Id::new("privacy-ads").unwrap())
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(by_slug.entries, 42);
+        assert_eq!(by_url.entries, 42);
+        assert_eq!(by_id_alias.entries, 42);
+        assert_eq!(by_id.entries, 42);
+    }
+
+    #[test]
+    fn resolve_alias_keeps_routing_identity_and_slot_in_one_generation() {
+        let old_row = mk_v1_blocklist("team-ads", "https://lists.test/old.txt", true);
+        let old_plan = crate::lists::source_key::ResolvedSourcePlan::build(
+            &crate::lists::catalog::Catalog::fallback(),
+            &[],
+            &[old_row],
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let reg = ListStatusRegistry::from_plan(&old_plan);
+        reg.update_for_url(
+            "team-ads",
+            ListStatus::from_refresh(1, ParsedCounts::default(), None, OffsetDateTime::now_utc()),
+        );
+        let old_generation = reg.generation.load_full();
+
+        let new_row = mk_v1_blocklist("team-ads", "https://lists.test/new.txt", true);
+        let new_plan = crate::lists::source_key::ResolvedSourcePlan::build(
+            &crate::lists::catalog::Catalog::fallback(),
+            &[],
+            &[new_row],
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        reg.sync_plan(&new_plan);
+        reg.update_for_url(
+            "team-ads",
+            ListStatus::from_refresh(2, ParsedCounts::default(), None, OffsetDateTime::now_utc()),
+        );
+
+        let old = ListStatusRegistry::resolve_alias_from_generation(&old_generation, "team-ads")
+            .expect("captured generation retains its alias and slot");
+        let current = reg
+            .resolve_alias("team-ads")
+            .expect("current generation resolves the same Id alias");
+        assert_eq!(old.representative, "https://lists.test/old.txt");
+        assert_eq!(old.primary_id.unwrap().as_str(), "team-ads");
+        assert_eq!(old.status.entries, 1);
+        assert_eq!(current.representative, "https://lists.test/new.txt");
+        assert_eq!(current.primary_id.unwrap().as_str(), "team-ads");
+        assert_eq!(current.status.entries, 2);
+    }
+
+    #[test]
+    fn planned_registry_does_not_recreate_a_retired_slot_from_a_late_writer() {
+        let rows = vec![mk_v1_blocklist(
+            "privacy-ads",
+            "https://lists.purge.cc/ads.txt",
+            true,
+        )];
+        let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+            &crate::lists::catalog::Catalog::fallback(),
+            &["privacy/ads".to_string()],
+            &rows,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let empty = crate::lists::source_key::ResolvedSourcePlan::default();
+        let reg = ListStatusRegistry::from_plan(&plan);
+
+        let old_generation = reg.generation.load_full();
+        reg.sync_plan(&empty);
+        reg.update_with_generation(
+            &old_generation,
+            "privacy/ads",
+            ListStatus::from_refresh(1, ParsedCounts::default(), None, OffsetDateTime::now_utc()),
+        );
+
+        assert!(reg.is_empty());
+        assert!(reg.status_for_url("privacy/ads").is_none());
+    }
+
+    #[test]
+    fn sync_plan_publishes_slots_and_aliases_as_one_generation() {
+        let rows = vec![mk_v1_blocklist(
+            "privacy-ads",
+            "https://lists.purge.cc/ads.txt",
+            true,
+        )];
+        let plan = crate::lists::source_key::ResolvedSourcePlan::build(
+            &crate::lists::catalog::Catalog::fallback(),
+            &["privacy/ads".to_string()],
+            &rows,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let reg = ListStatusRegistry::from_plan(&ResolvedSourcePlan::default());
+        reg.sync_plan(&plan);
+
+        let generation = reg.generation.load();
+        let representative = generation
+            .routing
+            .representative_for_source("privacy-ads")
+            .expect("the Id alias is part of the published generation");
+        assert!(
+            generation.slots.contains_key(representative),
+            "the same loaded generation must carry the routed status slot"
+        );
+    }
+
+    #[test]
     fn status_for_v1_id_resolves_legacy_slash_form_source_via_translation() {
-        // The constructor seeds slash-form slot keys into
-        // `by_v1_id_index` via `Id::new(s.replace('/','-'))` directly,
-        // so this works WITHOUT calling `populate_v1_id_index`.
+        // Compatibility construction translates slash-form keys directly.
         let reg = ListStatusRegistry::new(&["privacy/ads".to_string()]);
         let now = OffsetDateTime::now_utc();
         reg.update_for_url(
@@ -2038,32 +2898,21 @@ mod tests {
 
     #[test]
     fn populate_v1_id_index_skips_disabled_blocklists() {
-        // Parity with `SourceBitMap::build` —
-        // disabled rows don't get a `by_v1_id_index` alias because
-        // their URL doesn't surface in `merge_sources_with_blocklists`
-        // (so the slot wouldn't exist anyway). Pinning this prevents
-        // a dangling id-alias when a row is disabled at reload time.
+        // Disabled rows must not create compatibility Id aliases.
         let url = "https://lists.purge.cc/ads.txt";
         let reg = ListStatusRegistry::new(&[url.to_string()]);
-        // The row is in the catalogue but disabled — `populate` skips
-        // it. Slot exists (constructor created it from sources), but
-        // the v1-id lookup does NOT resolve.
+        // The URL slot remains, but the disabled row has no Id route.
         reg.populate_v1_id_index(&[mk_v1_blocklist("privacy-ads", url, false)]);
         assert!(reg
             .status_for_v1_id(&Id::new("privacy-ads").unwrap())
             .is_none());
-        // URL lookup still works (slot is present).
+        // The existing URL slot remains reachable.
         assert!(reg.status_for_url(url).is_some());
     }
 
     #[test]
     fn retain_only_retires_v1_id_index_entries_pointing_at_dropped_slots() {
-        // When a [[blocklists]] entry is removed
-        // at reload time, both the URL slot AND the v1-id alias must
-        // be retired. Otherwise `status_for_v1_id` would return
-        // `None` (correct outcome via the inner-lookup miss) but the
-        // index would leak the dead id forever. The doc-comment on
-        // `retain_only` calls this out — this test pins it.
+        // Removing a slot must also remove its compatibility Id route.
         let live = "https://lists.purge.cc/ads.txt";
         let stale = "https://lists.purge.cc/dead.txt";
         let reg = ListStatusRegistry::new(&[live.to_string(), stale.to_string()]);

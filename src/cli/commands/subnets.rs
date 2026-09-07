@@ -22,13 +22,14 @@ use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    read_or_empty, remove_id_keyed, resolve_existing_target_file, resolve_target_file,
-    upsert_id_keyed, write_value_validated, EntityClass,
+    read_or_empty_locked, remove_id_keyed, resolve_existing_target_file_locked,
+    resolve_target_file_locked, upsert_id_keyed, write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
 use crate::config::cidr::Cidr;
-use crate::config::loader::load_config;
-use crate::config::schema::{Id, Subnet};
+use crate::config::loader::{load_config, load_config_for_schema_under_guard};
+use crate::config::schema::{Id, Subnet, SCHEMA_VERSION_V1};
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 // ── Reports & outcomes ─────────────────────────────────────────────────
 //
@@ -146,7 +147,7 @@ fn render_subnet_detail(s: &Subnet) -> String {
 ///
 /// - `subnet "..." already exists` if the id collides (the pre-write
 ///   check; a concurrent-add race is caught by the merged pre-promote
-///   validation in [`super::target::write_value_validated`]).
+///   validation in [`super::target::write_value_validated_locked`]).
 /// - `profile "..." is not defined` if the referenced profile is
 ///   missing.
 /// - `at least one --cidr is required` / `invalid cidr "..."` / etc.
@@ -163,10 +164,40 @@ pub(crate) fn add_inner(
     if cidrs.is_empty() {
         bail!("at least one --cidr is required");
     }
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(
+        &guard,
+        config_path,
+        id,
+        display_name,
+        cidrs,
+        profile,
+        priority,
+        into,
+    )
+}
+
+/// Guard-reusing form of [`add_inner`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    display_name: Option<&str>,
+    cidrs: &[String],
+    profile: &str,
+    priority: Option<i32>,
+    into: Option<&Path>,
+) -> anyhow::Result<AddReport> {
+    let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
+    if cidrs.is_empty() {
+        bail!("at least one --cidr is required");
+    }
     let stored_cidrs = canonicalise_cidrs(cidrs)?;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if loaded.config.subnets.iter().any(|s| s.id.as_str() == id) {
         bail!("subnet \"{id}\" already exists");
     }
@@ -196,8 +227,8 @@ pub(crate) fn add_inner(
         tbl.insert("priority".into(), Value::Integer(p as i64));
     }
 
-    let target_path = resolve_target_file(config_path, EntityClass::Subnets, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_target_file_locked(guard, config_path, EntityClass::Subnets, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     // A create, and the returned flag is what says so — see the exhaustive
     // destructuring test in this module for the other half of the guard.
     anyhow::ensure!(
@@ -211,14 +242,14 @@ pub(crate) fn add_inner(
          nothing was changed",
         target_path.display()
     );
-    // write_value_validated runs the full merged validation (master + every
+    // The locked writer runs the full merged validation (master + every
     // sibling include + this staged slice) BEFORE the rename, so a concurrent
     // `warden subnet add` that landed the same id in another file is caught
     // here as a cross-file duplicate and the write is refused — nothing is
     // promoted. The friendly pre-check above covers the common (non-race)
     // case; the rare race surfaces the validator's DuplicateId message
     // rather than a bespoke string.
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
@@ -250,8 +281,21 @@ pub(crate) fn set_fields_inner(
     fields: &[(&str, &str)],
     into: Option<&Path>,
 ) -> anyhow::Result<SetFieldsReport> {
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Subnets, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let guard = acquire_for_write(config_path)?;
+    set_fields_inner_locked(&guard, config_path, id, fields, into)
+}
+
+/// Guard-reusing form of [`set_fields_inner`].
+pub(crate) fn set_fields_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    fields: &[(&str, &str)],
+    into: Option<&Path>,
+) -> anyhow::Result<SetFieldsReport> {
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Subnets, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let entry = find_id_entry_mut(&mut doc, EntityClass::Subnets.toml_key(), id)?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -264,7 +308,7 @@ pub(crate) fn set_fields_inner(
     for (field, value) in fields {
         apply_subnet_field(entry, field, value)?;
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     let id_for_audit = id.to_string();
     let fields_after = fields
         .iter()
@@ -297,7 +341,20 @@ pub(crate) fn set_inner(
     value: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<SetReport> {
-    let report = set_fields_inner(config_path, id, &[(field, value)], into)?;
+    let guard = acquire_for_write(config_path)?;
+    set_inner_locked(&guard, config_path, id, field, value, into)
+}
+
+/// Guard-reusing form of [`set_inner`].
+pub(crate) fn set_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    field: &str,
+    value: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<SetReport> {
+    let report = set_fields_inner_locked(guard, config_path, id, &[(field, value)], into)?;
     Ok(SetReport {
         id: report.id,
         field: field.to_string(),
@@ -315,13 +372,25 @@ pub(crate) fn remove_inner(
     id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Subnets, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, id, into)
+}
+
+/// Guard-reusing form of [`remove_inner`].
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<RemoveOutcome> {
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Subnets, id, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let removed = remove_id_keyed(&mut doc, EntityClass::Subnets.toml_key(), id)?;
     if !removed {
         return Ok(RemoveOutcome::NotFound { target_path });
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
     let id_for_audit = id.to_string();
     let target_for_audit = target_path.clone();
     persist_cli_mutation_audit(config_path, move || {
@@ -512,7 +581,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [server]
 default_profile = "default"

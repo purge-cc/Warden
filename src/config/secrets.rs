@@ -146,7 +146,7 @@ pub fn load_secrets(path: &Path) -> Result<Secrets, ConfigError> {
     // `O_NOFOLLOW` refuses a symlinked `secrets.toml` outright; the fstat and
     // the read then see the identical inode the gate approved — the same
     // posture the staged-temp write path already takes (`atomic_write.rs`).
-    let mut file = match std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -171,6 +171,39 @@ pub fn load_secrets(path: &Path) -> Result<Secrets, ConfigError> {
         }
     };
 
+    load_secrets_opened(file, path)
+}
+
+pub(crate) fn load_secrets_under_tree(
+    tree: super::tree_io::TreeIo<'_>,
+) -> Result<Secrets, ConfigError> {
+    let path = tree.identity.root.join(SECRETS_FILENAME);
+    let file = tree
+        .open_no_follow(Path::new(SECRETS_FILENAME))
+        .map_err(|e| {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.raw_os_error() == Some(libc::ELOOP))
+            {
+                return ConfigError::ValidationFailed(
+                    ErrorContext::new("secrets path is a symlink; refusing to follow")
+                        .with_file(path.clone())
+                        .with_suggestion(
+                            "replace the symlink at this path with a plain 0600 regular file",
+                        ),
+                );
+            }
+            ConfigError::ValidationFailed(
+                ErrorContext::new(format!("cannot open secrets file: {e:#}"))
+                    .with_file(path.clone()),
+            )
+        })?;
+    match file {
+        Some(file) => load_secrets_opened(file, &path),
+        None => Ok(Secrets::empty()),
+    }
+}
+
+fn load_secrets_opened(mut file: std::fs::File, path: &Path) -> Result<Secrets, ConfigError> {
     let metadata = file.metadata().map_err(|e| {
         ConfigError::ValidationFailed(
             ErrorContext::new(format!("cannot stat secrets file: {e}"))

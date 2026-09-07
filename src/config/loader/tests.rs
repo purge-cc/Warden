@@ -61,7 +61,7 @@ fn single_file_no_includes_uses_fast_path() {
 fn full_v1_fixture_loads_cleanly() {
     let master = committed_full_v1_master();
     let loaded = load_config(&master, now()).expect("full-v1 must load clean");
-    assert_eq!(loaded.config.schema_version, 3);
+    assert_eq!(loaded.config.schema_version, SCHEMA_VERSION_V1);
     assert_eq!(loaded.config.blocklists.len(), 4);
     assert_eq!(loaded.config.profiles.len(), 3);
     assert_eq!(loaded.config.devices.len(), 5);
@@ -136,7 +136,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -160,7 +160,7 @@ fn empty_glob_is_allowed() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml"]
 
 [upstream]
@@ -178,7 +178,7 @@ fn missing_explicit_include_is_error() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["no-such-file.toml"]
 
 [upstream]
@@ -203,7 +203,7 @@ fn non_regular_file_include_is_refused() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\nincludes = [\"notafile.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\nincludes = [\"notafile.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let errs = load_config(&master, now()).expect_err("directory include must be refused");
     let combined = join_errs(&errs);
@@ -223,7 +223,7 @@ fn glob_self_match_is_skipped_not_a_cycle() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\nincludes = [\"*.toml\"]\n\
+        "schema_version = 4\nincludes = [\"*.toml\"]\n\
          [server]\ndefault_profile = \"default\"\n\
          [profiles.default]\ndisplay_name = \"D\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
@@ -253,7 +253,7 @@ fn glob_skips_dotfile_disabled_includes() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\nincludes = [\"blocklists.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\nincludes = [\"blocklists.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("must load active, skip dotfile");
     assert!(loaded
@@ -276,8 +276,12 @@ fn read_to_string_capped_rejects_overrun() {
     // loader-08: the bounded reader caps at `cap + 1` and errors past `cap`.
     let tmp = tempfile::tempdir().unwrap();
     let p = write(tmp.path(), "data.txt", "0123456789"); // exactly 10 bytes
-    assert_eq!(super::read_to_string_capped(&p, 10).unwrap(), "0123456789");
-    let err = super::read_to_string_capped(&p, 5).expect_err("10-over-5 must error");
+    assert_eq!(
+        super::read_open_config_to_string_capped(std::fs::File::open(&p).unwrap(), &p, 10).unwrap(),
+        "0123456789"
+    );
+    let err = super::read_open_config_to_string_capped(std::fs::File::open(&p).unwrap(), &p, 5)
+        .expect_err("10-over-5 must error");
     assert!(matches!(err.as_slice(), [ConfigError::ValidationFailed(_)]));
 }
 
@@ -316,7 +320,7 @@ fn include_only_schema_version_is_refused() {
     write(
         tmp.path(),
         "extra.toml",
-        "schema_version = 3\n[server]\ndefault_profile = \"d\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[server]\ndefault_profile = \"d\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let master = write(
         tmp.path(),
@@ -347,7 +351,7 @@ default_profile = "other"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [server]
@@ -392,7 +396,7 @@ default_profile = "default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [server]
@@ -439,7 +443,7 @@ enabled = false
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [tracking]
@@ -484,7 +488,7 @@ display_name = "B"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["profiles.d/*.toml"]
 
 [upstream]
@@ -532,7 +536,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -568,7 +572,7 @@ id = "homework"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["custom_lists.d/*.toml"]
 
 [upstream]
@@ -591,7 +595,7 @@ fn cycle_detected_with_chain_in_error() {
     write(
         tmp.path(),
         "a.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["b.toml"]
 
 [upstream]
@@ -627,7 +631,7 @@ fn depth_limit_enforced() {
     write(
         tmp.path(),
         "f5.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -646,7 +650,7 @@ servers = ["192.0.2.1:53"]
             tmp.path(),
             &format!("f{i}.toml"),
             &format!(
-                "schema_version = 3\nincludes = [\"f{}.toml\"]\n{upstream}",
+                "schema_version = 4\nincludes = [\"f{}.toml\"]\n{upstream}",
                 i + 1,
             ),
         );
@@ -667,7 +671,7 @@ fn depth_at_limit_passes() {
     write(
         tmp.path(),
         "f4.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 "#,
     );
     for i in (0..4).rev() {
@@ -682,7 +686,7 @@ fn depth_at_limit_passes() {
             tmp.path(),
             &format!("f{i}.toml"),
             &format!(
-                "schema_version = 3\nincludes = [\"f{}.toml\"]\n{upstream}",
+                "schema_version = 4\nincludes = [\"f{}.toml\"]\n{upstream}",
                 i + 1,
             ),
         );
@@ -703,7 +707,7 @@ fn size_limit_enforced() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["huge.toml"]
 
 [upstream]
@@ -801,7 +805,7 @@ fn absolute_include_rejected() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["/etc/passwd"]
 
 [upstream]
@@ -819,7 +823,7 @@ fn parent_dir_traversal_rejected() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["../outside.toml"]
 
 [upstream]
@@ -841,7 +845,7 @@ fn symlink_escaping_root_rejected() {
     let outside_file = outside.path().join("secret.toml");
     fs::write(
         &outside_file,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     // Symlink from inside root → outside
@@ -851,7 +855,7 @@ fn symlink_escaping_root_rejected() {
     let master = write(
         root.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["link.toml"]
 
 [upstream]
@@ -892,7 +896,7 @@ display_name = "Default"
     let master = write(
         root.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -934,7 +938,7 @@ foo = 1
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [upstream]
@@ -957,12 +961,365 @@ servers = ["192.0.2.1:53"]
 // ── 9. schema_version discipline ────────────────────────────────
 
 #[test]
+fn explicit_schema_filesystem_loader_matrix_and_current_wrappers() {
+    let tmp = tempfile::tempdir().unwrap();
+    for declared in [3, 4] {
+        let src =
+            format!("schema_version = {declared}\n[upstream]\nservers = [\"192.0.2.1:53\"]\n");
+        let master = write(tmp.path(), "config.toml", &src);
+        for expected in [3, 4] {
+            let result = load_config_for_schema(&master, expected, now());
+            if declared == expected {
+                let loaded = result.unwrap();
+                assert_eq!(loaded.config.schema_version, declared);
+                assert_eq!(loaded.files_loaded, vec![master.canonicalize().unwrap()]);
+                assert_eq!(loaded.total_bytes, src.len() as u64);
+                if declared == SCHEMA_VERSION_V1 {
+                    assert_eq!(
+                        snapshot(&loaded),
+                        snapshot(&load_config(&master, now()).unwrap())
+                    );
+                }
+            } else {
+                let errs = result.unwrap_err();
+                assert_eq!(errs.len(), 1, "{errs:?}");
+                assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+                if expected == SCHEMA_VERSION_V1 {
+                    assert!(errs[0]
+                        .context()
+                        .reason
+                        .contains("this binary supports only"));
+                } else {
+                    assert!(errs[0]
+                        .context()
+                        .reason
+                        .contains(&format!("expected schema_version = {expected}")));
+                }
+                let suggestion = errs[0].context().suggestion.as_ref().unwrap();
+                if expected == SCHEMA_VERSION_V1 && declared == 3 {
+                    assert!(suggestion.contains("migrate v3-to-v4"));
+                } else {
+                    assert!(suggestion.contains(&format!("schema_version = {expected}")));
+                }
+            }
+        }
+        assert_eq!(
+            load_config(&master, now()).is_ok(),
+            declared == SCHEMA_VERSION_V1
+        );
+        assert_eq!(
+            load_config_with_overlay(&master, now(), None).is_ok(),
+            declared == SCHEMA_VERSION_V1
+        );
+        assert_eq!(
+            load_config_collect(&master, now()).0.is_ok(),
+            declared == SCHEMA_VERSION_V1
+        );
+    }
+}
+
+#[test]
+fn explicit_schema_includes_preserve_master_authority_and_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    for declared in [3, 4] {
+        let master = write(tmp.path(), "config.toml", &format!(
+            "schema_version = {declared}\nincludes = [\"extra.toml\"]\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
+        ));
+        for include_version in [None, Some(3), Some(4)] {
+            let declaration = include_version
+                .map(|v| format!("schema_version = {v}\n"))
+                .unwrap_or_default();
+            // Exercise deprecated-key normalisation on the merged path too.
+            let extra = write(
+                tmp.path(),
+                "extra.toml",
+                &format!("{declaration}[tracking]\nmax_clients = 512\n"),
+            );
+            for expected in [3, 4] {
+                let result = load_config_for_schema(&master, expected, now());
+                if include_version.is_some_and(|v| v != declared) {
+                    let errs = result.unwrap_err();
+                    assert_eq!(errs.len(), 1, "{errs:?}");
+                    assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                    assert_eq!(errs[0].context().file.as_deref(), Some(extra.as_path()));
+                    assert!(
+                        errs[0]
+                            .context()
+                            .reason
+                            .contains(&format!("disagrees with master's {declared}")),
+                        "include disagreement precedes target equality"
+                    );
+                } else if declared != expected {
+                    let errs = result.unwrap_err();
+                    assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                    assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+                    assert_eq!(errs[0].context().line, Some(1));
+                    if expected == SCHEMA_VERSION_V1 {
+                        assert!(errs[0]
+                            .context()
+                            .reason
+                            .contains("this binary supports only"));
+                    } else {
+                        assert!(errs[0]
+                            .context()
+                            .reason
+                            .contains(&format!("expected schema_version = {expected}")));
+                    }
+                } else {
+                    let loaded = result.unwrap();
+                    assert_eq!(loaded.config.schema_version, declared);
+                    assert_eq!(loaded.config.tracking.max_devices, 512);
+                    assert_eq!(loaded.files_loaded.len(), 2);
+                    assert_eq!(loaded.provenance["tracking"].0, extra);
+                }
+            }
+        }
+    }
+    let master = write(tmp.path(), "config.toml", "includes = [\"extra.toml\"]\n");
+    for declared in [3, 4] {
+        let extra = write(
+            tmp.path(),
+            "extra.toml",
+            &format!("schema_version = {declared}\n"),
+        );
+        for expected in [3, 4] {
+            let errs = load_config_for_schema(&master, expected, now()).unwrap_err();
+            assert!(matches!(errs[0], ConfigError::ValidationFailed(_)));
+            assert!(errs[0].context().reason.contains("not in the master"));
+            assert_eq!(errs[0].context().file.as_deref(), Some(extra.as_path()));
+        }
+    }
+}
+
+#[test]
+fn explicit_schema_overlays_validate_substitutions_and_extra_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let disk_src = "schema_version = 3\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let master = write(tmp.path(), "config.toml", disk_src)
+        .canonicalize()
+        .unwrap();
+    let extra = tmp.path().join("staged.toml");
+    for declared in [3, 4] {
+        let staged_src = disk_src.replace(
+            "schema_version = 3",
+            &format!("schema_version = {declared}"),
+        );
+        // None exercises the single-file overlay path; a staged new member
+        // forces the merged path without creating that include on disk.
+        for include_version in [None, Some(3), Some(4)] {
+            let mut overlay = LoaderOverlay::default();
+            overlay.stage(master.clone(), staged_src.clone(), false);
+            if let Some(version) = include_version {
+                overlay.stage(extra.clone(), format!("schema_version = {version}\n"), true);
+            }
+            for expected in [3, 4] {
+                let result =
+                    load_config_with_overlay_for_schema(&master, expected, now(), Some(&overlay));
+                if include_version.is_some_and(|v| v != declared) {
+                    let errs = result.unwrap_err();
+                    assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                    assert_eq!(errs[0].context().file.as_deref(), Some(extra.as_path()));
+                    assert!(errs[0].context().reason.contains("disagrees with master's"));
+                } else if expected != declared {
+                    let errs = result.unwrap_err();
+                    assert!(matches!(errs[0], ConfigError::VersionMismatch(_)));
+                    if expected == SCHEMA_VERSION_V1 {
+                        assert!(errs[0]
+                            .context()
+                            .reason
+                            .contains("this binary supports only"));
+                    } else {
+                        assert!(errs[0]
+                            .context()
+                            .reason
+                            .contains(&format!("expected schema_version = {expected}")));
+                    }
+                } else {
+                    let loaded = result.unwrap();
+                    assert_eq!(loaded.config.schema_version, declared);
+                    assert_eq!(
+                        loaded.files_loaded.len(),
+                        if include_version.is_some() { 2 } else { 1 }
+                    );
+                }
+            }
+            assert_eq!(
+                load_config_with_overlay(&master, now(), Some(&overlay)).is_ok(),
+                declared == SCHEMA_VERSION_V1
+                    && include_version.is_none_or(|v| v == SCHEMA_VERSION_V1)
+            );
+        }
+    }
+    assert_eq!(fs::read_to_string(&master).unwrap(), disk_src);
+    assert!(!extra.exists());
+    assert_eq!(
+        load_config_for_schema(&master, 3, now())
+            .unwrap()
+            .config
+            .schema_version,
+        3
+    );
+}
+
+#[test]
+fn probe_declared_schema_is_version_neutral_and_master_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    for version in [0, 3, 4, u32::MAX] {
+        // Invalid ConfigV1 fields and conflicting deprecated keys must be
+        // irrelevant to probing; a missing include would fail a full load.
+        let master = write(tmp.path(), "config.toml", &format!(
+            "\"schema_version\" = {version}\nincludes = [\"missing.toml\"]\nfuture_key = true\n[tracking]\nmax_clients = 1\nmax_devices = 2\n"
+        ));
+        assert_eq!(probe_declared_schema_version(&master).unwrap(), version);
+    }
+    write(tmp.path(), "extra.toml", "schema_version = 4\n");
+    let master = write(
+        tmp.path(),
+        "config.toml",
+        "includes = [\"extra.toml\"]\n[future]\nschema_version = 4\n",
+    );
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(matches!(errs[0], ConfigError::MissingRequired(_)));
+    assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+    assert_eq!(errs[0].context().entity.as_deref(), Some("schema_version"));
+    // Neither malformed includes nor missing includes can change the probe.
+    write(tmp.path(), "extra.toml", "not valid TOML !!!");
+    assert_eq!(probe_declared_schema_version(&master).unwrap_err(), errs);
+    fs::remove_file(tmp.path().join("extra.toml")).unwrap();
+    assert_eq!(probe_declared_schema_version(&master).unwrap_err(), errs);
+    write(
+        tmp.path(),
+        "config.toml",
+        "schema_version = 4\nincludes = [\"extra.toml\"]\n",
+    );
+    assert_eq!(probe_declared_schema_version(&master).unwrap(), 4);
+}
+
+#[test]
+fn probe_declared_schema_diagnoses_missing_type_range_syntax_and_io() {
+    let tmp = tempfile::tempdir().unwrap();
+    for value in ["\"3\"", "3.0", "true", "[]", "{}", "1979-05-27"] {
+        let master = write(
+            tmp.path(),
+            "config.toml",
+            &format!("# master\nschema_version = {value}\n"),
+        );
+        let errs = probe_declared_schema_version(&master).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0], ConfigError::Parse(_)));
+        assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+        assert_eq!(errs[0].context().entity.as_deref(), Some("schema_version"));
+        assert_eq!(errs[0].context().line, Some(2));
+        assert!(errs[0].context().reason.contains("must be an integer"));
+    }
+    for value in ["-1", "4294967296", "9223372036854775807"] {
+        let master = write(
+            tmp.path(),
+            "config.toml",
+            &format!("schema_version = {value}\n"),
+        );
+        let errs = probe_declared_schema_version(&master).unwrap_err();
+        assert!(matches!(errs[0], ConfigError::Parse(_)));
+        assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+        assert_eq!(errs[0].context().entity.as_deref(), Some("schema_version"));
+        assert!(errs[0]
+            .context()
+            .reason
+            .contains("non-negative integer that fits u32"));
+    }
+    for src in [
+        "schema_version = [",
+        "schema_version = 9223372036854775808",
+        "schema_version = 3\nschema_version = 4",
+        "schema_version = 3\n[broken",
+    ] {
+        let master = write(tmp.path(), "config.toml", src);
+        let errs = probe_declared_schema_version(&master).unwrap_err();
+        assert!(matches!(errs[0], ConfigError::Parse(_)));
+        assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+        assert!(errs[0].context().line.is_some());
+    }
+    let master = write(tmp.path(), "config.toml", "");
+    assert!(matches!(
+        probe_declared_schema_version(&master).unwrap_err()[0],
+        ConfigError::MissingRequired(_)
+    ));
+    fs::remove_file(&master).unwrap();
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(matches!(errs[0], ConfigError::Parse(_)));
+    assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+    fs::write(&master, [0xff]).unwrap();
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(matches!(errs[0], ConfigError::Parse(_)));
+    assert!(errs[0].context().reason.contains("cannot read config"));
+    assert_eq!(errs[0].context().file.as_deref(), Some(master.as_path()));
+}
+
+#[test]
+fn explicit_schema_loaders_and_probe_retain_file_guards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let master = tmp.path().join("config.toml");
+    fs::create_dir(&master).unwrap();
+    for expected in [3, 4] {
+        let errs = load_config_for_schema(&master, expected, now()).unwrap_err();
+        assert!(errs[0].context().reason.contains("not a regular file"));
+    }
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(errs[0].context().reason.contains("not a regular file"));
+    fs::remove_dir(&master).unwrap();
+    fs::File::create(&master)
+        .unwrap()
+        .set_len(MAX_TOTAL_BYTES + 1)
+        .unwrap();
+    for expected in [3, 4] {
+        let errs = load_config_for_schema(&master, expected, now()).unwrap_err();
+        assert!(errs[0].context().reason.contains("would exceed"));
+    }
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(errs[0].context().reason.contains("would exceed"));
+    for expected in [3, 4] {
+        write(
+            tmp.path(),
+            "config.toml",
+            &format!("schema_version = {expected}\nincludes = [\"../escape.toml\"]\n"),
+        );
+        let errs = load_config_for_schema(&master, expected, now()).unwrap_err();
+        assert!(matches!(errs[0], ConfigError::ValidationFailed(_)));
+        assert!(errs[0].context().reason.contains(".."));
+    }
+}
+
+#[test]
+fn probe_pins_one_regular_descriptor_across_path_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let master = write(tmp.path(), "config.toml", "schema_version = 3\n");
+    let original = tmp.path().join("original.toml");
+    let guard = write_lock::acquire_for_read(&master).unwrap();
+    let tree = guard.tree_io();
+    let entry = tree.resolve_key(&tree.master_key()).unwrap();
+    let (file, meta) = tree.open_regular(&entry).unwrap();
+    assert_eq!(meta.len(), 19);
+
+    fs::rename(&master, &original).unwrap();
+    let path = std::ffi::CString::new(master.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let source = read_open_config_to_string_capped(file, &master, MAX_TOTAL_BYTES).unwrap();
+    assert_eq!(source, "schema_version = 3\n");
+    drop(guard);
+    let errs = probe_declared_schema_version(&master).unwrap_err();
+    assert!(matches!(errs[0], ConfigError::ValidationFailed(_)));
+    assert!(errs[0].context().reason.contains("not a regular file"));
+}
+
+#[test]
 fn sub_file_may_echo_master_schema_version() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
         "extra.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [[devices]]
 id = "dev"
@@ -981,7 +1338,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -989,7 +1346,7 @@ servers = ["192.0.2.1:53"]
 "#,
     );
     let loaded = load_config(&master, now()).expect("matching echo must work");
-    assert_eq!(loaded.config.schema_version, 3);
+    assert_eq!(loaded.config.schema_version, SCHEMA_VERSION_V1);
 }
 
 #[test]
@@ -1004,7 +1361,7 @@ fn sub_file_disagreeing_schema_version_rejected() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [upstream]
@@ -1043,7 +1400,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -1076,7 +1433,7 @@ fn includes_must_be_array_of_strings() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = "not-an-array.toml"
 
 [upstream]
@@ -1093,7 +1450,7 @@ fn wildcard_only_in_final_segment() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["*/devices.toml"]
 
 [upstream]
@@ -1160,7 +1517,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = [
   "devices.d/*.toml",
   "devices.d/one.toml",
@@ -1188,7 +1545,7 @@ fn join_errs(errs: &[ConfigError]) -> String {
 
 #[test]
 fn line_of_top_key_finds_scalar_and_ignores_comments() {
-    let src = "# comment\nschema_version = 3\n\n[server]\n";
+    let src = "# comment\nschema_version = 4\n\n[server]\n";
     assert_eq!(line_of_top_key(src, "schema_version"), Some(2));
     assert_eq!(line_of_top_key(src, "server"), None); // headings aren't `key = ...`
 }
@@ -1250,7 +1607,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["level1.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -1269,7 +1626,7 @@ fn schema_version_only_is_a_valid_config() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("minimal config must load");
     assert!(loaded.config.devices.is_empty());
@@ -1320,7 +1677,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["things/device-*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -1340,7 +1697,7 @@ fn array_merge_type_mismatch_errors() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["extra.toml"]
 
 [upstream]
@@ -1390,7 +1747,7 @@ display_name = "Default"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [upstream]
@@ -1429,7 +1786,7 @@ display_name = "Kids"
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["profiles.d/*.toml"]
 
 [upstream]
@@ -1468,7 +1825,7 @@ fn relative_master_path_is_canonicalised() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let mut noisy = tmp.path().to_path_buf();
     noisy.push(".");
@@ -1491,7 +1848,7 @@ fn lookup_entity_prefix_walks_dotted_paths() {
 //
 // The loader must accept both section names: the new canonical key is
 // `[ip_blocklists]`; the legacy `[ip_denylists]` survives as a
-// deprecated alias (WARN at load, removed at schema_version = 3). Two
+// deprecated alias (WARN at load). Two
 // tests pin both paths so future edits can't silently drop either.
 
 #[test]
@@ -1500,7 +1857,7 @@ fn ip_blocklists_canonical_key_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[ip_blocklists]\nenabled = true\ninline = [\"1.2.3.4\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[ip_blocklists]\nenabled = true\ninline = [\"1.2.3.4\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("canonical key must load");
     assert!(loaded.config.ip_blocklists.enabled);
@@ -1518,7 +1875,7 @@ fn ip_denylists_legacy_alias_loads_into_ip_blocklists() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[ip_denylists]\nenabled = true\ninline = [\"5.6.7.8\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[ip_denylists]\nenabled = true\ninline = [\"5.6.7.8\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("legacy alias must load");
     assert!(loaded.config.ip_blocklists.enabled);
@@ -1535,7 +1892,7 @@ fn ip_denylists_and_ip_blocklists_in_same_file_is_refused() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\
+        "schema_version = 4\n\
          [ip_denylists]\nenabled = true\ninline = [\"5.6.7.8\"]\n\
          [ip_blocklists]\nenabled = true\ninline = [\"1.2.3.4\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
@@ -1559,7 +1916,7 @@ fn retired_categories_section_gets_directed_migration_hint() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[[categories]]\nid = \"ads\"\ndisplay_name = \"Ads\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[[categories]]\nid = \"ads\"\ndisplay_name = \"Ads\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let errs = load_config(&master, now()).expect_err("retired categories must be rejected");
     assert!(
@@ -1587,7 +1944,7 @@ fn lists_update_interval_secs_canonical_key_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[lists]\nupdate_interval_secs = 1800\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[lists]\nupdate_interval_secs = 1800\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("canonical key must load");
     assert_eq!(loaded.config.lists.update_interval_secs, 1800);
@@ -1604,7 +1961,7 @@ fn lists_refresh_interval_secs_legacy_alias_loads_into_update_interval_secs() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[lists]\nrefresh_interval_secs = 2400\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[lists]\nrefresh_interval_secs = 2400\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("legacy alias must load");
     assert_eq!(loaded.config.lists.update_interval_secs, 2400);
@@ -1616,7 +1973,7 @@ fn blocklist_update_interval_hours_canonical_key_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\
+        "schema_version = 4\n\
          [[blocklists]]\n\
          id = \"priv-ads\"\n\
          display_name = \"Privacy: Ads\"\n\
@@ -1625,7 +1982,7 @@ fn blocklist_update_interval_hours_canonical_key_loads() {
     );
     let loaded = load_config(&master, now()).expect("canonical key must load");
     assert_eq!(loaded.config.blocklists.len(), 1);
-    assert_eq!(loaded.config.blocklists[0].update_interval_hours, 6);
+    assert_eq!(loaded.config.blocklists[0].update_interval_hours, Some(6));
 }
 
 #[test]
@@ -1638,7 +1995,7 @@ fn blocklist_refresh_interval_hours_legacy_alias_loads_into_update_interval_hour
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\
+        "schema_version = 4\n\
          [[blocklists]]\n\
          id = \"priv-ads\"\n\
          display_name = \"Privacy: Ads\"\n\
@@ -1652,8 +2009,8 @@ fn blocklist_refresh_interval_hours_legacy_alias_loads_into_update_interval_hour
     );
     let loaded = load_config(&master, now()).expect("legacy alias must load");
     assert_eq!(loaded.config.blocklists.len(), 2);
-    assert_eq!(loaded.config.blocklists[0].update_interval_hours, 3);
-    assert_eq!(loaded.config.blocklists[1].update_interval_hours, 9);
+    assert_eq!(loaded.config.blocklists[0].update_interval_hours, Some(3));
+    assert_eq!(loaded.config.blocklists[1].update_interval_hours, Some(9));
 }
 
 // ── S42 T5 — `[[clients]]` → `[[devices]]` + `tracking.max_clients`
@@ -1671,7 +2028,7 @@ fn devices_canonical_array_of_tables_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\
+        "schema_version = 4\n\
          [[devices]]\n\
          id = \"laptop\"\n\
          display_name = \"Laptop\"\n\
@@ -1693,7 +2050,7 @@ fn clients_legacy_array_of_tables_loads_into_devices() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n\
+        "schema_version = 4\n\
          [[clients]]\n\
          id = \"laptop\"\n\
          display_name = \"Laptop\"\n\
@@ -1710,7 +2067,7 @@ fn tracking_max_devices_canonical_key_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[tracking]\nmax_devices = 512\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[tracking]\nmax_devices = 512\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("canonical key must load");
     assert_eq!(loaded.config.tracking.max_devices, 512);
@@ -1726,7 +2083,7 @@ fn tracking_max_clients_legacy_alias_loads_into_max_devices() {
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\n[tracking]\nmax_clients = 2048\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n[tracking]\nmax_clients = 2048\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     let loaded = load_config(&master, now()).expect("legacy alias must load");
     assert_eq!(loaded.config.tracking.max_devices, 2048);
@@ -1746,7 +2103,7 @@ fn expired_schedule_on_disk_still_loads() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 listen = "127.0.0.1:15353"
@@ -1819,7 +2176,7 @@ profile = "default"
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     (tmp, master, dev)
 }
@@ -1902,7 +2259,7 @@ fn deprecated_keys_reach_the_lint_warning_channel_on_a_single_file_config() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1957,7 +2314,7 @@ fn a_config_without_deprecated_keys_contributes_no_deprecation_warnings() {
     let master = write(
         tmp.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2048,7 +2405,7 @@ fn m3_single_file_fast_path_never_rereads_the_master_from_disk() {
     let mut ov = LoaderOverlay::default();
     ov.stage(
         canonicalize_path(&master).unwrap(),
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2181,7 +2538,7 @@ profile = "default"
     let master = write(
         tmp.path(),
         "config.toml",
-        "schema_version = 3\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
     assert!(load_config(&master, now()).is_ok(), "baseline loads");
 
@@ -2219,7 +2576,7 @@ fn secondary_master_with(tmp: &Path, body: &str) -> PathBuf {
         tmp,
         "config.toml",
         &format!(
-            "schema_version = 3\n\
+            "schema_version = 4\n\
              includes = [\"cluster.d/*.toml\"]\n\n\
              [cluster]\n\
              enabled = true\n\
@@ -2372,7 +2729,7 @@ fn a_primary_master_carrying_policy_is_untouched_by_the_guard() {
         tmp.path(),
         "config.toml",
         &format!(
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [cluster]\n\
              enabled = true\n\
              role = \"primary\"\n\
@@ -2423,7 +2780,7 @@ fn a_device_rule_warns_that_the_path_is_going_away() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[admin_rules]]\nid = \"let-tv-through\"\nrule = \"@@||x.example.com^\"\n\n\
          [[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\nip = \"192.0.2.10\"\n\
          allow_rules = [\"let-tv-through\"]\n",
@@ -2450,7 +2807,7 @@ fn a_device_without_rules_produces_no_deprecation_warning() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\nip = \"192.0.2.10\"\n",
     )
     .unwrap();
@@ -2471,7 +2828,7 @@ fn an_empty_rule_array_is_not_a_deprecated_rule() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\nip = \"192.0.2.10\"\n\
          allow_rules = []\ndeny_rules = []\n",
     )
@@ -2498,7 +2855,7 @@ fn a_device_with_twenty_rules_is_warned_about_once() {
     fs::write(
         &master,
         format!(
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n{rules}\
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n{rules}\
              [[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\nip = \"192.0.2.10\"\n\
              allow_rules = [{}]\n",
             refs.join(", ")
@@ -2522,7 +2879,7 @@ fn a_declared_custom_list_is_loaded_into_the_store() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[custom_lists]]\nid = \"minecraft\"\n",
     )
     .unwrap();
@@ -2548,7 +2905,7 @@ fn a_declared_custom_list_with_no_file_fails_the_load() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[custom_lists]]\nid = \"minecraft\"\n",
     )
     .unwrap();
@@ -2568,7 +2925,7 @@ fn a_config_with_no_custom_lists_loads_with_an_empty_store() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let loaded = load_config(&master, now()).expect("must load");
@@ -2587,7 +2944,7 @@ fn the_pack_path_is_anchored_to_the_master_not_to_the_declaring_fragment() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\nincludes = [\"conf.d/*.toml\"]\n\n\
+        "schema_version = 4\nincludes = [\"conf.d/*.toml\"]\n\n\
          [upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
@@ -2640,7 +2997,7 @@ fn a_pack_reaches_the_resolver_through_a_real_load() {
     let master = dir.path().join("config.toml");
     fs::write(
         &master,
-        "schema_version = 3\n\n[server]\ndefault_profile = \"kids\"\n\n\
+        "schema_version = 4\n\n[server]\ndefault_profile = \"kids\"\n\n\
          [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
          [[custom_lists]]\nid = \"minecraft\"\n\n\
          [profiles.kids]\ncustom_lists = [\"minecraft\"]\n",
@@ -2689,7 +3046,7 @@ fn mounting_a_custom_list_consumes_no_source_bit() {
     )
     .unwrap();
 
-    let base = "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+    let base = "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
                 [profiles.kids]\ndisplay_name = \"K\"\n";
     let master = dir.path().join("config.toml");
     let bits_of = |path: &std::path::Path| {

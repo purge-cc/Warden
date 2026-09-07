@@ -59,7 +59,7 @@ fn write(root: &Path, rel: &str, body: &str) -> PathBuf {
 /// entries and on `[profiles.<id>]`. Every other taggable entity is
 /// present too, because a config from a third party may tag any of them
 /// and `deny_unknown_fields` sits on all five.
-const V2_MASTER_WITH_TAGS: &str = r#"schema_version = 3
+const V2_MASTER_WITH_TAGS: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -142,7 +142,7 @@ fn a_multi_file_config_carrying_tags_still_loads() {
     let master = write(
         dir.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["blocklists.d/*.toml"]
 
 [server]
@@ -224,7 +224,7 @@ fn a_config_declaring_a_retired_tag_label_still_loads() {
     let master = write(
         dir.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -288,7 +288,7 @@ fn a_quoted_retired_tags_key_is_stripped_too() {
     let master = write(
         dir.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -325,7 +325,7 @@ fn an_unknown_key_that_is_not_tags_is_still_refused() {
     let master = write(
         dir.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -362,7 +362,7 @@ fn a_tags_key_on_a_daemon_section_is_still_refused() {
     let master = write(
         dir.path(),
         "config.toml",
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"

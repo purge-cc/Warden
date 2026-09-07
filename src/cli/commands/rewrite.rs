@@ -4,7 +4,7 @@
 //! profile-scoped — no global rewrites. Mirrors [`super::local_dns`]'s
 //! shape: validator pre-flight on the merged `[existing..., new]` slice
 //! via [`crate::config::validator::validate_rewrite_rules`], TOML
-//! mutation via [`super::target::write_value_validated`] (full v1 loader
+//! mutation via [`super::target::write_value_validated_locked`] (full v1 loader
 //! run against the STAGED bytes before the rename, so a rejected tree
 //! never lands), reload feedback, then single-seat audit emit.
 //!
@@ -23,12 +23,16 @@ use crate::config::validator::validate_rewrite_rules;
 
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::local_dns::profile_scoped::{
-    ensure_profile_exists, ensure_profile_exists_in, find_profile_entry_mut,
-    find_profile_target_file, load_for_resolution,
+    ensure_profile_exists_in, find_profile_entry_mut, find_profile_target_file_locked,
+    load_for_resolution,
 };
 use super::target::{
-    count_devices_on_profile, read_or_empty, resolve_explicit_into_under, write_value_validated,
+    effective_profile_for_device, read_or_empty_locked, resolve_explicit_into_under_locked,
+    write_value_validated_locked,
 };
+use crate::config::loader::load_config_for_schema_under_guard;
+use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 // ── Frozen strings ────────────────────────────────────────────────────
 
@@ -132,11 +136,27 @@ pub(crate) fn add_inner(
     spec: &RewriteSpec,
     into: Option<&Path>,
 ) -> anyhow::Result<AddOutcome> {
-    ensure_profile_exists(config_path, profile_id, format_rewrite_profile_not_found)?;
+    let guard = acquire_for_write(config_path)?;
+    add_inner_locked(&guard, config_path, profile_id, spec, into)
+}
+
+/// Guard-reusing form of [`add_inner`].
+pub(crate) fn add_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    profile_id: &str,
+    spec: &RewriteSpec,
+    into: Option<&Path>,
+) -> anyhow::Result<AddOutcome> {
+    let now = time::OffsetDateTime::now_utc();
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(super::format_config_errors)?;
+    ensure_profile_exists_in(&loaded.config, profile_id, format_rewrite_profile_not_found)?;
 
     // Snapshot existing rules + local_records (profile + global, for
     // shadow-warning context).
-    let (existing, local_records, global_records) = load_profile_state(config_path, profile_id)?;
+    let (existing, local_records, global_records) =
+        profile_state_from_config(&loaded.config, profile_id)?;
 
     // Idempotent silent no-op.
     let new_rule = spec.to_schema();
@@ -169,16 +189,16 @@ pub(crate) fn add_inner(
     }
 
     let target_path = match into {
-        Some(p) => resolve_explicit_into_under(config_path, p)?,
-        None => find_profile_target_file(config_path, profile_id)?,
+        Some(p) => resolve_explicit_into_under_locked(guard, config_path, p)?,
+        None => find_profile_target_file_locked(guard, config_path, profile_id)?,
     };
 
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let inserted = append_profile_rule(&mut doc, profile_id, spec)?;
     if !inserted {
         return Ok(AddOutcome::NoOp);
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     tracing::debug!(
         target: "audit",
@@ -205,7 +225,15 @@ pub(crate) fn add_inner(
             .with_match_subdomains(match_subdomains_for_audit)
     });
 
-    let devices_affected = count_devices_on_profile(config_path, profile_id);
+    let devices_affected = loaded
+        .config
+        .devices
+        .iter()
+        .filter(|device| {
+            effective_profile_for_device(&loaded.config, device)
+                .is_some_and(|profile| profile.as_str() == profile_id)
+        })
+        .count();
     Ok(AddOutcome::Applied {
         file: target_path,
         devices_affected,
@@ -218,28 +246,43 @@ pub(crate) fn remove_inner(
     from: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
-    ensure_profile_exists(config_path, profile_id, format_rewrite_profile_not_found)?;
+    let guard = acquire_for_write(config_path)?;
+    remove_inner_locked(&guard, config_path, profile_id, from, into)
+}
+
+/// Guard-reusing form of [`remove_inner`].
+pub(crate) fn remove_inner_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    profile_id: &str,
+    from: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<RemoveOutcome> {
+    let now = time::OffsetDateTime::now_utc();
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(super::format_config_errors)?;
+    ensure_profile_exists_in(&loaded.config, profile_id, format_rewrite_profile_not_found)?;
     let canonical_from = from.to_ascii_lowercase();
 
     let target_path = match into {
-        Some(p) => resolve_explicit_into_under(config_path, p)?,
-        None => find_profile_target_file(config_path, profile_id)?,
+        Some(p) => resolve_explicit_into_under_locked(guard, config_path, p)?,
+        None => find_profile_target_file_locked(guard, config_path, profile_id)?,
     };
 
     // Snapshot matching rules pre-removal so audit can carry `to` field.
-    let pre_removal: Vec<RewriteRule> = load_profile_state(config_path, profile_id)
+    let pre_removal: Vec<RewriteRule> = profile_state_from_config(&loaded.config, profile_id)
         .map(|(rules, _, _)| rules)
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.from.eq_ignore_ascii_case(&canonical_from))
         .collect();
 
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     let n_dropped = drop_profile_rules(&mut doc, profile_id, &canonical_from)?;
     if n_dropped == 0 {
         return Ok(RemoveOutcome::NotFound);
     }
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
     let profile_id_for_audit = profile_id.to_string();
     let from_for_audit = canonical_from.clone();
@@ -380,15 +423,14 @@ pub fn run_list(config_path: &Path, profile: Option<&str>) -> anyhow::Result<()>
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-fn load_profile_state(
-    config_path: &Path,
+fn profile_state_from_config(
+    cfg: &crate::config::schema::ConfigV1,
     profile_id: &str,
 ) -> anyhow::Result<(
     Vec<RewriteRule>,
     Vec<crate::config::settings::LocalDnsRecord>,
     Vec<crate::config::settings::LocalDnsRecord>,
 )> {
-    let cfg = load_for_resolution(config_path)?;
     let Some((_, p)) = cfg.profiles.iter().find(|(k, _)| k.as_str() == profile_id) else {
         let known: Vec<&str> = cfg.profiles.keys().map(|k| k.as_str()).collect();
         bail!("{}", format_rewrite_profile_not_found(profile_id, &known));

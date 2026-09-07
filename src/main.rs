@@ -25,21 +25,16 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
         cli::Commands::Start { .. }
             | cli::Commands::Init { .. }
             | cli::Commands::Resolve { .. }
-            // `lists refresh` (ex-`warden update`) drives the daemon over
-            // SIGHUP, not IPC — it never reads `socket_path`. Every other
-            // `lists` action does: `forget` over IPC, and the rest to ask
-            // whether the corpus is frozen. So the skip is scoped to this
-            // one action rather than the whole subcommand.
-            | cli::Commands::Lists {
-                action: cli::ListsAction::Refresh
-            }
             | cli::Commands::Config { .. }
             | cli::Commands::Completion { .. }
             | cli::Commands::FirewallRules
             | cli::Commands::Migrate { .. }
+            // Refresh loads its configuration inside run_update so a broken
+            // config can return its documented CONFIG exit code.
+            | cli::Commands::Lists { action: cli::ListsAction::Refresh }
             // `cluster token|join|leave` edit TOML and never open the socket
-            // — only `cluster status` queries the daemon. Scoped per-action
-            // like `lists refresh` above, for the same reason.
+            // — only `cluster status` queries the daemon. Scope this rule
+            // per action so future IPC-backed cluster actions fail closed.
             //
             // Since S2 these three legitimately run against a config that
             // does NOT load: `init --cluster-secondary` writes a policy-free
@@ -88,10 +83,10 @@ async fn main() -> anyhow::Result<()> {
     // skip the eager parse for Init/Config/Migrate/Completion/Start/… — a fresh
     // box running `warden init` no longer prints a spurious "cannot read
     // config" warning, and Start/FirewallRules parse the config exactly once
-    // (in their own arm). For the commands that DO need it, warn on a real
-    // parse error rather than silently using the default path, or an IPC
-    // command on a misconfigured install would connect to the wrong socket and
-    // report "daemon not running".
+    // (in their own arm). Legacy IPC commands retain the fallback socket on a
+    // parse error; `lists refresh` is excluded above because it must resolve
+    // its configured socket internally and fail closed before choosing IPC or
+    // foreground work.
     let now = time::OffsetDateTime::now_utc();
     let socket_path = if command_needs_socket(&command) {
         match config::loader::load_config(&config_path, now) {
@@ -308,8 +303,7 @@ async fn main() -> anyhow::Result<()> {
             }
             cli::ListsAction::Refresh => {
                 init_tracing("info");
-                let code = cli::commands::update::run_update(&config_path, &pid_file, &socket_path)
-                    .await?;
+                let code = cli::commands::update::run_update(&config_path, &pid_file).await?;
                 cli::exit_codes::exit_with(code);
             }
             cli::ListsAction::Catalog { scope } => {
@@ -361,21 +355,9 @@ async fn main() -> anyhow::Result<()> {
                     cli::commands::config::run_reset_auto_failure(&config_path)?;
                 } else {
                     let now = time::OffsetDateTime::now_utc();
-                    // --auto reads the resolved backup dir inside the
-                    // managed orchestrator. Manual mode honours --out or
-                    // falls back to the [backup] dir for parity with the
-                    // TUI / restore --list.
-                    let resolved_out = if auto {
-                        None
-                    } else {
-                        Some(match out {
-                            Some(p) => p,
-                            None => cli::commands::config::resolved_backup_dir(&config_path),
-                        })
-                    };
                     let code = cli::commands::config::run_backup_managed(
                         &config_path,
-                        resolved_out.as_deref(),
+                        out.as_deref(),
                         auto,
                         now,
                     )?;
@@ -1218,6 +1200,24 @@ async fn main() -> anyhow::Result<()> {
         cli::Commands::Tags { .. } => refuse_retired_tags_verb()?,
 
         cli::Commands::Migrate { action } => match action {
+            cli::MigrateAction::V3ToV4 {
+                from_config,
+                check,
+                rollback,
+                finalize,
+            } => {
+                let mode = if check {
+                    cli::commands::migrate::V3ToV4Mode::Check
+                } else if rollback {
+                    cli::commands::migrate::V3ToV4Mode::Rollback
+                } else if finalize {
+                    cli::commands::migrate::V3ToV4Mode::Finalize
+                } else {
+                    cli::commands::migrate::V3ToV4Mode::Migrate
+                };
+                let rc = cli::commands::migrate::run_v3_to_v4(&from_config, mode)?;
+                std::process::exit(rc);
+            }
             cli::MigrateAction::V0ToV1 {
                 legacy_config,
                 target,
@@ -1758,9 +1758,15 @@ mod tests {
     /// misconfigured install connects to the wrong socket and reports
     /// "daemon not running".
     #[test]
-    fn ipc_commands_still_need_the_socket() {
+    fn refresh_defers_socket_loading_but_other_ipc_commands_do_not() {
         assert!(command_needs_socket(&cli::Commands::Reload));
         assert!(command_needs_socket(&cli::Commands::Dashboard));
+        assert!(
+            !command_needs_socket(&cli::Commands::Lists {
+                action: cli::ListsAction::Refresh,
+            }),
+            "refresh resolves its configured socket inside run_update"
+        );
     }
 
     /// `--lists` is refused rather than silently writing a subscription

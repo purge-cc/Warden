@@ -40,14 +40,17 @@
 //! worst kind of red: a diagnostic pointing at the write path for a fault
 //! that was in the fixture.
 //!
-//! So the body row evicts the on-disk `.cache` file instead of racing the
-//! clock. That is not a hack around the clamp — it exercises the documented
-//! `"cache marked fresh but body missing, falling back to HTTP"` arm, which
-//! is a real state (an operator or a disk cleaner can produce it), and it is
-//! the only zero-wait way to reach the network through the public API.
+//! So the body row evicts the manifest-selected on-disk generation body
+//! instead of racing the clock. (For a legacy manifest, that body is still
+//! `<stem>.cache`.) That is not a hack around the clamp — it exercises the
+//! documented `"cache marked fresh but body missing, falling back to HTTP"`
+//! arm, which is a real state (an operator or a disk cleaner can produce it),
+//! and it is the only zero-wait way to reach the network through the public
+//! API.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -258,7 +261,7 @@ fn client_for(origin: &Origin) -> reqwest::Client {
         .unwrap()
 }
 
-const CONFIG: &str = "schema_version = 3\n\n\
+const CONFIG: &str = "schema_version = 4\n\n\
      [server]\n\
      default_profile = \"default\"\n\n\
      [profiles.default]\n\
@@ -287,6 +290,45 @@ fn served_generation(filter: &FilterEngine, step: &str) -> u64 {
          others"
     );
     first
+}
+
+/// Remove each manifest-selected body while retaining its `.meta` manifest.
+/// A manifest without `body=` is a legacy entry, whose selected body is
+/// `<stem>.cache`.
+fn evict_selected_cache_bodies(cache_dir: &Path) {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(cache_dir).unwrap() {
+        let meta_path = entry.unwrap().path();
+        if meta_path
+            .extension()
+            .is_none_or(|extension| extension != "meta")
+        {
+            continue;
+        }
+        let stem = meta_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("cache manifest must have a UTF-8 stem");
+        let manifest = std::fs::read_to_string(&meta_path).unwrap();
+        let body = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("body="))
+            .filter(|body| !body.is_empty())
+            .map_or_else(|| format!("{stem}.cache"), str::to_owned);
+        let body_path = cache_dir.join(&body);
+        assert!(
+            body_path.is_file(),
+            "manifest {} selected missing or non-file body {}",
+            meta_path.display(),
+            body_path.display(),
+        );
+        std::fs::remove_file(&body_path).unwrap();
+        removed += 1;
+    }
+    assert!(
+        removed > 0,
+        "fixture must retain a manifest and evict at least one selected body"
+    );
 }
 
 #[tokio::test]
@@ -339,15 +381,11 @@ async fn every_write_path_republishes_the_filter_generation() {
             Mutation::Nothing => {}
             Mutation::Body(next) => {
                 *origin.body.lock().unwrap() = next.to_string();
-                // Evict the body but leave the in-memory entry: the cycle
-                // then takes the documented "cache marked fresh but body
-                // missing, falling back to HTTP" arm.
-                for e in std::fs::read_dir(&cache_dir).unwrap() {
-                    let path = e.unwrap().path();
-                    if path.extension().is_some_and(|x| x == "cache") {
-                        std::fs::remove_file(&path).unwrap();
-                    }
-                }
+                // Evict the selected durable body but retain fresh in-memory
+                // validators and the manifest. The cycle then takes the
+                // documented "cache marked fresh but body missing, falling
+                // back to HTTP" arm.
+                evict_selected_cache_bodies(&cache_dir);
             }
             Mutation::Direction(allow) => mgr.set_list_policy(PolicyMasks {
                 base: ProfileMasks {

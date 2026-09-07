@@ -46,7 +46,7 @@ use purge_warden::cli::Cli;
 /// Master declaring an include glob that is deliberately **not**
 /// `profiles.d/` — the layout the convention-derived target scan could
 /// not see, and which owner resolution must now reach.
-const MASTER: &str = r#"schema_version = 3
+const MASTER: &str = r#"schema_version = 4
 
 includes = ["custom/*.toml"]
 

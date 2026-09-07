@@ -304,6 +304,7 @@ fn floor_system_panel_ellipsises_an_overlong_ram_row_instead_of_clipping_it() {
         }),
         lists_corpus_refusal: None,
         lists_corpus_freeze: None,
+        lists_cycle: None,
     });
     app.connected = true;
     // 80-col floor, System gets 34% of the KPI row width — the real
@@ -1823,6 +1824,13 @@ fn refusal_status(domain_count: usize) -> crate::tui::app::DaemonStatus {
             ceiling: 14_000_000,
             novel_by_source: vec![("privacy-ads".to_string(), 2_100_000)],
         }),
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        }),
         ..Default::default()
     }
 }
@@ -1893,6 +1901,13 @@ fn pulse_row_keeps_the_healthy_wording_without_a_refusal() {
         lists_active: 8,
         lists_total: 8,
         lists_corpus_refusal: None,
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Installed),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        }),
         ..Default::default()
     });
     let cells = pulse_row_cells(&app, 120);
@@ -1901,10 +1916,45 @@ fn pulse_row_keeps_the_healthy_wording_without_a_refusal() {
     assert!(!cells.contains("UNFILTERED"), "{cells:?}");
 }
 
-/// Truncation is the weaker sibling: the corpus installed, just short.
-/// It annotates rather than replacing the noun.
 #[test]
-fn pulse_row_flags_truncated_sources_without_claiming_a_refusal() {
+fn pulse_row_names_a_cleared_registry_and_uses_legacy_counts_only_without_cycle_support() {
+    let cleared = crate::lists::status::CycleMark {
+        seq: 3,
+        outcome: Some(crate::lists::status::CycleOutcome::ClearedNoSources),
+        source_coverage_incomplete: false,
+        generation_degraded: false,
+        served_state: Default::default(),
+    };
+    let mut app = App::new();
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        domain_count: 0,
+        list_count: 9,
+        lists_active: 0,
+        lists_total: 0,
+        lists_cycle: Some(cleared),
+        ..Default::default()
+    });
+    let cells = pulse_row_cells(&app, 180);
+    assert!(cells.contains("0/0 source rows"), "{cells:?}");
+    assert!(cells.contains("BLOCKLIST CLEARED"), "{cells:?}");
+    assert!(cells.contains("UNFILTERED"), "{cells:?}");
+    assert!(!cells.contains("9 lists"), "{cells:?}");
+
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        list_count: 9,
+        lists_active: 0,
+        lists_total: 0,
+        lists_cycle: None,
+        ..Default::default()
+    });
+    let legacy = pulse_row_cells(&app, 180);
+    assert!(legacy.contains("9 lists"), "{legacy:?}");
+}
+
+/// A per-source cap refusal can retain the previous good cache without
+/// becoming a corpus-level refusal.
+#[test]
+fn pulse_row_flags_refused_sources_without_claiming_a_corpus_refusal() {
     let mut app = App::new();
     app.daemon_status = Some(crate::tui::app::DaemonStatus {
         domain_count: 480_000,
@@ -1912,15 +1962,139 @@ fn pulse_row_flags_truncated_sources_without_claiming_a_refusal() {
         lists_total: 8,
         lists_truncated: 3,
         lists_corpus_refusal: None,
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Installed),
+            source_coverage_incomplete: false,
+            generation_degraded: false,
+            served_state: Default::default(),
+        }),
         ..Default::default()
     });
     let cells = pulse_row_cells(&app, 120);
-    assert!(cells.contains("3 TRUNCATED"), "{cells:?}");
+    assert!(cells.contains("3 REFUSED"), "{cells:?}");
     assert!(
         cells.contains("8/8 lists"),
-        "a truncated corpus IS installed — the noun stays: {cells:?}"
+        "a per-source refusal must not rewrite the corpus noun: {cells:?}"
     );
-    assert!(!cells.contains("REFUSED"), "{cells:?}");
+    assert!(!cells.contains("fetched"), "{cells:?}");
+}
+
+fn coverage_cycle(outcome: crate::lists::status::CycleOutcome) -> crate::lists::status::CycleMark {
+    crate::lists::status::CycleMark {
+        seq: 1,
+        outcome: Some(outcome),
+        source_coverage_incomplete: true,
+        generation_degraded: matches!(
+            outcome,
+            crate::lists::status::CycleOutcome::SpillRollbackFailed
+        ),
+        served_state: if matches!(
+            outcome,
+            crate::lists::status::CycleOutcome::SpillRollbackFailed
+        ) {
+            crate::lists::status::ServedState::Complete
+        } else {
+            crate::lists::status::ServedState::Partial
+        },
+    }
+}
+
+#[test]
+fn pulse_row_surfaces_a_hot_coverage_hold_even_when_rows_are_n_over_n() {
+    let mut app = App::new();
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        domain_count: 480_000,
+        lists_active: 8,
+        lists_total: 8,
+        lists_cycle: Some(coverage_cycle(
+            crate::lists::status::CycleOutcome::SpillRollbackFailed,
+        )),
+        ..Default::default()
+    });
+    let cells = pulse_row_cells(&app, 120);
+    assert!(cells.contains("SOURCE COVERAGE INCOMPLETE"), "{cells:?}");
+    assert!(
+        cells.contains("SERVED: COMPLETE — PREVIOUS COMPLETE SERVING"),
+        "{cells:?}"
+    );
+    assert!(!cells.contains("8/8 lists"), "N/N looks healthy: {cells:?}");
+}
+
+#[test]
+fn pulse_row_keeps_refusal_primary_when_coverage_is_standing() {
+    let mut app = App::new();
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        domain_count: 0,
+        lists_active: 8,
+        lists_total: 8,
+        lists_corpus_refusal: Some(crate::lists::status::CorpusRefusal {
+            unique: 10,
+            ceiling: 2,
+            novel_by_source: vec![],
+        }),
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::Refused),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: Default::default(),
+        }),
+        ..Default::default()
+    });
+    let cells = pulse_row_cells(&app, 120);
+    assert!(cells.contains("REFUSED"), "{cells:?}");
+    assert!(cells.contains("COVERAGE INCOMPLETE"), "{cells:?}");
+    assert!(cells.contains("0 domains UNFILTERED"), "{cells:?}");
+}
+
+#[test]
+fn pulse_row_keeps_config_rejection_primary_and_shows_freeze_age() {
+    use time::macros::datetime;
+
+    let mut app = App::new();
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        domain_count: 480_000,
+        lists_active: 8,
+        lists_total: 8,
+        lists_corpus_freeze: Some(crate::lists::status::CorpusFreeze {
+            since: Some(datetime!(2026-08-04 03:00:00 UTC)),
+            consecutive: 2,
+        }),
+        lists_cycle: Some(crate::lists::status::CycleMark {
+            seq: 1,
+            outcome: Some(crate::lists::status::CycleOutcome::ConfigRejected),
+            source_coverage_incomplete: true,
+            generation_degraded: false,
+            served_state: Default::default(),
+        }),
+        ..Default::default()
+    });
+    let cells = pulse_row_cells(&app, 160);
+    assert!(cells.contains("CONFIG REJECTED"), "{cells:?}");
+    assert!(cells.contains("STANDING COVERAGE INCOMPLETE"), "{cells:?}");
+    assert!(
+        cells.contains("FROZEN since 2026-08-04T03:00:00Z"),
+        "{cells:?}"
+    );
+}
+
+#[test]
+fn pulse_row_surfaces_a_cold_partial_install_even_when_rows_are_n_over_n() {
+    let mut app = App::new();
+    app.daemon_status = Some(crate::tui::app::DaemonStatus {
+        domain_count: 120_000,
+        lists_active: 8,
+        lists_total: 8,
+        lists_cycle: Some(coverage_cycle(
+            crate::lists::status::CycleOutcome::Installed,
+        )),
+        ..Default::default()
+    });
+    let cells = pulse_row_cells(&app, 120);
+    assert!(cells.contains("SOURCE COVERAGE INCOMPLETE"), "{cells:?}");
+    assert!(cells.contains("PARTIAL CORPUS"), "{cells:?}");
+    assert!(!cells.contains("8/8 lists"), "N/N looks healthy: {cells:?}");
 }
 
 #[test]

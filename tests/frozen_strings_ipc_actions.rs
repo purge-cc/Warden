@@ -68,6 +68,10 @@ fn ipc_command_action_names_are_frozen() {
             },
             "list.forget",
         ),
+        (
+            IpcCommand::ForceListRefresh { token: None },
+            "list.refresh.force",
+        ),
         (IpcCommand::Shutdown { token: None }, "shutdown"),
         (IpcCommand::DomainCount, "domain.count"),
         (IpcCommand::TrackingStats { token: None }, "tracking.stats"),
@@ -173,9 +177,9 @@ fn ipc_command_action_names_are_frozen() {
     ];
 
     #[cfg(not(feature = "cluster"))]
-    let expected_len = 22;
-    #[cfg(feature = "cluster")]
     let expected_len = 23;
+    #[cfg(feature = "cluster")]
+    let expected_len = 24;
     assert_eq!(
         cases.len(),
         expected_len,

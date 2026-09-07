@@ -10,7 +10,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -296,7 +296,7 @@ fn groups_add_opens_on_an_empty_config() {
     let master = dir.path().join("config.toml");
     std::fs::write(
             &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n",
         )
         .unwrap();
@@ -330,7 +330,7 @@ fn groups_edit_and_delete_stay_inert_on_an_empty_config() {
     let master = dir.path().join("config.toml");
     std::fs::write(
             &master,
-            "schema_version = 3\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n",
         )
         .unwrap();

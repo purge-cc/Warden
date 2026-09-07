@@ -482,7 +482,7 @@ fn table(filter: &FilterEngine, resolver: &ProfileResolver) -> String {
     out
 }
 
-/// The v2 fixture, put through `warden migrate v2-to-v3` in-process.
+/// The historical policy fixture, put through the real migration chain.
 ///
 /// **This is the acceptance test of the cutover, and it has to be the verb.**
 /// §5 asks for the binary post-migration to reproduce the S1 golden, which
@@ -491,16 +491,18 @@ fn table(filter: &FilterEngine, resolver: &ProfileResolver) -> String {
 /// they expect; running the real migration makes the claim
 /// *"the migration preserves every verdict"* instead.
 ///
-/// The fixture stays in its **v2** shape above for the same reason: it is
-/// what the migration has to be handed. The one edit `plp-s3` did make to it
-/// — `dev-default-plus-tag` moving from a device tag to a profile — is
-/// documented at that device, and was verified to leave the golden unchanged
-/// on the pre-S3 engine before any of this landed.
+/// The intermediate schema-3 output remains part of the assertion, but the
+/// current binary consumes it only after the required v3-to-v4 hop.
 fn migrated_config_path(dir: &Path) -> std::path::PathBuf {
     let v2 = write_config(dir, &config_toml());
     let v3 = dir.join("config.v3.toml");
     purge_warden::cli::commands::migrate::migrate_v2_to_v3(&v2, &v3, false)
         .expect("the fixture must migrate; a refusal here is a fixture fault");
+    purge_warden::cli::commands::migrate::run_v3_to_v4(
+        &v3,
+        purge_warden::cli::commands::migrate::V3ToV4Mode::Migrate,
+    )
+    .expect("the historical output must migrate to the live schema");
     v3
 }
 

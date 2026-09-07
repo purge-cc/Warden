@@ -1,27 +1,13 @@
-//! rev-2606 `init-scaffold-silent-no-blocking` — regression pins for the
-//! dual-channel list shape.
+//! Compatibility regression pins for the legacy merger and bitmap helpers.
 //!
-//! The pre-rework `warden init` scaffold wired the same 3 lists through
-//! BOTH config channels: `[lists].sources` catalog slugs AND
-//! `[[blocklists]]` URL entities. `merge_sources_with_blocklists`
-//! dedup'd by URL string only, so slug + entity became SEPARATE merged
-//! sources with separate filter bits; `SourceBitMap::build`'s entity
-//! loop then re-pointed `by_v1_id[entity-id]` from the slug's bit to
-//! the URL's bit, while the fetch loop populated Tier 1 under the
-//! slug's bit (the entity URLs were 404 path-form fiction on top).
-//! Net: profile mask ∩ populated bits = ∅ — the daemon held ~8M
-//! domains and blocked nothing (container-reproduced 2026-06-10).
+//! Production construction uses `ResolvedSourcePlan`; this file preserves
+//! historical behavior for callers that explicitly use the compatibility APIs.
 //!
-//! The S50 T5.5 / §4.24 test (`typed_source_keys_v1_pure.rs`) pinned the
-//! single-channel shapes; this file pins the dual-channel shape: the
-//! merge collapses a catalog-resolvable slug + same-id entity onto the
-//! slug's single bit, so the profile mask points at the bit the
-//! download actually populates ("mask bits == fetched bits").
+//! A catalog-resolvable slug and matching row share the legacy helper's
+//! fetch bit, so the profile mask reaches downloaded domains.
 //!
-//! The guard case is pinned too: a NON-catalog slug + same-id entity
-//! (the `imported.local` bridge shape) must keep the entity's URL fetch
-//! — there the slug channel can't download anything, so collapsing onto
-//! it would recreate the same silent no-blocking through the other door.
+//! The non-catalog case below is compatibility-only. Plan-backed construction
+//! resolves that alias to the enabled row's fetch URL.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,8 +32,8 @@ fn blocklist(id: &str, url: &str) -> Blocklist {
         display_name: id.into(),
         url: url.into(),
         format: BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: BlocklistBase::Deny,
@@ -77,11 +63,7 @@ fn resolve(_bit_map: &SourceBitMap, _blocklists: &[Blocklist]) -> ResolvedProfil
     )
 }
 
-/// The mask `default` gets from the publish-time projection.
-///
-/// `plp-s3`: the subscription left `ResolvedProfile`, so the bit-identity
-/// assertions in this file read it where it now lives. Same bits, same
-/// question — see `_docs/features/profile_list_policy.md` §2.4.
+/// The block mask for the default profile.
 fn projected_block_mask(bit_map: &SourceBitMap, blocklists: &[Blocklist]) -> u64 {
     let mut profiles = std::collections::BTreeMap::new();
     profiles.insert("default".to_string(), default_profile());
@@ -94,11 +76,7 @@ fn projected_block_mask(bit_map: &SourceBitMap, blocklists: &[Blocklist]) -> u64
         .block
 }
 
-/// Populate the engine the way the production fetch loop does: the
-/// known-bad domain lands under the bit of every merged source that
-/// "downloads" in this scenario (`fetched`: indices into
-/// `merged_sources`). The mask-vs-populated split IS the bug class, so
-/// the fixture must model which sources download, not mirror the mask.
+/// Populate only the source bits this fixture treats as fetched.
 fn engine_with_fetched(
     bit_map: &SourceBitMap,
     merged_sources: &[String],
@@ -119,11 +97,7 @@ fn engine_with_fetched(
     engine
 }
 
-/// The exact pre-rework scaffold shape: 3 catalog slugs in
-/// `[lists].sources` AND 3 same-id entities whose URLs are the 404
-/// path-form fiction. Post-dedup the entities must NOT become extra
-/// sources; the mask must sit on the slug bits — the only bits the
-/// downloads populate.
+/// Compatibility aliases must retain the slug fetch bits.
 #[test]
 fn scaffold_dual_channel_shape_blocks_via_slug_bits() {
     let slugs = [
@@ -131,8 +105,7 @@ fn scaffold_dual_channel_shape_blocks_via_slug_bits() {
         "privacy/ads".to_string(),
         "privacy/tracking".to_string(),
     ];
-    // Path-form URLs: what the pre-rework scaffold shipped; these 404
-    // on the live CDN, so their bits would never populate.
+    // These row URLs must not add compatibility fetch bits.
     let blocklists = vec![
         blocklist(
             "security-malicious",
@@ -156,8 +129,7 @@ fn scaffold_dual_channel_shape_blocks_via_slug_bits() {
     let bit_map = SourceBitMap::build(&merged, &blocklists).unwrap();
     let resolved = resolve(&bit_map, &blocklists);
 
-    // Bit identity: the mask covers exactly the slug bits — the bits
-    // the fetch loop populates.
+    // The projected policy must cover the fetched slug bits.
     let fetched_bits: u64 = (0..merged.len()).fold(0, |acc, i| acc | (1u64 << i));
     assert_eq!(
         projected_block_mask(&bit_map, &blocklists),
@@ -165,8 +137,7 @@ fn scaffold_dual_channel_shape_blocks_via_slug_bits() {
         "profile mask bits must equal fetched-source bits"
     );
 
-    // Only the slug channel downloads (the entity URLs are 404) — and
-    // that is now sufficient to block.
+    // Fetched slug bits block the domain.
     let engine = engine_with_fetched(&bit_map, &merged, &[0, 1, 2]);
     assert!(
         matches!(engine.evaluate(KNOWN_BAD, &resolved), FilterResult::Block),
@@ -178,14 +149,11 @@ fn scaffold_dual_channel_shape_blocks_via_slug_bits() {
     ));
 }
 
-/// `warden migrate` deliberately emits dual-channel configs (it derives
-/// `[lists].sources` from `[[blocklists]]`, entity URLs matching the
-/// catalog). Same collapse, no shadow warning case — pinned separately
-/// so a migrate-output config stays single-fetch.
+/// Matching catalog aliases share one compatibility bit.
 #[test]
 fn migrate_shaped_dual_channel_with_catalog_url_collapses() {
     let slugs = ["security/malicious".to_string()];
-    // Flat URL: what the catalog actually serves (and migrate emits).
+    // The catalog URL joins the slug's compatibility bit.
     let blocklists = vec![blocklist(
         "security-malicious",
         "https://lists.purge.cc/malicious.txt",
@@ -211,13 +179,9 @@ fn migrate_shaped_dual_channel_with_catalog_url_collapses() {
     ));
 }
 
-/// Guard regression: a slug the catalog does NOT know, paired with a
-/// same-id entity carrying the real URL (the `imported.local` bridge
-/// shape). The slug channel cannot download anything here, so the
-/// entity's URL fetch must survive the merge — and blocking must work
-/// through the URL bit.
+/// The compatibility helper retains a non-catalog slug and its row URL.
 #[test]
-fn non_catalog_slug_with_same_id_entity_keeps_url_fetch() {
+fn compatibility_merge_keeps_non_catalog_slug_and_row_url_separate() {
     let slugs = ["mycompany".to_string()];
     let blocklists = vec![blocklist(
         "mycompany",
@@ -237,15 +201,13 @@ fn non_catalog_slug_with_same_id_entity_keeps_url_fetch() {
     let bit_map = SourceBitMap::build(&merged, &blocklists).unwrap();
     let resolved = resolve(&bit_map, &blocklists);
 
-    // URL-alias-wins (§4.24 entity loop): the mask points at the URL
-    // bit — the channel that actually downloads in this shape.
+    // The row Id maps policy to its URL bit.
     let url_bit = bit_map
         .bit_for_url("https://imported.local/mycompany.txt")
         .unwrap();
     assert_eq!(projected_block_mask(&bit_map, &blocklists), 1u64 << url_bit);
 
-    // Only the URL source downloads (index 1); the unknown slug fetch
-    // fails. Blocking must still fire.
+    // The fetched URL bit blocks the domain.
     let engine = engine_with_fetched(&bit_map, &merged, &[1]);
     assert!(matches!(
         engine.evaluate(KNOWN_BAD, &resolved),
@@ -253,9 +215,7 @@ fn non_catalog_slug_with_same_id_entity_keeps_url_fetch() {
     ));
 }
 
-/// A disabled entity must stay excluded from the merge regardless of
-/// the dedup path (pre-existing contract, re-pinned here because the
-/// dedup rewrote the loop's skip conditions).
+/// Disabled rows do not enter the compatibility merge.
 #[test]
 fn disabled_entity_still_skipped() {
     let mut b = blocklist("security-malicious", "https://lists.purge.cc/malicious.txt");

@@ -22,10 +22,9 @@
 //!    `Id` to consistent values: bit assignment, trust, status slot
 //!    presence.
 //!
-//! 2. **Type-safety contract negatives.** Passing a v1-id-string into
-//!    `*_for_url` returns `None` (the typed contract pins May 6 at the
-//!    type level — a URL-keyed producer + id-keyed consumer mismatch
-//!    cannot recur because the call line uses different methods).
+//! 2. **Typed lookup boundaries.** Bit and trust URL lookups reject a
+//!    v1-id string, while the status registry deliberately routes every
+//!    configured alias to one slot for operator-facing telemetry.
 //!
 //! 3. **Legacy slash-form back-compat.** `[lists].sources =
 //!    ["security/malicious"]`, no `[[blocklists]]` row. The auto
@@ -47,8 +46,8 @@ fn malicious_blocklist() -> Blocklist {
         display_name: "Security: malicious".into(),
         url: "https://lists.purge.cc/security/malicious.txt".into(),
         format: BlocklistFormat::Domains,
-        update_interval_hours: 12,
-        max_entries: 5_000_000,
+        update_interval_hours: None,
+        max_entries: None,
         enabled: true,
         auth_token_ref: None,
         base: BlocklistBase::Deny,
@@ -153,30 +152,24 @@ fn phase2_pure_v1_all_facades_resolve_v1_id_coherently() {
 }
 
 #[test]
-fn phase2_typed_apis_reject_url_lookup_when_passed_a_v1_id_string() {
-    // The type-safety contract: passing a kebab-form v1-id string into
-    // `*_for_url` must return None. This is the line that would have
-    // compiled-but-silently-mis-matched on May 6 if the facade had
-    // been a `HashMap<String, _>` with an `enum SourceKey` wrapper.
-    // Pinning the negative across all four facades.
+fn phase2_typed_facades_stay_strict_while_status_registry_routes_aliases() {
     let blocklists = vec![malicious_blocklist()];
     let (merged_sources, trust_map) = merge_sources_with_blocklists(&[], &blocklists);
     let bit_map = SourceBitMap::build(&merged_sources, &blocklists).unwrap();
     let registry = ListStatusRegistry::new(&merged_sources);
     registry.populate_v1_id_index(&blocklists);
 
-    // Passing the kebab id-string into `bit_for_url` / `trust_for_url`
-    // / `status_for_url` — silent mismatch attempts. All return None.
+    // Internal typed facades keep URL and Id lookups distinct.
     assert_eq!(bit_map.bit_for_url("security-malicious"), None);
     assert_eq!(trust_map.trust_for_url("security-malicious"), None);
-    assert!(registry.status_for_url("security-malicious").is_none());
 
-    // Passing the v1-id newtype into the v1-id surface — the correct
-    // call line, must hit.
+    // Operator-facing status accepts either alias and reaches the same slot.
     let v1_id = Id::new("security-malicious").unwrap();
     assert!(bit_map.bit_for_v1_id(&v1_id).is_some());
     assert!(trust_map.trust_for_v1_id(&v1_id).is_some());
-    assert!(registry.status_for_v1_id(&v1_id).is_some());
+    let by_alias = registry.status_for_url("security-malicious").unwrap();
+    let by_id = registry.status_for_v1_id(&v1_id).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&by_alias, &by_id));
 }
 
 #[test]

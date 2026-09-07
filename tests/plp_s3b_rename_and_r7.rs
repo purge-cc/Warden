@@ -1,5 +1,5 @@
 //! plp-s3b — the wire rename (`kind` → `base`, `BlocklistBase::Ignore`,
-//! `SCHEMA_VERSION_V1 = 3`) and R7, the ordering that keeps the bump from
+//! schema 3 history and R7, the ordering that keeps the bump from
 //! being an outage.
 //!
 //! `_docs/features/profile_list_policy.md` §2.1 P6 and §6.1.
@@ -18,12 +18,16 @@
 
 use std::fs;
 
-use purge_warden::cli::commands::migrate::{migrate_v1_to_v3, migrate_v2_to_v3};
-use purge_warden::config::loader::load_config;
+use purge_warden::cli::commands::migrate::{
+    migrate_v1_to_v3, migrate_v2_to_v3, run_v3_to_v4, V3ToV4Mode,
+};
+use purge_warden::config::loader::{load_config, load_config_for_schema};
 use purge_warden::config::schema::validator::{
     format_base_ignore_list_is_inert, BASE_IGNORE_LIST_IS_INERT,
 };
-use purge_warden::config::schema::validator::{validate_collect, AuditWarnings};
+use purge_warden::config::schema::validator::{
+    validate_collect, validate_collect_for_schema, AuditWarnings,
+};
 use purge_warden::config::schema::{
     effective_direction, ConfigV1, Id, ListPolicy, SCHEMA_VERSION_V1,
 };
@@ -69,12 +73,12 @@ fn now() -> time::OffsetDateTime {
 // ── The bump itself ───────────────────────────────────────────────────
 
 #[test]
-fn the_schema_version_this_binary_speaks_is_three() {
+fn the_schema_version_this_binary_speaks_is_four() {
     // Spelled as a literal on purpose. Asserting `SCHEMA_VERSION_V1 ==
     // SCHEMA_VERSION_V1` is the shape of test that survives every bump and
     // notices none of them, and the number is the thing R7 is about: it is
     // what every config on disk has to be dragged up to before a restart.
-    assert_eq!(SCHEMA_VERSION_V1, 3);
+    assert_eq!(SCHEMA_VERSION_V1, 4);
 }
 
 // ── R7, proved by running it ──────────────────────────────────────────
@@ -86,7 +90,7 @@ fn the_schema_version_this_binary_speaks_is_three() {
 /// so the fence is not "does lint fail" (it does, trivially) but "does the
 /// migration turn a refusal into an acceptance, at the same path".
 #[test]
-fn a_v2_config_is_refused_then_migrated_then_accepted() {
+fn a_v2_config_is_refused_then_migrated_to_historical_v3_with_policy_parity() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path().join("config.toml");
     fs::write(&cfg, V2_ON_DISK).unwrap();
@@ -111,14 +115,43 @@ fn a_v2_config_is_refused_then_migrated_then_accepted() {
     let summary = migrate_v2_to_v3(&cfg, &cfg, true).expect("migration must succeed");
     assert_eq!(summary.lists_renamed_kind_to_base, 2);
 
-    // 3. Accepted.
-    let loaded = load_config(&cfg, now()).expect("the migrated config must load");
-    assert_eq!(loaded.config.schema_version, SCHEMA_VERSION_V1);
+    // 3. Historical migration output remains schema 3 and is validated by
+    // the explicit-target loader used by the next migrator's preflight.
+    let loaded = load_config_for_schema(&cfg, 3, now()).expect("the v3 output must load as v3");
+    assert_eq!(loaded.config.schema_version, 3);
 
     // And it filters what it filtered yesterday: the `household` tag reached
     // `ads` and not `work`, so `work` must come out explicitly ignored. If
     // this said `Deny`, the migration would have quietly widened what the
     // household blocks.
+    let default = loaded.config.profiles.get("default").expect("profile");
+    let by = |id: &str| {
+        loaded
+            .config
+            .blocklists
+            .iter()
+            .find(|b| b.id.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} must survive"))
+    };
+    assert_eq!(effective_direction(default, by("ads")), ListPolicy::Deny);
+    assert_eq!(effective_direction(default, by("work")), ListPolicy::Ignore);
+}
+
+#[test]
+fn a_v2_config_reaches_the_current_schema_through_v3_to_v4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(&cfg, V2_ON_DISK).unwrap();
+
+    migrate_v2_to_v3(&cfg, &cfg, true).expect("v2-to-v3 migration must succeed");
+    assert_eq!(
+        run_v3_to_v4(&cfg, V3ToV4Mode::Migrate).expect("v3-to-v4 migration must succeed"),
+        0
+    );
+
+    let loaded =
+        load_config(&cfg, now()).expect("the v4 output must load under the current binary");
+    assert_eq!(loaded.config.schema_version, SCHEMA_VERSION_V1);
     let default = loaded.config.profiles.get("default").expect("profile");
     let by = |id: &str| {
         loaded
@@ -141,7 +174,7 @@ fn a_migration_that_cannot_produce_a_loadable_config_changes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path().join("config.toml");
     // A profile naming a list that does not exist: the transformation runs,
-    // the post-write validator refuses, and the rename must never land.
+    // overlay validation refuses, and the rename must never land.
     let broken = V2_ON_DISK.replace(
         "[profiles.default]\ndisplay_name = \"Default\"\ntags = [\"household\"]",
         "[profiles.default]\ndisplay_name = \"Default\"\ntags = [\"household\"]\n\n[profiles.default.lists]\nghost = \"deny\"",
@@ -151,8 +184,8 @@ fn a_migration_that_cannot_produce_a_loadable_config_changes_nothing() {
 
     let err = migrate_v2_to_v3(&cfg, &cfg, true).expect_err("a config that cannot load must fail");
     assert!(
-        err.to_string().contains("left unchanged"),
-        "the failure must say the target was left alone: {err}"
+        err.to_string().contains("nothing written"),
+        "the validation failure must say that no write landed: {err}"
     );
     assert_eq!(
         fs::read_to_string(&cfg).unwrap(),
@@ -209,7 +242,7 @@ fn migrating_an_already_migrated_config_is_byte_identical() {
 /// spelled wrong in TOML.
 fn config_with_base(base: &str) -> ConfigV1 {
     let src = format!(
-        r##"schema_version = 3
+        r##"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -383,7 +416,7 @@ fn the_live_shapes_still_filter_after_migrating() {
         fs::write(&cfg, body).unwrap();
         migrate_v2_to_v3(&cfg, &cfg, true)
             .unwrap_or_else(|e| panic!("{name}: migration must succeed: {e}"));
-        let loaded = load_config(&cfg, now())
+        let loaded = load_config_for_schema(&cfg, 3, now())
             .unwrap_or_else(|e| panic!("{name}: migrated config must load: {e:?}"));
 
         assert!(
@@ -429,7 +462,7 @@ fn a_profile_whose_tags_reached_nothing_is_migrated_to_all_ignore() {
     // `office`, which no profile carries.
     fs::write(&cfg, V2_ON_DISK).unwrap();
     migrate_v2_to_v3(&cfg, &cfg, true).expect("migration must succeed");
-    let loaded = load_config(&cfg, now()).expect("must load");
+    let loaded = load_config_for_schema(&cfg, 3, now()).expect("must load as v3");
     let default = loaded.config.profiles.get("default").expect("profile");
 
     let by = |id: &str| {
@@ -446,6 +479,6 @@ fn a_profile_whose_tags_reached_nothing_is_migrated_to_all_ignore() {
     // And that all-ignore state really does lint clean — the property that
     // makes the check above necessary rather than paranoid.
     let mut warns = AuditWarnings::silent();
-    validate_collect(&loaded.config, now(), &mut warns, None, None)
+    validate_collect_for_schema(&loaded.config, 3, now(), &mut warns, None, None)
         .expect("a config that filters nothing is still a VALID config");
 }

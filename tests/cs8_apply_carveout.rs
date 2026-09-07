@@ -11,17 +11,15 @@
 //!    stages, validates and installs into `cluster.d/` directly and never
 //!    touches the validating writers. That is true structurally today; this
 //!    file's job is to keep it true. Note the deliberate contrast with
-//!    `cs8_secondary_policy_guard.rs`'s
-//!    `a_secondary_refuses_a_write_into_the_sync_owned_drop_in`: the same
-//!    directory, refused by hand and permitted to the sync.
+//!    `target::tests::cs8_secondary_policy_guard`: the same directory is
+//!    refused for manual writes and permitted to the sync.
 //! 2. **`warden lists refresh` stays allowed.** It is node-local, and since
 //!    S1 gave the secondary a real list manager it now does what it says
 //!    (pre-S1 it SIGHUPed a node whose reload path early-returned while
 //!    printing "lists will reload" — a lie).
 //!
-//! Only test 1 needs `--features cluster`; `apply.rs` does not exist without
-//! it. Test 2 is a source-level route assertion and is ungated, so the default
-//! `cargo test` still runs half this file.
+//! Only the live installer test needs `--features cluster`; the route and
+//! retired-interface fences remain active in the default test configuration.
 
 // ── carve-out 2: `warden lists refresh` (ungated) ───────────────────────
 
@@ -43,7 +41,10 @@ fn lists_refresh_does_not_route_through_the_validating_writers() {
         .split("#[cfg(test)]")
         .next()
         .expect("update.rs has a body before its test module");
-    for writer in ["write_value_validated", "write_values_validated"] {
+    for writer in [
+        "write_value_validated_locked",
+        "write_values_validated_locked",
+    ] {
         assert!(
             !production.contains(writer),
             "`lists refresh` now routes through {writer}, so the CS8 guard applies to it. \
@@ -68,8 +69,8 @@ fn apply_does_not_route_through_the_validating_writers() {
         .next()
         .expect("apply.rs has a body before its test module");
     for writer in [
-        "write_value_validated",
-        "write_values_validated",
+        "write_value_validated_locked",
+        "write_values_validated_locked",
         "promote_validated",
     ] {
         assert!(
@@ -77,6 +78,40 @@ fn apply_does_not_route_through_the_validating_writers() {
             "cluster apply now routes through {writer}; the CS8 guard would refuse the \
              sync's own install and the secondary would never receive policy again."
         );
+    }
+}
+
+/// C5.12 retires the temporary public acquiring interfaces. Keep this source
+/// fence deliberately narrow: capability-bearing locked APIs remain valid,
+/// while these exact public declarations must never return.
+#[test]
+fn c512_retired_public_writer_interfaces_stay_absent() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for (relative, retired) in [
+        (
+            "src/cli/commands/target.rs",
+            [
+                "pub fn write_value_validated(",
+                "pub fn write_values_validated(",
+                "pub struct StagedWrite",
+            ]
+            .as_slice(),
+        ),
+        (
+            "src/config/writer.rs",
+            ["pub fn write_config_v1("].as_slice(),
+        ),
+        ("src/config/write_lock.rs", ["pub fn acquire("].as_slice()),
+        ("src/config/mod.rs", ["pub mod writer;"].as_slice()),
+    ] {
+        let source = std::fs::read_to_string(format!("{root}/{relative}"))
+            .expect("production source is readable");
+        for symbol in retired {
+            assert!(
+                !source.contains(symbol),
+                "C5.12 retired public interface `{symbol}` returned in {relative}"
+            );
+        }
     }
 }
 
@@ -88,7 +123,7 @@ mod install {
     use purge_warden::cluster::policy::ClusterPolicyBundle;
 
     /// A joined secondary, shaped per §5.3: node-local keep-list only.
-    const SECONDARY_MASTER: &str = r#"schema_version = 3
+    const SECONDARY_MASTER: &str = r#"schema_version = 4
 includes = ["cluster.d/*.toml"]
 
 [server]
@@ -106,7 +141,7 @@ token_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
     /// Policy only — the CS3 fence (`deny_unknown_fields` on
     /// `ClusterPolicyBundle`) rejects any node-local section here.
-    const BUNDLE: &str = r#"schema_version = 3
+    const BUNDLE: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -124,9 +159,8 @@ ip = "192.0.2.50"
 "#;
 
     /// The install the whole feature exists to perform must still succeed on
-    /// a secondary — and it installs `[[devices]]`, the very section
-    /// `cs8_secondary_policy_guard.rs` proves an operator cannot write there
-    /// by hand.
+    /// a secondary — and it installs `[[devices]]`, which the target unit
+    /// tests prove an operator cannot write there by hand.
     #[tokio::test]
     async fn a_secondary_still_installs_a_synced_policy_bundle() {
         let dir = tempfile::tempdir().unwrap();

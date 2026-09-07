@@ -7,8 +7,9 @@
 //! 4. Starts the DNS server on the configured listen address
 //! 5. Enters a signal loop: SIGTERM/SIGINT→shutdown, SIGHUP→reload
 //!    (cache flush is NOT signal-based; use the authenticated IPC command)
-//! 6. On shutdown: aborts background tasks, removes PID file, exits cleanly
+//! 6. On shutdown: retires background tasks, removes PID file, exits cleanly
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,11 +27,11 @@ use crate::dns::local::LocalRecords;
 use crate::dns::server::DnsServer;
 use crate::filter::engine::FilterEngine;
 use crate::filter::ip_filter::{parse_ip_blocklist, IpFilter};
-use crate::ipc::socket_server::{spawn_ipc_server, DaemonState};
+use crate::ipc::socket_server::{spawn_ipc_server, DaemonState, ListManagerEndpoint};
 use crate::lists::catalog::Catalog;
-use crate::lists::manager::{merge_sources_with_blocklists, ListManager, RefreshMode};
+use crate::lists::manager::{ListManager, ListManagerTask, RefreshMode};
 use crate::lists::readiness::ReadinessGate;
-use crate::lists::source_key::{SourceBitMap, SourceTokenMap};
+use crate::lists::source_key::{ResolvedSourcePlan, SourceBitMap, SourceTokenMap, SourceTrustMap};
 use crate::lists::status::{CycleOutcome, ListStatusRegistry};
 use crate::profiles::ProfileResolver;
 use crate::tracking::StatsEngine;
@@ -266,10 +267,9 @@ fn is_cluster_secondary(config: &crate::config::schema::ConfigV1) -> bool {
 /// 2. the seed of the readiness gate — closed iff this returns `true`,
 /// 3. which side of the bind branches (b) and (c) live on.
 ///
-/// **Not "are any blocklists configured".** Sources arrive through two
-/// channels (`[lists].sources` and `[[blocklists]]`, merged by
-/// [`merge_sources_with_blocklists`]), so `config.blocklists` alone is empty on
-/// a fully configured node.
+/// **Not "are any blocklists configured".** The resolved source plan combines
+/// legacy entries and enabled rows, so either configuration shape can start a
+/// manager.
 ///
 /// **A cluster secondary is not an exception.** Replication is policy only —
 /// a secondary derives its own bitmask from the replicated policy exactly as
@@ -285,6 +285,22 @@ fn boot_spawns_list_manager(
 ) -> bool {
     let _ = config;
     !merged_sources.is_empty()
+}
+
+/// True when the operator declared any source, before catalog resolution.
+/// This distinguishes an intentional clear from a broken/empty catalog.
+pub(crate) fn config_declares_list_sources(config: &crate::config::schema::ConfigV1) -> bool {
+    !config.lists.sources.is_empty() || config.blocklists.iter().any(|blocklist| blocklist.enabled)
+}
+
+/// Reject only the ambiguity where declared sources resolve to nothing.
+/// A partially resolved legacy set keeps the established warning-only
+/// behavior; an actually empty configuration remains an intentional clear.
+fn rejects_declared_empty_plan(
+    config: &crate::config::schema::ConfigV1,
+    plan: &ResolvedSourcePlan,
+) -> bool {
+    config_declares_list_sources(config) && plan.is_empty()
 }
 
 /// Refusal shown when `warden start --blocklist <file>` is used.
@@ -375,6 +391,12 @@ pub async fn run_start(
     }
 
     result
+}
+
+/// Publish retirement before any asynchronous shutdown work can leave a
+/// previously accepted IPC handler looking at a running list manager.
+fn publish_list_manager_transitioning(endpoint: &Arc<arc_swap::ArcSwap<ListManagerEndpoint>>) {
+    endpoint.store(Arc::new(ListManagerEndpoint::Transitioning));
 }
 
 /// Core server startup + signal loop. Separated so the caller can
@@ -549,26 +571,33 @@ async fn run_server(
     }
     let filter = Arc::new(FilterEngine::new());
 
-    // Unify legacy `lists.sources` with v1 `[[blocklists]]` URLs into the
-    // source vector that drives the bit map AND the manager's fetch loop.
-    // `import-local` only writes the `[[blocklists]]` row, so without this
-    // merge the synthetic `imported.local` URL never reaches the manager
-    // and the loader-bridge has nothing to intercept. Trust map
-    // (per-source `BlocklistTrust`) is consumed by `set_local_bridge`
-    // below.
-    let (merged_sources, source_trust) =
-        merge_sources_with_blocklists(&config.lists.sources, &config.blocklists);
+    let has_enabled_sources = config_declares_list_sources(config);
+    let lists_dir = has_enabled_sources.then(|| lists_cache_dir(config_path, config));
+    let catalog = match &lists_dir {
+        Some(dir) => fetch_catalog_or_fallback(&list_client, dir, CatalogPreference::Disk).await,
+        None => Catalog::fallback(),
+    };
+    let source_plan = ResolvedSourcePlan::build_for_schema(
+        &catalog,
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    )
+    .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
+    if rejects_declared_empty_plan(config, &source_plan) {
+        anyhow::bail!("configured list sources resolved to no usable catalog entries");
+    }
+    let merged_sources = source_plan.representatives();
 
-    // Build the typed source bit map from merged sources + the v1
-    // `[[blocklists]]` catalogue. The validator caps `lists.sources`
-    // at 64, so this is defence-in-depth — if the cap is ever bypassed
-    // the operator gets a plain-English message instead of a panic.
-    // [`SourceBitMap`] seeds `by_v1_id` from both source channels so
-    // profile resolution by `&Id` always hits the right bit, regardless
-    // of whether the operator put their lists in `[lists].sources`
-    // (legacy slash-form) or in `[[blocklists]]` (v1).
-    let source_bits = SourceBitMap::build(&merged_sources, &config.blocklists)
-        .map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
+    // Bits, fetches, cache keys, and status aliases all derive from this
+    // catalog-resolved plan so one URL cannot acquire two identities.
+    let source_bits =
+        SourceBitMap::from_plan(&source_plan).map_err(|e| anyhow::anyhow!("lists.sources: {e}"))?;
 
     // The operator's per-profile list policy, projected onto the bit
     // assignment `source_bits` just made. Computed here because
@@ -577,34 +606,27 @@ async fn run_server(
     // travelling on its own.
     let policy_masks = source_bits.project_policy(&config.blocklists, &config.profiles);
 
-    // Resolve `[blocklists].auth_token_ref` values against the loaded
-    // secrets. The typed [`SourceTokenMap`] keys by legacy slash-form
-    // source string for the manager's fetch path AND by canonical v1
-    // [`Id`] for future id-keyed consumers; absence means the list fetch
-    // stays anonymous.
-    let source_tokens = SourceTokenMap::build(config, &secrets);
+    // Tokens follow the representative that owns each fetch.
+    let source_tokens = SourceTokenMap::from_plan(&source_plan, &secrets);
 
-    let profiles = Some(build_profile_resolver(config, &source_bits, custom_lists));
+    let profiles = Some(build_profile_resolver(config, custom_lists));
 
     // Initial list download
-    let mut refresh_handle: Option<JoinHandle<()>> = None;
+    let mut refresh_handle: Option<ListManagerTask> = None;
     // Fingerprints the list pipeline the manager below is built from, so
     // the FIRST reload can already skip a rebuild it does not need.
     // Stays `None` when no manager is spawned — the gate then falls
     // through to a rebuild, which is the safe direction.
     let mut lists_fingerprint: Option<ListsFingerprint> = None;
-    // ArcSwap-wrapped sender for the list manager's out-of-band command
-    // channel. Always allocated so the reload path
-    // can swap in a fresh sender after rebuilding the manager. Starts
-    // `None` — only flipped to `Some(tx)` when a manager is actually
-    // spawned (no sources = no manager = forget is unreachable, which
-    // is the correct behaviour).
-    let list_cmd_tx_swap: Arc<
-        arc_swap::ArcSwap<
-            Option<tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>>,
-        >,
-    > = Arc::new(arc_swap::ArcSwap::from_pointee(None));
-    let mut list_status_registry: Option<Arc<ListStatusRegistry>> = None;
+    // ArcSwap-wrapped lifecycle endpoint for list IPC. Transitioning is
+    // observable while a reload retires or replaces a manager generation.
+    let list_cmd_tx_swap: Arc<arc_swap::ArcSwap<ListManagerEndpoint>> = Arc::new(
+        arc_swap::ArcSwap::from_pointee(ListManagerEndpoint::EmptyStable),
+    );
+    // This Arc exists even for an intentionally empty configuration. Reload
+    // attaches every manager generation to it, so IPC sees a source added
+    // after an empty boot without replacing the daemon-owned handle.
+    let list_status_registry = Arc::new(ListStatusRegistry::from_plan(&source_plan));
     // Capture the list_state handle BEFORE `spawn_refresh_loop` consumes
     // the manager so `DaemonState` can plumb it into the
     // `ListDiagnostics` walk that backs `warden status`.
@@ -636,7 +658,7 @@ async fn run_server(
 
     // A cluster secondary downloads and builds its OWN lists, exactly like a
     // standalone node. The Tier-1 bitmask is a positional index into this
-    // process's merged sources vector, so it is derived here rather than
+    // process's representative source vector, so it is derived here rather than
     // received — each node computes identical bits from the identical
     // policy the bundle replicated.
     //
@@ -654,8 +676,7 @@ async fn run_server(
     //
     // `spawn_lists` is that predicate. It is NOT
     // `config.blocklists.is_empty()`: sources arrive through two
-    // channels (`[lists].sources` and `[[blocklists]]`, merged by
-    // `merge_sources_with_blocklists`), so a node configured entirely
+    // channels (`[lists].sources` and enabled `[[blocklists]]` rows), so a node configured entirely
     // through `[lists].sources` would read as "no lists" and seed the
     // gate open with no map built yet.
     //
@@ -665,19 +686,7 @@ async fn run_server(
     let filter_ready = ReadinessGate::new(!spawn_lists);
 
     if spawn_lists {
-        // Bound BEFORE the catalog is acquired: that is where the
-        // persisted copy is read from, and where a freshly fetched one is
-        // written back. `lists_cache_dir` `create_dir_all`s as a side
-        // effect, so this moves the directory's creation ahead of the
-        // fetch. Checked what that crosses: the catalog acquisition
-        // itself — the point of the move, since it is what needs this
-        // directory to exist — then the bit→label snapshot loop and the
-        // `interval` binding, neither of which touches the filesystem,
-        // and all three stay below.
-        let lists_dir = lists_cache_dir(config_path, config);
-        let catalog =
-            fetch_catalog_or_fallback(&list_client, &lists_dir, CatalogPreference::Disk).await;
-        // Build the snapshot before `catalog` moves into the manager.
+        // Build labels from the catalog selected for this source plan.
         // Bits not present in the catalog (e.g. operator-pinned URLs)
         // fall back to the URL filename stem.
         for (url, bit) in source_bits.iter_urls() {
@@ -700,29 +709,24 @@ async fn run_server(
         // Pin what this manager is built from so a reload that changes
         // none of it can reuse the manager instead
         // of re-parsing 9.9 M domains. Goes through `from_config` — the
-        // same entry point the gate's tests use — rather than reusing
-        // the locals below, so there is exactly one definition of "the
-        // fingerprint of this config" and no way for boot and reload to
-        // drift apart. It redoes the source merge, which its own doc
-        // calls a cold path; a duplicate merge once per boot is not
-        // worth a second code path.
-        lists_fingerprint = Some(ListsFingerprint::from_config(
+        // same plan fields reload compares, so boot and reload cannot drift.
+        lists_fingerprint = Some(ListsFingerprint::compute(
             config,
-            &secrets,
+            &source_plan,
+            &source_tokens,
             &bridge_config_dir,
         ));
 
-        let mut mgr = ListManager::with_tokens(
+        let mut mgr = ListManager::with_plan_and_tokens(
             list_client.clone(),
             filter.clone(),
-            merged_sources,
-            catalog,
+            source_plan.clone(),
             interval,
             source_bits.clone(),
             source_tokens.clone(),
             config.lists.max_body_bytes,
             config.lists.max_entries,
-            Some(lists_dir),
+            Some(lists_dir.expect("enabled sources selected a cache directory")),
         );
 
         // The daemon owns `list_state.json`, so this manager records its
@@ -730,30 +734,19 @@ async fn run_server(
         ManagerWiring::from_config(
             config,
             config_path,
-            source_trust,
+            &source_plan,
             bridge_config_dir,
             policy_masks,
             ListStateWriteback::Persist,
         )
         .apply(&mut mgr);
 
-        // Daemon-only, so it stays outside the shared wiring: wire
-        // `list_stats.json` for `delta_pct_vs_prev` persistence and
-        // capture the registry handle BEFORE `spawn_refresh_loop`
-        // consumes the manager. Same Arc goes to `DaemonState`, so the
-        // IPC handler reads through the atomic state the manager writes.
+        // Daemon-only persistence stays outside shared wiring. Attach the
+        // boot-owned registry before loading baselines so IPC and every
+        // manager generation retain one stable Arc.
+        mgr.attach_status_registry(list_status_registry.clone());
         mgr.set_status_persistence_path(list_stats_path(config_path));
-        list_status_registry = Some(mgr.status_registry());
-
-        // Seed the registry's `by_v1_id_index` so future id-keyed
-        // consumers (TUI Lists tab, audit attribution)
-        // resolve a `&Id` straight to the slot without re-deriving the
-        // URL. The manager constructed the registry with slash-form
-        // translations only (it doesn't have `&[Blocklist]` in scope);
-        // we own the catalogue here.
-        if let Some(reg) = list_status_registry.as_ref() {
-            reg.populate_v1_id_index(&config.blocklists);
-        }
+        list_status_registry.sync_plan(&source_plan);
 
         // Wire the broadcast publisher so each refresh cycle emits one
         // `ListStatsUpdated` per source. The Sender lives in
@@ -766,17 +759,6 @@ async fn run_server(
         // single source of truth.
         list_state_handle = Some(mgr.list_state_handle());
 
-        // Hand the resolver the SAME Arc the refresh loop writes
-        // through, so every later map rebuild (SIGHUP reload, 60 s
-        // schedule tick) sees each list's
-        // current download state instead of assuming all of them are
-        // live. Attaching does not rebuild anything by itself — the
-        // swap below, after the initial refresh, is what publishes the
-        // first state-aware map.
-        if let Some(resolver) = profiles.as_ref() {
-            resolver.attach_list_state(mgr.list_state_handle());
-        }
-
         // Wire the out-of-band command channel so the IPC `ForgetList`
         // handler can reach the refresh loop. Channel
         // depth 16 covers a burst of operator forgets without blocking
@@ -784,7 +766,7 @@ async fn run_server(
         // perspective once acked).
         let (list_cmd_tx, list_cmd_rx) = tokio::sync::mpsc::channel(16);
         mgr.set_command_channel(list_cmd_rx);
-        list_cmd_tx_swap.store(Arc::new(Some(list_cmd_tx)));
+        list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::running(list_cmd_tx)));
 
         // The manager is the only thing that opens the gate. Handed over
         // before the first cycle of any mode so the CacheOnly load below
@@ -796,20 +778,6 @@ async fn run_server(
         // two calls this replaced are inside it, not dropped.
         let count = load_corpus_before_bind(&mut mgr, BIND_RETRY_INITIAL_BACKOFF).await;
         tracing::info!(count, "initial blocklist loaded");
-        // The refresh above wrote every list's outcome into the state
-        // the resolver now holds a handle to. Republish the map so the
-        // one the DNS listener
-        // starts serving is built from those outcomes — the resolver
-        // built at startup predates the manager and assumed every list
-        // was live. This runs before the listener binds, so no query is
-        // ever answered from the pre-refresh map.
-        //
-        // Without this the first state-aware rebuild would wait for a
-        // reload or a schedule tick, and the tick only runs on a box
-        // that has schedules configured.
-        if let Some(resolver) = profiles.as_ref() {
-            resolver.swap(config, &source_bits, custom_lists);
-        }
         refresh_handle = Some(mgr.spawn_refresh_loop());
     } else {
         tracing::info!("no lists configured, filtering disabled");
@@ -1253,7 +1221,7 @@ async fn run_server(
         api_token_hash: api_token_hash_for_state,
         config_path: Some(config_path.to_path_buf()),
         config_write_lock: config_write_lock.clone(),
-        list_statuses: list_status_registry.clone(),
+        list_statuses: Some(list_status_registry.clone()),
         list_state: list_state_handle.clone(),
         local_records_hits: Some(local_records_hits),
         // The same process-wide ring the capture layer
@@ -1322,7 +1290,7 @@ async fn run_server(
             // Same registry the IPC handler reads. The HTTP surface is
             // always token-gated by the `/api/...` middleware — IPC's
             // "ReadOnly = no token" does NOT extend to HTTP.
-            list_statuses: list_status_registry.clone(),
+            list_statuses: Some(list_status_registry.clone()),
             // Same bit→label snapshot DaemonState holds, so /api/query
             // can name the blocking list. Cheap Arc clone.
             list_labels: list_labels.clone(),
@@ -1463,7 +1431,7 @@ async fn run_server(
         &api_token_hash,
         &acl_handle,
         stats.as_ref(),
-        list_status_registry.as_ref(),
+        Some(&list_status_registry),
         &notification_tx,
         &list_cmd_tx_swap,
         cluster_reload_handle,
@@ -1471,6 +1439,11 @@ async fn run_server(
         &mut api_handle,
     )
     .await;
+
+    // WHY: handlers outlive signal_loop briefly; close Force/Forget admission
+    // before audit or cleanup gives every already-spawned handler the same
+    // retiring endpoint rather than a still-running sender.
+    publish_list_manager_transitioning(&list_cmd_tx_swap);
 
     // Audit the shutdown before we tear anything down so a rollover that
     // crashes mid-cleanup still leaves a trail. `shutdown_uid` is
@@ -1541,8 +1514,12 @@ async fn run_server(
         }
     }
 
+    // The endpoint was unpublished immediately after signal_loop returned;
+    // retire its receiver only after the remaining shutdown bookkeeping.
     if let Some(h) = refresh_handle.take() {
-        h.abort();
+        if let Err(error) = h.retire().await {
+            tracing::error!(%error, "list manager controller ended abnormally during shutdown");
+        }
     }
 
     // Wait for server to finish
@@ -1559,7 +1536,7 @@ async fn run_server(
 /// loop it is about to become.
 ///
 /// Called at both transition points, and no longer symmetrically. **Reload**
-/// still calls it after its inline `refresh()` has returned. **Boot** calls it
+/// calls it after its tight-client refresh worker has returned. **Boot** calls it
 /// FIRST — see [`load_corpus_before_bind`] — because the boot path no longer
 /// refreshes over the network at all, so there is no inline refresh left to
 /// starve, and the background loop it hands off to now starts seconds after
@@ -1606,9 +1583,7 @@ const BIND_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Build the filter map the DNS listener will serve — **before** it binds.
 ///
 /// Builds the map via branches (a), (b) and (c) below. Returns the installed
-/// domain count, and the contract is that it **only returns at all once a
-/// map exists**: the caller binds on return, so returning `0` would be an
-/// unfiltered boot.
+/// domain count once a configured source set has reached a serveable state.
 ///
 /// # Precondition
 ///
@@ -1634,26 +1609,23 @@ async fn load_corpus_before_bind(mgr: &mut ListManager, initial_backoff: Duratio
     // it was four downloads that a 30 s TOTAL deadline made structurally
     // impossible to finish, whose fallback was this exact disk read anyway.
     let mut count = mgr.refresh_with_mode(RefreshMode::CacheOnly).await;
+    let mut served_state = mgr.served_state();
     tracing::info!(count, "blocklist loaded from disk cache");
 
-    // Branch (b): nothing on disk — a fresh install, or a cache the corpus
-    // guard refused. Fall back to the old behaviour and block on the network,
-    // now with the bulk client so a big list can actually complete.
-    if count == 0 {
+    // Branch (b): no cache generation is ready to serve. Block on the network.
+    if !served_state.is_ready_for_bind() {
         tracing::warn!(
             "no usable disk cache; downloading before the listener binds \
              (first run, or the cache was refused)"
         );
-        count = mgr.refresh_with_mode(RefreshMode::Network).await;
+        count = mgr.refresh_with_mode(RefreshMode::Force).await;
+        served_state = mgr.served_state();
     }
 
-    // Branch (c): still nothing. Do NOT bind. A daemon that answers without a
-    // filter map is the failure this change exists to prevent, and it has
-    // shipped here before. Retry rather than exit: exiting hands the box to a
-    // systemd restart loop, which removes DNS just as thoroughly and hides the
-    // cause.
+    // Branch (c): still no serveable generation. Retry instead of binding
+    // without validated list state.
     let mut backoff = initial_backoff;
-    while count == 0 {
+    while !served_state.is_ready_for_bind() {
         tracing::error!(
             retry_in_secs = backoff.as_secs(),
             "REFUSING TO BIND: no filter map could be built from disk or \
@@ -1662,7 +1634,8 @@ async fn load_corpus_before_bind(mgr: &mut ListManager, initial_backoff: Duratio
         );
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BIND_RETRY_MAX_BACKOFF);
-        count = mgr.refresh_with_mode(RefreshMode::Network).await;
+        count = mgr.refresh_with_mode(RefreshMode::Force).await;
+        served_state = mgr.served_state();
     }
 
     count
@@ -1707,7 +1680,7 @@ async fn signal_loop(
     list_client: &reqwest::Client,
     filter: &Arc<FilterEngine>,
     profiles: Option<&Arc<ProfileResolver>>,
-    refresh_handle: &mut Option<JoinHandle<()>>,
+    refresh_handle: &mut Option<ListManagerTask>,
     lists_fingerprint: &mut Option<ListsFingerprint>,
     mut has_schedules: bool,
     ipc_shutdown_rx: &mut mpsc::Receiver<Option<u32>>,
@@ -1720,11 +1693,7 @@ async fn signal_loop(
     stats: Option<&Arc<StatsEngine>>,
     list_status_registry: Option<&Arc<ListStatusRegistry>>,
     notification_tx: &tokio::sync::broadcast::Sender<crate::ipc::protocol::IpcNotification>,
-    list_cmd_tx_swap: &Arc<
-        arc_swap::ArcSwap<
-            Option<tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>>,
-        >,
-    >,
+    list_cmd_tx_swap: &Arc<arc_swap::ArcSwap<ListManagerEndpoint>>,
     cluster_state: ClusterReloadHandle<'_>,
     security: Option<&Arc<SecurityLayer>>,
     api_handle: &mut Option<JoinHandle<()>>,
@@ -1804,7 +1773,7 @@ async fn signal_loop(
                     cluster_state,
                     security,
                 )
-                .await
+                .await?
                 {
                     has_schedules = h;
                 }
@@ -1835,7 +1804,7 @@ async fn signal_loop(
                             cluster_state,
                             security,
                         )
-                        .await
+                        .await?
                         {
                             has_schedules = h;
                         }
@@ -1964,10 +1933,12 @@ fn collect_loaded_files(config_path: &Path) -> Vec<PathBuf> {
 /// silently skip construction for an "empty `[[devices]]`" optimisation.
 fn build_profile_resolver(
     config: &crate::config::schema::ConfigV1,
-    source_bits: &SourceBitMap,
     custom_lists: &CustomListStore,
 ) -> Arc<ProfileResolver> {
-    Arc::new(ProfileResolver::build(config, source_bits, custom_lists))
+    Arc::new(ProfileResolver::build_without_list_bits(
+        config,
+        custom_lists,
+    ))
 }
 
 /// Re-evaluate schedules by re-reading the v1 config and rebuilding
@@ -2006,22 +1977,23 @@ fn handle_schedule_tick(config_path: &Path, profiles: Option<&Arc<ProfileResolve
     if loaded.config.schedules.is_empty() {
         return;
     }
-    let (merged_sources, _trust) =
-        merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-    let source_bits = match SourceBitMap::build(&merged_sources, &loaded.config.blocklists) {
-        Ok(bits) => bits,
-        Err(e) => {
-            tracing::warn!(error = %e, "schedule tick: source bit map build failed");
-            return;
-        }
-    };
-    resolver.swap(&loaded.config, &source_bits, &loaded.custom_lists);
+    resolver.swap_without_list_bits(&loaded.config, &loaded.custom_lists);
     tracing::debug!("schedule tick: profile map rebuilt");
 
     // Drop lapsed one-shot rows from disk. Best-effort: a failure (e.g.
     // a read-only config tree under a hardened unit) only means the
     // inert rows stay until a CLI path prunes them.
-    match crate::cli::commands::schedules::prune_expired_schedules(config_path, &loaded, now) {
+    // The resolver above deliberately uses its reader snapshot. Pruning is a
+    // mutation, so it takes a fresh guarded snapshot instead.
+    let prune_result =
+        crate::config::write_lock::acquire_for_write(config_path).and_then(|guard| {
+            crate::cli::commands::schedules::prune_expired_schedules_locked(
+                &guard,
+                config_path,
+                now,
+            )
+        });
+    match prune_result {
         Ok(pruned) if !pruned.is_empty() => {
             tracing::info!(
                 count = pruned.len(),
@@ -2057,18 +2029,31 @@ fn handle_schedule_tick(config_path: &Path, profiles: Option<&Arc<ProfileResolve
 /// registry and the profile resolver, which is where those land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ListsFingerprint {
-    /// Merged source vector, **order-sensitive**. [`SourceBitMap::build`]
+    /// Representative source vector, **order-sensitive**. [`SourceBitMap::from_plan`]
     /// assigns bits positionally, so reordering `lists.sources` re-maps
     /// every profile's bitmask and genuinely does need a rebuild — never
     /// sort this before comparing.
     sources: Vec<String>,
-    /// Baked into the manager's refresh loop at construction.
-    update_interval_secs: u64,
+    /// Catalog-resolved identities. A slug retaining its spelling while the
+    /// selected catalog moves its URL still needs a fresh manager.
+    canonical_urls: Vec<String>,
+    /// Ordered exact request targets. Canonical equivalence is insufficient:
+    /// query spelling can select different upstream content or validators.
+    fetch_urls: Vec<String>,
+    /// Command and status aliases belong to the manager generation too.
+    source_aliases: Vec<(String, String)>,
+    id_aliases: Vec<(crate::config::schema::Id, String)>,
+    /// Effective cadence in representative order. This is what the manager
+    /// consumes, including schema-3 inheritance and schema-4 row floors.
+    source_update_interval_secs: Vec<u64>,
     max_body_bytes: usize,
     /// This changes what the parser keeps
     /// from an unchanged URL set, so a gate that only diffs URLs would
     /// serve a stale-width map while reporting success.
     max_entries: usize,
+    /// Effective caps in representative order. Row values must participate:
+    /// changing only one source's cap changes the corpus for unchanged bytes.
+    source_max_entries: Vec<usize>,
     /// The raw config value, *not* the resolved path: resolving means
     /// calling [`lists_cache_dir`], which `create_dir_all`s as a side
     /// effect. A fingerprint must not touch the filesystem.
@@ -2085,10 +2070,13 @@ pub(crate) struct ListsFingerprint {
     max_total_domains: usize,
     shrink_guard_enabled: bool,
     shrink_guard_max_drop_pct: u8,
-    /// Per-row fields that reach the fetch / parse / trust path. This
-    /// also covers `SourceTrustMap`, which `merge_sources_with_blocklists`
-    /// derives deterministically from these same rows.
-    blocklists: Vec<BlocklistFingerprint>,
+    /// Only first-owner fields reach the live manager. Alias-only fields
+    /// cannot trigger a rebuild because the source plan ignores them.
+    source_owners: Vec<SourceOwnerFingerprint>,
+    /// Profile overrides alter the policy masks the manager publishes even
+    /// when no row-level list field changed.
+    profile_list_policies:
+        BTreeMap<String, BTreeMap<crate::config::schema::Id, crate::config::schema::ListPolicy>>,
     /// SipHash of the *resolved* bearer tokens, key-sorted. A digest and
     /// not the values themselves, because this struct derives `Debug`
     /// and must never be able to print a secret (same reasoning as the
@@ -2099,20 +2087,15 @@ pub(crate) struct ListsFingerprint {
     token_digest: u64,
 }
 
-/// The subset of a `[[blocklists]]` row that changes what gets fetched
-/// or how it parses. `display_name` and `tags` are deliberately absent —
-/// see the membership rule on [`ListsFingerprint`].
+/// The source-owner fields that change fetch or parse behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BlocklistFingerprint {
+struct SourceOwnerFingerprint {
     id: crate::config::schema::Id,
-    url: String,
     format: crate::config::schema::BlocklistFormat,
-    update_interval_hours: u32,
-    max_entries: u64,
-    enabled: bool,
     auth_token_ref: Option<String>,
     base: crate::config::schema::BlocklistBase,
     trust: crate::config::schema::BlocklistTrust,
+    max_consecutive_failures: u32,
     /// The `imported.local` bridge (`lists::manager::try_bridge_imported_local`)
     /// re-reads this row's on-disk file fresh on every `ListManager::refresh`
     /// — but nothing above this field changes when the operator edits that
@@ -2128,24 +2111,23 @@ struct BlocklistFingerprint {
 }
 
 impl ListsFingerprint {
-    /// Build from the values `handle_reload` has already derived, so the
-    /// gate costs no extra merge.
+    /// Build from the plan `handle_reload` already derived.
     fn compute(
         config: &crate::config::schema::ConfigV1,
-        merged_sources: &[String],
+        plan: &ResolvedSourcePlan,
         source_tokens: &SourceTokenMap,
         config_dir: &Path,
     ) -> Self {
         use std::hash::{Hash, Hasher};
 
-        // `url_tokens()` is a `HashMap`: iteration order varies between
-        // instances, so hashing it as-iterated would yield a different
-        // digest for two equal maps and force a spurious rebuild on
-        // every single reload. Sort first.
-        let mut token_entries: Vec<(&str, &str)> = source_tokens
-            .url_tokens()
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+        // Sort representative/token pairs so equal plans hash equally.
+        let mut token_entries: Vec<(&str, &str)> = plan
+            .sources()
+            .filter_map(|source| {
+                source_tokens
+                    .token_for_url(source.representative())
+                    .map(|token| (source.representative(), token))
+            })
             .collect();
         token_entries.sort_unstable();
         // `DefaultHasher::new` is fixed-key, so it is deterministic for
@@ -2156,51 +2138,102 @@ impl ListsFingerprint {
         token_entries.hash(&mut hasher);
 
         Self {
-            sources: merged_sources.to_vec(),
-            update_interval_secs: config.lists.update_interval_secs,
+            sources: plan.representatives(),
+            canonical_urls: plan
+                .sources()
+                .map(|source| source.canonical_url().to_string())
+                .collect(),
+            fetch_urls: plan
+                .sources()
+                .map(|source| source.fetch_url().to_string())
+                .collect(),
+            source_aliases: {
+                let mut aliases: Vec<_> = plan
+                    .source_aliases()
+                    .iter()
+                    .map(|(alias, representative)| (alias.clone(), representative.clone()))
+                    .collect();
+                aliases.sort_unstable();
+                aliases
+            },
+            id_aliases: {
+                let mut aliases: Vec<_> = plan
+                    .id_aliases()
+                    .iter()
+                    .map(|(id, representative)| (id.clone(), representative.clone()))
+                    .collect();
+                aliases.sort_unstable();
+                aliases
+            },
+            source_update_interval_secs: plan
+                .sources()
+                .map(|source| source.effective_update_interval_secs())
+                .collect(),
             max_body_bytes: config.lists.max_body_bytes,
             max_entries: config.lists.max_entries,
+            source_max_entries: plan
+                .sources()
+                .map(|source| source.effective_max_entries())
+                .collect(),
             cache_dir: config.lists.cache_dir.clone(),
             max_total_domains: config.lists.max_total_domains,
             shrink_guard_enabled: config.lists.shrink_guard_enabled,
             shrink_guard_max_drop_pct: config.lists.shrink_guard_max_drop_pct,
-            blocklists: config
-                .blocklists
-                .iter()
-                .map(|b| BlocklistFingerprint {
+            source_owners: plan
+                .sources()
+                .filter_map(|source| source.owner_blocklist())
+                .map(|b| SourceOwnerFingerprint {
                     id: b.id.clone(),
-                    url: b.url.clone(),
                     format: b.format,
-                    update_interval_hours: b.update_interval_hours,
-                    max_entries: b.max_entries,
-                    enabled: b.enabled,
                     auth_token_ref: b.auth_token_ref.clone(),
                     base: b.base,
                     trust: b.trust,
+                    max_consecutive_failures: b.max_consecutive_failures,
                     local_stamp: matches!(b.trust, crate::config::schema::BlocklistTrust::Local)
                         .then(|| crate::lists::manager::stat_local_source(&b.url, config_dir))
                         .flatten(),
+                })
+                .collect(),
+            profile_list_policies: config
+                .profiles
+                .iter()
+                .map(|(id, profile)| {
+                    let policies = profile
+                        .lists
+                        .iter()
+                        .filter(|(list_id, _)| plan.representative_for_id(list_id).is_some())
+                        .map(|(list_id, policy)| (list_id.clone(), *policy))
+                        .collect();
+                    (id.clone(), policies)
                 })
                 .collect(),
             token_digest: hasher.finish(),
         }
     }
 
-    /// Derive from a loaded config + secrets, doing the source merge and
-    /// token resolution internally. Used to seed the fingerprint at
-    /// daemon boot (so the *first* reload can already skip) and by the
-    /// gate's tests.
+    /// Test helper deriving the fallback plan and its tokens from config.
+    #[cfg(test)]
     fn from_config(
         config: &crate::config::schema::ConfigV1,
         secrets: &crate::config::secrets::Secrets,
         config_dir: &Path,
     ) -> Self {
-        let (merged_sources, _trust) =
-            merge_sources_with_blocklists(&config.lists.sources, &config.blocklists);
+        let plan = ResolvedSourcePlan::build_for_schema(
+            &Catalog::fallback(),
+            &config.lists.sources,
+            &config.blocklists,
+            &config.profiles,
+            crate::lists::source_key::RowControlDefaults {
+                max_entries: config.lists.max_entries,
+                update_interval_secs: config.lists.update_interval_secs,
+            },
+            config.schema_version,
+        )
+        .expect("test fingerprint config has unambiguous list aliases");
         Self::compute(
             config,
-            &merged_sources,
-            &SourceTokenMap::build(config, secrets),
+            &plan,
+            &SourceTokenMap::from_plan(&plan, secrets),
             config_dir,
         )
     }
@@ -2212,8 +2245,10 @@ impl ListsFingerprint {
 /// both directions offline is at this seam.
 ///
 /// `live_refresh` is whether a refresh loop — and therefore a live
-/// [`ListManager`] — actually exists to be reused. It is ANDed rather
-/// than assumed: with no live loop, a matching fingerprint would
+/// [`ListManager`] — actually exists to be reused. A finished task is not
+/// live even while its handle is still `Some`: treating it as reusable would
+/// leave the daemon with a stale map and no future refreshes. It is ANDed
+/// rather than assumed: with no live loop, a matching fingerprint would
 /// otherwise "reuse" a manager that is not there, leaving the daemon
 /// with a stale map and nothing refreshing it. Every uncertain case
 /// resolves to `false`, i.e. rebuild.
@@ -2223,6 +2258,15 @@ fn should_reuse_live_lists(
     next: &ListsFingerprint,
 ) -> bool {
     live_refresh && live == Some(next)
+}
+
+fn has_live_list_manager(task: Option<&ListManagerTask>) -> bool {
+    task.is_some_and(|task| !task.is_finished())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PANIC_RELOAD_WORKER: bool;
 }
 
 /// Handle SIGHUP / IPC reload: re-read v1 config, validate, re-download
@@ -2243,7 +2287,7 @@ async fn handle_reload(
     list_client: &reqwest::Client,
     filter: &Arc<FilterEngine>,
     profiles: Option<&Arc<ProfileResolver>>,
-    refresh_handle: &mut Option<JoinHandle<()>>,
+    refresh_handle: &mut Option<ListManagerTask>,
     lists_fingerprint: &mut Option<ListsFingerprint>,
     audit_writer: &AuditWriter,
     current_files: &mut Vec<PathBuf>,
@@ -2253,15 +2297,11 @@ async fn handle_reload(
     stats: Option<&Arc<StatsEngine>>,
     list_status_registry: Option<&Arc<ListStatusRegistry>>,
     notification_tx: &tokio::sync::broadcast::Sender<crate::ipc::protocol::IpcNotification>,
-    list_cmd_tx_swap: &Arc<
-        arc_swap::ArcSwap<
-            Option<tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>>,
-        >,
-    >,
+    list_cmd_tx_swap: &Arc<arc_swap::ArcSwap<ListManagerEndpoint>>,
     invoker_uid: Option<u32>,
     cluster_state: ClusterReloadHandle<'_>,
     security: Option<&Arc<SecurityLayer>>,
-) -> Option<bool> {
+) -> anyhow::Result<Option<bool>> {
     #[cfg(not(feature = "cluster"))]
     let _ = cluster_state;
     let pre_hash = current_hash.clone();
@@ -2291,7 +2331,7 @@ async fn handle_reload(
                 if let Some(reg) = list_status_registry {
                     reg.record_cycle(CycleOutcome::ConfigRejected);
                 }
-                return None;
+                return Ok(None);
             }
         };
     let config = &loaded.config;
@@ -2342,25 +2382,77 @@ async fn handle_reload(
             if let Some(reg) = list_status_registry {
                 reg.record_cycle(CycleOutcome::ConfigRejected);
             }
-            return None;
+            return Ok(None);
         }
     };
 
-    // The old refresh loop is NOT aborted here. This point sits above the
+    // The old refresh loop is NOT retired here. This point sits above the
     // source-bitmap reject gate, the empty-sources branch, and the reuse
-    // gate — aborting here would orphan the live manager on paths that
+    // gate — retiring here would orphan the live manager on paths that
     // never re-arm one (a rejected bitmap build would leave the daemon
     // silently never refreshing its lists again), and it is incompatible
     // with reusing the live manager. Each path that genuinely retires the
-    // manager aborts it itself: the empty-sources branch and the rebuild
+    // manager retires it itself: the empty-sources branch and the rebuild
     // path.
 
-    // Same merge as the initial path so reloads pick up
-    // newly-imported `[[blocklists]]` URLs and refresh their trust map.
-    let (merged_sources, source_trust) =
-        merge_sources_with_blocklists(&config.lists.sources, &config.blocklists);
+    let has_enabled_sources = config_declares_list_sources(config);
+    let lists_dir = has_enabled_sources.then(|| lists_cache_dir(config_path, config));
+    let catalog = match &lists_dir {
+        Some(dir) => fetch_catalog_or_fallback(list_client, dir, CatalogPreference::Network).await,
+        None => Catalog::fallback(),
+    };
+    let source_plan = match ResolvedSourcePlan::build_for_schema(
+        &catalog,
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!(error = %e, "reload aborted: source identity plan failed");
+            let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                .with_uid(invoker_uid)
+                .with_files(current_files.iter())
+                .with_pre_hash(pre_hash.clone())
+                .with_post_hash(pre_hash)
+                .with_errors([e.to_string()]);
+            if let Err(write_err) = audit_writer.append(&rec) {
+                tracing::warn!(error = %write_err, "failed to write audit record");
+            }
+            if let Some(reg) = list_status_registry {
+                reg.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+    };
+    if rejects_declared_empty_plan(config, &source_plan) {
+        // Keep the historical orphan-source warning permissive when another
+        // source still resolves. Only an entirely empty plan would otherwise
+        // make a declared source set indistinguishable from an operator clear.
+        let error = "configured list sources resolved to no usable catalog entries";
+        tracing::error!("reload aborted: {error}");
+        let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+            .with_uid(invoker_uid)
+            .with_files(current_files.iter())
+            .with_pre_hash(pre_hash.clone())
+            .with_post_hash(pre_hash)
+            .with_errors([error.to_string()]);
+        if let Err(write_err) = audit_writer.append(&rec) {
+            tracing::warn!(error = %write_err, "failed to write audit record");
+        }
+        if let Some(reg) = list_status_registry {
+            reg.record_cycle(CycleOutcome::ConfigRejected);
+        }
+        return Ok(None);
+    }
+    let merged_sources = source_plan.representatives();
 
-    let source_bits = match SourceBitMap::build(&merged_sources, &config.blocklists) {
+    let source_bits = match SourceBitMap::from_plan(&source_plan) {
         Ok(bits) => bits,
         Err(e) => {
             tracing::error!(error = %e, "reload aborted: source bit map build failed");
@@ -2377,7 +2469,7 @@ async fn handle_reload(
             if let Some(reg) = list_status_registry {
                 reg.record_cycle(CycleOutcome::ConfigRejected);
             }
-            return None;
+            return Ok(None);
         }
     };
 
@@ -2385,7 +2477,7 @@ async fn handle_reload(
     let policy_masks = source_bits.project_policy(&config.blocklists, &config.profiles);
 
     if let Some(resolver) = profiles {
-        resolver.swap(config, &source_bits, &loaded.custom_lists);
+        resolver.swap_without_list_bits(config, &loaded.custom_lists);
     }
 
     // Live-swap the tunneling thresholds + `exempt_domains`, the
@@ -2471,8 +2563,11 @@ async fn handle_reload(
         // The operator removed every source: retire the live manager so
         // its refresh loop cannot re-download the old sources and
         // re-populate the map we are about to clear.
+        list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
         if let Some(h) = refresh_handle.take() {
-            h.abort();
+            if let Err(error) = h.retire().await {
+                tracing::error!(%error, "list manager controller ended abnormally during reload");
+            }
         }
         *lists_fingerprint = None;
         filter.swap_blocklist(Default::default());
@@ -2491,12 +2586,19 @@ async fn handle_reload(
         // never reaches the manager, so this is the only place that can say
         // so.
         if let Some(reg) = list_status_registry {
-            reg.record_cycle(CycleOutcome::ClearedNoSources);
+            reg.sync_plan(&source_plan);
+            // An intentional no-sources clear is a new, empty corpus, not a
+            // continued refusal. Clear both lifecycle payloads before the
+            // completed mark makes it observable.
+            reg.set_corpus_refusal(None);
+            reg.clear_corpus_freeze();
+            reg.record_cycle_with_source_coverage(CycleOutcome::ClearedNoSources, false, 0);
         }
-        return Some(reload_has_schedules);
+        list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::EmptyStable));
+        return Ok(Some(reload_has_schedules));
     }
 
-    let source_tokens = SourceTokenMap::build(config, &secrets_state);
+    let source_tokens = SourceTokenMap::from_plan(&source_plan, &secrets_state);
 
     // Computed here, ahead of the manager construction it feeds, so the
     // fingerprint can stat `trust = local` sources through the same
@@ -2520,39 +2622,31 @@ async fn handle_reload(
     // The gate sits BELOW the resolver swap on purpose. Hoisting it
     // above would skip the very change the operator asked for.
     //
-    // `refresh_handle.is_some()` is the proof that a live `ListManager`
-    // exists to reuse; with no live loop there is nothing to keep, so
-    // rebuild regardless of what the fingerprint says.
+    // A present, unfinished `refresh_handle` is the proof that a live
+    // `ListManager` exists to reuse. A finished handle is dead generation
+    // state, so rebuild regardless of what the fingerprint says.
     let fingerprint = ListsFingerprint::compute(
         config,
-        &merged_sources,
+        &source_plan,
         &source_tokens,
         &bridge_config_dir_for_fingerprint,
     );
     if should_reuse_live_lists(
-        refresh_handle.is_some(),
+        has_live_list_manager(refresh_handle.as_ref()),
         lists_fingerprint.as_ref(),
         &fingerprint,
     ) {
-        // The status registry still has to be re-synced. A blocklist's
-        // display name, tags, or trust label can change without moving
-        // anything the fingerprint covers, and the TUI reads the
-        // registry — not the config — to render the Lists tab.
-        // `ensure_slots` / `retain_only` are no-ops here by definition
-        // (the source set is unchanged); `populate_v1_id_index` is not.
-        // The live manager already holds this same `Arc`, so nothing
-        // needs re-attaching.
+        // The registry follows the accepted alias plan even when the
+        // manager is reused.
         if let Some(reg) = list_status_registry {
-            reg.ensure_slots(&merged_sources);
-            reg.retain_only(&merged_sources);
-            reg.populate_v1_id_index(&config.blocklists);
-            // A skip IS a completed cycle, and this is the ONLY path that
-            // can say so. The manager's install path never runs here — the
-            // function returns below — so a mark written only there would
-            // leave the sequence frozen through a perfectly successful
-            // reload, and anyone waiting for it to advance would wait out
-            // their whole timeout and then report "still reloading" about a
-            // cycle that finished instantly and correctly.
+            reg.sync_plan(&source_plan);
+            // A fingerprint skip IS a completed cycle. The manager can also
+            // report an unchanged usable corpus after a failed source attempt,
+            // but it never runs here — the function returns below — so a mark
+            // written only in the manager would
+            // leave the sequence frozen through this completed reload, and a
+            // waiter would report "still reloading" about a cycle that
+            // finished instantly.
             //
             // `corpus_refusal` is deliberately NOT cleared: no corpus was
             // built, so any standing refusal is still the truth about what
@@ -2580,37 +2674,36 @@ async fn handle_reload(
         }
         *current_files = new_files;
         *current_hash = new_hash;
-        return Some(reload_has_schedules);
+        return Ok(Some(reload_has_schedules));
     }
 
     // Past the gate: this reload genuinely retires the live manager, so
     // its refresh loop stops here.
+    // Unpublish before retiring so no IPC sender can target the old
+    // generation. Retire before constructing the replacement: an old worker
+    // must never publish cache/filter state after the new generation exists.
+    list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
     if let Some(h) = refresh_handle.take() {
-        h.abort();
+        if let Err(error) = h.retire().await {
+            tracing::error!(%error, "list manager controller ended abnormally during reload");
+        }
     }
 
-    // Bound before the catalog is acquired — same ordering constraint as
-    // the boot site: the persisted copy lives in here, and this reload is
-    // the only path that ever refreshes it.
-    let lists_dir = lists_cache_dir(config_path, config);
-    let catalog =
-        fetch_catalog_or_fallback(list_client, &lists_dir, CatalogPreference::Network).await;
     let interval = Duration::from_secs(config.lists.update_interval_secs);
     // Same value the fingerprint above was stamped against — computed once
     // and reused rather than re-derived, so the two can never disagree.
     let bridge_config_dir = bridge_config_dir_for_fingerprint;
 
-    let mut mgr = ListManager::with_tokens(
+    let mut mgr = ListManager::with_plan_and_tokens(
         list_client.clone(),
         filter.clone(),
-        merged_sources.clone(),
-        catalog,
+        source_plan.clone(),
         interval,
         source_bits.clone(),
         source_tokens,
         config.lists.max_body_bytes,
         config.lists.max_entries,
-        Some(lists_dir),
+        Some(lists_dir.expect("enabled sources selected a cache directory")),
     );
 
     // Same wiring the boot path applies, rebuilt from the post-reload
@@ -2622,30 +2715,18 @@ async fn handle_reload(
     ManagerWiring::from_config(
         config,
         config_path,
-        source_trust,
+        &source_plan,
         bridge_config_dir,
         policy_masks,
         ListStateWriteback::Persist,
     )
     .apply(&mut mgr);
 
-    // Keep the SAME registry handle DaemonState is reading through, so
-    // the IPC stats stay live across reload. The registry grows on
-    // demand, and `ensure_slots` pre-seeds rows for the new merged
-    // source set so the TUI sees "never_fetched" placeholders for fresh
-    // subscriptions within one IPC poll instead of waiting on the first
-    // download to complete (~1-3s). `retain_only` handles the symmetric
-    // case — deleting a [[blocklists]] entry also evicts its registry
-    // slot so the TUI doesn't render a permanent orphan row keyed on
-    // the dead URL.
+    // Keep the registry handle DaemonState reads so stats switch with the
+    // plan. `sync_plan` publishes aliases after slots exist, then retires
+    // obsolete slots.
     if let Some(reg) = list_status_registry {
-        reg.ensure_slots(&merged_sources);
-        reg.retain_only(&merged_sources);
-        // Rebuild the registry's typed
-        // `by_v1_id_index` to track the post-reload `[[blocklists]]`
-        // catalogue (rows added, removed, or trust-changed since the
-        // previous reload). Atomic replacement via ArcSwap.
-        reg.populate_v1_id_index(&config.blocklists);
+        reg.sync_plan(&source_plan);
         mgr.attach_status_registry(reg.clone());
     }
     // Re-attach the broadcast publisher so the post-reload
@@ -2655,26 +2736,61 @@ async fn handle_reload(
     mgr.set_notification_channel(notification_tx.clone());
     mgr.set_status_persistence_path(list_stats_path(config_path));
 
-    // Wire a fresh out-of-band command channel for
-    // the post-reload manager and swap the new sender into the shared
-    // ArcSwap so the IPC `ForgetList` handler picks it up on the next
-    // call. The previous channel's receiver dies with the aborted
-    // refresh task; the old sender (now disconnected) is overwritten
-    // here.
+    // Wire a fresh out-of-band command channel for the post-reload manager,
+    // but keep its sender private until the controller exists. Publishing it
+    // before the rebuild worker completes would let IPC accept a command into
+    // a generation with no receiver yet.
     let (list_cmd_tx, list_cmd_rx) = tokio::sync::mpsc::channel(16);
     mgr.set_command_channel(list_cmd_rx);
-    list_cmd_tx_swap.store(Arc::new(Some(list_cmd_tx)));
 
     mgr.load_disk_cache();
     mgr.cleanup_stale_caches();
-    let count = mgr.refresh().await;
+    #[cfg(test)]
+    if PANIC_RELOAD_WORKER
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        mgr.set_worker_hook_for_test(|at| {
+            if at == "start" {
+                panic!("injected replacement list worker panic");
+            }
+        });
+    }
+    // Keep the tight client for this foreground reload refresh. It runs via
+    // the same owned blocking worker as controller refreshes, so parsing and
+    // shard work never monopolize the signal-loop runtime thread.
+    let (mut mgr, count) = match mgr.refresh_in_blocking(RefreshMode::Scheduled).await {
+        Ok(result) => result,
+        Err(error) => {
+            // Config consumers have changed and the old manager is gone.
+            // Only daemon teardown can safely resolve this half-applied reload.
+            tracing::error!(%error, uid = ?invoker_uid, pre_hash = ?pre_hash,
+                attempted_hash = ?new_hash, "fatal reload: replacement list worker ended abnormally");
+            let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                .with_uid(invoker_uid)
+                .with_files(new_files.iter())
+                .with_pre_hash(pre_hash)
+                .with_post_hash(None)
+                .with_errors([format!(
+                    "replacement list worker failed; config partially applied, daemon stopping; attempted config hash {new_hash:?}: {error}"
+                )]);
+            if let Err(write_error) = audit_writer.append(&rec) {
+                tracing::error!(%write_error, "failed to append fatal reload audit");
+            }
+            *current_files = new_files;
+            *current_hash = None;
+            return Err(
+                anyhow::Error::new(error).context("fatal reload replacement list worker failure")
+            );
+        }
+    };
     tracing::info!(count, "lists reloaded");
-    // Same transition as the boot path: the inline refresh above ran inside
-    // the signal loop's `select!`, whose sibling arm is SIGTERM — so it had
-    // to stay on the tight client. The background loop it is about to
-    // become blocks nothing, so it gets the bulk one.
+    // The completed rebuild used the tight client above; only the background
+    // controller receives the bulk client.
     install_bulk_download_client(&mut mgr);
-    *refresh_handle = Some(mgr.spawn_refresh_loop());
+    let manager_task = mgr.spawn_refresh_loop_after_refresh();
+    list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::running(list_cmd_tx)));
+    *refresh_handle = Some(manager_task);
     // Describe the manager that is now live, so
     // the next reload can compare against it. Stored only once the
     // rebuild has actually happened — an earlier store would let a
@@ -2691,7 +2807,7 @@ async fn handle_reload(
     }
     *current_files = new_files;
     *current_hash = new_hash;
-    Some(reload_has_schedules)
+    Ok(Some(reload_has_schedules))
 }
 
 /// Start a `QueryLog` writer task and attach it to the
@@ -2769,47 +2885,53 @@ fn apply_query_log_reload(
 /// network because it runs behind an already-bound listener, and because it is
 /// the only path that ever refreshes the persisted copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatalogPreference {
+pub(crate) enum CatalogPreference {
     Disk,
     Network,
 }
 
-/// Whether a freshly fetched catalog is worth writing to disk.
-///
-/// Isolated from [`fetch_catalog_or_fallback`]'s `Ok` arm for the same
-/// reason [`should_reuse_live_lists`] is isolated from `handle_reload`:
-/// the caller only reaches that arm through `Catalog::fetch`, which
-/// hardcodes `https://lists.purge.cc/index.json`, so this predicate is
-/// the only seam a network-free test can exercise.
-///
-/// `false` for zero entries. `Catalog::fetch_from`
-/// has no viability check of its own — an HTTP 200 carrying a valid
-/// `{"lists": []}` is a well-formed `Ok` with nothing usable in it.
-/// Persisting that would freeze every later boot onto an empty catalog:
-/// `CatalogPreference::Disk` would keep finding it and resolving nothing,
-/// permanently, until a reload happened to see a real response. Does not
-/// change what the *current* process uses — the caller still returns `c`
-/// either way.
+/// Whether a freshly fetched catalog is viable for a reproducible plan.
 fn catalog_worth_persisting(c: &Catalog) -> bool {
-    !c.entries().is_empty()
+    c.is_usable()
+}
+
+/// Admit a fetched catalog only after its persistence boundary succeeds.
+///
+/// List caches record the resolved catalog URL. Using bytes selected by a
+/// catalog that cannot be saved would let those cache stamps outlive the
+/// catalog needed to interpret them after restart. The injected save boundary
+/// keeps this rule deterministic in tests.
+fn admit_fetched_catalog<F>(fetched: Catalog, persisted: Option<Catalog>, save: F) -> Catalog
+where
+    F: FnOnce(&Catalog) -> std::io::Result<()>,
+{
+    if !catalog_worth_persisting(&fetched) {
+        tracing::warn!("fetched catalog is empty, using a reproducible fallback");
+        return persisted.unwrap_or_else(Catalog::fallback);
+    }
+    match save(&fetched) {
+        Ok(()) => fetched,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to persist fetched catalog; using a reproducible fallback");
+            persisted.unwrap_or_else(Catalog::fallback)
+        }
+    }
 }
 
 /// Resolve the list catalog.
 ///
-/// This is the ONLY
-/// remaining pre-bind network call — 0.3 s on a live link, up to the
-/// client's 30 s total on a dead one, in front of a listener that has
-/// everything else it needs. It cannot be deferred past the bind:
-/// `load_disk_cache` resolves each source through the catalog and the
-/// cache stem derives from the resolved URL, so the on-disk list bodies
-/// are unreadable without it.
+/// Boot may fetch here only when no viable disk catalog exists. It cannot
+/// defer catalog selection past cache loading: `load_disk_cache` verifies the
+/// sidecar's resolved URL against this generation's plan. Cache stems remain
+/// tied to the representative source spelling; the sidecar is what prevents
+/// a moved catalog URL from reusing that spelling's old body.
 ///
 /// `pref` decides which side of the bind the caller is on:
 /// [`CatalogPreference::Disk`] for boot (never blocks),
-/// [`CatalogPreference::Network`] for reload (refreshes the persisted
-/// copy — the only path that ever does, because `Catalog::resolve`
-/// returns `None` for an unknown id rather than triggering a fetch).
-async fn fetch_catalog_or_fallback(
+/// [`CatalogPreference::Network`] for reload. A fetched catalog becomes live
+/// only if its save succeeds; otherwise this returns the prior viable disk
+/// copy or the compiled fallback.
+pub(crate) async fn fetch_catalog_or_fallback(
     client: &reqwest::Client,
     lists_dir: &Path,
     pref: CatalogPreference,
@@ -2821,19 +2943,9 @@ async fn fetch_catalog_or_fallback(
         }
     }
     match Catalog::fetch(client).await {
-        Ok(c) => {
-            if catalog_worth_persisting(&c) {
-                if let Err(e) = c.save_to_disk(lists_dir) {
-                    // Not fatal: a catalog we cannot persist still works
-                    // for this process, it just does not help the next
-                    // boot.
-                    tracing::warn!(error = %e, "failed to persist catalog");
-                }
-            } else {
-                tracing::warn!("fetched catalog has zero entries, not persisting to disk");
-            }
-            c
-        }
+        Ok(c) => admit_fetched_catalog(c, Catalog::load_from_disk(lists_dir), |catalog| {
+            catalog.save_to_disk(lists_dir)
+        }),
         Err(e) => {
             // Under `Network` the disk copy is a better fallback than the
             // compiled-in entries: it is what purge.cc last published, and
@@ -3018,20 +3130,9 @@ fn list_state_path(config_path: &Path) -> PathBuf {
     dir.join("data").join("list_state.toml")
 }
 
-/// Map a canonical kebab-form blocklist `Id` (e.g. `"privacy-ads"`) back to
-/// its legacy slash-form catalog slug (e.g. `"privacy/ads"`). Splits
-/// on the **first** hyphen so multi-segment topics survive intact:
-/// `"security-malicious-extra"` → `"security/malicious-extra"`. Returns
-/// `None` for ids without a hyphen — those are not catalog-shaped.
-///
-/// Mirrors the inverse transform used by [`SourceBitMap::build`] and
-/// `build_slug_to_id_map` in `crate::profiles::resolver` (module-private),
-/// so the manager's `source_to_blocklist` lookup hits regardless of
-/// whether the operator pinned the list via `lists.sources` (slash
-/// form) or `[[blocklists]]` (canonical id).
-fn canonical_id_to_slash(id: &str) -> Option<String> {
-    let idx = id.find('-')?;
-    Some(format!("{}/{}", &id[..idx], &id[idx + 1..]))
+pub(crate) fn list_schedule_state_path(config_path: &Path) -> PathBuf {
+    let dir = state_dir_for(config_path.parent().unwrap_or_else(|| Path::new(".")));
+    dir.join("data").join("list_schedule_state.toml")
 }
 
 /// Whether the manager built from this wiring owns the on-disk list
@@ -3074,19 +3175,23 @@ pub(crate) struct ManagerWiring {
     max_total_domains: usize,
     source_to_blocklist: std::collections::HashMap<String, (crate::config::schema::Id, u32)>,
     source_to_format: std::collections::HashMap<String, crate::lists::detector::ListFormat>,
+    source_to_max_entries: std::collections::HashMap<String, usize>,
     list_state: crate::config::list_state::ListState,
     list_state_path: Option<PathBuf>,
+    schedule_state: crate::config::list_schedule_state::ListScheduleState,
+    schedule_state_path: Option<PathBuf>,
+    schedule_state_allows_legacy_seed: bool,
 }
 
 impl ManagerWiring {
-    /// Derive the wiring from config. `source_trust`, `bridge_config_dir`
+    /// Derive the wiring from config. `plan`, `bridge_config_dir`
     /// and `policy_masks` are parameters because every caller has already
     /// computed them — `policy_masks` in particular must be projected
     /// before `source_bits` moves into the manager.
     pub(crate) fn from_config(
         config: &crate::config::schema::ConfigV1,
         config_path: &Path,
-        source_trust: crate::lists::source_key::SourceTrustMap,
+        plan: &ResolvedSourcePlan,
         bridge_config_dir: PathBuf,
         policy_masks: crate::filter::engine::PolicyMasks,
         writeback: ListStateWriteback,
@@ -3098,9 +3203,24 @@ impl ManagerWiring {
         // different things on the two sides of the wire.
         let list_state =
             crate::profiles::resolver::read_list_state_fail_open(&state_path).unwrap_or_default();
-        let (source_to_blocklist, source_to_format) = build_source_maps(&config.blocklists);
+        let schedule_path = list_schedule_state_path(config_path);
+        let (schedule_state, schedule_state_allows_legacy_seed) =
+            match crate::config::list_schedule_state::ListScheduleState::read_or_default(
+                &schedule_path,
+            ) {
+                Ok(state) => (state, true),
+                Err(error) => {
+                    tracing::warn!(path = %schedule_path.display(), %error, "ignoring unreadable list scheduling state; every source is due and compatibility seeding is suppressed");
+                    (
+                        crate::config::list_schedule_state::ListScheduleState::default(),
+                        false,
+                    )
+                }
+            };
+        let (source_to_blocklist, source_to_format, source_to_max_entries) =
+            plan.manager_source_maps();
         Self {
-            source_trust,
+            source_trust: SourceTrustMap::from_plan(plan),
             bridge_config_dir,
             policy_masks,
             shrink_guard_enabled: config.lists.shrink_guard_enabled,
@@ -3108,11 +3228,18 @@ impl ManagerWiring {
             max_total_domains: config.lists.max_total_domains,
             source_to_blocklist,
             source_to_format,
+            source_to_max_entries,
             list_state,
             list_state_path: match writeback {
                 ListStateWriteback::Persist => Some(state_path),
                 ListStateWriteback::ReadOnly => None,
             },
+            schedule_state,
+            schedule_state_path: match writeback {
+                ListStateWriteback::Persist => Some(schedule_path),
+                ListStateWriteback::ReadOnly => None,
+            },
+            schedule_state_allows_legacy_seed,
         }
     }
 
@@ -3130,8 +3257,12 @@ impl ManagerWiring {
             max_total_domains,
             source_to_blocklist,
             source_to_format,
+            source_to_max_entries,
             list_state,
             list_state_path,
+            schedule_state,
+            schedule_state_path,
+            schedule_state_allows_legacy_seed,
         } = self;
         mgr.set_local_bridge(source_trust, bridge_config_dir);
         mgr.set_list_policy(policy_masks);
@@ -3139,57 +3270,14 @@ impl ManagerWiring {
         mgr.set_max_total_domains(max_total_domains);
         mgr.set_source_blocklist_map(source_to_blocklist);
         mgr.set_source_format_map(source_to_format);
+        mgr.set_source_max_entries(source_to_max_entries);
         mgr.set_list_state(list_state, list_state_path);
+        mgr.set_schedule_state(
+            schedule_state,
+            schedule_state_path,
+            schedule_state_allows_legacy_seed,
+        );
     }
-}
-
-/// Map every source string a manager may see back to its `[[blocklists]]`
-/// row — the fetch URL, the slash-form catalog id a legacy
-/// `lists.sources` entry uses, and the canonical id itself.
-///
-/// The first map carries the canonical id and per-list failure threshold
-/// the retry state machine runs on. The second carries a declared parse
-/// format; only `hosts` and `adguard` rows enter it, so a `domains` or
-/// omitted format leaves the parse dispatch on content auto-detection.
-fn build_source_maps(
-    blocklists: &[crate::config::schema::Blocklist],
-) -> (
-    std::collections::HashMap<String, (crate::config::schema::Id, u32)>,
-    std::collections::HashMap<String, crate::lists::detector::ListFormat>,
-) {
-    let mut source_to_blocklist = std::collections::HashMap::new();
-    let mut source_to_format = std::collections::HashMap::new();
-    for b in blocklists {
-        if !b.enabled {
-            continue;
-        }
-        let declared_fmt = match b.format {
-            crate::config::schema::BlocklistFormat::Hosts => {
-                Some(crate::lists::detector::ListFormat::Hosts)
-            }
-            crate::config::schema::BlocklistFormat::Adguard => {
-                Some(crate::lists::detector::ListFormat::AdGuard)
-            }
-            crate::config::schema::BlocklistFormat::Domains => None,
-        };
-        let mut insert = |key: String| {
-            source_to_blocklist.insert(key.clone(), (b.id.clone(), b.max_consecutive_failures));
-            if let Some(fmt) = declared_fmt {
-                source_to_format.insert(key, fmt);
-            }
-        };
-        // Every blocklist exposes its fetch URL as a potential
-        // `merged_sources` entry.
-        insert(b.url.as_str().to_string());
-        // A list pinned through `lists.sources` arrives as the slash
-        // slug, not the URL.
-        if let Some(slash) = canonical_id_to_slash(b.id.as_str()) {
-            insert(slash);
-        }
-        // Defensive: a future caller passing the canonical id still hits.
-        insert(b.id.as_str().to_string());
-    }
-    (source_to_blocklist, source_to_format)
 }
 
 /// Resolve the lists cache directory from config, creating it if needed.

@@ -121,6 +121,35 @@ pub trait DomainSink {
     fn accept(&mut self, domain: &str, bit: u64) -> std::io::Result<()>;
 }
 
+/// Count accepted entries through the production extractor without retaining
+/// a corpus.  This is useful for import reporting: it has exactly the same
+/// syntax and validity semantics as a real list load, but no map allocation.
+pub(crate) fn count_list_entries(content: &str, format: ListFormat) -> u64 {
+    struct CountSink;
+    impl DomainSink for CountSink {
+        fn accept(&mut self, _: &str, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut sink = CountSink;
+    let extractor: fn(&str) -> LineDecision<'_> = match format {
+        ListFormat::DomainOnly => domain_extract,
+        ListFormat::Hosts => hosts_extract,
+        ListFormat::AdGuard => adguard_extract,
+    };
+    parse_lines_into_sink(
+        content,
+        1,
+        &mut sink,
+        usize::MAX,
+        "import-local entry count",
+        extractor,
+    )
+    .expect("CountSink::accept never fails")
+    .parsed_ok
+}
+
 /// [`DomainSink`] that writes into the bitmask-tagged `HashMap` the
 /// legacy `parse_*_into_map` / `parse_list_into_map[_reader]` entry
 /// points expose. This is the only sink able to compute
@@ -516,97 +545,54 @@ pub fn parse_list_into_map(
 
 // ── Streaming entry point ──────────────────────────────────────
 //
-// `parse_list_into_map` above requires the whole body as a `&str`.
-// `ListManager` currently gets there via `std::fs::read_to_string`,
-// which holds an entire list body (up to ~200 MB for the largest cached
-// source) resident for the duration of the parse — on top of the merged
-// map(s) already live at reload time. The functions below parse straight
-// off a `BufRead` — a file, a chained buffer, anything — one line at a
-// time, so that body is never fully resident.
-//
-// `detect_format` needs a `&str` prefix to sniff from, and a stream has
-// no such thing without buffering. [`sniff_format_reader`] buffers a
-// *bounded* prefix — capped at [`DETECT_PREFIX_MAX_LINES`] raw lines
-// AND at [`DETECT_PREFIX_MAX_BYTES`], since a line has no length limit
-// and one crafted line is otherwise the whole body — detects on it, and
-// the prefix is then replayed ahead of whatever is left on the reader
-// via `Read::chain` — one continuous pass, so `max_entries`/dedup state
-// is identical to parsing the same bytes as one `&str`.
-//
-// Wave 2 (`CONTRACT-wave2.md`) generalises the destination too: the
-// skeleton below no longer hardcodes a `HashMap`. It writes through
-// [`DomainSink`], so a caller can plug in a `HashMap` (via [`MapSink`],
-// what the compatibility wrappers use) or, for the reload producer,
-// per-shard spill files — without this skeleton knowing which.
+// These functions parse a `BufRead` into any [`DomainSink`] without
+// materialising the whole body. Format detection buffers and replays a
+// bounded prefix before the same one-pass parsing skeleton continues.
 
-/// Hard cap on how many *raw* lines (blank/comment/content combined)
-/// [`sniff_format_reader`] will buffer while sniffing the format.
-/// `detect_format` itself only ever examines the first 10 *non-comment*
-/// lines of whatever string it is handed — this only needs to
-/// comfortably outlast the blank/comment lines that can precede them in
-/// a real list header (a handful of `#`/`!` lines in every source seen
-/// in this repo's fixtures and live lists). It exists so a pathological
-/// source (an unbroken run of comment lines, say) cannot push the
-/// streaming parser back toward buffering the whole body — see
-/// `sniff_format_reader_buffers_at_most_the_documented_cap` and
-/// `reader_format_detection_prefix_is_bounded` in the test module for
-/// what happens at the boundary.
-///
-/// **A line cap alone does not bound memory** — see the companion
-/// [`DETECT_PREFIX_MAX_BYTES`], which does. Both are enforced and both
-/// are pinned by their own test; neither subsumes the other.
-const DETECT_PREFIX_MAX_LINES: usize = 256;
+/// Maximum raw lines buffered for format detection.
+pub(super) const DETECT_PREFIX_MAX_LINES: usize = 256;
 
-/// Hard cap on how many *bytes* [`sniff_format_reader`] will buffer
-/// while sniffing the format. The real bound — [`DETECT_PREFIX_MAX_LINES`]
-/// counts lines, and a line has no length limit.
-///
-/// Without this, one crafted line is the whole body: `read_until` has no
-/// length cap, so a body with no `\n` anywhere makes the sniff loop
-/// buffer all of it into `prefix`, which is then handed to
-/// `Cursor::new(prefix).chain(reader)` and stays resident for the entire
-/// parse *while* `parse_lines_into_sink_reader`'s own buffer re-reads the
-/// same bytes. Demonstrated at 2.00× the non-streaming path's peak on a
-/// 32 MB single-line body, i.e. 400 MB against 200 MB at the
-/// `lists.max_body_bytes` default — the difference between a refresh and
-/// an OOM on the 1 GB-class hardware this product targets.
-///
-/// This is not a hypothetical input class. External blocklists are an
-/// explicit supply-chain threat (`CLAUDE.md` rule 4), and
-/// [`super::status::MAX_SKIPPED_SAMPLE_BYTES`] exists in this very module
-/// tree for the same hostile-body shape one layer down. 64 KiB is ~256 B
-/// per line at the line cap, comfortably past any real list header, and
-/// 3200× below `max_body_bytes`.
-const DETECT_PREFIX_MAX_BYTES: usize = 64 * 1024;
+/// Maximum bytes buffered for format detection, independent of line count.
+pub(super) const DETECT_PREFIX_MAX_BYTES: usize = 64 * 1024;
 
-/// Buffer a bounded prefix off `reader` and run [`detect_format`] on it.
-/// Reading to sniff the format is destructive — there is no "unread" on
-/// a stream — so the returned prefix must be replayed through the
-/// chosen parser ahead of whatever is left on `reader`; see
-/// [`parse_list_into_map_reader`].
-///
-/// Bounded by [`DETECT_PREFIX_MAX_LINES`] **and** by
-/// [`DETECT_PREFIX_MAX_BYTES`], whichever binds first. The byte cap is
-/// applied via `Read::take` rather than by checking `prefix.len()` after
-/// each read: a post-hoc check is worthless here, because the read that
-/// blows the budget has already swallowed the whole line.
-///
-/// Returns raw bytes, not a `String`, on purpose. The byte cap can fall
-/// mid-line and therefore mid-UTF-8-sequence; `read_line` would reject
-/// that as `InvalidData` and fail an otherwise valid list. Detection runs
-/// on a lossy view (a diagnostic read, never replayed), while the bytes
-/// handed back are byte-exact so the chain replays the original body.
-/// Genuinely invalid UTF-8 still surfaces as an error — just from the
-/// parse loop downstream rather than from here.
-///
-/// A mid-line cut is invisible to the parser: `Chain::fill_buf` only
-/// reports EOF once *both* readers are drained, so `read_until` walks
-/// straight across the seam and reassembles the split line. Pinned by
-/// `reader_matches_str_path_across_a_byte_capped_mid_line_cut`.
+/// Physical-line payload cap; LF/CRLF are excluded and bare CR is included.
+/// Overlong lines fail the source, including comments and modifier tails.
+pub(super) const STREAMING_LINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Read one complete bounded line, retaining its terminator when present.
+fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> io::Result<bool> {
+    line.clear();
+
+    // Two extra bytes admit CRLF at the boundary or witness overflow.
+    let mut limited = reader.by_ref().take((STREAMING_LINE_MAX_BYTES + 2) as u64);
+    if limited.read_until(b'\n', line)? == 0 {
+        return Ok(false);
+    }
+
+    let payload_len = match line.last() {
+        Some(b'\n') => {
+            let before_newline = &line[..line.len() - 1];
+            before_newline.len() - usize::from(before_newline.last() == Some(&b'\r'))
+        }
+        _ => line.len(),
+    };
+    if payload_len > STREAMING_LINE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("blocklist line exceeds {STREAMING_LINE_MAX_BYTES}-byte limit"),
+        ));
+    }
+
+    Ok(true)
+}
+
+/// Buffer a bounded raw prefix for detection and replay it byte-for-byte.
+/// Keeping bytes avoids rejecting valid UTF-8 split at the prefix boundary.
 fn sniff_format_reader<R: BufRead>(reader: &mut R) -> io::Result<(ListFormat, Vec<u8>)> {
     let mut prefix = Vec::new();
     let mut limited = reader.take(DETECT_PREFIX_MAX_BYTES as u64);
     for _ in 0..DETECT_PREFIX_MAX_LINES {
+        super::cancellation::io_checkpoint("sniff")?;
         if limited.read_until(b'\n', &mut prefix)? == 0 {
             break;
         }
@@ -614,18 +600,8 @@ fn sniff_format_reader<R: BufRead>(reader: &mut R) -> io::Result<(ListFormat, Ve
     Ok((detect_format(&String::from_utf8_lossy(&prefix)), prefix))
 }
 
-/// Streaming counterpart to [`parse_lines_into_sink`]: reads lines off a
-/// `BufRead` one at a time via `read_line` into a reused buffer, so peak
-/// memory is bounded by one line, never the whole body. Generic over
-/// [`DomainSink`] for the same reason `parse_lines_into_sink` is — see
-/// its doc comment.
-///
-/// `read_line` keeps the line terminator, but `trim()` removes it same
-/// as everything else at the edges — `\n` and `\r` are both ASCII
-/// whitespace, so a trailing `\r\n` (or even a stray doubled `\r\r\n`)
-/// disappears into the same `.trim()` call the `&str` path already
-/// makes on each `str::lines()` segment. No terminator-specific
-/// stripping needed for the two paths to agree byte-for-byte.
+/// Streaming counterpart to [`parse_lines_into_sink`]. It rejects an
+/// overlong physical line before passing any part of it to [`apply_line`].
 fn parse_lines_into_sink_reader<R: BufRead>(
     mut reader: R,
     bit: u64,
@@ -636,13 +612,16 @@ fn parse_lines_into_sink_reader<R: BufRead>(
 ) -> io::Result<ParsedCounts> {
     let mut counts = ParsedCounts::default();
     let mut count = 0usize;
-    let mut buf = String::new();
+    let mut buf = Vec::with_capacity(STREAMING_LINE_MAX_BYTES + 2);
     loop {
-        buf.clear();
-        if reader.read_line(&mut buf)? == 0 {
+        super::cancellation::io_checkpoint("parse_line")?;
+        if !read_bounded_line(&mut reader, &mut buf)? {
             break;
         }
-        let trimmed = buf.trim();
+        // Match `BufRead::read_line` by refusing invalid UTF-8.
+        let line = std::str::from_utf8(&buf)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let trimmed = line.trim();
         apply_line(
             trimmed,
             bit,
@@ -666,13 +645,14 @@ fn parse_lines_into_sink_reader<R: BufRead>(
 /// anything else — without this function, or `apply_line` underneath
 /// it, needing to know which.
 ///
-/// Byte-identical results to the `&str` path for the same bytes — same
-/// entries delivered to the sink, same `parsed_ok` / `parsed_skipped` /
-/// samples — for any input whose format marker sits inside the bounded
-/// sniff window, so that detection agrees either way (see
-/// [`DETECT_PREFIX_MAX_LINES`] and [`DETECT_PREFIX_MAX_BYTES`]). Past
-/// that window the two paths can pick different formats; the *parse* of
-/// a given format is byte-identical regardless.
+/// Byte-identical results to the `&str` path for the same in-bound bytes —
+/// same entries delivered to the sink, same `parsed_ok` / `parsed_skipped` /
+/// samples — for any input whose format marker sits inside the bounded sniff
+/// window and whose physical lines do not exceed
+/// [`STREAMING_LINE_MAX_BYTES`] (see [`DETECT_PREFIX_MAX_LINES`] and
+/// [`DETECT_PREFIX_MAX_BYTES`]). Past that window the two paths can pick
+/// different formats; an overlong streaming line is deliberately refused
+/// rather than parsed differently.
 ///
 /// `declared` has the same meaning as in [`parse_list_into_map`]: `Some`
 /// forces the format and skips sniffing entirely (no prefix buffering);
@@ -695,12 +675,12 @@ fn parse_lines_into_sink_reader<R: BufRead>(
 ///
 /// # Errors
 ///
-/// On an I/O or UTF-8 decode error from `reader`, or an error from
-/// `sink.accept`, `sink` may already have accepted entries from lines
-/// processed before the failure — unlike the `&str` path, where the
-/// caller's own `read_to_string` fails closed before any parsing starts.
-/// A caller needing all-or-nothing semantics must snapshot state
-/// beforehand and roll back on `Err`.
+/// On an I/O or UTF-8 decode error from `reader`, an overlong physical line
+/// (`InvalidData`), or an error from `sink.accept`, `sink` may already have
+/// accepted entries from lines processed before the failure — unlike the
+/// `&str` path, where the caller's own `read_to_string` fails closed before
+/// any parsing starts. A caller needing all-or-nothing semantics must
+/// snapshot state beforehand and roll back on `Err`.
 pub fn parse_list_streaming<R: std::io::BufRead, S: DomainSink>(
     mut reader: R,
     bit: u64,
@@ -1355,8 +1335,8 @@ mod tests {
     /// Wraps the reader in a 4-byte `BufReader` rather than handing
     /// `Cursor` straight to `parse_list_into_map_reader`: `Cursor::fill_buf`
     /// returns its whole remaining slice in one call, so a bare `Cursor`
-    /// never exercises `read_line`'s own loop-until-`\n`-or-EOF behaviour
-    /// over multiple underlying reads. Lane C's real caller is
+    /// never exercises the bounded reader's own loop-until-`\n`-or-EOF
+    /// behaviour over multiple underlying reads. Lane C's real caller is
     /// `BufReader<File>`, where a line routinely spans more than one
     /// `fill_buf` — a 4-byte cap forces every non-trivial line in these
     /// fixtures to cross at least one such boundary.
@@ -1380,6 +1360,59 @@ mod tests {
             counts_reader, counts_str,
             "ParsedCounts diverge for: {content:?}"
         );
+    }
+
+    fn boundary_sized_adguard_line() -> String {
+        // The domain itself stays normal-sized. The ignored modifier tail
+        // makes this a valid accepted AdGuard rule at the line boundary,
+        // rather than a synthetic byte string the real skeleton could never
+        // accept.
+        let prefix = "||boundary.example^$";
+        format!(
+            "{prefix}{}",
+            "x".repeat(STREAMING_LINE_MAX_BYTES - prefix.len())
+        )
+    }
+
+    static VIRTUAL_COMMENT_CHUNK: [u8; 257] = [b'#'; 257];
+
+    /// A no-allocation, arbitrarily long comment body. `fill_buf` exposes a
+    /// tiny reusable slice each time, so this test can prove the parser stops
+    /// at its witness without first materialising a giant fixture.
+    struct VirtualCommentReader {
+        remaining: usize,
+        consumed: usize,
+    }
+
+    impl VirtualCommentReader {
+        fn new(byte_len: usize) -> Self {
+            Self {
+                remaining: byte_len,
+                consumed: 0,
+            }
+        }
+    }
+
+    impl Read for VirtualCommentReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(b'#');
+            self.remaining -= n;
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    impl BufRead for VirtualCommentReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&VIRTUAL_COMMENT_CHUNK[..self.remaining.min(VIRTUAL_COMMENT_CHUNK.len())])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            let n = amt.min(self.remaining).min(VIRTUAL_COMMENT_CHUNK.len());
+            self.remaining -= n;
+            self.consumed += n;
+        }
     }
 
     #[test]
@@ -1419,11 +1452,152 @@ mod tests {
     }
 
     #[test]
-    fn reader_read_line_reassembles_across_a_chained_seam() {
+    fn reader_exact_line_bound_accepts_lf_and_crlf_and_matches_str_path() {
+        let line = boundary_sized_adguard_line();
+        assert_eq!(line.len(), STREAMING_LINE_MAX_BYTES);
+
+        // Both terminators are deliberately outside the payload budget. The
+        // CRLF arm needs the helper's full two-byte witness; treating `\r` as
+        // payload would wrongly reject it at this exact boundary.
+        for terminator in ["\n", "\r\n"] {
+            let content = format!("{line}{terminator}");
+            let mut map = HashMap::with_hasher(RandomState::new());
+            let counts = parse_list_into_map_reader(
+                std::io::BufReader::with_capacity(7, std::io::Cursor::new(content.as_bytes())),
+                1,
+                &mut map,
+                T,
+                S,
+                Some(ListFormat::AdGuard),
+            )
+            .expect("an exactly bounded AdGuard line must parse");
+
+            assert_eq!(counts.parsed_ok, 1);
+            assert_eq!(map.get("boundary.example"), Some(&1));
+            assert_reader_matches_str(&content, Some(ListFormat::AdGuard));
+        }
+    }
+
+    #[test]
+    fn reader_refuses_line_one_byte_over_the_bound() {
+        let mut line = boundary_sized_adguard_line();
+        line.push('x');
+        assert_eq!(line.len(), STREAMING_LINE_MAX_BYTES + 1);
+
+        let mut map = HashMap::with_hasher(RandomState::new());
+        let error = parse_list_into_map_reader(
+            std::io::BufReader::with_capacity(7, std::io::Cursor::new(format!("{line}\n"))),
+            1,
+            &mut map,
+            T,
+            S,
+            Some(ListFormat::AdGuard),
+        )
+        .expect_err("a line one byte over the limit must refuse the body");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            map.is_empty(),
+            "the overlong rule must not be truncated into an accepted prefix"
+        );
+
+        // A lone CR is not a CRLF terminator. It is one more payload byte at
+        // EOF and must therefore reject just like the `x` above.
+        let mut bare_cr = boundary_sized_adguard_line();
+        bare_cr.push('\r');
+        let mut map = HashMap::with_hasher(RandomState::new());
+        let error = parse_list_into_map_reader(
+            std::io::BufReader::with_capacity(7, std::io::Cursor::new(bare_cr)),
+            1,
+            &mut map,
+            T,
+            S,
+            Some(ListFormat::AdGuard),
+        )
+        .expect_err("a bare CR beyond the payload bound must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn reader_refuses_overlong_prefix_before_following_valid_line() {
+        let mut line = boundary_sized_adguard_line();
+        line.push('x');
+        let content = format!("{line}\n||later.example^\n");
+        let mut sink = RecordingSink { events: Vec::new() };
+
+        let error = parse_list_streaming(
+            std::io::BufReader::with_capacity(7, std::io::Cursor::new(content.as_bytes())),
+            1,
+            &mut sink,
+            T,
+            S,
+            Some(ListFormat::AdGuard),
+        )
+        .expect_err("an overlong prefix must fail before a later line is considered");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            sink.events.is_empty(),
+            "the parser must neither split the long line nor admit the following valid rule"
+        );
+    }
+
+    #[test]
+    fn reader_refuses_huge_no_newline_comment_without_materializing_it() {
+        // This is logically a 64 MiB comment-only body, but the test holds no
+        // such body in memory. A regression back to an unbounded `read_line`
+        // / `read_until` would consume all 64 MiB before it could return.
+        let virtual_body_len = STREAMING_LINE_MAX_BYTES * 1024;
+        let mut reader = VirtualCommentReader::new(virtual_body_len);
+        let mut sink = RecordingSink { events: Vec::new() };
+
+        let error = parse_lines_into_sink_reader(&mut reader, 1, &mut sink, T, S, domain_extract)
+            .expect_err("a huge no-newline comment must be rejected, not skipped");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            reader.consumed,
+            STREAMING_LINE_MAX_BYTES + 2,
+            "only the payload cap and its CRLF/overflow witness may be consumed"
+        );
+        assert_eq!(
+            reader.remaining,
+            virtual_body_len - (STREAMING_LINE_MAX_BYTES + 2),
+            "the body-sized tail must remain unread"
+        );
+        assert!(sink.events.is_empty(), "a comment must not reach the sink");
+    }
+
+    #[test]
+    fn reader_invalid_utf8_remains_a_strict_invalid_data_error() {
+        let mut sink = RecordingSink { events: Vec::new() };
+        let error = parse_lines_into_sink_reader(
+            std::io::BufReader::with_capacity(
+                3,
+                std::io::Cursor::new(&b"invalid\xFF.example\n"[..]),
+            ),
+            1,
+            &mut sink,
+            T,
+            S,
+            domain_extract,
+        )
+        .expect_err("invalid UTF-8 must not be decoded lossily by the parser");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            sink.events.is_empty(),
+            "invalid bytes must not reach the sink"
+        );
+    }
+
+    #[test]
+    fn reader_reassembles_across_a_chained_seam() {
         // A line's bytes split across two chained readers must still be
-        // read as one line. Exercises `read_line`'s own loop-until-`\n`-
-        // or-EOF over a seam directly, in isolation from the sniff. The
-        // sniff/replay chain in `parse_list_into_map_reader` can now
+        // read as one line. Exercises the bounded reader's own
+        // loop-until-`\n`-or-EOF over a seam directly, in isolation from the
+        // sniff. The sniff/replay chain in `parse_list_into_map_reader` can now
         // split mid-line too, once the byte cap in `sniff_format_reader`
         // binds — that case is covered end-to-end by
         // `reader_matches_str_path_across_a_byte_capped_mid_line_cut`.
@@ -1563,21 +1737,27 @@ mod tests {
 
     #[test]
     fn reader_matches_str_path_across_a_byte_capped_mid_line_cut() {
-        // The byte cap can fall mid-line, which the line cap never
-        // could. The remainder of that line must be spliced back through
+        // The sniff byte cap can fall mid-line while that line stays within
+        // the parser's line bound. The remainder must be spliced back through
         // the `Cursor::chain(reader)` seam and reassembled, or the cap
         // silently corrupts every list carrying one long header line.
         //
         // Also covers the UTF-8 hazard the cap introduces: a multi-byte
-        // character straddling the cut would make a `read_line`-based
-        // sniff return InvalidData on a perfectly valid list. `€` is
-        // 3 bytes and the cap is a power of two, so the cut is
-        // guaranteed to land mid-character — asserted below rather than
-        // assumed, since a 2-byte filler would align with the cap and
-        // quietly stop testing this at all.
-        let mut content = String::from("# ");
-        content.push_str(&"\u{20ac}".repeat(DETECT_PREFIX_MAX_BYTES / 2));
-        content.push_str("\ngood.example.com\nads.example.com\n");
+        // character straddling the cut would make a `read_line`-based sniff
+        // return InvalidData on a perfectly valid list. A short preceding
+        // comment puts the cut *inside* an otherwise in-bound `€` comment
+        // line; this keeps the sniff regression test valid after the parser
+        // gained its own 64 KiB line cap.
+        let prelude = "# prelude\n";
+        let long_comment = format!(
+            "# {}",
+            "\u{20ac}".repeat((STREAMING_LINE_MAX_BYTES - 2) / '\u{20ac}'.len_utf8())
+        );
+        assert!(
+            long_comment.len() <= STREAMING_LINE_MAX_BYTES,
+            "fixture line must stay inside the parser bound"
+        );
+        let content = format!("{prelude}{long_comment}\ngood.example.com\nads.example.com\n");
         assert!(
             content.len() > DETECT_PREFIX_MAX_BYTES,
             "fixture must actually exceed the byte cap"

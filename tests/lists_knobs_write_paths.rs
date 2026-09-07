@@ -17,7 +17,7 @@ use purge_warden::cli::commands::lists_knobs;
 use purge_warden::config::schema::validator::LISTS_MAX_ENTRIES_ZERO;
 
 /// Minimal valid v1 master carrying an explicit `[lists]` section.
-const MASTER: &str = r#"schema_version = 3
+const MASTER: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -211,7 +211,7 @@ async fn a_lists_section_in_an_include_makes_the_master_write_fail_closed() {
     let master = tmp.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["conf.d/*.toml"]
 
 [server]

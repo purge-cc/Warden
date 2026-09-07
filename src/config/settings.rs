@@ -659,6 +659,13 @@ pub struct FallbackConfig {
 
 // ── [lists] ─────────────────────────────────────────────────────
 
+/// Default decoded-body limit for one list download (512 MiB).
+///
+/// Keep references to the default pointed here rather than repeating the
+/// byte count: catalog growth makes an old numeral look authoritative long
+/// after the configured policy moved.
+pub const DEFAULT_MAX_LIST_BODY_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ListsConfig {
     #[serde(default)]
@@ -670,21 +677,18 @@ pub struct ListsConfig {
     pub update_interval_secs: u64,
     /// Maximum allowed size (bytes) for a single blocklist download.
     ///
-    /// Streaming cap enforced by the hardened HTTP client — if a response
-    /// exceeds this size, the download aborts mid-stream rather than
-    /// buffering the whole body in memory. Prevents OOM from malicious
-    /// servers that omit `Content-Length`, and bounds worst-case memory
-    /// use during list refresh.
+    /// The HTTP client enforces this on decoded response bytes. Disk-backed
+    /// downloads stream into an unselected cache generation instead of
+    /// retaining the whole body in RAM. Invalid UTF-8 is preserved through
+    /// lossy conversion, so the stored representation can be up to three
+    /// times larger than the decoded input. Imported-local and explicit
+    /// no-cache callers keep their bodies resident.
     ///
-    /// **Default:** 512 MiB. Sized so [`Self::max_entries`] binds before
-    /// this cap does — 20,000,000 entries at ~23 bytes each is ~460 MB,
-    /// under 512 MiB — while still holding headroom over the largest
-    /// real list. A refresh can briefly hold a downloaded body twice over
-    /// in memory, so this is also a bound on that spike: on
-    /// resource-constrained hardware (e.g. a Raspberry Pi Zero 2 W with
-    /// 512 MB RAM), a body anywhere near this cap is the device's whole
-    /// RAM budget. Lower it, and curate a smaller list, on hardware that
-    /// small.
+    /// **Default:** 512 MiB, retaining headroom over the 2026-09-02 catalog
+    /// census. This is an input limit, not a process-memory guarantee;
+    /// [`Self::max_entries`] and [`Self::max_total_domains`] bound different
+    /// allocations. Lower all relevant limits and curate smaller lists on
+    /// resource-constrained hosts.
     ///
     /// Must be non-zero. `0` is treated as a misconfiguration and
     /// rejected at validation time.
@@ -692,16 +696,15 @@ pub struct ListsConfig {
     pub max_body_bytes: usize,
     /// Maximum number of entries (domains) to load from a single list.
     ///
-    /// Prevents OOM from adversarial or unexpectedly large list content.
+    /// Bounds work from adversarial or unexpectedly large list content.
     /// A list that exceeds this limit is **refused for the cycle** — it is
     /// not truncated. Each list is capped independently; the merged
     /// domain map may exceed this if multiple lists contribute different
     /// domains.
     ///
-    /// This is the **global** `[lists] max_entries`. A `max_entries` set
-    /// on an individual `[[blocklists]]` entry is validated and stored,
-    /// but not enforced — only this value reaches the parser. See
-    /// `default_max_list_entries`.
+    /// This is the **global** `[lists] max_entries` hard ceiling. Schema v4
+    /// lets a `max_entries` on an individual `[[blocklists]]` entry narrow
+    /// only that source; earlier schemas inherit this ceiling.
     ///
     /// Must be non-zero.
     #[serde(default = "default_max_list_entries")]
@@ -729,8 +732,8 @@ pub struct ListsConfig {
     /// status` says so explicitly and names the list contributing the most
     /// domains no other list supplies.
     ///
-    /// See `default_max_total_domains` for how the default is sized and
-    /// what it costs in memory.
+    /// See `default_max_total_domains` for the default's catalog rationale
+    /// and memory limits.
     ///
     /// `0` disables the check entirely, including the extra counting pass
     /// over the refresh spill that measures the union — so disabling it
@@ -825,19 +828,14 @@ fn default_staleness_threshold_secs() -> u64 {
     86_400
 }
 
-/// 512 MiB. [`ListsConfig::max_entries`] binds first in practice —
-/// 20,000,000 entries at ~23 bytes/domain is ~460 MB — so this is
-/// headroom over the largest first-party body rather than the binding
-/// constraint. A refresh can hold a downloaded body twice over in memory,
-/// so the worst case this cap allows is roughly twice itself.
+/// 512 MiB decoded-input cap with headroom over the 2026-09-02 catalog
+/// census. It is independent of row and installed-union limits.
 fn default_max_list_body_bytes() -> usize {
-    512 * 1024 * 1024
+    DEFAULT_MAX_LIST_BODY_BYTES
 }
 
-/// Global `[lists] max_entries` fallback — the only place this cap is
-/// actually enforced. A `max_entries` set on an individual
-/// `[[blocklists]]` entry is validated and stored, but never reaches the
-/// parser. See [`ListsConfig::max_entries`] for the refusal semantics.
+/// Global `[lists] max_entries` fallback and hard safety ceiling. Schema-v4
+/// blocklist caps may narrow it but can never raise it.
 ///
 /// 20,000,000 is roughly 2.2x the largest first-party list, a per-source
 /// sanity bound rather than a memory guarantee. It sits well under the
@@ -847,26 +845,16 @@ fn default_max_list_entries() -> usize {
     20_000_000
 }
 
-/// 24,000,000. The corpus is an exact-size sorted slice of
-/// `(CompactString, u64)` (32 B inline) plus heap for names longer than 24 B
-/// (25 % of the first-party corpus, ~10 B amortised), measured on two live
-/// hosts at 13.1 M and 14.9 M domains as RSS ≈ 25 MB + 47 B × N with a
-/// refresh transient of ~335 MB set by the largest single body, not by N.
-/// At this ceiling that is ≈1.15 GB steady and ≈1.5 GB at refresh peak —
-/// the largest round value whose refresh still fits a 2 GB box, the
-/// smallest class on which the `warden init` default subscription (12.4 M
-/// domains) fits at all. The full first-party catalog sits near 15.0 M,
-/// growing ~18 k/day; `tests/fixtures/catalog_census.json` pins that the
-/// shipped defaults keep ≥ 20 % headroom over the last census. Memory
-/// grows linearly with the count: there is no allocation step to sit
-/// under.
+/// 24,000,000 keeps at least 20% domain-count headroom over the 2026-09-02
+/// first-party catalog census. This independently caps installed unique
+/// domains; [`ListsConfig::max_entries`] caps accepted source rows and
+/// [`ListsConfig::max_body_bytes`] caps decoded input bytes.
 ///
-/// Two consequences worth knowing before raising it: the cold-start
-/// admission cap is twice this value (`cold_start_hard_cap`), so a corpus
-/// admitted at boot can reach ~2.3 GB before it is refused; and at this
-/// ceiling the dashboard's default `rss_warn_mb` (half of MemTotal) turns
-/// red on a 2 GB box — the budget reporting that it is spent, not a
-/// contradiction.
+/// Their composition is not a RAM guarantee. Domain lengths, duplicate raw
+/// rows, shard distribution, refresh scratch space, allocator retention and
+/// other daemon state all affect the peak. In particular, the cold-start
+/// admission cap is twice this value. Operators must measure their workload
+/// before raising the ceiling or treating it as suitable for a memory class.
 fn default_max_total_domains() -> usize {
     24_000_000
 }

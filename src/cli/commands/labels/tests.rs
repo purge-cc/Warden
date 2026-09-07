@@ -4,7 +4,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -459,7 +459,7 @@ fn mk_split_tree(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["labels.d/*.toml"]
 
 [server]

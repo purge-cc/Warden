@@ -330,7 +330,7 @@ fn write_broken_config(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("broken.toml");
     std::fs::write(
         &path,
-        "schema_version = 3\n\n[server]\ndefault_profile = \"no-such-profile\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 4\n\n[server]\ndefault_profile = \"no-such-profile\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     path
@@ -343,6 +343,9 @@ struct Run {
 
 /// Run one leaf against the broken config in an isolated temp dir.
 fn run_leaf(leaf: &Leaf, config: &Path, pid_file: &Path) -> Run {
+    let config_parent = config
+        .parent()
+        .expect("temporary config must have a parent directory");
     let out = Command::new(env!("CARGO_BIN_EXE_warden"))
         .arg("--config")
         .arg(config)
@@ -351,6 +354,7 @@ fn run_leaf(leaf: &Leaf, config: &Path, pid_file: &Path) -> Run {
         .args(&leaf.args)
         .stdin(Stdio::null())
         .env("EDITOR", "/bin/false")
+        .current_dir(config_parent)
         .output()
         .unwrap_or_else(|e| panic!("could not spawn `warden {}`: {e}", leaf.path));
 
@@ -489,7 +493,7 @@ fn write_valid_config(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("valid.toml");
     std::fs::write(
         &path,
-        "schema_version = 3\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
          default_profile = \"default\"\n\n[socket]\npath = \"/nonexistent/fence.sock\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -617,7 +621,7 @@ fn status_json_down_is_json() {
     let config = dir.path().join("valid.toml");
     std::fs::write(
         &config,
-        "schema_version = 3\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
          default_profile = \"default\"\n\n[socket]\npath = \"/nonexistent/fence.sock\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -671,7 +675,7 @@ fn a_negative_answer_is_not_a_failure() {
     let config = dir.path().join("refuse.toml");
     std::fs::write(
         &config,
-        "schema_version = 3\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\n\
+        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();

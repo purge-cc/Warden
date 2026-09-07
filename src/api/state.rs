@@ -44,12 +44,9 @@ pub struct ApiState {
     pub upstream_mode: String,
     pub upstream_count: usize,
     pub list_count: usize,
-    /// Shared handle to per-source `ListStatus`. `None` when the daemon
-    /// was started with no `[lists].sources` (filter disabled). The
-    /// `GET /api/blocklists/:id/stats` handler reads through this Arc;
-    /// the list manager updates it atomically on each refresh cycle.
-    /// Mirrors the `DaemonState.list_statuses` field — same registry,
-    /// two readers (IPC + HTTP).
+    /// Shared handle to per-source `ListStatus`. Production wires an empty
+    /// registry at boot when needed; `None` supports compatibility and tests.
+    /// Mirrors `DaemonState.list_statuses` for IPC and HTTP readers.
     pub list_statuses: Option<Arc<ListStatusRegistry>>,
     /// Bit → blocklist-label snapshot, cloned from the same `Arc` as
     /// `DaemonState.list_labels`. Lets `GET /api/query/{domain}`
@@ -62,8 +59,9 @@ pub struct ApiState {
     /// `DaemonState.config_write_lock` holds, so an IPC `warden blocklist
     /// add` and an API `POST /api/lists/add` cannot observe each other's
     /// read-modify-write window. Acquired only by
-    /// [`ApiState::mutate_config`] — see there for why the guard never
-    /// reaches a handler.
+    /// [`ApiState::mutate_config`]. This is an in-process sequencer; each
+    /// synchronous writer acquires its descriptor-pinned filesystem lock
+    /// inside the mutation it runs.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cluster serve-state: generations, content hashes, and the
     /// pre-serialised policy / domain-map artifacts the `/api/cluster/*`
@@ -83,14 +81,16 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    /// Run one config mutation while holding the config write lock.
+    /// Run one config mutation while holding the in-process mutation mutex.
     ///
     /// The guard is taken and released inside this function, so a handler
     /// cannot hold it across the reload notification and deadlock the
     /// capacity-1 reload channel: that half of the contract is a property
     /// of this scope, not a rule each handler has to restate. Sending the
     /// notification stays with the caller, because only the caller knows
-    /// whether its own outcome is a change worth reloading for.
+    /// whether its own outcome is a change worth reloading for. Synchronous
+    /// writers acquire `ConfigWriteLock` after this mutex and drop it before
+    /// they return, preserving that same reload boundary across processes.
     ///
     /// Takes a closure rather than a ready-made future on purpose:
     /// `tokio::task::spawn_blocking` starts its work at call time, so a

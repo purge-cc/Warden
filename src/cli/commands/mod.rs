@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 pub mod audit;
 pub mod audit_emit;
 pub mod blocklists;
@@ -42,41 +40,6 @@ pub mod token;
 pub mod toml_write;
 pub mod update;
 
-/// Return `desired` if nothing exists at that path, otherwise the first free
-/// `<desired>-N` (N = 1, 2, …).
-///
-/// Used for one-shot rollback asides (`*.pre-restore-<ts>`,
-/// `pre-migration-<ts>.toml`, `*.pre-init-<ts>`). Their second-granularity UTC
-/// timestamp collides on a same-second retry, and the bare `rename`/`copy` that
-/// follows would silently clobber a just-written recovery copy — losing the
-/// only rollback point. These aside names are never parsed back, so a numeric
-/// suffix is safe. (The `config-<ts>.tar.gz` backup *archive* name is parsed by
-/// [`config::backup::list_backups`], so it is deliberately NOT routed through
-/// here — same-second archives are same-content and retention manages them.)
-///
-/// Probe-and-bump carries an inherent check-then-create race, acceptable here
-/// because these asides are operator-paced, not a security boundary (the
-/// restore staging dir, which IS a boundary, uses exclusive `O_EXCL` create).
-pub(crate) fn make_unique_path(desired: PathBuf) -> PathBuf {
-    if !desired.exists() {
-        return desired;
-    }
-    let name = desired
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("backup");
-    let parent = desired.parent().unwrap_or_else(|| Path::new("."));
-    for n in 1..=10_000u32 {
-        let candidate = parent.join(format!("{name}-{n}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    // 10k same-named asides in one second is not a real operating condition;
-    // fall back to the original rather than loop unbounded.
-    desired
-}
-
 /// Collapse the loader's `Vec<ConfigError>` into a bulleted `anyhow::Error`.
 ///
 /// Every CLI read path needs this because `Vec<ConfigError>` is not
@@ -93,17 +56,4 @@ pub(crate) fn format_config_errors(errs: Vec<crate::config::error::ConfigError>)
         msg.push_str(&e.to_string());
     }
     anyhow::anyhow!(msg)
-}
-
-/// The same errors joined with `"; "`, for embedding in a one-line context
-/// such as a staging validator's `Result<(), String>`.
-pub(crate) fn format_config_errors_flat(errs: &[crate::config::error::ConfigError]) -> String {
-    let mut s = String::new();
-    for (i, e) in errs.iter().enumerate() {
-        if i > 0 {
-            s.push_str("; ");
-        }
-        s.push_str(&e.to_string());
-    }
-    s
 }

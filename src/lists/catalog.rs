@@ -149,6 +149,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Whether this catalog can resolve at least one configured slug.
+    ///
+    /// An empty JSON envelope is syntactically valid but operationally
+    /// unusable: treating it as a successful catalog makes declared sources
+    /// disappear like an intentional configuration clear.
+    pub fn is_usable(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     /// Fetch the catalog from the remote index.json.
     pub async fn fetch(client: &reqwest::Client) -> Result<Self, CatalogError> {
         Self::fetch_from(client, DEFAULT_CATALOG_URL).await
@@ -234,7 +243,11 @@ impl Catalog {
         )
         .await
         {
-            Ok(Ok(c)) => c,
+            Ok(Ok(c)) if c.is_usable() => c,
+            Ok(Ok(_)) => {
+                tracing::warn!("empty catalog response is unusable, using hardcoded fallback");
+                Self::fallback()
+            }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "catalog fetch failed, using hardcoded fallback");
                 Self::fallback()
@@ -293,10 +306,15 @@ impl Catalog {
     /// degrades to a fetch — but the temp-then-rename keeps even that from
     /// happening.
     ///
-    /// `std::io::Result` rather than `AtomicWriteError` because both call
-    /// sites log-and-continue: a catalog we cannot persist still works for
-    /// this process, it just does not help the next boot.
+    /// Empty catalogs are rejected because callers must never persist or use
+    /// one as a source plan: reproducibility comes before a cache stamp.
     pub fn save_to_disk(&self, dir: &Path) -> std::io::Result<()> {
+        if !self.is_usable() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to persist an empty catalog",
+            ));
+        }
         let body = serde_json::to_vec(&self.entries).map_err(std::io::Error::other)?;
         crate::config::atomic_write::hardened_atomic_write(
             &dir.join(Self::DISK_FILENAME),
@@ -324,9 +342,13 @@ impl Catalog {
             }
         };
         match serde_json::from_slice::<Vec<CatalogEntry>>(&bytes) {
-            Ok(entries) => {
+            Ok(entries) if !entries.is_empty() => {
                 tracing::debug!(count = entries.len(), "persisted catalog loaded");
                 Some(Self { entries })
+            }
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "persisted catalog is empty, ignoring");
+                None
             }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "persisted catalog is unparseable, ignoring");

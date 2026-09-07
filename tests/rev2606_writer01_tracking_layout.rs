@@ -26,7 +26,7 @@ use purge_warden::ipc::protocol::{IpcCommand, IpcResponse, TrackingPatch};
 use purge_warden::ipc::socket_client;
 use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 
-const MASTER: &str = r#"schema_version = 3
+const MASTER: &str = r#"schema_version = 4
 includes = ["blocklists.d/*.toml"]
 
 [server]
@@ -104,7 +104,9 @@ async fn spawn_fixture() -> Fixture {
         reload_coalescer: None,
         oui_table: None,
         list_labels: Arc::new(vec![None; 64]),
-        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+            purge_warden::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+        )),
         daemon_uid: purge_warden::ipc::socket_server::current_euid(),
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]

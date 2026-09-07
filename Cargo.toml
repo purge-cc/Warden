@@ -1,6 +1,6 @@
 [package]
 name = "purge-warden"
-version = "0.40.1"
+version = "0.41.0"
 edition = "2021"
 # Minimum supported Rust version. cargo enforces this at build time even
 # for a `publish = false` crate, so an outsider on an older toolchain gets a
@@ -41,6 +41,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.2"
+tempfile = "3"
 
 # Networking (list downloads + DoH upstream)
 #
@@ -195,7 +196,6 @@ cluster = ["dep:rcgen"]
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
-tempfile = "3"
 # `start_paused` for tests that must prove a WAIT happens. Dev-only: the
 # feature adds tokio's clock control, which no production path touches.
 # Needed because the property "this code waits" is temporal — a version that

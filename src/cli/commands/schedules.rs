@@ -21,9 +21,12 @@ use toml::Value;
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    read_or_empty, remove_id_keyed, write_value_validated, write_values_validated, StagedWrite,
+    read_or_empty_locked, remove_id_keyed, write_value_validated_locked,
+    write_values_validated_locked, StagedWrite,
 };
-use crate::config::loader::{load_config, LoadedConfig};
+use crate::config::loader::{load_config, load_config_for_schema_under_guard, LoadedConfig};
+use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 use crate::profiles::schedule::{local_now, ParsedSchedule};
 
 /// Remove every `[[schedules]]` row whose `expires_at` is in the past
@@ -40,9 +43,22 @@ use crate::profiles::schedule::{local_now, ParsedSchedule};
 /// pre-prune bytes.
 pub fn prune_expired_schedules(
     config_path: &Path,
-    loaded: &LoadedConfig,
+    _loaded: &LoadedConfig,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<Vec<String>> {
+    let guard = acquire_for_write(config_path)?;
+    prune_expired_schedules_locked(&guard, config_path, now)
+}
+
+/// Guarded prune entry point for compound writers. Reloads under `guard` so
+/// a caller's earlier reader snapshot can never decide this mutation.
+pub(crate) fn prune_expired_schedules_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<Vec<String>> {
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     let expired: Vec<String> = loaded
         .config
         .schedules
@@ -57,7 +73,7 @@ pub fn prune_expired_schedules(
     let mut pruned: Vec<String> = Vec::new();
     let mut writes: Vec<StagedWrite> = Vec::new();
     for file in &loaded.files_loaded {
-        let (mut doc, _) = read_or_empty(file)?;
+        let (mut doc, _) = read_or_empty_locked(guard, config_path, file)?;
         let mut changed = false;
         for id in &expired {
             if remove_id_keyed(&mut doc, "schedules", id)? {
@@ -79,7 +95,7 @@ pub fn prune_expired_schedules(
     // promotion order is immaterial; this replaces the former write-each-then-
     // aggregate-load-then-revert dance.
     if !writes.is_empty() {
-        write_values_validated(config_path, &writes)?;
+        write_values_validated_locked(guard, config_path, &writes)?;
     }
     Ok(pruned)
 }
@@ -164,7 +180,9 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 /// quiet schedule un-quiets the device early.
 pub async fn run_remove(config_path: &Path, socket_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     if !loaded.config.schedules.iter().any(|s| s.id.as_str() == id) {
         bail!(
             "no schedule named \"{id}\". Run `warden schedule list` to see configured schedules."
@@ -177,13 +195,13 @@ pub async fn run_remove(config_path: &Path, socket_path: &Path, id: &str) -> any
     let owner = loaded
         .files_loaded
         .iter()
-        .find(|file| file_defines_schedule(file, id).unwrap_or(false))
+        .find(|file| file_defines_schedule_locked(&guard, config_path, file, id).unwrap_or(false))
         .cloned()
         .with_context(|| {
             format!("schedule \"{id}\" is in the merged config but no loaded file defines it")
         })?;
 
-    let (mut doc, _) = read_or_empty(&owner)?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &owner)?;
     let removed = remove_id_keyed(&mut doc, "schedules", id)?;
     if !removed {
         bail!(
@@ -191,7 +209,8 @@ pub async fn run_remove(config_path: &Path, socket_path: &Path, id: &str) -> any
             owner.display()
         );
     }
-    write_value_validated(config_path, &owner, &doc)?;
+    write_value_validated_locked(&guard, config_path, &owner, &doc)?;
+    drop(guard);
     println!("removed schedule {id}");
 
     let outcome = ipc_reload::attempt_reload(socket_path).await;
@@ -200,20 +219,29 @@ pub async fn run_remove(config_path: &Path, socket_path: &Path, id: &str) -> any
     Ok(())
 }
 
-/// True when `file`'s raw `[[schedules]]` array contains a row with this id.
-fn file_defines_schedule(file: &Path, id: &str) -> anyhow::Result<bool> {
-    let raw =
-        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
-    let value: Value = raw
-        .parse()
-        .with_context(|| format!("{} is not valid TOML", file.display()))?;
-    Ok(value
+/// Guarded owner probe for `schedule remove`. An unreadable or malformed
+/// candidate retains the legacy false result, so it cannot steal ownership
+/// from a later loaded file.
+fn file_defines_schedule_locked(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    file: &Path,
+    id: &str,
+) -> anyhow::Result<bool> {
+    match read_or_empty_locked(guard, config_path, file) {
+        Ok((value, _)) => Ok(value_defines_schedule(&value, id)),
+        Err(_) => Ok(false),
+    }
+}
+
+fn value_defines_schedule(value: &Value, id: &str) -> bool {
+    value
         .get("schedules")
         .and_then(|v| v.as_array())
         .is_some_and(|arr| {
             arr.iter()
                 .any(|row| row.get("id").and_then(|v| v.as_str()) == Some(id))
-        }))
+        })
 }
 
 #[cfg(test)]
@@ -264,7 +292,7 @@ mod tests {
         );
     }
 
-    const MASTER_WITH_INCLUDES: &str = r#"schema_version = 3
+    const MASTER_WITH_INCLUDES: &str = r#"schema_version = 4
 includes = ["schedules.d/*.toml"]
 
 [server]

@@ -1,11 +1,27 @@
 use super::*;
-use std::path::PathBuf;
+use crate::cli::commands::target::{
+    commit_prevalidated_single_write_with_ops, ConfigCommitDisposition,
+};
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
+    AtomicWriteAtOpts, AtomicWriteTestFailure,
+};
+use std::{
+    io::{Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
+    },
+    path::PathBuf,
+    sync::mpsc,
+    time::Duration,
+};
 
 fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -23,6 +39,36 @@ servers = ["192.0.2.1:53"]
 
 fn fake_socket(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("ghost.sock")
+}
+
+#[test]
+fn cap_refusal_line_does_not_claim_a_retained_body_is_serving() {
+    let line = format_cap_refusal_line(3);
+    assert_eq!(
+        line,
+        "  LAST CAP REFUSAL:     3 entries beyond the effective source cap — candidate not installed; \
+         clears after a successful refresh or daemon restart; inspect effective_max_entries with `warden blocklist show <id>` and raise the limiting configured cap"
+    );
+    assert!(!line.contains("last good"));
+}
+
+#[test]
+fn show_effective_cadence_uses_the_resolved_row_contract() {
+    assert_eq!(
+        effective_show_update_interval_secs(Some(1), 7_200, 3),
+        7_200,
+        "schema 3 inherits the global cadence"
+    );
+    assert_eq!(
+        effective_show_update_interval_secs(Some(0), 7_200, 4),
+        60,
+        "schema 4 honors a row override but keeps the scheduler floor"
+    );
+    assert_eq!(
+        effective_show_update_interval_secs(Some(2), 7_200, 3),
+        7_200,
+        "a secondary alias row reports its effective inherited cadence"
+    );
 }
 
 // ── allow_direction_gates: the shared predicate ──────────────────
@@ -171,8 +217,8 @@ async fn add_refuses_a_taken_id_and_leaves_the_row_intact() {
     // through, the row would carry the defaults instead.
     assert_eq!(b.url, "https://lists.purge.cc/ads.txt");
     assert_eq!(b.display_name, "Privacy: ads");
-    assert_eq!(b.update_interval_hours, 6);
-    assert_eq!(b.max_entries, 1_234_567);
+    assert_eq!(b.update_interval_hours, Some(6));
+    assert_eq!(b.max_entries, Some(1_234_567));
 }
 
 /// The same gate on the other whole-row writer.
@@ -362,6 +408,74 @@ async fn add_list_result(master: &Path, sock: &Path, id: &str, url: &str) -> any
         None,
     )
     .await
+}
+
+#[tokio::test]
+async fn add_rechecks_duplicates_after_the_network_probe() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let sock = fake_socket(&dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/list.txt", listener.local_addr().unwrap());
+    let (request_seen_tx, request_seen_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).await.unwrap();
+        request_seen_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let first_master = master.clone();
+    let first_sock = sock.clone();
+    let first_url = url.clone();
+    let first = tokio::spawn(async move {
+        run_add(
+            &first_master,
+            &first_sock,
+            "first",
+            None,
+            &first_url,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), request_seen_rx)
+        .await
+        .expect("the first add must reach its network probe")
+        .unwrap();
+    add_list(&master, &sock, "second", &url).await;
+    release_tx.send(()).unwrap();
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(3), first)
+        .await
+        .expect("the first add must finish after the probe")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already added as \"second\""), "{err}");
+    server.await.unwrap();
+
+    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(loaded.config.blocklists.len(), 1);
+    assert_eq!(loaded.config.blocklists[0].id.as_str(), "second");
 }
 
 #[tokio::test]
@@ -642,6 +756,92 @@ async fn set_format_roundtrips() {
     assert_eq!(loaded.config.blocklists[0].format, BlocklistFormat::Adguard);
 }
 
+#[tokio::test]
+async fn set_row_controls_replace_legacy_alias_and_restore_inheritance() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let sock = fake_socket(&dir);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&master)
+        .unwrap()
+        .write_all(
+            br#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Privacy: Ads"
+url = "https://example.com/ads.txt"
+refresh_interval_hours = 12
+"#,
+        )
+        .unwrap();
+
+    run_set(
+        &master,
+        &sock,
+        "privacy-ads",
+        "update_interval_hours",
+        "6",
+        None,
+    )
+    .await
+    .unwrap();
+    run_set(&master, &sock, "privacy-ads", "max_entries", "123", None)
+        .await
+        .unwrap();
+    let numeric = std::fs::read_to_string(&master).unwrap();
+    assert!(numeric.contains("update_interval_hours = 6"));
+    assert!(numeric.contains("max_entries = 123"));
+    assert!(!numeric.contains("refresh_interval_hours"));
+
+    run_set(
+        &master,
+        &sock,
+        "privacy-ads",
+        "update_interval_hours",
+        "inherit",
+        None,
+    )
+    .await
+    .unwrap();
+    run_set(
+        &master,
+        &sock,
+        "privacy-ads",
+        "max_entries",
+        "inherit",
+        None,
+    )
+    .await
+    .unwrap();
+    let inherited = std::fs::read_to_string(&master).unwrap();
+    assert!(!inherited.contains("update_interval_hours"));
+    assert!(!inherited.contains("refresh_interval_hours"));
+    assert!(!inherited.contains("max_entries"));
+}
+
+#[tokio::test]
+async fn set_max_entries_rejects_values_outside_toml_integer_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let sock = fake_socket(&dir);
+    add_list(&master, &sock, "privacy-ads", "https://example.com/ads.txt").await;
+    let before = std::fs::read_to_string(&master).unwrap();
+
+    let err = run_set(
+        &master,
+        &sock,
+        "privacy-ads",
+        "max_entries",
+        "9223372036854775808",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("positive integer"));
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
+}
+
 // ── Sprint 36 HR2: hot-reload wiring ───────────────────────────────
 
 // ── S50 T3: per-list mutation verbs ────────────────────────────────
@@ -702,8 +902,10 @@ fn cli_surface_format_set_unknown_field_substitutes_field() {
 fn cli_surface_set_kind_through_generic_setter_names_the_dedicated_verbs() {
     let mut entry = Value::Table(toml::map::Map::new());
     let dir = tempfile::tempdir().unwrap();
-    let err = apply_blocklist_field(&mut entry, "kind", "allow", &dir.path().join("config.toml"))
-        .unwrap_err();
+    let master = mk_master(&dir);
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let err =
+        apply_blocklist_field_locked(&guard, &mut entry, "kind", "allow", &master).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("warden blocklist set-kind"), "{msg}");
     assert!(msg.contains("warden blocklist set-trust"), "{msg}");
@@ -796,8 +998,978 @@ fn s50_t3_autodetect_format_defaults_to_domains() {
 
 #[test]
 fn s50_t3_count_entries_skips_blank_and_comment_lines() {
-    let raw = "# header\n\nfoo\nbar\n# trailer\n";
+    let raw = "# header\n\nfoo\nnot a domain!\nbar\n# trailer\n";
     assert_eq!(count_entries(raw, BlocklistFormat::Domains), 2);
+    assert_eq!(
+        count_entries(
+            "||ads.example^\n@@||allow.example^\n/regex/\n",
+            BlocklistFormat::Adguard
+        ),
+        1
+    );
+}
+
+fn local_import_snapshot_text(snapshot: &mut LocalImportSnapshot) -> String {
+    let mut text = String::new();
+    snapshot.spool.read_to_string(&mut text).unwrap();
+    text
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum C53ImportFault {
+    None,
+    BodyPostRename,
+    BodyPostRenameReplaced,
+    BodySyncFailure,
+    ConfigRootSyncFailure,
+    ConfigPreRename,
+    ConfigTargetReplaced,
+    ConfigPostRename,
+    ConfigRollbackUncertain,
+}
+
+struct C53ImportOps {
+    fault: C53ImportFault,
+}
+
+impl ImportLocalOps for C53ImportOps {
+    fn publish_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+        spool: &mut std::fs::File,
+        len: u64,
+    ) -> Result<(), AtomicWriteError> {
+        let result = hardened_atomic_create_only_at(
+            target,
+            spool,
+            len,
+            AtomicCreateOnlyAtOpts {
+                test_failure: matches!(
+                    self.fault,
+                    C53ImportFault::BodyPostRename | C53ImportFault::BodyPostRenameReplaced
+                )
+                .then_some(AtomicWriteTestFailure::ParentFsync),
+                ..Default::default()
+            },
+        );
+        if self.fault == C53ImportFault::BodyPostRenameReplaced
+            && result.as_ref().is_err_and(|error| error.rename_landed())
+        {
+            std::fs::remove_file(target.display()).unwrap();
+            std::fs::write(target.display(), "replacement sentinel\n").unwrap();
+        }
+        result
+    }
+
+    fn sync_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+    ) -> anyhow::Result<()> {
+        if self.fault == C53ImportFault::BodySyncFailure {
+            anyhow::bail!("injected body sync failure");
+        }
+        target.sync_held_file_and_parent().map_err(Into::into)
+    }
+
+    fn sync_config_root(&mut self, tree: crate::config::tree_io::TreeIo<'_>) -> anyhow::Result<()> {
+        if self.fault == C53ImportFault::ConfigRootSyncFailure {
+            anyhow::bail!("injected config-root sync failure");
+        }
+        tree.sync_root().map_err(Into::into)
+    }
+
+    fn commit_config(
+        &mut self,
+        prepared: PreparedValidatedSingleWrite<'_>,
+    ) -> Result<(), ConfigCommitFailure> {
+        if matches!(
+            self.fault,
+            C53ImportFault::None
+                | C53ImportFault::BodyPostRename
+                | C53ImportFault::BodyPostRenameReplaced
+        ) {
+            return commit_prevalidated_single_write(prepared);
+        }
+        let fault = self.fault;
+        commit_prevalidated_single_write_with_ops(
+            prepared,
+            move |target, content| match fault {
+                C53ImportFault::ConfigPreRename => Err(AtomicWriteError::Fsync {
+                    path: target.display().to_path_buf(),
+                    source: std::io::Error::other("injected pre-rename config failure"),
+                }),
+                C53ImportFault::ConfigTargetReplaced => {
+                    let replacement = target.display().with_extension("replacement.toml");
+                    let visible = target.display().to_path_buf();
+                    let validator = move |_: &std::fs::File, _: &Path| {
+                        std::fs::write(&replacement, "schema_version = 1\n").unwrap();
+                        std::fs::rename(&replacement, &visible).unwrap();
+                        Ok(())
+                    };
+                    hardened_atomic_write_at(
+                        target,
+                        content.as_bytes(),
+                        AtomicWriteAtOpts {
+                            validator: Some(&validator),
+                            ..Default::default()
+                        },
+                    )
+                }
+                C53ImportFault::ConfigPostRename | C53ImportFault::ConfigRollbackUncertain => {
+                    hardened_atomic_write_at(
+                        target,
+                        content.as_bytes(),
+                        AtomicWriteAtOpts {
+                            test_failure: Some(AtomicWriteTestFailure::ParentFsync),
+                            ..Default::default()
+                        },
+                    )
+                }
+                C53ImportFault::None
+                | C53ImportFault::BodyPostRename
+                | C53ImportFault::BodyPostRenameReplaced
+                | C53ImportFault::BodySyncFailure
+                | C53ImportFault::ConfigRootSyncFailure => unreachable!(),
+            },
+            move |target, before| {
+                if fault == C53ImportFault::ConfigRollbackUncertain {
+                    anyhow::bail!("injected config rollback failure");
+                }
+                let rollback = target.rollback_target()?;
+                match before {
+                    Some(bytes) => hardened_atomic_write_at(
+                        &rollback,
+                        bytes.as_bytes(),
+                        AtomicWriteAtOpts::default(),
+                    )
+                    .map_err(anyhow::Error::new),
+                    None => rollback.unlink().map_err(Into::into),
+                }
+            },
+        )
+    }
+}
+
+fn c53_import_with_fault(
+    master: &Path,
+    source: &Path,
+    id: &str,
+    display_name: Option<&str>,
+    into: Option<&Path>,
+    fault: C53ImportFault,
+) -> anyhow::Result<ImportedLocal> {
+    run_import_local_transaction(
+        master,
+        snapshot_local_import_source(source)?,
+        id,
+        BlocklistBase::Deny,
+        BlocklistTrust::Local,
+        display_name,
+        into,
+        C53ImportOps { fault },
+    )
+}
+
+fn c53_append_master(master: &Path, suffix: &str) {
+    let mut contents = std::fs::read_to_string(master).unwrap();
+    contents.push_str(suffix);
+    std::fs::write(master, contents).unwrap();
+}
+
+fn c53_insert_top_level_include(master: &Path, pattern: &str) {
+    let mut contents = std::fs::read_to_string(master).unwrap();
+    let marker = "schema_version = 4\n";
+    let position = contents.find(marker).unwrap() + marker.len();
+    contents.insert_str(position, &format!("includes = [\"{pattern}\"]\n"));
+    std::fs::write(master, contents).unwrap();
+}
+
+#[test]
+fn c53_import_transaction_publishes_snapshot_content_format_and_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    let body = "||ads.example^\n@@||allow.example^\n";
+    std::fs::write(&source, body).unwrap();
+
+    let imported = c53_import_with_fault(
+        &master,
+        &source,
+        "local-ads",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap();
+
+    assert_eq!(imported.entry_count, 1);
+    assert_eq!(std::fs::read_to_string(&imported.body_path).unwrap(), body);
+    let written = std::fs::read_to_string(&master).unwrap();
+    assert!(written.contains("format = \"adguard\""), "{written}");
+    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(loaded.config.blocklists.len(), 1);
+}
+
+#[test]
+fn c53_import_enforces_loaded_body_cap_at_exact_boundary_and_plus_one() {
+    for (source_body, succeeds) in [("abcd", true), ("abcde", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let master = mk_master(&dir);
+        c53_append_master(&master, "\n[lists]\nmax_body_bytes = 4\n");
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, source_body).unwrap();
+
+        let result = c53_import_with_fault(
+            &master,
+            &source,
+            "cap-test",
+            None,
+            None,
+            C53ImportFault::None,
+        );
+        assert_eq!(result.is_ok(), succeeds);
+        let body = master.parent().unwrap().join("lists/cap-test.txt");
+        assert_eq!(body.exists(), succeeds);
+        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        assert_eq!(loaded.config.blocklists.len(), if succeeds { 1 } else { 0 });
+    }
+}
+
+#[test]
+fn c53_import_refuses_existing_body_without_touching_sentinel_or_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    let body = master.parent().unwrap().join("lists/sentinel.txt");
+    std::fs::create_dir(body.parent().unwrap()).unwrap();
+    std::fs::write(&body, "leave me alone\n").unwrap();
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "sentinel",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(&body).unwrap(), "leave me alone\n");
+    assert!(load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .is_empty());
+}
+
+#[test]
+fn c53_import_refuses_unreachable_into_before_creating_body_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+    std::fs::create_dir(dir.path().join("blocklists.d")).unwrap();
+    std::fs::write(dir.path().join("blocklists.d/local.toml"), "").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "unreachable",
+        None,
+        Some(Path::new("blocklists.d/local.toml")),
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not included"), "{error:#}");
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_import_refuses_a_conventional_but_unincluded_blocklists_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+    std::fs::create_dir(dir.path().join("blocklists.d")).unwrap();
+    std::fs::write(dir.path().join("blocklists.d/local.toml"), "").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "conventional-unincluded",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not included"), "{error:#}");
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_import_refuses_wildcard_include_collision_even_without_lists_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    c53_insert_top_level_include(&master, "lists/*");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "wildcard",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("would match an include"),
+        "{error:#}"
+    );
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_import_checks_wildcards_declared_by_nested_includes() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    c53_insert_top_level_include(&master, "nested.toml");
+    std::fs::write(dir.path().join("nested.toml"), "includes = [\"lists/*\"]\n").unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "nested-wildcard",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("would match an include"),
+        "{error:#}"
+    );
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_include_matcher_filters_hidden_prefix_suffix_and_nested_declarations_lexically() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    c53_insert_top_level_include(&master, "nested/declaring.toml");
+    std::fs::write(
+        dir.path().join("nested/declaring.toml"),
+        "includes = [\"lists/prefix*.toml\"]\n",
+    )
+    .unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let loaded = load_config_for_schema_under_guard(
+        &guard,
+        &master,
+        SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    for candidate in [
+        Path::new("nested/lists/.hidden.toml"),
+        Path::new("nested/lists/plain.toml"),
+        Path::new("nested/lists/prefix.txt"),
+    ] {
+        assert!(
+            loaded_include_matches_root_file(&guard, &master, &loaded, candidate)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(loaded_include_matches_root_file(
+        &guard,
+        &master,
+        &loaded,
+        Path::new("nested/lists/prefix-ok.toml"),
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn c53_include_matcher_refuses_a_loaded_toml_alias_to_the_body_member() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    c53_insert_top_level_include(&master, "body-alias.toml");
+    std::fs::create_dir(dir.path().join("lists")).unwrap();
+    std::fs::write(
+        dir.path().join("lists/collision.txt"),
+        "# valid empty TOML\n",
+    )
+    .unwrap();
+    symlink("lists/collision.txt", dir.path().join("body-alias.toml")).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let loaded = load_config_for_schema_under_guard(
+        &guard,
+        &master,
+        SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+
+    let error = loaded_include_matches_root_file(
+        &guard,
+        &master,
+        &loaded,
+        Path::new("lists/collision.txt"),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("already-loaded config member"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn c53_import_refuses_wildcard_collision_through_a_directory_alias() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    symlink("lists", dir.path().join("list-alias")).unwrap();
+    c53_insert_top_level_include(&master, "list-alias/*");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "aliased",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("would match an include"),
+        "{error:#}"
+    );
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_import_uses_the_canonical_root_through_a_cross_directory_master_file_alias() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    let master = mk_master(&real);
+    let alias = dir.path().join("master-alias.toml");
+    symlink(&master, &alias).unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let imported = c53_import_with_fault(
+        &alias,
+        &source,
+        "cross-dir",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap();
+    assert_eq!(imported.body_path, real.path().join("lists/cross-dir.txt"));
+    assert_eq!(
+        std::fs::read_to_string(real.path().join("lists/cross-dir.txt")).unwrap(),
+        "ads.example\n"
+    );
+    assert_eq!(std::fs::read_link(&alias).unwrap(), master);
+}
+
+#[test]
+fn c53_import_prevalidation_failure_leaves_no_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "invalid-final-config",
+        Some(""),
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("display_name"), "{error:#}");
+    assert!(!dir.path().join("lists").exists());
+}
+
+#[test]
+fn c53_import_config_failures_retain_body_for_retry() {
+    for (fault, expected_row_exists, needle, expected_disposition) in [
+        (
+            C53ImportFault::ConfigPreRename,
+            false,
+            "retained the published body",
+            ConfigCommitDisposition::Untouched,
+        ),
+        (
+            C53ImportFault::ConfigTargetReplaced,
+            false,
+            "retained the published body",
+            ConfigCommitDisposition::Uncertain,
+        ),
+        (
+            C53ImportFault::ConfigPostRename,
+            false,
+            "retained the published body",
+            ConfigCommitDisposition::RestoredDurably,
+        ),
+        (
+            C53ImportFault::ConfigRollbackUncertain,
+            true,
+            "retained the published body",
+            ConfigCommitDisposition::Uncertain,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let master = mk_master(&dir);
+        let source = dir.path().join("source.txt");
+        std::fs::write(&source, "ads.example\n").unwrap();
+
+        let error =
+            c53_import_with_fault(&master, &source, "recover", None, None, fault).unwrap_err();
+        assert!(error.to_string().contains(needle), "{error:#}");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ConfigCommitFailure>())
+            .expect("config commit error remains inspectable");
+        assert_eq!(failure.disposition(), expected_disposition);
+        if fault == C53ImportFault::ConfigTargetReplaced {
+            assert!(format!("{error:#}").contains("config state is uncertain"));
+        }
+        let body = dir.path().join("lists/recover.txt");
+        assert!(body.exists(), "{fault:?}: {error:#}");
+        let row_exists = std::fs::read_to_string(&master)
+            .unwrap()
+            .contains("id = \"recover\"");
+        assert_eq!(row_exists, expected_row_exists, "{fault:?}: {error:#}");
+    }
+}
+
+#[test]
+fn c53_import_retries_an_identical_retained_body_but_refuses_a_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    c53_import_with_fault(
+        &master,
+        &source,
+        "retry",
+        None,
+        None,
+        C53ImportFault::ConfigPreRename,
+    )
+    .unwrap_err();
+    let body = dir.path().join("lists/retry.txt");
+    assert_eq!(std::fs::read_to_string(&body).unwrap(), "ads.example\n");
+
+    c53_import_with_fault(&master, &source, "retry", None, None, C53ImportFault::None).unwrap();
+    assert!(std::fs::read_to_string(&master)
+        .unwrap()
+        .contains("id = \"retry\""));
+
+    let second = dir.path().join("source-second.txt");
+    std::fs::write(&second, "different.example\n").unwrap();
+    let sentinel = dir.path().join("lists/sentinel.txt");
+    std::fs::write(&sentinel, "sentinel\n").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let error = c53_import_with_fault(
+        &master,
+        &second,
+        "sentinel",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("exact retry snapshot"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "sentinel\n");
+}
+
+#[test]
+fn c53_import_allows_an_absent_into_slice_selected_by_wildcard() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    std::fs::create_dir(dir.path().join("blocklists.d")).unwrap();
+    c53_insert_top_level_include(&master, "blocklists.d/*.toml");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let imported = c53_import_with_fault(
+        &master,
+        &source,
+        "into-wildcard",
+        None,
+        Some(Path::new("blocklists.d/local.toml")),
+        C53ImportFault::None,
+    )
+    .unwrap();
+    assert!(imported.config_target.ends_with("blocklists.d/local.toml"));
+    assert!(load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .iter()
+        .any(|row| row.id.as_str() == "into-wildcard"));
+}
+
+#[test]
+fn c53_import_body_post_rename_failure_retains_retry_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "body-rename",
+        None,
+        None,
+        C53ImportFault::BodyPostRename,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("retained any body"), "{error:#}");
+    assert!(dir.path().join("lists/body-rename.txt").exists());
+    assert!(load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .is_empty());
+
+    c53_import_with_fault(
+        &master,
+        &source,
+        "body-rename",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap();
+    assert!(load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .iter()
+        .any(|row| row.id.as_str() == "body-rename"));
+}
+
+#[test]
+fn c53_import_sync_failure_prevents_config_commit_and_retains_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "sync-failure",
+        None,
+        None,
+        C53ImportFault::BodySyncFailure,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("sync published import body"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("lists/sync-failure.txt")).unwrap(),
+        "ads.example\n"
+    );
+    assert!(!std::fs::read_to_string(&master)
+        .unwrap()
+        .contains("id = \"sync-failure\""));
+}
+
+#[test]
+fn c53_import_root_sync_failure_blocks_a_separate_slice_commit_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let slices = dir.path().join("blocklists.d");
+    std::fs::create_dir(&slices).unwrap();
+    let slice = slices.join("local.toml");
+    std::fs::write(&slice, "# local blocklists\n").unwrap();
+    c53_insert_top_level_include(&master, "blocklists.d/*.toml");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "root-sync",
+        None,
+        Some(Path::new("blocklists.d/local.toml")),
+        C53ImportFault::ConfigRootSyncFailure,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("config root"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("lists/root-sync.txt")).unwrap(),
+        "ads.example\n"
+    );
+    assert!(!std::fs::read_to_string(&slice)
+        .unwrap()
+        .contains("id = \"root-sync\""));
+
+    c53_import_with_fault(
+        &master,
+        &source,
+        "root-sync",
+        None,
+        Some(Path::new("blocklists.d/local.toml")),
+        C53ImportFault::None,
+    )
+    .unwrap();
+    assert!(std::fs::read_to_string(&slice)
+        .unwrap()
+        .contains("id = \"root-sync\""));
+}
+
+#[test]
+fn c53_import_accepts_an_external_source_beneath_a_reserved_config_component_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let external = tempfile::tempdir().unwrap();
+    let reserved = external.path().join(".warden-write-input");
+    std::fs::create_dir(&reserved).unwrap();
+    let source = reserved.join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let imported = c53_import_with_fault(
+        &master,
+        &source,
+        "external-reserved",
+        None,
+        None,
+        C53ImportFault::None,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(imported.body_path).unwrap(),
+        "ads.example\n"
+    );
+}
+
+#[test]
+fn c53_import_body_cleanup_never_unlinks_a_replacement_by_pathname() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "ads.example\n").unwrap();
+
+    let error = c53_import_with_fault(
+        &master,
+        &source,
+        "body-replaced",
+        None,
+        None,
+        C53ImportFault::BodyPostRenameReplaced,
+    )
+    .unwrap_err();
+    let body = dir.path().join("lists/body-replaced.txt");
+    assert!(error.to_string().contains("retained any body"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(body).unwrap(),
+        "replacement sentinel\n"
+    );
+    assert!(load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists
+        .is_empty());
+}
+
+#[test]
+fn c53_snapshot_accepts_an_exact_cap_and_rewinds_an_unlinked_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"abcd").unwrap();
+
+    let mut snapshot = snapshot_local_import_source_with_test_cap(&source, 4).unwrap();
+
+    assert_eq!(snapshot.len, 4);
+    assert_eq!(snapshot.format, BlocklistFormat::Domains);
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(local_import_snapshot_text(&mut snapshot), "abcd");
+    let spool_link =
+        std::fs::read_link(format!("/proc/self/fd/{}", snapshot.spool.as_raw_fd())).unwrap();
+    assert!(
+        spool_link.to_string_lossy().ends_with(" (deleted)"),
+        "snapshot spool must have no directory entry: {}",
+        spool_link.display()
+    );
+}
+
+#[test]
+fn c53_snapshot_refuses_cap_plus_one_and_sparse_oversized_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let cap_plus_one = dir.path().join("cap-plus-one.txt");
+    std::fs::write(&cap_plus_one, b"abcde").unwrap();
+    let err = snapshot_local_import_source_with_test_cap(&cap_plus_one, 4).unwrap_err();
+    assert!(err.to_string().contains("5 bytes"), "{err:#}");
+
+    let sparse = dir.path().join("sparse.txt");
+    std::fs::File::create(&sparse).unwrap().set_len(5).unwrap();
+    let err = snapshot_local_import_source_with_test_cap(&sparse, 4).unwrap_err();
+    assert!(err.to_string().contains("5 bytes"), "{err:#}");
+}
+
+#[test]
+fn c53_snapshot_enforces_the_streaming_guard_after_in_place_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"abcd").unwrap();
+    let source_for_hook = source.clone();
+
+    let err = with_local_import_snapshot_test_hook(
+        move |event| {
+            assert_eq!(event, LocalImportSnapshotTestEvent::AfterMetadataPrecheck);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&source_for_hook)
+                .unwrap()
+                .write_all(b"e")
+                .unwrap();
+        },
+        || snapshot_local_import_source_with_test_cap(&source, 4).unwrap_err(),
+    );
+
+    assert!(err.to_string().contains("5 bytes"), "{err:#}");
+}
+
+#[test]
+fn c53_snapshot_refuses_invalid_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"good.example\n\xff").unwrap();
+
+    let err = snapshot_local_import_source_with_test_cap(&source, 64).unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"), "{err:#}");
+}
+
+#[test]
+fn c53_snapshot_refuses_fifo_without_blocking_and_other_non_regular_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.txt");
+    let err = snapshot_local_import_source_with_test_cap(&missing, 64).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err:#}");
+
+    let fifo = dir.path().join("source.fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let (sent, received) = mpsc::channel();
+    let fifo_for_thread = fifo.clone();
+    std::thread::spawn(move || {
+        sent.send(
+            snapshot_local_import_source_with_test_cap(&fifo_for_thread, 64)
+                .unwrap_err()
+                .to_string(),
+        )
+        .unwrap();
+    });
+    let fifo_error = received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("a FIFO must be refused before any blocking data open");
+    assert!(fifo_error.contains("not a regular file"), "{fifo_error}");
+
+    let err = snapshot_local_import_source_with_test_cap(dir.path(), 64).unwrap_err();
+    assert!(err.to_string().contains("not a regular file"), "{err:#}");
+
+    let err = snapshot_local_import_source_with_test_cap(std::path::Path::new("/dev/null"), 64)
+        .unwrap_err();
+    assert!(err.to_string().contains("not a regular file"), "{err:#}");
+}
+
+#[test]
+fn c53_snapshot_handles_empty_input_and_preserves_format_count_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, b"").unwrap();
+    let mut empty = snapshot_local_import_source_with_test_cap(&source, 64).unwrap();
+    assert_eq!(empty.len, 0);
+    assert_eq!(empty.format, BlocklistFormat::Domains);
+    assert_eq!(empty.entry_count, 0);
+    assert_eq!(local_import_snapshot_text(&mut empty), "");
+
+    for raw in [
+        "# header\n\nplain.example\n",
+        "0.0.0.0 ads.example\n127.0.0.1 tracker.example\n",
+        "||ads.example^\n@@||allowed.example^\n",
+    ] {
+        std::fs::write(&source, raw).unwrap();
+        let snapshot =
+            snapshot_local_import_source_with_test_cap(&source, raw.len() as u64).unwrap();
+        let expected_format = autodetect_format(raw);
+        assert_eq!(snapshot.format, expected_format, "{raw:?}");
+        assert_eq!(
+            snapshot.entry_count,
+            count_entries(raw, expected_format),
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn c53_snapshot_follows_source_symlinks_but_pins_the_resolved_inode() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    let source = dir.path().join("source.txt");
+    std::fs::write(&target, "0.0.0.0 ads.example\n").unwrap();
+    symlink(&target, &source).unwrap();
+
+    let mut snapshot = snapshot_local_import_source_with_test_cap(&source, 64).unwrap();
+    assert_eq!(snapshot.format, BlocklistFormat::Hosts);
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(
+        local_import_snapshot_text(&mut snapshot),
+        "0.0.0.0 ads.example\n"
+    );
+}
+
+#[test]
+fn c53_snapshot_never_reopens_a_replaced_source_pathname() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.txt");
+    let replacement = dir.path().join("replacement.txt");
+    std::fs::write(&source, "old.example\n").unwrap();
+    std::fs::write(&replacement, "new.example\n").unwrap();
+    let source_for_hook = source.clone();
+
+    let mut snapshot = with_local_import_snapshot_test_hook(
+        move |event| {
+            assert_eq!(event, LocalImportSnapshotTestEvent::AfterMetadataPrecheck);
+            std::fs::rename(&replacement, &source_for_hook).unwrap();
+        },
+        || snapshot_local_import_source_with_test_cap(&source, 64).unwrap(),
+    );
+
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "new.example\n");
+    assert_eq!(local_import_snapshot_text(&mut snapshot), "old.example\n");
 }
 
 // `s50_t3_set_category_writes_field_and_loads_back` deleted in
@@ -1456,7 +2628,7 @@ fn master_with_a_refused_allow_list(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2003,7 +3175,7 @@ fn report(config: &crate::config::schema::ConfigV1, id: &str) -> (Enforcement, S
 /// `plp-s3`: the inert arm used to be "carries a tag nothing else in the
 /// config has". Tags reach nothing now, so inertness has exactly one
 /// cause left and the fixture states it.
-const TWO_LISTS: &str = r#"schema_version = 3
+const TWO_LISTS: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2084,7 +3256,7 @@ fn only_the_inert_list_reaches_the_closing_note() {
 #[test]
 fn a_disabled_list_is_not_enforced_even_when_its_tags_match() {
     let (_dir, config) = load_master(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2137,7 +3309,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn an_untagged_allow_list_is_enforced_everywhere_not_inert() {
     let (_dir, config) = load_master(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2214,7 +3386,7 @@ fn the_closing_note_agrees_with_itself_in_the_singular() {
 #[test]
 fn a_list_no_profile_ignores_is_enforced_by_every_profile() {
     let (_dir, config) = load_master(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2257,7 +3429,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn a_list_every_profile_ignores_is_reported_inert() {
     let (_dir, config) = load_master(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -2302,7 +3474,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn a_partially_ignored_list_names_the_profiles_that_keep_it() {
     let (_dir, config) = load_master(
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"

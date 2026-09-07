@@ -1590,7 +1590,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         let mut f = std::fs::File::create(&master).unwrap();
         f.write_all(
-            br#"schema_version = 3
+            br#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]

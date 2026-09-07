@@ -12,7 +12,7 @@
 #   sudo ./scripts/install.sh --dry-run            # preview without changes
 #   sudo ./scripts/install.sh --upgrade            # update an existing install
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -170,6 +170,10 @@ BINARY_PATH=""
 UPGRADE="false"
 DRY_RUN="false"
 YES="false"
+# Saved once during upgrade preflight; later upgrade phases must not resolve
+# the master again after the transaction boundary.
+UPGRADE_CONFIG=""
+UPGRADE_TRANSACTION_FINALIZED="false"
 
 LOG_FILE=""
 LOG_TEE_PID=""
@@ -177,7 +181,7 @@ LOG_TEE_PID=""
 # ── Traps ─────────────────────────────────────────────────────────────
 # ERR: surface the failing line + what command ran.
 # INT/QUIT/TERM: clean Ctrl-C without a bash stack trace.
-trap 'rc=$?; err "installer failed at line ${BASH_LINENO[0]} (exit $rc)"; printf "\n  Last command: %s\n" "${BASH_COMMAND}" >&2; [[ -n $LOG_FILE ]] && printf "  Full log: %s\n" "$LOG_FILE" >&2; printf "  If reproducible, run with --dry-run first and share:\n    journalctl -u purge-warden -n 50 --no-pager\n\n" >&2; exit $rc' ERR
+trap 'rc=$?; err "installer failed at line ${BASH_LINENO[0]} (exit $rc)"; if [[ $UPGRADE_TRANSACTION_FINALIZED == "true" ]]; then printf "  The S6 candidate transaction already finalized; the candidate remains installed/running. Do not attempt config rollback or an old-daemon restart; repair this post-commit failure directly.\n" >&2; fi; printf "\n  Last command: %s\n" "${BASH_COMMAND}" >&2; [[ -n $LOG_FILE ]] && printf "  Full log: %s\n" "$LOG_FILE" >&2; printf "  If reproducible, run with --dry-run first and share:\n    journalctl -u purge-warden -n 50 --no-pager\n\n" >&2; exit $rc' ERR
 trap 'err "interrupted by user (signal)"; exit 130' INT QUIT TERM
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -644,19 +648,23 @@ preflight() {
 	# probing a Debian mirror on Fedora would test a name this install never
 	# resolves again, and pass or fail for the wrong reason.
 	local connectivity_host
-	if [[ $DISTRO_FAMILY == "rhel" ]]; then
+	if [[ $UPGRADE == "true" && $DRY_RUN == "true" ]]; then
+		log "upgrade preview: skipping DNS/network probe (the transaction preview is order-only)"
+	elif [[ $DISTRO_FAMILY == "rhel" ]]; then
 		connectivity_host="mirrors.fedoraproject.org"
 	else
 		connectivity_host="deb.debian.org"
 	fi
-	if ! timeout 5 getent hosts "$connectivity_host" >/dev/null 2>&1; then
+	if [[ $UPGRADE != "true" || $DRY_RUN != "true" ]] && ! timeout 5 getent hosts "$connectivity_host" >/dev/null 2>&1; then
 		err "cannot resolve $connectivity_host"
 		printf '\n  The installer needs internet to fetch %s packages and blocklist catalogs.\n' "$PKG_MGR"
 		printf '  Check your network: %sip -4 route show%s, %sip -4 addr show%s\n' "$C_D" "$C_R" "$C_D" "$C_R"
 		printf '  Check DNS:          %scat /etc/resolv.conf%s\n\n' "$C_D" "$C_R"
 		exit 1
 	fi
-	ok "DNS and network reachable ($connectivity_host)"
+	if [[ $UPGRADE != "true" || $DRY_RUN != "true" ]]; then
+		ok "DNS and network reachable ($connectivity_host)"
+	fi
 
 	# Detect + resolve port 53 conflict
 	if [[ $UPGRADE != "true" ]]; then
@@ -757,6 +765,9 @@ preflight() {
 	elif [[ $MODE == "build" ]]; then
 		ok "will build from source"
 	fi
+	if [[ $UPGRADE == "true" && $DRY_RUN == "true" && $MODE == "build" ]]; then
+		die "--upgrade --dry-run with --build-from-source cannot invent a candidate; pass an already executable --binary"
+	fi
 
 	[[ -f $UNIT_SRC ]] || die "systemd unit not found at $UNIT_SRC. Run from a purge-warden git checkout."
 	ok "unit file template: $UNIT_SRC"
@@ -825,16 +836,13 @@ classify_existing_install() {
 # exercised: preflight also detects the distro, resolves a binary source and
 # measures disk, none of which a gate can stand up.
 check_existing_install() {
-	local state
-	state=$(classify_existing_install)
-
 	if [[ $UPGRADE == "true" ]]; then
-		if [[ $state == "none" ]]; then
-			die "--upgrade requested but no existing install found (no $BINARY_DEST and no $UNIT_DEST)"
-		fi
-		ok "upgrade mode: existing install detected"
+		check_upgrade_prerequisites
 		return 0
 	fi
+
+	local state
+	state=$(classify_existing_install)
 
 	case $state in
 	none)
@@ -950,7 +958,11 @@ show_plan() {
 	# case left where the two can differ, and there NOTHING is at either
 	# warden path yet, so no resolution could have been better informed.
 	local plan_cfg
-	plan_cfg=$(resolve_installed_config) || plan_cfg="$CONFIG_PATH"
+	if [[ $UPGRADE == "true" ]]; then
+		plan_cfg="$UPGRADE_CONFIG"
+	else
+		plan_cfg=$(resolve_installed_config) || plan_cfg="$CONFIG_PATH"
+	fi
 	printf '  Config file: %s\n' "$plan_cfg"
 	printf '  LAN CIDR:    %s (→ server.allow_from)\n' "$LAN_CIDR"
 	printf '  Listen on:   %s\n' "$LISTEN"
@@ -1075,43 +1087,10 @@ install_binary() {
 	fi
 }
 
-# ── Phase 3.5: Validate any pre-existing config ───────────────────────
+# ── Phase 3.5: Validate a pre-existing fresh-install config ───────────
 
-# rev-2606 install-03/install-05: the old flow sed-patched pre-existing
-# configs (a v0 `lists =` shape the v2 loader hard-rejects, plus silent
-# no-op anchors). Replaced by an honest gate: lint the existing config
-# with the NEW binary BEFORE the running service is stopped, so a
-# config the new daemon would refuse aborts the install while LAN DNS
-# is still up. Fresh installs (no config) skip straight through —
-# warden init writes a complete config in Phase 5.
-# The candidate MUST come from resolve_installed_config, never from
-# $CONFIG_PATH alone. The daemon prefers /etc/purge-warden/config.toml and
-# only falls back to /var/lib, so a guard on $CONFIG_PATH returns early on
-# every /etc-master host — this gate lints NOTHING there, while Phase 5
-# then prints "keeping it (validated in Phase 3.5)" about a file it never
-# opened. A gate that reports green on the file it did not read is worse
-# than no gate: the operator stops the service on its word.
-#
-# Resolution happens BEFORE the --dry-run branch so the preview names the
-# file that would actually be linted (same principle as ensure_daemon_home).
-# NAME IS NARROWER THAN THE JOB, and deliberately kept — read this before
-# grepping for a "migrate" phase and concluding there isn't one.
-#
-# Since plp-s3b (R7) this does lint AND, when the lint fails, migrate v2->v3
-# and re-lint, via `upgrade_config_gate.sh`. Renaming it to match would touch
-# seventeen references in `check_install_config_resolution.sh` — a fence over
-# behaviour this change did not alter — so the rename is left for S4 and the
-# truth is written here instead.
-#
-# It still runs BEFORE `install_binary`, which is what stops the service, so
-# a refusal at any point leaves the running daemon and LAN DNS untouched.
-#
-# The migration writes `<config parent>/backups/pre-migration-*.toml` as
-# root, creating `backups/` at root's umask if it is absent. That is safe
-# only because Phase 6 (`prepare_backup_dir`) runs later and unconditionally
-# re-asserts `purge-warden:purge-warden` + 0750 on that directory — its own
-# comment says it exists to repair exactly this. The ORDER is what makes it
-# safe, and it is pinned by arm H of `check_upgrade_config_gate.sh`.
+# S6 migration is only for a complete running warden install.  Fresh setup
+# validates its selected master directly, before install_binary can mutate.
 lint_existing_config() {
 	local cfg
 	if ! cfg=$(resolve_installed_config); then
@@ -1121,39 +1100,15 @@ lint_existing_config() {
 	fi
 	step "Phase 3.5: Validate existing config against the new binary"
 	if [[ $DRY_RUN == "true" ]]; then
-		"$SCRIPT_DIR/upgrade_config_gate.sh" --binary "$BINARY_PATH" --config "$cfg" --dry-run
+		log "[dry] would lint existing config: $cfg"
 		return
 	fi
-	# The gate lints, and MIGRATES v2 -> v3 if the lint fails, then re-lints.
-	#
-	# It used to lint only, and print a `warden migrate ...` line for the
-	# operator to run. That form is one this repo has already paid for
-	# ("the installer verified the product and printed a command nobody
-	# ever ran"), and after the `SCHEMA_VERSION_V1` 2 -> 3 bump it stops
-	# being merely useless: EVERY config on disk fails the lint, so every
-	# upgrade would abort at Phase 3.5 with an instruction instead of an
-	# install. R7, `_docs/features/profile_list_policy.md` §6.1.
-	#
-	# Position is load-bearing and unchanged: this runs before
-	# `install_binary`, which is what stops the service. A refusal here
-	# leaves the running daemon — and LAN DNS — completely untouched.
-	#
-	# One implementation, shared with `make upgrade`, so the config-path
-	# resolution and the ordering exist once. `--config` is passed
-	# explicitly because `resolve_installed_config` has already run above:
-	# letting the gate resolve again could pick a different file than the
-	# one this function reported on, which is the exact defect the
-	# single-resolver rule was written for.
-	if "$SCRIPT_DIR/upgrade_config_gate.sh" --binary "$BINARY_PATH" --config "$cfg"; then
+	if "$BINARY_PATH" --config "$cfg" config lint; then
 		ok "existing config loads under the new binary: $cfg"
 	else
-		err "existing config at $cfg cannot be made loadable by the new binary"
-		printf '\n  The running service has NOT been touched, and the config was\n'
-		printf '  left unchanged unless the migration succeeded. Fix it first:\n'
-		printf '    - follow the suggestions printed above, or\n'
-		printf '    - pre-v2 configs: %swarden migrate v1-to-v3 --from-config %s --target %s --force%s\n' \
-			"$C_D" "$cfg" "$cfg" "$C_R"
-		printf '  then re-run this installer.\n\n'
+		err "existing config at $cfg is not loadable by the new binary"
+		printf '\n  No installer service action has run. Repair or migrate this config\n'
+		printf '  with its separately reviewed procedure, then re-run this installer.\n\n'
 		exit 6
 	fi
 }
@@ -1360,6 +1315,81 @@ resolve_installed_config() {
 	return 1
 }
 
+# Upgrade must not silently select a lower-precedence installation when the
+# higher master exists but has an unsupported type.  Fresh classification keeps
+# its historical `-f` behavior above so it can still identify repairable state.
+resolve_upgrade_config() {
+	local dir candidate
+	for candidate in /etc/purge-warden/config.toml "$CONFIG_PATH"; do
+		dir=$(dirname "$candidate")
+		if [[ $EUID -ne 0 && $DRY_RUN == "true" && -d $dir && ! -x $dir ]]; then
+			return 3
+		fi
+		if [[ -e $candidate || -L $candidate ]]; then
+			[[ -f $candidate && ! -L $candidate ]] || return 2
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# S6 accepts only a complete installed libexec layout.  Fresh-install
+# classification remains deliberately broader because it may repair a true
+# half-install; --upgrade must never create any missing prerequisite.
+legacy_purge_shield_present() {
+	local path root file
+	for path in \
+		/etc/systemd/system/purge-shield.service \
+		/etc/systemd/system/purge-shield-backup.service \
+		/etc/systemd/system/purge-shield-backup.timer \
+		/usr/local/bin/shield \
+		/etc/profile.d/purge-shield-wrapper.sh \
+		/etc/systemd/resolved.conf.d/purge-shield-no-stub.conf \
+		/etc/purge-shield /var/lib/purge-shield /run/purge-shield; do
+		[[ -e $path || -L $path ]] && return 0
+	done
+	id purge-shield >/dev/null 2>&1 && return 0
+	# Match the migrator's stale-path class across the active config trees, not
+	# merely the chosen master: included TOML can still point at the old tree.
+	for root in /etc/purge-warden /var/lib/purge-warden; do
+		[[ -d $root ]] || continue
+		while IFS= read -r -d '' file; do
+			grep -qE '/(etc|var/lib|run)/purge-shield([/"[:space:]]|$)' "$file" 2>/dev/null && return 0
+		done < <(find "$root" \( -path "$root/backups" -o -path "$root/lists" -o -path "$root/data" \) -prune -o -type f -name '*.toml' -print0)
+	done
+	return 1
+}
+
+check_upgrade_prerequisites() {
+	if [[ ! -f $BINARY_DEST || -L $BINARY_DEST || ! -x $BINARY_DEST ]] || ! is_elf_binary "$BINARY_DEST"; then
+		if [[ -f $WRAPPER_DEST && ! -L $WRAPPER_DEST ]] && is_elf_binary "$WRAPPER_DEST"; then
+			die "--upgrade refuses the pre-libexec raw-ELF layout at $WRAPPER_DEST; perform the separately reviewed legacy layout conversion first"
+		fi
+		die "--upgrade requires the current executable libexec ELF at $BINARY_DEST; this is a binary-only or partial installation requiring inspection (use a fresh install only to repair a true half-install)"
+	fi
+	local required
+	for required in "$UNIT_DEST" "$BACKUP_UNIT_DEST" "$BACKUP_TIMER_DEST"; do
+		[[ -f $required && ! -L $required ]] || die "--upgrade requires the installed regular unit $required; this partial installation requires inspection"
+	done
+	local resolve_rc=0
+	UPGRADE_CONFIG=$(resolve_upgrade_config) || resolve_rc=$?
+	if [[ $resolve_rc -eq 3 ]]; then
+		die "cannot determine the installed master; rerun the preview with sudo"
+	elif [[ $resolve_rc -eq 2 ]]; then
+		die "--upgrade refuses an unsupported higher-priority master; inspect or repair it before this transaction"
+	elif [[ $resolve_rc -ne 0 ]]; then
+		if [[ $DRY_RUN == "true" ]] && config_may_be_hidden; then
+			die "cannot determine the installed master; rerun the preview with sudo"
+		fi
+		die "--upgrade requires one installed regular master config in /etc/purge-warden or $CONFIG_PATH; this partial installation requires inspection"
+	fi
+	if legacy_purge_shield_present; then
+		die "--upgrade refuses purge-shield artifacts or stale paths; complete the separately reviewed legacy product/layout conversion first"
+	fi
+	ok "upgrade mode: complete S6 layout detected; master: $UPGRADE_CONFIG"
+}
+
 # Could a config be there that this process simply cannot SEE?
 #
 # `[[ -f x ]]` is false for "no such file" AND for "permission denied on the
@@ -1385,7 +1415,7 @@ config_may_be_hidden() {
 	[[ $EUID -eq 0 ]] && return 1
 	local dir
 	for dir in /etc/purge-warden "$(dirname "$CONFIG_PATH")"; do
-		[[ -d $dir && ! -r $dir ]] && return 0
+		[[ -d $dir && ! -x $dir ]] && return 0
 	done
 	return 1
 }
@@ -1410,8 +1440,8 @@ config_may_be_hidden() {
 ensure_admin_token() {
 	step "Phase 5.7: Admin token"
 
-	local cfg
-	if ! cfg=$(resolve_installed_config); then
+	local cfg="${1:-}"
+	if [[ -z $cfg ]] && ! cfg=$(resolve_installed_config); then
 		warn "no config found — skipping token generation"
 		return 0
 	fi
@@ -1481,8 +1511,8 @@ prepare_backup_dir() {
 	# has written any config, and `--dry-run` on a clean machine has to
 	# work. There the real run would create $CONFIG_PATH, so that is the
 	# parent to show.
-	local cfg
-	if ! cfg=$(resolve_installed_config); then
+	local cfg="${1:-}"
+	if [[ -z $cfg ]] && ! cfg=$(resolve_installed_config); then
 		if [[ $DRY_RUN == "true" ]]; then
 			cfg="$CONFIG_PATH"
 		else
@@ -1566,11 +1596,34 @@ install_unit() {
 	# backup --auto`, which honours `[backup] auto_interval` and exits
 	# 0 cleanly when not due / disabled / unset. Editing the TOML
 	# takes effect on the next hourly tick — no daemon-reload needed.
-	run install -m 0644 "$BACKUP_UNIT_SRC" "$BACKUP_UNIT_DEST"
-	run install -m 0644 "$BACKUP_TIMER_SRC" "$BACKUP_TIMER_DEST"
+	install_backup_unit_files
 	run systemctl daemon-reload
 	run systemctl enable --now purge-warden-backup.timer
 	ok "purge-warden-backup.timer enabled (hourly wakeup, gated by [backup] auto_interval)"
+}
+
+# File-copy half shared by fresh orchestration and the post-finalize upgrade
+# refresh. It controls no unit state.
+install_backup_unit_files() {
+	run install -m 0644 "$BACKUP_UNIT_SRC" "$BACKUP_UNIT_DEST"
+	restore_selinux_context "$BACKUP_UNIT_DEST"
+	run install -m 0644 "$BACKUP_TIMER_SRC" "$BACKUP_TIMER_DEST"
+	restore_selinux_context "$BACKUP_TIMER_DEST"
+}
+
+refresh_backup_units_after_upgrade() {
+	step "Post-commit: refresh backup unit files"
+	local source dest
+	for source in "$BACKUP_UNIT_SRC" "$BACKUP_TIMER_SRC"; do
+		if [[ $source == "$BACKUP_UNIT_SRC" ]]; then dest=$BACKUP_UNIT_DEST; else dest=$BACKUP_TIMER_DEST; fi
+		if cmp -s "$source" "$dest"; then
+			ok "backup unit unchanged: $dest"
+		else
+			warn "backup unit differs from repo copy — updating after finalized transaction: $dest"
+		fi
+	done
+	install_backup_unit_files
+	run systemctl daemon-reload
 }
 
 # ── Phase 7.5: Install the operator wrapper (§4.40) ───────────────────
@@ -2229,6 +2282,23 @@ migrate_existing_install() {
 	fi
 }
 
+run_upgrade_transaction() {
+	local args=(--binary "$BINARY_PATH" --config "$UPGRADE_CONFIG")
+	[[ $DRY_RUN == "true" ]] && args+=(--dry-run)
+	"$SCRIPT_DIR/upgrade_config_gate.sh" "${args[@]}"
+}
+
+refuse_unsafe_fresh_legacy_conversion() {
+	if [[ $DRY_RUN != "true" ]] && legacy_purge_shield_present; then
+		die "fresh install refuses to combine purge-shield conversion with the S6 v3-only transaction; complete the separately reviewed legacy conversion/migration prerequisite before installing warden"
+	fi
+}
+
+prepare_fresh_install() {
+	refuse_unsafe_fresh_legacy_conversion
+	migrate_existing_install
+}
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 main() {
@@ -2355,6 +2425,11 @@ main() {
 		warn "DRY RUN — no changes will be made"
 	fi
 
+	# Refuse before preflight can reconfigure systemd-resolved. Dry-run keeps
+	# the converter's read-only preview available.
+	if [[ $UPGRADE != "true" ]]; then
+		refuse_unsafe_fresh_legacy_conversion
+	fi
 	preflight
 	show_plan
 	show_disclaimer
@@ -2378,27 +2453,49 @@ main() {
 		fi
 	fi
 
-	migrate_existing_install
-	install_runtime_deps
-	if [[ $MODE == "build" ]]; then
-		install_build_deps
-		build_binary
+	if [[ $UPGRADE == "true" ]]; then
+		if [[ $DRY_RUN == "true" ]]; then
+			step "S6 upgrade preview"
+			log "previewing transaction order only; no v3-readiness, health, or finalization claim is made"
+			run_upgrade_transaction
+			log "[dry] after a successful transaction, would repair daemon home/token/backup directory, refresh backup unit files, and refresh the operator wrapper"
+		else
+			install_runtime_deps
+			if [[ $MODE == "build" ]]; then
+				install_build_deps
+				build_binary
+			fi
+			run_upgrade_transaction
+			UPGRADE_TRANSACTION_FINALIZED="true"
+			ensure_daemon_home
+			migrate_admin_token_to_fhs
+			ensure_admin_token "$UPGRADE_CONFIG"
+			prepare_backup_dir "$UPGRADE_CONFIG"
+			refresh_backup_units_after_upgrade
+			install_operator_wrapper
+			verify_operator_path
+			print_next_steps
+		fi
+	else
+		prepare_fresh_install
+		install_runtime_deps
+		if [[ $MODE == "build" ]]; then
+			install_build_deps
+			build_binary
+		fi
+		lint_existing_config
+		install_binary
+		run_warden_init
+		ensure_daemon_home
+		migrate_admin_token_to_fhs
+		ensure_admin_token
+		prepare_backup_dir
+		install_unit
+		install_operator_wrapper
+		verify
+		verify_operator_path
+		print_next_steps
 	fi
-	# Lint any pre-existing config with the NEW binary BEFORE
-	# install_binary stops the running service — a refused config must
-	# abort the upgrade while LAN DNS is still answering.
-	lint_existing_config
-	install_binary
-	run_warden_init
-	ensure_daemon_home
-	migrate_admin_token_to_fhs
-	ensure_admin_token
-	prepare_backup_dir
-	install_unit
-	install_operator_wrapper
-	verify
-	verify_operator_path
-	print_next_steps
 
 	# Drain the tee subprocess so the log captures every byte we wrote.
 	# Closing fd 1/2 sends EOF to the FIFO; wait joins on tee's exit.

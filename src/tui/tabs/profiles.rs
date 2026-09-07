@@ -865,7 +865,7 @@ mod tests {
         // the fixture via TOML — the same pattern the Local DNS tab
         // tests use. A device + a subnet both reference "kids".
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -994,7 +994,7 @@ profile = "kids"
     /// `block_all`, which supersedes list resolution entirely.
     fn mk_blocks_config() -> ConfigV1 {
         let toml_src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 servers = ["1.1.1.1"]

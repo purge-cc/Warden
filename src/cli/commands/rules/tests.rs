@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::symlink;
 
 fn tmpdir() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -11,7 +12,7 @@ fn write_minimal_master(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -32,7 +33,7 @@ fn write_master_with_device_and_kids(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -61,6 +62,12 @@ servers = ["192.0.2.1:53"]
     )
     .unwrap();
     master
+}
+
+fn dot_symlink_to(dir: &Path, master: &Path) -> PathBuf {
+    let alias = dir.join(".").join("master-alias.toml");
+    symlink(master, &alias).unwrap();
+    alias
 }
 
 // ── frozen string pins ────────────────────────────────────────────
@@ -210,11 +217,12 @@ fn rules_shares_the_profile_resolution_seat() {
 /// the operator writing a path when the cheaper answer is to look at
 /// which profiles exist.
 #[test]
-fn locate_profile_file_not_found_points_at_profile_list() {
+fn locked_profile_owner_lookup_not_found_points_at_profile_list() {
     let dir = tmpdir();
     let master = write_minimal_master(dir.path());
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
 
-    let err = locate_profile_file(&master, "ghost", None)
+    let err = find_profile_target_file_locked(&guard, &master, "ghost")
         .unwrap_err()
         .to_string();
 
@@ -232,23 +240,6 @@ fn locate_profile_file_not_found_points_at_profile_list() {
     );
 }
 
-/// Trip-wire: a private walk re-inlined here can satisfy every
-/// assertion above and still split the wording in two.
-#[test]
-fn locate_profile_file_not_found_is_the_seats_own_text() {
-    let dir = tmpdir();
-    let master = write_minimal_master(dir.path());
-
-    let mine = locate_profile_file(&master, "ghost", None)
-        .unwrap_err()
-        .to_string();
-    let seat = find_profile_target_file(&master, "ghost")
-        .unwrap_err()
-        .to_string();
-
-    assert_eq!(mine, seat);
-}
-
 /// The seat lives in the `local-dns` module, so wiring it up with that
 /// module's renderer is a one-token slip that compiles. This verb's
 /// operator text must survive the move.
@@ -256,12 +247,65 @@ fn locate_profile_file_not_found_is_the_seats_own_text() {
 fn resolve_scope_target_unknown_profile_keeps_this_verbs_wording() {
     let dir = tmpdir();
     let master = write_minimal_master(dir.path());
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
 
-    let err = resolve_scope_target(&master, &Scope::Profile("ghost"), None)
+    let err = resolve_scope_target_locked(&guard, &master, &Scope::Profile("ghost"), None)
         .unwrap_err()
         .to_string();
 
     assert_eq!(err, format_rules_profile_not_found("ghost", &[]));
+}
+
+#[test]
+fn guarded_add_updates_a_legacy_clients_owner_and_reference() {
+    let dir = tmpdir();
+    let master = dir.path().join("config.toml");
+    std::fs::write(
+        &master,
+        r#"schema_version = 4
+
+[server]
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+admin_rules = []
+
+[[clients]]
+id = "legacy-phone"
+display_name = "Legacy phone"
+ip = "10.0.0.8"
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#,
+    )
+    .unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+
+    let outcome = add_inner_locked(
+        &guard,
+        &master,
+        Scope::Device("legacy-phone"),
+        Action::Deny,
+        "legacy.example",
+        Some("legacy-rule"),
+        None,
+    )
+    .unwrap();
+
+    assert!(matches!(outcome, ChangeOutcome::Applied(_)));
+    drop(guard);
+    let raw = std::fs::read_to_string(&master).unwrap();
+    assert!(raw.contains("[[clients]]"));
+    assert!(raw.contains("deny_rules = [\"legacy-rule\"]"));
+    let cfg = load_config(&master, OffsetDateTime::now_utc())
+        .unwrap()
+        .config;
+    assert!(cfg.devices.iter().any(|d| {
+        d.id.as_str() == "legacy-phone"
+            && d.deny_rules.iter().any(|id| id.as_str() == "legacy-rule")
+    }));
 }
 
 // ── action helpers ────────────────────────────────────────────────
@@ -473,7 +517,7 @@ fn add_inner_default_scope_errors_when_default_profile_unset() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 
@@ -529,7 +573,7 @@ fn add_inner_device_allow_succeeds_after_override_flag_set() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -613,7 +657,7 @@ fn add_inner_group_scope_resolves_to_groups_profile() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -666,7 +710,7 @@ fn add_inner_subnet_by_id_resolves() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -714,7 +758,7 @@ fn add_inner_subnet_by_cidr_resolves() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -796,7 +840,7 @@ fn write_master_with_two_rules_on_one_domain(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1029,7 +1073,7 @@ fn remove_inner_keeps_admin_rule_when_other_entity_still_references_it() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1134,7 +1178,7 @@ fn undo_inner_drops_device_reference_too() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1191,7 +1235,7 @@ fn undo_inner_drops_admin_rule_row_from_rules_d_slice() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["rules.d/*.toml"]
 
 [server]
@@ -1274,7 +1318,7 @@ fn undo_inner_reaches_a_non_conventional_declared_include() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["custom/*.toml"]
 
 [server]
@@ -1342,7 +1386,7 @@ fn undo_inner_pops_master_row_not_rules_d_slice() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 includes = ["rules.d/*.toml"]
 
 [server]
@@ -1581,7 +1625,7 @@ fn cli_mutation_audit_persists_device_rules_prune() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1629,7 +1673,7 @@ fn prune_inner_drops_dangling_ids_from_device() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1744,7 +1788,7 @@ fn prune_inner_clean_when_no_dangling_ids() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1804,7 +1848,7 @@ fn write_master_for_rule_helpers(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [server]
 default_profile = "default"
@@ -1969,7 +2013,7 @@ async fn move_admin_rule_action_flip_reverts_on_step2_failure() {
     let master = dir.path().join("config.toml");
 
     let mut s = String::from(
-        "schema_version = 3\n\n[server]\ndefault_profile = \"default\"\n\n\
+        "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\nadmin_rules = [\"victim\"]\n\n\
          [[admin_rules]]\nid = \"victim\"\nrule = \"||victim.example^\"\n\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     );
@@ -2066,6 +2110,81 @@ async fn remove_admin_rule_by_id_drops_master_and_all_refs() {
         !device.deny_rules.iter().any(|i| i.as_str() == "test-rule"),
         "device ref must be gone"
     );
+}
+
+/// The requested master spelling is `./` plus a symlink, while owner lookup
+/// reports the canonical file. Every monolithic compound branch must treat
+/// those as one staged member.
+#[tokio::test]
+async fn monolithic_compound_rules_share_a_dot_symlink_master_identity() {
+    let dir = tmpdir();
+    let master = write_master_for_rule_helpers(dir.path());
+    let alias = dot_symlink_to(dir.path(), &master);
+    let socket = dir.path().join("ghost.sock");
+
+    let added = add_inner(
+        &alias,
+        Scope::Device("iphone"),
+        Action::Allow,
+        "added.example",
+        Some("added-rule"),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(added, ChangeOutcome::Applied(_)));
+
+    let removed = remove_inner(
+        &alias,
+        Scope::Device("iphone"),
+        Action::Allow,
+        "added.example",
+        None,
+    )
+    .unwrap();
+    assert!(matches!(removed, RemoveOutcome::Removed(_)));
+
+    let moved = move_admin_rule(
+        &alias,
+        &socket,
+        "test-rule",
+        Scope::Device("iphone"),
+        Action::Deny,
+        Scope::Device("iphone"),
+        Action::Allow,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        moved,
+        MoveOutcome::Applied {
+            master_rewritten: true,
+            ..
+        }
+    ));
+
+    let removed_by_id = remove_admin_rule_by_id(&alias, &socket, "test-rule")
+        .await
+        .unwrap();
+    assert!(matches!(
+        removed_by_id,
+        RemoveByIdOutcome::Removed { n_refs: 1, .. }
+    ));
+
+    let cfg = load_config(&master, OffsetDateTime::now_utc())
+        .unwrap()
+        .config;
+    assert!(!cfg
+        .admin_rules
+        .iter()
+        .any(|r| r.id.as_str() == "added-rule"));
+    assert!(!cfg.admin_rules.iter().any(|r| r.id.as_str() == "test-rule"));
+    let iphone = cfg
+        .devices
+        .iter()
+        .find(|d| d.id.as_str() == "iphone")
+        .unwrap();
+    assert!(iphone.allow_rules.is_empty());
+    assert!(iphone.deny_rules.is_empty());
 }
 
 #[tokio::test]

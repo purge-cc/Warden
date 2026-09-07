@@ -385,7 +385,7 @@ fn value_eq<T: serde::Serialize>(a: &T, b: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::writer::write_config_v1;
+    use crate::config::writer::write_config_v1_locked;
 
     fn load(src: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -394,7 +394,7 @@ mod tests {
         (dir, path)
     }
 
-    const BASE: &str = r#"schema_version = 3
+    const BASE: &str = r#"schema_version = 4
 
 [server]
 listen = "127.0.0.1:15353"
@@ -492,7 +492,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
     }
 
     #[test]
-    fn diff_roundtrips_via_write_config_v1() {
+    fn diff_roundtrips_via_guarded_v1_writer() {
         // Loading, writing via v1 writer, then reloading should produce
         // a config that diffs clean against itself.
         let (_d1, p1) = load(BASE);
@@ -500,7 +500,9 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         let loaded = loader::load_config(&p1, now).unwrap();
         let d2 = tempfile::tempdir().unwrap();
         let p2 = d2.path().join("config.toml");
-        write_config_v1(&p2, &loaded.config).unwrap();
+        let guard = crate::config::write_lock::acquire_for_write(&p2).unwrap();
+        write_config_v1_locked(&guard, &p2, &loaded.config).unwrap();
+        drop(guard);
         let rc = run_diff(&p1, &p2).unwrap();
         assert_eq!(rc, SUCCESS, "writer roundtrip must diff clean");
     }

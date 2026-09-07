@@ -41,7 +41,7 @@ const PROFILE_GUEST: &str = "guest";
 /// Build the 100-device synthetic config as an in-memory `ConfigV1`.
 fn build_synthetic_config() -> ConfigV1 {
     let mut config = ConfigV1 {
-        schema_version: 3,
+        schema_version: 4,
         ..Default::default()
     };
 
@@ -78,8 +78,8 @@ fn build_synthetic_config() -> ConfigV1 {
             } else {
                 BlocklistFormat::Domains
             },
-            update_interval_hours: 12,
-            max_entries: 5_000_000,
+            update_interval_hours: None,
+            max_entries: None,
             enabled: true,
             auth_token_ref: None,
             base: Default::default(),

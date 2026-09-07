@@ -121,7 +121,7 @@ mod tests {
 
     fn config() -> ConfigV1 {
         ConfigV1 {
-            schema_version: 3,
+            schema_version: 4,
             ..Default::default()
         }
     }

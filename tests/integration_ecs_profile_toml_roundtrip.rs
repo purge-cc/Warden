@@ -31,7 +31,7 @@ fn now() -> OffsetDateTime {
 #[test]
 fn profile_ecs_full_subtable_roundtrips_via_toml() {
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "doh"
@@ -72,7 +72,7 @@ fn profile_ecs_partial_override_inherits_per_field_from_upstream() {
     // Profile sets mode only; source_prefix_* inherit from upstream
     // defaults. Mirrors the D7 inheritance contract at the TOML edge.
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "doh"
@@ -111,7 +111,7 @@ fn profile_ecs_master_kill_switch_overrides_profile_via_toml() {
     // profile resolves to `EcsPolicy::OFF`. Operator emergency stop
     // sanity at the TOML edge.
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "doh"
@@ -139,7 +139,7 @@ source_prefix_v6 = 56
 fn profile_ecs_absent_subtable_inherits_upstream_defaults_fully() {
     // Profile carries no `[profile.X.ecs]` — every field inherits.
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "doh"
@@ -169,7 +169,7 @@ fn profile_ecs_subnet_out_of_range_prefix_v4_is_rejected_via_validator() {
     // The frozen-strings test pins the operator-facing text; this
     // pins the validator + TOML parse interaction.
     let src = r#"
-schema_version = 3
+schema_version = 4
 
 [upstream]
 mode = "doh"

@@ -31,7 +31,7 @@ fn now() -> time::OffsetDateTime {
 fn config_with(snippet: &str) -> String {
     format!(
         r#"
-schema_version = 3
+schema_version = 4
 
 [server]
 default_profile = "default"

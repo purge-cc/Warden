@@ -229,12 +229,75 @@ async fn metrics_names_the_corpus_series_on_a_healthy_daemon() {
         "purge_warden_lists_corpus_ceiling 0",
         "purge_warden_lists_corpus_refused_cycles 0",
         "purge_warden_lists_corpus_frozen_since_seconds 0",
+        "purge_warden_lists_source_coverage_incomplete 0",
+        "purge_warden_lists_generation_degraded 0",
     ] {
         assert!(
             body.contains(series),
             "healthy scrape is missing `{series}`:\n{body}"
         );
     }
+}
+
+#[tokio::test]
+async fn metrics_distinguish_hot_coverage_hold_from_cold_partial_install() {
+    let state = test_state_with_blocklists();
+    let reg = state.list_statuses.as_ref().unwrap();
+
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::SpillRollbackFailed,
+        true,
+        true,
+        123,
+    );
+    let hot = read_body_text(metrics(State(state.clone())).await.into_response()).await;
+    assert!(
+        hot.contains("purge_warden_lists_source_coverage_incomplete 1"),
+        "{hot}"
+    );
+    assert!(
+        hot.contains("purge_warden_lists_generation_degraded 1"),
+        "{hot}"
+    );
+
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        true,
+        false,
+        123,
+    );
+    let cold = read_body_text(metrics(State(state)).await.into_response()).await;
+    assert!(
+        cold.contains("purge_warden_lists_source_coverage_incomplete 1"),
+        "{cold}"
+    );
+    assert!(
+        cold.contains("purge_warden_lists_generation_degraded 0"),
+        "{cold}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_publish_cap_refusal_counts_with_the_frozen_metric_names() {
+    let state = test_state_with_blocklists();
+    let registry = state.list_statuses.as_ref().unwrap();
+    registry.update_for_url(
+        "privacy/ads",
+        ListStatus::from_cap_refusal(None, 10, 3, time::OffsetDateTime::now_utc()),
+    );
+    registry.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        0,
+    );
+
+    let body = read_body_text(metrics(State(state)).await.into_response()).await;
+    assert!(body.contains("purge_warden_lists_truncated 1"), "{body}");
+    assert!(
+        body.contains("purge_warden_list_truncated_entries{source=\"privacy/ads\"} 3"),
+        "{body}"
+    );
 }
 
 /// The frozen-string fence on the two names a dashboard and an alert
@@ -255,6 +318,7 @@ async fn metrics_names_a_frozen_corpus_with_its_age_and_its_streak() {
         ceiling: 14_000_000,
         novel_by_source: vec![],
     }));
+    reg.record_cycle_with_qualifiers(crate::lists::status::CycleOutcome::Refused, false, false, 0);
 
     let body = read_body_text(metrics(State(state.clone())).await.into_response()).await;
     assert!(
@@ -283,6 +347,12 @@ async fn metrics_names_a_frozen_corpus_with_its_age_and_its_streak() {
     // a scraper that only sees gaps.
     reg.note_installed_cycle();
     reg.set_corpus_refusal(None);
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        0,
+    );
     let after = read_body_text(metrics(State(state)).await.into_response()).await;
     assert!(
         after.contains("purge_warden_lists_corpus_refused_cycles 0"),
@@ -315,7 +385,7 @@ async fn api_status_names_a_refused_and_frozen_corpus() {
         ceiling: 14_000_000,
         novel_by_source: vec![("security/malicious".to_string(), 4_000_000)],
     }));
-    reg.record_cycle(crate::lists::status::CycleOutcome::Refused);
+    reg.record_cycle_with_qualifiers(crate::lists::status::CycleOutcome::Refused, false, false, 0);
 
     let body = read_body_json(get_status(State(state)).await.into_response()).await;
     assert_eq!(body["lists_corpus_refusal"]["unique"], 15_012_024_u64);
@@ -345,6 +415,38 @@ async fn api_status_publishes_the_corpus_keys_when_healthy() {
     assert!(body["lists_corpus_freeze"].is_null(), "{body}");
 }
 
+#[tokio::test]
+async fn api_and_metrics_use_completed_registry_domain_count() {
+    let state = test_state_with_blocklists();
+    let reg = state.list_statuses.as_ref().expect("registry wired");
+    // The fixture engine is empty. A completed manager generation is the
+    // authoritative status view until the next manager publication.
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        321,
+    );
+
+    let api = read_body_json(get_status(State(state.clone())).await.into_response()).await;
+    assert_eq!(api["domain_count"], 321_u64);
+    let metrics_body = read_body_text(metrics(State(state.clone())).await.into_response()).await;
+    assert!(
+        metrics_body.contains("purge_warden_domains_loaded 321"),
+        "{metrics_body}"
+    );
+
+    // A config-only outcome must retain the completed generation's count.
+    reg.record_cycle(crate::lists::status::CycleOutcome::ConfigRejected);
+    let api = read_body_json(get_status(State(state.clone())).await.into_response()).await;
+    assert_eq!(api["domain_count"], 321_u64);
+    let metrics_body = read_body_text(metrics(State(state)).await.into_response()).await;
+    assert!(
+        metrics_body.contains("purge_warden_domains_loaded 321"),
+        "{metrics_body}"
+    );
+}
+
 /// §4.2 G1a — `GET /api/query/{domain}` carries block attribution.
 /// A default profile with `block_all` blocks every name via the
 /// admin layer → `blocked_by = "admin_block"` present in the JSON.
@@ -354,7 +456,7 @@ async fn query_domain_reports_block_source() {
     use crate::profiles::ProfileResolver;
 
     let mut config = ConfigV1 {
-        schema_version: 3,
+        schema_version: 4,
         ..Default::default()
     };
     config.profiles.insert(
@@ -431,6 +533,89 @@ async fn blocklist_stats_returns_200_with_dto_on_exact_match() {
 }
 
 #[tokio::test]
+async fn blocklist_stats_plan_aliases_return_the_canonical_response_identity() {
+    use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust, Id};
+    use crate::lists::catalog::Catalog;
+    use crate::lists::source_key::ResolvedSourcePlan;
+    use std::collections::BTreeMap;
+
+    let row = Blocklist {
+        id: Id::new("team-ads").unwrap(),
+        display_name: "Team ads".to_string(),
+        url: "https://example.test/team-ads.txt".to_string(),
+        format: BlocklistFormat::Domains,
+        update_interval_hours: None,
+        max_entries: None,
+        enabled: true,
+        auth_token_ref: None,
+        base: BlocklistBase::Deny,
+        trust: BlocklistTrust::RemoteUnsigned,
+        accept_unsigned_allow: false,
+        max_consecutive_failures: 5,
+    };
+    let plan = ResolvedSourcePlan::build(
+        &Catalog::fallback(),
+        &["team/ads".to_string()],
+        &[row],
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let registry = Arc::new(ListStatusRegistry::from_plan(&plan));
+    registry.update_for_url(
+        "team/ads",
+        ListStatus::from_refresh(
+            7,
+            ParsedCounts::default(),
+            None,
+            time::OffsetDateTime::now_utc(),
+        ),
+    );
+    let cache = DnsCache::new(&CacheConfig::default());
+    let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(1);
+    let state = Arc::new(ApiState {
+        filter: Arc::new(FilterEngine::new()),
+        cache,
+        profiles: None,
+        stats: None,
+        config_path: "/tmp/test-config.toml".into(),
+        token_hash: String::new(),
+        rate_limiter: AuthRateLimiter::new(),
+        api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
+        reload_tx,
+        started_at: Instant::now(),
+        upstream: None,
+        listen_addr: "127.0.0.1:15353".into(),
+        upstream_mode: "plain".into(),
+        upstream_count: 0,
+        list_count: 1,
+        list_statuses: Some(registry),
+        list_labels: Arc::new(vec![None; 64]),
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(feature = "cluster")]
+        cluster: None,
+        #[cfg(feature = "cluster")]
+        cluster_observe: None,
+    });
+
+    for alias in [
+        "team/ads",
+        "team-ads",
+        "https://example.test/team-ads.txt",
+        "https://EXAMPLE.test:443/team-ads.txt/",
+    ] {
+        let response = get_blocklist_stats(State(state.clone()), Path(alias.to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "alias {alias}");
+        let body: BlocklistStatusDto =
+            serde_json::from_value(read_body_json(response).await).unwrap();
+        assert_eq!(body.source, "team/ads", "alias {alias}");
+        assert_eq!(body.id.as_deref(), Some("team-ads"), "alias {alias}");
+        assert_eq!(body.entries, 7, "alias {alias}");
+    }
+}
+
+#[tokio::test]
 async fn blocklist_stats_returns_404_for_unknown_id() {
     let state = test_state_with_blocklists();
     let app = Router::new()
@@ -451,11 +636,7 @@ async fn blocklist_stats_returns_404_for_unknown_id() {
 
 #[tokio::test]
 async fn blocklist_stats_returns_503_when_no_registry() {
-    // Daemon started with no `[lists].sources` → registry is None.
-    // Surface as 503 with an explanatory error rather than 200 of
-    // an empty list (which would mislead the operator into thinking
-    // their config has zero sources rather than telemetry being
-    // unavailable).
+    // `None` remains valid for compatibility and focused test construction.
     let state = test_state_no_blocklists();
     let app = Router::new()
         .route("/api/blocklists/{id}/stats", get(get_blocklist_stats))
@@ -718,7 +899,7 @@ async fn add_list_returns_400_on_overlong_id_via_router() {
     // so the config write lock is never touched. Mirrors the M-42
     // security guarantee at the trust boundary, not just the unit
     // level.
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "m42-overlong-id");
     let state = test_state_with_config_path(path.clone());
     let app = Router::new()
@@ -778,11 +959,18 @@ fn load_v1(path: &std::path::Path) -> crate::config::schema::ConfigV1 {
 ///    assertion);
 ///  - shares an isolated, fresh `config_write_lock`.
 fn test_state_with_config_path(path: std::path::PathBuf) -> Arc<ApiState> {
-    let cache = DnsCache::new(&CacheConfig::default());
-    let filter = Arc::new(FilterEngine::new());
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<Option<u32>>(1);
     // Detach a drain task so the receiver outlives the helper return.
     tokio::spawn(async move { while reload_rx.recv().await.is_some() {} });
+    test_state_with_config_path_and_reload(path, reload_tx)
+}
+
+fn test_state_with_config_path_and_reload(
+    path: std::path::PathBuf,
+    reload_tx: tokio::sync::mpsc::Sender<Option<u32>>,
+) -> Arc<ApiState> {
+    let cache = DnsCache::new(&CacheConfig::default());
+    let filter = Arc::new(FilterEngine::new());
     Arc::new(ApiState {
         filter,
         cache,
@@ -809,6 +997,13 @@ fn test_state_with_config_path(path: std::path::PathBuf) -> Arc<ApiState> {
     })
 }
 
+fn metadata_identity(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
 /// rev-2606 §07 A2: `GET /api/config` must star BOTH bearer-token
 /// hashes — `cluster.token_hash` used to ship verbatim while
 /// `api.token_hash` beside it was redacted. Asserts no 64-hex secret
@@ -818,7 +1013,7 @@ async fn get_config_redacts_cluster_token_hash() {
     let api_hash = "a".repeat(64);
     let cluster_hash = "b".repeat(64);
     let initial = format!(
-        "schema_version = 3\n\n[api]\ntoken_hash = \"{api_hash}\"\n\n\
+        "schema_version = 4\n\n[api]\ntoken_hash = \"{api_hash}\"\n\n\
          [cluster]\ntoken_hash = \"{cluster_hash}\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
     );
     let path = api_mutation_temp_config(&initial, "a2-redaction");
@@ -845,7 +1040,7 @@ async fn get_config_redacts_cluster_token_hash() {
 async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
     // Mirrors the IPC concurrency regression test
     // (`client_add_concurrent_calls_serialize_through_write_lock`).
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h15-concurrent");
     let state = test_state_with_config_path(path.clone());
 
@@ -898,6 +1093,438 @@ async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
     std::fs::remove_file(&path).ok();
 }
 
+#[tokio::test]
+async fn list_edit_preconditions_preserve_disk_and_skip_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let master = temp.path().join("config.toml");
+    let initial = "# preserve this\nschema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[lists]\nsources = [\"privacy/ads\"]\n";
+    std::fs::write(&master, initial).unwrap();
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+    let state = test_state_with_config_path_and_reload(master.clone(), reload_tx);
+
+    assert_eq!(
+        add_list(
+            State(state.clone()),
+            Json(ListBody {
+                id: "privacy/ads".into(),
+            }),
+        )
+        .await
+        .into_response()
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), initial);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reload_rx.recv())
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        remove_list(
+            State(state.clone()),
+            Json(ListBody {
+                id: "privacy/missing".into(),
+            }),
+        )
+        .await
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), initial);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reload_rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn list_edits_preserve_includes_in_a_multi_file_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("devices.d")).unwrap();
+    std::fs::create_dir_all(root.join("profiles.d")).unwrap();
+    let device = root.join("devices.d/router.toml");
+    let profile = root.join("profiles.d/default.toml");
+    std::fs::write(
+        &device,
+        "# device comment\n[[devices]]\nid = \"router\"\ndisplay_name = \"Router\"\nip = \"192.0.2.2\"\nprofile = \"default\"\n",
+    )
+    .unwrap();
+    std::fs::write(&profile, "[profiles.default]\ndisplay_name = \"Default\"\n").unwrap();
+    let master = root.join("config.toml");
+    std::fs::write(
+        &master,
+        "# master comment\nschema_version = 4\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let device_before = (std::fs::read(&device).unwrap(), metadata_identity(&device));
+    let profile_before = (
+        std::fs::read(&profile).unwrap(),
+        metadata_identity(&profile),
+    );
+    let state = test_state_with_config_path(master.clone());
+    let source = "https://example.com/multi-file.txt";
+
+    assert_eq!(
+        add_list(State(state.clone()), Json(ListBody { id: source.into() }),)
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        remove_list(State(state), Json(ListBody { id: source.into() }),)
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+
+    let master_after = std::fs::read_to_string(&master).unwrap();
+    assert!(master_after.contains("# master comment"));
+    assert!(master_after.contains("includes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]"));
+    assert_eq!(
+        (std::fs::read(&device).unwrap(), metadata_identity(&device)),
+        device_before
+    );
+    assert_eq!(
+        (
+            std::fs::read(&profile).unwrap(),
+            metadata_identity(&profile)
+        ),
+        profile_before
+    );
+    assert!(load_v1(&master).lists.sources.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn list_edits_follow_a_cross_directory_master_alias() {
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_root = temp.path().join("real");
+    let alias_root = temp.path().join("alias");
+    std::fs::create_dir_all(real_root.join("profiles.d")).unwrap();
+    std::fs::create_dir_all(&alias_root).unwrap();
+    let profile = real_root.join("profiles.d/default.toml");
+    std::fs::write(&profile, "[profiles.default]\ndisplay_name = \"Default\"\n").unwrap();
+    let master = real_root.join("config.toml");
+    std::fs::write(
+        &master,
+        "schema_version = 4\nincludes = [\"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let alias = alias_root.join("config.toml");
+    symlink(&master, &alias).unwrap();
+    let alias_before = (
+        std::fs::read_link(&alias).unwrap(),
+        std::fs::symlink_metadata(&alias).unwrap().ino(),
+    );
+    let profile_before = (
+        std::fs::read(&profile).unwrap(),
+        metadata_identity(&profile),
+    );
+    let state = test_state_with_config_path(alias.clone());
+    let source = "https://example.com/alias.txt";
+
+    assert_eq!(
+        add_list(State(state.clone()), Json(ListBody { id: source.into() }),)
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(load_v1(&master)
+        .lists
+        .sources
+        .iter()
+        .any(|item| item == source));
+    assert_eq!(
+        remove_list(State(state), Json(ListBody { id: source.into() }))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        (
+            std::fs::read_link(&alias).unwrap(),
+            std::fs::symlink_metadata(&alias).unwrap().ino()
+        ),
+        alias_before
+    );
+    assert_eq!(
+        (
+            std::fs::read(&profile).unwrap(),
+            metadata_identity(&profile)
+        ),
+        profile_before
+    );
+    assert!(real_root.join(".warden-config.lock").exists());
+    assert!(!alias_root.join(".warden-config.lock").exists());
+    assert!(load_v1(&alias).lists.sources.is_empty());
+}
+
+#[tokio::test]
+async fn list_edit_releases_mutation_mutex_before_reload_send() {
+    let temp = tempfile::tempdir().unwrap();
+    let master = temp.path().join("config.toml");
+    std::fs::write(
+        &master,
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+    reload_tx.try_send(None).unwrap();
+    let state = test_state_with_config_path_and_reload(master.clone(), reload_tx);
+    let source_a = "https://example.com/reload-a.txt";
+    let source_b = "https://example.com/reload-b.txt";
+    let a_state = state.clone();
+    let add_a = tokio::spawn(async move {
+        add_list(
+            State(a_state),
+            Json(ListBody {
+                id: source_a.into(),
+            }),
+        )
+        .await
+        .into_response()
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::fs::read_to_string(&master).unwrap().contains(source_a) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first edit must reach disk before its blocked reload send");
+
+    let b_state = state.clone();
+    let add_b = tokio::spawn(async move {
+        add_list(
+            State(b_state),
+            Json(ListBody {
+                id: source_b.into(),
+            }),
+        )
+        .await
+        .into_response()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::fs::read_to_string(&master).unwrap().contains(source_b) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second edit must pass the mutation mutex while reload is blocked");
+
+    for _ in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), reload_rx.recv())
+                .await
+                .expect("a blocked reload send must resume"),
+            Some(None)
+        );
+    }
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), add_a)
+            .await
+            .expect("first handler must complete")
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), add_b)
+            .await
+            .expect("second handler must complete")
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+/// Own a subprocess for the duration of a test, ensuring no failed assertion
+/// can leave it running against a fixture that is about to be removed.
+#[cfg(unix)]
+struct TestChildOwner(std::process::Child);
+
+#[cfg(unix)]
+impl TestChildOwner {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestChildOwner {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_test_child(
+    child: &mut TestChildOwner,
+    timeout: std::time::Duration,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("external writer status readable") {
+            return status;
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("external writer must complete before its deadline");
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_test_marker(path: &std::path::Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("external writer must contend for the filesystem lock");
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn list_edit_coordinates_with_an_external_guarded_writer() {
+    if let Ok(config_path) = std::env::var("WARDEN_C54_EXTERNAL_WRITER_CONFIG") {
+        let config_path = std::path::PathBuf::from(config_path);
+        let mut contended_marker = Some(std::path::PathBuf::from(
+            std::env::var("WARDEN_C54_EXTERNAL_WRITER_CONTENDED").unwrap(),
+        ));
+        crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::Contended {
+                    if let Some(marker) = contended_marker.take() {
+                        std::fs::write(marker, "contended\n").unwrap();
+                    }
+                }
+            },
+            || {
+                let guard = crate::config::write_lock::acquire_for_write(&config_path).unwrap();
+                let master =
+                    crate::cli::commands::target::guarded_master_locked(&guard, &config_path)
+                        .unwrap();
+                let master_path = master.display().to_path_buf();
+                let (mut doc, _) = crate::cli::commands::target::read_or_empty_locked(
+                    &guard,
+                    &config_path,
+                    &master_path,
+                )
+                .unwrap();
+                let lists = doc
+                    .as_table_mut()
+                    .unwrap()
+                    .entry("lists")
+                    .or_insert_with(|| toml::Value::Table(Default::default()))
+                    .as_table_mut()
+                    .unwrap();
+                lists.insert(
+                    "max_total_domains".to_string(),
+                    toml::Value::Integer(123456),
+                );
+                crate::cli::commands::target::write_value_validated_locked(
+                    &guard,
+                    &config_path,
+                    &master_path,
+                    &doc,
+                )
+                .unwrap();
+            },
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let real_root = temp.path().join("real");
+    let alias_root = temp.path().join("alias");
+    std::fs::create_dir_all(&real_root).unwrap();
+    std::fs::create_dir_all(&alias_root).unwrap();
+    let master = real_root.join("config.toml");
+    std::fs::write(
+        &master,
+        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let alias = alias_root.join("config.toml");
+    std::os::unix::fs::symlink(&master, &alias).unwrap();
+    let contended_marker = temp.path().join("writer-contended");
+    let (acquired, release, _reset) = install_list_edit_lock_barrier(master.clone());
+    let state = test_state_with_config_path(master.clone());
+    let api = tokio::spawn(async move {
+        add_list(
+            State(state),
+            Json(ListBody {
+                id: "https://example.com/api.txt".into(),
+            }),
+        )
+        .await
+        .into_response()
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            acquired.recv_timeout(std::time::Duration::from_secs(2))
+        }),
+    )
+    .await
+    .expect("API must acquire the filesystem lock")
+    .unwrap()
+    .expect("API lock barrier must be signalled");
+
+    let test_name = std::thread::current().name().unwrap().to_string();
+    let mut writer = TestChildOwner(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("WARDEN_C54_EXTERNAL_WRITER_CONFIG", &alias)
+            .env("WARDEN_C54_EXTERNAL_WRITER_CONTENDED", &contended_marker)
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_test_marker(&contended_marker, std::time::Duration::from_secs(2)).await;
+    assert!(
+        writer.try_wait().unwrap().is_none(),
+        "external writer bypassed the API lock"
+    );
+
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), api)
+            .await
+            .expect("API handler must complete")
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let status = wait_for_test_child(&mut writer, std::time::Duration::from_secs(3)).await;
+    assert!(status.success(), "external writer failed: {status}");
+    let config = load_v1(&master);
+    assert!(config
+        .lists
+        .sources
+        .iter()
+        .any(|item| item == "https://example.com/api.txt"));
+    assert_eq!(config.lists.max_total_domains, 123456);
+}
+
 // ── T2.8 H-16: domain validation at the API trust boundary ────────
 //
 // The shared `config::schema::admin_rule::validate_domain` is
@@ -908,7 +1535,7 @@ async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
 // (not bypassed) for each of the three call-sites.
 #[tokio::test]
 async fn h_16_add_whitelist_rejects_double_dot_with_400() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h16-wl-double-dot");
     let state = test_state_with_config_path(path.clone());
 
@@ -941,7 +1568,7 @@ async fn h_16_add_whitelist_rejects_double_dot_with_400() {
 
 #[tokio::test]
 async fn h_16_add_whitelist_rejects_control_char_with_400() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h16-wl-ctrl");
     let state = test_state_with_config_path(path.clone());
 
@@ -967,7 +1594,7 @@ async fn h_16_add_whitelist_rejects_control_char_with_400() {
 
 #[tokio::test]
 async fn h_16_add_whitelist_rejects_oversize_label_with_400() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h16-wl-oversize");
     let state = test_state_with_config_path(path.clone());
 
@@ -988,7 +1615,7 @@ async fn h_16_add_whitelist_rejects_oversize_label_with_400() {
 
 #[tokio::test]
 async fn h_16_remove_whitelist_rejects_invalid_domain_with_400() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h16-wl-rm-bad");
     let state = test_state_with_config_path(path.clone());
 
@@ -1049,7 +1676,7 @@ async fn h_16_add_whitelist_lowercases_canonical_form() {
     // how the operator capitalised the input. This makes the
     // disk-side rule list deterministic for downstream filter
     // engine matching.
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h16-wl-lower");
     let state = test_state_with_config_path(path.clone());
 
@@ -1100,7 +1727,7 @@ async fn h_16_add_whitelist_lowercases_canonical_form() {
 // `h_19_*_on_v1_master_returns_409_with_cli_hint` tests.)
 #[tokio::test]
 async fn add_list_on_v1_master_succeeds() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "v1-add-list");
     let state = test_state_with_config_path(path.clone());
 
@@ -1132,7 +1759,7 @@ async fn add_list_on_v1_master_succeeds() {
 
 #[tokio::test]
 async fn add_whitelist_on_v1_master_succeeds() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "v1-add-wl");
     let state = test_state_with_config_path(path.clone());
 
@@ -1174,7 +1801,7 @@ async fn h_17_add_list_reload_channel_closed_returns_500_with_restart_hint() {
     // Drop the receiver immediately — the next `send().await` on
     // the sender returns `SendError`, simulating "daemon shutting
     // down" between the disk write and the reload notification.
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h17-closed");
 
     let cache = DnsCache::new(&CacheConfig::default());
@@ -1279,7 +1906,7 @@ async fn healthz_body_carries_only_the_liveness_contract() {
 /// write, leaving the config byte-identical.
 #[tokio::test]
 async fn add_list_refuses_a_url_the_fetcher_would_reject() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "addlist-bad-url");
     let before = std::fs::read(&path).expect("fixture readable");
     let state = test_state_with_config_path(path.clone());
@@ -1306,7 +1933,7 @@ async fn add_list_refuses_a_url_the_fetcher_would_reject() {
 /// not URLs — the guard must not swallow them.
 #[tokio::test]
 async fn add_list_still_accepts_a_catalogue_slug() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "addlist-slug");
     let state = test_state_with_config_path(path.clone());
 
@@ -1404,7 +2031,7 @@ impl AuditCapture {
 /// resume the continuation on a worker that has no capture armed.
 #[tokio::test]
 async fn whitelist_mutations_audit_the_rule_that_reached_disk() {
-    let initial = "schema_version = 3\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "audit-canonical");
     let state = test_state_with_config_path(path.clone());
 
@@ -1489,23 +2116,41 @@ async fn whitelist_mutations_audit_the_rule_that_reached_disk() {
 // own source can never match them.
 
 fn api_source_files() -> Vec<std::path::PathBuf> {
+    fn collect(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src/api directory must be readable") {
+            let path = entry
+                .expect("src/api directory entry must be readable")
+                .path();
+            if path.is_dir() {
+                collect(&path, files);
+                continue;
+            }
+            let is_rust = path.extension().and_then(|x| x.to_str()) == Some("rs");
+            let filename = path
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or_default();
+            // The tripwires themselves use the scanned spellings. Keep test
+            // modules out of the production-source scan to prevent them from
+            // becoming their own offenders as the assertions evolve.
+            let is_test_module = filename == "tests.rs" || filename.ends_with("_tests.rs");
+            if is_rust && !is_test_module {
+                files.push(path);
+            }
+        }
+    }
+
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("src/api must be readable")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
-        .collect();
+    let mut files = Vec::new();
+    collect(&dir, &mut files);
     files.sort();
     assert!(files.len() > 1, "src/api enumeration found nothing");
     files
 }
 
-/// Holding the guard across the reload notification deadlocks the
-/// capacity-1 channel; skipping it re-opens the read-modify-write race
-/// the lock was added to close. Both are impossible for a caller that
-/// goes through `mutate_config`, which owns the guard — so the lock may
-/// be acquired in exactly that one place.
+/// Holding the in-process mutex across the reload notification deadlocks
+/// the capacity-1 channel; skipping it re-opens the in-daemon mutation
+/// race. Filesystem writers take their own guard inside this window.
 #[test]
 fn the_config_write_lock_has_exactly_one_taker() {
     let needle = concat!("config_write_lock", ".lock()");
@@ -1565,6 +2210,25 @@ fn every_config_writing_handler_goes_through_mutate_config() {
     assert!(
         offenders.is_empty(),
         "these handlers write config without the write lock: {offenders:?}"
+    );
+}
+
+#[test]
+fn api_list_writers_do_not_use_late_lock_compatibility_seats() {
+    let seats = [
+        concat!("target::read_or_empty", "("),
+        concat!("target::write_value_validated", "("),
+    ];
+    let offenders: Vec<std::path::PathBuf> = api_source_files()
+        .into_iter()
+        .filter(|path| {
+            let body = std::fs::read_to_string(path).expect("api source readable");
+            seats.iter().any(|seat| body.contains(seat))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "API list writers must use the guarded read/write seats: {offenders:?}"
     );
 }
 

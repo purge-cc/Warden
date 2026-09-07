@@ -7,7 +7,7 @@
 //! claim every keystroke until `Esc` (no leading `i` ceremony).
 //!
 //! The 5-level attribution body of [`resolve_for_tui`] is a lift from
-//! the former leaf — same `ProfileResolver::build` invocation, same
+//! the former leaf — same resolver invocation, same
 //! strings. Only the input source moved (modal buffer instead of leaf
 //! state) and the order the strings come back in: see that function
 //! for why the answer now leads.
@@ -17,8 +17,6 @@ use std::net::IpAddr;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::lists::manager::merge_sources_with_blocklists;
-use crate::lists::source_key::SourceBitMap;
 use crate::profiles::{resolver::ResolveLevel, ProfileResolver};
 use crate::tui::app::{App, Leaf};
 use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, ValueKind};
@@ -330,11 +328,7 @@ pub fn resolve_for_tui(app: &App, input: &str) -> Result<Vec<String>, String> {
         .parse()
         .map_err(|_| format!("\"{}\" is not a valid IP address", input.trim()))?;
 
-    let (merged_sources, _trust) =
-        merge_sources_with_blocklists(&loaded.config.lists.sources, &loaded.config.blocklists);
-    let source_bits = SourceBitMap::build(&merged_sources, &loaded.config.blocklists)
-        .map_err(|e| format!("lists.sources: {e}"))?;
-    let resolver = ProfileResolver::build(&loaded.config, &source_bits, &loaded.custom_lists);
+    let resolver = ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
     let res = resolver.resolve(&ip);
 
     let mut lines: Vec<String> = Vec::new();

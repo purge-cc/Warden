@@ -23,14 +23,18 @@ use purge_warden::ipc::errors::{
     IPC_ERROR_DUPLICATE_DEVICE_NAME, IPC_ERROR_DUPLICATE_PROFILE_ID, IPC_ERROR_INTERNAL,
     IPC_ERROR_INVALID_ARGUMENT, IPC_ERROR_INVALID_COMMAND, IPC_ERROR_INVALID_PROFILE_ID,
     IPC_ERROR_LIST_MANAGER_CHANNEL_CLOSED, IPC_ERROR_LIST_MANAGER_NOT_RUNNING,
-    IPC_ERROR_LIST_MANAGER_NO_ACK, IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE,
-    IPC_ERROR_NO_ARP_MAC_FOR_IP, IPC_ERROR_NO_CONFIG_PATH, IPC_ERROR_NO_PROFILES_RESOLVER_PROMOTE,
-    IPC_ERROR_NO_PROFILE_RESOLVER, IPC_ERROR_PROFILE_NOT_FOUND, IPC_ERROR_RELOAD_CHANNEL_CLOSED,
-    IPC_ERROR_RELOAD_NOT_AVAILABLE, IPC_ERROR_RETENTION_OUT_OF_RANGE,
-    IPC_ERROR_SHUTDOWN_CHANNEL_CLOSED, IPC_ERROR_SHUTDOWN_NOT_AVAILABLE, IPC_ERROR_STAGE_FAILED,
-    IPC_ERROR_TARGET_READ_FAILED, IPC_ERROR_TARGET_SCAN_FAILED, IPC_ERROR_TARGET_WRITE_FAILED,
-    IPC_ERROR_TOKEN_MISMATCH, IPC_ERROR_TOKEN_REQUIRED, IPC_ERROR_TRACKING_NOT_ENABLED,
-    IPC_ERROR_VALIDATION_FAILED, IPC_ERROR_VALIDATOR_REJECTED,
+    IPC_ERROR_LIST_MANAGER_NO_ACK, IPC_ERROR_LIST_MANAGER_UNAVAILABLE,
+    IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED, IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT,
+    IPC_ERROR_LIST_REFRESH_BUSY, IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED,
+    IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT, IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT,
+    IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE, IPC_ERROR_NO_ARP_MAC_FOR_IP, IPC_ERROR_NO_CONFIG_PATH,
+    IPC_ERROR_NO_PROFILES_RESOLVER_PROMOTE, IPC_ERROR_NO_PROFILE_RESOLVER,
+    IPC_ERROR_PROFILE_NOT_FOUND, IPC_ERROR_RELOAD_CHANNEL_CLOSED, IPC_ERROR_RELOAD_NOT_AVAILABLE,
+    IPC_ERROR_RETENTION_OUT_OF_RANGE, IPC_ERROR_SHUTDOWN_CHANNEL_CLOSED,
+    IPC_ERROR_SHUTDOWN_NOT_AVAILABLE, IPC_ERROR_STAGE_FAILED, IPC_ERROR_TARGET_READ_FAILED,
+    IPC_ERROR_TARGET_SCAN_FAILED, IPC_ERROR_TARGET_WRITE_FAILED, IPC_ERROR_TOKEN_MISMATCH,
+    IPC_ERROR_TOKEN_REQUIRED, IPC_ERROR_TRACKING_NOT_ENABLED, IPC_ERROR_VALIDATION_FAILED,
+    IPC_ERROR_VALIDATOR_REJECTED,
 };
 use purge_warden::ipc::protocol::IpcResponse;
 
@@ -80,6 +84,23 @@ fn ipc_error_list_manager_not_running_is_frozen() {
         IPC_ERROR_LIST_MANAGER_NOT_RUNNING,
         "list manager is not running (no `[lists].sources` configured)"
     );
+}
+
+#[test]
+fn ipc_error_force_refresh_lifecycle_and_wait_errors_are_frozen() {
+    assert_eq!(IPC_ERROR_LIST_MANAGER_UNAVAILABLE, "list manager is unavailable although list sources are configured; it may have stopped or be reloading");
+    assert_eq!(
+        IPC_ERROR_LIST_REFRESH_BUSY,
+        "too many list refresh requests are already waiting; retry after one completes"
+    );
+    assert_eq!(
+        IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT,
+        "list refresh could not be queued within 1 second; it was not accepted"
+    );
+    assert_eq!(IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT, "list refresh was queued but the manager did not acknowledge it within 5 seconds; work may still complete. Do not retry automatically.");
+    assert_eq!(IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT, "list refresh is still running after 15 minutes; work may still complete. Do not retry automatically.");
+    assert_eq!(IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED, "list manager dropped the refresh acceptance channel without responding; work may still complete. Do not retry automatically.");
+    assert_eq!(IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED, "list manager dropped the refresh completion channel without responding; work may still complete. Do not retry automatically.");
 }
 
 #[test]
@@ -478,8 +499,15 @@ fn ipc_error_wire_payload_carries_no_path() {
         IpcError::TokenMismatch,
         IpcError::NoTokenConfigured,
         IpcError::ListManagerNotRunning,
+        IpcError::ListManagerUnavailable,
+        IpcError::ListRefreshBusy,
         IpcError::ListManagerChannelClosed,
         IpcError::ListManagerNoAck,
+        IpcError::ListRefreshEnqueueTimeout,
+        IpcError::ListRefreshAcceptanceTimeout,
+        IpcError::ListRefreshCompletionTimeout,
+        IpcError::ListRefreshAcceptanceDropped,
+        IpcError::ListRefreshCompletionDropped,
         IpcError::ReloadChannelClosed,
         IpcError::ReloadNotAvailable,
         IpcError::ShutdownChannelClosed,

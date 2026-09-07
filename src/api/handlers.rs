@@ -280,8 +280,84 @@ enum ListEditError {
     Io(anyhow::Error),
 }
 
+#[cfg(test)]
+struct ListEditLockBarrier {
+    config_path: std::path::PathBuf,
+    acquired: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static LIST_EDIT_LOCK_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<ListEditLockBarrier>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct ListEditLockBarrierReset(std::sync::Arc<ListEditLockBarrier>);
+
+#[cfg(test)]
+impl Drop for ListEditLockBarrierReset {
+    fn drop(&mut self) {
+        let mut slot = LIST_EDIT_LOCK_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("list edit barrier mutex poisoned");
+        if slot
+            .as_ref()
+            .is_some_and(|barrier| std::sync::Arc::ptr_eq(barrier, &self.0))
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_list_edit_lock_barrier(
+    config_path: std::path::PathBuf,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+    ListEditLockBarrierReset,
+) {
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let barrier = std::sync::Arc::new(ListEditLockBarrier {
+        config_path,
+        acquired: acquired_tx,
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let mut slot = LIST_EDIT_LOCK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("list edit barrier mutex poisoned");
+    assert!(slot.is_none(), "list edit barrier already installed");
+    *slot = Some(barrier.clone());
+    (acquired_rx, release_tx, ListEditLockBarrierReset(barrier))
+}
+
+#[cfg(test)]
+fn pause_after_list_edit_lock(config_path: &std::path::Path) {
+    let barrier = LIST_EDIT_LOCK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("list edit barrier mutex poisoned")
+        .clone();
+    if let Some(barrier) = barrier.filter(|barrier| barrier.config_path == config_path) {
+        barrier
+            .acquired
+            .send(())
+            .expect("list edit barrier receiver dropped");
+        barrier
+            .release
+            .lock()
+            .expect("list edit barrier receiver mutex poisoned")
+            .recv()
+            .expect("list edit barrier sender dropped");
+    }
+}
+
 /// Edit the master config's `[lists].sources` array under a
-/// `spawn_blocking` hop, then atomic-write + validate-or-revert.
+/// `spawn_blocking` hop as one descriptor-pinned transaction.
 ///
 /// `[lists]` is a v1 pass-through table that lives only in the master
 /// file (never an include slice), so a single-file `toml::Value` edit
@@ -302,8 +378,16 @@ where
     F: FnOnce(&mut Vec<toml::Value>) -> Result<(), String> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
+        let guard = crate::config::write_lock::acquire_for_write(&config_path)
+            .map_err(ListEditError::Io)?;
+        #[cfg(test)]
+        pause_after_list_edit_lock(&config_path);
+        let master = crate::cli::commands::target::guarded_master_locked(&guard, &config_path)
+            .map_err(ListEditError::Io)?;
+        let master_path = master.display().to_path_buf();
         let (mut doc, _) =
-            crate::cli::commands::target::read_or_empty(&config_path).map_err(ListEditError::Io)?;
+            crate::cli::commands::target::read_or_empty_locked(&guard, &config_path, &master_path)
+                .map_err(ListEditError::Io)?;
         {
             let table = doc.as_table_mut().ok_or_else(|| {
                 ListEditError::Io(anyhow::anyhow!("config root is not a TOML table"))
@@ -322,8 +406,13 @@ where
             })?;
             edit(arr).map_err(ListEditError::Precondition)?;
         }
-        crate::cli::commands::target::write_value_validated(&config_path, &config_path, &doc)
-            .map_err(ListEditError::Io)?;
+        crate::cli::commands::target::write_value_validated_locked(
+            &guard,
+            &config_path,
+            &master_path,
+            &doc,
+        )
+        .map_err(ListEditError::Io)?;
         Ok(())
     })
     .await
@@ -468,28 +557,30 @@ pub async fn get_status(State(state): State<Arc<ApiState>>) -> impl IntoResponse
     // Off the `:53` hot path.
     let cache_entries = state.cache.flushed_usage().await.entries;
 
-    // Cycle-level facts, read straight off the registry for the same
-    // reason `handle_status` does: in a refused cycle every per-source row
-    // is healthy, which is precisely the problem. Same read order as the
-    // IPC path — payload first, mark second — so a cycle landing between
-    // the reads makes a caller re-poll rather than pair a new mark with an
-    // old payload.
-    let lists_corpus_refusal = state
+    // The three cycle-level fields come from one immutable completed-cycle
+    // view, so HTTP cannot join a new mark to an old refusal or freeze.
+    let lists_snapshot = state
         .list_statuses
         .as_ref()
-        .and_then(|reg| reg.corpus_refusal());
-    let lists_corpus_freeze = state
-        .list_statuses
+        .map(|reg| reg.consistent_snapshot());
+    let lists_corpus_refusal = lists_snapshot
         .as_ref()
-        .and_then(|reg| reg.corpus_freeze());
-    let lists_cycle = state.list_statuses.as_ref().map(|reg| reg.cycle());
+        .and_then(|snapshot| snapshot.corpus_refusal.clone());
+    let lists_corpus_freeze = lists_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.corpus_freeze.clone());
+    let lists_cycle = lists_snapshot.as_ref().map(|snapshot| snapshot.cycle);
+    let domain_count = lists_snapshot.as_ref().map_or_else(
+        || state.filter.domain_count(),
+        |snapshot| snapshot.domain_count,
+    );
 
     Json(StatusResponse {
         pid: std::process::id(),
         listen: state.listen_addr.clone(),
         upstream_mode: state.upstream_mode.clone(),
         upstream_count: state.upstream_count,
-        domain_count: state.filter.domain_count(),
+        domain_count,
         cache_entries,
         list_count: state.list_count,
         uptime_secs,
@@ -649,11 +740,13 @@ pub async fn get_logs(
 /// GET /api/blocklists/:id/stats — per-list runtime stats.
 ///
 /// `id` may be a canonical `[[blocklists]].id`, a legacy slash-form slug
-/// (`"privacy/ads"`), or an exact source string. The handler resolves it
-/// through the same three-pass logic the IPC layer uses (exact match →
-/// resolver `slug_to_id` ↔ `slug_for_id` bridge → case-insensitive
-/// substring), then renders the matched
+/// (`"privacy/ads"`), or an exact URL alias. The handler resolves aliases
+/// through the shared registry, then falls back to a case-insensitive
+/// substring and renders the matched
 /// [`BlocklistStatusDto`](crate::lists::status::BlocklistStatusDto).
+///
+/// This intentionally exposes a live per-source row, including an
+/// in-progress attempt; aggregate status uses completed-cycle snapshots.
 ///
 /// Token-gated by the `/api/` `auth_middleware` — IPC's
 /// `BlocklistStats` ReadOnly-no-token rule does not extend to HTTP.
@@ -661,8 +754,7 @@ pub async fn get_logs(
 /// Status codes:
 /// - 200 with the DTO when the id resolves to a live registry slot
 /// - 404 when no source matches and a `list_statuses` registry exists
-/// - 503 when `list_statuses` is `None` (daemon started with no
-///   `[lists].sources` configured — the registry was never built)
+/// - 503 when `list_statuses` is unavailable in a compatibility/test state
 pub async fn get_blocklist_stats(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -689,57 +781,41 @@ pub async fn get_blocklist_stats(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "blocklist telemetry unavailable: daemon was started with no [lists].sources",
+                    "error": "blocklist telemetry unavailable",
                 })),
             )
                 .into_response();
         }
     };
 
-    // Pass 1: exact source string (slug or raw URL as it lives in
-    // `[lists].sources`).
-    if let Some(status) = registry.status_for_url(&id) {
-        let canonical = state
-            .profiles
-            .as_ref()
-            .and_then(|r| r.id_for_slug(&id))
-            .map(|i| i.as_str().to_string());
-        let dto = crate::lists::status::BlocklistStatusDto::from_status(id, canonical, &status);
+    if let Some(resolved) = registry.resolve_alias(&id) {
+        let dto = crate::lists::status::BlocklistStatusDto::from_status(
+            resolved.representative,
+            resolved.primary_id.map(|id| id.to_string()),
+            &resolved.status,
+        );
         return Json(dto).into_response();
     }
 
-    // Pass 2: canonical [[blocklists]].id → resolve to slug, look up.
-    if let Some(slug) = state.profiles.as_ref().and_then(|r| r.slug_for_id(&id)) {
-        if let Some(status) = registry.status_for_url(&slug) {
-            let dto = crate::lists::status::BlocklistStatusDto::from_status(
-                slug,
-                Some(id.clone()),
-                &status,
-            );
-            return Json(dto).into_response();
-        }
-    }
-
-    // Pass 3: case-insensitive substring on the source string. Bounded
-    // by the 64-source cap of `build_source_bit_map`. `registry.snapshot()`
+    // Case-insensitive substring on the source string. Bounded by the
+    // 64-source cap of `build_source_bit_map`. `snapshot_with_ids()`
     // walks a HashMap so iteration order is
     // non-deterministic — same query on same data could return
     // different sources across calls. Sort by longer-match-first
     // (more specific wins) then lexicographic ascending so repeated
     // calls converge on the same answer.
     let needle = id.to_ascii_lowercase();
-    let mut snapshot = registry.snapshot();
-    snapshot.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    if let Some((source, status)) = snapshot
+    let mut snapshot = registry.snapshot_with_ids();
+    snapshot.sort_by(|(a, _, _), (b, _, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    if let Some((source, primary_id, status)) = snapshot
         .into_iter()
-        .find(|(s, _)| s.to_ascii_lowercase().contains(&needle))
+        .find(|(source, _, _)| source.to_ascii_lowercase().contains(&needle))
     {
-        let canonical = state
-            .profiles
-            .as_ref()
-            .and_then(|r| r.id_for_slug(&source))
-            .map(|i| i.as_str().to_string());
-        let dto = crate::lists::status::BlocklistStatusDto::from_status(source, canonical, &status);
+        let dto = crate::lists::status::BlocklistStatusDto::from_status(
+            source,
+            primary_id.map(|id| id.to_string()),
+            &status,
+        );
         return Json(dto).into_response();
     }
 
@@ -797,10 +873,8 @@ pub async fn add_list(
     }
 
     // Edit the master's `[lists].sources` in place via `toml::Value`
-    // surgery — the v1 mutation pattern. The dup check
-    // runs inside the same `spawn_blocking` hop, on the array we are
-    // about to mutate, so there is no read/write race. `mutate_config`
-    // owns the write lock across exactly this block.
+    // surgery. The duplicate check and commit share a filesystem guard;
+    // `mutate_config` supplies the in-process ordering around that work.
     let id = body.id.clone();
     match state
         .mutate_config(|| {
@@ -1245,8 +1319,14 @@ fn escape_metric_label(value: &str) -> String {
 /// - purge_warden_lists_corpus_ceiling (gauge)
 /// - purge_warden_lists_corpus_refused_cycles (gauge)
 /// - purge_warden_lists_corpus_frozen_since_seconds (gauge)
+/// - purge_warden_lists_source_coverage_incomplete (gauge)
+/// - purge_warden_lists_generation_degraded (gauge)
 pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     let mut out = String::with_capacity(1024);
+    let lists_snapshot = state
+        .list_statuses
+        .as_ref()
+        .map(|reg| reg.consistent_snapshot());
 
     // Uptime
     let uptime_secs = state.started_at.elapsed().as_secs();
@@ -1254,7 +1334,10 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     out.push_str(&format!("purge_warden_uptime_seconds {uptime_secs}\n"));
 
     // Domain count
-    let domains = state.filter.domain_count();
+    let domains = lists_snapshot.as_ref().map_or_else(
+        || state.filter.domain_count(),
+        |snapshot| snapshot.domain_count,
+    );
     out.push_str("# TYPE purge_warden_domains_loaded gauge\n");
     out.push_str(&format!("purge_warden_domains_loaded {domains}\n"));
 
@@ -1269,21 +1352,23 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     out.push_str("# TYPE purge_warden_cache_entries gauge\n");
     out.push_str(&format!("purge_warden_cache_entries {cache_entries}\n"));
 
-    // Blocklist truncation. Two series, because
-    // they answer different questions: the scalar is what an operator
-    // alerts on ("am I under-covered at all"), the per-source gauge is what
-    // they act on ("which list, and by how much"). Read from
-    // `list_statuses` rather than the stats engine — truncation is a
-    // property of the last refresh and exists even with tracking disabled.
-    if let Some(ref reg) = state.list_statuses {
-        let snap = reg.snapshot();
+    // Blocklist entry-cap refusals. The scalar tells an operator whether
+    // any source was refused; the per-source gauge gives the overshoot.
+    // Read from `list_statuses`, not the stats engine, so it remains
+    // available with query tracking disabled.
+    if let Some(snapshot) = lists_snapshot {
+        let source_coverage_incomplete = u8::from(snapshot.cycle.source_coverage_incomplete);
+        let generation_degraded = u8::from(snapshot.cycle.generation_degraded);
+        let snap = snapshot.rows;
         let truncated_lists = snap.iter().filter(|(_, s)| s.parsed_truncated > 0).count();
+        out.push_str("# HELP purge_warden_lists_truncated Sources with an uncleared max_entries refusal since this daemon started\n");
         out.push_str("# TYPE purge_warden_lists_truncated gauge\n");
         out.push_str(&format!("purge_warden_lists_truncated {truncated_lists}\n"));
         // Emitted for every source including the healthy ones, so the
         // series exists at 0 and an alert can be written as `> 0`. If only
-        // truncated lists appeared, a scrape gap and a healthy list would
+        // refused lists appeared, a scrape gap and a healthy list would
         // look identical.
+        out.push_str("# HELP purge_warden_list_truncated_entries Exact overshoot of the last uncleared max_entries refusal since this daemon started\n");
         out.push_str("# TYPE purge_warden_list_truncated_entries gauge\n");
         for (source, s) in snap.iter() {
             out.push_str(&format!(
@@ -1299,7 +1384,7 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         // them could fire while the daemon serves a stale corpus.
         // Emitted at 0 in the healthy case so `> 0` is a writable alert
         // and a scrape gap cannot pass for health.
-        let refusal = reg.corpus_refusal();
+        let refusal = snapshot.corpus_refusal;
         out.push_str("# TYPE purge_warden_lists_corpus_refused gauge\n");
         out.push_str(&format!(
             "purge_warden_lists_corpus_refused {}\n",
@@ -1337,7 +1422,7 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         // spill) clears the refusal payload and leaves the previous
         // generation serving. The corpus is still frozen; only the last
         // cycle's verdict changed.
-        let freeze = reg.corpus_freeze();
+        let freeze = snapshot.corpus_freeze;
         out.push_str("# TYPE purge_warden_lists_corpus_refused_cycles gauge\n");
         out.push_str(&format!(
             "purge_warden_lists_corpus_refused_cycles {}\n",
@@ -1350,6 +1435,19 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
                 .as_ref()
                 .and_then(|f| f.since)
                 .map_or(0, |t| t.unix_timestamp())
+        ));
+
+        // Coverage is the standing result of the last manager list attempt,
+        // not a replacement for the current coarse cycle outcome.
+        out.push_str("# HELP purge_warden_lists_source_coverage_incomplete Most recent manager list attempt had incomplete source coverage\n");
+        out.push_str("# TYPE purge_warden_lists_source_coverage_incomplete gauge\n");
+        out.push_str(&format!(
+            "purge_warden_lists_source_coverage_incomplete {source_coverage_incomplete}\n"
+        ));
+        out.push_str("# HELP purge_warden_lists_generation_degraded Most recent manager attempt did not complete a whole-generation install\n");
+        out.push_str("# TYPE purge_warden_lists_generation_degraded gauge\n");
+        out.push_str(&format!(
+            "purge_warden_lists_generation_degraded {generation_degraded}\n"
         ));
     }
 

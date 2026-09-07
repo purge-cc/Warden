@@ -12,10 +12,11 @@
 //! bus; defense in depth alongside the peer-uid gate in
 //! `handle_connection`.
 
+use std::ffi::OsStr;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -26,12 +27,45 @@ use crate::filter::FilterEngine;
 use crate::lists::status::{BlocklistStatusDto, ListStatusRegistry};
 use crate::profiles::ProfileResolver;
 use crate::tracking::StatsEngine;
+use crate::{
+    cli::commands::target::{
+        find_target_for_id_locked, read_or_empty_locked, write_value_validated_locked, EntityClass,
+    },
+    config::{
+        loader::load_config_for_schema_under_guard,
+        schema::SCHEMA_VERSION_V1,
+        write_lock::{acquire_for_write, ConfigWriteLock},
+    },
+};
 
 use super::errors::{ipc_error, IpcError};
 use super::protocol::{
     CommandTier, IpcCommand, IpcNotification, IpcResponse, LocalRecordsHitEntry,
 };
 use crate::auth::token::verify_token;
+
+/// Exact lifecycle of the list-controller IPC endpoint. A missing sender is
+/// not enough to distinguish an intentional empty plan from a retiring one.
+#[derive(Clone)]
+pub enum ListManagerEndpoint {
+    EmptyStable,
+    Transitioning,
+    Running {
+        sender: tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>,
+        waiters: Arc<tokio::sync::Semaphore>,
+    },
+}
+
+impl ListManagerEndpoint {
+    pub(crate) fn running(
+        sender: tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>,
+    ) -> Self {
+        Self::Running {
+            sender,
+            waiters: Arc::new(tokio::sync::Semaphore::new(MAX_FORCE_REFRESH_WAITERS)),
+        }
+    }
+}
 
 /// Effective uid of the calling process. Captured once at daemon boot
 /// into [`DaemonState::daemon_uid`] and reused for every peer-uid check
@@ -85,27 +119,21 @@ pub struct DaemonState {
     /// every successful reload; authentication reads through the swap
     /// with `state.api_token_hash.load().as_deref()`.
     pub api_token_hash: Arc<arc_swap::ArcSwap<Option<String>>>,
-    /// Path to `config.toml` — used by device mutation handlers to
+    /// Path to `config.toml` — used by daemon config mutation handlers to
     /// re-read the current state, apply the change, validate, and
     /// atomically write it back. `None` in tests that don't exercise
     /// the mutation path.
     pub config_path: Option<PathBuf>,
-    /// Per-daemon write lock for device mutation handlers. Each
-    /// IPC connection runs in its own tokio task, so without this
-    /// two concurrent DeviceAdds could read the same config, each
-    /// push its own device, and the second write would clobber
-    /// the first. The lock is acquired around the whole
-    /// read-modify-write-reload cycle. `tokio::sync::Mutex` (not
-    /// std) because we hold it across `await` points.
+    /// Per-daemon async sequencer for config mutations. It is acquired
+    /// before the OS tree guard and retained through the reload decision;
+    /// contending IPC tasks yield instead of blocking a runtime worker.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Shared handle to per-source `ListStatus`. `None`
-    /// when the daemon was started with no `[lists].sources` (filter
-    /// disabled). The `IpcCommand::BlocklistStats` handler reads
-    /// through this Arc; the list manager updates it atomically on each
-    /// refresh cycle.
+    /// Shared handle to per-source `ListStatus`. Production always wires a
+    /// registry, including an empty boot; `None` supports compatibility and
+    /// test construction. The manager updates it atomically on each refresh.
     pub list_statuses: Option<Arc<ListStatusRegistry>>,
     /// Shared handle to the retry state machine (`data/list_state.toml`).
-    /// `None` when no `[lists].sources` are configured. The
+    /// `None` when no list manager exists. The
     /// `IpcCommand::Status` handler walks `lists.values()` to derive
     /// the per-state counts surfaced as `ListDiagnostics`. The list
     /// manager updates the inner map atomically on every refresh
@@ -157,19 +185,15 @@ pub struct DaemonState {
     /// ArcSwap-wrapped sender for the
     /// [`ListManagerCommand`](crate::lists::manager::ListManagerCommand)
     /// out-of-band channel drained by `ListManager::spawn_refresh_loop`.
-    /// `None` when no `[lists].sources` are configured (no manager
-    /// task exists), or in tests that don't exercise the forget path.
+    /// `None` when no manager task exists, or in tests that don't exercise
+    /// the forget path.
     ///
     /// Wrapped in `Arc<ArcSwap<_>>` so the reload path in `handle_reload`
     /// can swap in the new task's `Sender` after rebuilding the manager,
     /// without rebuilding `DaemonState`. The IPC `handle_forget_list`
     /// reads through `.load()` on every call so the post-reload sender
     /// is picked up on the next forget without re-plumbing.
-    pub list_cmd_tx: Arc<
-        arc_swap::ArcSwap<
-            Option<tokio::sync::mpsc::Sender<crate::lists::manager::ListManagerCommand>>,
-        >,
-    >,
+    pub list_cmd_tx: Arc<arc_swap::ArcSwap<ListManagerEndpoint>>,
     /// Effective uid the daemon process runs as, captured
     /// once via [`current_euid`] at `start.rs` daemon init. Every
     /// accepted IPC connection's `SO_PEERCRED` uid must equal this
@@ -376,6 +400,7 @@ fn bind_with_atomic_perms(socket_path: &Path) -> anyhow::Result<UnixListener> {
 /// rather than queued, so spawn-flood attacks cannot exhaust FDs, heap,
 /// or tokio task slots on the runtime that also services DNS queries.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const MAX_FORCE_REFRESH_WAITERS: usize = 4;
 
 /// First backoff step on a persistent `accept` error. Doubles every
 /// consecutive error up to [`ACCEPT_BACKOFF_CAP`].
@@ -675,6 +700,7 @@ async fn dispatch_command(
             handle_cache_flush(domain.as_deref(), peer_uid, state).await
         }
         IpcCommand::ForgetList { id, .. } => handle_forget_list(id, peer_uid, state).await,
+        IpcCommand::ForceListRefresh { .. } => handle_force_list_refresh(peer_uid, state).await,
         IpcCommand::Reload { .. } => handle_reload(peer_uid, state).await,
         IpcCommand::Shutdown { .. } => handle_shutdown(peer_uid, state).await,
         IpcCommand::DomainCount => handle_domain_count(state),
@@ -818,49 +844,38 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
         .stats
         .as_ref()
         .and_then(|s| s.query_log_drop_counters());
-    let (lists_active, lists_total, lists_truncated) = match &state.list_statuses {
-        Some(reg) => {
-            let snap = reg.snapshot();
+    let lists_snapshot = state
+        .list_statuses
+        .as_ref()
+        .map(|reg| reg.consistent_snapshot());
+    let (lists_active, lists_total, lists_truncated) = match &lists_snapshot {
+        Some(snapshot) => {
+            let snap = &snapshot.rows;
             let total = snap.len() as u32;
             let active = snap
                 .iter()
                 .filter(|(_, s)| matches!(s.last_outcome, crate::lists::status::LastOutcome::Ok))
                 .count() as u32;
-            // Counted over every source, not just the active ones: a
-            // source that truncated and then failed its next refresh is
-            // still serving a partial list from the retained generation.
+            // Counted over every source, not just active ones: a later
+            // failure must not hide an earlier cap refusal from operators.
             let truncated = snap.iter().filter(|(_, s)| s.parsed_truncated > 0).count() as u32;
             (active, total, truncated)
         }
         None => (0, 0, 0),
     };
-    // Cycle-level, so it is read straight off the registry rather than
-    // derived from the per-source snapshot above — in this state every one
-    // of those rows is healthy, which is precisely the problem.
-    let lists_corpus_refusal = state
-        .list_statuses
+    // One immutable completed-cycle view: never assemble a mark, source
+    // rows, refusal, and freeze from independent atomics here.
+    let lists_corpus_refusal = lists_snapshot
         .as_ref()
-        .and_then(|reg| reg.corpus_refusal());
-    // Read alongside the refusal, and it can legitimately outlive one: the
-    // arms that fail to install without refusing (flush error, degraded
-    // shard build, empty spill) clear `lists_corpus_refusal` while the
-    // previous generation is still what is serving. The freeze is the
-    // longer-lived fact — "nothing new has installed since" — and the
-    // refusal is "the last cycle was refused, and here is by how much".
-    let lists_corpus_freeze = state
-        .list_statuses
+        .and_then(|snapshot| snapshot.corpus_refusal.clone());
+    let lists_corpus_freeze = lists_snapshot
         .as_ref()
-        .and_then(|reg| reg.corpus_freeze());
-    // Read AFTER the refusal above, and the order is deliberate. A cycle
-    // that lands between the two reads would pair an older refusal with a
-    // newer mark — which makes the caller re-poll, the harmless direction.
-    // Reading the mark first could pair a NEW refusal with an OLD seq, and
-    // the caller would report the previous cycle's verdict as its own.
-    // `map`, not `and_then`: the registry always HAS a mark (seq 0 before
-    // the first cycle), so `None` here means one thing only — this daemon
-    // has no list subsystem wired, and no cycle is ever coming. A caller
-    // must not wait on that, and `None` is how it learns not to.
-    let lists_cycle = state.list_statuses.as_ref().map(|reg| reg.cycle());
+        .and_then(|snapshot| snapshot.corpus_freeze.clone());
+    let lists_cycle = lists_snapshot.as_ref().map(|snapshot| snapshot.cycle);
+    let domain_count = lists_snapshot.as_ref().map_or_else(
+        || state.filter.domain_count(),
+        |snapshot| snapshot.domain_count,
+    );
     // Walk the retry state machine and tally per-state counts. The walk
     // runs under the existing `Mutex` so a concurrent `record_blocklist_*`
     // call serialises through the same lock. `None` (no list_state
@@ -918,7 +933,7 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
         listen: state.listen_addr.clone(),
         upstream_mode: state.upstream_mode.clone(),
         upstream_count: state.upstream_count,
-        domain_count: state.filter.domain_count(),
+        domain_count,
         cache_entries: cache_usage.entries,
         list_count: state.list_count,
         uptime_secs: state.started_at.elapsed().as_secs(),
@@ -1128,20 +1143,21 @@ async fn handle_cache_flush(
 async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonState) -> IpcResponse {
     use crate::lists::manager::ListManagerCommand;
 
-    let tx_guard = state.list_cmd_tx.load();
-    let tx = match tx_guard.as_ref() {
-        Some(t) => t.clone(),
-        None => {
-            return ipc_error(IpcError::ListManagerNotRunning);
-        }
+    let endpoint = state.list_cmd_tx.load();
+    let tx = match endpoint.as_ref() {
+        ListManagerEndpoint::Running { sender, .. } => sender.clone(),
+        ListManagerEndpoint::EmptyStable => return ipc_error(IpcError::ListManagerNotRunning),
+        ListManagerEndpoint::Transitioning => return ipc_error(IpcError::ListManagerUnavailable),
     };
-    drop(tx_guard);
+    drop(endpoint);
 
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(ListManagerCommand::Forget {
             source: id.clone(),
-            ack: ack_tx,
+            accepted: accepted_tx,
+            completion: completion_tx,
         })
         .await
         .is_err()
@@ -1149,7 +1165,14 @@ async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonSta
         return ipc_error(IpcError::ListManagerChannelClosed);
     }
 
-    match ack_rx.await {
+    // Acceptance stays internal for this wire revision: the existing IPC
+    // response remains the completed forget result, but a controller that has
+    // already retired is detected before we wait on a completion forever.
+    if accepted_rx.await.is_err() {
+        return ipc_error(IpcError::ListManagerNoAck);
+    }
+
+    match completion_rx.await {
         Ok(was_cached) => {
             tracing::info!(
                 target: "audit",
@@ -1162,6 +1185,158 @@ async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonSta
             IpcResponse::ListForgotten { id, was_cached }
         }
         Err(_) => ipc_error(IpcError::ListManagerNoAck),
+    }
+}
+
+/// Manager handoff bounds. Fifteen minutes is an operator wait bound, not a
+/// source deadline: sources can run sequentially, and work continues after it.
+#[derive(Clone, Copy)]
+struct ForceRefreshTimeouts {
+    enqueue: Duration,
+    acceptance: Duration,
+    completion: Duration,
+}
+
+const FORCE_REFRESH_TIMEOUTS: ForceRefreshTimeouts = ForceRefreshTimeouts {
+    enqueue: Duration::from_secs(1),
+    acceptance: Duration::from_secs(5),
+    completion: Duration::from_secs(15 * 60),
+};
+
+async fn handle_force_list_refresh(peer_uid: Option<u32>, state: &DaemonState) -> IpcResponse {
+    handle_force_list_refresh_with_timeouts(peer_uid, state, FORCE_REFRESH_TIMEOUTS).await
+}
+
+async fn handle_force_list_refresh_with_timeouts(
+    peer_uid: Option<u32>,
+    state: &DaemonState,
+    timeouts: ForceRefreshTimeouts,
+) -> IpcResponse {
+    use crate::lists::manager::ListManagerCommand;
+
+    tracing::info!(target: "audit", action = "list.refresh.force", phase = "requested", uid = ?peer_uid, "IPC list refresh requested");
+    let endpoint = state.list_cmd_tx.load();
+    let (tx, _waiter) = match endpoint.as_ref() {
+        ListManagerEndpoint::Running { sender, waiters } => {
+            match waiters.clone().try_acquire_owned() {
+                Ok(permit) => (sender.clone(), permit),
+                Err(_) => return force_refresh_terminal(peer_uid, IpcError::ListRefreshBusy),
+            }
+        }
+        ListManagerEndpoint::Transitioning => {
+            return force_refresh_terminal(peer_uid, IpcError::ListManagerUnavailable)
+        }
+        ListManagerEndpoint::EmptyStable => {
+            let snapshot = state.list_statuses.as_ref().map(|registry| {
+                registry.record_cycle_with_qualifiers_and_served_state(
+                    crate::lists::status::CycleOutcome::ClearedNoSources,
+                    false,
+                    false,
+                    0,
+                    Some(crate::lists::status::ServedState::Cleared),
+                )
+            });
+            return match snapshot {
+                Some(snapshot) => {
+                    tracing::info!(target: "audit", action = "list.refresh.force", phase = "accepted", uid = ?peer_uid, disposition = "started", "IPC list refresh accepted");
+                    completed_force_refresh_response(
+                        peer_uid,
+                        crate::lists::manager::ListManagerCommandDisposition::Started,
+                        snapshot,
+                        None,
+                    )
+                }
+                None => force_refresh_terminal(peer_uid, IpcError::ListManagerUnavailable),
+            };
+        }
+    };
+    drop(endpoint);
+
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    match tokio::time::timeout(
+        timeouts.enqueue,
+        tx.send(ListManagerCommand::ForceRefresh {
+            accepted: accepted_tx,
+            completion: completion_tx,
+        }),
+    )
+    .await
+    {
+        Err(_) => return force_refresh_terminal(peer_uid, IpcError::ListRefreshEnqueueTimeout),
+        Ok(Err(_)) => return force_refresh_terminal(peer_uid, IpcError::ListManagerChannelClosed),
+        Ok(Ok(())) => {}
+    }
+
+    let disposition = match tokio::time::timeout(timeouts.acceptance, accepted_rx).await {
+        Err(_) => return force_refresh_terminal(peer_uid, IpcError::ListRefreshAcceptanceTimeout),
+        Ok(Err(_)) => {
+            return force_refresh_terminal(peer_uid, IpcError::ListRefreshAcceptanceDropped)
+        }
+        Ok(Ok(disposition)) => disposition,
+    };
+    tracing::info!(
+        target: "audit",
+        action = "list.refresh.force",
+        phase = "accepted",
+        uid = ?peer_uid,
+        disposition = disposition.as_str(),
+        "IPC list refresh accepted"
+    );
+
+    match tokio::time::timeout(timeouts.completion, completion_rx).await {
+        Err(_) => force_refresh_terminal(peer_uid, IpcError::ListRefreshCompletionTimeout),
+        Ok(Err(_)) => force_refresh_terminal(peer_uid, IpcError::ListRefreshCompletionDropped),
+        Ok(Ok(completion)) => completed_force_refresh_response(
+            peer_uid,
+            disposition,
+            completion.snapshot,
+            completion.max_total_domains,
+        ),
+    }
+}
+
+fn completed_force_refresh_response(
+    peer_uid: Option<u32>,
+    disposition: crate::lists::manager::ListManagerCommandDisposition,
+    snapshot: crate::lists::status::RegistrySnapshot,
+    max_total_domains: Option<usize>,
+) -> IpcResponse {
+    tracing::info!(
+        target: "audit",
+        action = "list.refresh.force",
+        phase = "completed",
+        uid = ?peer_uid,
+        disposition = disposition.as_str(),
+        cycle_seq = snapshot.cycle.seq,
+        cycle_outcome = ?snapshot.cycle.outcome,
+        domain_count = snapshot.domain_count,
+        "IPC list refresh completed"
+    );
+    IpcResponse::ListRefreshCompleted {
+        disposition,
+        snapshot: snapshot.into(),
+        max_total_domains: max_total_domains.map(|value| value as u64),
+    }
+}
+
+fn force_refresh_terminal(peer_uid: Option<u32>, error: IpcError) -> IpcResponse {
+    let phase = force_refresh_failure_phase(&error);
+    tracing::info!(target: "audit", action = "list.refresh.force", phase, uid = ?peer_uid, error = ?error, "IPC list refresh terminal");
+    ipc_error(error)
+}
+
+fn force_refresh_failure_phase(error: &IpcError) -> &'static str {
+    match error {
+        IpcError::ListRefreshAcceptanceTimeout
+        | IpcError::ListRefreshAcceptanceDropped
+        | IpcError::ListRefreshCompletionTimeout
+        | IpcError::ListRefreshCompletionDropped => "unknown",
+        IpcError::ListManagerUnavailable
+        | IpcError::ListRefreshBusy
+        | IpcError::ListManagerChannelClosed
+        | IpcError::ListRefreshEnqueueTimeout => "rejected",
+        _ => "rejected",
     }
 }
 
@@ -1236,22 +1411,23 @@ async fn handle_shutdown(peer_uid: Option<u32>, state: &DaemonState) -> IpcRespo
 
 fn handle_domain_count(state: &DaemonState) -> IpcResponse {
     IpcResponse::DomainCount {
-        count: state.filter.domain_count(),
+        count: state.list_statuses.as_ref().map_or_else(
+            || state.filter.domain_count(),
+            |registry| registry.consistent_snapshot().domain_count,
+        ),
     }
 }
 
 /// Read per-source list telemetry.
 ///
-/// `source_id = None` returns one entry per `[lists].sources`. A
-/// `Some(filter)` filter is matched against the registry in three
-/// progressively-loose passes:
-///   1. exact source string (legacy slug like `"privacy/ads"` or raw URL)
-///   2. canonical `[[blocklists]].id` (looked up via the resolver's
-///      `slug_to_id` bridge — the v1 id form `"privacy-ads"` resolves
-///      back to the slash-form slug used by ListManager)
-///   3. case-insensitive substring on the source string
+/// `source_id = None` returns one row per planned representative. A filter
+/// first resolves through the registry's URL, slug, and Id aliases, then
+/// falls back to a case-insensitive source substring.
 ///
-/// Pass 3 is permissive on purpose: an operator typing `warden blocklist
+/// This intentionally exposes live per-source rows; aggregate status reads a
+/// completed-cycle snapshot to keep its cycle qualifiers coherent.
+///
+/// The final pass is permissive on purpose: an operator typing `warden blocklist
 /// stats ads` should hit `privacy/ads` without having to remember the
 /// full slug. False positives are bounded — at most 64 sources can be
 /// configured (`build_source_bit_map` panics over 64).
@@ -1264,48 +1440,39 @@ fn handle_blocklist_stats(state: &DaemonState, source_id: Option<String>) -> Ipc
         return IpcResponse::BlocklistStatsList { stats: Vec::new() };
     };
 
-    let snapshot = registry.snapshot();
-    let id_lookup = |source: &str| -> Option<String> {
-        state
-            .profiles
-            .as_ref()
-            .and_then(|r| r.id_for_slug(source))
-            .map(|id| id.as_str().to_string())
-    };
-
-    let filtered = match source_id.as_deref() {
-        None | Some("") => snapshot,
+    let stats = match source_id.as_deref() {
+        None | Some("") => registry
+            .snapshot_with_ids()
+            .into_iter()
+            .map(|(source, id, status)| {
+                BlocklistStatusDto::from_status(source, id.map(|id| id.to_string()), &status)
+            })
+            .collect(),
         Some(query) => {
-            // Pass 1: exact match against the registry key.
-            if let Some(slot) = snapshot.iter().find(|(s, _)| s == query) {
-                vec![slot.clone()]
-            } else if let Some(resolved_slug) =
-                state.profiles.as_ref().and_then(|r| r.slug_for_id(query))
-            {
-                // Pass 2: query is a canonical [[blocklists]].id; map
-                // it back to the slug-form the registry is keyed on.
-                snapshot
-                    .into_iter()
-                    .filter(|(s, _)| s == &resolved_slug)
-                    .collect()
+            if let Some(resolved) = registry.resolve_alias(query) {
+                vec![BlocklistStatusDto::from_status(
+                    resolved.representative,
+                    resolved.primary_id.map(|id| id.to_string()),
+                    &resolved.status,
+                )]
             } else {
-                // Pass 3: case-insensitive substring on the source.
+                // Final pass: case-insensitive substring on the source.
                 let needle = query.to_ascii_lowercase();
-                snapshot
+                registry
+                    .snapshot_with_ids()
                     .into_iter()
-                    .filter(|(s, _)| s.to_ascii_lowercase().contains(&needle))
+                    .filter(|(source, _, _)| source.to_ascii_lowercase().contains(&needle))
+                    .map(|(source, id, status)| {
+                        BlocklistStatusDto::from_status(
+                            source,
+                            id.map(|id| id.to_string()),
+                            &status,
+                        )
+                    })
                     .collect()
             }
         }
     };
-
-    let stats: Vec<BlocklistStatusDto> = filtered
-        .into_iter()
-        .map(|(source, status)| {
-            let id = id_lookup(&source);
-            BlocklistStatusDto::from_status(source, id, &status)
-        })
-        .collect();
     IpcResponse::BlocklistStatsList { stats }
 }
 
@@ -1976,11 +2143,10 @@ async fn handle_query_logs(
 /// Loads via the v1 loader so duplicate-detection sees the merged
 /// master+includes view, writes the new entity into
 /// `devices.d/<id>.toml` (or falls through to the master when no class
-/// directory exists), then `validate_or_revert` runs the full v1
-/// validator on the staged file. Held under `config_write_lock` so two
-/// concurrent IPC device mutations cannot race the read-modify-write
-/// cycle. Preserves includes / per-entity files the operator already
-/// organised by hand.
+/// directory exists), then validates the complete staged tree before
+/// promotion. The Tokio sequencer and OS tree guard prevent daemon-local
+/// and cross-process writers from racing the transaction. Existing include
+/// and per-entity layout is preserved.
 async fn handle_device_add(
     state: &DaemonState,
     client: crate::config::settings::ClientConfig,
@@ -1990,10 +2156,9 @@ async fn handle_device_add(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    // Serialize against other in-flight mutations. Held across the
-    // whole load→write→validate→reload cycle so a racing reload from
-    // SIGHUP can't observe a half-mutated state either.
-    let _guard = state.config_write_lock.lock().await;
+    // Acquire daemon sequencing before the OS guard. Retain it through reload;
+    // the OS guard covers only tree observation through promotion.
+    let _ipc_guard = state.config_write_lock.lock().await;
 
     // Slug the operator-typed name into a v1 id. Display name keeps
     // the original (free-form) string so the TUI rendering doesn't
@@ -2015,8 +2180,26 @@ async fn handle_device_add(
     // Load via the v1 loader so duplicate-detection sees the merged
     // master+includes view (a device defined in `devices.d/foo.toml`
     // would otherwise be invisible to a single-file parse).
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "device_add v1: acquire config write guard failed",
+            );
+            return ipc_error(IpcError::ConfigReadFailed);
+        }
+    };
+
     let now = time::OffsetDateTime::now_utc();
-    let loaded = match crate::config::loader::load_config(config_path, now) {
+    let loaded = match load_config_for_schema_under_guard(
+        &config_guard,
+        config_path,
+        SCHEMA_VERSION_V1,
+        now,
+    ) {
         Ok(l) => l,
         Err(errs) => {
             tracing::warn!(
@@ -2061,17 +2244,20 @@ async fn handle_device_add(
     // multiple `devices.d/*.toml` already exist, and IPC has no
     // `--into` knob to disambiguate. Per-id files are also easier to
     // diff in a git workflow than a monolithic `auto-migrated.toml`.
-    let parent = config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let class_dir = parent.join("devices.d"); // include-dir-ok: creation default
-    let target_path = if class_dir.is_dir() {
-        class_dir.join(format!("{new_id}.toml"))
-    } else {
-        config_path.clone()
+    let target_path = match resolve_device_add_target_locked(&config_guard, config_path, &new_id) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "device_add v1: resolve target failed",
+            );
+            return ipc_error(IpcError::TargetScanFailed);
+        }
     };
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(&target_path) {
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, &target_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -2102,9 +2288,7 @@ async fn handle_device_add(
     // against the merged tree BEFORE the rename; nothing is written on
     // failure. Merges the former write-then-validate-revert two-step — a
     // genuine write I/O error and a cross-ref rejection both surface here.
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, &target_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, &target_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             path = %target_path.display(),
@@ -2113,6 +2297,9 @@ async fn handle_device_add(
         );
         return ipc_error(IpcError::ValidationFailed);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",
@@ -2130,9 +2317,9 @@ async fn handle_device_add(
     // is dropped — and that is the correct outcome: the next reload
     // pass will see our just-written change because the file is
     // already on disk before this point. Using `send().await` here
-    // would deadlock under concurrent mutations because we hold the
-    // write lock across the await, and the channel may be full while
-    // the receiver is itself blocked on the lock during a SIGHUP. The
+    // would deadlock under concurrent mutations because we retain the
+    // Tokio sequencer, and the channel may be full while the receiver
+    // is itself blocked on that sequencer during a SIGHUP. The
     // only failure we DO surface is a closed channel — that means the
     // daemon is shutting down and the operator should restart it to
     // observe the change.
@@ -2162,6 +2349,72 @@ async fn handle_device_add(
     IpcResponse::Ok { message }
 }
 
+fn resolve_device_add_target_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    id: &str,
+) -> anyhow::Result<PathBuf> {
+    guard.verify_master(master)?;
+    let tree = guard.tree_io();
+    let master_key = tree.master_key();
+    let class_dir_name = Path::new("devices.d"); // include-dir-ok: new device placement
+    if let Some(class_dir) = tree.directory_from(&master_key, class_dir_name)? {
+        let filename = format!("{id}.toml");
+        Ok(tree
+            .resolve_in_directory(&class_dir, OsStr::new(&filename))?
+            .display()
+            .to_path_buf())
+    } else {
+        Ok(tree.plan_master_target()?.display().to_path_buf())
+    }
+}
+
+fn after_config_guard_released(_config_path: &Path) {
+    #[cfg(test)]
+    pre_reload_test_hook(_config_path);
+}
+
+#[cfg(test)]
+type PreReloadTestHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static PRE_RELOAD_TEST_HOOK: std::cell::RefCell<Option<(PathBuf, PreReloadTestHook)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn pre_reload_test_hook(config_path: &Path) {
+    PRE_RELOAD_TEST_HOOK.with(|slot| {
+        let Some((path, mut hook)) = slot.borrow_mut().take() else {
+            return;
+        };
+        if path == config_path {
+            hook();
+        }
+        *slot.borrow_mut() = Some((path, hook));
+    });
+}
+
+#[cfg(test)]
+fn with_pre_reload_test_hook<T>(
+    path: PathBuf,
+    hook: impl FnMut() + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<(PathBuf, PreReloadTestHook)>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PRE_RELOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    let _reset =
+        Reset(PRE_RELOAD_TEST_HOOK.with(|slot| slot.replace(Some((path, Box::new(hook))))));
+    body()
+}
+
 /// Apply a partial update to an existing client by name. Same write
 /// lock + read-modify-validate-write-reload shape as `handle_device_add`.
 ///
@@ -2182,7 +2435,7 @@ async fn handle_device_update(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
     // Map the operator-typed device name back to its v1 id. The TUI
     // round-trips the original name (whatever the operator typed) so
@@ -2200,9 +2453,23 @@ async fn handle_device_update(
         }
     };
 
-    let target_path = match crate::cli::commands::target::find_target_for_id(
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "device_update v1: acquire config write guard failed",
+            );
+            return ipc_error(IpcError::TargetScanFailed);
+        }
+    };
+
+    let target_path = match find_target_for_id_locked(
+        &config_guard,
         config_path,
-        crate::cli::commands::target::EntityClass::Devices,
+        EntityClass::Devices,
         &current_id,
     ) {
         Ok(Some(p)) => p,
@@ -2220,7 +2487,7 @@ async fn handle_device_update(
         }
     };
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(&target_path) {
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, &target_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -2356,22 +2623,7 @@ async fn handle_device_update(
     // dropped in silence — the failure mode the tag model itself died of.
     // The rest of the patch still lands, matching the `ip_denylists`
     // strip-and-report precedent in `normalise_deprecated_keys`.
-    if super::protocol::retired_tags_worth_reporting(patch.retired_tags.as_ref()) {
-        let tags = patch
-            .retired_tags
-            .as_ref()
-            .expect("non-empty implies present");
-        tracing::warn!(
-            target: "audit",
-            device = %name,
-            tags = ?tags,
-            "TAGS_RETIRED — this request carries a `tags` key, which no longer \
-             exists in the product. It has been IGNORED; every other field in \
-             the request was applied. The sender is almost certainly an older \
-             `warden` binary still on PATH after an upgrade — check that \
-             `warden --version` matches the running daemon.",
-        );
-    }
+    let retired_tags = patch.retired_tags.clone().filter(|tags| !tags.is_empty());
     if let Some(groups) = patch.groups.clone() {
         if groups.is_empty() {
             table.remove("groups");
@@ -2394,9 +2646,7 @@ async fn handle_device_update(
 
     let final_name = patch.new_name.clone().unwrap_or_else(|| name.clone());
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, &target_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, &target_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             path = %target_path.display(),
@@ -2404,6 +2654,22 @@ async fn handle_device_update(
             "device_update v1: staged patch rejected before write",
         );
         return ipc_error(IpcError::ValidationFailed);
+    }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
+
+    if let Some(tags) = retired_tags {
+        tracing::warn!(
+            target: "audit",
+            device = %name,
+            tags = ?tags,
+            "TAGS_RETIRED — this request carries a `tags` key, which no longer \
+             exists in the product. It has been IGNORED; every other field in \
+             the request was applied. The sender is almost certainly an older \
+             `warden` binary still on PATH after an upgrade — check that \
+             `warden --version` matches the running daemon.",
+        );
     }
 
     tracing::info!(
@@ -2465,7 +2731,7 @@ async fn handle_device_remove(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
     let target_id = match crate::cli::commands::target::slug_id(&name) {
         Ok(id) => id,
@@ -2480,9 +2746,23 @@ async fn handle_device_remove(
         }
     };
 
-    let target_path = match crate::cli::commands::target::find_target_for_id(
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "device_remove v1: acquire config write guard failed",
+            );
+            return ipc_error(IpcError::TargetScanFailed);
+        }
+    };
+
+    let target_path = match find_target_for_id_locked(
+        &config_guard,
         config_path,
-        crate::cli::commands::target::EntityClass::Devices,
+        EntityClass::Devices,
         &target_id,
     ) {
         Ok(Some(p)) => p,
@@ -2500,7 +2780,7 @@ async fn handle_device_remove(
         }
     };
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(&target_path) {
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, &target_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -2539,9 +2819,7 @@ async fn handle_device_remove(
         return ipc_error(IpcError::ConcurrentEdit);
     }
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, &target_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, &target_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             path = %target_path.display(),
@@ -2550,6 +2828,9 @@ async fn handle_device_remove(
         );
         return ipc_error(IpcError::ValidatorRejected);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",
@@ -2689,7 +2970,7 @@ async fn handle_device_promote(
 ///
 /// Shape matches the entity editors: write-lock, per-file `toml::Value`
 /// surgery on the master's `[tracking]` table, promote through the
-/// overlay-validating `write_value_validated` (layout-preserving — see
+/// overlay-validating `write_value_validated_locked` (layout-preserving — see
 /// writer-01), trigger reload through the shared `reload_tx` channel so
 /// `apply_query_log_reload` in `start.rs` sees the flip and attaches /
 /// detaches the writer accordingly.
@@ -2701,7 +2982,7 @@ async fn handle_tracking_config_update(
     let Some(config_path) = state.config_path.as_ref() else {
         return ipc_error(IpcError::NoConfigPath);
     };
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
     // Pre-flight: fail fast on out-of-range values with the frozen
     // operator strings. The v1 loader's validator would also catch
@@ -2728,10 +3009,23 @@ async fn handle_tracking_config_update(
     // validation). `[tracking]` is a master-only pass-through section
     // (same as `[lists]` in `api::handlers::edit_master_lists_sources`),
     // so editing only the master's table and writing only the master
-    // preserves the include layout. `write_value_validated` still
+    // preserves the include layout. `write_value_validated_locked` still
     // overlay-validates {master + every include} BEFORE the rename, so
     // a bad result is refused with nothing written.
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(config_path) {
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "tracking_config_update: acquire config write guard failed",
+            );
+            return ipc_error(IpcError::ConfigReadFailed);
+        }
+    };
+
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, config_path) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(
@@ -2792,17 +3086,18 @@ async fn handle_tracking_config_update(
         }
     }
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, config_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, config_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             path = %config_path.display(),
             error = %e,
-            "tracking_config_update: write_value_validated failed",
+            "tracking_config_update: write_value_validated_locked failed",
         );
         return ipc_error(IpcError::ConfigWriteFailed);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",
@@ -2854,7 +3149,7 @@ async fn handle_profile_create(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
     if let Err(e) = crate::config::schema::Id::new(&id) {
         tracing::warn!(
@@ -2866,21 +3161,42 @@ async fn handle_profile_create(
         return ipc_error(IpcError::InvalidProfileId { id: id.clone() });
     }
 
-    if let Ok(Some(existing_path)) = crate::cli::commands::target::find_target_for_id(
-        config_path,
-        crate::cli::commands::target::EntityClass::Profiles,
-        &id,
-    ) {
-        tracing::warn!(
-            target: "ipc.error",
-            id = %id,
-            existing = %existing_path.display(),
-            "profile_create: id already exists",
-        );
-        return ipc_error(IpcError::DuplicateProfileId { id: id.clone() });
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "profile_create: acquire config write guard failed",
+            );
+            return ipc_error(IpcError::TargetScanFailed);
+        }
+    };
+
+    match find_target_for_id_locked(&config_guard, config_path, EntityClass::Profiles, &id) {
+        Ok(Some(existing_path)) => {
+            tracing::warn!(
+                target: "ipc.error",
+                id = %id,
+                existing = %existing_path.display(),
+                "profile_create: id already exists",
+            );
+            return ipc_error(IpcError::DuplicateProfileId { id: id.clone() });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc.error",
+                path = %config_path.display(),
+                error = %e,
+                "profile_create: find_target_for_id failed",
+            );
+            return ipc_error(IpcError::TargetScanFailed);
+        }
     }
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(config_path) {
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, config_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -2911,9 +3227,7 @@ async fn handle_profile_create(
         return ipc_error(IpcError::StageFailed);
     }
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, config_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, config_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             id = %id,
@@ -2922,6 +3236,9 @@ async fn handle_profile_create(
         );
         return ipc_error(IpcError::ValidatorRejected);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",
@@ -2961,7 +3278,7 @@ async fn handle_profile_create(
 /// override sails through. Serde owns the defaults; this asks serde.
 ///
 /// The loaded config is deliberately not consulted, and not only because
-/// [`DaemonState`] holds no handle to it: `find_target_for_id` answers
+/// [`DaemonState`] holds no handle to it: `find_target_for_id_locked` answers
 /// about the bytes the next write will sit next to, which is the state
 /// this decision is actually about. For `trust` and
 /// `accept_unsigned_allow` the loaded view would agree — neither is
@@ -2971,16 +3288,17 @@ struct BlocklistRowOnDisk {
     accept_unsigned_allow: bool,
 }
 
-fn blocklist_row_on_disk(
+fn blocklist_row_on_disk_locked(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     list_id: &str,
 ) -> anyhow::Result<Option<BlocklistRowOnDisk>> {
-    use crate::cli::commands::target::{find_target_for_id, read_or_empty, EntityClass};
-
-    let Some(target) = find_target_for_id(config_path, EntityClass::Blocklists, list_id)? else {
+    let Some(target) =
+        find_target_for_id_locked(guard, config_path, EntityClass::Blocklists, list_id)?
+    else {
         return Ok(None);
     };
-    let (doc, _) = read_or_empty(&target)?;
+    let (doc, _) = read_or_empty_locked(guard, config_path, &target)?;
     let Some(array) = doc
         .as_table()
         .and_then(|t| t.get(EntityClass::Blocklists.toml_key()))
@@ -3018,29 +3336,39 @@ async fn handle_profile_update(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
-    let target_path = match crate::cli::commands::target::find_target_for_id(
-        config_path,
-        crate::cli::commands::target::EntityClass::Profiles,
-        &id,
-    ) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return ipc_error(IpcError::ProfileNotFound { id: id.clone() });
-        }
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
         Err(e) => {
             tracing::warn!(
                 target: "ipc.error",
                 path = %config_path.display(),
                 error = %e,
-                "profile_update: find_target_for_id failed",
+                "profile_update: acquire config write guard failed",
             );
             return ipc_error(IpcError::TargetScanFailed);
         }
     };
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(&target_path) {
+    let target_path =
+        match find_target_for_id_locked(&config_guard, config_path, EntityClass::Profiles, &id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return ipc_error(IpcError::ProfileNotFound { id: id.clone() });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ipc.error",
+                    path = %config_path.display(),
+                    error = %e,
+                    "profile_update: find_target_for_id failed",
+                );
+                return ipc_error(IpcError::TargetScanFailed);
+            }
+        };
+
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, &target_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -3181,7 +3509,7 @@ async fn handle_profile_update(
         // applied: a patch that names two lists and gets one wrong writes
         // neither, so a refusal never leaves a half-applied override.
         for (list_id, policy) in &lists.set {
-            let row = match blocklist_row_on_disk(config_path, list_id) {
+            let row = match blocklist_row_on_disk_locked(&config_guard, config_path, list_id) {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return ipc_error(IpcError::ListPolicyUnknownList {
@@ -3234,6 +3562,7 @@ async fn handle_profile_update(
                 false,
             );
             if gates.needs_consent {
+                drop(config_guard);
                 tracing::warn!(
                     target: "audit",
                     action = "profile.list_policy.refused.v1",
@@ -3365,9 +3694,7 @@ async fn handle_profile_update(
         }
     }
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, &target_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, &target_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             id = %id,
@@ -3376,6 +3703,9 @@ async fn handle_profile_update(
         );
         return ipc_error(IpcError::ValidatorRejected);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",
@@ -3406,29 +3736,39 @@ async fn handle_profile_delete(
         return ipc_error(IpcError::NoConfigPath);
     };
 
-    let _guard = state.config_write_lock.lock().await;
+    let _ipc_guard = state.config_write_lock.lock().await;
 
-    let target_path = match crate::cli::commands::target::find_target_for_id(
-        config_path,
-        crate::cli::commands::target::EntityClass::Profiles,
-        &id,
-    ) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return ipc_error(IpcError::ProfileNotFound { id: id.clone() });
-        }
+    let config_guard = match acquire_for_write(config_path) {
+        Ok(guard) => guard,
         Err(e) => {
             tracing::warn!(
                 target: "ipc.error",
                 path = %config_path.display(),
                 error = %e,
-                "profile_delete: find_target_for_id failed",
+                "profile_delete: acquire config write guard failed",
             );
             return ipc_error(IpcError::TargetScanFailed);
         }
     };
 
-    let (mut doc, _) = match crate::cli::commands::target::read_or_empty(&target_path) {
+    let target_path =
+        match find_target_for_id_locked(&config_guard, config_path, EntityClass::Profiles, &id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return ipc_error(IpcError::ProfileNotFound { id: id.clone() });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ipc.error",
+                    path = %config_path.display(),
+                    error = %e,
+                    "profile_delete: find_target_for_id failed",
+                );
+                return ipc_error(IpcError::TargetScanFailed);
+            }
+        };
+
+    let (mut doc, _) = match read_or_empty_locked(&config_guard, config_path, &target_path) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -3463,9 +3803,7 @@ async fn handle_profile_delete(
         return ipc_error(IpcError::ConcurrentEdit);
     }
 
-    if let Err(e) =
-        crate::cli::commands::target::write_value_validated(config_path, &target_path, &doc)
-    {
+    if let Err(e) = write_value_validated_locked(&config_guard, config_path, &target_path, &doc) {
         tracing::warn!(
             target: "ipc.error",
             id = %id,
@@ -3474,6 +3812,9 @@ async fn handle_profile_delete(
         );
         return ipc_error(IpcError::ValidatorRejected);
     }
+
+    drop(config_guard);
+    after_config_guard_released(config_path);
 
     tracing::info!(
         target: "audit",

@@ -303,7 +303,7 @@ mod tests {
     /// A master shaped like a real one: comments above sections, a
     /// trailing comment on a value, and keys in an order no serialiser
     /// would choose.
-    const COMMENTED: &str = r#"schema_version = 3
+    const COMMENTED: &str = r#"schema_version = 4
 
 # The upstream resolvers this household uses.
 # Changed 2026-03-01 after the old pair started timing out.
@@ -496,7 +496,7 @@ display_name = "Adults"
 
     #[test]
     fn table_mut_creates_a_missing_table_and_refuses_a_non_table() {
-        let mut doc = "schema_version = 3\n".parse::<DocumentMut>().unwrap();
+        let mut doc = "schema_version = 4\n".parse::<DocumentMut>().unwrap();
         table_mut(&mut doc, "api")
             .unwrap()
             .insert("enabled", toml_edit::value(true));

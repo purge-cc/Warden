@@ -20,9 +20,12 @@
 //! `get_with` then a manual insert) would still pass every unit test
 //! while regressing N→1 to N→N upstream calls.
 
+use std::future::{poll_fn, Future};
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use hickory_proto::op::ResponseCode;
@@ -33,6 +36,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use purge_warden::config::settings::CacheConfig;
 use purge_warden::dns::cache::DnsCache;
 use purge_warden::dns::error::DnsError;
+use tokio::sync::Semaphore;
 
 fn cache_config() -> CacheConfig {
     CacheConfig {
@@ -171,66 +175,91 @@ async fn singleflight_collapses_concurrent_negative_misses() {
 /// but the result is NOT cached so a follow-up call after they complete
 /// runs a fresh fetcher. Validates that try_get_with semantics give us
 /// "coalesce in flight, never cache" for non-cacheable responses.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "current_thread")]
 async fn singleflight_servfail_coalesces_in_flight_but_does_not_cache() {
     const N: usize = 8;
-    let cache = Arc::new(DnsCache::new(&cache_config()));
-    let counter = Arc::new(AtomicU64::new(0));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let cache = Arc::new(DnsCache::new(&cache_config()));
+        let counter = Arc::new(AtomicU64::new(0));
+        let servfail_permits = Arc::new(Semaphore::new(0));
 
-    // Round 1: N concurrent SERVFAIL fetches → 1 closure invocation.
-    let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
-        let cache = Arc::clone(&cache);
-        let counter = Arc::clone(&counter);
-        handles.push(tokio::spawn(async move {
-            cache
-                .lookup_or_fetch(
-                    "broken.example",
-                    RecordType::A,
-                    DNSClass::IN,
-                    None,
-                    move || async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                        Err(DnsError::Uncacheable(ResponseCode::ServFail))
-                    },
-                )
-                .await
-                .err()
-                .map(|f| match f.error.as_ref() {
+        // Round 1 holds the leader while every caller joins its in-flight fetch.
+        let mut calls: Vec<Pin<Box<dyn Future<Output = ResponseCode>>>> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let cache = Arc::clone(&cache);
+            let counter = Arc::clone(&counter);
+            let servfail_permits = Arc::clone(&servfail_permits);
+            calls.push(Box::pin(async move {
+                let failure = cache
+                    .lookup_or_fetch(
+                        "broken.example",
+                        RecordType::A,
+                        DNSClass::IN,
+                        None,
+                        move || async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let _permit = servfail_permits
+                                .acquire_owned()
+                                .await
+                                .expect("test semaphore must remain open");
+                            Err(DnsError::Uncacheable(ResponseCode::ServFail))
+                        },
+                    )
+                    .await
+                    .err()
+                    .expect("SERVFAIL must remain an error");
+                match failure.error.as_ref() {
                     DnsError::Uncacheable(rc) => *rc,
                     _ => panic!("expected Uncacheable"),
-                })
-        }));
-    }
-    for h in handles {
-        let rc = h.await.expect("spawn").expect("err");
-        assert_eq!(rc, ResponseCode::ServFail);
-    }
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "round 1: in-flight SERVFAIL must coalesce to 1 closure invocation"
-    );
+                }
+            }));
+        }
 
-    // Round 2: try_get_with did NOT cache the SERVFAIL — the next call
-    // runs a fresh closure invocation, bringing the counter to 2.
-    let counter_round2 = Arc::clone(&counter);
-    let _ = cache
-        .lookup_or_fetch(
-            "broken.example",
-            RecordType::A,
-            DNSClass::IN,
-            None,
-            move || async move {
-                counter_round2.fetch_add(1, Ordering::SeqCst);
-                Err(DnsError::Uncacheable(ResponseCode::ServFail))
-            },
-        )
+        // This polls every caller while the leader is blocked before releasing it.
+        poll_fn(|cx| {
+            for call in &mut calls {
+                assert!(
+                    call.as_mut().poll(cx).is_pending(),
+                    "SERVFAIL must remain in flight until the test releases its leader"
+                );
+            }
+            Poll::Ready(())
+        })
         .await;
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "round 2: SERVFAIL must NOT have been cached — closure must run again"
-    );
+        // Release enough permits for every broken leader to terminate.
+        servfail_permits.add_permits(N);
+
+        for call in calls {
+            let rc = call.await;
+            assert_eq!(rc, ResponseCode::ServFail);
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "round 1: in-flight SERVFAIL must coalesce to 1 closure invocation"
+        );
+
+        // Round 2: try_get_with did NOT cache the SERVFAIL — the next call
+        // runs a fresh closure invocation, bringing the counter to 2.
+        let counter_round2 = Arc::clone(&counter);
+        let _ = cache
+            .lookup_or_fetch(
+                "broken.example",
+                RecordType::A,
+                DNSClass::IN,
+                None,
+                move || async move {
+                    counter_round2.fetch_add(1, Ordering::SeqCst);
+                    Err(DnsError::Uncacheable(ResponseCode::ServFail))
+                },
+            )
+            .await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "round 2: SERVFAIL must NOT have been cached — closure must run again"
+        );
+    })
+    .await
+    .expect("SERVFAIL singleflight scenario timed out after 10 seconds");
 }

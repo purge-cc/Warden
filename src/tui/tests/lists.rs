@@ -48,7 +48,7 @@ fn app_with_overridden_lists_and_profiles() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -399,7 +399,7 @@ fn build_grouped_rows_collapses_canonical_id_duplicates() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -468,7 +468,7 @@ fn build_meta_falls_back_to_url_match_when_dto_id_is_none() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -511,29 +511,16 @@ display_name = "Default"
 
 // ── List edit modal builder + state transitions ──────────────────
 
-// ── surface-5m: modal builders must read the shared default ──────
-//
-// `build_promote_modal_for` and `build_add_modal` used to hardcode
-// `max_entries: 5_000_000` — a stale copy of a daemon-wide default
-// that was raised to 10M. Since the fail-closed corpus guard change,
-// exceeding `max_entries` refuses the source whole (previous
-// generation kept) instead of truncating it, so a list added from
-// the TUI that holds more than 5M domains silently vanishes on the
-// next refresh. These pin both builders to the single source of
-// truth (`crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES`) so
-// raising the schema default propagates here with no further edit.
+// ── Fresh modal fixtures inherit shared controls ─────────────────
 
 #[test]
-fn add_modal_max_entries_reads_the_shared_default_not_a_copy() {
+fn add_modal_max_entries_is_inherited() {
     let modal = build_add_modal();
-    assert_eq!(
-        modal.original.max_entries,
-        crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES as u64
-    );
+    assert_eq!(modal.original.max_entries, None);
 }
 
 #[test]
-fn promote_modal_max_entries_reads_the_shared_default_not_a_copy() {
+fn promote_modal_max_entries_is_inherited() {
     let mut app = App::new();
     app.lists.entries = vec![BlocklistStatusDto {
         source: "https://raw.example/orphan.txt".into(),
@@ -543,10 +530,7 @@ fn promote_modal_max_entries_reads_the_shared_default_not_a_copy() {
     }];
     app.lists.table_state.select(Some(0));
     let modal = build_promote_modal_for(&app).expect("orphan row must build a Promote modal");
-    assert_eq!(
-        modal.original.max_entries,
-        crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES as u64
-    );
+    assert_eq!(modal.original.max_entries, None);
 }
 
 #[test]
@@ -601,6 +585,7 @@ fn s53_interval_choice_round_trips_known_presets_and_custom_fallback() {
         IntervalChoice::Custom
     ));
     assert!(IntervalChoice::Custom.hours().is_none());
+    assert!(IntervalChoice::Inherited.hours().is_none());
 }
 
 /// The picker still groups by kind and still emits a header per non-empty
@@ -882,7 +867,7 @@ fn app_with_no_inert_lists() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -932,7 +917,7 @@ fn app_with_two_inert_lists() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -988,7 +973,7 @@ fn app_with_two_genuinely_inert_lists() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1075,7 +1060,7 @@ fn inert_reason_none_when_only_a_group_tag_reaches_the_list() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -2618,6 +2603,10 @@ fn picker_entry(id: &str, original: app::CatalogRowState) -> app::CatalogPickerR
     app::CatalogPickerRow {
         catalog_id: id.to_string(),
         canonical_id: id.replace('/', "-"),
+        captured_id: original.is_subscribed().then(|| id.replace('/', "-")),
+        captured_canonical_url: original
+            .is_subscribed()
+            .then(|| format!("https://lists.purge.cc/{topic}.txt")),
         url: format!("https://lists.purge.cc/{topic}.txt"),
         display_name: format!("Test: {id}"),
         scope: scope.to_string(),

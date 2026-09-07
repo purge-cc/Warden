@@ -19,7 +19,7 @@ use super::super::secrets::Secrets;
 // SAME parser the filter engine consumes, so `config lint` accepts exactly
 // what the engine will enforce. A second hand-rolled grammar here would
 // drift and re-create the silent-rule bug.
-use super::blocklist::{effective_direction, BlocklistBase, BlocklistTrust, ListPolicy};
+use super::blocklist::{effective_direction, Blocklist, BlocklistBase, BlocklistTrust, ListPolicy};
 use super::cluster::validate_peer_url;
 use super::id::Id;
 use super::label::{Label, LabelKind};
@@ -121,9 +121,25 @@ pub fn validate_collect(
     secrets: Option<&Secrets>,
     provenance: Option<&ProvenanceMap>,
 ) -> Result<(), Vec<ConfigError>> {
+    validate_collect_for_schema(config, SCHEMA_VERSION_V1, now, warns, secrets, provenance)
+}
+
+/// Validate against `expected_schema`, placed immediately after the config.
+///
+/// This selects the required schema equality; schema-sensitive rules still use
+/// the config's declared version. All other checks and warning collection are
+/// identical to [`validate_collect`], which requires the current schema.
+pub fn validate_collect_for_schema(
+    config: &ConfigV1,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    warns: &mut AuditWarnings,
+    secrets: Option<&Secrets>,
+    provenance: Option<&ProvenanceMap>,
+) -> Result<(), Vec<ConfigError>> {
     let mut errs = Vec::new();
 
-    check_schema_version(config, &mut errs);
+    check_schema_version(config, expected_schema, &mut errs);
     let profile_ids = collect_profile_ids(config, &mut errs);
     let blocklist_ids = collect_unique_ids(&config.blocklists, |b| &b.id, "blocklists", &mut errs);
     let device_ids = collect_unique_ids(&config.devices, |d| &d.id, "devices", &mut errs);
@@ -191,17 +207,33 @@ pub fn validate_collect(
 
 // ── scalar / structural checks ─────────────────────────────────
 
-fn check_schema_version(config: &ConfigV1, errs: &mut Vec<ConfigError>) {
-    if config.schema_version != SCHEMA_VERSION_V1 {
-        errs.push(ConfigError::VersionMismatch(
-            ErrorContext::new(format!(
+fn check_schema_version(config: &ConfigV1, expected_schema: u32, errs: &mut Vec<ConfigError>) {
+    if config.schema_version != expected_schema {
+        let reason = if expected_schema == SCHEMA_VERSION_V1 {
+            format!(
                 "schema_version = {}; this binary supports only schema_version = {}",
                 config.schema_version, SCHEMA_VERSION_V1
-            ))
-            .with_entity("schema_version")
-            .with_suggestion(format!(
-                "set `schema_version = {SCHEMA_VERSION_V1}` at the top of config.toml"
-            )),
+            )
+        } else {
+            format!(
+                "schema_version = {}; expected schema_version = {expected_schema}",
+                config.schema_version
+            )
+        };
+        let suggestion = if expected_schema == SCHEMA_VERSION_V1
+            && SCHEMA_VERSION_V1 == 4
+            && config.schema_version == 3
+        {
+            "run `warden migrate v3-to-v4 --from-config <config.toml>`; do not change \
+             schema_version by hand because schema-3 row controls must be retired before schema 4"
+                .to_string()
+        } else {
+            format!("set `schema_version = {expected_schema}` at the top of config.toml")
+        };
+        errs.push(ConfigError::VersionMismatch(
+            ErrorContext::new(reason)
+                .with_entity("schema_version")
+                .with_suggestion(suggestion),
         ));
     }
 }
@@ -2001,7 +2033,7 @@ fn check_blocklists(
             }
             warns.push(msg);
         }
-        if b.update_interval_hours == 0 {
+        if b.update_interval_hours == Some(0) {
             errs.push(ConfigError::ValidationFailed(
                 ErrorContext::new(format!(
                     "blocklists[{i}].update_interval_hours must be greater than 0"
@@ -2009,7 +2041,7 @@ fn check_blocklists(
                 .with_entity(format!("blocklists.{}", b.id)),
             ));
         }
-        if b.max_entries == 0 {
+        if b.max_entries == Some(0) {
             errs.push(ConfigError::ValidationFailed(
                 ErrorContext::new(format!(
                     "blocklists[{i}].max_entries must be greater than 0"
@@ -2097,19 +2129,16 @@ fn check_blocklists(
             }
         }
     }
-    check_blocklist_duplicate_urls(config, warns);
+    let conflicting_duplicate_urls = check_blocklist_alias_conflicts(config, errs);
+    check_blocklist_duplicate_urls(config, warns, &conflicting_duplicate_urls);
     check_orphan_legacy_sources(config, warns);
 }
 
 /// Two or more **enabled** blocklists
 /// resolving to the same canonical source URL.
 ///
-/// **WARN, never fatal.** A duplicate blocklist pair is not a defect —
-/// the resolver still works, just wastefully — so making this an error
-/// would refuse to start over information rather than a failure.
-/// `warden config lint` already
-/// captures every `target = "audit"` WARN and exits `2`, which is the
-/// channel that makes it impossible to ignore.
+/// Semantically identical aliases warn; conflicting aliases fail before
+/// one downloaded body can acquire two policies.
 ///
 /// Disabled lists are skipped: a parked duplicate downloads nothing,
 /// touches no cache file, and burns no bitmask slot, so warning about it
@@ -2119,14 +2148,65 @@ fn check_blocklists(
 /// named, not one line per list — the operator needs to see the pair to
 /// know which one to remove. Iteration order follows the config so the
 /// ids in the message are stable across reloads.
-fn check_blocklist_duplicate_urls(config: &ConfigV1, warns: &mut AuditWarnings) {
+fn check_blocklist_duplicate_urls(
+    config: &ConfigV1,
+    warns: &mut AuditWarnings,
+    conflicting_urls: &HashSet<String>,
+) {
     for (key, ids) in duplicate_url_groups(config) {
+        if conflicting_urls.contains(&key) {
+            continue;
+        }
         let msg = format_blocklist_duplicate_url(&ids, &key);
         if warns.emit() {
             tracing::warn!(target: "audit", blocklists = %ids.join(","), "{msg}");
         }
         warns.push(msg);
     }
+}
+
+/// Reject duplicate URL rows when one downloaded body would acquire two
+/// different runtime meanings. Harmless aliases retain the legacy warning.
+fn check_blocklist_alias_conflicts(
+    config: &ConfigV1,
+    errs: &mut Vec<ConfigError>,
+) -> HashSet<String> {
+    let mut conflicts = HashSet::new();
+    for (canonical_url, _ids) in duplicate_url_groups(config) {
+        let mut first: Option<&Blocklist> = None;
+        for row in config.blocklists.iter().filter(|b| {
+            b.enabled && crate::lists::source_key::canonical_url_key(&b.url) == canonical_url
+        }) {
+            if let Some(first) = first {
+                if let Some(conflict) = crate::lists::source_key::blocklist_alias_conflict(
+                    first,
+                    row,
+                    &config.profiles,
+                    crate::lists::source_key::RowControlDefaults {
+                        max_entries: config.lists.max_entries,
+                        update_interval_secs: config.lists.update_interval_secs,
+                    },
+                    crate::lists::source_key::RowControlMode::for_schema_version(
+                        config.schema_version,
+                    ),
+                ) {
+                    conflicts.insert(canonical_url.clone());
+                    errs.push(ConfigError::ValidationFailed(ErrorContext::new(
+                        crate::lists::source_key::format_list_source_alias_conflict(
+                            first.id.as_str(),
+                            row.id.as_str(),
+                            &canonical_url,
+                            conflict.field(),
+                        ),
+                    )));
+                    break;
+                }
+            } else {
+                first = Some(row);
+            }
+        }
+    }
+    conflicts
 }
 
 /// Report every `[lists].sources` entry that cannot filter.
@@ -3917,16 +3997,9 @@ pub fn format_device_metadata_unknown_label(
 /// Emitted when two or more enabled
 /// blocklists resolve to the same canonical source URL.
 ///
-/// Duplicates are not merely wasteful. `lists::manager::source_to_cache_stem`
-/// derives the on-disk cache name from the **URL alone**, so twin entries
-/// share one cache body and one `.meta` sidecar: they see each other's ETag,
-/// a `304` for one silently satisfies the other, and the last writer wins the
-/// body — while `ListStatus` stays keyed per-id and can disagree with the file
-/// it points at. Each twin also burns one of the 64 bitmask slots.
-///
-/// WARN at load (never fatal — a duplicate is not a defect, and refusing
-/// to start over it would take a working config offline); surfaces as an
-/// error through `warden config lint`, which exits `2` on warnings.
+/// Semantically identical aliases share one planned fetch, bit, cache, and
+/// status row. Rows with conflicting runtime settings are rejected earlier;
+/// this warning asks the operator to remove harmless duplicate spelling.
 ///
 /// `{ids}` is the comma-separated list of every colliding blocklist id,
 /// `{url}` the canonical key they share.

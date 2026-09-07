@@ -25,6 +25,7 @@ use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
 use ratatui::Frame;
 
 use crate::ipc::protocol::DomainCount;
+use crate::lists::status::ServedState;
 use crate::tui::app::App;
 use crate::tui::format;
 use crate::tui::theme::{self, T};
@@ -2330,11 +2331,13 @@ fn pulse_row_active(app: &App) -> Line<'static> {
 
 /// Filter corpus counts: number of configured lists + total domains in
 /// the engine. Reads the daemon `Status` snapshot. List count renders
-/// `active/total` when the daemon reports the registry counters
-/// (`lists_total > 0`), else falls back to the legacy `list_count`
-/// scalar for an older daemon that doesn't report them. Muted `—`
+/// `active/total` when the daemon reports a cycle marker, else falls back
+/// to the legacy `list_count` scalar for an older daemon. A reported 0/0
+/// is an intentional empty registry. Muted `—`
 /// before the first poll lands.
 fn pulse_row_filter_counts(app: &App) -> Line<'static> {
+    use time::format_description::well_known::Rfc3339;
+
     let label = pulse_label("Filter");
     let Some(s) = app.daemon_status.as_ref() else {
         return Line::from(vec![
@@ -2343,12 +2346,27 @@ fn pulse_row_filter_counts(app: &App) -> Line<'static> {
             Span::styled("\u{2014}", Style::default().fg(T.text_muted)),
         ]);
     };
-    let lists_text = if s.lists_total > 0 {
+    let lists_text = if s.lists_cycle.is_some() {
         format!("{}/{}", s.lists_active, s.lists_total)
     } else {
         format!("{}", s.list_count)
     };
-    let refused = s.lists_corpus_refusal.is_some();
+    let outcome = s.lists_cycle.and_then(|cycle| cycle.outcome);
+    let cleared = outcome == Some(crate::lists::status::CycleOutcome::ClearedNoSources);
+    let source_coverage_incomplete = s
+        .lists_cycle
+        .is_some_and(|cycle| cycle.source_coverage_incomplete);
+    let generation_degraded = s.lists_cycle.is_some_and(|cycle| cycle.generation_degraded);
+    let degraded_served_state = s
+        .lists_cycle
+        .map_or(ServedState::Unknown, |cycle| cycle.served_state);
+    let cold_partial = source_coverage_incomplete
+        && outcome == Some(crate::lists::status::CycleOutcome::Installed);
+    // Refusal and config rejection are this cycle's primary results;
+    // coverage is a standing qualifier from the latest manager attempt.
+    let config_rejected = outcome == Some(crate::lists::status::CycleOutcome::ConfigRejected);
+    let refused = outcome == Some(crate::lists::status::CycleOutcome::Refused)
+        || (!config_rejected && s.lists_corpus_refusal.is_some());
     let mut spans = vec![
         label,
         Span::raw(" "),
@@ -2359,29 +2377,110 @@ fn pulse_row_filter_counts(app: &App) -> Line<'static> {
         // to it. `warden status` makes exactly this substitution
         // (`format_lists_lines`) and for exactly this reason.
         Span::styled(
-            format!("{lists_text} {}", if refused { "fetched" } else { "lists" }),
+            format!(
+                "{lists_text} {}",
+                if cleared || config_rejected || source_coverage_incomplete || generation_degraded {
+                    "source rows"
+                } else if refused {
+                    "fetched"
+                } else {
+                    "lists"
+                }
+            ),
             Style::default()
-                .fg(if refused { T.warning } else { T.text_primary })
+                .fg(
+                    if refused
+                        || source_coverage_incomplete
+                        || generation_degraded
+                        || config_rejected
+                    {
+                        T.warning
+                    } else {
+                        T.text_primary
+                    },
+                )
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if refused {
+    if cleared {
+        spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
         spans.push(Span::styled(
-            " \u{00b7} ",
-            Style::default().fg(T.text_muted),
+            "BLOCKLIST CLEARED — FILTERING NOTHING",
+            Style::default().fg(T.error).add_modifier(Modifier::BOLD),
         ));
+    } else if config_rejected {
+        spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
+        spans.push(Span::styled(
+            "CONFIG REJECTED",
+            Style::default().fg(T.error).add_modifier(Modifier::BOLD),
+        ));
+        if source_coverage_incomplete {
+            spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
+            spans.push(Span::styled(
+                "STANDING COVERAGE INCOMPLETE",
+                Style::default().fg(T.warning),
+            ));
+        }
+    } else if refused {
+        spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
         spans.push(Span::styled(
             "REFUSED",
             Style::default().fg(T.error).add_modifier(Modifier::BOLD),
         ));
-    } else if s.lists_truncated > 0 {
+        if source_coverage_incomplete {
+            spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
+            spans.push(Span::styled(
+                "COVERAGE INCOMPLETE",
+                Style::default().fg(T.warning),
+            ));
+        }
+    } else if source_coverage_incomplete {
         spans.push(Span::styled(
             " \u{00b7} ",
             Style::default().fg(T.text_muted),
         ));
         spans.push(Span::styled(
-            format!("{} TRUNCATED", s.lists_truncated),
+            if cold_partial {
+                "SOURCE COVERAGE INCOMPLETE · PARTIAL CORPUS"
+            } else {
+                "STANDING SOURCE COVERAGE INCOMPLETE"
+            },
+            Style::default().fg(T.error).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if generation_degraded {
+        spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
+        spans.push(Span::styled(
+            degraded_served_state_label(degraded_served_state),
+            Style::default().fg(T.error).add_modifier(Modifier::BOLD),
+        ));
+    } else if !cleared
+        && !config_rejected
+        && !refused
+        && !source_coverage_incomplete
+        && s.lists_truncated > 0
+    {
+        spans.push(Span::styled(
+            " \u{00b7} ",
+            Style::default().fg(T.text_muted),
+        ));
+        spans.push(Span::styled(
+            format!("{} REFUSED since start", s.lists_truncated),
             Style::default().fg(T.warning).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(freeze) = &s.lists_corpus_freeze {
+        let since = freeze
+            .since
+            .and_then(|time| time.format(&Rfc3339).ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        spans.push(Span::styled(" · ", Style::default().fg(T.text_muted)));
+        spans.push(Span::styled(
+            format!(
+                "FROZEN since {since} ({} cycles; this daemon)",
+                freeze.consecutive
+            ),
+            Style::default().fg(T.warning),
         ));
     }
     spans.push(Span::styled(
@@ -2393,13 +2492,17 @@ fn pulse_row_filter_counts(app: &App) -> Line<'static> {
     // zero it describes no generation at all. That zero is the daemon's
     // worst state (up, listening, filtering nothing), and printed bare it
     // reads as an ordinary counter.
-    let (domains_text, domains_fg) = match (refused, s.domain_count) {
-        (true, 0) => ("0 domains UNFILTERED".to_string(), T.error),
-        (true, n) => (
+    let (domains_text, domains_fg) = match (cleared, refused, s.domain_count) {
+        (true, _, 0) => (
+            "0 domains UNFILTERED (blocklist cleared)".to_string(),
+            T.error,
+        ),
+        (_, true, 0) => ("0 domains UNFILTERED".to_string(), T.error),
+        (_, true, n) => (
             format!("{} domains (previous)", format_count(n as u64)),
             T.warning,
         ),
-        (false, n) => (
+        (_, false, n) => (
             format!("{} domains", format_count(n as u64)),
             T.text_primary,
         ),
@@ -2409,6 +2512,19 @@ fn pulse_row_filter_counts(app: &App) -> Line<'static> {
         Style::default().fg(domains_fg).add_modifier(Modifier::BOLD),
     ));
     Line::from(spans)
+}
+
+/// The degraded flag records a failed refresh, while this value records what
+/// the filter actually serves; the two must not be conflated in the UI.
+fn degraded_served_state_label(state: ServedState) -> &'static str {
+    match state {
+        ServedState::Complete => "SERVED: COMPLETE — PREVIOUS COMPLETE SERVING",
+        ServedState::Partial => "SERVED: PARTIAL — RETRY EXPECTED",
+        ServedState::Uninitialized => "SERVED: UNINITIALIZED — DNS UNFILTERED",
+        ServedState::IntentionalEmpty => "SERVED: INTENTIONAL EMPTY — FILTERING NOTHING",
+        ServedState::Cleared => "SERVED: CLEARED — FILTERING NOTHING",
+        ServedState::Unknown => "SERVED: UNKNOWN (LEGACY) — COMPLETENESS UNKNOWN",
+    }
 }
 
 /// Freshness summary across all configured blocklists. Shows the age
@@ -2558,6 +2674,64 @@ fn format_uptime(secs: u64) -> String {
         format!("{hours}h {mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn degraded_filter_row_names_each_served_state() {
+    let cases = [
+        (
+            ServedState::Complete,
+            "SERVED: COMPLETE — PREVIOUS COMPLETE SERVING",
+        ),
+        (ServedState::Partial, "SERVED: PARTIAL — RETRY EXPECTED"),
+        (
+            ServedState::Uninitialized,
+            "SERVED: UNINITIALIZED — DNS UNFILTERED",
+        ),
+        (
+            ServedState::IntentionalEmpty,
+            "SERVED: INTENTIONAL EMPTY — FILTERING NOTHING",
+        ),
+        (
+            ServedState::Unknown,
+            "SERVED: UNKNOWN (LEGACY) — COMPLETENESS UNKNOWN",
+        ),
+    ];
+
+    for (served_state, expected) in cases {
+        let mut app = App::new();
+        app.daemon_status = Some(crate::tui::app::DaemonStatus {
+            lists_active: 8,
+            lists_total: 8,
+            lists_cycle: Some(crate::lists::status::CycleMark {
+                seq: 1,
+                outcome: Some(crate::lists::status::CycleOutcome::SpillRollbackFailed),
+                source_coverage_incomplete: false,
+                generation_degraded: true,
+                served_state,
+            }),
+            ..Default::default()
+        });
+        let text: String = pulse_row_filter_counts(&app)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains(expected), "{served_state:?}: {text}");
+        assert!(
+            text.contains("8/8 source rows"),
+            "{served_state:?}: degraded counts must not sound active: {text}"
+        );
+        assert!(
+            !text.contains("8/8 lists"),
+            "{served_state:?}: degraded counts must not sound active: {text}"
+        );
+        assert!(
+            !text.contains("NO COMPLETE GENERATION"),
+            "{served_state:?}: {text}"
+        );
     }
 }
 

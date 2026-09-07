@@ -17,6 +17,30 @@ use super::protocol::{CommandTier, IpcCommand, IpcResponse};
 /// away from the number the code actually enforces.
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The daemon allows a force refresh to run for fifteen minutes. Keep a small
+/// read-side margin for serialisation and socket scheduling while retaining
+/// the normal short connect/write budget.
+pub const FORCE_LIST_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60 + 15);
+
+#[derive(Clone, Copy)]
+struct CommandTimeouts {
+    connect: Duration,
+    write: Duration,
+    read: Duration,
+}
+
+const ORDINARY_COMMAND_TIMEOUTS: CommandTimeouts = CommandTimeouts {
+    connect: IPC_TIMEOUT,
+    write: IPC_TIMEOUT,
+    read: IPC_TIMEOUT,
+};
+
+const FORCE_LIST_REFRESH_TIMEOUTS: CommandTimeouts = CommandTimeouts {
+    connect: IPC_TIMEOUT,
+    write: IPC_TIMEOUT,
+    read: FORCE_LIST_REFRESH_RESPONSE_TIMEOUT,
+};
+
 /// Write one JSON command line and close the write half, under `deadline`.
 ///
 /// A Unix stream socket blocks in `write_all` once the peer's receive queue
@@ -49,11 +73,26 @@ where
 ///   — the command is never sent in that state.
 /// - `ReadOnly` commands are sent as-is. No token lookup happens, so
 ///   `warden status` works even on a fresh install with no token.
-/// - Connect, write and read each carry their own [`IPC_TIMEOUT`]
-///   deadline. The bound is per phase, not a total for the exchange:
-///   a large response that is still arriving must not be cut off by
-///   time the connect already spent.
+/// - Ordinary commands apply [`IPC_TIMEOUT`] independently to connect,
+///   write, and read. `ForceListRefresh` keeps the short connect/write
+///   limits but uses [`FORCE_LIST_REFRESH_RESPONSE_TIMEOUT`] for its one
+///   completion response.
 pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::Result<IpcResponse> {
+    let timeouts = if matches!(command, IpcCommand::ForceListRefresh { .. }) {
+        FORCE_LIST_REFRESH_TIMEOUTS
+    } else {
+        ORDINARY_COMMAND_TIMEOUTS
+    };
+    send_command_with_timeouts(socket_path, command, timeouts).await
+}
+
+/// Internal timeout seam keeps tests short without changing the public
+/// fifteen-minute force-refresh contract.
+async fn send_command_with_timeouts(
+    socket_path: &Path,
+    command: &IpcCommand,
+    timeouts: CommandTimeouts,
+) -> anyhow::Result<IpcResponse> {
     // Clone the command so we can attach a token without requiring the
     // caller to pass a mutable reference. IpcCommand is cheap to clone.
     let command = command.clone();
@@ -83,7 +122,7 @@ pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::R
         }
     };
 
-    let stream = tokio::time::timeout(IPC_TIMEOUT, UnixStream::connect(socket_path))
+    let stream = tokio::time::timeout(timeouts.connect, UnixStream::connect(socket_path))
         .await
         .map_err(|_| anyhow::anyhow!("connection timeout"))??;
 
@@ -92,12 +131,12 @@ pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::R
     // Send command as JSON line
     let mut cmd_json = serde_json::to_string(&command)?;
     cmd_json.push('\n');
-    write_command_line(&mut writer, &cmd_json, IPC_TIMEOUT).await?;
+    write_command_line(&mut writer, &cmd_json, timeouts.write).await?;
 
     // Read response line
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    tokio::time::timeout(IPC_TIMEOUT, reader.read_line(&mut line))
+    tokio::time::timeout(timeouts.read, reader.read_line(&mut line))
         .await
         .map_err(|_| anyhow::anyhow!("response timeout"))??;
 
@@ -167,6 +206,75 @@ mod tests {
     #[test]
     fn ipc_timeout_is_the_five_seconds_the_docs_promise() {
         assert_eq!(IPC_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn force_refresh_keeps_short_connect_write_and_extends_only_the_read() {
+        assert_eq!(FORCE_LIST_REFRESH_TIMEOUTS.connect, IPC_TIMEOUT);
+        assert_eq!(FORCE_LIST_REFRESH_TIMEOUTS.write, IPC_TIMEOUT);
+        assert_eq!(
+            FORCE_LIST_REFRESH_TIMEOUTS.read,
+            FORCE_LIST_REFRESH_RESPONSE_TIMEOUT
+        );
+        assert!(FORCE_LIST_REFRESH_RESPONSE_TIMEOUT > Duration::from_secs(15 * 60));
+    }
+
+    #[tokio::test]
+    async fn force_refresh_read_can_outlive_the_ordinary_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("delayed.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            writer
+                .write_all(b"{\"type\":\"ok\",\"message\":\"done\"}\n")
+                .await
+                .unwrap();
+        });
+        let response = send_command_with_timeouts(
+            &socket,
+            &IpcCommand::ForceListRefresh {
+                token: Some("test".into()),
+            },
+            CommandTimeouts {
+                connect: Duration::from_secs(1),
+                write: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, IpcResponse::Ok { .. }));
+        server.await.unwrap();
+
+        let ordinary_socket = dir.path().join("ordinary-delayed.sock");
+        let ordinary_listener = tokio::net::UnixListener::bind(&ordinary_socket).unwrap();
+        let ordinary_server = tokio::spawn(async move {
+            let (stream, _) = ordinary_listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = writer
+                .write_all(b"{\"type\":\"ok\",\"message\":\"late\"}\n")
+                .await;
+        });
+        let ordinary = send_command_with_timeouts(
+            &ordinary_socket,
+            &IpcCommand::Status,
+            CommandTimeouts {
+                connect: Duration::from_secs(1),
+                write: Duration::from_secs(1),
+                read: Duration::from_millis(25),
+            },
+        )
+        .await;
+        assert_eq!(ordinary.unwrap_err().to_string(), "response timeout");
+        ordinary_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -284,7 +392,9 @@ mod tests {
             log_ring: None,
             notification_tx: None,
             list_labels: Arc::new(vec![None; 64]),
-            list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            list_cmd_tx: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::ipc::socket_server::ListManagerEndpoint::EmptyStable,
+            )),
             daemon_uid: crate::ipc::socket_server::current_euid(),
             resource_budget_store: crate::resource_budget::types::new_store(),
             #[cfg(feature = "cluster")]

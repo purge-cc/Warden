@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use purge_warden::cli::commands::migrate::migrate_v2_to_v3;
-use purge_warden::config::loader::load_config;
+use purge_warden::config::loader::load_config_for_schema;
 
 const ZIMA: &str = include_str!("fixtures/plp_v2_node_a.toml");
 const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
@@ -237,7 +237,7 @@ fn both_live_shapes_migrate_to_exactly_what_the_tag_model_resolved() {
 fn the_migrated_config_loads_and_every_profile_states_its_policy() {
     for (label, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
         let m = migrate(body);
-        let loaded = load_config(&m.after, time::OffsetDateTime::now_utc())
+        let loaded = load_config_for_schema(&m.after, 3, time::OffsetDateTime::now_utc())
             .unwrap_or_else(|e| panic!("{label}: migrated config must load: {e:?}"));
         assert!(
             !loaded.config.profiles.is_empty(),

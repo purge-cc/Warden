@@ -30,7 +30,7 @@ fn now() -> time::OffsetDateTime {
 /// Minimal v2 config with the entities a `warden device quiet` schedule
 /// references (a `blocked` profile + a target device), mirroring what
 /// `run_quiet` materialises before appending the one-shot row.
-const BASE: &str = r#"schema_version = 3
+const BASE: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"

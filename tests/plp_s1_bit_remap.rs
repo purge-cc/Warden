@@ -119,13 +119,15 @@ fn build(label: &'static str, with_l1: bool) -> Generation {
     let dir = tempfile::tempdir().unwrap();
     let v2 = dir.path().join("config.toml");
     std::fs::write(&v2, config_toml(with_l1)).unwrap();
-    // `plp-s3`: the fixture stays in its v2 shape and is put through the real
-    // migration, so what this file exercises is the config an operator would
-    // actually be running after the cutover — not a v3 twin written by hand
-    // to produce the masks the assertions want.
+    // Exercise the historical policy migration and the required live-schema hop.
     let path = dir.path().join("config.v3.toml");
     purge_warden::cli::commands::migrate::migrate_v2_to_v3(&v2, &path, false)
         .unwrap_or_else(|e| panic!("{label}: fixture must migrate: {e:#}"));
+    purge_warden::cli::commands::migrate::run_v3_to_v4(
+        &path,
+        purge_warden::cli::commands::migrate::V3ToV4Mode::Migrate,
+    )
+    .unwrap_or_else(|e| panic!("{label}: v3-to-v4 migration must succeed: {e:#}"));
     let config: ConfigV1 = load_config(&path, time::OffsetDateTime::now_utc())
         .map(|l| l.config)
         .unwrap_or_else(|e| panic!("{label}: migrated fixture config must load: {e:?}"));

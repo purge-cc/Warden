@@ -1,19 +1,20 @@
 //! Atomic v1 config file writer.
 //!
 //! The daemon and every CLI verb operate exclusively on [`ConfigV1`]; the
-//! single writer here is [`write_config_v1`], used by `warden init` and
-//! `config restore` — both whole-file replacements where flattening is
-//! not a concern (a fresh scaffold / an operator-accepted backup).
+//! single writer here is [`write_config_v1_locked`], retained for guarded
+//! in-crate whole-file writer coverage.
 //! Per-section mutations (the schedule-tick prune, the IPC
 //! tracking-config handler, every entity editor) do NOT go through here
 //! — they use per-file `toml::Value` surgery via
-//! `cli::commands::target::write_value_validated` so multi-file include
+//! `cli::commands::target::write_value_validated_locked` so multi-file include
 //! layouts aren't flattened onto the master.
 
 use std::path::Path;
 
-use super::atomic_write::atomic_write_and_validate;
+use super::atomic_write::{hardened_atomic_write_at, AtomicWriteAtOpts};
+use super::loader::{load_config_with_overlay_for_schema_under_guard, LoaderOverlay};
 use super::schema::ConfigV1;
+use super::write_lock::ConfigWriteLock;
 
 /// Serialize a v1 [`ConfigV1`] back to TOML and write atomically.
 ///
@@ -26,53 +27,57 @@ use super::schema::ConfigV1;
 ///   the backup being canonical).
 ///
 /// Not suitable for round-tripping a hand-edited file without churn.
-pub fn write_config_v1(path: &Path, config: &ConfigV1) -> anyhow::Result<()> {
+pub(crate) fn write_config_v1_locked(
+    guard: &ConfigWriteLock,
+    path: &Path,
+    config: &ConfigV1,
+) -> anyhow::Result<()> {
     let content = toml::to_string_pretty(config)
         .map_err(|e| anyhow::anyhow!("failed to serialize v1 config: {}", e))?;
-    // Atomic write: the validator is the full v1 loader so we
-    // surface include-graph / cross-reference errors before the rename
-    // lands. If the staged bytes would not boot the daemon, the
-    // original file on disk stays untouched. Matching loader = same
-    // code path a cold-start would take.
+    guard.verify_master(path)?;
+    let plan = guard.tree_io().plan_master_target()?;
+    let mut overlay = LoaderOverlay::default();
+    overlay.stage_plan(&plan, content.clone())?;
+
+    // Validate staged master bytes under the same guard before materializing
+    // a missing parent or promoting the pinned target.
     let now = time::OffsetDateTime::now_utc();
-    atomic_write_and_validate(path, &content, |staged: &Path| {
-        super::loader::load_config(staged, now).map(|_| ()).map_err(
-            |errs: Vec<super::error::ConfigError>| {
-                // Collapse the error list into a single human-readable
-                // string — the atomic helper only needs Display, and
-                // the original struct list is carried in the daemon's
-                // audit trail already.
-                let mut s = String::new();
-                for (i, e) in errs.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str("; ");
-                    }
-                    s.push_str(&e.to_string());
-                }
-                s
-            },
-        )
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    if let Err(errs) = load_config_with_overlay_for_schema_under_guard(
+        guard,
+        path,
+        super::schema::SCHEMA_VERSION_V1,
+        now,
+        Some(&overlay),
+    ) {
+        let message = errs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(anyhow::anyhow!("validation failed: {message}"));
+    }
+
+    let target = plan.materialize()?;
+    hardened_atomic_write_at(&target, content.as_bytes(), AtomicWriteAtOpts::default())
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-// There is no `pub(crate) atomic_write(&str)` here: every config-mutation
-// call-site goes through [`atomic_write_and_validate`] so the v1 master +
-// every `.d/*.toml` slice gets the round-trip validator and fsync +
-// mode/owner preservation. The remaining manpage-output caller (man
-// pages are not config) carries its own private helper inside
-// `cli/commands/manpages.rs`; it still routes through
-// [`hardened_atomic_write`] so even non-config writes get fsync.
+// No raw config writer is exposed: whole-config writes use the pinned target
+// and guarded overlay above; per-section mutations use the target module's
+// guarded transaction. Manpage output is not live configuration and keeps its
+// own hardened writer.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use time::OffsetDateTime;
 
     use crate::config::loader::load_config;
     use crate::config::schema::load::load_from_str;
+    use crate::config::schema::Id;
 
-    const MINIMAL_V1: &str = r#"schema_version = 3
+    const MINIMAL_V1: &str = r#"schema_version = 4
 
 [server]
 listen = "127.0.0.1:15353"
@@ -91,12 +96,14 @@ servers = ["192.0.2.1:53"]
 "#;
 
     #[test]
-    fn write_config_v1_roundtrips_semantically() {
+    fn guarded_writer_roundtrips_semantically() {
         let now = OffsetDateTime::now_utc();
         let original = load_from_str(MINIMAL_V1, None, now).expect("fixture parses");
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        write_config_v1(&path, &original).unwrap();
+        let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+        write_config_v1_locked(&guard, &path, &original).unwrap();
+        drop(guard);
         let reloaded = load_config(&path, now).expect("written config reloads");
         // Semantic equality via TOML serialisation — ConfigV1 does not
         // implement PartialEq (pass-through types do not).
@@ -106,13 +113,14 @@ servers = ["192.0.2.1:53"]
     }
 
     #[test]
-    fn write_config_v1_is_atomic() {
+    fn guarded_writer_is_atomic() {
         // The `.tmp` sibling must not survive a successful write.
         let now = OffsetDateTime::now_utc();
         let original = load_from_str(MINIMAL_V1, None, now).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        write_config_v1(&path, &original).unwrap();
+        let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+        write_config_v1_locked(&guard, &path, &original).unwrap();
         let tmp_sibling = path.with_extension("toml.tmp");
         assert!(
             !tmp_sibling.exists(),
@@ -122,14 +130,122 @@ servers = ["192.0.2.1:53"]
     }
 
     #[test]
-    fn write_config_v1_creates_file_when_absent() {
+    fn guarded_writer_creates_file_when_absent() {
         let now = OffsetDateTime::now_utc();
         let original = load_from_str(MINIMAL_V1, None, now).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("fresh.toml");
         assert!(!path.exists());
-        write_config_v1(&path, &original).unwrap();
+        let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+        write_config_v1_locked(&guard, &path, &original).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn locked_writer_completes_under_a_live_guard() {
+        let now = OffsetDateTime::now_utc();
+        let original = load_from_str(MINIMAL_V1, None, now).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+
+        write_config_v1_locked(&guard, &path, &original).unwrap();
+
+        assert!(path.exists());
+        drop(guard);
+        let reloaded = load_config(&path, now).expect("written config reloads");
+        let actual = toml::to_string(&reloaded.config).unwrap();
+        assert_eq!(actual, toml::to_string(&original).unwrap());
+    }
+
+    #[test]
+    fn locked_writer_rejects_a_guard_from_another_tree_before_change() {
+        let now = OffsetDateTime::now_utc();
+        let config = load_from_str(MINIMAL_V1, None, now).unwrap();
+        for present in [false, true] {
+            let target_dir = tempfile::tempdir().unwrap();
+            let path = target_dir.path().join("config.toml");
+            let before = "existing sentinel\n";
+            if present {
+                std::fs::write(&path, before).unwrap();
+            }
+            let other_dir = tempfile::tempdir().unwrap();
+            let other_master = other_dir.path().join("config.toml");
+            let guard = crate::config::write_lock::acquire_for_write(&other_master).unwrap();
+
+            let error = write_config_v1_locked(&guard, &path, &config).unwrap_err();
+
+            assert!(error.to_string().contains("config guard belongs to"));
+            if present {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn locked_writer_updates_existing_and_absent_masters_twice() {
+        let now = OffsetDateTime::now_utc();
+        let first = load_from_str(
+            &MINIMAL_V1.replace("127.0.0.1:15353", "127.0.0.1:15354"),
+            None,
+            now,
+        )
+        .unwrap();
+        let second = load_from_str(
+            &MINIMAL_V1.replace("127.0.0.1:15353", "127.0.0.1:15355"),
+            None,
+            now,
+        )
+        .unwrap();
+        for present in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("config.toml");
+            if present {
+                std::fs::write(&path, MINIMAL_V1).unwrap();
+            }
+            let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+
+            write_config_v1_locked(&guard, &path, &first).unwrap();
+            write_config_v1_locked(&guard, &path, &second).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                toml::to_string_pretty(&second).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn locked_writer_validation_failure_preserves_existing_or_absent_master() {
+        let now = OffsetDateTime::now_utc();
+        let valid = load_from_str(MINIMAL_V1, None, now).unwrap();
+        let mut invalid = valid.clone();
+        invalid.server.default_profile = Some(Id::new("ghost").unwrap());
+        for present in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("config.toml");
+            if present {
+                std::fs::write(&path, MINIMAL_V1).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let before = present.then(|| {
+                let metadata = std::fs::metadata(&path).unwrap();
+                (std::fs::read(&path).unwrap(), metadata.mode() & 0o7777)
+            });
+            let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+
+            let error = write_config_v1_locked(&guard, &path, &invalid).unwrap_err();
+
+            assert!(error.to_string().contains("ghost"), "{error:#}");
+            if let Some((bytes, mode)) = before {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+            } else {
+                assert!(!path.exists());
+            }
+        }
     }
 
     /// The deprecation must be **clearable**: a loader-synthesised value
@@ -169,7 +285,9 @@ servers = ["192.0.2.1:53"]
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        write_config_v1(&path, &original).unwrap();
+        let guard = crate::config::write_lock::acquire_for_write(&path).unwrap();
+        write_config_v1_locked(&guard, &path, &original).unwrap();
+        drop(guard);
         let written = std::fs::read_to_string(&path).unwrap();
 
         assert!(

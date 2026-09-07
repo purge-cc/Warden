@@ -2,7 +2,7 @@
 //!
 //! The only module in this feature that touches the filesystem.
 //!
-//! # Why every writer takes a `&ConfigWriteLock` it never reads
+//! # Why every writer takes a `&ConfigWriteLock`
 //!
 //! Appending and removing a rule are read-modify-write cycles: read the
 //! whole file, edit the line set, rewrite it. The rewrite is atomic, so no
@@ -11,20 +11,23 @@
 //! it, and the second erases the first operator's rule with no error on
 //! either side.
 //!
-//! Possession of a live guard is the entire contract, so it is a parameter
-//! rather than a `let _lock = acquire(..)` inside each function: a binding
-//! can be dropped early or reduced to `let _ =` — which releases
-//! immediately — and no fast test separates "held" from "created, then
-//! released". As a parameter the requirement is the type system's, and
-//! these functions cannot be entered without one.
+//! Possession of a live guard is the entire contract. Each writer uses it to
+//! pin its target from the inspected read through its final rename.
 
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use compact_str::CompactString;
 
-use crate::config::atomic_write::{hardened_atomic_write, AtomicWriteOpts};
+#[cfg(test)]
+use crate::config::atomic_write::AtomicWriteTestFailure;
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
+    AtomicWriteAtOpts, AtomicWriteError,
+};
+use crate::config::tree_io::{CappedRead, PinnedTarget, TargetPlan};
 use crate::config::write_lock::ConfigWriteLock;
 
 use super::grammar::{compose_line, normalise_domain, parse_pack_line, GrammarError, PackLine};
@@ -93,7 +96,21 @@ impl PackReadError {
 /// has a typo is the same fail-open with the sign reversed.
 pub fn read_pack(path: &Path, max_bytes: u64) -> Result<CompiledCustomList, PackReadError> {
     let text = read_text(path, max_bytes)?;
+    Ok(parse_text(&text, path))
+}
 
+pub(crate) fn read_pack_from_file(
+    file: std::fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<CompiledCustomList, PackReadError> {
+    Ok(parse_text(
+        &read_text_from_file(file, path, max_bytes)?,
+        path,
+    ))
+}
+
+fn parse_text(text: &str, path: &Path) -> CompiledCustomList {
     let mut out = CompiledCustomList::default();
     for (n, line) in text.lines().enumerate() {
         match parse_pack_line(line) {
@@ -111,7 +128,7 @@ pub fn read_pack(path: &Path, max_bytes: u64) -> Result<CompiledCustomList, Pack
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// One line of the pack, as it sits on the file.
@@ -169,6 +186,14 @@ fn read_text(path: &Path, max_bytes: u64) -> Result<String, PackReadError> {
         }
         Err(e) => return Err(classify(path, e)),
     };
+    read_text_from_file(file, path, max_bytes)
+}
+
+fn read_text_from_file(
+    file: std::fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<String, PackReadError> {
     let meta = file.metadata().map_err(|e| classify(path, e))?;
     if !meta.is_file() {
         return Err(PackReadError::Io {
@@ -201,7 +226,12 @@ fn read_text(path: &Path, max_bytes: u64) -> Result<String, PackReadError> {
     })
 }
 
-fn classify(path: &Path, e: std::io::Error) -> PackReadError {
+pub(crate) fn classify(path: &Path, e: std::io::Error) -> PackReadError {
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        return PackReadError::Symlink {
+            path: path.to_path_buf(),
+        };
+    }
     match e.kind() {
         std::io::ErrorKind::NotFound => PackReadError::Missing {
             path: path.to_path_buf(),
@@ -235,10 +265,11 @@ pub enum PackWriteError {
     #[error("reading {0} before the write failed: {1}")]
     Read(PathBuf, #[source] PackReadError),
     #[error("writing {0} failed: {1}")]
-    Write(
-        PathBuf,
-        #[source] crate::config::atomic_write::AtomicWriteError,
-    ),
+    Write(PathBuf, #[source] AtomicWriteError),
+    #[error("accessing managed custom list file {path} failed: {detail}")]
+    Access { path: PathBuf, detail: String },
+    #[error("creating {path} left uncertain state; recovery required: {detail}")]
+    RecoveryRequired { path: PathBuf, detail: String },
     #[error(
         "writing {path} would leave it {size} bytes, over the {cap}-byte \
          [custom_list_limits] max_file_bytes limit"
@@ -290,7 +321,21 @@ pub fn write_pack(
             });
         }
     }
-    write_all_raw(lock, path, lines, max_bytes)
+    let plan = plan_pack_target(lock, path)?;
+    write_all_raw(plan, path, lines, max_bytes)
+}
+
+/// A just-published empty pack that can remove only its own inode.
+pub(crate) struct CreatedPack<'g> {
+    target: PinnedTarget<'g>,
+}
+
+impl CreatedPack<'_> {
+    /// Remove this create's promoted inode if no writer has replaced it.
+    pub(crate) fn rollback(self) -> anyhow::Result<()> {
+        self.target.rollback_target()?.unlink()?;
+        Ok(())
+    }
 }
 
 /// Create the file for a new custom list, empty.
@@ -303,16 +348,67 @@ pub fn write_pack(
 /// operator never wrote on line 1 of every list they own. `display_name`
 /// is unused: nothing is written from it.
 ///
-/// Routed through `write_all_raw` like every other writer here, so an
-/// empty pack still goes through the write lock and the byte cap rather
-/// than bypassing them for the one writer that "obviously" can't overflow.
 pub fn create_pack(
     lock: &ConfigWriteLock,
     path: &Path,
     _display_name: &str,
     max_bytes: u64,
 ) -> Result<(), PackWriteError> {
-    write_all_raw(lock, path, &[], max_bytes)
+    create_pack_with_receipt(lock, path, _display_name, max_bytes).map(|_| ())
+}
+
+/// Create an empty pack without replacing an existing orphan or live file.
+pub(crate) fn create_pack_with_receipt<'g>(
+    lock: &'g ConfigWriteLock,
+    path: &Path,
+    _display_name: &str,
+    _max_bytes: u64,
+) -> Result<CreatedPack<'g>, PackWriteError> {
+    create_pack_with_receipt_inner(lock, path, AtomicCreateOnlyAtOpts::default())
+}
+
+fn create_pack_with_receipt_inner<'g>(
+    lock: &'g ConfigWriteLock,
+    path: &Path,
+    opts: AtomicCreateOnlyAtOpts,
+) -> Result<CreatedPack<'g>, PackWriteError> {
+    let plan = plan_pack_target(lock, path)?;
+    let display = plan.display().to_path_buf();
+    let mut spool = tempfile::tempfile().map_err(|source| {
+        PackWriteError::Write(
+            display.clone(),
+            AtomicWriteError::WriteTemp {
+                tmp: display.clone(),
+                source,
+            },
+        )
+    })?;
+    let target = plan
+        .materialize()
+        .map_err(|error| classify_plan_error(path, error))?;
+    let result = hardened_atomic_create_only_at(&target, &mut spool, 0, opts);
+    finish_created_pack(target, result)
+}
+
+fn finish_created_pack<'g>(
+    target: PinnedTarget<'g>,
+    result: Result<(), AtomicWriteError>,
+) -> Result<CreatedPack<'g>, PackWriteError> {
+    let path = target.display().to_path_buf();
+    match result {
+        Ok(()) => Ok(CreatedPack { target }),
+        Err(error) if error.rename_landed() => match (CreatedPack { target }).rollback() {
+            Ok(()) => Err(PackWriteError::Write(path, error)),
+            Err(rollback) => Err(PackWriteError::RecoveryRequired {
+                path,
+                detail: format!(
+                    "the create may have been published after {error}; \
+                     rollback could not be proved durable: {rollback:#}"
+                ),
+            }),
+        },
+        Err(error) => Err(PackWriteError::Write(path, error)),
+    }
 }
 
 /// Append one rule, unless an identical one is already there.
@@ -328,7 +424,8 @@ pub fn add_rule(
 ) -> Result<AddOutcome, PackWriteError> {
     let line = compose_line(domain, allow)?;
     let target = normalise_domain(domain)?;
-    let text = read_raw(path, max_bytes)?;
+    let plan = plan_pack_target(lock, path)?;
+    let text = read_raw(&plan, path, max_bytes)?;
     // Compared as parsed rules rather than as text: `normalise_domain`
     // lowercases, so a file already carrying `||EXAMPLE.COM^` carries THIS
     // rule, and a text compare appended a duplicate the operator never typed.
@@ -345,7 +442,7 @@ pub fn add_rule(
     }
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     lines.push(line);
-    write_all_raw(lock, path, &lines, max_bytes).map(|()| AddOutcome::Added)
+    write_all_raw(plan, path, &lines, max_bytes).map(|()| AddOutcome::Added)
 }
 
 /// Replace the rule on one file line, in place.
@@ -377,7 +474,8 @@ pub fn replace_rule_at_line(
     let new_line = compose_line(domain, allow)?;
     let want = normalise_domain(domain)?;
 
-    let text = read_raw(path, max_bytes)?;
+    let plan = plan_pack_target(lock, path)?;
+    let text = read_raw(&plan, path, max_bytes)?;
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
     let stale = |found: String| PackWriteError::StaleLine {
@@ -428,7 +526,7 @@ pub fn replace_rule_at_line(
     }
 
     lines[idx] = new_line;
-    write_all_raw(lock, path, &lines, max_bytes)
+    write_all_raw(plan, path, &lines, max_bytes)
 }
 
 /// The rule the caller says was on the line, in the file's own syntax.
@@ -460,7 +558,8 @@ pub fn remove_rule(
     max_bytes: u64,
 ) -> Result<bool, PackWriteError> {
     let target = normalise_domain(domain)?;
-    let text = read_raw(path, max_bytes)?;
+    let plan = plan_pack_target(lock, path)?;
+    let text = read_raw(&plan, path, max_bytes)?;
     let kept: Vec<String> = text
         .lines()
         .filter(|l| match parse_pack_line(l) {
@@ -471,19 +570,163 @@ pub fn remove_rule(
         .collect();
     let removed = kept.len() != text.lines().count();
     if removed {
-        write_all_raw(lock, path, &kept, max_bytes)?;
+        write_all_raw(plan, path, &kept, max_bytes)?;
     }
     Ok(removed)
 }
 
-/// The read half of a read-modify-write, through the reader's own open.
-///
-/// Shares `read_text` rather than reopening by path, so a rule append cannot
-/// be talked into copying a symlink target's body into the operator's pack —
-/// and so the two paths cannot drift into disagreeing about what this file
-/// is.
-fn read_raw(path: &Path, max_bytes: u64) -> Result<String, PackWriteError> {
-    read_text(path, max_bytes).map_err(|e| PackWriteError::Read(path.to_path_buf(), e))
+/// The descriptor-pinned read half of a read-modify-write.
+fn read_raw(plan: &TargetPlan<'_>, path: &Path, max_bytes: u64) -> Result<String, PackWriteError> {
+    if let Some(size) = plan.original_len().filter(|size| *size > max_bytes) {
+        return Err(PackWriteError::Read(
+            path.to_path_buf(),
+            PackReadError::TooLarge {
+                path: path.to_path_buf(),
+                size,
+                cap: max_bytes,
+            },
+        ));
+    }
+    match plan.read_original_capped(max_bytes).map_err(|error| {
+        PackWriteError::Read(path.to_path_buf(), classify_capped_read(path, error))
+    })? {
+        CappedRead::Missing => Err(PackWriteError::Read(
+            path.to_path_buf(),
+            PackReadError::Missing {
+                path: path.to_path_buf(),
+            },
+        )),
+        CappedRead::Contents(bytes) => String::from_utf8(bytes).map_err(|_| {
+            PackWriteError::Read(
+                path.to_path_buf(),
+                PackReadError::NotUtf8 {
+                    path: path.to_path_buf(),
+                },
+            )
+        }),
+        CappedRead::LimitExceeded { bytes_read } => Err(PackWriteError::Read(
+            path.to_path_buf(),
+            PackReadError::TooLarge {
+                path: path.to_path_buf(),
+                size: bytes_read,
+                cap: max_bytes,
+            },
+        )),
+    }
+}
+
+/// Admit one caller path and return the only plan used by this mutation.
+fn plan_pack_target<'g>(
+    lock: &'g ConfigWriteLock,
+    path: &Path,
+) -> Result<TargetPlan<'g>, PackWriteError> {
+    let relative = clean_root_relative(lock, path)?;
+    lock.tree_io()
+        .plan_root_file_no_follow(&relative)
+        .map_err(|error| classify_plan_error(path, error))
+}
+
+/// Derive a normal, root-relative key without canonicalizing any alias.
+fn clean_root_relative(lock: &ConfigWriteLock, path: &Path) -> Result<PathBuf, PackWriteError> {
+    if !path.is_absolute() {
+        return Err(PackWriteError::Access {
+            path: path.to_path_buf(),
+            detail: "managed custom list path must be an absolute path under the guarded root"
+                .to_string(),
+        });
+    }
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
+        return Err(PackWriteError::Access {
+            path: path.to_path_buf(),
+            detail: "managed custom list path must name a file".to_string(),
+        });
+    }
+    let relative =
+        path.strip_prefix(&lock.identity().root)
+            .map_err(|_| PackWriteError::Access {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "path is outside guarded config root {}",
+                    lock.identity().root.display()
+                ),
+            })?;
+    let mut clean = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                if crate::config::write_lock::reserved_component(name) {
+                    return Err(PackWriteError::Access {
+                        path: path.to_path_buf(),
+                        detail: format!("reserved config namespace: {}", name.to_string_lossy()),
+                    });
+                }
+                clean.push(name);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(PackWriteError::Access {
+                    path: path.to_path_buf(),
+                    detail: "managed custom list path must not contain `..`".to_string(),
+                });
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(PackWriteError::Access {
+                    path: path.to_path_buf(),
+                    detail: "managed custom list path must be root-relative".to_string(),
+                });
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(PackWriteError::Access {
+            path: path.to_path_buf(),
+            detail: "managed custom list path must name a file".to_string(),
+        });
+    }
+    Ok(clean)
+}
+
+fn classify_plan_error(path: &Path, error: anyhow::Error) -> PackWriteError {
+    if let Some(source) = error.downcast_ref::<std::io::Error>() {
+        PackWriteError::Read(path.to_path_buf(), classify_io_cause(path, source))
+    } else {
+        PackWriteError::Access {
+            path: path.to_path_buf(),
+            detail: format!("{error:#}"),
+        }
+    }
+}
+
+fn classify_capped_read(path: &Path, error: anyhow::Error) -> PackReadError {
+    if let Some(source) = error.downcast_ref::<std::io::Error>() {
+        classify_io_cause(path, source)
+    } else {
+        PackReadError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("{error:#}")),
+        }
+    }
+}
+
+fn classify_io_cause(path: &Path, source: &std::io::Error) -> PackReadError {
+    if source.raw_os_error() == Some(libc::ELOOP) {
+        return PackReadError::Symlink {
+            path: path.to_path_buf(),
+        };
+    }
+    match source.kind() {
+        std::io::ErrorKind::NotFound => PackReadError::Missing {
+            path: path.to_path_buf(),
+        },
+        std::io::ErrorKind::PermissionDenied => PackReadError::Permission {
+            path: path.to_path_buf(),
+        },
+        kind => PackReadError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(kind, source.to_string()),
+        },
+    }
 }
 
 /// Write the file without re-judging lines this call did not author.
@@ -501,7 +744,7 @@ fn read_raw(path: &Path, max_bytes: u64) -> Result<String, PackWriteError> {
 /// back in through warden at all. Checked in this function rather than at each
 /// caller because all four writers route through it.
 fn write_all_raw(
-    _lock: &ConfigWriteLock,
+    plan: TargetPlan<'_>,
     path: &Path,
     lines: &[String],
     max_bytes: u64,
@@ -517,8 +760,12 @@ fn write_all_raw(
             cap: max_bytes,
         });
     }
-    hardened_atomic_write(path, body.as_bytes(), AtomicWriteOpts::default())
-        .map_err(|e| PackWriteError::Write(path.to_path_buf(), e))
+    let display = plan.display().to_path_buf();
+    let target = plan
+        .materialize()
+        .map_err(|error| classify_plan_error(path, error))?;
+    hardened_atomic_write_at(&target, body.as_bytes(), AtomicWriteAtOpts::default())
+        .map_err(|error| PackWriteError::Write(display, error))
 }
 
 #[cfg(test)]
@@ -531,7 +778,7 @@ mod tests {
     /// statement would contend against each other, since `flock` attaches
     /// to the open file description and not to the process.
     fn lock(dir: &std::path::Path) -> ConfigWriteLock {
-        crate::config::write_lock::acquire(&dir.join("config.toml")).unwrap()
+        crate::config::write_lock::acquire_for_write(&dir.join("config.toml")).unwrap()
     }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -731,6 +978,374 @@ mod tests {
         let fmode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(dmode, 0o750, "pack dir mode");
         assert_eq!(fmode, 0o640, "pack file mode");
+    }
+
+    #[test]
+    fn a_guard_for_another_tree_refuses_before_touching_a_pack() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(second.join("packs")).unwrap();
+        let target = second.join("packs").join("a.txt");
+        std::fs::write(&target, b"sentinel\n").unwrap();
+        let before = std::fs::read(&target).unwrap();
+        let lk = lock(&first);
+
+        let error = create_pack(&lk, &target, "A", 1024).expect_err("wrong tree must refuse");
+        assert!(matches!(error, PackWriteError::Access { .. }), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+    }
+
+    #[test]
+    fn directory_suffixes_do_not_alias_a_pack_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = write(dir.path(), "a.txt", "||old.example.com^\n");
+        let before = std::fs::read(&path).unwrap();
+
+        for spelling in [
+            format!("{}/", path.display()),
+            format!("{}/.", path.display()),
+        ] {
+            let error = add_rule(&lk, Path::new(&spelling), "new.example.com", false, 1024)
+                .expect_err("directory syntax must not normalize to a file");
+            assert!(matches!(error, PackWriteError::Access { .. }), "{error}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn parent_and_leaf_symlinks_leave_external_bytes_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let parent_sentinel = external.path().join("parent.txt");
+        std::fs::write(&parent_sentinel, b"parent sentinel\n").unwrap();
+        std::os::unix::fs::symlink(external.path(), root.path().join("packs")).unwrap();
+        let lk = lock(root.path());
+
+        let parent_error = add_rule(
+            &lk,
+            &root.path().join("packs").join("parent.txt"),
+            "new.example.com",
+            false,
+            1024,
+        )
+        .expect_err("a symlinked packs parent must refuse");
+        assert!(
+            matches!(
+                parent_error,
+                PackWriteError::Read(_, PackReadError::Symlink { .. })
+            ),
+            "{parent_error}"
+        );
+        assert_eq!(
+            std::fs::read(&parent_sentinel).unwrap(),
+            b"parent sentinel\n"
+        );
+
+        std::fs::remove_file(root.path().join("packs")).unwrap();
+        std::fs::create_dir(root.path().join("packs")).unwrap();
+        let leaf_sentinel = external.path().join("leaf.txt");
+        std::fs::write(&leaf_sentinel, b"leaf sentinel\n").unwrap();
+        let leaf = root.path().join("packs").join("leaf.txt");
+        std::os::unix::fs::symlink(&leaf_sentinel, &leaf).unwrap();
+
+        let leaf_error = add_rule(&lk, &leaf, "new.example.com", false, 1024)
+            .expect_err("a symlinked pack leaf must refuse");
+        assert!(
+            matches!(
+                leaf_error,
+                PackWriteError::Read(_, PackReadError::Symlink { .. })
+            ),
+            "{leaf_error}"
+        );
+        assert_eq!(std::fs::read(&leaf_sentinel).unwrap(), b"leaf sentinel\n");
+    }
+
+    #[test]
+    fn an_in_tree_packs_alias_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = dir.path().join("actual-packs");
+        std::fs::create_dir(&actual).unwrap();
+        let target = actual.join("a.txt");
+        std::fs::write(&target, b"||old.example.com^\n").unwrap();
+        std::os::unix::fs::symlink("actual-packs", dir.path().join("packs")).unwrap();
+        let lk = lock(dir.path());
+
+        let error = add_rule(
+            &lk,
+            &dir.path().join("packs").join("a.txt"),
+            "new.example.com",
+            false,
+            1024,
+        )
+        .expect_err("an in-tree alias is still not a managed pack path");
+        assert!(
+            matches!(
+                error,
+                PackWriteError::Read(_, PackReadError::Symlink { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"||old.example.com^\n",
+            "the alias target must remain byte-identical"
+        );
+    }
+
+    #[test]
+    fn planned_rmw_stays_on_the_inspected_parent_after_a_path_swap() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let packs = dir.path().join("packs");
+        let parked = dir.path().join("parked-packs");
+        let path = packs.join("a.txt");
+        std::fs::create_dir(&packs).unwrap();
+        std::fs::write(&path, b"||old.example.com^\n").unwrap();
+        let external_path = external.path().join("a.txt");
+        std::fs::write(&external_path, b"external sentinel\n").unwrap();
+        let lk = lock(dir.path());
+        let swapped = Rc::new(Cell::new(false));
+        let hook_swapped = Rc::clone(&swapped);
+        let hook_packs = packs.clone();
+        let hook_parked = parked.clone();
+        let hook_external = external.path().to_path_buf();
+
+        crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::BeforeDataOpen
+                    && !hook_swapped.replace(true)
+                {
+                    std::fs::rename(&hook_packs, &hook_parked).unwrap();
+                    std::os::unix::fs::symlink(&hook_external, &hook_packs).unwrap();
+                }
+            },
+            || {
+                assert_eq!(
+                    add_rule(&lk, &path, "new.example.com", false, 1024).unwrap(),
+                    AddOutcome::Added
+                );
+            },
+        );
+
+        assert!(swapped.get(), "the test hook must swap the path");
+        assert_eq!(
+            std::fs::read(&external_path).unwrap(),
+            b"external sentinel\n"
+        );
+        assert_eq!(
+            std::fs::read(parked.join("a.txt")).unwrap(),
+            b"||old.example.com^\n||new.example.com^\n"
+        );
+    }
+
+    #[test]
+    fn an_idempotent_add_reads_the_pinned_target_without_promoting() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = write(dir.path(), "a.txt", "||existing.example.com^\n");
+        let opens = Rc::new(Cell::new(0));
+        let hook_opens = Rc::clone(&opens);
+
+        crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::BeforeDataOpen {
+                    hook_opens.set(hook_opens.get() + 1);
+                }
+            },
+            || {
+                assert_eq!(
+                    add_rule(&lk, &path, "existing.example.com", false, 1024).unwrap(),
+                    AddOutcome::AlreadyPresent
+                );
+            },
+        );
+
+        assert_eq!(opens.get(), 1, "the read occurs without a promotion");
+        assert_eq!(std::fs::read(&path).unwrap(), b"||existing.example.com^\n");
+    }
+
+    #[test]
+    fn a_leaf_replaced_after_the_read_is_not_overwritten_at_promotion() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = write(dir.path(), "a.txt", "||old.example.com^\n");
+        let replacement = dir.path().join("replacement.txt");
+        std::fs::write(&replacement, b"competing replacement\n").unwrap();
+        let opens = Rc::new(Cell::new(0));
+        let hook_opens = Rc::clone(&opens);
+        let hook_path = path.clone();
+        let hook_replacement = replacement.clone();
+
+        crate::config::write_lock::with_test_hook(
+            move |event| {
+                if event == crate::config::write_lock::TestEvent::BeforeDataOpen {
+                    let open = hook_opens.get() + 1;
+                    hook_opens.set(open);
+                    if open == 2 {
+                        std::fs::rename(&hook_replacement, &hook_path).unwrap();
+                    }
+                }
+            },
+            || {
+                assert!(
+                    add_rule(&lk, &path, "new.example.com", false, 1024).is_err(),
+                    "a replacement after the read must stop the promotion"
+                );
+            },
+        );
+
+        assert_eq!(opens.get(), 2, "the swap follows the pinned read");
+        assert_eq!(std::fs::read(&path).unwrap(), b"competing replacement\n");
+    }
+
+    #[test]
+    fn a_too_large_pinned_pack_reports_its_full_original_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = write(dir.path(), "a.txt", &"x".repeat(1000));
+
+        let error = add_rule(&lk, &path, "new.example.com", false, 64)
+            .expect_err("the 1000-byte pack exceeds the cap");
+        match error {
+            PackWriteError::Read(
+                _,
+                PackReadError::TooLarge {
+                    size: 1000,
+                    cap: 64,
+                    ..
+                },
+            ) => {}
+            other => panic!("expected the pinned length, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_permission_error_with_symlink_in_its_name_stays_a_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if nix_running_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let parent = dir.path().join("not-a-symlink");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("a.txt");
+        std::fs::write(&path, b"||existing.example.com^\n").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = add_rule(&lk, &path, "new.example.com", false, 1024)
+            .expect_err("the unsearchable parent must refuse during planning");
+        assert!(
+            matches!(
+                error,
+                PackWriteError::Read(_, PackReadError::Permission { .. })
+            ),
+            "{error}"
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn create_only_refuses_existing_packs_byte_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let packs = dir.path().join("packs");
+        std::fs::create_dir(&packs).unwrap();
+
+        for (name, body) in [
+            ("empty.txt", b"".as_slice()),
+            ("rules.txt", b"||old.example.com^\n"),
+        ] {
+            let path = packs.join(name);
+            std::fs::write(&path, body).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let error = create_pack(&lk, &path, "A", 1024).expect_err("existing pack must refuse");
+            assert!(matches!(
+                error,
+                PackWriteError::Write(_, AtomicWriteError::TargetMustBeAbsent { .. })
+            ));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{name} must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_rollback_removes_only_the_pack_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = dir.path().join("packs").join("a.txt");
+        let receipt = create_pack_with_receipt(&lk, &path, "A", 1024).unwrap();
+
+        receipt.rollback().unwrap();
+        assert!(!path.exists(), "the receipt must remove its own empty pack");
+    }
+
+    #[test]
+    fn post_rename_create_failure_cleans_up_when_the_receipt_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = dir.path().join("packs").join("a.txt");
+        let error = match create_pack_with_receipt_inner(
+            &lk,
+            &path,
+            AtomicCreateOnlyAtOpts {
+                test_failure: Some(AtomicWriteTestFailure::ParentFsync),
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => panic!("the injected post-rename fsync failure must be reported"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            PackWriteError::Write(_, AtomicWriteError::PostRenameFsync { .. })
+        ));
+        assert!(!path.exists(), "the landed pack must be rolled back");
+    }
+
+    #[test]
+    fn competing_replacement_turns_post_rename_cleanup_into_recovery_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let lk = lock(dir.path());
+        let path = dir.path().join("packs").join("a.txt");
+        let receipt = create_pack_with_receipt(&lk, &path, "A", 1024).unwrap();
+        let replacement = dir.path().join("replacement.txt");
+        std::fs::write(&replacement, b"competing replacement\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let error = match finish_created_pack(
+            receipt.target,
+            Err(AtomicWriteError::PostRenameFsync {
+                path: path.parent().unwrap().to_path_buf(),
+                source: std::io::Error::other("injected post-rename fsync failure"),
+            }),
+        ) {
+            Ok(_) => panic!("a replaced receipt must not unlink another writer's inode"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, PackWriteError::RecoveryRequired { .. }),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"competing replacement\n");
     }
 
     #[test]

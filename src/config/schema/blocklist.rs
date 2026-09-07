@@ -291,27 +291,6 @@ impl BlocklistTrust {
     }
 }
 
-fn default_update_interval_hours() -> u32 {
-    12
-}
-
-/// Per-`[[blocklists]]` entry cap. Must stay in step with
-/// [`crate::lists::parser::DEFAULT_MAX_LIST_ENTRIES`] and
-/// `settings::default_max_list_entries` — see the former for the measured
-/// rationale behind 20M (largest real list 9.03M). Sized against list
-/// size alone, with no merged-map doubling-cliff constraint entangled.
-///
-/// This value is validated and stored on every `[[blocklists]]` entry,
-/// but not enforced — only the global `[lists] max_entries` reaches the
-/// parser.
-///
-/// A cap sized too low silently drops list content: a 5M cap once sat
-/// *below* four of the eight live sources, so the daemon silently
-/// dropped 19% of the corpus.
-fn default_max_entries() -> u64 {
-    20_000_000
-}
-
 fn default_enabled() -> bool {
     true
 }
@@ -322,8 +301,6 @@ fn default_enabled() -> bool {
 /// display_name = "Privacy: Ads"
 /// url = "https://lists.purge.cc/privacy/ads.txt"
 /// format = "domains"
-/// update_interval_hours = 12
-/// max_entries = 5000000
 /// enabled = true
 /// auth_token_ref = "privacy-ads-token"
 /// ```
@@ -337,12 +314,15 @@ pub struct Blocklist {
     #[serde(default)]
     pub format: BlocklistFormat,
     #[serde(
-        default = "default_update_interval_hours",
+        default,
+        skip_serializing_if = "Option::is_none",
         alias = "refresh_interval_hours"
     )]
-    pub update_interval_hours: u32,
-    #[serde(default = "default_max_entries")]
-    pub max_entries: u64,
+    pub update_interval_hours: Option<u32>,
+    /// Optional schema-v4 per-source entry cap. Omitted values inherit
+    /// `[lists] max_entries`; larger values are limited by that hard ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<u64>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Optional key in `secrets.toml` that holds the Authorization bearer
@@ -520,12 +500,8 @@ url = "https://lists.purge.cc/privacy/ads.txt"
         let b: Blocklist = toml::from_str(toml_src).unwrap();
         assert_eq!(b.id.as_str(), "privacy-ads");
         assert_eq!(b.format, BlocklistFormat::Domains);
-        assert_eq!(b.update_interval_hours, 12);
-        // Must track `default_max_entries` — if you are here because
-        // this failed, size the new value against the largest real
-        // list plus headroom. A cap sized too low silently drops list
-        // content (see `default_max_entries` doc).
-        assert_eq!(b.max_entries, 20_000_000);
+        assert_eq!(b.update_interval_hours, None);
+        assert_eq!(b.max_entries, None);
         assert!(b.enabled);
         assert!(b.auth_token_ref.is_none());
     }
@@ -544,8 +520,8 @@ auth_token_ref = "corp-custom-token"
 "#;
         let b: Blocklist = toml::from_str(toml_src).unwrap();
         assert_eq!(b.format, BlocklistFormat::Adguard);
-        assert_eq!(b.update_interval_hours, 1);
-        assert_eq!(b.max_entries, 2_000_000);
+        assert_eq!(b.update_interval_hours, Some(1));
+        assert_eq!(b.max_entries, Some(2_000_000));
         assert!(!b.enabled);
         assert_eq!(b.auth_token_ref.as_deref(), Some("corp-custom-token"));
     }
@@ -610,7 +586,7 @@ url = "https://example.com/lst.txt"
 refresh_interval_hours = 6
 "#;
         let b: Blocklist = toml::from_str(toml_src).unwrap();
-        assert_eq!(b.update_interval_hours, 6);
+        assert_eq!(b.update_interval_hours, Some(6));
     }
 
     #[test]
@@ -620,8 +596,8 @@ refresh_interval_hours = 6
             display_name: "Privacy: Tracking".into(),
             url: "https://lists.purge.cc/privacy/tracking.txt".into(),
             format: BlocklistFormat::Domains,
-            update_interval_hours: 6,
-            max_entries: 1_000_000,
+            update_interval_hours: Some(6),
+            max_entries: Some(1_000_000),
             enabled: true,
             auth_token_ref: None,
             base: BlocklistBase::Deny,
@@ -630,8 +606,26 @@ refresh_interval_hours = 6
             max_consecutive_failures: 5,
         };
         let s = toml::to_string(&b).unwrap();
+        assert!(s.contains("update_interval_hours = 6"));
+        assert!(s.contains("max_entries = 1000000"));
         let back: Blocklist = toml::from_str(&s).unwrap();
         assert_eq!(back, b);
+    }
+
+    #[test]
+    fn omitted_row_controls_remain_omitted_on_roundtrip() {
+        let b: Blocklist = toml::from_str(
+            r#"
+id = "privacy-ads"
+display_name = "Privacy: Ads"
+url = "https://lists.purge.cc/privacy/ads.txt"
+"#,
+        )
+        .unwrap();
+        let serialized = toml::to_string(&b).unwrap();
+        assert!(!serialized.contains("update_interval_hours"));
+        assert!(!serialized.contains("max_entries"));
+        assert_eq!(toml::from_str::<Blocklist>(&serialized).unwrap(), b);
     }
 
     /// `accept_unsigned_allow` carries **no**

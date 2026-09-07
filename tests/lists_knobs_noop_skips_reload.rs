@@ -25,7 +25,7 @@ use purge_warden::ipc::protocol::IpcResponse;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-const MASTER: &str = r#"schema_version = 3
+const MASTER: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"

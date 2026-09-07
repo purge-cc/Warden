@@ -1,477 +1,805 @@
-//! One writer at a time across the config tree — `flock(LOCK_EX)` held for a
-//! whole read-modify-write, not merely for the write.
-//!
-//! # The defect this closes
-//!
-//! `target::promote_validated` is the single seat every config mutation goes
-//! through, from the CLI verbs *and* from the daemon's IPC handlers
-//! (`ipc/socket_server.rs` calls `write_value_validated` from **seven** `async
-//! fn` handlers — device add/update/remove, tracking-config update, and profile
-//! create/update/delete; counted, not estimated). It
-//! runs four steps: snapshot the pre-edit bytes, validate the would-be-merged
-//! tree, promote each slice by rename, and **on a mid-promotion I/O failure
-//! restore the slices it already promoted** from the step-0 snapshot.
-//!
-//! That rollback is the hazard, and it is not a lost update — it is one
-//! process erasing another's *committed* change:
-//!
-//! | | A stages `[X, Y]` | B stages `[X]` |
-//! |---|---|---|
-//! | 1 | snapshots X's bytes | |
-//! | 2 | promotes X | |
-//! | 3 | | promotes X — **B's change is now on disk and valid** |
-//! | 4 | rename of Y fails (ENOSPC, EROFS, …) | |
-//! | 5 | reverts X to its **step-1** snapshot | |
-//!
-//! At step 5 B's committed change is gone, B exited 0, and nothing anywhere
-//! records that it happened. A serialising lock over steps 1–5 makes the
-//! interleaving unrepresentable.
-//!
-//! The lesser sibling — A and B each computing a new value from their own
-//! earlier read, so the second write drops the first's key — is **not** closed
-//! by this lock, because the caller's read happens before it is taken. See
-//! "What this does not close" below; it is a smaller defect and a separate
-//! change.
-//!
-//! # Why the lock is NOT on the config file
-//!
-//! **`flock` locks an inode, and promotion replaces the target by `rename`,
-//! which swaps the inode.** Locking `config.toml` would give A the lock on the
-//! old inode, and B — arriving after A's rename — the lock on the *new* one.
-//! Both would proceed, hold what looks like an exclusive lock, and interleave
-//! exactly as before.
-//!
-//! That failure mode is silent and it passes a naive test (one process locks,
-//! a second blocks) because the second process only stops blocking once a
-//! rename has happened. Wrong locking is worse than the rare lost update —
-//! this is the specific way it goes wrong here. The lock therefore lives on
-//! a **side file that is never renamed, never promoted and never part of
-//! the config**.
-//!
-//! # Why `flock` and not the marker file `config/backup.rs` uses
-//!
-//! That module's `.lock` is a file whose body is `pid:timestamp`, reclaimed
-//! when older than `STALE_LOCK_AGE` (5 minutes). It is the right shape there —
-//! it guards a long-running archive job and must survive across processes that
-//! are not each other's children.
-//!
-//! It is the wrong shape here. A staleness heuristic **steals the lock from a
-//! slow-but-live holder**: a full config load on a box merging a large tree
-//! can outlast any age bound, and the moment it does, the guarantee inverts
-//! into two concurrent writers who each believe they are alone. `flock` needs
-//! no heuristic — the kernel releases it when the holder's descriptor closes,
-//! including on `SIGKILL`, so a crashed holder never leaves a lock behind and
-//! a live one is never overruled.
+//! Directory flock lets readers synchronize without creating filesystem metadata.
+//! Writers also keep a stable side lock across config-file renames.
+//! Every participant must lock the directory first; older side-only lockers cannot
+//! synchronize these readers. Unsupported directory flock fails closed.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::ffi::{CString, OsStr};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 
-/// File name of the config-tree write lock, under the master's directory.
-///
-/// Not a `.toml` and not inside a `.d/` directory, so no `includes` glob can
-/// match it and the loader never sees it as a slice. A dotfile also keeps it
-/// out of an operator's `ls`.
+use super::migration_journal;
+
 const WRITE_LOCK_FILE: &str = ".warden-config.lock";
+pub(crate) const WRITE_STAGE_PREFIX: &str = ".warden-write-";
+const LOCK_DEADLINE: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(10);
 
-/// How long to wait for another writer to finish before giving up.
-///
-/// A **deadline**, not an attempt count, for the reason `pid.rs` documents at
-/// length: an attempt count bounds the number of samples taken, not the
-/// wall-clock a starved thread is actually given, so under a parallel build it
-/// can burn every attempt inside one scheduling gap.
-///
-/// Unlike the PID lock, this one is **not** held for a process lifetime — a
-/// holder keeps it for one mutation, which is a config load plus a few
-/// renames. So waiting is the correct behaviour rather than a mask for a live
-/// daemon: the operator's `warden device add` should queue behind another
-/// writer, not fail. The bound exists only so a wedged holder cannot hang the
-/// CLI forever, and 30 s is chosen to sit well above a slow full-tree load on
-/// a small box while still being a wait a human recognises as broken.
-const LOCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-/// Poll interval while waiting. Cheap: `flock(LOCK_NB)` on a held lock is a
-/// single syscall that fails immediately.
-const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// An exclusive claim on the config tree, released when dropped.
-///
-/// Holding the guard is the whole contract — there is no `unlock` to forget.
-/// Dropping it closes the descriptor, which is what releases the `flock`, so
-/// an early `return` or a `?` inside the critical section cannot leave the
-/// lock held.
-#[must_use = "the lock is released as soon as the guard is dropped, so a \
-              guard that is not bound to a variable protects nothing"]
-#[derive(Debug)]
-pub struct ConfigWriteLock {
-    /// Kept solely to own the descriptor: the `flock` lives on this fd and
-    /// dies with it.
-    _file: File,
-    path: PathBuf,
+pub(crate) fn reserved_component(name: &OsStr) -> bool {
+    name == WRITE_LOCK_FILE
+        || name.as_bytes().starts_with(WRITE_STAGE_PREFIX.as_bytes())
+        || name == migration_journal::TXN_DIR_NAME
+        || name
+            .as_bytes()
+            .starts_with(migration_journal::CLEANUP_DIR_PREFIX.as_bytes())
+        || name
+            .as_bytes()
+            .starts_with(migration_journal::FINALIZED_DIR_PREFIX.as_bytes())
 }
 
-impl ConfigWriteLock {
-    /// The lock file this guard holds. Diagnostics only.
-    pub fn path(&self) -> &Path {
-        &self.path
+#[derive(Debug, thiserror::Error)]
+#[error("config path is not a regular file: {0}")]
+pub(crate) struct NonRegularMaster(pub(crate) PathBuf);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigTreeIdentity {
+    pub(crate) canonical_master: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) lock_path: PathBuf,
+    pub(crate) txn_dir: PathBuf,
+    // The existing ancestor pins identity even before a new root is created.
+    anchor: PathBuf,
+    anchor_inode: (u64, u64),
+}
+
+impl ConfigTreeIdentity {
+    #[allow(dead_code, reason = "standalone identity inspection API")]
+    pub(crate) fn resolve(requested_master: &Path) -> anyhow::Result<Self> {
+        Self::resolve_from(requested_master, &std::env::current_dir()?)
     }
-}
 
-/// Where the lock for `master`'s tree lives.
-///
-/// One lock per config **directory**, not per file: a single mutation can
-/// stage several slices (`rule add`, `tags rename`), and a per-file lock would
-/// let two such mutations interleave across each other's files while each held
-/// every lock it thought it needed.
-///
-/// # The two "no directory" cases
-///
-/// Only one of them is what a naive `unwrap_or(".")` handles:
-///
-/// - `Path::new("config.toml").parent()` is `Some("")`, **not** `None` — a bare
-///   file name has an *empty* parent. An `unwrap_or_else` alone is dead code
-///   for exactly the case it looks like it was written for, and the empty path
-///   would flow into `join`, yielding `.warden-config.lock` by accident rather than by
-///   decision. It happens to resolve in the working directory, which is why
-///   the bug would never have surfaced as a failure — only as a reader
-///   believing a guard fired when it did not.
-/// - `parent()` is `None` only for a root (`/`), where `.` is the honest
-///   answer.
-///
-/// Both are normalised to `.` so the returned path is explicit at the call
-/// site and in any diagnostic that prints it.
-pub fn lock_path_for(master: &Path) -> PathBuf {
-    let dir = match master.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    dir.join(WRITE_LOCK_FILE)
-}
-
-/// The blocking retry itself: `LOCK_EX | LOCK_NB` polled against a deadline.
-///
-/// Returns `flock`'s last return value; the caller reads `errno` to tell a
-/// timeout from a real failure.
-fn flock_until(file: &File, wait: std::time::Duration) -> i32 {
-    let deadline = std::time::Instant::now() + wait;
-    let mut ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    while ret != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(LOCK_POLL);
-        ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    fn resolve_from(requested_master: &Path, cwd: &Path) -> anyhow::Result<Self> {
+        Ok(Self::resolve_with_master_from(requested_master, cwd)?.0)
     }
-    ret
-}
 
-/// [`flock_until`], moved off the reactor when there is one.
-///
-/// # Why this exists
-///
-/// The daemon reaches this seat from **seven `async fn` handlers** in
-/// `ipc/socket_server.rs`, none of them inside `spawn_blocking` — verified, not
-/// assumed. So the `sleep` in [`flock_until`] would run on a tokio worker
-/// thread and, under contention, park it for up to [`LOCK_DEADLINE`], starving
-/// every other task scheduled on it. Uncontended the cost is one syscall and
-/// this is all moot; contention is the entire reason the lock exists.
-///
-/// `flock` must not be held across an await point on a blocking-thread
-/// model. This is the containment for that constraint, without
-/// restructuring seven async handlers.
-///
-/// **The flavour check is not defensive padding.** `block_in_place` **panics**
-/// on a `current_thread` runtime, and this crate has `current_thread` tests
-/// (`resource_budget/sampler.rs`, `tracking/query_log.rs`). Calling it
-/// unconditionally would turn a lock acquisition into a panic in exactly the
-/// tests least likely to be run against a contended lock.
-fn wait_for_flock(file: &File, wait: std::time::Duration) -> i32 {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    match Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| flock_until(file, wait))
+    fn resolve_with_master_from(
+        requested_master: &Path,
+        cwd: &Path,
+    ) -> anyhow::Result<(Self, Option<File>)> {
+        ensure!(
+            !requested_master.as_os_str().is_empty() && requested_master.file_name().is_some(),
+            "master config path must name a file: {}",
+            requested_master.display()
+        );
+        let (canonical_master, master) =
+            super::tree_io::resolve_global_entry_from(requested_master, cwd)?;
+        ensure!(
+            !matches!(
+                requested_master
+                    .as_os_str()
+                    .as_bytes()
+                    .rsplit(|b| *b == b'/')
+                    .next(),
+                Some(b"" | b"." | b"..")
+            ),
+            "master config path must name a file: {}",
+            requested_master.display()
+        );
+        ensure!(
+            !canonical_master
+                .components()
+                .any(|part| reserved_component(part.as_os_str())),
+            "reserved config namespace cannot contain a master: {}",
+            canonical_master.display()
+        );
+        if let Some(file) = &master {
+            ensure!(
+                file.metadata()?.is_file(),
+                NonRegularMaster(canonical_master.clone())
+            );
         }
-        // No runtime at all (the CLI, and every sync test), or a
-        // single-threaded one where there is no other worker to protect.
-        _ => flock_until(file, wait),
-    }
-}
-
-/// Take the config-tree write lock, waiting up to [`LOCK_DEADLINE`].
-///
-/// # Errors
-///
-/// - the lock file cannot be created (the config directory is unwritable);
-/// - another writer held the lock for longer than the deadline;
-/// - `flock` failed for a reason other than "would block".
-///
-/// A refusal names the lock path, because an operator who hits it needs to
-/// know *which* tree is contended when several `--config` roots are in play.
-pub fn acquire(master: &Path) -> anyhow::Result<ConfigWriteLock> {
-    acquire_with_deadline(master, LOCK_DEADLINE)
-}
-
-/// [`acquire`] with the wait bound as a parameter.
-///
-/// Exists so the contended path — the poll loop and the refusal it ends in —
-/// is testable in milliseconds instead of [`LOCK_DEADLINE`]. Without it that
-/// path has no coverage at all: a test can prove `flock` refuses a second
-/// claim, which says nothing about whether *this function* waits, gives up at
-/// the right time, or produces the error an operator can act on.
-fn acquire_with_deadline(
-    master: &Path,
-    wait: std::time::Duration,
-) -> anyhow::Result<ConfigWriteLock> {
-    let path = lock_path_for(master);
-
-    // Mirror `promote_validated` step 1, which creates a new slice's parent
-    // before writing it: on a fresh tree the directory may not exist yet, and
-    // the lock has to be takeable there too or `init` cannot run.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create config directory {}", parent.display()))?;
+        let root = canonical_master
+            .parent()
+            .context("master config path has no parent")?
+            .to_path_buf();
+        let mut anchor = root.clone();
+        let meta = loop {
+            match std::fs::symlink_metadata(&anchor) {
+                Ok(meta) => break meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    ensure!(anchor.pop(), "config root has no existing ancestor");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        ensure!(
+            meta.is_dir(),
+            "config root ancestor is not a directory: {}",
+            anchor.display()
+        );
+        Ok((
+            Self {
+                lock_path: root.join(WRITE_LOCK_FILE),
+                txn_dir: root.join(migration_journal::TXN_DIR_NAME),
+                canonical_master,
+                root,
+                anchor,
+                anchor_inode: inode(&meta),
+            },
+            master,
+        ))
     }
 
-    // 0o600: the lock carries no content, but a world-writable one in the
-    // config directory would let any local user block every config mutation.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("open config write lock {}", path.display()))?;
+    fn verify_master_from(&self, master: &Path, cwd: &Path) -> anyhow::Result<Option<File>> {
+        self.open_root(false)?;
+        let (requested, file) = Self::resolve_with_master_from(master, cwd)?;
+        ensure!(
+            &requested == self,
+            "config guard belongs to {}, not {}",
+            self.canonical_master.display(),
+            master.display()
+        );
+        Ok(file)
+    }
 
-    let ret = wait_for_flock(&file, wait);
+    pub(crate) fn open_root(&self, create: bool) -> anyhow::Result<File> {
+        // O_PATH preserves traversal through searchable but unreadable ancestors.
+        let access = if self.root == Path::new("/") {
+            libc::O_RDONLY
+        } else {
+            libc::O_PATH
+        };
+        let mut dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")?;
+        let mut path = PathBuf::from("/");
+        self.check_anchor(&path, &dir)?;
+        for component in self.root.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            path.push(name);
+            let access = if path == self.root {
+                libc::O_RDONLY
+            } else {
+                libc::O_PATH
+            };
+            let next = match open_at(&dir, name, access | libc::O_DIRECTORY, 0) {
+                Ok(next) => next,
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                    let parent =
+                        open_at(&dir, OsStr::new("."), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                    let name_c = CString::new(name.as_bytes())?;
+                    #[cfg(test)]
+                    test_event(TestEvent::BeforeMkdir);
+                    let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o750) };
+                    let created = rc == 0;
+                    if !created && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+                    {
+                        return Err(io::Error::last_os_error()).with_context(|| {
+                            format!("create config directory {}", path.display())
+                        });
+                    }
+                    let next = open_at(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                    if created {
+                        preserve_owner(&next, &dir.metadata()?)?;
+                        next.set_permissions(std::fs::Permissions::from_mode(0o750))?;
+                        next.sync_all()?;
+                        parent.sync_all()?;
+                    }
+                    next
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "open config directory {} without following symlinks",
+                            path.display()
+                        )
+                    })
+                }
+            };
+            self.check_anchor(&path, &next)?;
+            dir = next;
+        }
+        Ok(dir)
+    }
 
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            anyhow::bail!(
-                "another warden process has been writing this config for over {}s \
-                 ({}).\n\
-                 Nothing was written. If no other `warden` command and no daemon \
-                 reload is running, the holder has wedged — check with \
-                 `fuser {}` and retry.",
-                wait.as_secs(),
-                path.display(),
+    fn check_anchor(&self, path: &Path, file: &File) -> anyhow::Result<()> {
+        if path == self.anchor {
+            ensure!(
+                inode(&file.metadata()?) == self.anchor_inode,
+                "config root changed while acquiring its lock: {}",
                 path.display()
             );
         }
-        return Err(
-            anyhow::Error::new(err).context(format!("lock config tree via {}", path.display()))
-        );
+        Ok(())
     }
 
-    Ok(ConfigWriteLock { _file: file, path })
+    pub(crate) fn owner_metadata(&self, root: &File) -> anyhow::Result<Metadata> {
+        match open_at(
+            root,
+            self.canonical_master
+                .file_name()
+                .context("master filename")?,
+            libc::O_PATH,
+            0,
+        ) {
+            Ok(master) => {
+                let meta = master.metadata()?;
+                ensure!(meta.is_file(), "master config must be a regular file");
+                Ok(meta)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(root.metadata()?),
+            Err(e) => Err(e).context("inspect canonical master ownership"),
+        }
+    }
 }
 
-// ── What this does not close ────────────────────────────────────────
-//
-// The lock starts inside `promote_validated`, and the caller's READ happened
-// before that — a verb loads the config, edits a `Value`, then calls the
-// seat. So two mutations to *different keys of the same file* can still lose
-// one:
-//
-//   A loads → B loads → A promotes → B promotes (from its pre-A view)
-//
-// B's file is valid and B's own key is right; A's key is gone. That is the
-// "rare lost update", and it is strictly less severe than the
-// rollback above: no committed-and-then-erased state, no silent revert of a
-// third party, and the operator can see it by re-reading.
-//
-// Closing it needs the baseline the caller read to travel to the seat, so the
-// promotion can refuse when the file moved underneath — optimistic
-// concurrency, not a wider lock. Widening the lock to the caller instead would
-// mean taking it at ~40 verb entry points and inviting a self-deadlock the
-// moment one verb calls another. That is a separate change, and it is not
-// pretended here.
+pub(crate) fn resolve_path(requested: &Path) -> anyhow::Result<PathBuf> {
+    super::tree_io::resolve_global_from(requested, &std::env::current_dir()?)
+}
+
+pub(crate) fn open_at(dir: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+pub(crate) fn preserve_owner(file: &File, owner: &Metadata) -> anyhow::Result<()> {
+    if unsafe { libc::geteuid() } == 0 {
+        let rc = unsafe { libc::fchown(file.as_raw_fd(), owner.uid(), owner.gid()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("preserve config ownership");
+        }
+    }
+    Ok(())
+}
+
+fn inode(meta: &Metadata) -> (u64, u64) {
+    (meta.dev(), meta.ino())
+}
+
+#[must_use = "dropping the guard releases the config tree lock"]
+#[derive(Debug)]
+pub struct ConfigWriteLock {
+    _side_file: File,
+    side_lock_owner: (u32, u32),
+    _root: File,
+    identity: ConfigTreeIdentity,
+    cwd: PathBuf,
+    requested: PathBuf,
+    root_alias: Option<PathBuf>,
+    master: RefCell<Option<File>>,
+}
+
+#[must_use = "dropping the guard releases the config tree lock"]
+#[derive(Debug)]
+pub(crate) struct ConfigReadLock {
+    _root: File,
+    identity: ConfigTreeIdentity,
+    cwd: PathBuf,
+    requested: PathBuf,
+    root_alias: Option<PathBuf>,
+    master: RefCell<Option<File>>,
+}
+
+#[must_use = "dropping the guard releases the config tree lock"]
+#[derive(Debug)]
+pub(crate) struct MigrationWriteLock(ConfigWriteLock);
+
+macro_rules! identity_accessors {
+    () => {
+        pub(crate) fn tree_io(&self) -> super::tree_io::TreeIo<'_> {
+            super::tree_io::TreeIo {
+                identity: &self.identity,
+                root: &self._root,
+                cwd: &self.cwd,
+                requested: &self.requested,
+                root_alias: self.root_alias.as_deref(),
+                master: &self.master,
+            }
+        }
+        pub(crate) fn verify_master(&self, master: &Path) -> anyhow::Result<()> {
+            if self.cwd.join(master).as_os_str() == self.requested.as_os_str()
+                || master.as_os_str() == self.canonical_master().as_os_str()
+            {
+                return Ok(());
+            }
+            let resolved = ConfigTreeIdentity::resolve_from(master, &self.cwd)?;
+            ensure!(
+                resolved == self.identity,
+                "config guard belongs to {}, not {}",
+                self.canonical_master().display(),
+                master.display()
+            );
+            Ok(())
+        }
+        pub(crate) fn identity(&self) -> &ConfigTreeIdentity {
+            &self.identity
+        }
+        pub(crate) fn canonical_master(&self) -> &Path {
+            &self.identity.canonical_master
+        }
+        #[allow(dead_code, reason = "guarded mutation API")]
+        pub(crate) fn resolve_member(&self, path: &Path) -> anyhow::Result<PathBuf> {
+            Ok(self.tree_io().plan_target(path)?.display().to_path_buf())
+        }
+    };
+}
+
+impl ConfigWriteLock {
+    identity_accessors!();
+
+    pub(crate) fn admitted_side_lock_owner(&self) -> anyhow::Result<(u32, u32)> {
+        let meta = self._side_file.metadata()?;
+        ensure!(
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.mode() & 0o7777 == 0o600
+                && (meta.uid(), meta.gid()) == self.side_lock_owner,
+            "config side lock changed after admission: {}",
+            self.identity.lock_path.display()
+        );
+        Ok(self.side_lock_owner)
+    }
+
+    /// Admit the canonical master's replacement made by the direct CLI editor.
+    ///
+    /// This is deliberately not a general identity refresh: it examines only
+    /// the canonical leaf beneath the already locked root, without following
+    /// it, and accepts only a regular single-link replacement.
+    pub(crate) fn recapture_canonical_master_after_editor(&self) -> anyhow::Result<()> {
+        let owner = self.admitted_side_lock_owner()?;
+        let name = self
+            .identity
+            .canonical_master
+            .file_name()
+            .context("master filename")?;
+        let file = super::tree_io::inspect_at(&self._root, name)?
+            .context("editor removed the canonical master")?;
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_file() && meta.nlink() == 1,
+            "editor replacement must be a regular single-link canonical master: {}",
+            self.identity.canonical_master.display()
+        );
+        let ownership = reopen_inspected(&file, libc::O_RDONLY)
+            .context("reopen editor replacement before ownership normalization")?;
+        if (meta.uid(), meta.gid()) != owner && unsafe { libc::geteuid() } == 0 {
+            let rc = unsafe { libc::fchown(ownership.as_raw_fd(), owner.0, owner.1) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error())
+                    .context("preserve editor replacement ownership");
+            }
+            #[cfg(test)]
+            if take_recaptured_owner_sync_failure() {
+                return Err(io::Error::other(
+                    "injected editor replacement ownership sync failure",
+                ))
+                .context("sync editor replacement ownership");
+            }
+            ownership
+                .sync_all()
+                .context("sync editor replacement ownership")?;
+        }
+        let meta = ownership.metadata()?;
+        ensure!(
+            (meta.uid(), meta.gid()) == owner,
+            "editor replacement owner does not match admitted config lock owner {}:{}: {}",
+            owner.0,
+            owner.1,
+            self.identity.canonical_master.display()
+        );
+        *self.master.borrow_mut() = Some(file);
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.identity.lock_path
+    }
+}
+
+impl ConfigReadLock {
+    pub(crate) fn tree_io(&self) -> super::tree_io::TreeIo<'_> {
+        super::tree_io::TreeIo {
+            identity: &self.identity,
+            root: &self._root,
+            cwd: &self.cwd,
+            requested: &self.requested,
+            root_alias: self.root_alias.as_deref(),
+            master: &self.master,
+        }
+    }
+
+    #[allow(dead_code, reason = "guarded backup seam")]
+    pub(crate) fn verify_master(&self, master: &Path) -> anyhow::Result<()> {
+        if self.cwd.join(master).as_os_str() == self.requested.as_os_str()
+            || master.as_os_str() == self.canonical_master().as_os_str()
+        {
+            return Ok(());
+        }
+        let resolved = ConfigTreeIdentity::resolve_from(master, &self.cwd)?;
+        ensure!(
+            resolved == self.identity,
+            "config guard belongs to {}, not {}",
+            self.canonical_master().display(),
+            master.display()
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "guarded backup seam")]
+    pub(crate) fn canonical_master(&self) -> &Path {
+        &self.identity.canonical_master
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &ConfigTreeIdentity {
+        &self.identity
+    }
+}
+
+impl MigrationWriteLock {
+    pub(crate) fn tree_io(&self) -> super::tree_io::TreeIo<'_> {
+        self.0.tree_io()
+    }
+    pub(crate) fn verify_master(&self, master: &Path) -> anyhow::Result<()> {
+        self.0.verify_master(master)
+    }
+    pub(crate) fn identity(&self) -> &ConfigTreeIdentity {
+        self.0.identity()
+    }
+    pub(crate) fn canonical_master(&self) -> &Path {
+        self.0.canonical_master()
+    }
+}
+
+pub fn acquire_for_write(master: &Path) -> anyhow::Result<ConfigWriteLock> {
+    let guard = acquire_write_with_deadline(master, LOCK_DEADLINE)?;
+    migration_journal::refuse_normal_write(guard.tree_io())?;
+    #[cfg(test)]
+    test_event(TestEvent::WriteRootLocked);
+    Ok(guard)
+}
+
+pub(crate) fn acquire_for_read(master: &Path) -> anyhow::Result<ConfigReadLock> {
+    acquire_read_with_deadline(master, LOCK_DEADLINE)
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) fn acquire_for_read_with_timeout(
+    master: &Path,
+    wait: Duration,
+) -> anyhow::Result<ConfigReadLock> {
+    acquire_read_with_deadline(master, wait)
+}
 
-    /// The lock is a sibling of the master, not the master itself.
-    ///
-    /// Pins the decision the module header argues: locking the config file
-    /// would be defeated by the rename that promotes it.
-    #[test]
-    fn the_lock_is_a_side_file_never_the_config_itself() {
-        let master = Path::new("/etc/purge-warden/config.toml");
-        let lock = lock_path_for(master);
-        assert_ne!(lock, master, "the lock must never BE the promoted file");
-        assert_eq!(lock, Path::new("/etc/purge-warden/.warden-config.lock"));
+#[cfg(test)]
+pub(crate) fn acquire_for_write_with_timeout(
+    master: &Path,
+    wait: Duration,
+) -> anyhow::Result<ConfigWriteLock> {
+    acquire_write_with_deadline(master, wait)
+}
+
+fn acquire_read_with_deadline(master: &Path, wait: Duration) -> anyhow::Result<ConfigReadLock> {
+    let cwd = std::env::current_dir()?;
+    let (identity, root, captured) = lock_root(master, &cwd, false, wait)?;
+    let guard = ConfigReadLock {
+        master: RefCell::new(captured),
+        _root: root,
+        root_alias: admitted_parent_alias(master, &cwd, &identity)?,
+        identity,
+        requested: cwd.join(master),
+        cwd,
+    };
+    migration_journal::refuse_normal_access(guard.tree_io())?;
+    #[cfg(test)]
+    test_event(TestEvent::RootLocked);
+    Ok(guard)
+}
+
+#[allow(dead_code, reason = "migration-only API")]
+pub(crate) fn acquire_for_migration(master: &Path) -> anyhow::Result<MigrationWriteLock> {
+    Ok(MigrationWriteLock(acquire_write_with_deadline(
+        master,
+        LOCK_DEADLINE,
+    )?))
+}
+
+fn admitted_parent_alias(
+    master: &Path,
+    cwd: &Path,
+    identity: &ConfigTreeIdentity,
+) -> anyhow::Result<Option<PathBuf>> {
+    let absolute = cwd.join(master);
+    let parent = absolute.parent().context("master parent")?;
+    Ok(
+        (super::tree_io::resolve_global_from(parent, cwd)? == identity.root)
+            .then(|| parent.to_path_buf()),
+    )
+}
+
+fn lock_root(
+    master: &Path,
+    cwd: &Path,
+    exclusive: bool,
+    wait: Duration,
+) -> anyhow::Result<(ConfigTreeIdentity, File, Option<File>)> {
+    let initial = ConfigTreeIdentity::resolve_from(master, cwd)?;
+    if std::fs::metadata(&initial.canonical_master).is_ok() {
+        std::fs::metadata(cwd.join(master))
+            .context("requested master spelling cannot be traversed")?;
     }
+    let root = initial.open_root(exclusive)?;
+    let identity = ConfigTreeIdentity::resolve_from(master, cwd)?;
+    ensure!(
+        initial.root == identity.root && initial.canonical_master == identity.canonical_master,
+        "config identity changed while creating its root"
+    );
+    ensure!(
+        inode(&root.metadata()?) == identity.anchor_inode && identity.anchor == identity.root,
+        "config root changed while opening its lock"
+    );
+    wait_for_flock(&root, exclusive, wait).with_context(|| {
+        format!(
+            "lock config directory {}; Nothing was written",
+            identity.root.display()
+        )
+    })?;
+    let verified = identity.verify_master_from(master, cwd)?;
+    let captured = capture_master(&identity, &root, verified.as_ref())?;
+    Ok((identity, root, captured))
+}
 
-    /// A bare file name locks in the working directory, EXPLICITLY.
-    ///
-    /// This test found the real bug: `Path::new("config.toml").parent()` is
-    /// `Some("")`, so the original `unwrap_or_else(|| Path::new("."))` never
-    /// fired here and the empty parent flowed into `join`. The result
-    /// (`.warden-config.lock`) resolved correctly by accident, so nothing would have
-    /// broken — the defect was a guard that read as handling a case it did not
-    /// touch. Asserting the `./` prefix is what makes the normalisation
-    /// deliberate rather than incidental.
-    #[test]
-    fn a_bare_file_name_locks_in_the_current_directory_explicitly() {
-        assert_eq!(
-            lock_path_for(Path::new("config.toml")),
-            Path::new("./.warden-config.lock"),
-            "an empty parent must normalise to `.`, not flow into join as \"\""
-        );
+fn acquire_write_with_deadline(master: &Path, wait: Duration) -> anyhow::Result<ConfigWriteLock> {
+    let started = Instant::now();
+    // Directory-first ordering lets readers synchronize without side-file access.
+    let cwd = std::env::current_dir()?;
+    let (identity, root, captured) = lock_root(master, &cwd, true, wait)?;
+    let owner = captured
+        .as_ref()
+        .map(File::metadata)
+        .transpose()?
+        .unwrap_or(root.metadata()?);
+    let name = OsStr::new(WRITE_LOCK_FILE);
+    let flags = libc::O_RDWR | libc::O_NONBLOCK;
+    let (file, created) = match open_at(&root, name, flags | libc::O_CREAT | libc::O_EXCL, 0o600) {
+        Ok(file) => (file, true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (
+            open_at(&root, name, libc::O_PATH, 0).with_context(|| {
+                format!("open safe config lock {}", identity.lock_path.display())
+            })?,
+            false,
+        ),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("create config lock {}", identity.lock_path.display()))
+        }
+    };
+    if created {
+        preserve_owner(&file, &owner)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-
-    /// A root master also normalises, and by the OTHER branch — `parent()` is
-    /// genuinely `None` here. Keeps both arms of the match covered, so a
-    /// "simplification" back to a bare `unwrap_or` breaks a test.
-    #[test]
-    fn a_root_master_normalises_through_the_none_arm() {
-        assert_eq!(
-            lock_path_for(Path::new("/")),
-            Path::new("./.warden-config.lock")
-        );
+    validate_lock(&file.metadata()?, &owner, &identity.lock_path)?;
+    let file = if created {
+        file
+    } else {
+        reopen_inspected(&file, flags)?
+    };
+    if created {
+        file.sync_all()?;
+        root.sync_all()?;
     }
+    wait_for_flock(&file, true, wait.saturating_sub(started.elapsed())).with_context(|| {
+        format!(
+            "lock config tree via {}; Nothing was written",
+            identity.lock_path.display()
+        )
+    })?;
+    let verified = identity.verify_master_from(master, &cwd)?;
+    ensure!(
+        super::tree_io::same_optional_inode(captured.as_ref(), verified.as_ref())?,
+        "canonical master changed while acquiring the side lock"
+    );
+    let current = open_at(&root, name, libc::O_PATH, 0)?;
+    validate_lock(&current.metadata()?, &owner, &identity.lock_path)?;
+    ensure!(
+        inode(&file.metadata()?) == inode(&current.metadata()?),
+        "config lock inode changed during acquisition"
+    );
+    Ok(ConfigWriteLock {
+        master: RefCell::new(capture_master(&identity, &root, verified.as_ref())?),
+        _side_file: file,
+        side_lock_owner: (owner.uid(), owner.gid()),
+        _root: root,
+        root_alias: admitted_parent_alias(master, &cwd, &identity)?,
+        identity,
+        requested: cwd.join(master),
+        cwd,
+    })
+}
 
-    /// The lock name must not be reachable by an `includes` glob.
-    ///
-    /// `*.toml` and `*.d/*.toml` are the shapes the loader accepts; a lock
-    /// that matched either would be parsed as a config slice and the tree
-    /// would fail to load the moment it was taken.
-    #[test]
-    fn the_lock_name_is_not_a_toml_and_not_in_a_dot_d() {
-        assert!(!WRITE_LOCK_FILE.ends_with(".toml"));
-        assert!(!WRITE_LOCK_FILE.contains(".d/"));
-        assert!(WRITE_LOCK_FILE.starts_with('.'));
-    }
+fn capture_master(
+    identity: &ConfigTreeIdentity,
+    root: &File,
+    verified: Option<&File>,
+) -> anyhow::Result<Option<File>> {
+    #[cfg(test)]
+    test_event(TestEvent::BeforeMasterCapture);
+    let file = super::tree_io::inspect_at(
+        root,
+        identity
+            .canonical_master
+            .file_name()
+            .context("master filename")?,
+    )?;
+    ensure!(
+        super::tree_io::same_optional_inode(verified, file.as_ref())?,
+        "canonical master changed between identity verification and capture"
+    );
+    Ok(file)
+}
 
-    /// Two guards over the same tree cannot coexist — the second waits, and
-    /// with the first still held it times out rather than proceeding.
-    ///
-    /// The deadline is shortened for the test by contending from a thread and
-    /// asserting the ORDER of events, not by waiting 30 s: the second acquire
-    /// must not return while the first guard is alive.
-    #[test]
-    fn a_second_writer_does_not_get_the_lock_while_the_first_holds_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
+fn validate_lock(meta: &Metadata, owner: &Metadata, path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.mode() & 0o7777 == 0o600
+            && meta.uid() == owner.uid()
+            && meta.gid() == owner.gid(),
+        "unsafe config lock (expected regular, single-link, mode 0600, owner {}:{}): {}. Stop all warden daemons and commands before maintenance; inspect this exact entry without following symlinks. After confirming it is an obsolete lock, move it aside and let warden recreate it. Do not remove or replace a lock while any old or new process may hold it",
+        owner.uid(),
+        owner.gid(),
+        path.display()
+    );
+    Ok(())
+}
 
-        let first = acquire(&master).unwrap();
-
-        // A non-blocking probe from a SEPARATE process would be the strict
-        // test, but `flock` is per-open-file-description: a second `open` in
-        // this same process contends correctly, which is what the seat does
-        // when the daemon and a CLI verb race.
-        let path = lock_path_for(&master);
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_ne!(rc, 0, "a second exclusive claim must not succeed");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EWOULDBLOCK),
-            "contention must present as EWOULDBLOCK, not another errno"
-        );
-
-        drop(first);
-
-        // Released on drop, with no explicit unlock anywhere.
-        let rc = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(rc, 0, "dropping the guard must release the lock");
-    }
-
-    /// The contended path: `acquire` WAITS, then refuses, and the refusal
-    /// carries what the operator needs.
-    ///
-    /// Covers what the raw-`flock` probe above cannot — that this function
-    /// polls rather than failing on the first `EWOULDBLOCK`, that it stops at
-    /// its deadline rather than hanging, and that the message names the lock
-    /// path. A `bail!` whose text nobody asserts drifts into uselessness.
-    #[test]
-    fn a_contended_lock_waits_then_refuses_naming_the_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, "").unwrap();
-
-        let _held = acquire(&master).unwrap();
-
-        let waited = std::time::Duration::from_millis(120);
-        let started = std::time::Instant::now();
-        let err = acquire_with_deadline(&master, waited)
-            .expect_err("a second acquire must not succeed while the first is held");
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= waited,
-            "acquire returned after {elapsed:?} but was given {waited:?} — it is not \
-             waiting, it is failing on the first EWOULDBLOCK"
-        );
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(".warden-config.lock"),
-            "the refusal must name the lock path; got: {msg}"
-        );
-        assert!(
-            msg.contains("Nothing was written"),
-            "the refusal must say the write did not happen; got: {msg}"
-        );
-    }
-
-    /// Acquiring from inside a MULTI-THREADED tokio runtime must not panic.
-    ///
-    /// The daemon's seven mutation handlers are `async fn` on the default
-    /// `#[tokio::main]` runtime, so this is the production path, and
-    /// `block_in_place` is only legal there. Uncontended, so it exercises the
-    /// dispatch rather than the wait.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn acquiring_inside_a_multi_thread_runtime_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        let guard = acquire(&master).expect("block_in_place path must succeed");
-        assert!(guard.path().exists());
-    }
-
-    /// And from a CURRENT-THREAD runtime, where `block_in_place` would panic.
-    ///
-    /// This crate has `current_thread` tests elsewhere, so the flavour check in
-    /// `wait_for_flock` is load-bearing rather than defensive: without it this
-    /// test panics instead of failing an assertion.
-    #[tokio::test(flavor = "current_thread")]
-    async fn acquiring_inside_a_current_thread_runtime_does_not_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        let guard = acquire(&master).expect("current_thread path must not panic");
-        assert!(guard.path().exists());
-    }
-
-    /// The lock file is created 0o600, not world-writable.
-    #[test]
-    fn the_lock_file_is_not_world_writable() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        let guard = acquire(&master).unwrap();
-        let mode = std::fs::metadata(guard.path())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "lock mode was {mode:o}");
-    }
-
-    /// Acquiring on a tree whose directory does not exist yet must work —
-    /// `init` runs before anything is on disk.
-    #[test]
-    fn a_tree_whose_directory_is_absent_can_still_be_locked() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("not/created/yet/config.toml");
-        let guard = acquire(&master).unwrap();
-        assert!(guard.path().exists());
+fn flock_until(file: &File, exclusive: bool, wait: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    let kind = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), kind | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(err);
+        }
+        #[cfg(test)]
+        test_event(TestEvent::Contended);
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("another warden process holds the config tree lock (waited {wait:?})"),
+            ));
+        };
+        std::thread::sleep(LOCK_POLL.min(remaining));
     }
 }
+
+pub(crate) fn reopen_inspected(file: &File, flags: i32) -> io::Result<File> {
+    let meta = file.metadata()?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(io::Error::other(
+            "refusing data access to a non-regular, non-directory inode",
+        ));
+    }
+    #[cfg(test)]
+    test_event(TestEvent::BeforeDataOpen);
+    // procfs names the inspected inode, so replacement devices are never opened.
+    let reopened = OpenOptions::new()
+        .read(true)
+        .write(flags & libc::O_RDWR != 0)
+        .custom_flags(flags | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    if inode(&meta) != inode(&reopened.metadata()?) {
+        return Err(io::Error::other("inspected inode changed during reopen"));
+    }
+    Ok(reopened)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestEvent {
+    Contended,
+    BeforeMkdir,
+    BeforeDataOpen,
+    BeforeExternalSourceParentPin,
+    RootLocked,
+    WriteRootLocked,
+    BeforePromotion,
+    IncludeDirectoryPinned,
+    BeforeOverlay,
+    OverlayResolved,
+    BeforeMasterCapture,
+    BeforeGuardedValidation,
+    AfterGuardedValidation,
+    AfterEditorRecapture,
+}
+
+#[cfg(test)]
+type TestHook = Box<dyn FnMut(TestEvent)>;
+#[cfg(test)]
+thread_local! { static TEST_HOOK: std::cell::RefCell<Option<TestHook>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static FAIL_RECAPTURED_OWNER_SYNC: Cell<bool> = const { Cell::new(false) }; }
+
+#[cfg(test)]
+pub(crate) fn test_event(event: TestEvent) {
+    TEST_HOOK.with(|slot| {
+        let Some(mut hook) = slot.borrow_mut().take() else {
+            return;
+        };
+        hook(event);
+        *slot.borrow_mut() = Some(hook);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_hook<T>(
+    hook: impl FnMut(TestEvent) + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<TestHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    body()
+}
+
+#[cfg(test)]
+pub(crate) fn with_recaptured_owner_sync_failure<T>(body: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_RECAPTURED_OWNER_SYNC.with(|slot| slot.set(self.0));
+        }
+    }
+    let reset = FAIL_RECAPTURED_OWNER_SYNC.with(|slot| Reset(slot.replace(true)));
+    let result = body();
+    drop(reset);
+    result
+}
+
+#[cfg(test)]
+fn take_recaptured_owner_sync_failure() -> bool {
+    FAIL_RECAPTURED_OWNER_SYNC.with(|slot| slot.replace(false))
+}
+
+fn wait_for_flock(file: &File, exclusive: bool, wait: Duration) -> io::Result<()> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    // Contention must not park a daemon worker; current-thread runtimes cannot use block_in_place.
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| flock_until(file, exclusive, wait))
+        }
+        _ => flock_until(file, exclusive, wait),
+    }
+}
+
+#[cfg(test)]
+#[path = "write_lock/tests.rs"]
+mod tests;

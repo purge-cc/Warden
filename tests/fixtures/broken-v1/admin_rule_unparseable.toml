@@ -2,7 +2,7 @@
 # whose rule text the filter engine cannot parse — an unclosed regex
 # group. Before the fix this linted clean and silently enforced nothing;
 # now it triggers ConfigError::ValidationFailed at validator time.
-schema_version = 3
+schema_version = 4
 
 [profiles.default]
 display_name = "Default"

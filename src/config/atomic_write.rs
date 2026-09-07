@@ -43,7 +43,7 @@
 //! agnostic about which schema it is guarding.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,6 +71,30 @@ static TEMP_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// validation, or a rename blocked by some pre-existing path conflict.
 #[derive(Debug, Error)]
 pub enum AtomicWriteError {
+    #[error("create-only target must have an absent snapshot: {target}")]
+    TargetMustBeAbsent { target: PathBuf },
+    #[error("create-only target already exists: {target}")]
+    TargetExists { target: PathBuf },
+    #[error("renameat2(RENAME_NOREPLACE) is unsupported for {target}: {source}")]
+    NoReplaceUnsupported {
+        target: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot seek/read spooled source for {target}: {source}")]
+    ReadSource {
+        target: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "spooled source for {target} violates its {expected_size}-byte size/EOF contract (observed at least {observed_size} bytes)"
+    )]
+    SourceSize {
+        target: PathBuf,
+        expected_size: u64,
+        observed_size: u64,
+    },
     #[error("cannot create parent directory for {target}: {source}")]
     MkDir {
         target: PathBuf,
@@ -105,13 +129,25 @@ pub enum AtomicWriteError {
         #[source]
         source: std::io::Error,
     },
-    /// `fsync` (or the parent-dir `fsync`) failed. The temp has been
-    /// cleaned up best-effort; the target on disk is untouched. Without
-    /// this the bytes hit page cache but never reach the storage layer,
-    /// so a power loss before the next kernel writeback would leave a
-    /// zero-byte target.
+    /// The staged temp-file `fsync` failed. The temp has been cleaned up
+    /// best-effort; the target on disk is untouched. Without this the
+    /// bytes hit page cache but never reach the storage layer, so a power
+    /// loss before the next kernel writeback would leave a zero-byte target.
     #[error("fsync failed on {path}: {source}")]
     Fsync {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The rename already replaced `target`, but opening or syncing its
+    /// parent directory failed. The new bytes are visible at `target`; only
+    /// crash-durability of the directory entry is unconfirmed.
+    ///
+    /// This deliberately has the same operator-facing wording as
+    /// [`AtomicWriteError::Fsync`], while retaining the disposition callers
+    /// need for compensating transactions.
+    #[error("fsync failed on {path}: {source}")]
+    PostRenameFsync {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -130,6 +166,24 @@ pub enum AtomicWriteError {
         #[source]
         source: std::io::Error,
     },
+}
+
+impl AtomicWriteError {
+    /// Whether this error was raised after the target rename committed.
+    pub fn rename_landed(&self) -> bool {
+        matches!(self, Self::PostRenameFsync { .. })
+    }
+}
+
+/// A per-operation fault used only by unit tests. It deliberately lives in
+/// [`AtomicWriteOpts`] instead of a process-global hook, so concurrent tests
+/// cannot make an unrelated write fail.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicWriteTestFailure {
+    TempFsync,
+    ParentOpen,
+    ParentFsync,
 }
 
 /// Borrowed validator closure type used by [`AtomicWriteOpts::validator`].
@@ -158,6 +212,9 @@ pub struct AtomicWriteOpts<'a> {
     /// durability. Default `true`; set `false` only for ephemeral test
     /// fixtures where the cost is not worth it.
     pub fsync_parent: bool,
+    /// Unit-test-only, operation-scoped fault injection.
+    #[cfg(test)]
+    pub(crate) test_failure: Option<AtomicWriteTestFailure>,
 }
 
 impl Default for AtomicWriteOpts<'_> {
@@ -166,6 +223,8 @@ impl Default for AtomicWriteOpts<'_> {
             validator: None,
             mode: None,
             fsync_parent: true,
+            #[cfg(test)]
+            test_failure: None,
         }
     }
 }
@@ -185,10 +244,10 @@ impl Default for AtomicWriteOpts<'_> {
 ///   exception: a parent-directory fsync failure raised *after* the
 ///   rename has already committed. In that case the new bytes ARE on
 ///   disk (the swap succeeded); only crash-durability of the directory
-///   entry is unconfirmed. `AtomicWriteError::Fsync { path: <parent> }`
-///   therefore means "the write LANDED but durability is unconfirmed",
-///   NOT "the write failed and the target is unchanged" — callers doing
-///   compensating rollback must not treat it as a no-op failure.
+///   entry is unconfirmed. `AtomicWriteError::PostRenameFsync` therefore
+///   means "the write LANDED but durability is unconfirmed", NOT "the
+///   write failed and the target is unchanged" — callers doing compensating
+///   rollback must not treat it as a no-op failure.
 /// - Temp files are cleaned up on success (the rename consumes the temp)
 ///   and on every HANDLED failure path (best-effort `remove_file`). A hard
 ///   crash (SIGKILL / panic) between temp creation and the rename leaves a
@@ -419,6 +478,17 @@ pub fn hardened_atomic_write(
     // fsync the data + the just-asserted mode/owner metadata together:
     // fsync flushes the inode's data AND metadata, so the chmod/lchown
     // above are now crash-durable, not just the bytes.
+    #[cfg(test)]
+    {
+        if opts.test_failure == Some(AtomicWriteTestFailure::TempFsync) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(AtomicWriteError::Fsync {
+                path: tmp.clone(),
+                source: std::io::Error::other("injected staged-temp fsync failure"),
+            });
+        }
+    }
     if let Err(source) = file.sync_all() {
         drop(file);
         let _ = std::fs::remove_file(&tmp);
@@ -449,17 +519,31 @@ pub fn hardened_atomic_write(
     }
 
     if opts.fsync_parent {
+        #[cfg(test)]
+        if opts.test_failure == Some(AtomicWriteTestFailure::ParentOpen) {
+            return Err(AtomicWriteError::PostRenameFsync {
+                path: parent.to_path_buf(),
+                source: std::io::Error::other("injected parent-directory open failure"),
+            });
+        }
         match File::open(parent) {
             Ok(dir) => {
+                #[cfg(test)]
+                if opts.test_failure == Some(AtomicWriteTestFailure::ParentFsync) {
+                    return Err(AtomicWriteError::PostRenameFsync {
+                        path: parent.to_path_buf(),
+                        source: std::io::Error::other("injected parent-directory fsync failure"),
+                    });
+                }
                 if let Err(source) = dir.sync_all() {
-                    return Err(AtomicWriteError::Fsync {
+                    return Err(AtomicWriteError::PostRenameFsync {
                         path: parent.to_path_buf(),
                         source,
                     });
                 }
             }
             Err(source) => {
-                return Err(AtomicWriteError::Fsync {
+                return Err(AtomicWriteError::PostRenameFsync {
                     path: parent.to_path_buf(),
                     source,
                 });
@@ -468,6 +552,520 @@ pub fn hardened_atomic_write(
     }
 
     Ok(())
+}
+
+pub(crate) type AtomicWriteFdValidator<'a> = &'a dyn Fn(&File, &Path) -> Result<(), String>;
+
+mod staging;
+
+pub(crate) struct AtomicWriteAtOpts<'a> {
+    pub validator: Option<AtomicWriteFdValidator<'a>>,
+    pub mode: Option<u32>,
+    /// Owner for an absent target. Existing targets retain snapshot ownership.
+    pub owner: Option<(u32, u32)>,
+    pub fsync_parent: bool,
+    #[cfg(test)]
+    pub(crate) test_failure: Option<AtomicWriteTestFailure>,
+}
+
+impl Default for AtomicWriteAtOpts<'_> {
+    fn default() -> Self {
+        Self {
+            validator: None,
+            mode: None,
+            owner: None,
+            fsync_parent: true,
+            #[cfg(test)]
+            test_failure: None,
+        }
+    }
+}
+
+pub(crate) fn hardened_atomic_write_at(
+    target: &super::tree_io::PinnedTarget<'_>,
+    content: &[u8],
+    opts: AtomicWriteAtOpts<'_>,
+) -> Result<(), AtomicWriteError> {
+    use super::tree_io::rename_at;
+    use std::io::Seek;
+    use std::os::unix::io::AsRawFd;
+    let path = target.display();
+    target
+        .check_original()
+        .map_err(|e| AtomicWriteError::Stat {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("{e:#}")),
+        })?;
+    let meta = &target.metadata;
+    let mode = opts
+        .mode
+        .or_else(|| meta.as_ref().map(|m| m.mode() & 0o7777))
+        .unwrap_or(DEFAULT_TARGET_MODE);
+    let mut staging = staging::StagingDirectory::create(&target.parent).map_err(|source| {
+        AtomicWriteError::WriteTemp {
+            tmp: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let tmp = path
+        .parent()
+        .expect("target parent")
+        .join(&staging.name)
+        .join(staging::payload());
+    let mut file = super::write_lock::open_at(
+        &staging.file,
+        staging::payload(),
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )
+    .map_err(|source| AtomicWriteError::WriteTemp {
+        tmp: tmp.clone(),
+        source,
+    })?;
+    staging
+        .record_payload(&file)
+        .map_err(|source| AtomicWriteError::WriteTemp {
+            tmp: tmp.clone(),
+            source,
+        })?;
+    (|| {
+        file.write_all(content)
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        let requested_owner = meta
+            .as_ref()
+            .map(|meta| (meta.uid(), meta.gid()))
+            .or(opts.owner);
+        if let Some(owner) = requested_owner {
+            let current = file
+                .metadata()
+                .map_err(|source| AtomicWriteError::Metadata {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            if let Some((uid, gid)) =
+                needed_owner_ids(current.uid(), current.gid(), owner.0, owner.1)
+            {
+                if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+                    return Err(AtomicWriteError::Metadata {
+                        tmp: tmp.clone(),
+                        source: std::io::Error::last_os_error(),
+                    });
+                }
+            }
+            let staged_owner = file
+                .metadata()
+                .map_err(|source| AtomicWriteError::Metadata {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            if (staged_owner.uid(), staged_owner.gid()) != owner {
+                return Err(AtomicWriteError::Metadata {
+                    tmp: tmp.clone(),
+                    source: std::io::Error::other(match meta {
+                        Some(_) => "cannot preserve snapshot ownership",
+                        None => "cannot set requested new file ownership",
+                    }),
+                });
+            }
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|source| AtomicWriteError::Metadata {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        #[cfg(test)]
+        if opts.test_failure == Some(AtomicWriteTestFailure::TempFsync) {
+            return Err(AtomicWriteError::Fsync {
+                path: tmp.clone(),
+                source: std::io::Error::other("injected staged-temp fsync failure"),
+            });
+        }
+        file.sync_all().map_err(|source| AtomicWriteError::Fsync {
+            path: tmp.clone(),
+            source,
+        })?;
+        if let Some(validator) = opts.validator {
+            let mut validated = file
+                .try_clone()
+                .map_err(|source| AtomicWriteError::WriteTemp {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            validated
+                .rewind()
+                .map_err(|source| AtomicWriteError::WriteTemp {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            validator(&validated, &tmp).map_err(|reason| AtomicWriteError::Validation {
+                target: path.to_path_buf(),
+                reason,
+            })?;
+        }
+        target
+            .check_original()
+            .map_err(|source| AtomicWriteError::Stat {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        // Retain the exact source before rename, including on post-rename fsync failure.
+        let promoted = file
+            .try_clone()
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        let master = target
+            .master
+            .map(|_| file.try_clone())
+            .transpose()
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        rename_at(
+            &staging.file,
+            staging::payload(),
+            &target.parent,
+            &target.name,
+        )
+        .map_err(|source| AtomicWriteError::Rename {
+            tmp: tmp.clone(),
+            target: path.to_path_buf(),
+            source,
+        })?;
+        target.record_promotion(promoted, master);
+        if opts.fsync_parent {
+            staging
+                .file
+                .sync_all()
+                .map_err(|source| AtomicWriteError::PostRenameFsync {
+                    path: tmp.parent().unwrap().to_path_buf(),
+                    source,
+                })?;
+        }
+        drop(staging);
+        if opts.fsync_parent {
+            #[cfg(test)]
+            if matches!(
+                opts.test_failure,
+                Some(AtomicWriteTestFailure::ParentOpen | AtomicWriteTestFailure::ParentFsync)
+            ) {
+                return Err(AtomicWriteError::PostRenameFsync {
+                    path: path.parent().unwrap().to_path_buf(),
+                    source: std::io::Error::other("injected parent-directory durability failure"),
+                });
+            }
+            target
+                .parent
+                .sync_all()
+                .map_err(|source| AtomicWriteError::PostRenameFsync {
+                    path: path.parent().unwrap().to_path_buf(),
+                    source,
+                })?;
+        }
+        Ok(())
+    })()
+}
+
+/// Options for [`hardened_atomic_create_only_at`].
+#[derive(Default)]
+pub(crate) struct AtomicCreateOnlyAtOpts {
+    /// Mode for the new target. `None` uses [`DEFAULT_TARGET_MODE`] (`0o640`).
+    pub(crate) mode: Option<u32>,
+    /// Owner for the new target. `None` derives it from the pinned parent.
+    pub(crate) owner: Option<(u32, u32)>,
+    #[cfg(test)]
+    pub(crate) test_failure: Option<AtomicWriteTestFailure>,
+}
+
+/// Create an absent pinned target from a seekable spool without replacement.
+///
+/// `source` is rewound to byte zero and must contain exactly `expected_size`
+/// bytes followed by EOF.  The source is copied through a fixed-size buffer;
+/// it is never collected into memory.
+pub(crate) fn hardened_atomic_create_only_at(
+    target: &super::tree_io::PinnedTarget<'_>,
+    source: &mut File,
+    expected_size: u64,
+    opts: AtomicCreateOnlyAtOpts,
+) -> Result<(), AtomicWriteError> {
+    use super::tree_io::rename_noreplace_at;
+    use std::os::unix::io::AsRawFd;
+
+    let path = target.display();
+    if target.original.is_some() || target.metadata.is_some() {
+        return Err(AtomicWriteError::TargetMustBeAbsent {
+            target: path.to_path_buf(),
+        });
+    }
+    check_create_only_target_absent(target, path)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| AtomicWriteError::ReadSource {
+            target: path.to_path_buf(),
+            source,
+        })?;
+
+    let mut staging = staging::StagingDirectory::create(&target.parent).map_err(|source| {
+        AtomicWriteError::WriteTemp {
+            tmp: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let tmp = path
+        .parent()
+        .expect("target parent")
+        .join(&staging.name)
+        .join(staging::payload());
+    let mut file = super::write_lock::open_at(
+        &staging.file,
+        staging::payload(),
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )
+    .map_err(|source| AtomicWriteError::WriteTemp {
+        tmp: tmp.clone(),
+        source,
+    })?;
+    staging
+        .record_payload(&file)
+        .map_err(|source| AtomicWriteError::WriteTemp {
+            tmp: tmp.clone(),
+            source,
+        })?;
+
+    (|| {
+        copy_spool_exact(source, &mut file, expected_size, path, &tmp)?;
+
+        let owner = match opts.owner {
+            Some(owner) => owner,
+            None => {
+                let owner =
+                    target
+                        .parent
+                        .metadata()
+                        .map_err(|source| AtomicWriteError::Metadata {
+                            tmp: tmp.clone(),
+                            source,
+                        })?;
+                (owner.uid(), owner.gid())
+            }
+        };
+        let current = file
+            .metadata()
+            .map_err(|source| AtomicWriteError::Metadata {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        if let Some((uid, gid)) = needed_owner_ids(current.uid(), current.gid(), owner.0, owner.1) {
+            if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+                return Err(AtomicWriteError::Metadata {
+                    tmp: tmp.clone(),
+                    source: std::io::Error::last_os_error(),
+                });
+            }
+        }
+        let staged_owner = file
+            .metadata()
+            .map_err(|source| AtomicWriteError::Metadata {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        if (staged_owner.uid(), staged_owner.gid()) != owner {
+            return Err(AtomicWriteError::Metadata {
+                tmp: tmp.clone(),
+                source: std::io::Error::other(match opts.owner {
+                    Some(_) => "cannot set requested new file ownership",
+                    None => "cannot derive new file ownership from parent",
+                }),
+            });
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(
+            opts.mode.unwrap_or(DEFAULT_TARGET_MODE),
+        ))
+        .map_err(|source| AtomicWriteError::Metadata {
+            tmp: tmp.clone(),
+            source,
+        })?;
+        #[cfg(test)]
+        if opts.test_failure == Some(AtomicWriteTestFailure::TempFsync) {
+            return Err(AtomicWriteError::Fsync {
+                path: tmp.clone(),
+                source: std::io::Error::other("injected staged-temp fsync failure"),
+            });
+        }
+        file.sync_all().map_err(|source| AtomicWriteError::Fsync {
+            path: tmp.clone(),
+            source,
+        })?;
+        check_create_only_target_absent(target, path)?;
+
+        let promoted = file
+            .try_clone()
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        let master = target
+            .master
+            .map(|_| file.try_clone())
+            .transpose()
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.clone(),
+                source,
+            })?;
+        rename_noreplace_at(
+            &staging.file,
+            staging::payload(),
+            &target.parent,
+            &target.name,
+        )
+        .map_err(|source| classify_noreplace_error(path, tmp.clone(), source))?;
+        target.record_promotion(promoted, master);
+
+        staging
+            .file
+            .sync_all()
+            .map_err(|source| AtomicWriteError::PostRenameFsync {
+                path: tmp.parent().expect("staging parent").to_path_buf(),
+                source,
+            })?;
+        drop(staging);
+        #[cfg(test)]
+        if matches!(
+            opts.test_failure,
+            Some(AtomicWriteTestFailure::ParentOpen | AtomicWriteTestFailure::ParentFsync)
+        ) {
+            return Err(AtomicWriteError::PostRenameFsync {
+                path: path.parent().expect("target parent").to_path_buf(),
+                source: std::io::Error::other("injected parent-directory durability failure"),
+            });
+        }
+        target
+            .parent
+            .sync_all()
+            .map_err(|source| AtomicWriteError::PostRenameFsync {
+                path: path.parent().expect("target parent").to_path_buf(),
+                source,
+            })?;
+        Ok(())
+    })()
+}
+
+/// Preserve an actual competing destination as `TargetExists`, without
+/// misreporting descriptor lookup/recheck failures as ordinary conflicts.
+fn check_create_only_target_absent(
+    target: &super::tree_io::PinnedTarget<'_>,
+    path: &Path,
+) -> Result<(), AtomicWriteError> {
+    if let Err(original_error) = target.check_original() {
+        return match super::tree_io::inspect_at(&target.parent, &target.name) {
+            Ok(Some(_)) => Err(AtomicWriteError::TargetExists {
+                target: path.to_path_buf(),
+            }),
+            Ok(None) => Err(AtomicWriteError::Stat {
+                path: path.to_path_buf(),
+                source: original_error,
+            }),
+            Err(source) => Err(AtomicWriteError::Stat {
+                path: path.to_path_buf(),
+                source,
+            }),
+        };
+    }
+    Ok(())
+}
+
+/// `-1`/MAX is the POSIX fchown sentinel for leaving that field intact.
+fn needed_owner_ids(
+    current_uid: u32,
+    current_gid: u32,
+    desired_uid: u32,
+    desired_gid: u32,
+) -> Option<(libc::uid_t, libc::gid_t)> {
+    let uid = if current_uid != desired_uid {
+        desired_uid as libc::uid_t
+    } else {
+        libc::uid_t::MAX
+    };
+    let gid = if current_gid != desired_gid {
+        desired_gid as libc::gid_t
+    } else {
+        libc::gid_t::MAX
+    };
+    (uid != libc::uid_t::MAX || gid != libc::gid_t::MAX).then_some((uid, gid))
+}
+
+fn copy_spool_exact(
+    source: &mut File,
+    destination: &mut File,
+    expected_size: u64,
+    target: &Path,
+    tmp: &Path,
+) -> Result<(), AtomicWriteError> {
+    const COPY_BUFFER_SIZE: usize = 64 * 1024;
+    let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+    let mut copied = 0_u64;
+    while copied < expected_size {
+        let wanted = usize::try_from((expected_size - copied).min(COPY_BUFFER_SIZE as u64))
+            .expect("bounded by COPY_BUFFER_SIZE");
+        let count =
+            source
+                .read(&mut buffer[..wanted])
+                .map_err(|source| AtomicWriteError::ReadSource {
+                    target: target.to_path_buf(),
+                    source,
+                })?;
+        if count == 0 {
+            return Err(AtomicWriteError::SourceSize {
+                target: target.to_path_buf(),
+                expected_size,
+                observed_size: copied,
+            });
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|source| AtomicWriteError::WriteTemp {
+                tmp: tmp.to_path_buf(),
+                source,
+            })?;
+        copied += count as u64;
+    }
+    let count = source
+        .read(&mut buffer[..1])
+        .map_err(|source| AtomicWriteError::ReadSource {
+            target: target.to_path_buf(),
+            source,
+        })?;
+    if count != 0 {
+        return Err(AtomicWriteError::SourceSize {
+            target: target.to_path_buf(),
+            expected_size,
+            observed_size: expected_size.saturating_add(1),
+        });
+    }
+    Ok(())
+}
+
+fn classify_noreplace_error(path: &Path, tmp: PathBuf, source: std::io::Error) -> AtomicWriteError {
+    match source.kind() {
+        std::io::ErrorKind::AlreadyExists => AtomicWriteError::TargetExists {
+            target: path.to_path_buf(),
+        },
+        std::io::ErrorKind::Unsupported => AtomicWriteError::NoReplaceUnsupported {
+            target: path.to_path_buf(),
+            source,
+        },
+        _ => AtomicWriteError::Rename {
+            tmp,
+            target: path.to_path_buf(),
+            source,
+        },
+    }
 }
 
 /// Build a temp-file path in the same directory as `target`, shaped so
@@ -770,6 +1368,69 @@ mod tests {
     }
 
     #[test]
+    fn hardened_atomic_write_parent_open_failure_is_post_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("durable.toml");
+        std::fs::write(&target, b"old").unwrap();
+
+        let err = hardened_atomic_write(
+            &target,
+            b"new",
+            AtomicWriteOpts {
+                test_failure: Some(AtomicWriteTestFailure::ParentOpen),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AtomicWriteError::PostRenameFsync { .. }));
+        assert!(err.rename_landed());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(err.to_string().starts_with("fsync failed on "));
+    }
+
+    #[test]
+    fn hardened_atomic_write_parent_sync_failure_is_post_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("durable.toml");
+        std::fs::write(&target, b"old").unwrap();
+
+        let err = hardened_atomic_write(
+            &target,
+            b"new",
+            AtomicWriteOpts {
+                test_failure: Some(AtomicWriteTestFailure::ParentFsync),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AtomicWriteError::PostRenameFsync { .. }));
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn hardened_atomic_write_temp_fsync_failure_leaves_target_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("durable.toml");
+        std::fs::write(&target, b"old").unwrap();
+
+        let err = hardened_atomic_write(
+            &target,
+            b"new",
+            AtomicWriteOpts {
+                test_failure: Some(AtomicWriteTestFailure::TempFsync),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AtomicWriteError::Fsync { .. }));
+        assert!(!err.rename_landed());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    #[test]
     fn hardened_atomic_write_validator_failure_leaves_target_intact() {
         // Helper-level mirror of `atomic_write_leaves_original_on_validator_error`.
         let dir = tempfile::tempdir().unwrap();
@@ -790,3 +1451,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "pristine");
     }
 }
+
+#[cfg(test)]
+#[path = "atomic_write/fd_tests.rs"]
+mod fd_tests;

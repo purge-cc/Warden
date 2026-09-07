@@ -26,8 +26,8 @@
 //!
 //! # Pre-promote validation
 //!
-//! Mutations route through [`write_value_validated`] (single file) or
-//! [`write_values_validated`] (compound multi-file). Both run the full
+//! Mutations route through [`write_value_validated_locked`] (single file) or
+//! [`write_values_validated_locked`] (compound multi-file). Both run the full
 //! [`crate::config::loader::load_config`] against the STAGED bytes — via a
 //! [`crate::config::loader::LoaderOverlay`] that substitutes the would-be-
 //! written content for each touched path — BEFORE the rename. A tree the
@@ -37,23 +37,29 @@
 //! with `file:line` attribution and the live config is unchanged.
 
 use std::collections::BTreeSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use toml::Value;
 
-use crate::config::atomic_write::atomic_write_and_validate;
+use crate::config::atomic_write::{hardened_atomic_write_at, AtomicWriteAtOpts, AtomicWriteError};
 use crate::config::cidr::Cidr;
 use crate::config::loader::{
-    canonicalize_path, load_config, load_config_with_overlay, LoaderOverlay,
+    canonicalize_path, load_config, load_config_for_schema_under_guard,
+    load_config_with_overlay_for_schema_under_guard, LoaderOverlay, MAX_INCLUDE_FILES,
 };
 use crate::config::schema::device::Device;
 use crate::config::schema::id::Id;
 use crate::config::schema::subnet::Subnet;
 use crate::config::schema::{
     ClusterConfig, ClusterRole, ConfigV1, REPLICATED_BUT_ALLOWED_IN_A_SECONDARY_MASTER,
-    REPLICATED_SECTIONS,
+    REPLICATED_SECTIONS, SCHEMA_VERSION_V1,
 };
+use crate::config::tree_io::{
+    for_each_dir_name, CappedRead, MemberKey, PinnedTarget, TargetPlan, TreeIo,
+};
+use crate::config::write_lock::ConfigWriteLock;
 
 /// The entity collections the CLI can mutate. Maps to the v1 schema
 /// top-level keys + the `<name>.d/` subdirectory convention.
@@ -75,6 +81,44 @@ pub enum EntityClass {
     /// kinds. `cli::commands::labels` carries pair-keyed equivalents and
     /// uses this variant purely for path resolution.
     Labels,
+}
+
+/// The pinned master member in a held config tree.
+///
+/// `display` is the canonical in-tree spelling; `key` is the descriptor-bound
+/// member identity used to recognise alternate spellings of that same file.
+pub(crate) struct GuardedMaster {
+    display: PathBuf,
+    key: MemberKey,
+}
+
+impl GuardedMaster {
+    pub(crate) fn display(&self) -> &Path {
+        &self.display
+    }
+
+    /// Whether `path` resolves to this guard's master member.
+    pub(crate) fn matches_path(
+        &self,
+        guard: &ConfigWriteLock,
+        path: &Path,
+    ) -> anyhow::Result<bool> {
+        Ok(guard.tree_io().plan_target(path)?.key() == &self.key)
+    }
+}
+
+/// Return the canonical master display path and descriptor-bound identity for
+/// a held config tree.
+pub(crate) fn guarded_master_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+) -> anyhow::Result<GuardedMaster> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_master_target()?;
+    Ok(GuardedMaster {
+        display: plan.display().to_path_buf(),
+        key: plan.key().clone(),
+    })
 }
 
 impl EntityClass {
@@ -168,6 +212,56 @@ pub fn resolve_target_file(
     }
 }
 
+/// Descriptor-pinned form of [`resolve_target_file`] for guarded mutations.
+pub(crate) fn resolve_target_file_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    class: EntityClass,
+    into: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    guard.verify_master(master)?;
+    if let Some(explicit) = into {
+        return resolve_explicit_into_under_locked(guard, master, explicit);
+    }
+
+    let candidates = conventional_candidates_locked(guard, class)?;
+    match candidates.len() {
+        0 => Ok(guard
+            .tree_io()
+            .plan_master_target()?
+            .display()
+            .to_path_buf()),
+        1 => Ok(candidates.into_iter().next().expect("one candidate")),
+        _ => {
+            let class_dir = class.dir_name(); // include-dir-ok: ambiguity display only
+            let parent = guard
+                .tree_io()
+                .plan_master_target()?
+                .display()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let names: Vec<_> = candidates
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&parent)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            bail!(
+                "ambiguous {label} target: {n} files in {dir}. Pick one with \
+                 `--into <path>`: {list}",
+                label = class.label(),
+                n = names.len(),
+                dir = parent.join(class_dir).display(),
+                list = names.join(", ")
+            );
+        }
+    }
+}
+
 /// Resolve the file an **existing** entity lives in, for `set` / `remove`
 /// verbs. With `--into` the operator's explicit choice wins (unchanged).
 /// Otherwise locate the file that actually defines `id` via
@@ -193,6 +287,25 @@ pub fn resolve_existing_target_file(
     match find_target_for_id(master, class, id)? {
         Some(owner) => Ok(owner),
         None => resolve_target_file(master, class, None),
+    }
+}
+
+/// Descriptor-pinned form of [`resolve_existing_target_file`] for guarded
+/// mutations.
+pub(crate) fn resolve_existing_target_file_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    class: EntityClass,
+    id: &str,
+    into: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    guard.verify_master(master)?;
+    if let Some(explicit) = into {
+        return resolve_explicit_into_under_locked(guard, master, explicit);
+    }
+    match find_target_for_id_locked(guard, master, class, id)? {
+        Some(owner) => Ok(owner),
+        None => resolve_target_file_locked(guard, master, class, None),
     }
 }
 
@@ -246,14 +359,58 @@ fn resolve_explicit_into(parent: &Path, into: &Path) -> anyhow::Result<PathBuf> 
     Ok(normalised)
 }
 
-/// Containment-check an explicit `--into` path for verbs that resolve their
-/// own (non-[`EntityClass`]) target file — the profile-scoped `rewrite` /
-/// `local-dns` inners. Mirrors [`resolve_target_file`]'s `--into` branch so
-/// a caller forwarding operator input (e.g. the TUI) cannot write outside
-/// the config tree.
-pub(crate) fn resolve_explicit_into_under(master: &Path, into: &Path) -> anyhow::Result<PathBuf> {
+/// Preserve the CLI's `--into` spelling checks, then bind the result to the
+/// guarded tree and return its canonical in-root display path.
+pub(crate) fn resolve_explicit_into_under_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    into: &Path,
+) -> anyhow::Result<PathBuf> {
+    guard.verify_master(master)?;
     let parent = master.parent().unwrap_or_else(|| Path::new("."));
-    resolve_explicit_into(parent, into)
+    let spelling = resolve_explicit_into(parent, into)?;
+    Ok(guard
+        .tree_io()
+        .plan_target(&spelling)?
+        .display()
+        .to_path_buf())
+}
+
+fn conventional_candidates_locked(
+    guard: &ConfigWriteLock,
+    class: EntityClass,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let tree = guard.tree_io();
+    let dir_name = class.dir_name(); // include-dir-ok: bounded owner superset
+    let Some(dir) = tree.directory_from(&tree.master_key(), Path::new(dir_name))? else {
+        return Ok(Vec::new());
+    };
+    let mut candidates = BTreeSet::new();
+    for_each_dir_name(&dir, |name| {
+        if Path::new(name).extension() != Some(std::ffi::OsStr::new("toml")) {
+            return Ok(());
+        }
+        if !dir.file_candidate(name)? {
+            return Ok(());
+        }
+        let entry = tree.resolve_in_directory(&dir, name)?;
+        let Some(metadata) = entry.metadata()? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            metadata.is_file() && metadata.nlink() == 1,
+            "managed config member must be a regular file with one link: {}",
+            entry.display().display()
+        );
+        if candidates.insert(entry.display().to_path_buf()) {
+            anyhow::ensure!(
+                candidates.len() <= MAX_INCLUDE_FILES,
+                "config candidate count exceeded hard cap {MAX_INCLUDE_FILES}"
+            );
+        }
+        Ok(())
+    })?;
+    Ok(candidates.into_iter().collect())
 }
 
 /// Enumerate `*.toml` files in a directory (one level deep, no recursion).
@@ -329,7 +486,7 @@ pub fn slug_id(name: &str) -> Result<String, String> {
 /// searched **in addition**, never instead. Two layouts depend on it:
 /// a config that does not currently load (a repair verb still has to find
 /// its target, and the caller's own pre-promote validation —
-/// [`write_value_validated`] — is the real gate on what lands), and a tree
+/// `write_value_validated_locked` — is the real gate on what lands), and a tree
 /// whose `<class>.d/` predates the `includes` line that should declare it.
 /// Dropping the convention would have turned this widening into a
 /// regression for both. That union is the single sanctioned owner-lookup
@@ -374,6 +531,61 @@ pub fn owner_candidate_files(master: &Path, convention_classes: &[EntityClass]) 
         }
     }
     out
+}
+
+/// Descriptor-pinned owner search for guarded mutations.
+///
+/// A broken include graph intentionally contributes no graph members, matching
+/// [`owner_candidate_files`]' repair-path behaviour. Descriptor or path-safety
+/// failures are returned instead of being treated as an empty directory.
+pub(crate) fn owner_candidate_files_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    convention_classes: &[EntityClass],
+) -> anyhow::Result<Vec<PathBuf>> {
+    guard.verify_master(master)?;
+    let tree = guard.tree_io();
+    let master_display = tree.plan_master_target()?.display().to_path_buf();
+
+    let mut convention = BTreeSet::new();
+    for class in convention_classes {
+        for path in conventional_candidates_locked(guard, *class)? {
+            convention.insert(path);
+            anyhow::ensure!(
+                convention.len() < MAX_INCLUDE_FILES,
+                "config candidate count exceeded hard cap {MAX_INCLUDE_FILES}"
+            );
+        }
+    }
+
+    let graph = match load_config_for_schema_under_guard(
+        guard,
+        master,
+        SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(loaded) => loaded.files_loaded,
+        Err(_) => Vec::new(),
+    };
+
+    let mut seen = BTreeSet::new();
+    seen.insert(master_display.clone());
+    let mut out = vec![master_display];
+    for path in convention.into_iter().chain(graph) {
+        // Bind every loader-reported path again before returning it. This
+        // rejects a replaced or escaped member rather than handing a raw path
+        // to a later locked read.
+        let plan = tree.plan_target(&path)?;
+        let display = plan.display().to_path_buf();
+        if seen.insert(display.clone()) {
+            anyhow::ensure!(
+                out.len() < MAX_INCLUDE_FILES,
+                "config candidate count exceeded hard cap {MAX_INCLUDE_FILES}"
+            );
+            out.push(display);
+        }
+    }
+    Ok(out)
 }
 
 /// Locate the TOML file that currently owns an entry of `class` keyed
@@ -456,6 +668,36 @@ pub fn find_target_for_id(
                 // outcome when the operator splits entities across
                 // multiple `*.d/` files.
             }
+        }
+    }
+    Ok(None)
+}
+
+/// Descriptor-pinned form of [`find_target_for_id`] for guarded mutations.
+pub(crate) fn find_target_for_id_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    class: EntityClass,
+    id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    guard.verify_master(master)?;
+    for path in owner_candidate_files_locked(guard, master, &[class])? {
+        // Existing owner lookup deliberately skips unreadable or malformed
+        // members so a repair can still find another candidate. The final
+        // guarded overlay validation remains the mutation gate.
+        let Ok((value, _)) = read_or_empty_locked(guard, master, &path) else {
+            continue;
+        };
+        match value.get(class.toml_key()) {
+            Some(Value::Array(arr))
+                if arr
+                    .iter()
+                    .any(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)) =>
+            {
+                return Ok(Some(path));
+            }
+            Some(Value::Table(table)) if table.contains_key(id) => return Ok(Some(path)),
+            _ => {}
         }
     }
     Ok(None)
@@ -593,6 +835,51 @@ pub fn read_or_empty(path: &Path) -> anyhow::Result<(Value, Option<String>)> {
     Ok((value, Some(raw)))
 }
 
+/// Read a member through the held tree descriptor. Missing members retain the
+/// legacy empty-table result; existing members must be pinned regular files.
+pub(crate) fn read_or_empty_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    path: &Path,
+) -> anyhow::Result<(Value, Option<String>)> {
+    let (raw, display) = read_raw_or_empty_locked(guard, master, path)?;
+    let Some(raw) = raw else {
+        return Ok((Value::Table(Default::default()), None));
+    };
+    let value = raw
+        .parse()
+        .with_context(|| format!("{} is not valid TOML", display.display()))?;
+    Ok((value, Some(raw)))
+}
+
+/// Read a member through the held tree descriptor without parsing it.
+///
+/// This lets callers that scan optional repair candidates account for the
+/// raw bytes before deciding whether to parse another member.
+pub(crate) fn read_raw_or_empty_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    path: &Path,
+) -> anyhow::Result<(Option<String>, PathBuf)> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_target(path)?;
+    let display = plan.display().to_path_buf();
+    Ok((plan.read_original()?, display))
+}
+
+/// Read at most `max_bytes + 1` bytes from a descriptor-pinned member.
+pub(crate) fn read_raw_capped_locked(
+    guard: &ConfigWriteLock,
+    master: &Path,
+    path: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<(CappedRead, PathBuf)> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_target(path)?;
+    let display = plan.display().to_path_buf();
+    Ok((plan.read_original_capped(max_bytes)?, display))
+}
+
 /// Find or insert an id-keyed entry inside an array-of-tables. Returns
 /// `true` if a new entry was created, `false` if an existing one was
 /// replaced.
@@ -691,30 +978,24 @@ pub fn remove_profile(doc: &mut Value, profile_id: &str) -> anyhow::Result<bool>
 }
 
 /// Restore `path` to `original_content`, or remove it when the file did not
-/// exist before our write. Used by [`write_values_validated`]'s compound
+/// exist before our write. Used by `write_values_validated_locked`'s compound
 /// mid-sequence I/O-failure rollback (the cross-reference check already passed
 /// for the whole batch, so a TOML round-trip on the restored bytes suffices).
-fn revert(path: &Path, original_content: Option<&str>) -> anyhow::Result<()> {
+fn revert(target: &PinnedTarget<'_>, original_content: Option<&str>) -> anyhow::Result<()> {
+    let target = target.rollback_target()?;
     match original_content {
-        // Restore previously-known-good bytes through the hardened
-        // atomic-write helper. The bytes were valid before the
-        // edit, so a lightweight `toml::Value` round-trip is sufficient
-        // — a full v1 loader pass would re-resolve includes and could
-        // spuriously fail mid-revert if a sibling slice changed.
-        Some(content) => {
-            atomic_write_and_validate(path, content, |staged: &Path| -> Result<(), String> {
-                let raw = std::fs::read_to_string(staged).map_err(|e| e.to_string())?;
-                raw.parse::<Value>().map(|_| ()).map_err(|e| e.to_string())
-            })
-            .map_err(|e| anyhow::anyhow!("{e}"))
-        }
-        None => {
-            if path.exists() {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("cannot remove {}", path.display()))?;
-            }
-            Ok(())
-        }
+        Some(content) => write_slice_syntax_checked(&target, content).map_err(Into::into),
+        None => Ok(target.unlink()?),
+    }
+}
+
+/// Historical migration rollback restores the captured bytes verbatim.  The
+/// replaced config may intentionally be malformed or from an older schema.
+fn revert_raw(target: &PinnedTarget<'_>, original_content: Option<&str>) -> anyhow::Result<()> {
+    let target = target.rollback_target()?;
+    match original_content {
+        Some(content) => write_slice_raw(&target, content).map_err(Into::into),
+        None => Ok(target.unlink()?),
     }
 }
 
@@ -730,37 +1011,281 @@ fn revert(path: &Path, original_content: Option<&str>) -> anyhow::Result<()> {
 
 /// One staged write in a (possibly compound) mutation: the destination and the
 /// exact bytes to land there.
-pub struct StagedWrite {
-    pub final_path: PathBuf,
-    pub content: String,
+pub(crate) struct StagedWrite {
+    pub(crate) final_path: PathBuf,
+    pub(crate) content: String,
 }
 
-/// Serialise + validate-then-promote a single slice. Full cross-reference
-/// validation against {master + every include + this staged slice} runs
-/// BEFORE the rename; on failure nothing is written and the error names every
-/// validator complaint. Drop-in replacement for the `write_value` +
-/// `validate_or_revert` two-step at single-file mutation seats.
-pub fn write_value_validated(
+/// A staged write bound to the exact tree entry observed under the write
+/// guard. Keeping the plan and before-image together prevents a later path
+/// walk from accepting a replacement that appeared after preparation.
+struct PreparedWrite<'g> {
+    plan: TargetPlan<'g>,
+    before_image: Option<String>,
+    content: String,
+}
+
+/// A single config slice whose final bytes have passed the full overlay load.
+///
+/// This deliberately has no general "stage arbitrary members" surface: the
+/// import-local transaction needs to validate one already-reachable document,
+/// publish its body, then commit that exact prepared config write.
+pub(crate) struct PreparedValidatedSingleWrite<'g> {
+    target: PinnedTarget<'g>,
+    before_image: Option<String>,
+    content: String,
+}
+
+/// How far a failed prevalidated config commit got after its companion body
+/// was published. Import-local reports this state while retaining the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigCommitDisposition {
+    Untouched,
+    RestoredDurably,
+    Uncertain,
+}
+
+/// A config commit error with the recovery state kept machine-readable.
+#[derive(Debug)]
+pub(crate) struct ConfigCommitFailure {
+    disposition: ConfigCommitDisposition,
+    write_error: AtomicWriteError,
+    rollback_error: Option<anyhow::Error>,
+}
+
+impl ConfigCommitFailure {
+    /// Recovery disposition for the caller's already-published companion data.
+    pub(crate) fn disposition(&self) -> ConfigCommitDisposition {
+        self.disposition
+    }
+}
+
+impl std::fmt::Display for ConfigCommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.disposition {
+            ConfigCommitDisposition::Untouched => write!(
+                f,
+                "config commit failed before rename; config is untouched: {}",
+                self.write_error
+            ),
+            ConfigCommitDisposition::RestoredDurably => write!(
+                f,
+                "config commit renamed its target but durable rollback restored the prior config: {}",
+                self.write_error
+            ),
+            ConfigCommitDisposition::Uncertain => write!(
+                f,
+                "config state is uncertain; recovery required: {}{}",
+                self.write_error,
+                self.rollback_error
+                    .as_ref()
+                    .map(|error| format!("; rollback failed: {error:#}"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigCommitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.write_error)
+    }
+}
+
+/// Render, overlay-validate, and pin one existing config member without
+/// promoting it. The caller must later use [`commit_prevalidated_single_write`]
+/// while retaining the same write guard.
+pub(crate) fn prepare_value_validated_single_locked<'g>(
+    guard: &'g crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    final_path: &Path,
+    value: &Value,
+) -> anyhow::Result<PreparedValidatedSingleWrite<'g>> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_target(final_path)?;
+    let resolved = plan.display().to_path_buf();
+    let before_image = plan.read_original()?;
+    let original = before_image.as_deref().unwrap_or_default();
+    let content = super::toml_write::render_preserving(original, value)
+        .with_context(|| format!("serialise {}", resolved.display()))?;
+    prepare_prevalidated_single_locked(guard, master, plan, before_image, content)
+}
+
+/// Overlay-validate and pin one existing config member's exact final bytes
+/// without promoting them.  This keeps editor saves byte-for-byte while
+/// giving their later commit the same typed recovery disposition as rendered
+/// config writes.
+pub(crate) fn prepare_raw_validated_single_locked<'g>(
+    guard: &'g crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    final_path: &Path,
+    content: String,
+) -> anyhow::Result<PreparedValidatedSingleWrite<'g>> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_target(final_path)?;
+    let before_image = plan.read_original()?;
+    prepare_prevalidated_single_locked(guard, master, plan, before_image, content)
+}
+
+fn prepare_prevalidated_single_locked<'g>(
+    guard: &'g crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    plan: TargetPlan<'g>,
+    before_image: Option<String>,
+    content: String,
+) -> anyhow::Result<PreparedValidatedSingleWrite<'g>> {
+    let prepared = PreparedWrite {
+        plan,
+        before_image,
+        content,
+    };
+    validate_prepared_locked(guard, master, std::slice::from_ref(&prepared))?;
+    let PreparedWrite {
+        plan,
+        before_image,
+        content,
+    } = prepared;
+    Ok(PreparedValidatedSingleWrite {
+        target: plan.materialize()?,
+        before_image,
+        content,
+    })
+}
+
+/// Commit one previously overlay-validated slice. A post-rename write failure
+/// is rolled back through the retained promoted inode before its disposition is
+/// returned to the enclosing body+config transaction.
+pub(crate) fn commit_prevalidated_single_write(
+    prepared: PreparedValidatedSingleWrite<'_>,
+) -> Result<(), ConfigCommitFailure> {
+    commit_prevalidated_single_write_with_ops(prepared, write_slice_syntax_checked, revert)
+}
+
+/// Operation-injected form used by import-local transaction tests. The fault
+/// closures are scoped to this call rather than installed process-wide.
+#[cfg(test)]
+pub(crate) fn commit_prevalidated_single_write_with_ops<W, R>(
+    prepared: PreparedValidatedSingleWrite<'_>,
+    write: W,
+    rollback: R,
+) -> Result<(), ConfigCommitFailure>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    commit_prevalidated_single_write_inner(prepared, write, rollback)
+}
+
+#[cfg(not(test))]
+fn commit_prevalidated_single_write_with_ops<W, R>(
+    prepared: PreparedValidatedSingleWrite<'_>,
+    write: W,
+    rollback: R,
+) -> Result<(), ConfigCommitFailure>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    commit_prevalidated_single_write_inner(prepared, write, rollback)
+}
+
+fn commit_prevalidated_single_write_inner<W, R>(
+    prepared: PreparedValidatedSingleWrite<'_>,
+    mut write: W,
+    mut rollback: R,
+) -> Result<(), ConfigCommitFailure>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    let PreparedValidatedSingleWrite {
+        target,
+        before_image,
+        content,
+    } = prepared;
+    #[cfg(test)]
+    crate::config::write_lock::test_event(crate::config::write_lock::TestEvent::BeforePromotion);
+    match write(&target, &content) {
+        Ok(()) => Ok(()),
+        // A descriptor identity recheck is immediately before rename.  If it
+        // fails, another writer may have changed the visible destination, so
+        // claiming the transaction is untouched would authorize unsafe body
+        // cleanup.
+        Err(write_error @ AtomicWriteError::Stat { .. }) => Err(ConfigCommitFailure {
+            disposition: ConfigCommitDisposition::Uncertain,
+            write_error,
+            rollback_error: None,
+        }),
+        Err(write_error) if !write_error.rename_landed() => Err(ConfigCommitFailure {
+            disposition: ConfigCommitDisposition::Untouched,
+            write_error,
+            rollback_error: None,
+        }),
+        Err(write_error) => match rollback(&target, before_image.as_deref()) {
+            Ok(()) => Err(ConfigCommitFailure {
+                disposition: ConfigCommitDisposition::RestoredDurably,
+                write_error,
+                rollback_error: None,
+            }),
+            Err(rollback_error) => Err(ConfigCommitFailure {
+                disposition: ConfigCommitDisposition::Uncertain,
+                write_error,
+                rollback_error: Some(rollback_error),
+            }),
+        },
+    }
+}
+
+/// Serialise + validate-then-promote a single slice while retaining `guard`.
+/// The destination is resolved and read through the pinned tree before its
+/// staged bytes are validated and promoted.
+pub(crate) fn write_value_validated_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
     master: &Path,
     final_path: &Path,
     value: &Value,
 ) -> anyhow::Result<()> {
+    write_value_validated_locked_inner(guard, master, final_path, value, || {})
+}
+
+#[cfg(test)]
+fn write_value_validated_locked_after_prepare(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    final_path: &Path,
+    value: &Value,
+    after_prepare: impl FnOnce(),
+) -> anyhow::Result<()> {
+    write_value_validated_locked_inner(guard, master, final_path, value, after_prepare)
+}
+
+fn write_value_validated_locked_inner(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    final_path: &Path,
+    value: &Value,
+    after_prepare: impl FnOnce(),
+) -> anyhow::Result<()> {
     // Re-read the file we are about to replace so its comments and key
     // order can be carried across the mutation. `read_or_empty` already
     // hands the raw text back to most callers, but not through this
-    // signature — and threading it here would mean touching ~40 call
-    // sites to fix one serialiser. One extra read per CLI mutation is
-    // not a cost anyone can measure; this is not the query path.
-    let original = std::fs::read_to_string(final_path).unwrap_or_default();
-    let content = super::toml_write::render_preserving(&original, value)
-        .with_context(|| format!("serialise {}", final_path.display()))?;
-    promote_validated(
-        master,
-        &[StagedWrite {
-            final_path: final_path.to_path_buf(),
-            content,
-        }],
-    )
+    // signature — and threading it here would mean touching ~40 call sites
+    // to fix one serialiser. Read through the pinned target so a path outside
+    // this guard's tree is refused before touching the filesystem.
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_target(final_path)?;
+    let resolved = plan.display().to_path_buf();
+    let before_image = plan.read_original()?;
+    let original = before_image.as_deref().unwrap_or_default();
+    let content = super::toml_write::render_preserving(original, value)
+        .with_context(|| format!("serialise {}", resolved.display()))?;
+    let prepared = PreparedWrite {
+        plan,
+        before_image,
+        content,
+    };
+    after_prepare();
+    promote_prepared_locked(guard, master, vec![prepared])
 }
 
 /// Validate the COMBINED final state of a multi-file mutation ({master + every
@@ -774,107 +1299,253 @@ pub fn write_value_validated(
 /// (additions: container/row before reference; removals: reference before
 /// row). If a later rename fails for I/O reasons, already-promoted files are
 /// restored from their captured pre-edit bytes before bailing.
-pub fn write_values_validated(master: &Path, writes: &[StagedWrite]) -> anyhow::Result<()> {
-    promote_validated(master, writes)
+pub(crate) fn write_values_validated_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    writes: &[StagedWrite],
+) -> anyhow::Result<()> {
+    promote_validated_locked(guard, master, writes)
 }
 
-/// Shared core for [`write_value_validated`] / [`write_values_validated`].
+/// Publish a historical migration batch under an already-held destination
+/// guard.  Historical output has its own pinned schema contract and must not
+/// inherit the normal CLI mutation policy gate.
+pub(crate) fn write_historical_values_validated_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    writes: &[StagedWrite],
+    historical_schema: u32,
+) -> anyhow::Result<()> {
+    let prepared = prepare_writes(guard, master, writes)?;
+    promote_historical_prepared_locked(guard, master, prepared, historical_schema)
+}
+
+/// Shared core for [`write_value_validated_locked`] /
+/// [`write_values_validated_locked`].
 ///
-/// 1. Build a [`LoaderOverlay`] over every staged `(canonical_path → bytes)`,
-///    keyed with the loader's own [`canonicalize_path`] so the keys match the
-///    canonical paths the loader derives from globs — a raw-path key would
-///    silently miss and let the loader read stale on-disk bytes (a false
-///    pass). A `canonicalize_path` failure is a hard error, never a degraded
-///    key. A path not yet on disk is staged as a `new_file` (extra include
-///    member) so the merged view sees the post-rename file set.
+/// 1. Snapshot held destinations and bind their staged bytes into a
+///    [`LoaderOverlay`]. Every staged document must participate at its planned
+///    destination; new files enter as extra include members.
 /// 2. Run the overlay-aware load once. On failure: nothing is written.
 /// 3. Promote each slice atomically (cross-ref already proven, so the staged
 ///    validator is a cheap TOML round-trip). On a later-rename I/O failure,
 ///    restore the slices already promoted in this batch.
 ///
-/// All four steps run under the tree's exclusive write lock
-/// ([`crate::config::write_lock`]), because step 3's rollback restores the
-/// step-0 snapshot — so without it a concurrent writer's *committed* change to
-/// a shared slice is silently reverted. That module's header carries the
-/// interleaving table and explains why the lock cannot live on the config file
-/// itself.
-fn promote_validated(master: &Path, staged: &[StagedWrite]) -> anyhow::Result<()> {
-    let lock = crate::config::write_lock::acquire(master)?;
-    promote_validated_locked(&lock, master, staged)
-}
-
-/// [`promote_validated`]'s body, callable **only** with the tree's write lock
-/// in hand.
-///
-/// # Why the guard is a parameter this function never reads
-///
-/// The first shape of this was `let _write_lock = acquire(master)?;` at the top
-/// of one function, with a comment warning the next reader not to "simplify" it
-/// to `let _ =` — which drops the guard immediately and leaves every step below
-/// unprotected.
-///
-/// **That warning was measured, and it does not hold.** Mutating the binding to
-/// `let _ =` left all 35 tests in this module green: the lock file is created
-/// either way, and no fast test can separate "held" from "created, then
-/// released" without contending against a real second writer. `#[must_use]`
-/// does not fire on `let _ =` either. The defence was prose, and prose does not
-/// fail a build.
-///
-/// Taking `&ConfigWriteLock` moves the requirement into the type system — this
-/// function cannot be entered without a reference to a **live** guard, so there
-/// is no binding left to get wrong. The parameter is deliberately unused:
-/// possession is the entire contract.
+/// Passing the held guard prevents overlay validation from reacquiring a read lock.
 fn promote_validated_locked(
-    _lock: &crate::config::write_lock::ConfigWriteLock,
+    lock: &crate::config::write_lock::ConfigWriteLock,
     master: &Path,
     staged: &[StagedWrite],
 ) -> anyhow::Result<()> {
-    // 0. Snapshot the pre-edit bytes of every staged path, ONCE.
-    //
-    // Two consumers: the cluster-secondary guard below (which needs to know
-    // what this write CHANGES, not merely what the staged file contains)
-    // and step 3's rollback capture. One read means both see the same
-    // bytes — the tree as it stood
-    // when the operator's command started — instead of two reads straddling a
-    // full config load.
-    let pre_edit: Vec<Option<String>> = staged
+    let prepared = prepare_writes(lock, master, staged)?;
+    promote_prepared_locked(lock, master, prepared)
+}
+
+/// The transaction core with operation parameters kept explicit so tests can
+/// exercise a post-rename write failure and an independent rollback failure
+/// without any process-global fault hook.
+#[cfg(test)]
+fn promote_validated_locked_with_ops<W, R>(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    staged: &[StagedWrite],
+    write: W,
+    rollback: R,
+) -> anyhow::Result<()>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    let prepared = prepare_writes(lock, master, staged)?;
+    promote_prepared_locked_with_ops(lock, master, prepared, write, rollback)
+}
+
+fn prepare_writes<'g>(
+    lock: &'g crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    staged: &[StagedWrite],
+) -> anyhow::Result<Vec<PreparedWrite<'g>>> {
+    let master = guarded_master_locked(lock, master)?;
+    let tree = lock.tree_io();
+    let mut keys = BTreeSet::new();
+    staged
         .iter()
-        .map(|w| {
-            let path = w.final_path.as_path();
-            if path.exists() {
-                std::fs::read_to_string(path)
-                    .map(Some)
-                    .with_context(|| format!("snapshot {} before write", path.display()))
+        .map(|write| {
+            let plan = if master.matches_path(lock, &write.final_path)? {
+                tree.plan_master_target()?
             } else {
-                Ok(None)
-            }
+                tree.plan_target(&write.final_path)?
+            };
+            anyhow::ensure!(
+                keys.insert(plan.key().clone()),
+                "duplicate staged config member: {}",
+                plan.display().display()
+            );
+            Ok(PreparedWrite {
+                before_image: plan.read_original()?,
+                plan,
+                content: write.content.clone(),
+            })
         })
-        .collect::<anyhow::Result<_>>()?;
+        .collect()
+}
 
-    // 0b. A cluster secondary is read-only for policy.
-    refuse_policy_write_on_a_cluster_secondary(master, staged, &pre_edit)?;
+fn promote_prepared_locked(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: Vec<PreparedWrite<'_>>,
+) -> anyhow::Result<()> {
+    promote_prepared_locked_with_ops(lock, master, prepared, write_slice_syntax_checked, revert)
+}
 
-    // 1. Build the overlay.
-    let mut overlay = LoaderOverlay::default();
-    for w in staged {
-        let path = w.final_path.as_path();
-        let new_file = !path.exists();
-        if new_file {
-            // Mirror the hardened writer's own mkdir so a brand-new slice in a
-            // not-yet-existing dir both canonicalises and (later) writes.
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create parent dir for {}", path.display()))?;
+fn promote_historical_prepared_locked(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: Vec<PreparedWrite<'_>>,
+    historical_schema: u32,
+) -> anyhow::Result<()> {
+    validate_historical_prepared_locked(lock, master, &prepared, historical_schema)?;
+    promote_prepared_after_validation_with_ops(lock, prepared, write_slice_raw, revert_raw)
+}
+
+#[cfg(test)]
+fn promote_historical_prepared_locked_with_ops<W, R>(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    staged: &[StagedWrite],
+    historical_schema: u32,
+    write: W,
+    rollback: R,
+) -> anyhow::Result<()>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    let prepared = prepare_writes(lock, master, staged)?;
+    validate_historical_prepared_locked(lock, master, &prepared, historical_schema)?;
+    promote_prepared_after_validation_with_ops(lock, prepared, write, rollback)
+}
+
+fn promote_prepared_locked_with_ops<W, R>(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: Vec<PreparedWrite<'_>>,
+    write: W,
+    rollback: R,
+) -> anyhow::Result<()>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    validate_prepared_locked(lock, master, &prepared)?;
+    promote_prepared_after_validation_with_ops(lock, prepared, write, rollback)
+}
+
+/// Publish a batch whose final overlay has already been validated by the
+/// caller's explicit contract.
+fn promote_prepared_after_validation_with_ops<W, R>(
+    _lock: &crate::config::write_lock::ConfigWriteLock,
+    prepared: Vec<PreparedWrite<'_>>,
+    mut write: W,
+    mut rollback: R,
+) -> anyhow::Result<()>
+where
+    W: FnMut(&PinnedTarget<'_>, &str) -> Result<(), AtomicWriteError>,
+    R: FnMut(&PinnedTarget<'_>, Option<&str>) -> anyhow::Result<()>,
+{
+    // 3. Promote each slice atomically, rolling back from the step-0 snapshot.
+    let prepared_targets = prepared
+        .into_iter()
+        .map(|write| {
+            let PreparedWrite {
+                plan,
+                before_image,
+                content,
+            } = write;
+            Ok((plan.materialize()?, before_image, content))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    #[cfg(test)]
+    crate::config::write_lock::test_event(crate::config::write_lock::TestEvent::BeforePromotion);
+    let mut promoted: Vec<(&PinnedTarget<'_>, Option<String>)> =
+        Vec::with_capacity(prepared_targets.len());
+    for (target, before_image, content) in &prepared_targets {
+        let path = target.display();
+        let before_image = before_image.clone();
+        match write(target, content) {
+            Ok(()) => promoted.push((target, before_image)),
+            Err(write_err) => {
+                let mut rollback_errs = Vec::new();
+                let rename_landed = write_err.rename_landed();
+                if rename_landed {
+                    if let Err(re) = rollback(target, before_image.as_deref()) {
+                        rollback_errs.push(format!("{}: {re}", path.display()));
+                    }
+                }
+                for (done_path, original) in promoted.iter().rev() {
+                    if let Err(re) = rollback(done_path, original.as_deref()) {
+                        rollback_errs.push(format!("{}: {re}", done_path.display().display()));
+                    }
+                }
+                if rollback_errs.is_empty() {
+                    let recovered = if rename_landed {
+                        format!(
+                            "write {} renamed the target but parent-directory durability is unconfirmed; current and {} earlier slice(s) in this change were rolled back",
+                            path.display(),
+                            promoted.len()
+                        )
+                    } else {
+                        format!(
+                            "write {} failed before its rename; {} earlier slice(s) in this change were rolled back",
+                            path.display(),
+                            promoted.len()
+                        )
+                    };
+                    return Err(anyhow::Error::new(write_err).context(recovered));
+                }
+                let disposition = if rename_landed {
+                    "renamed the target but parent-directory durability is unconfirmed"
+                } else {
+                    "failed before its rename"
+                };
+                return Err(anyhow::Error::new(write_err).context(format!(
+                    "write {} {}; rollback incomplete and recovery required ({} rollback failure(s)): {}",
+                    path.display(),
+                    disposition,
+                    rollback_errs.len(),
+                    rollback_errs.join("; ")
+                )));
             }
         }
-        let canonical = canonicalize_path(path)
-            .map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", path.display()))?;
-        overlay.stage(canonical, w.content.clone(), new_file);
+    }
+    Ok(())
+}
+
+/// Validate staged config bytes while every destination remains unpromoted.
+fn validate_prepared_locked(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: &[PreparedWrite<'_>],
+) -> anyhow::Result<()> {
+    lock.verify_master(master)?;
+    let tree = lock.tree_io();
+    refuse_policy_write_on_a_cluster_secondary(tree, prepared)?;
+    #[cfg(test)]
+    crate::config::write_lock::test_event(crate::config::write_lock::TestEvent::BeforeOverlay);
+    let mut overlay = LoaderOverlay::default();
+    for write in prepared {
+        overlay.stage_plan(&write.plan, write.content.clone())?;
     }
 
     // 2. Validate the would-be-merged tree once, before promoting anything.
     let now = time::OffsetDateTime::now_utc();
-    if let Err(errs) = load_config_with_overlay(master, now, Some(&overlay)) {
+    if let Err(errs) = load_config_with_overlay_for_schema_under_guard(
+        lock,
+        master,
+        crate::config::schema::SCHEMA_VERSION_V1,
+        now,
+        Some(&overlay),
+    ) {
         // Errors first, boilerplate last. The TUI renders this string in a
         // fixed 2-row band (~105 usable cells after its own prefixes) and
         // ellipsises the rest, so any preamble is paid for in operator
@@ -893,36 +1564,44 @@ fn promote_validated_locked(
         }
         bail!(msg);
     }
+    Ok(())
+}
 
-    // 3. Promote each slice atomically, rolling back from the step-0 snapshot.
-    let mut promoted: Vec<(&Path, Option<String>)> = Vec::with_capacity(staged.len());
-    for (w, pre_edit) in staged.iter().zip(&pre_edit) {
-        let path = w.final_path.as_path();
-        let pre_edit = pre_edit.clone();
-        match write_slice_syntax_checked(path, &w.content) {
-            Ok(()) => promoted.push((path, pre_edit)),
-            Err(e) => {
-                let mut rollback_errs = Vec::new();
-                for (done_path, original) in promoted.iter().rev() {
-                    if let Err(re) = revert(done_path, original.as_deref()) {
-                        rollback_errs.push(format!("{}: {re}", done_path.display()));
-                    }
-                }
-                if rollback_errs.is_empty() {
-                    return Err(e.context(format!(
-                        "write {} failed; earlier slices in this change were rolled back",
-                        path.display()
-                    )));
-                }
-                return Err(e.context(format!(
-                    "write {} failed AND rollback of {} earlier slice(s) failed: {}",
-                    path.display(),
-                    rollback_errs.len(),
-                    rollback_errs.join("; ")
-                )));
-            }
-        }
+/// Validate a historical migration's exact final overlay.  New members are
+/// admitted only when an include can reach them; unlike normal entity writes,
+/// no cluster-secondary mutation policy is applied here.
+fn validate_historical_prepared_locked(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: &[PreparedWrite<'_>],
+    historical_schema: u32,
+) -> anyhow::Result<()> {
+    lock.verify_master(master)?;
+    #[cfg(test)]
+    crate::config::write_lock::test_event(crate::config::write_lock::TestEvent::BeforeOverlay);
+    let mut overlay = LoaderOverlay::default();
+    for write in prepared {
+        overlay.stage_plan_reachable_only(&write.plan, write.content.clone())?;
     }
+    let now = time::OffsetDateTime::now_utc();
+    match load_config_with_overlay_for_schema_under_guard(
+        lock,
+        master,
+        historical_schema,
+        now,
+        Some(&overlay),
+    ) {
+        Ok(_) => {}
+        Err(errs) => {
+            let mut msg =
+                format!("historical schema {historical_schema} validation failed; nothing written");
+            for error in &errs {
+                msg.push_str("\n  - ");
+                msg.push_str(&error.to_string());
+            }
+            bail!(msg);
+        }
+    };
     Ok(())
 }
 
@@ -965,7 +1644,7 @@ fn promote_validated_locked(
 ///
 /// **The word order is load-bearing.** This error reaches the TUI's fixed
 /// 2-row band (~105 usable cells, ellipsised past that — see the note on the
-/// `bail!` in `promote_validated` and the incident it records; plain backticks
+/// `bail!` in `promote_validated_locked` and the incident it records; plain backticks
 /// because this const is `pub` and that fn is private, so an intra-doc link
 /// here breaks the docs built without `--document-private-items`). The
 /// actionable half — that the edit belongs on the primary, and the primary's
@@ -1015,11 +1694,10 @@ pub const CLUSTER_PEER_UNSET: &str = "`cluster.peer` unset";
 ///   only `get_mut("server")` in the CLI is `migrate.rs`), so the hole is
 ///   known and currently unreachable rather than unnoticed.
 fn refuse_policy_write_on_a_cluster_secondary(
-    master: &Path,
-    staged: &[StagedWrite],
-    pre_edit: &[Option<String>],
+    tree: TreeIo<'_>,
+    prepared: &[PreparedWrite<'_>],
 ) -> anyhow::Result<()> {
-    let Some(cluster) = cluster_section_in_effect(master, staged) else {
+    let Some(cluster) = cluster_section_in_effect(tree, prepared) else {
         return Ok(());
     };
     // Mirrors `validator::policy_arrives_from_a_primary`. `enabled` is the
@@ -1031,9 +1709,9 @@ fn refuse_policy_write_on_a_cluster_secondary(
     }
 
     let mut sections = BTreeSet::new();
-    for (w, before) in staged.iter().zip(pre_edit) {
+    for write in prepared {
         sections.extend(
-            changed_top_level_keys(before.as_deref(), &w.content)
+            changed_top_level_keys(write.before_image.as_deref(), &write.content)
                 .into_iter()
                 .filter(|k| is_replicated_policy_section(k)),
         );
@@ -1061,7 +1739,7 @@ fn refuse_policy_write_on_a_cluster_secondary(
 /// staged writes (the `.d`-less fallback layout restages it wholesale), and
 /// from disk otherwise. `None` when the master is unreadable, unparseable, or
 /// declares no `[cluster]` — in the first two cases the load in
-/// [`promote_validated`] reports the real syntax error a paragraph later, and
+/// [`promote_validated_locked`] reports the real syntax error a paragraph later, and
 /// a refusal here would name the wrong cause.
 ///
 /// *Known residual:* a `[cluster]` declared in an INCLUDE rather than the
@@ -1072,28 +1750,24 @@ fn refuse_policy_write_on_a_cluster_secondary(
 /// Resolving it properly
 /// would mean re-implementing the loader's include walk, and two
 /// implementations of one rule drift.
-fn cluster_section_in_effect(master: &Path, staged: &[StagedWrite]) -> Option<ClusterConfig> {
-    let staged_master = staged
+fn cluster_section_in_effect(
+    tree: TreeIo<'_>,
+    prepared: &[PreparedWrite<'_>],
+) -> Option<ClusterConfig> {
+    let staged_master = prepared
         .iter()
-        .find(|w| same_file(&w.final_path, master))
-        .map(|w| w.content.clone());
+        .find(|write| write.plan.key() == &tree.master_key())
+        .map(|write| write.content.clone());
     let raw = match staged_master {
         Some(content) => content,
-        None => std::fs::read_to_string(master).ok()?,
+        None => tree.plan_master_target().ok()?.read_original().ok()??,
     };
     let table = raw.parse::<Value>().ok()?;
-    let section = table.get("cluster")?;
-    section.clone().try_into::<ClusterConfig>().ok()
-}
-
-/// Do these two paths denote the same file? Canonical comparison when both
-/// resolve, raw comparison otherwise — a path that cannot be canonicalised is
-/// not yet on disk, and a brand-new slice is never the master.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (canonicalize_path(a), canonicalize_path(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
+    table
+        .get("cluster")?
+        .clone()
+        .try_into::<ClusterConfig>()
+        .ok()
 }
 
 /// Top-level TOML keys whose value differs between the pre-edit bytes and the
@@ -1142,14 +1816,66 @@ fn is_replicated_policy_section(key: &str) -> bool {
 
 /// Promote one slice through the hardened atomic writer with a syntax-only
 /// staged validator. The cross-reference check already passed for the whole
-/// batch in [`promote_validated`], so this only guards against a serialise bug
+/// batch in [`promote_validated_locked`], so this only guards against a serialise bug
 /// producing non-round-trippable TOML. RAWFS-compliant (hardened atomic write).
-fn write_slice_syntax_checked(path: &Path, content: &str) -> anyhow::Result<()> {
-    atomic_write_and_validate(path, content, |staged: &Path| -> Result<(), String> {
-        let raw = std::fs::read_to_string(staged).map_err(|e| e.to_string())?;
+fn write_slice_syntax_checked(
+    path: &PinnedTarget<'_>,
+    content: &str,
+) -> Result<(), AtomicWriteError> {
+    write_slice_syntax_checked_with_opts(path, content, AtomicWriteAtOpts::default())
+}
+
+/// Write already overlay-validated historical bytes without imposing a TOML
+/// parser on either publication or compensating rollback.
+fn write_slice_raw(path: &PinnedTarget<'_>, content: &str) -> Result<(), AtomicWriteError> {
+    write_slice_raw_with_opts(path, content, AtomicWriteAtOpts::default())
+}
+
+fn write_slice_raw_with_opts(
+    path: &PinnedTarget<'_>,
+    content: &str,
+    write_opts: AtomicWriteAtOpts<'_>,
+) -> Result<(), AtomicWriteError> {
+    hardened_atomic_write_at(
+        path,
+        content.as_bytes(),
+        AtomicWriteAtOpts {
+            validator: None,
+            mode: write_opts.mode,
+            owner: write_opts.owner,
+            fsync_parent: write_opts.fsync_parent,
+            #[cfg(test)]
+            test_failure: write_opts.test_failure,
+        },
+    )
+}
+
+/// Syntax-only staged write with caller-supplied write options. Keeping this
+/// typed helper beneath the transaction boundary lets it classify the sole
+/// failure that occurs after rename before adding `anyhow` display context.
+fn write_slice_syntax_checked_with_opts(
+    path: &PinnedTarget<'_>,
+    content: &str,
+    write_opts: AtomicWriteAtOpts<'_>,
+) -> Result<(), AtomicWriteError> {
+    let syntax_check = |mut staged: &std::fs::File, _display: &Path| -> Result<(), String> {
+        use std::io::Read;
+        let mut raw = String::new();
+        staged.read_to_string(&mut raw).map_err(|e| e.to_string())?;
         raw.parse::<Value>().map(|_| ()).map_err(|e| e.to_string())
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    hardened_atomic_write_at(
+        path,
+        content.as_bytes(),
+        AtomicWriteAtOpts {
+            validator: Some(&syntax_check),
+            mode: write_opts.mode,
+            owner: write_opts.owner,
+            fsync_parent: write_opts.fsync_parent,
+            #[cfg(test)]
+            test_failure: write_opts.test_failure,
+        },
+    )
 }
 
 /// Longest-prefix length of a parsed CIDR, for subnet match tie-breaking.

@@ -3,9 +3,9 @@
 //! The flow avoids the legacy `Settings::from_file` + `write_config`
 //! pipeline, which could corrupt the master config:
 //!
-//! 1. Load the master via [`loader::load_config`] so the current v1 tree
-//!    is validated before anything mutates.
-//! 2. Read the master as a format-preserving document and mutate only the
+//! 1. Claim the config tree, then load the master through that guard so the
+//!    current v1 tree is validated before anything mutates.
+//! 2. Read the master through the guarded target writer and mutate only the
 //!    `[api].token_hash` field — every other top-level section (`includes`,
 //!    `[[blocklists]]`, `[profiles.*]`, `[[devices]]`, etc.) is preserved,
 //!    along with its comments and key order.
@@ -14,11 +14,9 @@
 //!    `toml::Value` + `toml::to_string_pretty` deletes every comment in
 //!    the file and re-sorts it, and the master is the most comment-dense
 //!    file on a real install.
-//! 3. Write atomically via
-//!    [`crate::config::atomic_write::atomic_write_and_validate`] with the
-//!    full v1 loader as the validator. If the mutation produces anything
-//!    the daemon could not boot, the rename never happens and the live
-//!    master on disk is unchanged.
+//! 3. Validate and promote through the guarded target writer. If the mutation
+//!    produces anything the daemon could not boot, the rename never happens
+//!    and the live master on disk is unchanged.
 //! 4. Save the new plaintext to `~/.config/purge-warden/token`
 //!    (`save_token_at`, mode `0600`).
 //! 5. (regenerate only) Send `IpcCommand::Reload` to the daemon
@@ -32,13 +30,21 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+use toml_edit::DocumentMut;
+
 use crate::auth::token::generate_token;
-use crate::config::atomic_write::atomic_write_and_validate;
 use crate::config::error::ConfigError;
 use crate::config::loader;
+use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 use crate::ipc::auth_token::{load_token_at, save_token_at};
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
+
+use super::target::{
+    commit_prevalidated_single_write, prepare_raw_validated_single_locked, read_or_empty_locked,
+};
 
 /// Generate a new API token. Fails if one already exists in the v1 master.
 ///
@@ -62,17 +68,23 @@ pub async fn run_generate(
     token_path: &Path,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = loader::load_config(config_path, now).map_err(format_load_errs)?;
+    let plaintext = {
+        let guard = acquire_for_write(config_path)?;
+        let loaded =
+            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+                .map_err(format_load_errs)?;
 
-    if loaded.config.api.token_hash.is_some() {
-        anyhow::bail!("token already exists. Use `warden token regenerate` to replace it.");
-    }
+        if loaded.config.api.token_hash.is_some() {
+            anyhow::bail!("token already exists. Use `warden token regenerate` to replace it.");
+        }
 
-    let (plaintext, hash) = generate_token();
+        let (plaintext, hash) = generate_token();
 
-    write_token_hash_to_master(config_path, &hash, now)?;
+        write_token_hash_to_master(&guard, config_path, &hash)?;
+        plaintext
+    };
 
-    let saved_path = match save_token_at(token_path, &plaintext) {
+    let saved_path = match save_token_after_master_write(token_path, &plaintext) {
         Ok(()) => Some(token_path.to_path_buf()),
         Err(e) => {
             println!("Warning: could not save token to disk: {e}");
@@ -118,18 +130,25 @@ pub async fn run_regenerate(
     token_path: &Path,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let _loaded = loader::load_config(config_path, now).map_err(format_load_errs)?;
 
     // Snapshot the old plaintext BEFORE mutation. Needed to authenticate
     // the post-write Reload — the daemon still has the old hash in
     // memory until it actually reloads.
     let old_plaintext = load_token_at(token_path).ok().flatten();
 
-    let (plaintext, hash) = generate_token();
+    let plaintext = {
+        let guard = acquire_for_write(config_path)?;
+        let _loaded =
+            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+                .map_err(format_load_errs)?;
 
-    write_token_hash_to_master(config_path, &hash, now)?;
+        let (plaintext, hash) = generate_token();
 
-    let saved_path = match save_token_at(token_path, &plaintext) {
+        write_token_hash_to_master(&guard, config_path, &hash)?;
+        plaintext
+    };
+
+    let saved_path = match save_token_after_master_write(token_path, &plaintext) {
         Ok(()) => Some(token_path.to_path_buf()),
         Err(e) => {
             println!("Warning: could not save token to disk: {e}");
@@ -180,6 +199,46 @@ pub async fn run_regenerate(
     Ok(())
 }
 
+#[cfg(test)]
+type SidecarSaveHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+std::thread_local! {
+    static SIDECAR_SAVE_HOOK: std::cell::RefCell<Option<SidecarSaveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn sidecar_save_event() {
+    SIDECAR_SAVE_HOOK.with(|slot| {
+        let Some(mut hook) = slot.borrow_mut().take() else {
+            return;
+        };
+        hook();
+        *slot.borrow_mut() = Some(hook);
+    });
+}
+
+#[cfg(test)]
+fn with_sidecar_save_hook<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+    struct Reset(Option<SidecarSaveHook>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SIDECAR_SAVE_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    let _reset = Reset(SIDECAR_SAVE_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    body()
+}
+
+fn save_token_after_master_write(path: &Path, plaintext: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    sidecar_save_event();
+    save_token_at(path, plaintext)
+}
+
 /// Result of the post-regenerate IPC reload attempt.
 enum ReloadOutcome {
     /// Daemon acknowledged the reload — new hash is live.
@@ -228,39 +287,28 @@ async fn attempt_ipc_reload(socket_path: &Path, old_plaintext: Option<&str>) -> 
     }
 }
 
-/// Mutate `[api].token_hash` in the master file and atomically write it
-/// back, validating the result through the full v1 loader.
+/// Mutate `[api].token_hash` in the master file and validate/promote it through
+/// the held config-tree guard.
 ///
 /// Every other top-level section survives the round-trip **including its
-/// comments and key order**, because the edit goes through
-/// [`super::toml_write`] on a format-preserving document.
-///
-/// This doc comment used to claim the sections survived "byte-for-byte"
-/// while the code round-tripped through `toml::to_string_pretty`, which
-/// has no representation for a comment and emits its own key order. The
-/// claim was false, and it was the reason the defect survived: anyone
-/// looking for exactly this bug would have read that line and moved on.
+/// comments and key order**, because only the target item is changed in the
+/// original format-preserving document.
 fn write_token_hash_to_master(
+    guard: &ConfigWriteLock,
     config_path: &Path,
     new_hash: &str,
-    now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
-    let content = super::toml_write::edit_document(config_path, |doc| {
-        super::toml_write::table_mut(doc, "api")?
-            .insert("token_hash", toml_edit::value(new_hash.to_string()));
-        Ok(())
-    })?;
-
-    atomic_write_and_validate(
-        config_path,
-        &content,
-        |staged: &Path| -> Result<(), String> {
-            loader::load_config(staged, now)
-                .map(|_| ())
-                .map_err(format_errs_flat)
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    let (_, raw) = read_or_empty_locked(guard, config_path, config_path)?;
+    let raw = raw.ok_or_else(|| anyhow::anyhow!("cannot read {}", config_path.display()))?;
+    let mut doc = raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("cannot parse {} as TOML", config_path.display()))?;
+    super::toml_write::table_mut(&mut doc, "api")?
+        .insert("token_hash", toml_edit::value(new_hash.to_string()));
+    let prepared =
+        prepare_raw_validated_single_locked(guard, config_path, config_path, doc.to_string())?;
+    commit_prevalidated_single_write(prepared)?;
+    Ok(())
 }
 
 fn format_load_errs(errs: Vec<ConfigError>) -> anyhow::Error {
@@ -283,12 +331,14 @@ pub(crate) fn format_errs_flat(errs: Vec<ConfigError>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::target::write_value_validated_locked;
     use super::*;
+    use toml::Value;
 
     /// Full v1 master covering every section that a legacy writer used to
     /// silently drop. The regenerate round-trip must preserve each one
     /// byte-for-byte on disk.
-    const FULL_V1_MASTER: &str = r#"schema_version = 3
+    const FULL_V1_MASTER: &str = r#"schema_version = 4
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -335,6 +385,84 @@ servers = ["192.0.2.1:53"]
         path
     }
 
+    /// Model a peer writer changing the master while it owns the same tree.
+    /// The token commands must load this post-lock state rather than overwrite
+    /// it from a read that happened before their acquisition.
+    fn peer_updates_master(
+        guard: &ConfigWriteLock,
+        master: &Path,
+        token_hash: Option<&str>,
+        default_blocked_ttl_secs: i64,
+    ) {
+        let (mut doc, _) = read_or_empty_locked(guard, master, master).unwrap();
+        let root = doc.as_table_mut().unwrap();
+        let server = root
+            .get_mut("server")
+            .and_then(Value::as_table_mut)
+            .unwrap();
+        server.insert(
+            "default_blocked_ttl_secs".to_string(),
+            Value::Integer(default_blocked_ttl_secs),
+        );
+        if let Some(token_hash) = token_hash {
+            root.get_mut("api")
+                .and_then(Value::as_table_mut)
+                .unwrap()
+                .insert(
+                    "token_hash".to_string(),
+                    Value::String(token_hash.to_string()),
+                );
+        }
+        write_value_validated_locked(guard, master, master, &doc).unwrap();
+    }
+
+    fn block_until_contended(receiver: &std::sync::mpsc::Receiver<()>, operation: &str) {
+        use std::time::Duration;
+
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("{operation} did not contend before loading: {error}"));
+    }
+
+    fn assert_sidecar_save_follows_released_guard(
+        operation: &'static str,
+        config_path: &Path,
+        run: impl FnOnce() -> anyhow::Result<()>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let reached_save = Arc::new(AtomicBool::new(false));
+        let reached_save_hook = Arc::clone(&reached_save);
+        let config_path = config_path.to_path_buf();
+        with_sidecar_save_hook(
+            move || {
+                reached_save_hook.store(true, Ordering::SeqCst);
+                let probe = crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        assert_ne!(
+                            event,
+                            crate::config::write_lock::TestEvent::Contended,
+                            "{operation} retained the config-tree guard through sidecar save"
+                        );
+                    },
+                    || {
+                        acquire_for_write(&config_path)
+                            .expect("sidecar save must follow a released config-tree guard")
+                    },
+                );
+                drop(probe);
+            },
+            || run().unwrap(),
+        );
+        assert!(
+            reached_save.load(Ordering::SeqCst),
+            "{operation} did not reach the sidecar-save seam"
+        );
+    }
+
     // ── Regenerate on ConfigV1 ─────────────────────────────────────────
 
     #[tokio::test]
@@ -357,7 +485,7 @@ servers = ["192.0.2.1:53"]
         let loaded = loader::load_config(&master, now).expect("master reloads cleanly");
         let cfg = &loaded.config;
 
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
         assert_eq!(cfg.includes.len(), 2);
         assert!(cfg.includes.iter().any(|g| g.contains("devices.d")));
         assert!(cfg.includes.iter().any(|g| g.contains("profiles.d")));
@@ -504,6 +632,7 @@ display_name = "Default"
         let received: Arc<Mutex<Vec<IpcCommand>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = UnixListener::bind(&socket_path).unwrap();
         let received_bg = received.clone();
+        let master_for_server = master.clone();
         let server = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
@@ -514,6 +643,22 @@ display_name = "Default"
                         received_bg.lock().unwrap().push(cmd);
                     }
                 }
+                // This happens while `run_regenerate` awaits the reply. A
+                // contended probe would mean it carried its OS guard into IPC.
+                let probe = crate::config::write_lock::with_test_hook(
+                    |event| {
+                        assert_ne!(
+                            event,
+                            crate::config::write_lock::TestEvent::Contended,
+                            "run_regenerate retained the config-tree guard while awaiting reload"
+                        );
+                    },
+                    || {
+                        acquire_for_write(&master_for_server)
+                            .expect("reload handler must acquire the released config-tree guard")
+                    },
+                );
+                drop(probe);
                 let resp = IpcResponse::Ok {
                     message: "stub acknowledged".into(),
                 };
@@ -621,5 +766,419 @@ display_name = "Default"
             new_hash, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "token_hash must be replaced"
         );
+    }
+
+    #[tokio::test]
+    async fn token_hash_edits_preserve_multiline_scalar_array_comments() {
+        let includes = r#"includes = [
+    "devices.d/*.toml", # device definitions
+    # profile definitions
+    "profiles.d/*.toml",
+]
+"#;
+        let servers = r#"servers = [
+    "192.0.2.1:53", # primary resolver
+    # emergency resolver
+    "192.0.2.2:53",
+]
+"#;
+        let master_text = FULL_V1_MASTER
+            .replace(
+                "includes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n",
+                includes,
+            )
+            .replace("servers = [\"192.0.2.1:53\"]\n", servers);
+        let dir = tmpdir();
+        let master = write_master_to(&dir, &master_text);
+        let token_path = dir.path().join("token");
+        let no_socket = dir.path().join("nope.sock");
+
+        run_generate(&master, &no_socket, &token_path)
+            .await
+            .unwrap();
+        let after_generate = std::fs::read_to_string(&master).unwrap();
+        assert!(after_generate.contains(includes));
+        assert!(after_generate.contains(servers));
+        let generated_hash = after_generate.parse::<Value>().unwrap()["api"]["token_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        run_regenerate(&master, &no_socket, &token_path)
+            .await
+            .unwrap();
+        let after_regenerate = std::fs::read_to_string(&master).unwrap();
+        assert!(after_regenerate.contains(includes));
+        assert!(after_regenerate.contains(servers));
+        let regenerated_hash = after_regenerate.parse::<Value>().unwrap()["api"]["token_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(generated_hash, regenerated_hash);
+    }
+
+    #[test]
+    fn token_sidecar_save_follows_released_config_guard() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let generate_dir = tmpdir();
+        let generate_master = write_master_to(&generate_dir, FULL_V1_MASTER);
+        let generate_token = generate_dir.path().join("token");
+        let generate_socket = generate_dir.path().join("nope.sock");
+        assert_sidecar_save_follows_released_guard("generate", &generate_master, || {
+            runtime.block_on(run_generate(
+                &generate_master,
+                &generate_socket,
+                &generate_token,
+            ))
+        });
+
+        let regenerate_dir = tmpdir();
+        let regenerate_master = write_master_to(&regenerate_dir, FULL_V1_MASTER);
+        let regenerate_token = regenerate_dir.path().join("token");
+        let regenerate_socket = regenerate_dir.path().join("nope.sock");
+        save_token_at(&regenerate_token, "ps_oldplaintext").unwrap();
+        assert_sidecar_save_follows_released_guard("regenerate", &regenerate_master, || {
+            runtime.block_on(run_regenerate(
+                &regenerate_master,
+                &regenerate_socket,
+                &regenerate_token,
+            ))
+        });
+    }
+
+    #[tokio::test]
+    async fn token_operations_refuse_a_migration_fence_before_master_or_sidecar_mutation() {
+        // Generate must hit the acquisition fence before it evaluates the
+        // already-exists condition, or a pre-existing hash would mask the
+        // migration refusal.
+        let generate_dir = tmpdir();
+        let with_token = FULL_V1_MASTER.replace(
+            "[api]\ntoken_hash = \"\"",
+            "[api]\ntoken_hash = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+        );
+        let generate_master = write_master_to(&generate_dir, &with_token);
+        let generate_token = generate_dir.path().join("token");
+        let migration = crate::config::write_lock::acquire_for_migration(&generate_master).unwrap();
+        crate::config::migration_journal::create_fence(&migration).unwrap();
+        drop(migration);
+
+        let generate_err = run_generate(
+            &generate_master,
+            &generate_dir.path().join("nope.sock"),
+            &generate_token,
+        )
+        .await
+        .expect_err("a migration fence must refuse generate");
+        assert!(
+            generate_err.to_string().contains("migration"),
+            "unexpected error: {generate_err:#}"
+        );
+        assert!(
+            !generate_err.to_string().contains("already exists"),
+            "the already-exists check must not run before the fence: {generate_err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&generate_master).unwrap(),
+            with_token
+        );
+        assert!(
+            !generate_token.exists(),
+            "generate must not persist plaintext after a fence refusal"
+        );
+
+        let regenerate_dir = tmpdir();
+        let regenerate_master = write_master_to(&regenerate_dir, FULL_V1_MASTER);
+        let regenerate_token = regenerate_dir.path().join("token");
+        save_token_at(&regenerate_token, "ps_oldplaintext").unwrap();
+        let master_before = std::fs::read(&regenerate_master).unwrap();
+        let token_before = std::fs::read(&regenerate_token).unwrap();
+        let migration =
+            crate::config::write_lock::acquire_for_migration(&regenerate_master).unwrap();
+        crate::config::migration_journal::create_fence(&migration).unwrap();
+        drop(migration);
+
+        let regenerate_err = run_regenerate(
+            &regenerate_master,
+            &regenerate_dir.path().join("nope.sock"),
+            &regenerate_token,
+        )
+        .await
+        .expect_err("a migration fence must refuse regenerate");
+        assert!(
+            regenerate_err.to_string().contains("migration"),
+            "unexpected error: {regenerate_err:#}"
+        );
+        assert_eq!(std::fs::read(&regenerate_master).unwrap(), master_before);
+        assert_eq!(std::fs::read(&regenerate_token).unwrap(), token_before);
+    }
+
+    #[test]
+    fn generate_observes_a_token_and_peer_edit_landed_before_its_acquisition() {
+        let dir = tmpdir();
+        let master = write_master_to(&dir, FULL_V1_MASTER);
+        let token_path = dir.path().join("token");
+        let socket_path = dir.path().join("nope.sock");
+        let held = acquire_for_write(&master).unwrap();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+
+        let result = std::thread::scope(|scope| {
+            let worker_master = master.clone();
+            let worker_token = token_path.clone();
+            let worker_socket = socket_path.clone();
+            let worker = scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || {
+                        runtime.block_on(run_generate(
+                            &worker_master,
+                            &worker_socket,
+                            &worker_token,
+                        ))
+                    },
+                )
+            });
+
+            block_until_contended(&contended_rx, "generate");
+            peer_updates_master(
+                &held,
+                &master,
+                Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                301,
+            );
+            let peer_bytes = std::fs::read(&master).unwrap();
+            drop(held);
+            (worker.join().unwrap(), peer_bytes)
+        });
+
+        let (error, peer_bytes) = result;
+        assert!(error
+            .expect_err("generate must see the peer's token")
+            .to_string()
+            .contains("already exists"));
+        assert_eq!(
+            std::fs::read(&master).unwrap(),
+            peer_bytes,
+            "the stale generate must not lose the peer's unrelated master edit"
+        );
+        assert!(
+            !token_path.exists(),
+            "the rejected stale generate must not save plaintext"
+        );
+    }
+
+    #[test]
+    fn regenerate_preserves_a_peer_edit_landed_before_its_acquisition() {
+        let dir = tmpdir();
+        let master = write_master_to(&dir, FULL_V1_MASTER);
+        let token_path = dir.path().join("token");
+        let socket_path = dir.path().join("nope.sock");
+        save_token_at(&token_path, "ps_oldplaintext").unwrap();
+        let held = acquire_for_write(&master).unwrap();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+
+        let peer_value = std::thread::scope(|scope| {
+            let worker_master = master.clone();
+            let worker_token = token_path.clone();
+            let worker_socket = socket_path.clone();
+            let worker = scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                crate::config::write_lock::with_test_hook(
+                    move |event| {
+                        if event == crate::config::write_lock::TestEvent::Contended {
+                            let _ = contended_tx.send(());
+                        }
+                    },
+                    || {
+                        runtime.block_on(run_regenerate(
+                            &worker_master,
+                            &worker_socket,
+                            &worker_token,
+                        ))
+                    },
+                )
+            });
+
+            block_until_contended(&contended_rx, "regenerate");
+            peer_updates_master(&held, &master, None, 301);
+            let peer_value = std::fs::read_to_string(&master)
+                .unwrap()
+                .parse::<Value>()
+                .unwrap();
+            drop(held);
+            worker.join().unwrap().unwrap();
+            peer_value
+        });
+
+        let after: Value = std::fs::read_to_string(&master).unwrap().parse().unwrap();
+        assert_eq!(
+            after.get("server"),
+            peer_value.get("server"),
+            "regenerate must preserve the peer's unrelated master field"
+        );
+        assert_eq!(
+            after
+                .get("api")
+                .and_then(Value::as_table)
+                .and_then(|api| api.get("token_hash"))
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            64,
+            "regenerate must update only the token hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_through_master_alias_writes_only_in_the_canonical_tree() {
+        let canonical_dir = tmpdir();
+        let master = write_master_to(&canonical_dir, FULL_V1_MASTER);
+        let alias_dir = tmpdir();
+        let alias = alias_dir.path().join("dashboard.toml");
+        std::os::unix::fs::symlink(&master, &alias).unwrap();
+        let token_path = canonical_dir.path().join("token");
+
+        run_generate(&alias, &alias_dir.path().join("nope.sock"), &token_path)
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the alias itself must remain a symlink"
+        );
+        assert_eq!(
+            loader::load_config(&master, time::OffsetDateTime::now_utc())
+                .unwrap()
+                .config
+                .api
+                .token_hash
+                .as_deref()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(
+            !alias_dir.path().join(".warden-config.lock").exists(),
+            "the alias directory must not receive a config lock"
+        );
+        let alias_entries: Vec<_> = std::fs::read_dir(alias_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            alias_entries,
+            vec![std::ffi::OsString::from("dashboard.toml")],
+            "no config artifact may be created beside the alias"
+        );
+    }
+
+    #[test]
+    fn token_hash_writer_refuses_a_guard_from_another_tree_before_bytes_change() {
+        let left = tmpdir();
+        let right = tmpdir();
+        let left_master = write_master_to(&left, FULL_V1_MASTER);
+        let right_master = write_master_to(&right, FULL_V1_MASTER);
+        let before = std::fs::read(&right_master).unwrap();
+        let guard = acquire_for_write(&left_master).unwrap();
+
+        let error = write_token_hash_to_master(
+            &guard,
+            &right_master,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect_err("a guard must not write another config tree");
+        assert!(
+            error.to_string().contains("config guard belongs"),
+            "got: {error:#}"
+        );
+        assert_eq!(std::fs::read(&right_master).unwrap(), before);
+    }
+
+    #[test]
+    fn token_writers_keep_one_guarded_acquire_load_write_drop_pipeline() {
+        let source = include_str!("token.rs");
+        let operations = [
+            (
+                "run_generate",
+                "pub async fn run_generate",
+                "/// Regenerate",
+            ),
+            (
+                "run_regenerate",
+                "pub async fn run_regenerate",
+                "/// Result of the post-regenerate IPC reload attempt.",
+            ),
+        ];
+
+        for (name, start_marker, end_marker) in operations {
+            let start = source.find(start_marker).unwrap();
+            let end = source[start..]
+                .find(end_marker)
+                .map(|offset| start + offset)
+                .unwrap();
+            let body = &source[start..end];
+            assert_eq!(
+                body.match_indices("acquire_for_write(config_path)").count(),
+                1,
+                "{name} must acquire exactly one config-tree guard"
+            );
+            let acquire = body.find("acquire_for_write(config_path)").unwrap();
+            let load = body
+                .find("load_config_for_schema_under_guard")
+                .unwrap_or_else(|| panic!("{name} does not load under its guard"));
+            let write = body
+                .find("write_token_hash_to_master(&guard")
+                .unwrap_or_else(|| panic!("{name} does not write through its guard"));
+            let sidecar = body
+                .find("let saved_path")
+                .unwrap_or_else(|| panic!("{name} has no post-guard sidecar save"));
+            let guarded = &body[acquire..sidecar];
+            assert!(acquire < load && load < write && write < sidecar);
+            assert!(
+                !guarded.contains(".await"),
+                "{name} awaits while holding the OS guard"
+            );
+            assert!(
+                !guarded.contains("loader::load_config("),
+                "{name} uses the normal loader inside its guarded region"
+            );
+            assert!(
+                !guarded.contains("atomic_write_and_validate")
+                    && !guarded.contains("toml_write::edit_document"),
+                "{name} uses a retired path-based writer inside its guarded region"
+            );
+        }
+
+        let helper_start = source.find("fn write_token_hash_to_master").unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn format_load_errs")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("read_or_empty_locked(guard"));
+        assert!(helper.contains("parse::<DocumentMut>()"));
+        assert!(helper.contains("super::toml_write::table_mut"));
+        assert!(helper.contains("prepare_raw_validated_single_locked"));
+        assert!(helper.contains("commit_prevalidated_single_write"));
+        assert!(!helper.contains("acquire_for_write"));
+        assert!(!helper.contains("write_value_validated_locked"));
+        assert!(!helper.contains("atomic_write"));
     }
 }

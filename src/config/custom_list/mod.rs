@@ -72,6 +72,45 @@ pub fn build_store(
     }
 }
 
+pub(crate) fn build_store_under_tree(
+    tree: super::tree_io::TreeIo<'_>,
+    lists: &[CustomList],
+    max_bytes: u64,
+) -> Result<CustomListStore, Vec<(Id, PackReadError)>> {
+    let mut store = CustomListStore::new();
+    let mut errors = Vec::new();
+    for entry in lists {
+        let relative = pack_path(Path::new(""), &entry.id);
+        let display = tree.identity.root.join(&relative);
+        let result = tree
+            .open_no_follow(&relative)
+            .map_err(|e| {
+                io::classify(
+                    &display,
+                    e.downcast::<std::io::Error>()
+                        .unwrap_or_else(|e| std::io::Error::other(format!("{e:#}"))),
+                )
+            })
+            .and_then(|file| {
+                file.ok_or_else(|| PackReadError::Missing {
+                    path: display.clone(),
+                })
+            })
+            .and_then(|file| io::read_pack_from_file(file, &display, max_bytes));
+        match result {
+            Ok(compiled) => {
+                store.insert(entry.id.clone(), compiled);
+            }
+            Err(e) => errors.push((entry.id.clone(), e)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(store)
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

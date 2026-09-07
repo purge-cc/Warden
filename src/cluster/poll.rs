@@ -307,7 +307,7 @@ mod tests {
     /// A minimal config the loader actually accepts. `peer_cert_from_config`
     /// goes through the real loader, so the fixture must be loadable — a bare
     /// `[cluster]` table is not.
-    const LOADABLE: &str = r#"schema_version = 3
+    const LOADABLE: &str = r#"schema_version = 4
 
 [server]
 default_profile = "default"

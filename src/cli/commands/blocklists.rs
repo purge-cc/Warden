@@ -12,9 +12,13 @@
 //! secrets.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use memmap2::MmapOptions;
 use toml::Value;
 
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
@@ -23,19 +27,40 @@ use super::ipc_reload;
 // `Profile.blocklists` was removed, so the
 // `apply_blocklists_change_inline` cascade helper is dead in this file.
 use super::target::{
-    read_or_empty, remove_id_keyed, resolve_existing_target_file, resolve_target_file,
-    upsert_id_keyed, write_value_validated, write_values_validated, EntityClass, StagedWrite,
+    commit_prevalidated_single_write, prepare_value_validated_single_locked, read_or_empty,
+    read_or_empty_locked, remove_id_keyed, resolve_existing_target_file,
+    resolve_existing_target_file_locked, resolve_target_file_locked, upsert_id_keyed,
+    write_value_validated_locked, write_values_validated_locked, ConfigCommitFailure, EntityClass,
+    PreparedValidatedSingleWrite, StagedWrite,
+};
+use crate::config::atomic_write::{
+    hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts, AtomicWriteError,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::load_config;
+use crate::config::loader::{
+    load_config, load_config_for_schema_under_guard, loaded_include_matches_root_file,
+};
 use crate::config::schema::blocklist::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust};
-use crate::config::schema::Id;
-use crate::config::secrets::{load_secrets, secrets_path_for};
+use crate::config::schema::{Id, SCHEMA_VERSION_V1};
+use crate::config::secrets::secrets_path_for;
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
-use crate::lists::manager::merge_sources_with_blocklists;
-use crate::lists::source_key::{canonical_url_key, is_url_source, SourceBitMap};
+use crate::lists::source_key::{
+    canonical_url_key, is_url_source, ResolvedSourcePlan, SourceBitMap,
+};
 use crate::lists::status::BlocklistStatusDto;
+
+fn effective_show_update_interval_secs(
+    row_update_interval_hours: Option<u32>,
+    global_update_interval_secs: u64,
+    schema_version: u32,
+) -> u64 {
+    crate::lists::source_key::effective_update_interval_secs(
+        row_update_interval_hours,
+        global_update_interval_secs,
+        crate::lists::source_key::RowControlMode::for_schema_version(schema_version),
+    )
+}
 
 // ── retired: RULE_DANGLING_REF ──────────────────────────────────────
 //
@@ -166,9 +191,9 @@ fn plural(n: usize, noun: &str) -> String {
     }
 }
 
-/// The 64-slot map the filter engine indexes lists by, built exactly the
-/// way `warden start` builds it — legacy `[lists].sources` merged with
-/// every enabled `[[blocklists]]` URL, then translated to bits.
+/// A fallback-catalog estimate of the 64-slot map used for this display.
+/// The daemon may have selected a newer persisted catalog, so this read-only
+/// result must not reject configuration or claim an exact runtime identity.
 ///
 /// A list with no slot holds no bit in any profile's mask, so it filters
 /// nothing however well its tags line up. `None` means the map could not
@@ -176,8 +201,19 @@ fn plural(n: usize, noun: &str) -> String {
 /// outright); in that case no slot claim is made either way, because a
 /// guess here would be a fabricated measurement.
 fn filter_slots(config: &crate::config::schema::ConfigV1) -> Option<SourceBitMap> {
-    let (merged, _trust) = merge_sources_with_blocklists(&config.lists.sources, &config.blocklists);
-    SourceBitMap::build(&merged, &config.blocklists).ok()
+    let plan = ResolvedSourcePlan::build_for_schema(
+        &crate::lists::catalog::Catalog::fallback(),
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    )
+    .ok()?;
+    SourceBitMap::from_plan(&plan).ok()
 }
 
 /// Work out who, if anyone, this list reaches.
@@ -248,14 +284,16 @@ fn format_list_row(b: &crate::config::schema::Blocklist) -> String {
         .map(|r| format!(" auth_token_ref={r}"))
         .unwrap_or_default();
     format!(
-        "  {id} \"{name}\" url={url} format={fmt:?} kind={kind} update={update}h \
+        "  {id} \"{name}\" url={url} format={fmt:?} kind={kind} update={update} \
          enabled={on}{auth}",
         id = b.id.as_str(),
         name = b.display_name,
         url = b.url,
         fmt = b.format,
         kind = kind_label(b.base),
-        update = b.update_interval_hours,
+        update = b
+            .update_interval_hours
+            .map_or_else(|| "inherited".to_string(), |hours| format!("{hours}h")),
         on = if b.enabled { "on" } else { "off" },
     )
 }
@@ -436,8 +474,32 @@ pub async fn run_show(config_path: &Path, socket_path: &Path, id: &str) -> anyho
     for line in format_show_consent(b) {
         println!("{line}");
     }
-    println!("update_interval_hours:  {}", b.update_interval_hours);
-    println!("max_entries:            {}", b.max_entries);
+    println!(
+        "update_interval_hours:  {}",
+        b.update_interval_hours
+            .map_or_else(|| "<inherited>".to_string(), |hours| hours.to_string())
+    );
+    let effective_interval_secs = effective_show_update_interval_secs(
+        b.update_interval_hours,
+        loaded.config.lists.update_interval_secs,
+        loaded.config.schema_version,
+    );
+    println!("effective_update_interval_secs:  {effective_interval_secs}");
+    println!(
+        "max_entries:            {}",
+        b.max_entries
+            .map_or_else(|| "<inherited>".to_string(), |entries| entries.to_string())
+    );
+    println!(
+        "effective_max_entries:  {}",
+        crate::lists::source_key::effective_max_entries(
+            b.max_entries,
+            loaded.config.lists.max_entries,
+            crate::lists::source_key::RowControlMode::for_schema_version(
+                loaded.config.schema_version,
+            ),
+        )
+    );
     println!("enabled:                {}", b.enabled);
     match b.auth_token_ref.as_deref() {
         Some(r) => println!("auth_token_ref:         {r}"),
@@ -485,21 +547,8 @@ async fn query_blocklist_stats(
     }
 }
 
-/// Query by `url` first, falling back to `id`.
-///
-/// The status registry is keyed on the **source string**, which for a v2
-/// `[[blocklists]]` entry is its URL — not its id. Querying by id alone
-/// meant every v2 list printed `<no telemetry — reload may be pending>`
-/// forever: on the live daemon `blocklist show privacy-tracking` reported
-/// no telemetry for a source that was active, fetched, and truncating.
-/// The daemon-side lookup does try `slug_for_id`, but that map only
-/// covers legacy slug-form sources (`privacy/ads`), so an id like
-/// `privacy-tracking` fell through to a substring match that cannot hit
-/// `https://lists.purge.cc/tracking.txt`.
-///
-/// The id retry is kept for exactly those legacy slug-form sources, where
-/// the registry key is the slug and the URL is what does not match. Only
-/// one extra round-trip, only on the miss path.
+/// Query by URL first, then retry by Id for compatibility with older daemons
+/// whose status registry did not route every source alias.
 async fn print_runtime_block(socket_path: &Path, id: &str, url: &str) {
     let mut stats = match query_blocklist_stats(socket_path, url).await {
         Ok(s) => s,
@@ -529,18 +578,12 @@ async fn print_runtime_block(socket_path: &Path, id: &str, url: &str) {
     println!("  entries:              {}", s.entries);
     println!("  parsed_ok:            {}", s.parsed_ok);
     println!("  parsed_skipped:       {}", s.parsed_skipped);
-    // Printed only when non-zero, and loudly when it is: a zero line here
-    // would read as reassurance on the 99% of lists that are fine, which
-    // is how the condition stayed invisible in the first place. The
-    // remedy is named inline because a bare count tells the operator a
-    // number, not what to do about it — and it names the GLOBAL knob
-    // because the per-`[[blocklists]]` `max_entries` never reaches the
-    // parser.
+    // Printed only when non-zero. It is the exact last-uncleared overshoot
+    // since this daemon started, not necessarily this attempt: a later failure
+    // retains it until a success clears it. The configured and effective
+    // values above identify which cap applies, so this line stays generic.
     if s.parsed_truncated > 0 {
-        println!(
-            "  REFUSED:              {} entries over [lists] max_entries — this cycle kept the last good body; raise the GLOBAL value: warden lists set max_entries <n>",
-            s.parsed_truncated
-        );
+        println!("{}", format_cap_refusal_line(s.parsed_truncated));
     }
     match s.fetched_at.as_deref() {
         Some(ts) => println!("  last update:          {ts}"),
@@ -556,6 +599,13 @@ async fn print_runtime_block(socket_path: &Path, id: &str, url: &str) {
         }
         _ => println!("  delta vs prev:        —"),
     }
+}
+
+fn format_cap_refusal_line(dropped: u64) -> String {
+    format!(
+        "  LAST CAP REFUSAL:     {dropped} entries beyond the effective source cap — \
+         candidate not installed; clears after a successful refresh or daemon restart; inspect effective_max_entries with `warden blocklist show <id>` and raise the limiting configured cap"
+    )
 }
 
 /// The CLI-side companion to the validator's
@@ -759,6 +809,12 @@ pub struct AddOutcome {
     pub reload_outcome: ipc_reload::ReloadOutcome,
 }
 
+/// Durable result of the guarded add core, before daemon reload scheduling.
+pub(crate) struct AddWriteOutcome {
+    pub target_path: std::path::PathBuf,
+    pub warnings: Vec<String>,
+}
+
 /// Quiet variant of [`run_add`] — same write + reload pipeline but no
 /// `println!`/`eprintln!`. The TUI catalog picker and Add-mode submit
 /// flow call this so terminal raw mode + alt-screen don't get
@@ -824,7 +880,7 @@ pub async fn run_add_silent(
 ///    `--accept-unsigned-allow` this refuses with the validator's own
 ///    frozen
 ///    [`UNSIGNED_ALLOW_LIST_REQUIRES_ACK`](crate::config::schema::validator::UNSIGNED_ALLOW_LIST_REQUIRES_ACK).
-///    Refusing *here* rather than letting `write_value_validated` roll
+///    Refusing *here* rather than letting the guarded writer roll
 ///    the write back matters: the rollback path leaves an audit row for
 ///    a mutation that was staged and undone, and tells the operator
 ///    their config was rejected when it was their command that was.
@@ -865,15 +921,15 @@ pub async fn run_add_silent_with_direction(
     into: Option<&Path>,
     direction: AddDirection<'_>,
 ) -> anyhow::Result<AddOutcome> {
+    // Keep argument errors ahead of the optional network probe. The guarded
+    // core repeats these checks for callers that already hold a tree lock.
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
     if !is_url_source(url) {
         bail!("url must start with http:// or https:// — got \"{url}\"");
     }
-    let parsed_format = match format {
-        Some(f) => Some(parse_format(f)?),
-        None => None,
-    };
-
+    if let Some(format) = format {
+        parse_format(format)?;
+    }
     let kind = match direction.kind {
         Some(k) => parse_kind(k)?,
         None => BlocklistBase::Deny,
@@ -897,39 +953,119 @@ pub async fn run_add_silent_with_direction(
             );
         }
     }
-
-    let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
-    if loaded.config.blocklists.iter().any(|b| b.id.as_str() == id) {
-        bail!("blocklist \"{id}\" already exists");
-    }
-    // Compare on the CANONICAL key, not
-    // byte-exactly. `…/ads.txt` and `…/ads.txt/` are one source: they
-    // share a cache file and its ETag (`source_to_cache_stem` keys on the
-    // URL alone), so a 304 for one silently satisfies the other and the
-    // last write wins the body. Stays a hard error — `add` is creating a
-    // new entry, so no existing config breaks.
-    let canonical = canonical_url_key(url);
-    if let Some(existing) = loaded
-        .config
-        .blocklists
-        .iter()
-        .find(|b| canonical_url_key(&b.url) == canonical)
+    // Reject conflicts before a potentially slow probe, then repeat the same
+    // pure check under the authoritative mutation guard after the await.
     {
-        bail!(
-            "list URL already added as \"{}\" — use that id or remove it first",
-            existing.id.as_str()
-        );
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        let loaded = load_config_for_schema_under_guard(
+            &guard,
+            config_path,
+            SCHEMA_VERSION_V1,
+            time::OffsetDateTime::now_utc(),
+        )
+        .map_err(format_config_errors)?;
+        ensure_no_duplicate_blocklist(&loaded.config, id, url)?;
     }
-
     if !skip_head_check {
         probe_url_reachable(url).await?;
     }
 
+    let written = {
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        run_add_silent_with_direction_locked(
+            &guard,
+            config_path,
+            id,
+            display_name,
+            url,
+            format,
+            update_interval_hours,
+            max_entries,
+            enabled,
+            auth_token_ref,
+            into,
+            direction,
+        )?
+    };
+    let id_for_audit = id.to_string();
+    let url_for_audit = if kind == BlocklistBase::Allow {
+        format!(
+            "{url} kind=allow accept_unsigned_allow={}",
+            direction.accept_unsigned_allow
+        )
+    } else {
+        url.to_string()
+    };
+    let target_for_audit = written.target_path.clone();
+    persist_cli_mutation_audit(config_path, move || {
+        AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
+            .with_uid(current_uid())
+            .with_action("blocklist.add")
+            .with_scope("blocklist")
+            .with_target_id(id_for_audit)
+            .with_fields_after(url_for_audit)
+            .with_files([config_path, target_for_audit.as_path()])
+    });
+    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
+    Ok(AddOutcome {
+        target_path: written.target_path,
+        warnings: written.warnings,
+        reload_outcome,
+    })
+}
+
+/// Guarded add core for callers composing larger config mutations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_add_silent_with_direction_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    display_name: Option<&str>,
+    url: &str,
+    format: Option<&str>,
+    update_interval_hours: Option<u32>,
+    max_entries: Option<u64>,
+    enabled: Option<bool>,
+    auth_token_ref: Option<&str>,
+    into: Option<&Path>,
+    direction: AddDirection<'_>,
+) -> anyhow::Result<AddWriteOutcome> {
+    let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
+    if !is_url_source(url) {
+        bail!("url must start with http:// or https:// — got \"{url}\"");
+    }
+    let parsed_format = match format {
+        Some(f) => Some(parse_format(f)?),
+        None => None,
+    };
+
+    let kind = match direction.kind {
+        Some(k) => parse_kind(k)?,
+        None => BlocklistBase::Deny,
+    };
+    let trust = BlocklistTrust::RemoteUnsigned;
+    if kind == BlocklistBase::Allow {
+        let gates = allow_direction_gates(trust, false, direction.accept_unsigned_allow);
+        if gates.needs_consent {
+            bail!(
+                "{}\n{}",
+                crate::config::schema::validator::format_unsigned_allow_list_requires_ack(
+                    id, trust
+                ),
+                ACCEPT_UNSIGNED_ALLOW_FLAG_HINT
+            );
+        }
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
+    ensure_no_duplicate_blocklist(&loaded.config, id, url)?;
+
     let mut warnings: Vec<String> = Vec::new();
     if let Some(r) = auth_token_ref {
         let secrets_path = secrets_path_for(config_path);
-        match load_secrets(&secrets_path) {
+        match crate::config::secrets::load_secrets_under_tree(guard.tree_io()) {
             Ok(secrets) => {
                 if secrets.get(r).is_none() {
                     warnings.push(format!(
@@ -981,7 +1117,9 @@ pub async fn run_add_silent_with_direction(
         tbl.insert("update_interval_hours".into(), Value::Integer(h as i64));
     }
     if let Some(m) = max_entries {
-        tbl.insert("max_entries".into(), Value::Integer(m as i64));
+        let m = i64::try_from(m)
+            .map_err(|_| anyhow::anyhow!("max_entries exceeds TOML's signed integer range"))?;
+        tbl.insert("max_entries".into(), Value::Integer(m));
     }
     if let Some(e) = enabled {
         tbl.insert("enabled".into(), Value::Boolean(e));
@@ -997,50 +1135,46 @@ pub async fn run_add_silent_with_direction(
     // the loader's business, and a value the loader synthesises must not
     // be round-tripped back into the file by a writer.
 
-    let target_path = resolve_target_file(config_path, EntityClass::Blocklists, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path =
+        resolve_target_file_locked(guard, config_path, EntityClass::Blocklists, into)?;
+    let (mut doc, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     upsert_id_keyed(
         &mut doc,
         EntityClass::Blocklists.toml_key(),
         id,
         Value::Table(tbl),
     )?;
-    write_value_validated(config_path, &target_path, &doc)?;
+    write_value_validated_locked(guard, config_path, &target_path, &doc)?;
 
-    // Blocklist add is supply-chain-relevant — record the URL
-    // the operator subscribed so a later silent re-point is attributable.
-    //
-    // Since `add` can create an allow-direction list, the URL alone no
-    // longer describes the mutation: the same line could be a subscription
-    // to a deny-list or the moment a remote party gained the power to
-    // unblock domains. The deny shape is left byte-identical so existing
-    // audit readers are unaffected; the allow case says so explicitly.
-    let id_for_audit = id.to_string();
-    let url_for_audit = if kind == BlocklistBase::Allow {
-        format!(
-            "{url} kind=allow accept_unsigned_allow={}",
-            direction.accept_unsigned_allow
-        )
-    } else {
-        url.to_string()
-    };
-    let target_for_audit = target_path.clone();
-    persist_cli_mutation_audit(config_path, move || {
-        AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
-            .with_uid(current_uid())
-            .with_action("blocklist.add")
-            .with_scope("blocklist")
-            .with_target_id(id_for_audit)
-            .with_fields_after(url_for_audit)
-            .with_files([config_path, target_for_audit.as_path()])
-    });
-
-    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
-    Ok(AddOutcome {
+    Ok(AddWriteOutcome {
         target_path,
         warnings,
-        reload_outcome,
     })
+}
+
+/// Keep the optimistic preflight and locked write check byte-for-byte aligned.
+fn ensure_no_duplicate_blocklist(
+    config: &crate::config::schema::ConfigV1,
+    id: &str,
+    url: &str,
+) -> anyhow::Result<()> {
+    if config.blocklists.iter().any(|b| b.id.as_str() == id) {
+        bail!("blocklist \"{id}\" already exists");
+    }
+    // URLs key a shared cache entry, so compare the canonical form rather
+    // than letting trailing-slash spelling create two owners.
+    let canonical = canonical_url_key(url);
+    if let Some(existing) = config
+        .blocklists
+        .iter()
+        .find(|b| canonical_url_key(&b.url) == canonical)
+    {
+        bail!(
+            "list URL already added as \"{}\" — use that id or remove it first",
+            existing.id.as_str()
+        );
+    }
+    Ok(())
 }
 
 pub async fn run_set(
@@ -1051,8 +1185,15 @@ pub async fn run_set(
     value: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Blocklists, id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let target_path = resolve_existing_target_file_locked(
+        &guard,
+        config_path,
+        EntityClass::Blocklists,
+        id,
+        into,
+    )?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     let entry =
         find_id_entry_mut(&mut doc, EntityClass::Blocklists.toml_key(), id)?.ok_or_else(|| {
             anyhow::anyhow!("blocklist \"{id}\" not found in {}", target_path.display())
@@ -1069,8 +1210,9 @@ pub async fn run_set(
     } else {
         None
     };
-    apply_blocklist_field(entry, field, value, config_path)?;
-    write_value_validated(config_path, &target_path, &doc)?;
+    apply_blocklist_field_locked(&guard, entry, field, value, config_path)?;
+    write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
+    drop(guard);
     let id_for_audit = id.to_string();
     let fields_after = format!("{field}={value}");
     let target_for_audit = target_path.clone();
@@ -1118,15 +1260,24 @@ pub async fn run_remove(
     // get a uniform "remove of absent" exit code across the entity verbs.
     // If the config won't load, fall through and let run_remove_silent
     // surface the real error.
-    let now = time::OffsetDateTime::now_utc();
-    let exists = load_config(config_path, now)
-        .map(|l| l.config.blocklists.iter().any(|b| b.id.as_str() == id))
-        .unwrap_or(true);
-    if !exists {
-        println!("blocklist \"{id}\" not found — nothing to remove");
-        return Ok(());
-    }
-    let outcome = run_remove_silent(config_path, socket_path, id, into, false).await?;
+    let cascade_log = {
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        let now = time::OffsetDateTime::now_utc();
+        let exists =
+            load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+                .map(|l| l.config.blocklists.iter().any(|b| b.id.as_str() == id))
+                .unwrap_or(true);
+        if !exists {
+            println!("blocklist \"{id}\" not found — nothing to remove");
+            return Ok(());
+        }
+        run_remove_silent_locked(&guard, config_path, id, into, false)?
+    };
+    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
+    let outcome = RemoveOutcome {
+        cascade_log,
+        reload_outcome,
+    };
     for line in &outcome.cascade_log {
         println!("{line}");
     }
@@ -1155,6 +1306,25 @@ pub async fn run_remove_silent(
     into: Option<&Path>,
     cascade: bool,
 ) -> anyhow::Result<RemoveOutcome> {
+    let cascade_log = {
+        let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+        run_remove_silent_locked(&guard, config_path, id, into, cascade)?
+    };
+    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
+    Ok(RemoveOutcome {
+        cascade_log,
+        reload_outcome,
+    })
+}
+
+/// Guarded remove core for callers composing several config mutations.
+pub(crate) fn run_remove_silent_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    config_path: &Path,
+    id: &str,
+    into: Option<&Path>,
+    cascade: bool,
+) -> anyhow::Result<Vec<String>> {
     // **The comment that used to sit here was the defect.** It read: "profiles
     // no longer enumerate blocklists, so the v1 cross-ref check + cascade is
     // structurally a no-op now" — and then assigned `Vec::new()` on the
@@ -1166,7 +1336,7 @@ pub async fn run_remove_silent(
     // true to false without anything going red.
     //
     // **The symptom was measured, and it is not the one the dead premise
-    // suggests.** `write_value_validated` validates the staged bytes *before*
+    // suggests.** The guarded writer validates staged bytes *before*
     // promoting anything, so the removal never bricked a later boot: it failed
     // outright, quoting the operator's own profile back at them, and no verb
     // could remove such a list at all. Fail-closed and unusable, rather than
@@ -1181,7 +1351,8 @@ pub async fn run_remove_silent(
     // override names something that will not exist a moment later. Removing a
     // dead name is cleanup, not a change of intent — and the trace lines below
     // keep it visible rather than silent.
-    let target_path = resolve_existing_target_file(config_path, EntityClass::Blocklists, id, into)?;
+    let target_path =
+        resolve_existing_target_file_locked(guard, config_path, EntityClass::Blocklists, id, into)?;
 
     // Which profiles name this list?
     //
@@ -1189,17 +1360,21 @@ pub async fn run_remove_silent(
     // skipped there rather than guessed at, and the pre-promote validation
     // below is what refuses — the same fail-closed outcome as before this
     // repair, never a half-applied removal.
-    let overriding_profiles: Vec<String> =
-        match load_config(config_path, time::OffsetDateTime::now_utc()) {
-            Ok(loaded) => loaded
-                .config
-                .profiles
-                .iter()
-                .filter(|(_, p)| p.lists.keys().any(|k| k.as_str() == id))
-                .map(|(key, _)| key.to_string())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+    let overriding_profiles: Vec<String> = match load_config_for_schema_under_guard(
+        guard,
+        config_path,
+        SCHEMA_VERSION_V1,
+        time::OffsetDateTime::now_utc(),
+    ) {
+        Ok(loaded) => loaded
+            .config
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.lists.keys().any(|k| k.as_str() == id))
+            .map(|(key, _)| key.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
 
     // Stage every file this mutation touches, reading each exactly ONCE. A
     // profile override and the blocklist row frequently live in the same file
@@ -1211,10 +1386,18 @@ pub async fn run_remove_silent(
     let mut cascade_log: Vec<String> = Vec::new();
 
     for profile_id in &overriding_profiles {
-        let p_path =
-            resolve_existing_target_file(config_path, EntityClass::Profiles, profile_id, None)?;
+        let p_path = resolve_existing_target_file_locked(
+            guard,
+            config_path,
+            EntityClass::Profiles,
+            profile_id,
+            None,
+        )?;
         if !docs.contains_key(&p_path) {
-            docs.insert(p_path.clone(), read_or_empty(&p_path)?);
+            docs.insert(
+                p_path.clone(),
+                read_or_empty_locked(guard, config_path, &p_path)?,
+            );
             order.push(p_path.clone());
         }
         let (doc, _) = docs.get_mut(&p_path).expect("doc just staged");
@@ -1238,10 +1421,13 @@ pub async fn run_remove_silent(
     }
 
     if !docs.contains_key(&target_path) {
-        docs.insert(target_path.clone(), read_or_empty(&target_path)?);
+        docs.insert(
+            target_path.clone(),
+            read_or_empty_locked(guard, config_path, &target_path)?,
+        );
         order.push(target_path.clone());
     }
-    // **References before row.** `write_values_validated` promotes in the
+    // **References before row.** The guarded batch writer promotes in the
     // given order, so the blocklist's own slice goes LAST: no inter-rename
     // intermediate is a tree where an override outlives what it names. When
     // the row and an override share a file, the two edits share one staged doc
@@ -1276,7 +1462,7 @@ pub async fn run_remove_silent(
     // One validation of the COMBINED final state, then the renames. A tree the
     // loader would reject is never promoted, so the on-disk state only ever
     // moves valid → valid.
-    write_values_validated(config_path, &writes)?;
+    write_values_validated_locked(guard, config_path, &writes)?;
     // **`cascade` is the parameter; `cascade_refs` is what happened.** Emitting
     // the parameter here would now be a lie: the CLI passes `false` and
     // cascades anyway, so every CLI removal that dropped an override would be
@@ -1306,14 +1492,7 @@ pub async fn run_remove_silent(
         rec
     });
 
-    // This is the ONE reload that lands the whole compound
-    // mutation (for cascade, the loop wrote N profile files) in the
-    // daemon's view at once.
-    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
-    Ok(RemoveOutcome {
-        cascade_log,
-        reload_outcome,
-    })
+    Ok(cascade_log)
 }
 
 /// Drop `lists.<list_id>` from the `[profiles.<profile_id>]` table in `doc`.
@@ -1374,12 +1553,43 @@ pub fn format_blocklist_set_unknown_field(field: &str) -> String {
     BLOCKLIST_SET_UNKNOWN_FIELD.replace("{field}", field)
 }
 
-fn apply_blocklist_field(
+fn apply_blocklist_field_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
     entry: &mut Value,
     field: &str,
     value: &str,
     config_path: &Path,
 ) -> anyhow::Result<()> {
+    apply_blocklist_field_inner(
+        entry,
+        field,
+        value,
+        config_path,
+        || {
+            load_config_for_schema_under_guard(
+                guard,
+                config_path,
+                SCHEMA_VERSION_V1,
+                time::OffsetDateTime::now_utc(),
+            )
+            .ok()
+        },
+        || crate::config::secrets::load_secrets_under_tree(guard.tree_io()).ok(),
+    )
+}
+
+fn apply_blocklist_field_inner<LoadConfig, LoadSecrets>(
+    entry: &mut Value,
+    field: &str,
+    value: &str,
+    config_path: &Path,
+    mut load_config_for_dedup: LoadConfig,
+    mut load_secrets_for_warning: LoadSecrets,
+) -> anyhow::Result<()>
+where
+    LoadConfig: FnMut() -> Option<crate::config::loader::LoadedConfig>,
+    LoadSecrets: FnMut() -> Option<crate::config::secrets::Secrets>,
+{
     let tbl = entry
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("blocklist entry is not a TOML table"))?;
@@ -1402,13 +1612,12 @@ fn apply_blocklist_field(
             // not added here: this field-applier is sync, and wiring the
             // async probe in would need the `set` dispatch reworked.
             let self_id = tbl.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let now = time::OffsetDateTime::now_utc();
             // Same canonical key as the
             // `add` gate. Byte-exact here would have let `set url` add a
             // trailing slash and manufacture the very cache-file collision
             // `add` refuses.
             let canonical = canonical_url_key(value);
-            if let Ok(loaded) = load_config(config_path, now) {
+            if let Some(loaded) = load_config_for_dedup() {
                 if let Some(existing) =
                     loaded.config.blocklists.iter().find(|b| {
                         canonical_url_key(&b.url) == canonical && b.id.as_str() != self_id
@@ -1431,10 +1640,16 @@ fn apply_blocklist_field(
             tbl.insert("format".into(), Value::String(format_label(f).to_string()));
         }
         "update_interval_hours" => {
+            if value == "inherit" {
+                tbl.remove("update_interval_hours");
+                tbl.remove("refresh_interval_hours");
+                return Ok(());
+            }
             let n: u32 = value.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
                 anyhow::anyhow!("update_interval_hours must be a positive integer (>= 1)")
             })?;
-            tbl.insert("update_interval_hours".into(), Value::Integer(n as i64));
+            tbl.remove("refresh_interval_hours");
+            tbl.insert("update_interval_hours".into(), Value::Integer(i64::from(n)));
         }
         // Deprecated legacy field name. Accepts the same
         // value, emits a stderr WARN, routes to the canonical key.
@@ -1444,16 +1659,28 @@ fn apply_blocklist_field(
                 "warning: field name 'refresh_interval_hours' is deprecated, use \
                  'update_interval_hours' (removal in v0.5.0)"
             );
+            if value == "inherit" {
+                tbl.remove("update_interval_hours");
+                tbl.remove("refresh_interval_hours");
+                return Ok(());
+            }
             let n: u32 = value.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
                 anyhow::anyhow!("update_interval_hours must be a positive integer (>= 1)")
             })?;
+            tbl.remove("refresh_interval_hours");
             tbl.insert("update_interval_hours".into(), Value::Integer(n as i64));
         }
         "max_entries" => {
-            let n: u64 = value
+            if value == "inherit" {
+                tbl.remove("max_entries");
+                return Ok(());
+            }
+            let n: i64 = value
                 .parse()
-                .map_err(|_| anyhow::anyhow!("max_entries must be a positive integer"))?;
-            tbl.insert("max_entries".into(), Value::Integer(n as i64));
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| anyhow::anyhow!("max_entries must be a positive integer"))?;
+            tbl.insert("max_entries".into(), Value::Integer(n));
         }
         "enabled" => {
             let b = match value {
@@ -1468,7 +1695,7 @@ fn apply_blocklist_field(
                 tbl.remove("auth_token_ref");
             } else {
                 let secrets_path = secrets_path_for(config_path);
-                if let Ok(secrets) = load_secrets(&secrets_path) {
+                if let Some(secrets) = load_secrets_for_warning() {
                     if secrets.get(value).is_none() {
                         eprintln!(
                             "warning: auth_token_ref \"{value}\" is not defined in {}",
@@ -1919,6 +2146,7 @@ pub async fn run_set_kind_with_ack(
 ) -> anyhow::Result<()> {
     let kind = parse_kind(kind_str)?;
     let now = time::OffsetDateTime::now_utc();
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
 
     // The entry's own file is opened BEFORE the config is loaded, which
     // inverts the order every other verb uses. The reason is the
@@ -1937,9 +2165,14 @@ pub async fn run_set_kind_with_ack(
     // SHA-256s the master on every mutating blocklist verb, twice
     // (before and after). Dropping it makes the comment true and stops
     // paying for a field with no reader.
-    let target_path =
-        resolve_existing_target_file(config_path, EntityClass::Blocklists, list_id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_existing_target_file_locked(
+        &guard,
+        config_path,
+        EntityClass::Blocklists,
+        list_id,
+        into,
+    )?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     let entry = find_id_entry_mut(&mut doc, EntityClass::Blocklists.toml_key(), list_id)?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -1951,19 +2184,20 @@ pub async fn run_set_kind_with_ack(
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("blocklist entry is not a TOML table"))?;
 
-    let blist = match load_config(config_path, now) {
-        Ok(loaded) => loaded
-            .config
-            .blocklists
-            .iter()
-            .find(|b| b.id.as_str() == list_id)
-            .with_context(|| format!("blocklist '{list_id}' not found"))?
-            .clone(),
-        // Only the narrowing direction survives a config that will not
-        // load. `→ allow` widens what is permitted and stays gated on a
-        // config someone can read.
-        Err(errs) => degraded_mutation_view(tbl, list_id, kind == BlocklistBase::Deny, errs)?,
-    };
+    let blist =
+        match load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now) {
+            Ok(loaded) => loaded
+                .config
+                .blocklists
+                .iter()
+                .find(|b| b.id.as_str() == list_id)
+                .with_context(|| format!("blocklist '{list_id}' not found"))?
+                .clone(),
+            // Only the narrowing direction survives a config that will not
+            // load. `→ allow` widens what is permitted and stays gated on a
+            // config someone can read.
+            Err(errs) => degraded_mutation_view(tbl, list_id, kind == BlocklistBase::Deny, errs)?,
+        };
     let before = kind_label(blist.base).to_string();
     let after = kind_label(kind).to_string();
 
@@ -1994,7 +2228,7 @@ pub async fn run_set_kind_with_ack(
         tbl.insert("accept_unsigned_allow".into(), Value::Boolean(true));
     }
     tbl.insert("base".into(), Value::String(after.clone()));
-    let validate_outcome = write_value_validated(config_path, &target_path, &doc);
+    let validate_outcome = write_value_validated_locked(&guard, config_path, &target_path, &doc);
 
     match validate_outcome {
         Ok(()) => {
@@ -2014,6 +2248,7 @@ pub async fn run_set_kind_with_ack(
 
             println!("{}", format_blocklist_set_kind_ok(list_id, &after));
 
+            drop(guard);
             let outcome = ipc_reload::attempt_reload(socket_path).await;
             ipc_reload::report_reload_outcome(&outcome);
             Ok(())
@@ -2129,7 +2364,9 @@ pub async fn run_set_trust(
 ) -> anyhow::Result<()> {
     let trust = parse_trust(trust_str)?;
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
     let blist = loaded
         .config
         .blocklists
@@ -2187,9 +2424,14 @@ pub async fn run_set_trust(
         bail!("{msg}\n{ACCEPT_UNSIGNED_ALLOW_FLAG_HINT}");
     }
 
-    let target_path =
-        resolve_existing_target_file(config_path, EntityClass::Blocklists, list_id, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let target_path = resolve_existing_target_file_locked(
+        &guard,
+        config_path,
+        EntityClass::Blocklists,
+        list_id,
+        into,
+    )?;
+    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &target_path)?;
     let entry = find_id_entry_mut(&mut doc, EntityClass::Blocklists.toml_key(), list_id)?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -2207,7 +2449,7 @@ pub async fn run_set_trust(
         tbl.insert("accept_unsigned_allow".into(), Value::Boolean(true));
     }
     tbl.insert("trust".into(), Value::String(after.clone()));
-    let validate_outcome = write_value_validated(config_path, &target_path, &doc);
+    let validate_outcome = write_value_validated_locked(&guard, config_path, &target_path, &doc);
 
     match validate_outcome {
         Ok(()) => {
@@ -2227,6 +2469,7 @@ pub async fn run_set_trust(
 
             println!("{}", format_blocklist_set_trust_ok(list_id, &after));
 
+            drop(guard);
             let outcome = ipc_reload::attempt_reload(socket_path).await;
             ipc_reload::report_reload_outcome(&outcome);
             Ok(())
@@ -2250,6 +2493,170 @@ pub async fn run_set_trust(
             Err(e)
         }
     }
+}
+
+/// Absolute ceiling for one external file captured by `import-local`.
+///
+/// The import coordinator will additionally apply the authoritative
+/// `lists.max_body_bytes` setting; this fixed ceiling is the outer bound.
+const LOCAL_IMPORT_HARD_CEILING_BYTES: u64 = 512 * 1024 * 1024;
+const LOCAL_IMPORT_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+
+/// A bounded, immutable capture of an external `import-local` source.
+///
+/// The spool is an unlinked temporary file so neither the source body nor a
+/// second copy of it occupies the heap. It is rewound before return.
+#[derive(Debug)]
+struct LocalImportSnapshot {
+    spool: File,
+    len: u64,
+    format: BlocklistFormat,
+    entry_count: usize,
+}
+
+#[cfg(test)]
+fn snapshot_local_import_source(src: &Path) -> anyhow::Result<LocalImportSnapshot> {
+    snapshot_local_import_source_with_cap(src, LOCAL_IMPORT_HARD_CEILING_BYTES)
+}
+
+fn snapshot_local_import_source_with_cap(
+    src: &Path,
+    hard_cap: u64,
+) -> anyhow::Result<LocalImportSnapshot> {
+    let cwd = std::env::current_dir().context("resolve current directory for source")?;
+    let (_, inspected) = crate::config::tree_io::resolve_external_entry_from(src, &cwd)
+        .with_context(|| format!("resolve source file {}", src.display()))?;
+    let inspected = inspected
+        .ok_or_else(|| anyhow::anyhow!("source file does not exist: {}", src.display()))?;
+    let metadata = inspected
+        .metadata()
+        .with_context(|| format!("inspect source file {}", src.display()))?;
+    if !metadata.is_file() {
+        bail!("source path is not a regular file: {}", src.display());
+    }
+    if metadata.len() > hard_cap {
+        bail!(
+            "source file {} is {} bytes, over the import cap of {hard_cap} bytes",
+            src.display(),
+            metadata.len()
+        );
+    }
+
+    #[cfg(test)]
+    local_import_snapshot_test_event(LocalImportSnapshotTestEvent::AfterMetadataPrecheck);
+
+    // Reopen the inspected inode, never the pathname. The metadata check above
+    // keeps FIFOs and devices from reaching this data-open path.
+    let mut source = crate::config::write_lock::reopen_inspected(&inspected, libc::O_RDONLY)
+        .with_context(|| format!("open source file {}", src.display()))?;
+    let mut spool = unlinked_import_spool().context("create import snapshot spool")?;
+    let mut buffer = [0_u8; LOCAL_IMPORT_STREAM_BUFFER_BYTES];
+    let mut len = 0_u64;
+    loop {
+        let remaining = hard_cap.saturating_sub(len);
+        // Once at the cap, read precisely one more byte. Metadata is only a
+        // precheck; this is the growth guard for the opened inode.
+        let read_len = if remaining == 0 {
+            1
+        } else {
+            remaining.min(buffer.len() as u64) as usize
+        };
+        let read = source
+            .read(&mut buffer[..read_len])
+            .with_context(|| format!("read source file {}", src.display()))?;
+        if read == 0 {
+            break;
+        }
+        len = len.saturating_add(read as u64);
+        if len > hard_cap {
+            bail!(
+                "source file {} is {len} bytes, over the import cap of {hard_cap} bytes",
+                src.display()
+            );
+        }
+        spool
+            .write_all(&buffer[..read])
+            .context("write import snapshot spool")?;
+    }
+
+    let (format, entry_count) = if len == 0 {
+        (BlocklistFormat::Domains, 0)
+    } else {
+        // SAFETY: the unlinked spool is private to this function and is not
+        // changed while the read-only mapping is alive.
+        let map = unsafe { MmapOptions::new().map(&spool) }.context("map import snapshot spool")?;
+        let raw = std::str::from_utf8(&map).map_err(|error| {
+            anyhow::anyhow!("source file {} is not valid UTF-8 ({error})", src.display())
+        })?;
+        let format = autodetect_format(raw);
+        (format, count_entries(raw, format))
+    };
+    spool
+        .seek(SeekFrom::Start(0))
+        .context("rewind import snapshot spool")?;
+
+    Ok(LocalImportSnapshot {
+        spool,
+        len,
+        format,
+        entry_count,
+    })
+}
+
+/// Create an unlinked, file-backed spool through the production tempfile
+/// dependency. It never needs a pathname after creation.
+fn unlinked_import_spool() -> std::io::Result<File> {
+    tempfile::tempfile()
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalImportSnapshotTestEvent {
+    AfterMetadataPrecheck,
+}
+
+#[cfg(test)]
+type LocalImportSnapshotTestHook = Box<dyn FnMut(LocalImportSnapshotTestEvent)>;
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_IMPORT_SNAPSHOT_TEST_HOOK:
+        std::cell::RefCell<Option<LocalImportSnapshotTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn local_import_snapshot_test_event(event: LocalImportSnapshotTestEvent) {
+    LOCAL_IMPORT_SNAPSHOT_TEST_HOOK.with(|slot| {
+        let Some(mut hook) = slot.borrow_mut().take() else {
+            return;
+        };
+        hook(event);
+        *slot.borrow_mut() = Some(hook);
+    });
+}
+
+#[cfg(test)]
+fn with_local_import_snapshot_test_hook<T>(
+    hook: impl FnMut(LocalImportSnapshotTestEvent) + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<LocalImportSnapshotTestHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOCAL_IMPORT_SNAPSHOT_TEST_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset =
+        Reset(LOCAL_IMPORT_SNAPSHOT_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    body()
+}
+
+#[cfg(test)]
+fn snapshot_local_import_source_with_test_cap(
+    src: &Path,
+    hard_cap: u64,
+) -> anyhow::Result<LocalImportSnapshot> {
+    snapshot_local_import_source_with_cap(src, hard_cap)
 }
 
 /// `warden blocklist import-local <path> --id <list-id> --kind <deny|allow>
@@ -2347,108 +2754,330 @@ pub async fn run_import_local(
             );
         }
     }
-    if !src.exists() {
-        bail!("source file does not exist: {}", src.display());
+    // Do a read-only preflight before touching the external source.  The
+    // guarded transaction below repeats these checks authoritatively.
+    let preflight =
+        load_config(config_path, time::OffsetDateTime::now_utc()).map_err(format_config_errors)?;
+    if preflight
+        .config
+        .blocklists
+        .iter()
+        .any(|blocklist| blocklist.id.as_str() == list_id)
+    {
+        bail!("blocklist '{list_id}' already exists");
     }
-    if !src.is_file() {
-        bail!("source path is not a regular file: {}", src.display());
+    let configured_cap = u64::try_from(preflight.config.lists.max_body_bytes).unwrap_or(u64::MAX);
+    let snapshot = snapshot_local_import_source_with_cap(
+        src,
+        configured_cap.min(LOCAL_IMPORT_HARD_CEILING_BYTES),
+    )?;
+    let imported = run_import_local_transaction(
+        config_path,
+        snapshot,
+        list_id,
+        kind,
+        trust,
+        display_name,
+        into,
+        DefaultImportLocalOps,
+    )?;
+
+    // The transaction explicitly releases its sole config guard before it
+    // returns. Audit and reload are deliberately outside that critical span.
+    let path_str = imported.body_path.display().to_string();
+    let kind_str_owned = kind_label(kind).to_string();
+    persist_audit(
+        config_path,
+        |files| {
+            AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
+                .with_uid(current_uid())
+                .with_action("blocklist.import_local")
+                .with_target_id(list_id.to_string())
+                .with_fields_before("")
+                .with_fields_after(format!("kind={kind_str_owned}, trust=local"))
+                .with_files(files)
+        },
+        &[config_path, &imported.config_target, &imported.body_path],
+    );
+
+    println!(
+        "{}",
+        format_blocklist_import_local_ok(
+            &path_str,
+            list_id,
+            kind_label(kind),
+            imported.entry_count
+        )
+    );
+
+    let outcome = ipc_reload::attempt_reload(socket_path).await;
+    ipc_reload::report_reload_outcome(&outcome);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ImportedLocal {
+    config_target: PathBuf,
+    body_path: PathBuf,
+    entry_count: usize,
+}
+
+trait ImportLocalOps {
+    fn publish_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+        spool: &mut File,
+        len: u64,
+    ) -> Result<(), AtomicWriteError>;
+
+    fn sync_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+    ) -> anyhow::Result<()>;
+
+    fn sync_config_root(&mut self, tree: crate::config::tree_io::TreeIo<'_>) -> anyhow::Result<()>;
+
+    fn commit_config(
+        &mut self,
+        prepared: PreparedValidatedSingleWrite<'_>,
+    ) -> Result<(), ConfigCommitFailure>;
+}
+
+struct DefaultImportLocalOps;
+
+impl ImportLocalOps for DefaultImportLocalOps {
+    fn publish_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+        spool: &mut File,
+        len: u64,
+    ) -> Result<(), AtomicWriteError> {
+        hardened_atomic_create_only_at(target, spool, len, AtomicCreateOnlyAtOpts::default())
     }
 
+    fn sync_body(
+        &mut self,
+        target: &crate::config::tree_io::PinnedTarget<'_>,
+    ) -> anyhow::Result<()> {
+        target.sync_held_file_and_parent().map_err(Into::into)
+    }
+
+    fn sync_config_root(&mut self, tree: crate::config::tree_io::TreeIo<'_>) -> anyhow::Result<()> {
+        tree.sync_root().map_err(Into::into)
+    }
+
+    fn commit_config(
+        &mut self,
+        prepared: PreparedValidatedSingleWrite<'_>,
+    ) -> Result<(), ConfigCommitFailure> {
+        commit_prevalidated_single_write(prepared)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_import_local_transaction<O: ImportLocalOps>(
+    config_path: &Path,
+    snapshot: LocalImportSnapshot,
+    list_id: &str,
+    kind: BlocklistBase,
+    trust: BlocklistTrust,
+    display_name: Option<&str>,
+    into: Option<&Path>,
+    mut ops: O,
+) -> anyhow::Result<ImportedLocal> {
+    let guard = crate::config::write_lock::acquire_for_write(config_path)?;
+    let result = run_import_local_locked(
+        &guard,
+        config_path,
+        snapshot,
+        list_id,
+        kind,
+        trust,
+        display_name,
+        into,
+        &mut ops,
+    );
+    drop(guard);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_import_local_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    config_path: &Path,
+    mut snapshot: LocalImportSnapshot,
+    list_id: &str,
+    kind: BlocklistBase,
+    trust: BlocklistTrust,
+    display_name: Option<&str>,
+    into: Option<&Path>,
+    ops: &mut impl ImportLocalOps,
+) -> anyhow::Result<ImportedLocal> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        .map_err(format_config_errors)?;
+    let configured_cap = u64::try_from(loaded.config.lists.max_body_bytes).unwrap_or(u64::MAX);
+    if snapshot.len > configured_cap {
+        bail!(
+            "source snapshot is {} bytes, over configured lists.max_body_bytes of {configured_cap} bytes",
+            snapshot.len
+        );
+    }
     if loaded
         .config
         .blocklists
         .iter()
-        .any(|b| b.id.as_str() == list_id)
+        .any(|blocklist| blocklist.id.as_str() == list_id)
     {
         bail!("blocklist '{list_id}' already exists");
     }
 
-    // Copy source to the managed location.
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let lists_dir = parent.join("lists");
-    std::fs::create_dir_all(&lists_dir)
-        .with_context(|| format!("create {}", lists_dir.display()))?;
-    let dest = lists_dir.join(format!("{list_id}.txt"));
-    std::fs::copy(src, &dest)
-        .with_context(|| format!("copy {} → {}", src.display(), dest.display()))?;
+    let target_path =
+        resolve_target_file_locked(guard, config_path, EntityClass::Blocklists, into)?;
+    let target_plan = guard.tree_io().plan_target(&target_path)?;
+    let target_path = target_plan.display().to_path_buf();
+    let target_relative = target_path
+        .strip_prefix(&guard.identity().root)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "blocklist import target escaped the held config root: {}",
+                target_path.display()
+            )
+        })?;
+    let target_reachable = loaded.files_loaded.iter().any(|path| path == &target_path)
+        || (target_plan.is_new()
+            && loaded_include_matches_root_file(guard, config_path, &loaded, target_relative)?
+                .is_some());
+    anyhow::ensure!(
+        target_reachable,
+        "blocklist import target {} is not included by the current config; add it to `includes` or choose an already-loaded file with --into",
+        target_path.display()
+    );
 
-    // Tally entries + auto-detect format.
-    let raw = std::fs::read_to_string(&dest).unwrap_or_default();
-    let format = autodetect_format(&raw);
-    let n_entries = count_entries(&raw, format);
+    let body_relative = PathBuf::from("lists").join(format!("{list_id}.txt"));
+    let body_plan = guard.tree_io().plan_root_file_no_follow(&body_relative)?;
+    anyhow::ensure!(
+        target_plan.key() != body_plan.key(),
+        "blocklist import config target {} aliases managed body {}; choose a different --into target",
+        target_path.display(),
+        body_plan.display().display()
+    );
+    if let Some(declared_by) =
+        loaded_include_matches_root_file(guard, config_path, &loaded, &body_relative)?
+    {
+        bail!(
+            "refusing import-local body {}: it would match an include declared by {}; remove or narrow that include before importing",
+            body_plan.display().display(),
+            declared_by.display()
+        );
+    }
 
-    let mut tbl = toml::map::Map::new();
-    tbl.insert("id".into(), Value::String(list_id.to_string()));
-    tbl.insert(
+    let mut table = toml::map::Map::new();
+    table.insert("id".into(), Value::String(list_id.to_string()));
+    table.insert(
         "display_name".into(),
         Value::String(display_name.unwrap_or(list_id).to_string()),
     );
-    // Synthetic URL — see DECISION OUTSIDE DOC in the doc-comment above.
-    tbl.insert(
+    table.insert(
         "url".into(),
         Value::String(format!("https://imported.local/{list_id}.txt")),
     );
-    tbl.insert(
+    table.insert(
         "format".into(),
-        Value::String(format_label(format).to_string()),
+        Value::String(format_label(snapshot.format).to_string()),
     );
-    tbl.insert("base".into(), Value::String(kind_label(kind).to_string()));
-    tbl.insert(
+    table.insert("base".into(), Value::String(kind_label(kind).to_string()));
+    table.insert(
         "trust".into(),
         Value::String(trust_label(trust).to_string()),
     );
-    // No `category` field — the entity was removed. No `tags` key
-    // either: `--tag` is gone, so there is nothing operator-supplied
-    // to persist, and the loader's auto-promotion of an untagged
-    // deny-list must not be round-tripped into the file by a writer.
 
-    let target_path = resolve_target_file(config_path, EntityClass::Blocklists, into)?;
-    let (mut doc, _) = read_or_empty(&target_path)?;
+    let (mut document, _) = read_or_empty_locked(guard, config_path, &target_path)?;
     upsert_id_keyed(
-        &mut doc,
+        &mut document,
         EntityClass::Blocklists.toml_key(),
         list_id,
-        Value::Table(tbl),
+        Value::Table(table),
     )?;
-    let validate_outcome = write_value_validated(config_path, &target_path, &doc);
 
-    match validate_outcome {
-        Ok(()) => {
-            let path_str = dest.display().to_string();
-            let kind_str_owned = kind_label(kind).to_string();
-            persist_audit(
-                config_path,
-                |files| {
-                    AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
-                        .with_uid(current_uid())
-                        .with_action("blocklist.import_local")
-                        .with_target_id(list_id.to_string())
-                        .with_fields_before("")
-                        .with_fields_after(format!("kind={kind_str_owned}, trust=local"))
-                        .with_files(files)
-                },
-                &[config_path, &target_path],
-            );
-
-            println!(
-                "{}",
-                format_blocklist_import_local_ok(&path_str, list_id, kind_label(kind), n_entries)
-            );
-
-            let outcome = ipc_reload::attempt_reload(socket_path).await;
-            ipc_reload::report_reload_outcome(&outcome);
-            Ok(())
-        }
-        Err(e) => {
-            // Best-effort cleanup: a rejected import shouldn't leave the
-            // managed-location file lingering. Silent on failure (operator
-            // can clean up by hand if needed).
-            let _ = std::fs::remove_file(&dest);
-            Err(e)
-        }
+    // Nothing below this point is a read-only gate. In particular, materializing
+    // `body_plan` is the first operation that can create `lists/`.
+    let prepared_config =
+        prepare_value_validated_single_locked(guard, config_path, &target_path, &document)?;
+    let body_path = body_plan.display().to_path_buf();
+    let body_target = body_plan.materialize()?;
+    if body_target.original.is_some() {
+        anyhow::ensure!(
+            managed_import_body_matches(&body_target, &mut snapshot.spool, snapshot.len)?,
+            "managed import body {} already exists but is not the exact retry snapshot; refusing to change it",
+            body_path.display()
+        );
+    } else if let Err(error) = ops.publish_body(&body_target, &mut snapshot.spool, snapshot.len) {
+        return Err(anyhow::Error::new(error).context(
+            "body publication failed; retained any body that may have been published for retry/recovery",
+        ));
     }
+
+    ops.sync_body(&body_target).context(
+        "sync published import body before config commit; retained the body for retry/recovery",
+    )?;
+    // A prior interrupted attempt can leave `lists/` visible without having
+    // durably linked it from the config root. Sync the root on every attempt,
+    // including exact-body retries and writes to a separate config directory.
+    ops.sync_config_root(guard.tree_io()).context(
+        "sync managed body directory in the config root before config commit; retained the body for retry/recovery",
+    )?;
+
+    match ops.commit_config(prepared_config) {
+        Ok(()) => Ok(ImportedLocal {
+            config_target: target_path,
+            body_path,
+            entry_count: snapshot.entry_count,
+        }),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context("config commit failed; retained the published body for retry/recovery")),
+    }
+}
+
+fn managed_import_body_matches(
+    body: &crate::config::tree_io::PinnedTarget<'_>,
+    snapshot: &mut File,
+    expected_size: u64,
+) -> anyhow::Result<bool> {
+    const BUFFER: usize = 64 * 1024;
+    let metadata = body
+        .metadata
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("managed import body disappeared"))?;
+    let parent = body.parent.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o640
+        || (metadata.uid(), metadata.gid()) != (parent.uid(), parent.gid())
+        || metadata.len() != expected_size
+    {
+        return Ok(false);
+    }
+    body.check_original()?;
+    snapshot.seek(SeekFrom::Start(0))?;
+    let held = body
+        .original
+        .as_ref()
+        .expect("metadata has an original inode");
+    let mut existing = crate::config::write_lock::reopen_inspected(held, libc::O_RDONLY)?;
+    let mut left = expected_size;
+    let mut a = [0_u8; BUFFER];
+    let mut b = [0_u8; BUFFER];
+    while left != 0 {
+        let wanted = left.min(BUFFER as u64) as usize;
+        snapshot.read_exact(&mut a[..wanted])?;
+        existing.read_exact(&mut b[..wanted])?;
+        if a[..wanted] != b[..wanted] {
+            return Ok(false);
+        }
+        left -= wanted as u64;
+    }
+    Ok(existing.read(&mut a[..1])? == 0 && snapshot.read(&mut b[..1])? == 0)
 }
 
 // ── Helpers shared by the new mutation verbs ───────────────────────
@@ -2532,11 +3161,14 @@ fn autodetect_format(raw: &str) -> BlocklistFormat {
     }
 }
 
-fn count_entries(raw: &str, _format: BlocklistFormat) -> usize {
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .count()
+fn count_entries(raw: &str, format: BlocklistFormat) -> usize {
+    use crate::lists::detector::ListFormat;
+    let format = match format {
+        BlocklistFormat::Domains => ListFormat::DomainOnly,
+        BlocklistFormat::Hosts => ListFormat::Hosts,
+        BlocklistFormat::Adguard => ListFormat::AdGuard,
+    };
+    usize::try_from(crate::lists::parser::count_list_entries(raw, format)).unwrap_or(usize::MAX)
 }
 
 /// Thin signature adapter over the single audit seam

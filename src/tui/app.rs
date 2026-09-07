@@ -1626,12 +1626,12 @@ pub struct DaemonStatus {
     /// extrapolation is the legacy fallback in that case.
     pub cache_cap: u64,
     /// Number of blocklist sources whose most recent refresh
-    /// succeeded. 0 when polling an older daemon (or when no
-    /// sources are configured).
+    /// succeeded. 0 when polling an older daemon or when the completed
+    /// registry has no source rows; `lists_cycle` distinguishes those cases.
     pub lists_active: u32,
-    /// Total number of configured blocklist sources. 0 when
-    /// polling an older daemon; `list_count` above is the legacy
-    /// fallback.
+    /// Total number of completed-registry source rows. 0 may be an
+    /// intentional clear; `list_count` is the legacy fallback only when
+    /// `lists_cycle` is absent.
     pub lists_total: u32,
     /// Resource-budget sample (RSS / VSZ / fd count / CPU%)
     /// plus the configured `rss_warn_mb` threshold. `None` until the
@@ -1655,18 +1655,13 @@ pub struct DaemonStatus {
     ///
     /// Carried beside the refusal because the refusal payload is rebuilt by
     /// every refused cycle and so reads identically on day one and on day
-    /// fourteen. Not rendered yet — the field exists so the projection
-    /// cannot lose it before a panel is there to show it.
-    #[allow(dead_code)] // carried for the TUI; no panel renders it yet
+    /// fourteen. Rendered with the Pulse-row refusal state.
     pub lists_corpus_freeze: Option<crate::lists::status::CorpusFreeze>,
-    /// Number of sources whose most recent refresh hit `max_entries` and
-    /// dropped entries on the floor.
-    ///
-    /// The **second** blind spot of the same shape: a truncated source
-    /// is *also* active, so it too is invisible in `lists_active`, and
-    /// before this the TUI carried no notion of list truncation at all.
-    /// Weaker than a refusal — the corpus did install, just short — so it
-    /// annotates the counts rather than replacing them.
+    /// Last list cycle. Its coverage qualifier prevents a stale N/N source
+    /// count from being rendered as a healthy corpus.
+    pub lists_cycle: Option<crate::lists::status::CycleMark>,
+    /// Number of sources whose most recent refresh was refused by
+    /// `max_entries`. A retained last-good cache can still be active.
     pub lists_truncated: u32,
     /// Per-server upstream list (primary then fallback), each with its
     /// literal address and kind. Empty when polling a daemon that does not
@@ -2604,6 +2599,11 @@ pub struct CatalogPickerRow {
     /// **existing** entry's id, so Save upserts it instead of creating a
     /// twin under a derived name.
     pub canonical_id: String,
+    /// Identity captured for a row that was already subscribed when the
+    /// picker opened. Save must still find this exact id and canonical URL
+    /// before changing its `enabled` flag.
+    pub captured_id: Option<String>,
+    pub captured_canonical_url: Option<String>,
     pub url: String,
     /// Human label from the catalog (`name`), e.g. `"DoH Resolvers"`.
     /// Written as `display_name` on a newly-created entry.
@@ -2635,7 +2635,7 @@ pub struct CatalogPickerRow {
     /// for dirty rows — so a kind-only edit would be silently dropped
     /// before Save ever sees it. `base = allow` would also be refused by
     /// the validator for any row not already `trust = local` on disk:
-    /// `build_catalog_blocklist_value` never sets `accept_unsigned_allow`,
+    /// the fresh-row builder never sets `accept_unsigned_allow`,
     /// and a brand-new entry's `trust` defaults to `remote-unsigned`, so
     /// either lands on
     /// [`crate::config::error::ConfigError::UnsignedAllowListRequiresAck`].
@@ -2701,6 +2701,10 @@ pub struct EditListModal {
     /// catalog subscribe flow always sets this to `true` since rows
     /// are pre-validated by the catalog publisher.
     pub skip_head_check: bool,
+    /// A successful Add/Promote HEAD probe, keyed by the exact candidate
+    /// URL. This is transient submit state; it never changes the operator's
+    /// persistent `skip_head_check` choice.
+    pub head_probe_passed_for: Option<String>,
     pub interval: IntervalChoice,
     /// Custom interval buffer — populated only when `interval ==
     /// IntervalChoice::Custom`. Numeric string the operator types in.
@@ -2770,9 +2774,13 @@ pub enum EditModalMode {
     /// domain they add to it, at every refresh, with nothing on screen
     /// afterwards to mark the moment it was granted.
     ///
-    /// `Esc` returns to `Edit` with `consent_declared` untouched. Only
+    /// `Esc` returns to the form that opened the confirmation with
+    /// `consent_declared` untouched. Only
     /// `typed == EditListModal::blocklist_id` on `Enter` sets it.
-    ConfirmUnsignedAllow { typed: String },
+    ConfirmUnsignedAllow {
+        typed: String,
+        origin: UnsignedAllowOrigin,
+    },
     /// Promote-orphan mode. `source` is the raw string that lives in
     /// `[lists].sources` and that the save flow must remove after the
     /// new v1 entry lands. The Tab cycle starts on `EditField::ListId`
@@ -2789,6 +2797,25 @@ pub enum EditModalMode {
     /// renders as "Cancel" so the operator has an explicit Tab-target
     /// for "back out without saving" alongside the global Esc.
     Add,
+}
+
+/// Form mode to restore after the unsigned-allow confirmation. Promote
+/// retains its source string so confirmation cannot turn it into Add.
+#[derive(Debug, Clone)]
+pub enum UnsignedAllowOrigin {
+    Edit,
+    Promote { source: String },
+    Add,
+}
+
+impl UnsignedAllowOrigin {
+    pub fn into_mode(self) -> EditModalMode {
+        match self {
+            Self::Edit => EditModalMode::Edit,
+            Self::Promote { source } => EditModalMode::Promote { source },
+            Self::Add => EditModalMode::Add,
+        }
+    }
 }
 
 /// Field-focus enumeration for `Tab` / `Shift-Tab` cycling. Read-only
@@ -2894,11 +2921,12 @@ impl EditField {
     }
 }
 
-/// Update-interval picker — six fixed presets plus a `Custom` slot that
+/// Update-interval picker — inherited, six fixed presets, plus a `Custom` slot that
 /// reveals a numeric input. The schema accepts any `u32` hours; the
 /// presets are pure UX scaffolding (L4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntervalChoice {
+    Inherited,
     H1,
     H2,
     H6,
@@ -2909,7 +2937,8 @@ pub enum IntervalChoice {
 }
 
 impl IntervalChoice {
-    pub const ORDER: [IntervalChoice; 7] = [
+    pub const ORDER: [IntervalChoice; 8] = [
+        IntervalChoice::Inherited,
         IntervalChoice::H1,
         IntervalChoice::H2,
         IntervalChoice::H6,
@@ -2934,10 +2963,15 @@ impl IntervalChoice {
         }
     }
 
-    /// Preset hours for the fixed slots; `None` for `Custom` (caller
-    /// reads the operator-supplied buffer instead).
+    pub fn from_optional_hours(hours: Option<u32>) -> IntervalChoice {
+        hours.map_or(IntervalChoice::Inherited, Self::from_hours)
+    }
+
+    /// Preset hours for fixed slots. `Inherited` and `Custom` return
+    /// `None`; callers distinguish the latter to read its buffer.
     pub fn hours(self) -> Option<u32> {
         match self {
+            IntervalChoice::Inherited => None,
             IntervalChoice::H1 => Some(1),
             IntervalChoice::H2 => Some(2),
             IntervalChoice::H6 => Some(6),
@@ -2950,6 +2984,7 @@ impl IntervalChoice {
 
     pub fn label(self) -> &'static str {
         match self {
+            IntervalChoice::Inherited => "Inherited",
             IntervalChoice::H1 => "1h",
             IntervalChoice::H2 => "2h",
             IntervalChoice::H6 => "6h",
