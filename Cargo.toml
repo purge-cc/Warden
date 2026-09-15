@@ -1,6 +1,6 @@
 [package]
 name = "purge-warden"
-version = "0.41.0"
+version = "0.42.0"
 edition = "2021"
 # Minimum supported Rust version. cargo enforces this at build time even
 # for a `publish = false` crate, so an outsider on an older toolchain gets a
@@ -29,6 +29,7 @@ name = "oui-pack"
 path = "tools/oui_pack.rs"
 
 [dependencies]
+base64 = "0.22"
 # Core DNS
 hickory-server = "0.26"
 hickory-proto = "0.26"
@@ -121,6 +122,8 @@ async-trait = "0.1"
 
 # Regex (rule pattern matching)
 regex = "1"
+regex-automata = { version = "0.4.14", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "unicode"] }
+regex-syntax = "0.8.10"
 
 # Error handling
 thiserror = "2"
@@ -161,8 +164,14 @@ memmap2 = "0.9"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-segmentation = "1.13"
+unicode-width = "=0.2.0"
+
+# Bounded streaming from immutable corpus objects.
+tokio-util = { version = "0.7", features = ["io"], optional = true }
 
 [features]
+default = ["cluster"]
 # DNS-over-QUIC (RFC 9250) upstream transport. OFF by default — opt in with
 # `--features doq`. Sprint §4.9-1 ships the QUIC transport + handshake only;
 # message framing + the Upstream::Doq config variant land in §4.9-2.
@@ -177,21 +186,8 @@ doq = ["dep:quinn"]
 # the default and Raspberry Pi binaries stay byte-for-byte unchanged.
 dnssec = ["hickory-proto/dnssec-ring", "dep:data-encoding"]
 
-# §4.11 primary/secondary cluster replication. OFF by default — opt in with
-# `--features cluster`. Gates the serve-side endpoints (`/api/cluster/*`), the
-# policy serialiser, and the generation/hash bookkeeping. The `[cluster]` CONFIG
-# section is parsed unconditionally (§4.11-1) so a clustered config deserialises
-# on any build; a feature-less binary with `cluster.enabled` bails at startup
-# (mirrors the dnssec/doq `--features` contract). Kept gated so the default and
-# Raspberry Pi binaries stay byte-for-byte unchanged.
-#
-# Carries exactly ONE dependency, `rcgen` (S4): the primary mints its own
-# self-signed API certificate so the secondary has something to pin. The
-# postcard+zstd domain-map codec that used to be here went out with the map
-# transfer (`cluster_sync_policy_only.md` §3) — only policy crosses the wire
-# now, as TOML. This comment read "carries no extra dependencies" until S4;
-# it is updated in the commit that made it false rather than left to rot.
-cluster = ["dep:rcgen"]
+# Cluster control plane is included in standard builds and inactive until configured.
+cluster = ["dep:rcgen", "dep:tokio-util"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
@@ -238,6 +234,10 @@ harness = false
 
 [[bench]]
 name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "resolver_bench"
 harness = false
 
 [profile.release]

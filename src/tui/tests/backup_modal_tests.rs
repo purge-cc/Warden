@@ -12,14 +12,14 @@ fn dummy_poller(dir: &Path) -> IpcPoller {
     IpcPoller::new(&dir.join("ghost.sock"))
 }
 
-/// Minimal v2 master that `load_v1_config` will accept. Mirrors the
+/// Minimal current-schema master that `load_current_config` accepts. Mirrors the
 /// helper used by the s53 list-modal tests but copied here so this
 /// module is independent.
 fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]

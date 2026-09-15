@@ -16,7 +16,7 @@
 
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use compact_str::CompactString;
@@ -52,10 +52,20 @@ pub enum PackReadError {
     Permission { path: PathBuf },
     #[error("custom list file {path} is {size} bytes, over the {cap}-byte limit")]
     TooLarge { path: PathBuf, size: u64, cap: u64 },
+    #[error("custom list bodies would occupy {size} bytes, over the {cap}-byte aggregate limit")]
+    AggregateTooLarge { path: PathBuf, size: u64, cap: u64 },
+    #[error("custom list declaration {path} exceeds the {cap}-member limit ({count} declared)")]
+    TooManyMembers {
+        path: PathBuf,
+        count: usize,
+        cap: usize,
+    },
     #[error("custom list file {path} is not valid UTF-8")]
     NotUtf8 { path: PathBuf },
     #[error("custom list file {path} is a symlink; refusing to follow it")]
     Symlink { path: PathBuf },
+    #[error("custom list file {path} has multiple hard links; refusing to read it")]
+    HardLink { path: PathBuf },
     #[error("custom list file {path} could not be read: {source}")]
     Io {
         path: PathBuf,
@@ -76,8 +86,17 @@ impl PackReadError {
                 "make the file readable by the warden user, or drop the entry that names it"
             }
             Self::TooLarge { .. } => "split the file, or raise [custom_list_limits] max_file_bytes",
+            Self::AggregateTooLarge { .. } => {
+                "split or remove custom list bodies until their total is within the hard aggregate limit"
+            }
+            Self::TooManyMembers { .. } => {
+                "remove custom list declarations until their count is within the hard member limit"
+            }
             Self::Symlink { .. } => {
-                "replace the symlink with a plain file, or drop the entry that names it"
+                "replace the symlink with a plain single-link file, or drop the entry that names it"
+            }
+            Self::HardLink { .. } => {
+                "replace the hard link with a plain single-link file, or drop the entry that names it"
             }
             Self::NotUtf8 { .. } | Self::Io { .. } => {
                 "repair the file, or drop the [[custom_lists]] entry that names it"
@@ -99,15 +118,59 @@ pub fn read_pack(path: &Path, max_bytes: u64) -> Result<CompiledCustomList, Pack
     Ok(parse_text(&text, path))
 }
 
-pub(crate) fn read_pack_from_file(
+pub(crate) fn read_pack_with_budget(
+    path: &Path,
+    max_bytes: u64,
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(CompiledCustomList, u64), PackReadError> {
+    let file = open_pack(path)?;
+    read_pack_from_file_with_budget(file, path, max_bytes, total_before, total_cap)
+}
+
+/// Read one descriptor-pinned pack after admitting its actual body size to a
+/// running aggregate budget. The aggregate check occurs before UTF-8 decoding
+/// or rule parsing, and the bounded read repeats the check if the inode grows.
+pub(crate) fn read_pack_from_file_with_budget(
     file: std::fs::File,
     path: &Path,
     max_bytes: u64,
-) -> Result<CompiledCustomList, PackReadError> {
-    Ok(parse_text(
-        &read_text_from_file(file, path, max_bytes)?,
-        path,
-    ))
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(CompiledCustomList, u64), PackReadError> {
+    let (text, bytes) =
+        read_pack_text_from_file_with_budget(file, path, max_bytes, total_before, total_cap)?;
+    Ok((parse_text(&text, path), bytes))
+}
+
+/// Admit an overlay body to the same running aggregate budget as a pack file.
+/// Overlay bytes are already owned by the transaction, but are not decoded or
+/// compiled until both the per-file and aggregate ceilings admit them.
+pub(crate) fn read_pack_from_bytes_with_budget(
+    bytes: &[u8],
+    path: &Path,
+    max_bytes: u64,
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(CompiledCustomList, u64), PackReadError> {
+    let (text, len) =
+        read_pack_text_from_bytes_with_budget(bytes, path, max_bytes, total_before, total_cap)?;
+    Ok((parse_text(text, path), len))
+}
+
+pub(crate) fn read_pack_text_from_bytes_with_budget<'a>(
+    bytes: &'a [u8],
+    path: &Path,
+    max_bytes: u64,
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(&'a str, u64), PackReadError> {
+    let len = bytes.len() as u64;
+    admit_pack_bytes(path, len, max_bytes, total_before, total_cap)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| PackReadError::NotUtf8 {
+        path: path.to_path_buf(),
+    })?;
+    Ok((text, len))
 }
 
 fn parse_text(text: &str, path: &Path) -> CompiledCustomList {
@@ -173,20 +236,22 @@ pub fn read_pack_lines(path: &Path, max_bytes: u64) -> Result<Vec<PackLineView>,
 /// takes this posture. Working from a single descriptor also closes the
 /// window between the size check and the read.
 fn read_text(path: &Path, max_bytes: u64) -> Result<String, PackReadError> {
-    let file = match std::fs::OpenOptions::new()
+    let file = open_pack(path)?;
+    read_text_from_file(file, path, max_bytes)
+}
+
+fn open_pack(path: &Path) -> Result<std::fs::File, PackReadError> {
+    match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(PackReadError::Symlink {
-                path: path.to_path_buf(),
-            })
-        }
-        Err(e) => return Err(classify(path, e)),
-    };
-    read_text_from_file(file, path, max_bytes)
+        Ok(file) => Ok(file),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(PackReadError::Symlink {
+            path: path.to_path_buf(),
+        }),
+        Err(e) => Err(classify(path, e)),
+    }
 }
 
 fn read_text_from_file(
@@ -199,6 +264,11 @@ fn read_text_from_file(
         return Err(PackReadError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+        });
+    }
+    if meta.nlink() != 1 {
+        return Err(PackReadError::HardLink {
+            path: path.to_path_buf(),
         });
     }
     if meta.len() > max_bytes {
@@ -224,6 +294,85 @@ fn read_text_from_file(
     String::from_utf8(bytes).map_err(|_| PackReadError::NotUtf8 {
         path: path.to_path_buf(),
     })
+}
+
+pub(crate) fn read_pack_text_from_file_with_budget(
+    mut file: std::fs::File,
+    path: &Path,
+    max_bytes: u64,
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(String, u64), PackReadError> {
+    let meta = file.metadata().map_err(|e| classify(path, e))?;
+    validate_pack_metadata(&meta, path)?;
+    admit_pack_bytes(path, meta.len(), max_bytes, total_before, total_cap)?;
+
+    let remaining = total_cap.saturating_sub(total_before);
+    let read_cap = max_bytes.min(remaining);
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(read_cap)
+        .read_to_end(&mut bytes)
+        .map_err(|e| classify(path, e))?;
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra).map_err(|e| classify(path, e))? != 0 {
+        if max_bytes < remaining {
+            return Err(PackReadError::TooLarge {
+                path: path.to_path_buf(),
+                size: max_bytes.saturating_add(1),
+                cap: max_bytes,
+            });
+        }
+        return Err(PackReadError::AggregateTooLarge {
+            path: path.to_path_buf(),
+            size: total_before.saturating_add(read_cap).saturating_add(1),
+            cap: total_cap,
+        });
+    }
+    let bytes_read = bytes.len() as u64;
+    let text = String::from_utf8(bytes).map_err(|_| PackReadError::NotUtf8 {
+        path: path.to_path_buf(),
+    })?;
+    Ok((text, bytes_read))
+}
+
+fn validate_pack_metadata(meta: &std::fs::Metadata, path: &Path) -> Result<(), PackReadError> {
+    if !meta.is_file() {
+        return Err(PackReadError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+        });
+    }
+    if meta.nlink() != 1 {
+        return Err(PackReadError::HardLink {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn admit_pack_bytes(
+    path: &Path,
+    size: u64,
+    max_bytes: u64,
+    total_before: u64,
+    total_cap: u64,
+) -> Result<(), PackReadError> {
+    if size > max_bytes {
+        return Err(PackReadError::TooLarge {
+            path: path.to_path_buf(),
+            size,
+            cap: max_bytes,
+        });
+    }
+    if size > total_cap.saturating_sub(total_before) {
+        return Err(PackReadError::AggregateTooLarge {
+            path: path.to_path_buf(),
+            size: total_before.saturating_add(size),
+            cap: total_cap,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn classify(path: &Path, e: std::io::Error) -> PackReadError {
@@ -905,6 +1054,18 @@ mod tests {
         assert!(matches!(
             read_pack_lines(&link, 1024 * 1024).unwrap_err(),
             PackReadError::Symlink { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hardlinked_pack_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = write(dir.path(), "original.txt", "||ads.example.test^\n");
+        let link = dir.path().join("linked.txt");
+        std::fs::hard_link(original, &link).unwrap();
+        assert!(matches!(
+            read_pack(&link, 1024 * 1024),
+            Err(PackReadError::HardLink { .. })
         ));
     }
 

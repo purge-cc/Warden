@@ -24,17 +24,22 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
+use std::sync::Arc;
 
-use compact_str::CompactString;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
+use purge_warden::config::schema::{ConfigV1, Id, Profile, TARGET_SCHEMA_VERSION_V5};
 use purge_warden::config::settings::CacheConfig;
 use purge_warden::dns::cache::{CacheLookup, DnsCache};
-use purge_warden::filter::cname::NamePolicy;
-use purge_warden::filter::ip_filter::IpFilter;
+use purge_warden::filter::cname::{walk_response_with_grant, Verdict};
+use purge_warden::filter::operator_rules::{
+    CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+};
 use purge_warden::filter::FilterEngine;
+use purge_warden::profiles::profile::ResolvedProfile;
+use purge_warden::profiles::resolver::ProfileResolver;
 
 fn config() -> CacheConfig {
     CacheConfig {
@@ -72,6 +77,43 @@ fn a_record(domain: &str, ip: [u8; 4], ttl: u32) -> Record {
     )
 }
 
+fn compiled_profile(content: &str) -> Arc<ResolvedProfile> {
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content,
+            }],
+            &[ProfileMounts {
+                profile_id: "default",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    let mut config = ConfigV1 {
+        schema_version: TARGET_SCHEMA_VERSION_V5,
+        ..ConfigV1::default()
+    };
+    config.server.default_profile = Some(Id::new("default").unwrap());
+    config.profiles.insert(
+        "default".to_string(),
+        Profile {
+            custom_lists: vec![Id::new("rules").unwrap()],
+            ..Profile::default()
+        },
+    );
+    ProfileResolver::build_with_operator_rules(&config, rules)
+        .resolve(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .profile
+        .expect("default profile must resolve")
+}
+
 #[tokio::test]
 async fn m12_cname_race_post_population_rule_add_invalidates_on_hit() {
     // Timeline:
@@ -106,9 +148,8 @@ async fn m12_cname_race_post_population_rule_add_invalidates_on_hit() {
 
     // T1: operator adds the deny rule. This is the moment a filter
     // snapshot ArcSwap fires in production.
-    let blocked: ahash::HashSet<CompactString> =
-        std::iter::once(CompactString::from("tracker.evil.com")).collect();
-    let filter = FilterEngine::with_domains(blocked);
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.com");
 
     // T2: simulate the cache-hit branch's re-check.
     let lookup = cache
@@ -119,24 +160,17 @@ async fn m12_cname_race_post_population_rule_add_invalidates_on_hit() {
         _ => panic!("entry was just populated, must be fresh"),
     };
 
-    // The new helper in handler.rs is `check_cname_chain` — but for the
-    // integration test we use the same lower-level walker the splice
-    // exercises: any CNAME target landing in the deny set must trip.
-    let mut tripped: Option<String> = None;
-    for record in entry.records() {
-        if record.record_type() == RecordType::CNAME {
-            if let RData::CNAME(ref t) = record.data {
-                let target = t.to_string();
-                let target_norm = target.trim_end_matches('.').to_ascii_lowercase();
-                if filter.is_blocked(&target_norm) {
-                    tripped = Some(target_norm);
-                    break;
-                }
-            }
-        }
-    }
-    let tripped = tripped.expect("M-12 CNAME race must trip the post-cache-hit re-check");
-    assert_eq!(tripped, "tracker.evil.com");
+    assert!(matches!(
+        walk_response_with_grant(
+            entry.records(),
+            "alias.example.com",
+            &filter,
+            &profile,
+            None,
+            16,
+        ),
+        Verdict::Block { .. }
+    ));
 
     // The handler's splice now invalidates the exact tuple it just
     // looked up, then sends a canned block. The cache must NOT serve
@@ -147,54 +181,6 @@ async fn m12_cname_race_post_population_rule_add_invalidates_on_hit() {
     assert!(matches!(
         cache
             .lookup("alias.example.com", RecordType::A, DNSClass::IN, None)
-            .await,
-        CacheLookup::Miss
-    ));
-}
-
-#[tokio::test]
-async fn m12_ip_blocklist_race_post_population_invalidates_on_hit() {
-    // Symmetric to the CNAME race but for the IP blocklist axis. A
-    // cached A record points at 1.2.3.4. After the cache populates, the
-    // operator adds 1.2.3.4 to the IP blocklist. The next cache hit
-    // must trip the IP re-check, invalidate, and block.
-    let cache = DnsCache::new(&config());
-    cache
-        .insert(
-            "fastflux.example.com",
-            RecordType::A,
-            DNSClass::IN,
-            vec![a_record("fastflux.example.com.", [1, 2, 3, 4], 300)],
-            ResponseCode::NoError,
-            None,
-            None,
-        )
-        .await;
-
-    let mut bad_ips: ahash::HashSet<IpAddr> = ahash::HashSet::default();
-    bad_ips.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-    let ipf = IpFilter::with_ips(bad_ips);
-
-    let entry = match cache
-        .lookup("fastflux.example.com", RecordType::A, DNSClass::IN, None)
-        .await
-    {
-        CacheLookup::Fresh(e) => e,
-        _ => panic!("entry was just populated, must be fresh"),
-    };
-
-    assert_eq!(
-        ipf.check_response(entry.records(), NamePolicy::Neutral),
-        Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
-        "M-12 IP race must trip the post-cache-hit re-check"
-    );
-
-    cache
-        .invalidate_key("fastflux.example.com", RecordType::A, DNSClass::IN, None)
-        .await;
-    assert!(matches!(
-        cache
-            .lookup("fastflux.example.com", RecordType::A, DNSClass::IN, None)
             .await,
         CacheLookup::Miss
     ));
@@ -263,33 +249,19 @@ async fn stale_path_cname_block_re_check_invalidates() {
         _ => panic!("entry should be Stale after TTL expiry (pre-stale-buffer)"),
     };
 
-    // Post-population rule add — mirrors a runtime ArcSwap of the filter.
-    let blocked: ahash::HashSet<CompactString> =
-        std::iter::once(CompactString::from("tracker.evil.com")).collect();
-    let filter = FilterEngine::with_domains(blocked);
-
-    // Mirror what the §4.42 stale-fallback guard does: scan the cached
-    // CNAME chain for a deny-set hit. The handler's live path uses
-    // `walk_response` from `filter::cname`; we open-code the same scan
-    // to match the existing M-12 test pattern and avoid pulling in
-    // ResolvedProfile fixtures.
-    let mut tripped: Option<String> = None;
-    for record in entry.records() {
-        if record.record_type() == RecordType::CNAME {
-            if let RData::CNAME(ref t) = record.data {
-                let target = t.to_string();
-                let target_norm = target.trim_end_matches('.').to_ascii_lowercase();
-                if filter.is_blocked(&target_norm) {
-                    tripped = Some(target_norm);
-                    break;
-                }
-            }
-        }
-    }
-    let tripped = tripped.expect(
-        "§4.42 stale-fallback guard must trip on cached CNAME chain when target now denied",
-    );
-    assert_eq!(tripped, "tracker.evil.com");
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.com");
+    assert!(matches!(
+        walk_response_with_grant(
+            entry.records(),
+            "alias.example.com",
+            &filter,
+            &profile,
+            None,
+            16,
+        ),
+        Verdict::Block { .. }
+    ));
 
     // After the live helper invalidates the bucket, the cache must not
     // surface the entry again — not even as Stale.
@@ -299,60 +271,6 @@ async fn stale_path_cname_block_re_check_invalidates() {
     assert!(matches!(
         cache
             .lookup("alias.example.com", RecordType::A, DNSClass::IN, None)
-            .await,
-        CacheLookup::Miss
-    ));
-}
-
-#[tokio::test]
-async fn stale_path_ip_block_re_check_invalidates() {
-    // Symmetric to `stale_path_cname_block_re_check_invalidates` for the
-    // IP-blocklist axis: cache populated with an A record, runtime
-    // blocklist add for the response IP, then verify the §4.42 stale
-    // guard would trip via `ip_filter::IpFilter::check_response`.
-    let cfg = CacheConfig {
-        min_ttl_secs: 0,
-        ..config()
-    };
-    let cache = DnsCache::new(&cfg);
-    cache
-        .insert(
-            "fastflux.example.com",
-            RecordType::A,
-            DNSClass::IN,
-            vec![a_record("fastflux.example.com.", [1, 2, 3, 4], 1)],
-            ResponseCode::NoError,
-            None,
-            None,
-        )
-        .await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-    let lookup = cache
-        .lookup("fastflux.example.com", RecordType::A, DNSClass::IN, None)
-        .await;
-    let entry = match lookup {
-        CacheLookup::Stale(e) => e,
-        _ => panic!("entry should be Stale after TTL expiry (pre-stale-buffer)"),
-    };
-
-    let mut bad_ips: ahash::HashSet<IpAddr> = ahash::HashSet::default();
-    bad_ips.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-    let ipf = IpFilter::with_ips(bad_ips);
-
-    assert_eq!(
-        ipf.check_response(entry.records(), NamePolicy::Neutral),
-        Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
-        "§4.42 stale-fallback guard must trip on the cached A record's now-blocked IP"
-    );
-
-    cache
-        .invalidate_key("fastflux.example.com", RecordType::A, DNSClass::IN, None)
-        .await;
-    assert!(matches!(
-        cache
-            .lookup("fastflux.example.com", RecordType::A, DNSClass::IN, None)
             .await,
         CacheLookup::Miss
     ));

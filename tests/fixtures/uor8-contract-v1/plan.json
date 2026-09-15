@@ -1,0 +1,52 @@
+{
+  "contract_version": 1,
+  "planner_version": 1,
+  "request": {
+    "contract_version": 1,
+    "request_id": "golden-plan-v1",
+    "expected_config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "operations": [
+      {
+        "op": "add_domain_rule",
+        "id": "local-rules",
+        "domain": "telemetry.invalid",
+        "action": "deny"
+      }
+    ],
+    "expected_plan_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "base_config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate_config_revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "base_operator_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "candidate_operator_policy_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "semantic_diff": {
+    "semantic_changed": true,
+    "cosmetic_changed": false,
+    "rules_added": 1,
+    "rules_removed": 0,
+    "exact_changes": 1,
+    "wildcard_changes": 0,
+    "regex_changes": 0,
+    "changed_scopes": [
+      "custom_list:local-rules"
+    ],
+    "omitted_entries": 0
+  },
+  "plan_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "changed": true,
+  "touched_members": [
+    "custom_list:local-rules"
+  ],
+  "impacted_profiles": [
+    "default"
+  ],
+  "impacted_recipients": [
+    "profile:default"
+  ],
+  "pack_bytes_after": 21,
+  "rules_after": 1,
+  "warnings": [],
+  "required_capabilities": [
+    "semantic_hash"
+  ]
+}

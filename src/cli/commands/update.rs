@@ -174,7 +174,7 @@ fn render_completed_refresh(snapshot: &ListRegistrySnapshotDto, ceiling: Option<
 /// operation succeeding. "Daemon down" is only a failure for the verbs
 /// whose whole job is talking to the daemon.
 ///
-/// **Loader.** Uses the v1 [`loader::load_config`] (the same loader the
+/// **Loader.** Uses [`loader::load_current_config`] (the same loader the
 /// daemon and the rest of the CLI surface use), so a config with
 /// `[lists].sources = []` and `[[blocklists]]` populated is read
 /// correctly here rather than reporting "no list sources configured".
@@ -187,7 +187,7 @@ pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i
     // Resolve this command's socket here, not in `main`: an invalid config
     // must return CONFIG rather than escaping through anyhow as exit 1.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = match loader::load_config(config_path, now) {
+    let loaded = match loader::load_current_config(config_path, now) {
         Ok(l) => l,
         Err(errs) => {
             eprintln!(

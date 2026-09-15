@@ -33,6 +33,8 @@
 //! `LISTS_TAB_EMPTY` is a frozen string, pinned byte-for-byte by
 //! `tests/frozen_strings_s43.rs`.
 
+use std::cmp::Ordering;
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -45,11 +47,11 @@ use crate::config::schema::validator::{inert_blocklists, InertListReason};
 use crate::config::schema::{BlocklistBase, BlocklistFormat, BlocklistTrust};
 use crate::lists::status::BlocklistStatusDto;
 use crate::tui::app;
-use crate::tui::app::{App, EditField, EditListModal, EditModalMode, IntervalChoice};
+use crate::tui::app::{App, EditField, EditListModal, EditModalMode, IntervalChoice, Leaf};
 use crate::tui::format::count as format_count;
 use crate::tui::modal_form;
+use crate::tui::mouse::{self, MouseAction, SortOrder};
 use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
 
 /// Frozen empty-state message, pinned byte-for-byte by
 /// `tests/frozen_strings_s43.rs`.
@@ -93,6 +95,9 @@ pub struct ListRowMeta {
     /// `None` when the schema entry is missing (orphan row — nothing to
     /// judge) or the list genuinely has effect.
     pub inert_reason: Option<String>,
+    /// True only when the actual runtime source matches a catalog URL.
+    /// Computed once during projection, never during sorting.
+    pub source_is_catalog: bool,
 }
 
 /// Build the flat row vec for the current app state — one row per
@@ -127,11 +132,92 @@ pub fn build_grouped_rows(app: &App) -> Vec<ListRowMeta> {
         .map(|dto| build_meta(app, dto, &inert_by_id))
         .collect();
     let collapsed = collapse_by_canonical_id(raw_metas);
-    collapsed
+    let catalog = crate::lists::catalog::Catalog::fallback();
+    let mut rows: Vec<ListRowMeta> = collapsed
         .into_iter()
         // Query-Log-style filter (search text + kind chip), client-side.
         .filter(|m| list_meta_matches(m, &app.lists))
-        .collect()
+        .collect();
+    for row in &mut rows {
+        row.source_is_catalog = catalog.entries().iter().any(|entry| {
+            row.dto.source == entry.id()
+                || crate::lists::source_key::canonical_url_key(&row.dto.source)
+                    == crate::lists::source_key::canonical_url_key(&entry.url)
+        });
+    }
+    if let Some(sort) = app.mouse.sort(Leaf::Lists) {
+        rows.sort_by(|a, b| compare_rows(a, b, sort.column, sort.descending));
+    }
+    rows
+}
+
+fn compare_rows(a: &ListRowMeta, b: &ListRowMeta, column: usize, descending: bool) -> Ordering {
+    let ordering = match column {
+        0 => a.selection_key().cmp(&b.selection_key()),
+        1 => source_label(a).cmp(source_label(b)),
+        2 => direction_label(a.base).cmp(direction_label(b.base)),
+        3 => a
+            .display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase()),
+        4 => format_label(a.format).cmp(format_label(b.format)),
+        5 => entries_display_count(a).cmp(&entries_display_count(b)),
+        6 => a.dto.last_outcome.cmp(&b.dto.last_outcome),
+        7 => optional_order(refresh_timestamp(a), refresh_timestamp(b), descending),
+        8 => a.used_by_profiles.cmp(&b.used_by_profiles),
+        _ => Ordering::Equal,
+    };
+    let tie = a.selection_key().cmp(&b.selection_key());
+    if column == 7 {
+        ordering.then(tie)
+    } else if descending {
+        ordering.reverse().then(tie)
+    } else {
+        ordering.then(tie)
+    }
+}
+
+fn refresh_timestamp(meta: &ListRowMeta) -> Option<OffsetDateTime> {
+    meta.dto
+        .last_refresh_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+}
+
+fn optional_order<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let order = left.cmp(&right);
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn direction_label(base: BlocklistBase) -> &'static str {
+    match base {
+        BlocklistBase::Deny => "BLOCK",
+        BlocklistBase::Allow => "ALLOW",
+        BlocklistBase::Ignore => "IGNORE",
+    }
+}
+
+fn format_label(format: Option<BlocklistFormat>) -> &'static str {
+    format.map(format_label_for).unwrap_or("—")
+}
+
+fn entries_display_count(meta: &ListRowMeta) -> u64 {
+    if meta.dto.parsed_ok > 0 {
+        meta.dto.parsed_ok
+    } else {
+        meta.dto.entries
+    }
 }
 
 fn build_meta(
@@ -195,6 +281,7 @@ fn build_meta(
         used_by_profiles,
         is_stale,
         inert_reason,
+        source_is_catalog: false,
     }
 }
 
@@ -356,9 +443,11 @@ pub fn focused_list(app: &App) -> Option<ListRowMeta> {
 // ── Render ───────────────────────────────────────────────────────────
 
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
+    let overlay_area = area;
+    let area = crate::tui::filter_chips::render_card(f, area, app);
     if app.lists.entries.is_empty() {
         render_empty(f, area, app);
-        render_overlays(f, area, app);
+        render_overlays(f, overlay_area, app);
         return;
     }
 
@@ -397,11 +486,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let refusal_para = refusal.map(|r| corpus_refusal_paragraph(r, app));
     let inert_para = (inert_count > 0).then(|| inert_summary_paragraph(&grouped));
 
-    let mut constraints = Vec::with_capacity(4);
+    let mut constraints = Vec::with_capacity(3);
     if let Some(p) = &refusal_para {
         constraints.push(Constraint::Length(alert_band_height(p, area.width)));
     }
-    constraints.push(Constraint::Length(3)); // shared filter card, no title
     if let Some(p) = &inert_para {
         constraints.push(Constraint::Length(alert_band_height(p, area.width)));
     }
@@ -413,14 +501,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(p, chunks[next]);
         next += 1;
     }
-    render_filters(f, chunks[next], app);
-    next += 1;
     if let Some(p) = inert_para {
         f.render_widget(p, chunks[next]);
         next += 1;
     }
     render_table(f, chunks[next], app, &grouped);
-    render_overlays(f, area, app);
+    render_overlays(f, overlay_area, app);
 }
 
 /// `tui-blind-to-corpus-refusal`: the band that says the last reload
@@ -520,6 +606,12 @@ fn alert_band_height(para: &Paragraph<'static>, width: u16) -> u16 {
 }
 
 fn render_overlays(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(id) = app.lists.detail_id.as_deref() {
+        render_subscription_detail(f, area, app, id);
+    }
+    if let Some(selected) = app.lists.import_source {
+        render_import_source(f, area, selected, app.lists.import_source_focus);
+    }
     // Catalog picker renders BELOW the edit modal so a (theoretical)
     // collision lands the form-mutation surface highest.
     // Event-gates in `tui::mod.rs` make collisions unreachable in
@@ -571,60 +663,151 @@ fn render_overlays(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Shared filter card: a text search (`/`) combined with the
-/// all/block/allow kind chip (`f` — `k` is taken by scroll-up). Mirrors
-/// `tabs::query_log::render_filters` / `tabs::rules::render_filters` —
-/// all three (plus Tags) go through `theme::render_filter_card`.
-fn render_filters(f: &mut Frame, area: Rect, app: &App) {
-    let content_area = theme::render_filter_card(f, area);
-
-    let (search_val, search_style) = match &app.input_mode {
-        app::InputMode::FilterLists(s) => (format!("{s}_"), Style::default().fg(T.info)),
-        _ => (
-            app.lists.filter_text.clone().unwrap_or_default(),
-            Style::default().fg(T.text_secondary),
-        ),
+fn render_subscription_detail(f: &mut Frame, area: Rect, app: &App, id: &str) {
+    let Some(meta) = build_grouped_rows(app)
+        .into_iter()
+        .find(|row| row_key(row).as_deref() == Some(id))
+    else {
+        return;
     };
-
-    let chip = |label: &str, selected: bool| {
-        let style = if selected {
-            Style::default()
-                .fg(T.text_inverse)
-                .bg(T.brand_red)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(T.text_secondary)
-        };
-        Span::styled(format!(" {label} "), style)
-    };
-
-    let kind = app.lists.kind_filter;
-    // Width budget: build the fixed spans (label + chips + clear hint)
-    // first, then give the search value whatever horizontal space is left
-    // — tail-kept so the trailing `_` edit cursor stays visible and the
-    // chips never scroll off on a long query. Mirrors tabs::query_log.
-    let lead = Span::styled("Search [/]: ", Style::default().fg(T.text_muted));
-    let trailing = vec![
-        Span::styled("   Kind [f]: ", Style::default().fg(T.text_muted)),
-        chip("all", kind == app::ListsKindFilter::All),
-        Span::raw(" "),
-        chip("block", kind == app::ListsKindFilter::Block),
-        Span::raw(" "),
-        chip("allow", kind == app::ListsKindFilter::Allow),
-        Span::styled("   [R] clear", Style::default().fg(T.text_muted)),
-    ];
-    let fixed: usize = lead.width() + trailing.iter().map(|s| s.width()).sum::<usize>();
-    let budget = (content_area.width as usize).saturating_sub(fixed).max(11);
-    let shown = if search_val.is_empty() {
-        "___________".to_string()
+    let name = if meta.display_name.is_empty() {
+        "—"
     } else {
-        crate::tui::tabs::query_log::truncate_tail(&search_val, budget)
+        &meta.display_name
     };
-    let mut spans = Vec::with_capacity(trailing.len() + 2);
-    spans.push(lead);
-    spans.push(Span::styled(shown, search_style));
-    spans.extend(trailing);
-    f.render_widget(Paragraph::new(Line::from(spans)), content_area);
+    let canonical = meta.canonical_id.as_deref().unwrap_or("Unmanaged source");
+    let used = if meta.used_by_profiles.is_empty() {
+        "None · This Subscription Filters Nothing".to_string()
+    } else {
+        meta.used_by_profiles.join(", ")
+    };
+    let mut prose = vec![
+        modal_form::ProseRow::emphasis(
+            format!("ID              {canonical}"),
+            modal_form::ValueKind::Identity,
+        ),
+        modal_form::ProseRow::plain(format!("Display         {name}")),
+        modal_form::ProseRow::verbatim(
+            format!("URL             {}", meta.dto.source),
+            modal_form::ValueKind::Identity,
+        ),
+        modal_form::ProseRow::plain(format!("Direction       {}", direction_label(meta.base))),
+        modal_form::ProseRow::plain(format!("Entries         {}", entries_display_count(&meta))),
+        modal_form::ProseRow::plain(format!("Status          {}", meta.dto.last_outcome)),
+        modal_form::ProseRow::plain(format!("Used by         {used}")),
+    ];
+    let attention = meta.inert_reason.is_some() || meta.dto.last_outcome != "ok";
+    if app.lists.detail_advanced {
+        prose.push(modal_form::ProseRow::emphasis(
+            "ADVANCED",
+            modal_form::ValueKind::Caution,
+        ));
+        prose.push(modal_form::ProseRow::plain(format!(
+            "Trust           {}",
+            meta.trust.wire_str()
+        )));
+        prose.push(modal_form::ProseRow::plain(format!(
+            "Format          {}",
+            format_label(meta.format)
+        )));
+        prose.push(modal_form::ProseRow::plain(format!(
+            "Updated         {}",
+            meta.dto.last_refresh_at.as_deref().unwrap_or("Never")
+        )));
+        if let Some(warning) = meta.inert_reason {
+            prose.push(modal_form::ProseRow::verbatim(
+                warning,
+                modal_form::ValueKind::Blocking,
+            ));
+        }
+    }
+    let spec = modal_form::NoticeSpec {
+        title: "Subscription Details".into(),
+        desc: "Source, policy and runtime status".into(),
+        prose,
+        hint: if attention && !app.lists.detail_advanced {
+            "blocking warning remains visible · Enter shows Advanced".into()
+        } else if app.lists.detail_advanced {
+            "Enter hides Advanced".into()
+        } else {
+            "Enter shows Advanced".into()
+        },
+        keys: "[Enter] Advanced   [i / Esc] close".into(),
+        actions: vec![
+            modal_form::Action::new(
+                "  [Enter] Advanced  ",
+                false,
+                modal_form::ActionKind::Primary,
+                "",
+            )
+            .on_key(crossterm::event::KeyCode::Enter),
+            modal_form::Action::new(
+                "  [Esc] Close  ",
+                false,
+                modal_form::ActionKind::Neutral,
+                "",
+            )
+            .on_key(crossterm::event::KeyCode::Esc),
+        ],
+        ..Default::default()
+    };
+    modal_form::render_modal(f, area, 78, |width| {
+        (modal_form::notice_body(&spec, width), ())
+    });
+}
+
+/// Source choice shown by `a` before either import contract is opened.
+/// The selected index is owned by `App`; this renderer intentionally has no
+/// persistence side effects. `NoticeSpec` supplies the same modal chrome,
+/// scrolling, and keyboard/mouse choice-hit registration as other pickers.
+pub fn render_import_source(f: &mut Frame, area: Rect, selected: usize, focus: usize) {
+    modal_form::render_modal(f, area, 68, |width| {
+        let selected = selected.min(1);
+        let spec = modal_form::NoticeSpec {
+            title: "Add Subscription".into(),
+            desc: "Choose a Source".into(),
+            choices: vec![
+                modal_form::ChoiceRow {
+                    label: format!("{} Purge.cc Catalog", if selected == 0 { "●" } else { "○" }),
+                    detail: None,
+                    kind: modal_form::ValueKind::Identity,
+                    focused: selected == 0 && focus == 0,
+                    note: Some(modal_form::ChoiceNote::Detail(
+                        "Choose Which Catalog Lists to Subscribe to".into(),
+                    )),
+                },
+                modal_form::ChoiceRow {
+                    label: format!("{} Custom Source", if selected == 1 { "●" } else { "○" }),
+                    detail: None,
+                    kind: modal_form::ValueKind::Identity,
+                    focused: selected == 1 && focus == 0,
+                    note: Some(modal_form::ChoiceNote::Detail(
+                        "Add Your Own or a Third-Party List by URL".into(),
+                    )),
+                },
+            ],
+            prose: vec![modal_form::ProseRow::plain("")],
+            actions: vec![
+                modal_form::Action::new("Cancel", focus == 1, modal_form::ActionKind::Neutral, "")
+                    .on_key(crossterm::event::KeyCode::Esc),
+                modal_form::Action::new(
+                    "Continue",
+                    focus == 2,
+                    modal_form::ActionKind::Primary,
+                    "",
+                )
+                .on_key(crossterm::event::KeyCode::Char(if selected == 0 {
+                    'p'
+                } else {
+                    'u'
+                })),
+            ],
+            ..Default::default()
+        };
+        let mut body = modal_form::notice_body(&spec, width);
+        body.fields.extend([Line::default(), Line::default()]);
+        (body, ())
+    });
 }
 
 /// Client-side Lists filter: kind chip AND case-insensitive text search
@@ -634,6 +817,7 @@ fn list_meta_matches(meta: &ListRowMeta, state: &app::ListsState) -> bool {
         app::ListsKindFilter::All => true,
         app::ListsKindFilter::Block => matches!(meta.base, BlocklistBase::Deny),
         app::ListsKindFilter::Allow => matches!(meta.base, BlocklistBase::Allow),
+        app::ListsKindFilter::Off => matches!(meta.base, BlocklistBase::Ignore),
     };
     if !kind_ok {
         return false;
@@ -668,7 +852,13 @@ pub(crate) fn total_list_count(app: &App) -> usize {
 }
 
 fn render_empty(f: &mut Frame, area: Rect, app: &App) {
-    let content = render_section_chrome(f, area, "Lists", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "SUBSCRIPTIONS",
+        "No Configured Sources",
+        theme::CardRole::Analytics,
+    );
 
     let waiting = app.daemon_status.is_none();
     let line = if waiting {
@@ -687,48 +877,41 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App, grouped: &[ListRowMeta
     let total = total_list_count(app);
     let no_filter =
         app.lists.filter_text.is_none() && app.lists.kind_filter == app::ListsKindFilter::All;
-    let title = if no_filter {
-        format!("Lists ({total})")
+    let subtitle = if no_filter {
+        format!("{total} Configured Sources")
     } else {
-        format!("Lists ({shown}/{total} after filter)")
+        format!("{shown}/{total} After Filter")
     };
-    let content = render_section_chrome(f, area, &title, T.text_secondary);
-
-    let header = Row::new(vec![
-        Cell::from(""), // inert badge gutter — deliberately unlabeled, see render_inert_summary
-        Cell::from("ID"),
-        Cell::from("KIND"),
-        Cell::from("DISPLAY"),
-        Cell::from("FORMAT"),
-        Cell::from("ENTRIES"),
-        Cell::from("STATUS"),
-        Cell::from("LAST UPDATE"),
-        Cell::from("USED BY"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "SUBSCRIPTIONS",
+        &subtitle,
+        theme::CardRole::Analytics,
     );
 
-    let rows: Vec<Row> = grouped.iter().cloned().map(render_list_row).collect();
+    let columns = list_columns(content.width);
+    let sort = app.mouse.sort(Leaf::Lists);
+    let header = Row::new(columns.iter().map(|column| {
+        Cell::from(sort_header(column.label, column.sort_column, sort)).style(
+            theme::table_heading_style(
+                column
+                    .sort_column
+                    .is_some_and(|index| sort.is_some_and(|order| order.column == index)),
+            ),
+        )
+    }))
+    .style(theme::table_heading_style(false));
+
+    let rows: Vec<Row> = grouped
+        .iter()
+        .cloned()
+        .map(|meta| render_list_row_with_columns(meta, &columns))
+        .collect();
 
     const COLUMN_SPACING: u16 = 3;
-    let constraints = [
-        // Fixed-width gutter, independent of DISPLAY's content — a
-        // long display_name must never be able to truncate the inert
-        // badge away (Table cells don't wrap).
-        Constraint::Length(2),  // inert badge
-        Constraint::Length(20), // id
-        Constraint::Length(8),  // kind badge
-        Constraint::Min(16),    // display name
-        Constraint::Length(10), // format
-        Constraint::Length(9),  // entries
-        Constraint::Length(10), // status
-        Constraint::Length(20), // last update (fits "MM-DD HH:MM · Stale" = 19; lists-01)
-        Constraint::Min(16),    // used_by_profiles
-    ];
-    let table = Table::new(rows, constraints)
+    let constraints: Vec<Constraint> = columns.iter().map(|column| column.constraint).collect();
+    let table = Table::new(rows, constraints.clone())
         .header(header)
         .column_spacing(COLUMN_SPACING)
         .row_highlight_style(theme::highlight_style());
@@ -739,11 +922,128 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App, grouped: &[ListRowMeta
     let selected = app.lists.table_state.selected();
     super::render_table(f, content, table, &mut app.lists.table_state, selected);
 
-    // Query-Log-style vertical separators between columns.
-    crate::tui::ui::draw_table_column_separators(f, content, &constraints, COLUMN_SPACING);
+    for (column, column_area) in
+        crate::tui::ui::table_column_rects(content, &constraints, COLUMN_SPACING, 0)
+            .into_iter()
+            .enumerate()
+    {
+        if let Some(sort_column) = columns[column].sort_column {
+            mouse::register(
+                app,
+                column_area,
+                MouseAction::Sort(Leaf::Lists, sort_column),
+            );
+        }
+    }
+    let visible_rows = content.height.saturating_sub(1) as usize;
+    let offset = app.lists.table_state.offset();
+    for (visible, index) in (offset..grouped.len()).take(visible_rows).enumerate() {
+        mouse::register(
+            app,
+            Rect::new(content.x, content.y + 1 + visible as u16, content.width, 1),
+            MouseAction::Row(Leaf::Lists, index),
+        );
+    }
 }
 
-fn render_list_row(meta: ListRowMeta) -> Row<'static> {
+#[derive(Clone, Copy)]
+struct ListColumn {
+    sort_column: Option<usize>,
+    label: &'static str,
+    constraint: Constraint,
+}
+
+fn list_columns(width: u16) -> Vec<ListColumn> {
+    if width < 110 {
+        vec![
+            ListColumn {
+                sort_column: None,
+                label: "",
+                constraint: Constraint::Length(2),
+            },
+            ListColumn {
+                sort_column: Some(0),
+                label: "ID",
+                constraint: Constraint::Min(18),
+            },
+            ListColumn {
+                sort_column: Some(1),
+                label: "SOURCE",
+                constraint: Constraint::Length(8),
+            },
+            ListColumn {
+                sort_column: Some(2),
+                label: "DIRECTION",
+                constraint: Constraint::Length(10),
+            },
+            ListColumn {
+                sort_column: Some(5),
+                label: "ENTRIES",
+                constraint: Constraint::Length(9),
+            },
+            ListColumn {
+                sort_column: Some(6),
+                label: "STATUS",
+                constraint: Constraint::Length(10),
+            },
+        ]
+    } else {
+        vec![
+            ListColumn {
+                sort_column: None,
+                label: "",
+                constraint: Constraint::Length(2),
+            },
+            ListColumn {
+                sort_column: Some(0),
+                label: "ID",
+                constraint: Constraint::Length(20),
+            },
+            ListColumn {
+                sort_column: Some(1),
+                label: "SOURCE",
+                constraint: Constraint::Length(8),
+            },
+            ListColumn {
+                sort_column: Some(2),
+                label: "DIRECTION",
+                constraint: Constraint::Length(10),
+            },
+            ListColumn {
+                sort_column: Some(3),
+                label: "DISPLAY",
+                constraint: Constraint::Min(16),
+            },
+            ListColumn {
+                sort_column: Some(4),
+                label: "FORMAT",
+                constraint: Constraint::Length(10),
+            },
+            ListColumn {
+                sort_column: Some(5),
+                label: "ENTRIES",
+                constraint: Constraint::Length(9),
+            },
+            ListColumn {
+                sort_column: Some(6),
+                label: "STATUS",
+                constraint: Constraint::Length(10),
+            },
+            ListColumn {
+                sort_column: Some(7),
+                label: "LAST UPDATE",
+                constraint: Constraint::Length(20),
+            },
+            ListColumn {
+                sort_column: Some(8),
+                label: "USED BY",
+                constraint: Constraint::Min(16),
+            },
+        ]
+    }
+}
+
+fn render_list_row_with_columns(meta: ListRowMeta, columns: &[ListColumn]) -> Row<'static> {
     // Trust=Local rows dim the whole row (operator scans for trusted
     // local entries by colour, no extra column needed). RemoteUnsigned
     // is nominal; Signed is reserved (validator refuses it) — if a
@@ -797,12 +1097,7 @@ fn render_list_row(meta: ListRowMeta) -> Row<'static> {
     // header on lists.purge.cc and what they expect to see in the
     // TUI. Falls back to `entries` only when the parser has no
     // pre-dedup count yet (NeverFetched state).
-    let entries_display = if meta.dto.parsed_ok > 0 {
-        meta.dto.parsed_ok
-    } else {
-        meta.dto.entries
-    };
-    let entries = format_count(entries_display);
+    let entries = format_count(entries_display_count(&meta));
     let (status_label, status_color) = status_of(&meta.dto);
     let status_style = if matches!(meta.trust, BlocklistTrust::Local) {
         row_style
@@ -858,9 +1153,10 @@ fn render_list_row(meta: ListRowMeta) -> Row<'static> {
         Cell::from("")
     };
 
-    Row::new(vec![
+    let cells = vec![
         inert_cell,
         Cell::from(Span::styled(id_label, row_style)),
+        Cell::from(Span::styled(source_label(&meta), row_style)),
         Cell::from(Span::styled(kind_label, kind_style)),
         Cell::from(Span::styled(meta.display_name, row_style)),
         Cell::from(Span::styled(format_label, row_style)),
@@ -868,7 +1164,12 @@ fn render_list_row(meta: ListRowMeta) -> Row<'static> {
         Cell::from(Span::styled(status_label, status_style)),
         last_update_cell,
         Cell::from(Span::styled(users_label, users_style)),
-    ])
+    ];
+    Row::new(
+        columns.iter().map(|column| {
+            cells[column.sort_column.map_or(0, |sort_column| sort_column + 1)].clone()
+        }),
+    )
 }
 
 /// Short label for the format column. Title-cases AdGuard for visual
@@ -880,6 +1181,25 @@ fn format_label_for(f: BlocklistFormat) -> &'static str {
         BlocklistFormat::Domains => "domains",
         BlocklistFormat::Adguard => "AdGuard",
         BlocklistFormat::Hosts => "hosts",
+    }
+}
+
+/// Classify a source by the canonical offline catalog, not by a hostname
+/// substring. A custom list hosted on `lists.purge.cc.evil.example` (or an
+/// unlisted path on the real host) therefore remains CUSTOM.
+fn source_label(meta: &ListRowMeta) -> &'static str {
+    if meta.source_is_catalog {
+        "PURGE"
+    } else {
+        "CUSTOM"
+    }
+}
+
+fn sort_header(label: &str, column: Option<usize>, sort: Option<SortOrder>) -> String {
+    match sort.filter(|sort| Some(sort.column) == column) {
+        Some(sort) if sort.descending => format!("{label} ▼"),
+        Some(_) => format!("{label} ▲"),
+        None => label.to_string(),
     }
 }
 
@@ -1441,7 +1761,7 @@ const CATALOG_MODAL_W: u16 = 68;
 
 /// Cells before the first column: the focus rule (or its blank stand-in)
 /// plus one space, matching the ecosystem's 2-cell row lead.
-const CAT_LEAD: usize = 2;
+const CAT_LEAD: usize = 0;
 /// Inter-column gap. The rule glyph is the middle cell, so the rule row
 /// can put `┼` at the same offset.
 const CAT_SEP: &str = " \u{2502} ";
@@ -1548,8 +1868,8 @@ fn cat_cell_right(text: &str, width: usize) -> String {
 /// header in the scrolling region leaves the operator with unlabelled
 /// columns of numbers the moment they press `j` twice.
 fn catalog_header_rows(cols: CatalogCols) -> [Line<'static>; 2] {
-    let mut labels = String::from("  ");
-    let mut rule = String::from("  ");
+    let mut labels = String::new();
+    let mut rule = String::new();
     let mut push = |label: &str, width: usize, right: bool, first: bool| {
         if !first {
             labels.push_str(CAT_SEP);
@@ -1601,15 +1921,6 @@ fn catalog_row_line(
     let sep_style = paint(T.border_subtle);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
-    if focused {
-        spans.push(Span::styled(
-            "\u{258c}".to_string(),
-            Style::default().fg(T.emerald_ping).bg(T.bg_highlight),
-        ));
-        spans.push(Span::styled(" ".to_string(), paint(T.text_primary)));
-    } else {
-        spans.push(Span::styled("  ".to_string(), Style::default()));
-    }
 
     let sep = |spans: &mut Vec<Span<'static>>| {
         spans.push(Span::styled(CAT_SEP.to_string(), sep_style));
@@ -1700,7 +2011,7 @@ fn catalog_body(modal: &app::CatalogPickerModal, width: u16) -> modal_form::Scro
     let selected = modal.table_state.selected();
 
     let mut head = vec![
-        modal_form::title_band("Browse purge.cc catalog", width),
+        modal_form::title_band("Purge.cc Catalog", width),
         modal_form::desc_band(&catalog_desc(modal), width),
     ];
     let mut fields: Vec<Line<'static>> = Vec::with_capacity(modal.rows.len());
@@ -1740,25 +2051,27 @@ fn catalog_body(modal: &app::CatalogPickerModal, width: u16) -> modal_form::Scro
     tail.push(modal_form::nav_keys_line(
         "\u{2191}\u{2193}/jk move \u{b7} Space toggle \u{b7} Tab actions \u{b7} Ctrl+s save",
     ));
-    tail.push(modal_form::action_row(
-        &[
-            modal_form::Action::new(
-                "  Cancel  ",
-                modal.focus == CatalogPickerFocus::Cancel,
-                modal_form::ActionKind::Neutral,
-                "close without writing",
-            ),
-            modal_form::Action::new(
-                "  Save  ",
-                modal.focus == CatalogPickerFocus::Save,
-                modal_form::ActionKind::Primary,
-                "write every pending change",
-            ),
-        ],
-        width,
-    ));
+    let actions = [
+        modal_form::Action::new(
+            "  Cancel  ",
+            modal.focus == CatalogPickerFocus::Cancel,
+            modal_form::ActionKind::Neutral,
+            "close without writing",
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
+        modal_form::Action::new(
+            "  Save  ",
+            modal.focus == CatalogPickerFocus::Save,
+            modal_form::ActionKind::Primary,
+            "write every pending change",
+        )
+        .on_save(),
+    ];
+    tail.push(modal_form::action_row(&actions, width));
 
     modal_form::ScrollBody {
+        action_hits: modal_form::action_hits(&actions, width),
+        field_hits: Vec::new(),
         head,
         fields,
         tail,
@@ -1774,7 +2087,24 @@ fn catalog_body(modal: &app::CatalogPickerModal, width: u16) -> modal_form::Scro
 /// picker's "you are here" is the focus bar on the selected row, and the
 /// selection lives in `modal.table_state`, which `mod.rs` still owns.
 pub fn render_catalog_picker(f: &mut Frame, area: Rect, modal: &app::CatalogPickerModal) {
-    modal_form::render_modal(f, area, CATALOG_MODAL_W, |w| (catalog_body(modal, w), ()));
+    let rendered =
+        modal_form::render_modal(f, area, CATALOG_MODAL_W, |w| (catalog_body(modal, w), ()));
+    if modal.rows.is_empty() {
+        return;
+    }
+    let first = rendered.view.offset;
+    let visible = rendered.view.view_h;
+    for (row, index) in (first..modal.rows.len()).take(visible).enumerate() {
+        mouse::register_overlay_action(
+            Rect::new(
+                rendered.inner.x,
+                rendered.inner.y + rendered.view.head_h as u16 + row as u16,
+                rendered.inner.width,
+                1,
+            ),
+            MouseAction::OverlayChoice(index),
+        );
+    }
 }
 
 /// Build the "Add new list" modal — same form layout as Promote but
@@ -1941,7 +2271,7 @@ fn build_edit_modal_from_blocklist(
 fn edit_band_text(modal: &EditListModal) -> (String, [&'static str; 2]) {
     match &modal.mode {
         EditModalMode::Add => (
-            "Add list".to_string(),
+            "Add Subscription".to_string(),
             [
                 "Subscribe to a remote list of domains to block or allow.",
                 "Nature sets direction; each profile may override it.",
@@ -1955,7 +2285,7 @@ fn edit_band_text(modal: &EditListModal) -> (String, [&'static str; 2]) {
             ],
         ),
         _ => (
-            format!("Edit list \u{b7} {}", modal.blocklist_id),
+            format!("Edit Subscription \u{b7} {}", modal.blocklist_id),
             [
                 "Change where this list comes from and how Warden treats it.",
                 "Nature sets direction; each profile may override it.",
@@ -2061,7 +2391,12 @@ fn edit_form_body(
     let mut rows = modal_form::FormRows::new_desc2(&title, desc, width);
 
     // IDENTITY
-    rows.section("Identity");
+    rows.line(modal_form::section_rule(
+        "Identity",
+        width,
+        theme::CardRole::Summary,
+    ));
+    rows.spacer();
     let dn_focus = modal.focus == EditField::DisplayName;
     rows.text_field(
         modal_form::value_row(
@@ -2104,7 +2439,12 @@ fn edit_form_body(
     rows.spacer();
 
     // SOURCE
-    rows.section("Source");
+    rows.line(modal_form::section_rule(
+        "Source",
+        width,
+        theme::CardRole::Summary,
+    ));
+    rows.spacer();
     let url_focus = modal.focus == EditField::Url;
     rows.text_field(
         modal_form::value_row(
@@ -2198,7 +2538,12 @@ fn edit_form_body(
     rows.spacer();
 
     // FILTERING
-    rows.section("Filtering");
+    rows.line(modal_form::section_rule(
+        "Filtering",
+        width,
+        theme::CardRole::Analytics,
+    ));
+    rows.spacer();
     let nature_focus = modal.focus == EditField::Nature;
     // A RADIO IS A TWO-STATE WIDGET AND `base` HAS THREE. `radio_row` takes
     // one bool, so `Ignore` would have to render as "Allow selected" — a
@@ -2222,6 +2567,7 @@ fn edit_form_body(
             nature_focus,
             width,
         )
+        .into()
     };
     rows.field(nature_row, nature_focus, hint(EditField::Nature));
     let enabled_focus = modal.focus == EditField::Enabled;
@@ -2246,25 +2592,34 @@ fn edit_form_body(
             EditModalMode::Promote { .. } => "  Discard  ",
             _ => "  Delete  ",
         };
-        actions.push(modal_form::Action::new(
-            del_label,
-            modal.focus == EditField::DeleteButton,
-            modal_form::ActionKind::Destructive,
-            hint(EditField::DeleteButton),
-        ));
+        actions.push(
+            modal_form::Action::new(
+                del_label,
+                modal.focus == EditField::DeleteButton,
+                modal_form::ActionKind::Destructive,
+                hint(EditField::DeleteButton),
+            )
+            .on_key(crossterm::event::KeyCode::Delete),
+        );
     }
-    actions.push(modal_form::Action::new(
-        "  Cancel  ",
-        modal.focus == EditField::Cancel,
-        modal_form::ActionKind::Neutral,
-        hint(EditField::Cancel),
-    ));
-    actions.push(modal_form::Action::new(
-        "  Save  ",
-        modal.focus == EditField::Save,
-        modal_form::ActionKind::Primary,
-        hint(EditField::Save),
-    ));
+    actions.push(
+        modal_form::Action::new(
+            "  Cancel  ",
+            modal.focus == EditField::Cancel,
+            modal_form::ActionKind::Neutral,
+            hint(EditField::Cancel),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
+    );
+    actions.push(
+        modal_form::Action::new(
+            "  Save  ",
+            modal.focus == EditField::Save,
+            modal_form::ActionKind::Primary,
+            hint(EditField::Save),
+        )
+        .on_save(),
+    );
 
     let tail = modal_form::form_tail(
         &rows,
@@ -2320,7 +2675,7 @@ pub fn compute_cascade_targets(app: &App, blocklist_id: &str) -> Vec<String> {
 /// Column the typed buffer starts at, measured from the inner-left edge.
 /// Structural, not measured: [`modal_form::prose_row`] lays out a 2-cell
 /// indent and the row's own text opens with `"> "`.
-const TYPED_PROMPT_COL: u16 = 4;
+const TYPED_PROMPT_COL: u16 = 2;
 
 /// The Archetype-C body of the typed-id delete confirm.
 ///
@@ -2411,7 +2766,7 @@ fn delete_notice(
     prose.push(modal_form::ProseRow::plain(format!("> {typed}")));
 
     modal_form::NoticeSpec {
-        title: "Delete list".to_string(),
+        title: "Remove Subscription".to_string(),
         desc: "removes the [[blocklists]] entry from disk".to_string(),
         prose,
         choices: Vec::new(),
@@ -2426,13 +2781,15 @@ fn delete_notice(
         // action labels below carry their own keys.
         keys: String::new(),
         actions: vec![
-            modal_form::Action::new("  Esc Back  ", false, modal_form::ActionKind::Neutral, ""),
+            modal_form::Action::new("  Esc Back  ", false, modal_form::ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
             modal_form::Action::new(
                 "  Enter Delete  ",
                 false,
                 modal_form::ActionKind::Destructive,
                 "",
-            ),
+            )
+            .on_key(crossterm::event::KeyCode::Enter),
         ],
     }
 }
@@ -2661,7 +3018,8 @@ pub(crate) fn unsigned_allow_notice(
         hint_rows: None,
         keys: String::new(),
         actions: vec![
-            modal_form::Action::new("  Esc Back  ", false, modal_form::ActionKind::Neutral, ""),
+            modal_form::Action::new("  Esc Back  ", false, modal_form::ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
             modal_form::Action::new(
                 "  Enter Accept  ",
                 false,
@@ -2669,7 +3027,8 @@ pub(crate) fn unsigned_allow_notice(
                 // risk, not on the border. Accepting is the one.
                 modal_form::ActionKind::Destructive,
                 "",
-            ),
+            )
+            .on_key(crossterm::event::KeyCode::Enter),
         ],
     }
 }

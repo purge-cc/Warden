@@ -1,146 +1,124 @@
-//! Help overlay — keybindings shown on `?`.
+//! Scrollable keyboard reference using the shared modal chrome.
 //!
-//! Layout: each section is a two-column `Table` (key on the left,
-//! description on the right) so a long description wraps inside the
-//! description cell without dragging into the key column. Section
-//! titles render as styled paragraphs above each table; vertical
-//! spacers carry the breathing room. Block heights are computed from
-//! the wrapped row count so the popup grows with its content rather
-//! than guessing a fixed height.
-//!
-//! **Height vs the 80×24 floor.** The full block list needs 37-49 rows
-//! depending on the active leaf; `ui::render` refuses to draw at all
-//! below a 24-row terminal, a 22-row interior after the border. Content
-//! that size cannot fit that floor by any layout choice — the fix needs
-//! either scrolling or losing rows, and [`fit_blocks`] is the honest
-//! half of that choice reachable from this file: it keeps only whole
-//! blocks from the front (`build_blocks` puts the per-leaf section
-//! first for exactly this reason) and the border title reports the cut
-//! in numbers rather than letting `Layout::vertical` silently squeeze
-//! whichever block loses the constraint solver's tie.
-//!
-//! **What this does not do.** A real fix scrolls: a stored offset,
-//! `↑`/`↓`/`PgUp`/`PgDn` bound while the overlay is open, and a
-//! `Scrollbar` drawn against it. That needs an arm in `mod.rs`'s
-//! `dispatched_from_help` match (`mod.rs:908-925`) — today any key but
-//! `?`/`Esc`/`q`/`Ctrl+C` closes the overlay and falls through to the
-//! leaf underneath, by design (`mod.rs:888-891`: "deliberately NO
-//! second dispatch table"). This module cannot add that arm, so the
-//! shared sections below the per-leaf one stay unreachable at the floor
-//! until whoever owns `mod.rs` next wires the scroll.
+//! Page keys move through the reference while ordinary shortcuts still execute
+//! their active-screen action. Headings and the close hint remain visible.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use crate::tui::app::Leaf;
-use crate::tui::overlay::centered_rect;
+use crate::tui::modal_form;
 use crate::tui::theme::T;
 
 const POPUP_W: u16 = 70;
 const KEY_COL_W: u16 = 20;
 const COL_SPACING: u16 = 1;
-/// Width available to the description cell once the borders, key
-/// column, and column spacing are subtracted from the popup width.
-/// Drives both the word-wrap helper and the Table column constraint.
+/// Width used by the wrapping unit tests for the nominal modal width.
+#[cfg(test)]
 const DESC_COL_W: u16 = POPUP_W - 2 - KEY_COL_W - COL_SPACING;
 
+#[cfg(test)]
 pub fn render(f: &mut Frame, active_leaf: Leaf) {
-    let area = f.area();
-    let blocks = build_blocks(active_leaf);
+    let mut offset = 0;
+    render_scrolled(f, active_leaf, &mut offset);
+}
 
-    // Popup height grows with the content, clamped to the real frame by
-    // `centered_rect`. `fit_blocks` is what keeps that clamp honest: it
-    // decides, in whole blocks, how much of `blocks` the clamped popup
-    // can actually hold — instead of handing every block's full height
-    // to `Layout::vertical` and letting the constraint solver silently
-    // squeeze whichever ones lose the tie.
-    let content_h = blocks.iter().map(HelpBlock::height).sum::<u16>();
-    let popup = centered_rect(area, POPUP_W, content_h + 2);
-    let inner_budget = popup.height.saturating_sub(2);
-    let fit = fit_blocks(&blocks, inner_budget);
+/// Render the complete help document with a caller-owned vertical offset.
+/// Only the body rows scroll; the paired heading and navigation hint remain
+/// visible at every position. The offset is clamped in-place so stale state
+/// after a leaf change cannot expose a blank help pane.
+#[cfg(test)]
+pub fn render_scrolled(f: &mut Frame, active_leaf: Leaf, offset: &mut usize) {
+    render_in(f, f.area(), active_leaf, offset);
+}
 
-    f.render_widget(Clear, popup);
+#[cfg(test)]
+pub fn render_in(f: &mut Frame, area: Rect, active_leaf: Leaf, offset: &mut usize) {
+    render_with_app(f, area, active_leaf, offset, None);
+}
 
-    // `?` uses the modal ecosystem's chrome — rounded, neutral accent,
-    // raised surface — instead of a square red-bordered reference card.
-    // The ecosystem colour rule bans
-    // the brand's red tone on a border outright ("reads as an error
-    // state") and reserves it for the brand tick + destructive actions,
-    // neither of which this overlay has. Mirrors
-    // `modal_form::render_chrome_in`.
-    //
-    // The title doubles as the overflow tell. Below the terminal-size
-    // floor `fit.hidden` is never zero, and this count — not a scroll,
-    // see the module doc — is the honest half of that hazard reachable
-    // from this file alone.
-    let title = if fit.hidden > 0 {
-        format!(
-            " Help — showing {}/{content_h} rows, resize to see the rest ",
-            fit.used
-        )
-    } else {
-        " Help — press ? or Esc to close ".to_string()
-    };
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(T.text_primary))
-        .style(Style::default().bg(T.bg_elevated))
-        .title_style(
-            Style::default()
-                .fg(T.text_primary)
-                .add_modifier(Modifier::BOLD),
-        )
-        .title(title);
-    let inner = outer.inner(popup);
-    f.render_widget(outer, popup);
+pub fn render_for_app(f: &mut Frame, area: Rect, app: &crate::tui::App, offset: &mut usize) {
+    render_with_app(f, area, app.active_leaf, offset, Some(app));
+}
 
-    let shown = &blocks[..fit.shown];
-    let constraints: Vec<Constraint> = shown
-        .iter()
-        .map(|b| Constraint::Length(b.height()))
-        .collect();
-    let chunks = Layout::vertical(constraints).split(inner);
+fn render_with_app(
+    f: &mut Frame,
+    area: Rect,
+    active_leaf: Leaf,
+    offset: &mut usize,
+    app: Option<&crate::tui::App>,
+) {
+    let requested = *offset;
+    let rendered = modal_form::render_modal(f, area, POPUP_W, |width| {
+        let mut body = body_for_width(active_leaf, width, app);
+        let (_, view, _) = modal_form::scroll_layout(
+            area.height.saturating_sub(2) as usize,
+            body.head.len(),
+            body.fields.len(),
+            body.tail.len(),
+        );
+        let page = requested.min(body.fields.len().saturating_sub(view));
+        body.focus_row = view.checked_sub(1).map(|last| page + last);
+        (body, ())
+    });
+    *offset = rendered.view.offset;
+}
 
-    for (rect, blk) in chunks.iter().zip(shown.iter()) {
-        blk.render(f, *rect);
+fn body_for_width(
+    active_leaf: Leaf,
+    width: u16,
+    app: Option<&crate::tui::App>,
+) -> modal_form::ScrollBody {
+    modal_form::ScrollBody {
+        action_hits: Vec::new(),
+        field_hits: Vec::new(),
+        head: vec![
+            modal_form::title_band("HELP", width),
+            modal_form::desc_band("Keyboard commands · arrows execute the active leaf", width),
+        ],
+        fields: help_lines(active_leaf, width, app),
+        tail: vec![modal_form::nav_keys_line(
+            "PgUp/PgDn scroll · Home/End jump · ?/Esc close",
+        )],
+        focus_row: None,
+        scrollable: true,
     }
 }
 
-/// How much of `blocks` fits in `budget` rows.
-#[derive(Debug, Clone, Copy)]
-struct HelpFit {
-    /// Number of leading blocks that fit whole.
-    shown: usize,
-    /// Rows those blocks occupy.
-    used: u16,
-    /// Rows left out — the ones a cut fell on.
-    hidden: u16,
-}
-
-/// Walk `blocks` front to back, keeping whole blocks only, until the next
-/// one would exceed `budget`. Never a partial row: a cut always lands on
-/// a section boundary, not mid-table.
-fn fit_blocks(blocks: &[HelpBlock], budget: u16) -> HelpFit {
-    let mut used = 0u16;
-    let mut shown = 0usize;
-    for b in blocks {
-        let h = b.height();
-        if used + h > budget {
-            break;
+fn help_lines(active_leaf: Leaf, width: u16, app: Option<&crate::tui::App>) -> Vec<Line<'static>> {
+    let desc_width = width.saturating_sub(KEY_COL_W + COL_SPACING) as usize;
+    let mut lines = Vec::new();
+    for block in build_blocks(active_leaf, app) {
+        match block {
+            HelpBlock::Title(text) => lines.push(Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(T.warden_teal)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            HelpBlock::Spacer => lines.push(Line::default()),
+            HelpBlock::Rows(rows) => {
+                for row in rows {
+                    let wrapped = word_wrap(row.desc, desc_width.max(1));
+                    for (index, desc) in wrapped.into_iter().enumerate() {
+                        let key = if index == 0 { row.key } else { "" };
+                        let key = crate::tui::text::pad(&format!("  {key}"), KEY_COL_W as usize);
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                key,
+                                Style::default().fg(T.info).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" "),
+                            Span::raw(desc),
+                        ]));
+                    }
+                }
+            }
         }
-        used += h;
-        shown += 1;
     }
-    let total: u16 = blocks.iter().map(HelpBlock::height).sum();
-    HelpFit {
-        shown,
-        used,
-        hidden: total.saturating_sub(used),
-    }
+    lines
 }
 
 /// One row of the help table.
@@ -170,69 +148,11 @@ enum HelpBlock {
     Rows(Vec<HelpRow>),
 }
 
-impl HelpBlock {
-    fn height(&self) -> u16 {
-        match self {
-            HelpBlock::Title(_) | HelpBlock::Spacer => 1,
-            HelpBlock::Rows(rows) => rows
-                .iter()
-                .map(|r| word_wrap(r.desc, DESC_COL_W as usize).len() as u16)
-                .sum(),
-        }
-    }
-
-    fn render(&self, f: &mut Frame, area: Rect) {
-        match self {
-            HelpBlock::Title(text) => {
-                // `warden_teal` marks static info — section
-                // headers, read-only values. These are section headers.
-                let para = Paragraph::new(Line::from(Span::styled(
-                    *text,
-                    Style::default()
-                        .fg(T.warden_teal)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                f.render_widget(para, area);
-            }
-            HelpBlock::Spacer => {}
-            HelpBlock::Rows(rows) => {
-                let table_rows: Vec<Row<'_>> = rows
-                    .iter()
-                    .map(|r| {
-                        let lines = word_wrap(r.desc, DESC_COL_W as usize);
-                        let height = lines.len() as u16;
-                        let desc_text = Text::from(
-                            lines.into_iter().map(Line::from).collect::<Vec<Line<'_>>>(),
-                        );
-                        Row::new(vec![
-                            Cell::from(Span::styled(
-                                format!("  {}", r.key),
-                                Style::default().fg(T.info).add_modifier(Modifier::BOLD),
-                            )),
-                            Cell::from(desc_text),
-                        ])
-                        .height(height)
-                    })
-                    .collect();
-
-                let table = Table::new(
-                    table_rows,
-                    [
-                        Constraint::Length(KEY_COL_W),
-                        Constraint::Length(DESC_COL_W),
-                    ],
-                )
-                .column_spacing(COL_SPACING);
-
-                f.render_widget(table, area);
-            }
-        }
-    }
-}
+impl HelpBlock {}
 
 /// Build the ordered list of blocks for the popup: shared sections
 /// (Navigation / Mnemonics / Global) followed by the per-leaf section.
-fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
+fn build_blocks(active_leaf: Leaf, app: Option<&crate::tui::App>) -> Vec<HelpBlock> {
     let mut blocks = vec![
         HelpBlock::Title(" Navigation"),
         HelpBlock::Spacer,
@@ -255,12 +175,12 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
             #[cfg(not(feature = "cluster"))]
             HelpRow {
                 key: "Tab / Shift+Tab",
-                desc: "Cycle ALL 14 leaves linearly",
+                desc: "Cycle 12 visible leaves linearly",
             },
             #[cfg(feature = "cluster")]
             HelpRow {
                 key: "Tab / Shift+Tab",
-                desc: "Cycle ALL 15 leaves linearly",
+                desc: "Cycle up to 13 visible leaves linearly",
             },
             HelpRow {
                 key: "g <letter>",
@@ -342,27 +262,35 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
                 desc: "Profiles / Lists   (Filters)",
             },
             HelpRow {
-                key: "g t / g u",
-                desc: "Custom Lists / Rules   (Filters)",
+                key: "g t",
+                desc: "Custom Lists   (Filters)",
             },
             HelpRow {
                 key: "g b / g e",
                 desc: "Labels / Settings   (Configuration)",
             },
             HelpRow {
-                key: "g f / g m",
-                desc: "File / Log Messages   (Configuration)",
+                key: "g m",
+                desc: "Log Messages   (Configuration)",
             },
             #[cfg(feature = "cluster")]
             HelpRow {
-                key: "g c",
-                desc: "Cluster",
+                key: "g n",
+                desc: "Nodes   (Configuration)",
             },
         ]),
         HelpBlock::Spacer,
         HelpBlock::Title(" Global"),
         HelpBlock::Spacer,
         HelpBlock::Rows(vec![
+            HelpRow {
+                key: "T",
+                desc: "Cycle theme (Warden, Tokyo Night, Gruvbox, Everforest, Dracula)",
+            },
+            HelpRow {
+                key: "Mouse",
+                desc: "Click menus, rows, column headings and dialog controls",
+            },
             HelpRow {
                 key: "r",
                 desc: "Force refresh + reload daemon",
@@ -373,6 +301,10 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
             },
             HelpRow {
                 key: "s",
+                desc: "Focus sortable column headings",
+            },
+            HelpRow {
+                key: "Shift+S",
                 desc: "Open Resolver modal (source-IP lookup)",
             },
             HelpRow {
@@ -386,19 +318,78 @@ fn build_blocks(active_leaf: Leaf) -> Vec<HelpBlock> {
         ]),
     ];
 
-    // The per-leaf section leads rather than trails: it is the one block
-    // that changes with the active leaf, and the one the operator opened
-    // `?` to find. `render` cuts from the back when the popup does not
-    // fit the terminal (`fit_blocks`), so a cut lands on one of the four
-    // shared sections above, never on this one.
+    // Start with the active screen's shortcuts; common navigation follows.
+    let rows = app
+        .map(contextual_rows)
+        .unwrap_or_else(|| per_leaf_rows(active_leaf));
+    #[cfg(feature = "cluster")]
+    if let Some(app) = app {
+        if !crate::tui::nodes::policy_access(app).editable {
+            for block in &mut blocks {
+                if let HelpBlock::Rows(rows) = block {
+                    for row in rows {
+                        if row.key == "r" {
+                            row.desc = "Refresh views (daemon reload suppressed on replica)";
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut leading = vec![
         HelpBlock::Title(per_leaf_header(active_leaf)),
         HelpBlock::Spacer,
-        HelpBlock::Rows(per_leaf_rows(active_leaf)),
+        HelpBlock::Rows(rows),
         HelpBlock::Spacer,
     ];
     leading.append(&mut blocks);
     leading
+}
+
+fn contextual_rows(app: &crate::tui::App) -> Vec<HelpRow> {
+    let rows = per_leaf_rows(app.active_leaf);
+    #[cfg(feature = "cluster")]
+    let mut rows = rows;
+    #[cfg(feature = "cluster")]
+    {
+        if !crate::tui::nodes::policy_access(app).editable {
+            rows.retain(|row| !help_row_mutates_policy(app.active_leaf, row.key));
+        }
+        if app.active_leaf == Leaf::Nodes {
+            rows.retain(|row| match row.key {
+                "a" => crate::tui::nodes::can_add_node(app),
+                "Enter / e" => crate::tui::nodes::controls_available(app),
+                "d" => crate::tui::nodes::can_remove_node(app),
+                "u" => crate::tui::nodes::control_status_for_display(app)
+                    .is_some_and(|status| !status.operations.is_empty()),
+                _ => true,
+            });
+        }
+    }
+    rows
+}
+
+#[cfg(feature = "cluster")]
+fn help_row_mutates_policy(leaf: Leaf, keys: &str) -> bool {
+    if leaf == Leaf::Settings && keys == "Ctrl+r" {
+        return true;
+    }
+    keys.split('/')
+        .map(str::trim)
+        .filter_map(|key| match key {
+            "Enter" => Some(crossterm::event::KeyCode::Enter),
+            "Delete" => Some(crossterm::event::KeyCode::Delete),
+            "a" => Some(crossterm::event::KeyCode::Char('a')),
+            "e" => Some(crossterm::event::KeyCode::Char('e')),
+            "d" => Some(crossterm::event::KeyCode::Char('d')),
+            "m" => Some(crossterm::event::KeyCode::Char('m')),
+            "p" => Some(crossterm::event::KeyCode::Char('p')),
+            "B" => Some(crossterm::event::KeyCode::Char('B')),
+            "K" => Some(crossterm::event::KeyCode::Char('K')),
+            "R" => Some(crossterm::event::KeyCode::Char('R')),
+            _ => None,
+        })
+        .any(|key| crate::tui::nodes::mutation_key(leaf, key))
 }
 
 fn per_leaf_header(leaf: Leaf) -> &'static str {
@@ -418,7 +409,7 @@ fn per_leaf_header(leaf: Leaf) -> &'static str {
         Leaf::File => " File Keybindings",
         Leaf::Logs => " Log Messages Keybindings",
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => " Cluster Keybindings",
+        Leaf::Nodes => " Nodes Keybindings",
     }
 }
 
@@ -432,10 +423,20 @@ fn per_leaf_header(leaf: Leaf) -> &'static str {
 /// a reword that keeps the promise.
 pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
     match leaf {
-        Leaf::Dashboard => vec![HelpRow {
-            key: "d",
-            desc: "Toggle hourly / daily chart",
-        }],
+        Leaf::Dashboard => vec![
+            HelpRow {
+                key: "Up/Down",
+                desc: "Scroll dashboard",
+            },
+            HelpRow {
+                key: "PgUp/PgDn",
+                desc: "Scroll a page",
+            },
+            HelpRow {
+                key: "Home/End",
+                desc: "Jump to first / last row",
+            },
+        ],
         Leaf::QueryLog => vec![
             HelpRow {
                 key: "Up/Down",
@@ -457,19 +458,15 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "/",
-                desc: "Filter by domain (substring)",
+                desc: "Open the Domain filter window (case-insensitive substring)",
             },
             HelpRow {
                 key: "c",
-                desc: "Filter by client (substring)",
+                desc: "Pick one or more exact clients (OR); search by name or IP",
             },
-            // `qlog-advanced-filter-form`. The card's `Adv [f]` chip is
-            // the other half of this, and it is allowed to disappear on a
-            // narrow terminal while inactive — which is precisely when a
-            // first-time operator needs the key named. So it is named here.
             HelpRow {
                 key: "f",
-                desc: "Advanced search (client name / IP / subnet, glob)",
+                desc: "Focus filter chips; arrows move, Enter opens, Esc leaves",
             },
             HelpRow {
                 key: "b",
@@ -477,11 +474,19 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "t",
-                desc: "Cycle time filter (off/1h/6h/24h)",
+                desc: "Choose period (available history / 1h / 3h / 6h / 24h)",
             },
             HelpRow {
                 key: "R",
                 desc: "Reset all filters",
+            },
+            HelpRow {
+                key: "Alt+D/C/B/T/F",
+                desc: "Clear domain / client / result / period / more filters only",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Read full focused query detail (Enter remains rule action)",
             },
             HelpRow {
                 key: "Esc",
@@ -493,6 +498,14 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
         ],
         Leaf::Devices => vec![
+            HelpRow {
+                key: "i / Esc",
+                desc: "Open full details / return to the device table",
+            },
+            HelpRow {
+                key: "f",
+                desc: "Focus the Subnet filter chip; Enter opens",
+            },
             HelpRow {
                 key: "Up/Down",
                 desc: "Move cursor (skips group headers)",
@@ -521,7 +534,19 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
         Leaf::Subnets => vec![
             HelpRow {
                 key: "Up/Down",
-                desc: "Scroll list",
+                desc: "Move through the subnet list; scroll the Clients view",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Open full subnet details and clients",
+            },
+            HelpRow {
+                key: "c",
+                desc: "Open the sortable Clients view",
+            },
+            HelpRow {
+                key: "s",
+                desc: "Focus client sort headers in the Clients view",
             },
             HelpRow {
                 key: "a",
@@ -537,33 +562,29 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "Enter",
-                desc: "Promote the focused auto-discovered candidate to a configured subnet",
+                desc: "Edit a configured subnet or promote the focused auto-discovered candidate",
             },
         ],
         Leaf::LocalDns => vec![
             HelpRow {
                 key: "Up/Down",
-                desc: "Scroll focused panel",
-            },
-            HelpRow {
-                key: "o",
-                desc: "Switch focus Global ⇄ Profile",
-            },
-            HelpRow {
-                key: "n / N",
-                desc: "Next / previous profile (Profile panel)",
+                desc: "Move through every record and scope",
             },
             HelpRow {
                 key: "a",
                 desc: "Add a local DNS record",
             },
             HelpRow {
-                key: "e",
+                key: "Enter / e",
                 desc: "Edit the focused row",
             },
             HelpRow {
                 key: "d / Delete",
                 desc: "Remove the focused row (tiered confirm)",
+            },
+            HelpRow {
+                key: "i / Esc",
+                desc: "Open / close record details and audit history",
             },
         ],
         Leaf::Profiles => vec![
@@ -573,15 +594,27 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "a",
-                desc: "Add a profile (id + display name)",
+                desc: "Add a complete profile draft",
             },
             HelpRow {
-                key: "e",
-                desc: "Edit the focused profile (6 mutable fields)",
+                key: "Enter / e",
+                desc: "Edit the focused profile",
             },
             HelpRow {
                 key: "d / Delete",
                 desc: "Delete the focused profile (refuses if still referenced)",
+            },
+            HelpRow {
+                key: "Right",
+                desc: "Open the profile detail panel",
+            },
+            HelpRow {
+                key: "Esc",
+                desc: "Return from the detail panel to the profile list",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Inspect the focused profile",
             },
         ],
         // The pane the keys act on is the one with the ▸ cursor, and the
@@ -599,8 +632,8 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Move inside the focused pane",
             },
             HelpRow {
-                key: "Enter/Right",
-                desc: "Give the rule pane the cursor",
+                key: "v",
+                desc: "Switch between the list and rule panes",
             },
             HelpRow {
                 key: "Left/Esc",
@@ -611,8 +644,8 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Add: a list on the left pane, a rule on the right",
             },
             HelpRow {
-                key: "e",
-                desc: "Edit the selected list's name and description",
+                key: "Enter / e",
+                desc: "Edit the selected list or rule",
             },
             HelpRow {
                 key: "d / Delete",
@@ -620,7 +653,11 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "m",
-                desc: "Mount / unmount the list on profiles (Space toggles, Enter saves)",
+                desc: "Mount / unmount the list on profiles",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Inspect the selected list or rule",
             },
         ],
         Leaf::Lists => vec![
@@ -634,11 +671,19 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "a",
-                desc: "Add a new blocklist by URL",
+                desc: "Add from the purge.cc catalog or a URL",
             },
             HelpRow {
-                key: "B",
-                desc: "Browse the purge.cc catalog (Space toggles, Ctrl+s saves)",
+                key: "e",
+                desc: "Edit the focused subscription",
+            },
+            HelpRow {
+                key: "d / Delete",
+                desc: "Remove the focused subscription",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Inspect the focused subscription",
             },
             HelpRow {
                 key: "K",
@@ -651,7 +696,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "f",
-                desc: "Cycle kind filter (all / block / allow)",
+                desc: "Focus filter chips; arrows move, Enter changes",
             },
             HelpRow {
                 key: "R",
@@ -698,23 +743,27 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
         // both live boxes are actually in.
         Leaf::Labels => vec![
             HelpRow {
-                key: "Left/Right",
-                desc: "Move focus between the kind menu and the entries",
+                key: "f",
+                desc: "Focus the category column",
             },
             HelpRow {
                 key: "Up/Down",
-                desc: "Move inside the focused pane (kind, or entry)",
+                desc: "Select a category or label; scroll details",
             },
             // There is no `h`/`l` alias for Left/Right — it is deleted
             // outright, not just unadvertised, so there is no alias row
             // left to list.
             HelpRow {
+                key: "Left/Right",
+                desc: "Move between categories, labels and details",
+            },
+            HelpRow {
                 key: "a",
                 desc: "Declare a value in the selected kind",
             },
             HelpRow {
-                key: "e",
-                desc: "Edit the selected entry",
+                key: "Enter / e",
+                desc: "Enter the label list, or edit its selected entry",
             },
             HelpRow {
                 key: "d",
@@ -733,12 +782,16 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
                 desc: "Add a group",
             },
             HelpRow {
-                key: "e",
+                key: "Enter / e",
                 desc: "Edit the selected group",
             },
             HelpRow {
                 key: "d / Delete",
                 desc: "Remove the selected group",
+            },
+            HelpRow {
+                key: "i / Esc",
+                desc: "Open / close full group details",
             },
         ],
         // The document's keys moved to Leaf::File with the
@@ -763,30 +816,38 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
         Leaf::Logs => vec![
             HelpRow {
                 key: "Up/Down",
-                desc: "Scroll one message",
+                desc: "Select one message",
             },
             HelpRow {
                 key: "PgUp/PgDn",
-                desc: "Scroll one page",
+                desc: "Move one page",
             },
             HelpRow {
                 key: "Home/End",
                 desc: "Jump to newest / oldest fetched",
             },
             HelpRow {
-                key: "/",
-                desc: "Search message text and module",
-            },
-            HelpRow {
                 key: "f",
-                desc: "Cycle level: all / errors / warnings / info",
+                desc: "Focus filters; Tab/arrows move, Enter opens, Delete clears",
             },
             HelpRow {
-                key: "R",
-                desc: "Clear the search and the level filter",
+                key: "Enter",
+                desc: "Open complete message",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Open complete message",
             },
         ],
         Leaf::Settings => vec![
+            HelpRow {
+                key: "Up/Down · Enter",
+                desc: "Select a setting and open its action",
+            },
+            HelpRow {
+                key: "i",
+                desc: "Inspect the selected setting",
+            },
             HelpRow {
                 key: "t",
                 desc: "Open the Tracking form",
@@ -805,10 +866,36 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
         ],
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => vec![HelpRow {
-            key: "Up/Down",
-            desc: "Select a roster node (primary only)",
-        }],
+        Leaf::Nodes => vec![
+            HelpRow {
+                key: "Up/Down",
+                desc: "Select a node by stable identity",
+            },
+            HelpRow {
+                key: "/ / R",
+                desc: "Search roster / clear search",
+            },
+            HelpRow {
+                key: "o / O",
+                desc: "Cycle sort column / reverse order",
+            },
+            HelpRow {
+                key: "u",
+                desc: "Resume or cancel a recoverable Nodes operation",
+            },
+            HelpRow {
+                key: "a",
+                desc: "Add a node with destination name, IP, and association token",
+            },
+            HelpRow {
+                key: "Enter / e",
+                desc: "Edit selected node name, IP, or Nodes HTTPS port",
+            },
+            HelpRow {
+                key: "d",
+                desc: "Remove selected remote node; this node cannot be removed",
+            },
+        ],
     }
 }
 
@@ -850,6 +937,13 @@ fn word_wrap(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        (0..buf.area.height).any(|y| {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            line.contains(needle)
+        })
+    }
 
     fn flatten_rows(rows: &[HelpRow]) -> String {
         rows.iter()
@@ -901,7 +995,8 @@ mod tests {
             "End jump-to-bottom must remain (not the vim-style G); got:\n{blob}"
         );
         assert!(
-            blob.contains("Filter by domain"),
+            rows.iter()
+                .any(|row| row.key == "/" && row.desc.contains("Domain filter window")),
             "/ filter-by-domain binding must remain; got:\n{blob}"
         );
         assert!(
@@ -917,7 +1012,7 @@ mod tests {
     #[test]
     fn build_blocks_advertises_the_modal_form_grammar_on_every_leaf() {
         for leaf in Leaf::ALL {
-            let blocks = build_blocks(leaf);
+            let blocks = build_blocks(leaf, None);
             let blob: String = blocks
                 .iter()
                 .filter_map(|b| match b {
@@ -945,16 +1040,16 @@ mod tests {
     fn build_blocks_includes_resolver_global_hotkey() {
         // Post-S52 review: `s` must appear in the Global section so
         // operators see it inside `?` even before noticing the footer.
-        let blocks = build_blocks(Leaf::Dashboard);
+        let blocks = build_blocks(Leaf::Dashboard, None);
         let has_resolver = blocks.iter().any(|b| match b {
             HelpBlock::Rows(rows) => rows
                 .iter()
-                .any(|r| r.key == "s" && r.desc.contains("Resolver modal")),
+                .any(|r| r.key == "Shift+S" && r.desc.contains("Resolver modal")),
             _ => false,
         });
         assert!(
             has_resolver,
-            "Help overlay must list `s` → Resolver modal in Global section"
+            "Help overlay must list `Shift+S` → Resolver modal in Global section"
         );
     }
 
@@ -1014,7 +1109,7 @@ mod tests {
     /// AND description matches `"g b"` inside prose, so it cannot tell a
     /// documented letter from a mentioned one.
     fn mnemonic_block_keys() -> Vec<&'static str> {
-        let blocks = build_blocks(Leaf::Dashboard);
+        let blocks = build_blocks(Leaf::Dashboard, None);
         let title = blocks
             .iter()
             .position(|b| matches!(b, HelpBlock::Title(t) if t.contains("Mnemonics")))
@@ -1047,6 +1142,9 @@ mod tests {
             let Some(leaf) = Leaf::from_mnemonic(ch) else {
                 continue;
             };
+            if !leaf.is_menu_leaf() {
+                continue;
+            }
             let want = format!("g {ch}");
             assert!(
                 keys.iter().any(|k| k.split(" / ").any(|t| t == want)),
@@ -1064,7 +1162,7 @@ mod tests {
     #[test]
     fn no_help_key_overflows_the_key_column() {
         for leaf in Leaf::ALL {
-            for blk in build_blocks(leaf) {
+            for blk in build_blocks(leaf, None) {
                 let HelpBlock::Rows(rows) = blk else { continue };
                 for r in rows {
                     let rendered = format!("  {}", r.key);
@@ -1101,11 +1199,11 @@ mod tests {
             screen.push('\n');
         }
         assert!(
-            screen.contains("g t / g u"),
+            screen.contains("g t") && !screen.contains("g u"),
             "the Filters mnemonic row must paint whole; got:\n{screen}"
         );
         assert!(
-            screen.contains("Custom Lists / Rules"),
+            screen.contains("Custom Lists") && !screen.contains("Custom Lists / Rules"),
             "its description must paint too; got:\n{screen}"
         );
     }
@@ -1113,9 +1211,8 @@ mod tests {
     /// Lists help_rows must advertise the full current
     /// binding set. This once drifted: the Lists rows still described a
     /// stale "Toggle drill-down detail" Enter behaviour and missed
-    /// the five mutation hotkeys (a/B/c/m/K). The footer hint
-    /// cluster in `ui::tab_hints_for` already advertised them but the
-    /// `?` overlay had not caught up.
+    /// the mutation hotkeys. The source chooser owns catalog-vs-URL after
+    /// `a`, so the retired direct-catalog `B` binding must stay absent.
     #[test]
     fn lists_help_advertises_current_binding_set() {
         let blob = flatten_rows(&per_leaf_rows(Leaf::Lists));
@@ -1124,7 +1221,7 @@ mod tests {
         // blob start; multi-char keys like `Enter` survive a contains-
         // check directly. The live filter-card keys
         // (`/`, `f`, `R`) must be present.
-        for needle in ["Enter", "\na ", "\nB ", "\nK ", "\n/ ", "\nf ", "\nR "] {
+        for needle in ["Enter", "\na ", "\nK ", "\n/ ", "\nf ", "\nR "] {
             assert!(
                 blob.contains(needle),
                 "Lists help must advertise [{}] binding; got blob:\n{blob}",
@@ -1133,7 +1230,7 @@ mod tests {
         }
         // The unmounted category/assignment keys must NOT be
         // advertised any more (they dead-ended in refusal stubs).
-        for gone in ["\nc ", "\nm ", "\np ", "Space / x"] {
+        for gone in ["\nB ", "\nc ", "\nm ", "\np ", "Space / x"] {
             assert!(
                 !blob.contains(gone),
                 "Lists help must NOT advertise removed binding [{}]; got blob:\n{blob}",
@@ -1242,7 +1339,7 @@ mod tests {
     /// moment a leaf is added.
     #[test]
     fn navigation_block_leaf_count_matches_leaf_all_len() {
-        let blocks = build_blocks(Leaf::Dashboard);
+        let blocks = build_blocks(Leaf::Dashboard, None);
         let mut nav_blob = String::new();
         let mut iter = blocks.iter();
         while let Some(block) = iter.next() {
@@ -1261,7 +1358,10 @@ mod tests {
                 }
             }
         }
-        let expected = format!("{} leaves", Leaf::ALL.len());
+        let expected = format!(
+            "{} visible leaves",
+            Leaf::ALL.iter().filter(|leaf| leaf.is_menu_leaf()).count()
+        );
         assert!(
             nav_blob.contains(&expected),
             "navigation block must say `Cycle ALL {} leaves` matching Leaf::ALL.len() = {}; got:\n{nav_blob}",
@@ -1270,7 +1370,7 @@ mod tests {
         );
     }
 
-    /// A render-level guard, not just a source-grep.
+    /// A render-level guard for the shared square modal chrome.
     /// The grep can see the red border and the brand-red titles come back;
     /// it cannot see the rounded border type or the raised surface simply
     /// failing to be added, since neither has a banned token to catch.
@@ -1286,15 +1386,11 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let area = buf.area;
 
-        // A rounded top-left corner ('\u{256d}') only exists if
-        // `BorderType::Rounded` was actually set — the default `Plain`
-        // border draws '\u{250c}' there instead, so this cell's mere
-        // presence proves the border type, and its colours prove the
-        // chrome rule's other two properties in the same read.
+        // The shared modal renderer owns the plain square border.
         let (cx, cy) = (0..area.width)
             .flat_map(|x| (0..area.height).map(move |y| (x, y)))
-            .find(|&(x, y)| buf[(x, y)].symbol() == "\u{256d}")
-            .expect("help popup must draw a rounded top-left corner, not a square one");
+            .find(|&(x, y)| buf[(x, y)].symbol() == "┌")
+            .expect("help popup must draw a square modal border");
         let corner = &buf[(cx, cy)];
         assert_eq!(
             corner.fg, T.text_primary,
@@ -1302,7 +1398,7 @@ mod tests {
         );
         assert_eq!(
             corner.bg, T.bg_elevated,
-            "help popup must sit on the elevated surface, not bare Clear"
+            "help popup must sit on the elevated surface"
         );
 
         let has_teal_title = (0..area.width)
@@ -1317,83 +1413,25 @@ mod tests {
         );
     }
 
-    /// tui-infra-01, achievable half: at the declared 80×24 floor every
-    /// leaf's content overflows (37-49 rows needed against a 22-row
-    /// interior — this repo's own measured numbers), so every leaf must
-    /// hit the truncation branch, and what IS shown must actually be on
-    /// screen rather than merely claimed. A revert to the old
-    /// full-height `Layout::vertical` (no `fit_blocks`, no title count)
-    /// fails this on the last assertion: the fallback title never
-    /// contains "showing N/".
+    /// At the 80×24 floor the complete help document remains reachable by
+    /// scrolling to its final page.
     #[test]
-    fn every_leaf_declares_its_truncation_honestly_at_the_80x24_floor() {
+    fn every_leaf_scrolls_to_the_end_at_the_80x24_floor() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        const FLOOR_INNER: u16 = 22; // 24-row terminal minus the 2-row border
-
         for leaf in Leaf::ALL {
-            let blocks = build_blocks(leaf);
-            let fit = fit_blocks(&blocks, FLOOR_INNER);
-            assert!(
-                fit.hidden > 0,
-                "{leaf:?}: this leaf's content now fits the 80x24 floor — \
-                 update this test's premise instead of leaving it green by accident"
-            );
-
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            term.draw(|f| render(f, leaf)).unwrap();
+            let mut offset = usize::MAX;
+            term.draw(|f| render_scrolled(f, leaf, &mut offset))
+                .unwrap();
             let buf = term.backend().buffer().clone();
-            let mut screen = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    screen.push_str(buf[(x, y)].symbol());
-                }
-                screen.push('\n');
-            }
-
-            // Every row inside the fitted budget must actually be on
-            // screen — a byte count claiming "shown" is not evidence,
-            // the pixels are.
-            for b in &blocks[..fit.shown] {
-                if let HelpBlock::Rows(rows) = b {
-                    for r in rows {
-                        assert!(
-                            screen.contains(r.key),
-                            "{leaf:?}: {:?} is inside the fitted budget but not on screen:\n{screen}",
-                            r.key
-                        );
-                    }
-                }
-            }
-
-            // The row-content loop above is a no-op if `fit.shown` lands
-            // on Title+Spacer alone — this closes that gap so a budget
-            // too small for any keybindings fails loudly instead of
-            // reading as "every shown row is on screen" (vacuously true
-            // of zero rows).
+            assert!(buffer_contains(&buf, "HELP"));
             assert!(
-                blocks[..fit.shown]
-                    .iter()
-                    .any(|b| matches!(b, HelpBlock::Rows(_))),
-                "{leaf:?}: fitted budget holds no keybinding rows — the \
-                 overlay would paint a header and blank space"
+                buffer_contains(&buf, "Quit"),
+                "{leaf:?}: end page lost global commands"
             );
-
-            // The per-leaf section leads, so it must always survive the cut.
-            let header = per_leaf_header(leaf).trim();
-            assert!(
-                screen.contains(header),
-                "{leaf:?}: per-leaf header must survive the cut; got:\n{screen}"
-            );
-
-            // The cut must be declared, with numbers that add up — not a
-            // silent clip with nothing on screen to say so.
-            let expect_used = format!("showing {}/", fit.used);
-            assert!(
-                screen.contains(&expect_used),
-                "{leaf:?}: overlay must report its own truncation ({expect_used}); got:\n{screen}"
-            );
+            assert!(offset < usize::MAX, "{leaf:?}: offset was not clamped");
         }
     }
 }

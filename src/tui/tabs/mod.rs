@@ -1,5 +1,3 @@
-#[cfg(feature = "cluster")]
-pub mod cluster;
 pub mod custom_lists;
 pub mod dashboard;
 pub mod devices;
@@ -9,6 +7,8 @@ pub mod labels;
 pub mod lists;
 pub mod local_dns;
 pub mod logs;
+#[cfg(feature = "cluster")]
+pub mod nodes;
 pub mod profiles;
 pub mod query_log;
 pub mod rules;
@@ -54,7 +54,11 @@ pub(super) fn render_table(
 /// scroll_persistence_tests`) and can.
 #[cfg(test)]
 mod scroll_persistence_tests {
+    use crate::operator_rules::{
+        Capabilities, ListDetail, Metadata, RuleAction, RuleRow, TransportLimits,
+    };
     use crate::tui::app::App;
+    use crate::tui::operator_policy::{PolicyCatalog, PolicyRules};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
@@ -87,7 +91,7 @@ mod scroll_persistence_tests {
     /// not care which one a given tab happens to use.
     fn big_config_toml() -> String {
         let mut s =
-            String::from("schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n");
+            String::from("schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n");
         for i in 0..ROWS {
             s += &format!("[profiles.prof-{i:02}]\ndisplay_name = \"Prof {i:02}\"\n\n");
         }
@@ -142,6 +146,65 @@ mod scroll_persistence_tests {
         }
     }
 
+    fn custom_list_catalog() -> PolicyCatalog {
+        PolicyCatalog {
+            capabilities: Capabilities {
+                contract_version: crate::operator_rules::CONTRACT_VERSION,
+                schema_version: 5,
+                operator_rule_grammar: 1,
+                operations: Vec::new(),
+                semantic_hash: true,
+                activation_ack: true,
+                cluster_artifact: false,
+                limits: TransportLimits::IPC,
+            },
+            metadata: Metadata {
+                contract_version: crate::operator_rules::CONTRACT_VERSION,
+                schema_version: 5,
+                config_revision: "config-r1".into(),
+                desired_operator_policy_hash: String::new(),
+                active_policy: None,
+                activation_in_sync: true,
+                lists: ROWS,
+                mounted_lists: 0,
+                orphan_packs: 0,
+            },
+            lists: (0..ROWS)
+                .map(|i| ListDetail {
+                    id: format!("cl-{i:02}"),
+                    display_name: format!("CL {i:02}"),
+                    description: String::new(),
+                    config_revision: "config-r1".into(),
+                    pack_revision: format!("cl-{i:02}-r1"),
+                    bytes: 0,
+                    rule_count: 1,
+                    invalid_rows: 0,
+                    profiles: Vec::new(),
+                })
+                .collect(),
+            orphan_packs: Vec::new(),
+        }
+    }
+
+    fn custom_list_rules() -> PolicyRules {
+        PolicyRules {
+            id: "cl-00".into(),
+            config_revision: "config-r1".into(),
+            pack_revision: "cl-00-r1".into(),
+            rows: (0..ROWS)
+                .map(|i| RuleRow {
+                    line: i + 1,
+                    raw: format!("||d{i:02}.example^"),
+                    row_ref: format!("cl-00:r1:{i}"),
+                    rule_key: Some(format!("hash-{i}")),
+                    action: Some(RuleAction::Deny),
+                    valid: true,
+                    duplicate: false,
+                })
+                .collect(),
+        }
+    }
+
     fn mapped_device(i: usize) -> crate::ipc::protocol::MappedDeviceDto {
         crate::ipc::protocol::MappedDeviceDto {
             ip: format!("10.9.{i}.2"),
@@ -166,6 +229,7 @@ mod scroll_persistence_tests {
             network_name_wildcard: false,
             id: Some(format!("dev-{i:02}")),
             hourly_queries: Vec::new(),
+            hourly_blocked: None,
             unfiltered: false,
         }
     }
@@ -201,6 +265,7 @@ mod scroll_persistence_tests {
                 build: || {
                     let mut app = App::new();
                     app.loaded_config = Some(big_loaded_config());
+                    app.operator_catalog = Some(custom_list_catalog());
                     app.custom_lists.selected_id = Some(format!("cl-{DEEP:02}"));
                     app
                 },
@@ -212,27 +277,18 @@ mod scroll_persistence_tests {
                 name: "custom_lists (rules/pack pane)",
                 build: || {
                     let mut app = App::new();
-                    // The pack pane only paints once the list pane has at
-                    // least one row (`render`'s own early-empty-state
-                    // gate), so this reuses the shared config too.
                     app.loaded_config = Some(big_loaded_config());
-                    let rows = (0..ROWS)
-                        .map(|i| crate::tui::app::PackRow {
-                            number: i + 1,
-                            raw: format!("||d{i:02}.example^"),
-                            domain: Some(format!("d{i:02}.example")),
-                            action: crate::tui::app::PackRowAction::Deny,
-                        })
-                        .collect();
-                    app.custom_lists.pack = Some(crate::tui::app::PackView {
-                        id: "cl-00".to_string(),
-                        rows,
-                        error: None,
-                    });
-                    app.custom_lists.selected_line = Some(DEEP + 1); // 1-based line
+                    app.operator_catalog = Some(custom_list_catalog());
+                    app.operator_rules = Some(custom_list_rules());
+                    app.custom_lists.selected_id = Some("cl-00".to_string());
+                    app.custom_lists.selected_row_ref =
+                        Some(("cl-00".to_string(), format!("cl-00:r1:{DEEP}")));
                     app
                 },
-                advance: |app| app.custom_lists.selected_line = Some(SHALLOW + 1),
+                advance: |app| {
+                    app.custom_lists.selected_row_ref =
+                        Some(("cl-00".to_string(), format!("cl-00:r1:{SHALLOW}")));
+                },
                 render: super::custom_lists::render,
                 offset: |app| app.custom_lists.rules_table_state.offset(),
             },
@@ -241,13 +297,19 @@ mod scroll_persistence_tests {
                 build: || {
                     let mut app = App::new();
                     app.loaded_config = Some(big_loaded_config());
-                    app.local_dns.selected_id =
-                        Some(("global".to_string(), format!("rec{DEEP:02}.home")));
+                    app.local_dns.selected_id = Some((
+                        "global".to_string(),
+                        format!("rec{DEEP:02}.home"),
+                        "A".into(),
+                    ));
                     app
                 },
                 advance: |app| {
-                    app.local_dns.selected_id =
-                        Some(("global".to_string(), format!("rec{SHALLOW:02}.home")))
+                    app.local_dns.selected_id = Some((
+                        "global".to_string(),
+                        format!("rec{SHALLOW:02}.home"),
+                        "A".into(),
+                    ))
                 },
                 render: super::local_dns::render,
                 offset: |app| app.local_dns.table_state.offset(),

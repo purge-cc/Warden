@@ -12,17 +12,14 @@ fn dummy_poller(dir: &Path) -> IpcPoller {
     IpcPoller::new(&dir.join("ghost.sock"))
 }
 
-/// One group with a populated `devices` list and one tag, plus a
-/// device carrying two *other* tags — so the chip picker has real
-/// suggestions to focus. `filter_tag_suggestions` drops tags the
-/// group already holds, so a fixture whose only known tag is the
-/// group's own would make the picker permanently empty and the
-/// stale-focus assertion below vacuous.
+/// One group with a populated `devices` list. The group modal now exposes
+/// only supported current-schema fields, so the fixture stays free of the
+/// retired tag vocabulary.
 fn mk_groups_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -37,7 +34,6 @@ display_name = "Home"
 id = "phone-1"
 display_name = "Phone 1"
 mac = "AA:BB:CC:DD:EE:01"
-tags = ["media", "trusted"]
 
 [[devices]]
 id = "phone-2"
@@ -50,7 +46,6 @@ display_name = "Phones"
 profile = "home"
 priority = 7
 devices = ["phone-1", "phone-2"]
-tags = ["ads"]
 "#,
     )
     .unwrap();
@@ -58,8 +53,8 @@ tags = ["ads"]
 }
 
 fn groups_app(master: &Path) -> App {
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(master);
     app.active_leaf = Leaf::Groups;
     assert!(
         app.loaded_config.is_some(),
@@ -178,10 +173,10 @@ async fn ux13_paste_is_inert_in_the_groups_remove_confirm() {
 /// column 0, whereas brace counting is fooled by braces inside live
 /// string literals — this file has
 /// `panic!("expected Submitted{{ok:true,..}}, got {other:?}")` in a
-/// test module. The lone indented marker is
-/// `TerminalGuard::with_restore`, a three-line fn that binds no keys;
-/// `ux14_the_stripper_actually_strips` pins that it is the *only*
-/// survivor, so a walk that quietly gave up cannot pass.
+/// test module. The indented markers belong to `TerminalGuard::with_restore`
+/// and the two polling fallbacks; none introduces a key handler.
+/// `ux14_the_stripper_actually_strips` pins the exact set of indented
+/// survivors, so a walk that quietly gave up cannot pass.
 ///
 /// **Scope, stated because it is a real boundary and not an obvious
 /// one.** This reads `mod.rs` and nothing else. That is complete
@@ -235,7 +230,13 @@ const CANCEL_SHIFTED: &str = " | KeyCode::Char('N')";
 #[test]
 fn ux14_every_single_key_confirm_accepts_both_cases() {
     let src = collapsed(&production_source());
-    let sites = sites_of(&src, CONFIRM);
+    let sites: Vec<_> = sites_of(&src, CONFIRM)
+        .into_iter()
+        .filter(|site| {
+            let tail = &site[CONFIRM.len()..];
+            tail.starts_with(" |") || tail.starts_with(" =>")
+        })
+        .collect();
 
     // Vacuity guard. "Every site complies" is trivially true of no
     // sites, so a broken stripper or a stale needle would read green.
@@ -263,19 +264,17 @@ fn ux14_every_single_key_confirm_accepts_both_cases() {
     );
 }
 
-/// The cancel half — **and as of N6 (2026-08-24) it has no exception
-/// left.**
+/// The cancel half. Bare `n` is permitted only for the Nodes rename action,
+/// which is not a confirmation gate.
 ///
 /// It used to allow exactly one bare `n`, by identity: the Local DNS
 /// leaf bound `n` to "next profile" and `N` to "previous profile" —
 /// the vim search idiom, where the two cases mean *opposite* things,
 /// so merging those arms would have been a bug rather than a fix.
 ///
-/// N6 retired the panel model those two keys served, so the binding is
-/// gone and with it the carve-out. The floor drops 10 → 9 and the
-/// allowance drops 1 → 0, which is the direction that makes an
-/// invariant stronger: every single-key cancel in the TUI now takes
-/// both cases, with nothing exempted.
+/// N6 retired the panel model those two keys served. Nodes later assigned
+/// bare `n` to Rename; the typed lifecycle operation in the match arm is
+/// the narrow carve-out that keeps this scan about cancel gates.
 ///
 /// The floor was lowered rather than removed, exactly as the message
 /// on the `y` twin instructs — a count of zero would make this test
@@ -297,6 +296,7 @@ fn ux14_every_single_key_cancel_accepts_both_cases() {
 
     let bare: Vec<&str> = sites
         .iter()
+        .filter(|s| !s.contains("LifecycleOperation::Rename"))
         .filter(|s| !s[CANCEL.len()..].starts_with(CANCEL_SHIFTED))
         .copied()
         .collect();
@@ -305,8 +305,7 @@ fn ux14_every_single_key_cancel_accepts_both_cases() {
         bare.is_empty(),
         "these cancel gates take `n` but ignore `N` — an operator with \
              CapsLock presses a key that does nothing and is told nothing. \
-             The Local DNS next-profile binding used to be a legitimate bare \
-             `n` here; N6 deleted it, so there is no exception any more:\n{}",
+             The only legitimate bare `n` is the typed Nodes Rename action:\n{}",
         bare.join("\n\n")
     );
 }
@@ -359,25 +358,25 @@ fn ux14_the_stripper_actually_strips() {
         .lines()
         .filter(|l| looks_like_test_cfg_attr(l.trim()))
         .collect();
-    assert_eq!(
-        survivors.len(),
-        1,
-        "exactly one test-cfg marker is indented (TerminalGuard::with_restore) \
-             and so is not a column-0 module the walk removes; more than one \
-             means whole test modules are being left behind: {survivors:?}"
-    );
+    let expected = [
+        "    #[cfg(test)]\n    fn with_restore",
+        "        #[cfg(test)]\n        poll_active_leaf_inline(app, _poller).await;",
+        "        #[cfg(test)]\n        poll_heartbeat_inline(app, _poller).await;",
+    ];
+    assert_eq!(survivors.len(), expected.len(),
+        "only the named indented helpers may survive; whole test modules must be stripped: {survivors:?}");
     assert!(
-        survivors[0].starts_with(char::is_whitespace),
-        "the one survivor must be indented — a column-0 survivor means a \
-             real test module failed to strip: {:?}",
-        survivors[0]
+        survivors
+            .iter()
+            .all(|line| line.starts_with(char::is_whitespace)),
+        "a column-0 test item survived the strip: {survivors:?}"
     );
-    assert!(
-        stripped.contains("    #[cfg(test)]\n    fn with_restore"),
-        "the survivor must be `TerminalGuard::with_restore` specifically — a \
-         count of one is also satisfied by an unrelated indented marker while \
-         that one went missing"
-    );
+    for item in expected {
+        assert!(
+            stripped.contains(item),
+            "expected precisely this indented test seam: {item}"
+        );
+    }
 }
 
 /// Discipline pin for the mod.rs decomposition: every `#[cfg(test)] mod
@@ -451,7 +450,7 @@ fn mk_local_dns_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -489,11 +488,15 @@ async fn ux14_shifted_confirm_removes_a_local_dns_record() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_local_dns_master(&dir);
     let poller = dummy_poller(dir.path());
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(&master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(&master);
     app.active_leaf = Leaf::LocalDns;
     // N6: one cursor, anchored by (scope, domain).
-    app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
+    app.local_dns.selected_id = Some((
+        "global".to_string(),
+        "nas.home".to_string(),
+        "A".to_string(),
+    ));
     assert!(
         app.loaded_config.is_some(),
         "fixture must parse — every assertion below is vacuous otherwise"

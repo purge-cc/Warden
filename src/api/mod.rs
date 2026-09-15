@@ -32,6 +32,10 @@
 
 pub mod deprecation;
 pub mod handlers;
+#[cfg(feature = "cluster")]
+pub mod node_transport;
+pub mod operator_rule_jobs;
+pub mod operator_rules;
 pub mod rate_limit;
 pub mod routes;
 pub mod server;

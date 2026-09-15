@@ -85,7 +85,7 @@ mod tests {
         let canonical = tempfile::tempdir().unwrap();
         let alias_dir = tempfile::tempdir().unwrap();
         let master = canonical.path().join("config.toml");
-        std::fs::write(&master, "schema_version = 4\n").unwrap();
+        std::fs::write(&master, "schema_version = 5\n").unwrap();
         let alias = alias_dir.path().join("alias.toml");
         std::os::unix::fs::symlink(&master, &alias).unwrap();
 

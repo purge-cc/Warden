@@ -29,7 +29,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use toml::Value;
 
-use crate::config::loader::load_config;
+use crate::config::loader::load_current_config;
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
 use crate::lists::status::{CorpusRefusal, CycleMark};
@@ -132,7 +132,7 @@ pub async fn run_show(config_path: &Path, socket_path: &Path) -> anyhow::Result<
     warn_if_frozen(socket_path).await;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(|errs| {
+    let loaded = load_current_config(config_path, now).map_err(|errs| {
         anyhow::anyhow!(
             "cannot read config: {}",
             errs.iter()

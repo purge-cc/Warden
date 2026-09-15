@@ -64,6 +64,10 @@ fn response_status_roundtrip() {
         lists_cycle: None,
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
+        lists_memory_bytes: None,
+        query_log_client_ips_supported: false,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: None,
         cache_weighted_size: 0,
     };
@@ -149,6 +153,10 @@ fn status_cycle_qualifiers_remain_wire_compatible() {
         }),
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
+        lists_memory_bytes: None,
+        query_log_client_ips_supported: false,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: None,
     };
     let wire = serde_json::to_string(&current).unwrap();
@@ -280,6 +288,10 @@ fn response_status_with_drop_counters_roundtrip() {
         lists_cycle: None,
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
+        lists_memory_bytes: None,
+        query_log_client_ips_supported: false,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: None,
         cache_weighted_size: 0,
     };
@@ -344,6 +356,10 @@ fn response_status_s419_fields_roundtrip() {
         lists_cycle: None,
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
+        lists_memory_bytes: None,
+        query_log_client_ips_supported: false,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: None,
         cache_weighted_size: 4_120,
     };
@@ -415,12 +431,21 @@ fn response_status_with_resource_budget_roundtrip() {
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
         cache_weighted_size: 300,
+        lists_memory_bytes: Some(12345),
+        query_log_client_ips_supported: true,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: Some(ResourceBudgetSnapshot {
             rss_mb: 42,
             vsz_mb: 280,
             fd_count: 18,
             cpu_user_pct: 3,
             rss_warn_mb: 256,
+            swap_mb: Some(17),
+            peak_rss_mb: Some(64),
+            mem_available_mb: Some(120),
+            mem_total_mb: Some(1024),
+            sampled_at: Some(1700000000),
         }),
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -812,6 +837,7 @@ fn admin_commands_have_admin_tier() {
     );
     assert_eq!(
         IpcCommand::QueryLogs {
+            client_ips: Vec::new(),
             limit: 10,
             client: None,
             blocked_only: false,
@@ -836,6 +862,7 @@ fn with_token_attaches_to_gated_commands() {
     assert_eq!(shutdown.token(), Some("ps_abc123"));
 
     let logs = IpcCommand::QueryLogs {
+        client_ips: Vec::new(),
         limit: 10,
         client: None,
         blocked_only: false,
@@ -917,6 +944,7 @@ fn with_token_preserves_every_query_logs_field() {
         ..Default::default()
     };
     let cmd = IpcCommand::QueryLogs {
+        client_ips: Vec::new(),
         limit: 40,
         client: Some("laptop".into()),
         blocked_only: true,
@@ -929,6 +957,7 @@ fn with_token_preserves_every_query_logs_field() {
     let IpcCommand::QueryLogs {
         limit,
         client,
+        client_ips,
         blocked_only,
         domain,
         since_secs,
@@ -939,6 +968,7 @@ fn with_token_preserves_every_query_logs_field() {
     else {
         panic!("with_token must not change the variant");
     };
+    assert!(client_ips.is_empty());
     assert_eq!(limit, 40);
     assert_eq!(client.as_deref(), Some("laptop"));
     assert!(blocked_only);
@@ -981,6 +1011,7 @@ fn query_logs_wire_is_compatible_in_both_directions() {
     let IpcResponse::QueryLogs {
         next_cursor,
         cursor_stale,
+        client_ips_applied,
         ..
     } = resp
     else {
@@ -988,9 +1019,11 @@ fn query_logs_wire_is_compatible_in_both_directions() {
     };
     assert!(next_cursor.is_none());
     assert!(!cursor_stale);
+    assert!(!client_ips_applied);
 
     // And a cursor-bearing command survives the round trip.
     let with_cursor = IpcCommand::QueryLogs {
+        client_ips: Vec::new(),
         limit: 40,
         client: None,
         blocked_only: false,
@@ -1016,6 +1049,7 @@ fn query_logs_wire_is_compatible_in_both_directions() {
 #[test]
 fn query_logs_response_roundtrip() {
     let resp = IpcResponse::QueryLogs {
+        client_ips_applied: true,
         entries: vec![QueryLogDto {
             timestamp: "2026-04-08T15:00:00Z".into(),
             client_ip: "192.168.1.1".into(),
@@ -1128,11 +1162,57 @@ fn mapped_device_dto_roundtrip() {
         network_name_wildcard: false,
         id: None,
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
         unfiltered: false,
     };
     let json = serde_json::to_string(&dto).unwrap();
     let parsed: MappedDeviceDto = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, dto);
+}
+
+#[test]
+fn mapped_device_old_daemon_missing_hourly_blocked_is_unavailable() {
+    let dto = MappedDeviceDto {
+        ip: "192.168.1.42".into(),
+        name: "legacy".into(),
+        mac: None,
+        mac_aliases: Vec::new(),
+        profile: "default".into(),
+        owner: None,
+        device_type: None,
+        department: None,
+        queries: 0,
+        queries_today: 0,
+        blocked: 0,
+        blocked_24h: 0,
+        cache_hits: 0,
+        last_seen: 0,
+        online: false,
+        vendor: None,
+        groups: Vec::new(),
+        notes: None,
+        network_name: None,
+        network_name_wildcard: false,
+        id: None,
+        hourly_queries: Vec::new(),
+        hourly_blocked: None,
+        unfiltered: false,
+    };
+    let mut wire = serde_json::to_value(dto).unwrap();
+    wire.as_object_mut().unwrap().remove("hourly_blocked");
+    let parsed: MappedDeviceDto = serde_json::from_value(wire).unwrap();
+    assert_eq!(parsed.hourly_blocked, None);
+
+    let unmapped: UnmappedDeviceDto = serde_json::from_value(serde_json::json!({
+        "ip": "192.168.1.43",
+        "mac": null,
+        "queries": 0,
+        "blocked": 0,
+        "last_seen": 0,
+        "online": false
+    }))
+    .unwrap();
+    assert_eq!(unmapped.hourly_blocked, None);
 }
 
 /// The device view really does put operator-private metadata on the
@@ -1169,6 +1249,7 @@ fn device_view_carries_operator_private_fields() {
         network_name_wildcard: false,
         id: None,
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
         unfiltered: false,
     };
     let json = serde_json::to_string(&dto).unwrap();
@@ -1211,6 +1292,7 @@ fn mapped_device_dto_wire_shape_is_flat() {
         network_name_wildcard: false,
         id: None,
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
         unfiltered: false,
     };
     let json = serde_json::to_string(&dto).unwrap();
@@ -1308,6 +1390,7 @@ fn device_view_dto_roundtrip_after_sn3_flag_removal() {
             network_name_wildcard: false,
             id: None,
             hourly_queries: Vec::new(),
+            hourly_blocked: None,
             unfiltered: false,
         }],
         unmapped: vec![UnmappedDeviceDto {
@@ -1321,6 +1404,7 @@ fn device_view_dto_roundtrip_after_sn3_flag_removal() {
             online: false,
             vendor: None,
             hourly_queries: Vec::new(),
+            hourly_blocked: None,
         }],
     };
     let json = serde_json::to_string(&view).unwrap();
@@ -1543,6 +1627,10 @@ fn response_status_upstream_servers_roundtrip() {
         lists_corpus_freeze: None,
         lc2_list_diagnostics: ListDiagnostics::default(),
         cache_weighted_size: 0,
+        lists_memory_bytes: None,
+        query_log_client_ips_supported: false,
+        tracking_enabled: None,
+        top_lists_24h_supported: false,
         resource_budget: None,
         upstream_servers: vec![
             UpstreamServerInfo {
@@ -1580,4 +1668,200 @@ fn response_status_legacy_without_upstream_servers_deserializes() {
         } => assert!(upstream_servers.is_empty()),
         other => panic!("expected Status, got {other:?}"),
     }
+}
+
+#[test]
+fn exact_client_set_defaults_empty_and_survives_wire_and_token_attachment() {
+    let legacy: IpcCommand = serde_json::from_value(serde_json::json!({
+        "type": "query_logs", "limit": 10
+    }))
+    .unwrap();
+    assert!(!serde_json::to_value(&legacy)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("client_ips"));
+    let cmd: IpcCommand = serde_json::from_value(serde_json::json!({
+        "type": "query_logs", "limit": 10,
+        "client_ips": ["10.0.0.1", "2001:db8::1"]
+    }))
+    .unwrap();
+    let attached = cmd.with_token(Some("token".into()));
+    let json = serde_json::to_value(&attached).unwrap();
+    assert_eq!(
+        json["client_ips"],
+        serde_json::json!(["10.0.0.1", "2001:db8::1"])
+    );
+    let IpcCommand::QueryLogs {
+        client_ips, token, ..
+    } = serde_json::from_value(json).unwrap()
+    else {
+        panic!("wrong command");
+    };
+    assert_eq!(client_ips, ["10.0.0.1", "2001:db8::1"]);
+    assert_eq!(token.as_deref(), Some("token"));
+    let req: QueryLogRequest = serde_json::from_str("{}").unwrap();
+    assert!(req.client_ips.is_empty());
+    assert!(serde_json::to_value(req)
+        .unwrap()
+        .get("client_ips")
+        .is_none());
+}
+
+#[test]
+fn status_tracking_availability_distinguishes_legacy_disabled_and_enabled() {
+    let legacy = serde_json::json!({"type":"status", "pid":1, "listen":"127.0.0.1:53",
+        "upstream_mode":"plain", "upstream_count":1, "domain_count":0,
+        "cache_entries":0, "list_count":0, "uptime_secs":0});
+    for setting in [None, Some(false), Some(true)] {
+        let mut wire = legacy.clone();
+        if let Some(enabled) = setting {
+            wire["tracking_enabled"] = serde_json::json!(enabled);
+        }
+        let response: IpcResponse = serde_json::from_value(wire).unwrap();
+        let IpcResponse::Status {
+            tracking_enabled, ..
+        } = &response
+        else {
+            panic!("expected Status")
+        };
+        assert_eq!(*tracking_enabled, setting);
+        let roundtrip: IpcResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(response, roundtrip);
+    }
+}
+
+#[test]
+fn status_top_lists_capability_defaults_false_and_roundtrips_true() {
+    let legacy = serde_json::json!({"type":"status", "pid":1, "listen":"127.0.0.1:53",
+        "upstream_mode":"plain", "upstream_count":1, "domain_count":0,
+        "cache_entries":0, "list_count":0, "uptime_secs":0});
+    for field in [None, Some(false), Some(true)] {
+        let mut wire = legacy.clone();
+        if let Some(supported) = field {
+            wire["top_lists_24h_supported"] = serde_json::json!(supported);
+        }
+        let response: IpcResponse = serde_json::from_value(wire).unwrap();
+        let IpcResponse::Status {
+            top_lists_24h_supported,
+            ..
+        } = &response
+        else {
+            panic!("expected Status")
+        };
+        assert_eq!(*top_lists_24h_supported, field.unwrap_or(false));
+        let restored: IpcResponse =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(restored, response);
+    }
+}
+
+#[test]
+fn operator_rules_tiers_are_exhaustive_and_tokens_preserve_payloads() {
+    assert_eq!(
+        IpcCommand::OperatorRulesCapabilities.tier(),
+        CommandTier::ReadOnly
+    );
+    assert_eq!(
+        IpcCommand::CustomListsMetadata.tier(),
+        CommandTier::ReadOnly
+    );
+    let commands = vec![
+        IpcCommand::CustomListsRead {
+            request: CustomListsReadRequest::Show {
+                id: "private-list".into(),
+            },
+            token: None,
+        },
+        IpcCommand::CustomListExportChunk {
+            request: crate::operator_rules::ExportRequest {
+                id: "private-list".into(),
+                offset: 17,
+                max_bytes: 900,
+                expected_pack_revision: Some("a".repeat(64)),
+            },
+            token: None,
+        },
+        IpcCommand::OperatorRulesPlan {
+            request: None,
+            plan_ref: Some("opaque-reference".into()),
+            page: crate::operator_rules::PageRequest {
+                cursor: Some("cursor".into()),
+                limit: Some(37),
+            },
+            token: None,
+        },
+        IpcCommand::OperatorRulesApply {
+            plan_ref: "opaque-reference".into(),
+            plan_hash: "b".repeat(64),
+            request_id: "apply-request".into(),
+            token: None,
+        },
+        IpcCommand::OperatorRulesReplay {
+            request: crate::operator_rules::BatchRequest {
+                contract_version: 1,
+                request_id: "apply-request".into(),
+                expected_config_revision: "b".repeat(64),
+                operations: Vec::new(),
+                expected_plan_hash: None,
+            },
+            token: None,
+        },
+        IpcCommand::OperatorRulesOperation {
+            operation_id: "c".repeat(32),
+            token: None,
+        },
+    ];
+    for command in commands {
+        assert_eq!(command.tier(), CommandTier::Admin);
+        let before = serde_json::to_value(&command).unwrap();
+        let attached = command.with_token(Some("secret".into()));
+        assert_eq!(attached.token(), Some("secret"));
+        let mut after = serde_json::to_value(attached).unwrap();
+        after.as_object_mut().unwrap().remove("token");
+        assert_eq!(before, after, "with_token changed a non-token field");
+    }
+}
+
+#[test]
+fn operator_rules_wire_does_not_offer_actor_or_limits_fields() {
+    let command = IpcCommand::OperatorRulesApply {
+        plan_ref: "opaque-reference".into(),
+        plan_hash: "d".repeat(64),
+        request_id: "apply-request".into(),
+        token: None,
+    };
+    let wire = serde_json::to_value(command).unwrap();
+    assert!(wire.get("actor").is_none());
+    assert!(wire.get("limits").is_none());
+    assert!(
+        wire.get("request").is_none(),
+        "apply must not carry a plan body"
+    );
+}
+
+#[test]
+fn operator_rules_structured_error_roundtrips() {
+    let response = IpcResponse::OperatorRulesError {
+        error: crate::operator_rules::OperatorRulesError::new(
+            crate::operator_rules::ErrorCode::TransportLimitExceeded,
+            "use REST",
+        ),
+    };
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(wire.len() < OPERATOR_RULES_MAX_BYTES);
+    assert_eq!(
+        serde_json::from_str::<IpcResponse>(&wire).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn legacy_admin_rules_patch_preserves_empty_field_presence_for_rejection() {
+    let patch: ProfileUpdatePatch =
+        serde_json::from_str(r#"{"admin_rules":{"add":[],"remove":[]}}"#).unwrap();
+    assert!(patch.admin_rules.is_some());
+    let admin = patch.admin_rules.unwrap();
+    assert!(admin.add.is_empty() && admin.remove.is_empty());
 }

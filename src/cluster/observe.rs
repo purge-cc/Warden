@@ -65,7 +65,8 @@ pub struct SyncStatus {
     /// failing tick so "last-sync age" reflects the last good sync, not the
     /// last attempt.
     pub last_sync: Option<Instant>,
-    /// Whether the most recent tick succeeded.
+    /// Whether the most recent tick succeeded; reads clear this when its
+    /// confirmation is no longer fresh.
     pub last_poll_ok: bool,
     /// The most recent tick's error (`None` after a success).
     pub last_error: Option<String>,
@@ -85,19 +86,10 @@ pub struct SyncStatus {
 /// enough (`stale_secs`). They answer different questions on different nodes
 /// and must not be unified.
 ///
-/// **Why there is no age threshold here.** `Stale` is defined as *"the most
-/// recent poll tick failed"*, not *"the last good sync is older than
-/// `stale_secs`"*, and that is deliberate:
-///
-///  * every successful tick refreshes `last_sync`, so while polls succeed the
-///    age cannot grow — the two definitions only ever disagree in one
-///    direction, and
-///  * the poll loop uses [`tokio::time::MissedTickBehavior::Skip`]; a slow but
-///    *successful* poll can push the age past `3 × poll_interval_secs` with
-///    nothing wrong, which an age-based rule would report as a fault and then
-///    flap on.
-///
-/// One definition, used by the log edge and by both renderers.
+/// Readers apply the confirmation-age bound before classification. An old
+/// successful tick cannot prove current sync when the poll loop stops making
+/// progress. The poll-loop edge detector classifies each completed tick;
+/// status readers also degrade when that tick's confirmation expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncHealth {
     /// No poll has succeeded **since this process booted**. Note what this does
@@ -105,11 +97,10 @@ pub enum SyncHealth {
     /// bundle from `cluster.d/` at startup and filters with it, so
     /// this is "unconfirmed policy", not "no policy".
     NeverSynced,
-    /// Synced at least once and the most recent tick succeeded.
+    /// Synced at least once and the latest success has a fresh confirmation.
     Current,
-    /// Synced at least once, and the most recent tick failed — the applied
-    /// policy stands but is no longer being confirmed. Filtering continues:
-    /// degrade audibly, never refuse.
+    /// Synced at least once, but the latest tick failed or its confirmation
+    /// expired. The applied policy stands and filtering continues.
     Stale,
 }
 
@@ -121,6 +112,7 @@ impl SyncHealth {
     /// `synced_at_least_once` (the poll loop writes `last_sync` and
     /// `synced_at_least_once` on the same success branch), so the CLI and TUI
     /// renderers classify with this same function rather than re-deriving it.
+    /// Status readers pass `last_poll_ok` after applying the freshness bound.
     ///
     /// **Precondition: the caller has already established that this node is a
     /// secondary.** A primary never writes [`SyncStatus`], so feeding it a
@@ -163,9 +155,7 @@ pub struct SyncView {
     /// Seconds since the last *successful* poll; `None` when there has not
     /// been one since boot.
     pub confirmed_secs_ago: Option<u64>,
-    /// Whether the most recent tick succeeded (`health` folds this together
-    /// with `synced_at_least_once`; kept here so a renderer can show the error
-    /// without re-deriving).
+    /// Whether the latest poll succeeded and its confirmation is still fresh.
     pub last_poll_ok: bool,
     /// The most recent tick's error.
     pub last_error: Option<String>,
@@ -503,6 +493,12 @@ impl Roster {
 ///
 ///   * primary   — `state = Some`, roster fed by heartbeats, `sync` unused.
 ///   * secondary — `state = None`, `sync` fed by the poll loop, roster unused.
+#[derive(Clone)]
+struct ActiveNodePair {
+    policy: super::dto::ArtifactIdentity,
+    corpus: String,
+}
+
 pub struct ClusterObserve {
     /// This node's role (echoed into the status view).
     pub role: ClusterRole,
@@ -511,10 +507,11 @@ pub struct ClusterObserve {
     pub node_name: Option<String>,
     /// The primary's base URL a secondary polls (`None` on a primary).
     pub peer: Option<String>,
-    /// A peer is stale once its last sample is older than this — 3 ×
-    /// `poll_interval_secs`, computed at boot.
+    /// Peer samples and secondary confirmations expire after this many
+    /// seconds — 3 × `poll_interval_secs`, computed at boot.
     pub stale_secs: u64,
     sync: ArcSwap<SyncStatus>,
+    active_pair: arc_swap::ArcSwapOption<ActiveNodePair>,
     roster: Mutex<Roster>,
     state: Option<std::sync::Arc<ClusterState>>,
     /// Edge-detector state for [`Self::note_tick`]. A `Mutex` (not an atomic):
@@ -538,6 +535,7 @@ impl ClusterObserve {
             peer: None,
             stale_secs,
             sync: ArcSwap::from_pointee(SyncStatus::default()),
+            active_pair: arc_swap::ArcSwapOption::empty(),
             roster: Mutex::new(Roster::new(roster_cap)),
             state: Some(state),
             edge: Mutex::new(EdgeState::default()),
@@ -553,9 +551,109 @@ impl ClusterObserve {
             peer: Some(peer),
             stale_secs,
             sync: ArcSwap::from_pointee(SyncStatus::default()),
+            active_pair: arc_swap::ArcSwapOption::empty(),
             roster: Mutex::new(Roster::new(0)),
             state: None,
             edge: Mutex::new(EdgeState::default()),
+        }
+    }
+
+    pub(crate) fn refresh_primary_membership(&self) -> anyhow::Result<()> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let Some(context) = state.membership_context() else {
+            return Ok(());
+        };
+        let guard = crate::config::write_lock::acquire_for_migration(&context.master)?;
+        let members = super::membership::MembershipStore::open(&guard)?;
+        anyhow::ensure!(
+            members.matches(&context.cluster_id, &context.primary_node_id),
+            "active membership identity changed"
+        );
+        state.record_membership_roster(members.views(super::membership::now()?));
+        Ok(())
+    }
+
+    pub(crate) fn active_pair_matches(
+        &self,
+        policy: &super::dto::ArtifactIdentity,
+        generation: &str,
+    ) -> bool {
+        self.active_pair
+            .load()
+            .as_ref()
+            .is_some_and(|pair| pair.policy == *policy && pair.corpus == generation)
+    }
+
+    pub(crate) fn clear_active_pair(&self) {
+        self.active_pair.store(None);
+    }
+
+    /// Publish only after the resolver and corpus have activated together.
+    pub(crate) fn record_active_pair(&self, policy: super::dto::ArtifactIdentity, corpus: String) {
+        self.active_pair
+            .store(Some(std::sync::Arc::new(ActiveNodePair { policy, corpus })));
+    }
+
+    /// Project live process evidence without deriving activation from disk markers.
+    pub(crate) fn enrich_nodes_status(&self, status: &mut super::lifecycle::LifecycleStatus) {
+        use super::lifecycle::NodeRole;
+        let now = Instant::now();
+        status.active_role = Some(if self.role == ClusterRole::Primary {
+            NodeRole::Primary
+        } else {
+            NodeRole::Secondary
+        });
+        status.restart_required |= status.active_role != Some(status.saved_role);
+        status.can_edit_policy &=
+            self.role != ClusterRole::Secondary && !status.pending_join && !status.restart_required;
+        status.active_policy = None;
+        status.active_corpus = None;
+        if let Some(pair) = self.active_pair.load_full() {
+            status.active_policy = Some(pair.policy.clone());
+            status.active_corpus = Some(pair.corpus.clone());
+        }
+        if let Some(state) = &self.state {
+            let policy = state.policy();
+            let desired = policy
+                .manifest
+                .as_deref()
+                .map(super::dto::ArtifactIdentity::from);
+            let corpus = desired
+                .as_ref()
+                .and_then(|d| {
+                    state
+                        .corpus_store()
+                        .and_then(|s| s.manifest_for_artifact(&d.artifact_hash).ok())
+                })
+                .map(|m| m.generation);
+            status.desired_policy = desired.clone();
+            status.desired_corpus = corpus.clone();
+            if let Some(context) = state.membership_context() {
+                context
+                    .acknowledgements
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .enrich(
+                        &mut status.roster,
+                        desired.as_ref(),
+                        corpus.as_deref(),
+                        now,
+                        std::time::Duration::from_secs(self.stale_secs),
+                    );
+            }
+        } else if let Some(view) = self.sync_view(now) {
+            status.last_error = view.last_error.clone().or_else(|| {
+                (!view.last_poll_ok).then(|| "primary synchronization is unconfirmed".into())
+            });
+            if !view.last_poll_ok {
+                for peer in &mut status.roster {
+                    if peer.state != super::membership::MemberState::Revoked {
+                        peer.sync = Some("stale".into());
+                    }
+                }
+            }
         }
     }
 
@@ -564,10 +662,25 @@ impl ClusterObserve {
         self.sync.store(std::sync::Arc::new(status));
     }
 
-    /// Read the secondary's latest poll telemetry (IPC reader side).
+    /// Read the latest telemetry with expired confirmations marked stale.
     #[must_use]
     pub fn load_sync(&self) -> std::sync::Arc<SyncStatus> {
-        self.sync.load_full()
+        self.load_sync_at(Instant::now())
+    }
+
+    fn load_sync_at(&self, now: Instant) -> std::sync::Arc<SyncStatus> {
+        let status = self.sync.load_full();
+        let fresh = status
+            .last_sync
+            .and_then(|at| now.checked_duration_since(at))
+            .is_some_and(|age| age <= std::time::Duration::from_secs(self.stale_secs));
+        if status.last_poll_ok && !fresh {
+            let mut stale = (*status).clone();
+            stale.last_poll_ok = false;
+            std::sync::Arc::new(stale)
+        } else {
+            status
+        }
     }
 
     /// The staleness view: *"which policy am I applying, and how old is that
@@ -583,7 +696,7 @@ impl ClusterObserve {
         if self.role != ClusterRole::Secondary {
             return None;
         }
-        let s = self.load_sync();
+        let s = self.load_sync_at(now);
         Some(SyncView {
             health: SyncHealth::of_secondary(s.synced_at_least_once, s.last_poll_ok),
             applied_hash: s.last_config_hash.clone(),
@@ -705,9 +818,24 @@ impl ClusterObserve {
     /// serve-state).
     #[must_use]
     pub fn generations(&self) -> Option<(u64, String)> {
-        self.state
-            .as_ref()
-            .map(|s| (s.config_generation(), s.policy().hash.clone()))
+        self.state.as_ref().map(|s| {
+            let policy = s.policy();
+            (policy.config_generation, policy.hash.clone())
+        })
+    }
+
+    pub(crate) fn primary_summary(&self, now: Instant) -> Option<(u64, String, bool)> {
+        self.state.as_ref().map(|state| {
+            let policy = state.policy();
+            let converged = policy.manifest.as_deref().is_some_and(|manifest| {
+                state.converged_for(
+                    &super::dto::ArtifactIdentity::from(manifest),
+                    now,
+                    std::time::Duration::from_secs(self.stale_secs),
+                )
+            });
+            (policy.config_generation, policy.hash.clone(), converged)
+        })
     }
 }
 
@@ -721,6 +849,34 @@ mod tests {
             total_blocked: b,
             cache_hits: 0,
         }
+    }
+
+    #[test]
+    fn active_pair_proof_is_exact_and_clear_invalidates_status() {
+        let observe = ClusterObserve::new_secondary(None, "https://192.0.2.10:8053".into(), 45);
+        let policy = super::super::dto::ArtifactIdentity {
+            primary_lineage: "a".repeat(64),
+            policy_epoch: 1,
+            artifact_hash: "b".repeat(64),
+            config_revision: "c".repeat(64),
+            operator_policy_hash: "d".repeat(64),
+        };
+        let corpus = "e".repeat(64);
+        assert!(!observe.active_pair_matches(&policy, &corpus));
+        observe.record_active_pair(policy.clone(), corpus.clone());
+        assert!(observe.active_pair_matches(&policy, &corpus));
+        assert!(!observe.active_pair_matches(&policy, &"f".repeat(64)));
+        let mut other = policy.clone();
+        other.policy_epoch += 1;
+        assert!(!observe.active_pair_matches(&other, &corpus));
+        let mut status = super::super::lifecycle::LifecycleStatus::default();
+        observe.enrich_nodes_status(&mut status);
+        assert_eq!(status.active_policy, Some(policy.clone()));
+        observe.clear_active_pair();
+        assert!(!observe.active_pair_matches(&policy, &corpus));
+        observe.enrich_nodes_status(&mut status);
+        assert!(status.active_policy.is_none());
+        assert!(status.active_corpus.is_none());
     }
 
     fn ip(n: u8) -> IpAddr {
@@ -851,6 +1007,113 @@ mod tests {
         assert_eq!(v.health, SyncHealth::Current);
         assert_eq!(v.applied_hash.as_deref(), Some("deadbeef"));
         assert_eq!(v.confirmed_secs_ago, Some(12));
+    }
+
+    #[test]
+    fn successful_confirmation_expires_at_the_precise_freshness_boundary() {
+        let obs = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let confirmed = Instant::now();
+        obs.store_sync(SyncStatus {
+            last_config_hash: Some("a".repeat(64)),
+            last_sync: Some(confirmed),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        });
+        let boundary = confirmed + std::time::Duration::from_secs(45);
+        assert!(obs.load_sync_at(boundary).last_poll_ok);
+        assert_eq!(obs.sync_view(boundary).unwrap().health, SyncHealth::Current);
+
+        let expired = boundary + std::time::Duration::from_nanos(1);
+        let status = obs.load_sync_at(expired);
+        assert!(!status.last_poll_ok);
+        assert_eq!(status.last_sync, Some(confirmed));
+        assert_eq!(status.last_config_hash, Some("a".repeat(64)));
+        assert!(status.last_error.is_none());
+        let view = obs.sync_view(expired).unwrap();
+        assert_eq!(view.health, SyncHealth::Stale);
+        assert!(!view.last_poll_ok);
+        assert_eq!(view.confirmed_secs_ago, Some(45));
+        assert!(obs.sync.load().last_poll_ok);
+    }
+
+    #[test]
+    fn load_sync_rejects_an_old_success_without_advancing_its_observation() {
+        let obs = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let confirmed = Instant::now() - std::time::Duration::from_secs(46);
+        obs.store_sync(SyncStatus {
+            last_config_hash: Some("b".repeat(64)),
+            last_sync: Some(confirmed),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        });
+        let status = obs.load_sync();
+        assert!(!status.last_poll_ok);
+        assert_eq!(status.last_sync, Some(confirmed));
+        assert_eq!(status.last_config_hash, Some("b".repeat(64)));
+    }
+
+    #[test]
+    fn failed_poll_invalidates_a_recent_success_until_a_new_success_arrives() {
+        let obs = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let confirmed = Instant::now();
+        let success = SyncStatus {
+            last_config_hash: Some("a".repeat(64)),
+            last_sync: Some(confirmed),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        };
+        obs.store_sync(success.clone());
+        assert_eq!(
+            obs.sync_view(confirmed).unwrap().health,
+            SyncHealth::Current
+        );
+        obs.store_sync(SyncStatus {
+            last_poll_ok: false,
+            last_error: Some("primary unreachable".into()),
+            ..success
+        });
+        let failed_at = confirmed + std::time::Duration::from_secs(1);
+        let failed = obs.sync_view(failed_at).unwrap();
+        assert_eq!(failed.health, SyncHealth::Stale);
+        assert!(!failed.last_poll_ok);
+        assert_eq!(failed.confirmed_secs_ago, Some(1));
+        assert_eq!(failed.applied_hash, Some("a".repeat(64)));
+        assert_eq!(failed.last_error.as_deref(), Some("primary unreachable"));
+
+        let recovered_at = confirmed + std::time::Duration::from_secs(60);
+        obs.store_sync(SyncStatus {
+            last_config_hash: Some("b".repeat(64)),
+            last_sync: Some(recovered_at),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        });
+        let recovered = obs.sync_view(recovered_at).unwrap();
+        assert_eq!(recovered.health, SyncHealth::Current);
+        assert!(recovered.last_poll_ok);
+        assert_eq!(recovered.confirmed_secs_ago, Some(0));
+        assert_eq!(recovered.applied_hash, Some("b".repeat(64)));
+        assert!(recovered.last_error.is_none());
+    }
+
+    #[test]
+    fn success_without_a_usable_confirmation_cannot_be_current() {
+        let obs = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let now = Instant::now();
+        for last_sync in [None, Some(now + std::time::Duration::from_secs(1))] {
+            obs.store_sync(SyncStatus {
+                last_config_hash: Some("a".repeat(64)),
+                last_sync,
+                last_poll_ok: true,
+                last_error: None,
+                synced_at_least_once: true,
+            });
+            assert!(!obs.load_sync_at(now).last_poll_ok);
+            assert_eq!(obs.sync_view(now).unwrap().health, SyncHealth::Stale);
+        }
     }
 
     #[test]

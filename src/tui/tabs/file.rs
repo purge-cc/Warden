@@ -576,11 +576,6 @@ mod tests {
     const FLOOR_H: u16 = 16;
 
     /// The focus bar `modal_form` paints in front of the focused row.
-    /// Asserting on `FOCUS + label` is what makes the needle
-    /// discriminating — the bare label also occurs on unfocused rows, and
-    /// a filter substring occurs inside every match it selected.
-    const FOCUS: &str = "\u{258c} ";
-
     fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -603,13 +598,38 @@ mod tests {
         app
     }
 
-    fn popup_dump(app: &App, filter: &str) -> String {
+    fn popup_buffer(app: &App, filter: &str) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(FLOOR_W, FLOOR_H)).unwrap();
         term.draw(|f| render_section_jump_popup(f, f.area(), app, filter))
             .unwrap();
-        dump_buffer(term.backend().buffer())
+        term.backend().buffer().clone()
+    }
+
+    fn popup_dump(app: &App, filter: &str) -> String {
+        dump_buffer(&popup_buffer(app, filter))
+    }
+
+    fn assert_value_focused(buffer: &ratatui::buffer::Buffer, needle: &str) {
+        let dump = dump_buffer(buffer);
+        let row = dump
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not rendered:\n{dump}"))
+            as u16;
+        let col = dump
+            .lines()
+            .nth(row as usize)
+            .unwrap()
+            .chars()
+            .position(|ch| ch == needle.chars().next().unwrap())
+            .unwrap() as u16;
+        assert_eq!(
+            buffer[(col, row)].bg,
+            T.info,
+            "the first match's value must carry keyboard focus:\n{dump}"
+        );
     }
 
     #[test]
@@ -619,7 +639,8 @@ mod tests {
             "filtering".to_string(),
             "zz_unique_section".to_string(),
         ]);
-        let dump = popup_dump(&app, "zz_u");
+        let buffer = popup_buffer(&app, "zz_u");
+        let dump = dump_buffer(&buffer);
 
         // The prompt lead is what discriminates: `zz_u` on its own also
         // matches the section name it selected, one row below.
@@ -627,11 +648,8 @@ mod tests {
             dump.contains("/ zz_u"),
             "the typed filter and its prompt must be on screen:\n{dump}"
         );
-        assert!(
-            dump.contains(&format!("{FOCUS}zz_unique_section")),
-            "the first match must wear the focus bar — that is the row Enter \
-             jumps to:\n{dump}"
-        );
+        assert_value_focused(&buffer, "zz_unique_section");
+        assert!(!dump.contains('\u{258c}') && !dump.contains('\u{25c0}'));
         assert!(
             dump.contains(SECTION_JUMP_HINT),
             "the key legend is this surface's action row and was cut:\n{dump}"
@@ -646,12 +664,10 @@ mod tests {
     fn floor_section_jump_survives_a_list_far_longer_than_the_anchor() {
         let sections: Vec<String> = (0..40).map(|i| format!("sec{i:02}")).collect();
         let app = app_with_sections(sections);
-        let dump = popup_dump(&app, "");
+        let buffer = popup_buffer(&app, "");
+        let dump = dump_buffer(&buffer);
 
-        assert!(
-            dump.contains(&format!("{FOCUS}sec00")),
-            "the jump target must be on screen:\n{dump}"
-        );
+        assert_value_focused(&buffer, "sec00");
         assert!(
             dump.contains(SECTION_JUMP_HINT),
             "the key legend was cut by the long list:\n{dump}"
@@ -758,7 +774,7 @@ mod tests {
 
         let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
         for (y, (bl, al)) in b.iter().zip(a.iter()).enumerate() {
-            if !CONTENT_ROWS.contains(&y) {
+            if y + 1 < b.len() && !CONTENT_ROWS.contains(&y) {
                 assert_eq!(
                     bl, al,
                     "the section-jump popup repainted row {y}, which is header / \
@@ -766,6 +782,16 @@ mod tests {
                 );
             }
         }
+        let mut footer = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        footer
+            .draw(|f| crate::tui::ui::render_footer_for_test(f, f.area(), &app))
+            .unwrap();
+        let expected = dump_buffer(footer.backend().buffer());
+        assert_eq!(a.last().unwrap(), &expected.lines().next().unwrap());
+        assert!(a
+            .last()
+            .unwrap()
+            .contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         // Control arm: without this the loop above passes vacuously if the
         // popup failed to render at all.
         assert_ne!(

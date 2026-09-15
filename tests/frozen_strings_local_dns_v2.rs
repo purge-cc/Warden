@@ -306,9 +306,13 @@ fn welcome_banner_copy_is_the_first_run_setup_checklist() {
 
     // The leaf-local keys, in the copy's own two-space highlight form so the
     // needle cannot be satisfied by an indefinite article.
-    for key in ["  B  ", "  a  ", "  e  "] {
+    for key in ["  a  ", "  e  "] {
         assert!(copy.contains(key), "key hint {key:?} is gone: {copy}");
     }
+    assert!(
+        !copy.contains("  B  "),
+        "the retired direct-catalog key returned to the welcome copy: {copy}"
+    );
 
     // Retired copy must not resurface: the Local DNS advert this replaced,
     // and the `[5]` / 0.4.7 pair that froze in once already

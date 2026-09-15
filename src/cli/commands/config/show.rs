@@ -1,8 +1,8 @@
 //! `warden config show [--resolved] [--annotate] [--section NAME]`.
 //!
-//! Three presentation modes on top of the same v1 loader:
+//! Three presentation modes on top of the current schema-5 loader:
 //!
-//! - **Default** — the merged `ConfigV1` serialised as TOML.
+//! - **Default** — the merged `ConfigV5` serialised as TOML.
 //! - **`--section <name>`** — print only one top-level table/array
 //!   (`devices`, `profiles`, `subnets`, `server`, `upstream`, `cache`, …).
 //! - **`--annotate`** — precede the output with a block listing every
@@ -21,8 +21,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use crate::config::cidr::Cidr;
-use crate::config::loader::{self, LoadedConfig, ProvenanceMap};
+use crate::config::loader::{self, LoadedConfigV5, ProvenanceMap};
 use crate::config::secrets;
+use crate::config::target_v5::compile_v5_operator_rules;
+use crate::filter::operator_rules::CompileAdmission;
 use crate::profiles::resolver::ResolveLevel;
 use crate::profiles::ProfileResolver;
 
@@ -43,7 +45,7 @@ pub fn run_show(
     section: Option<&str>,
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = match loader::load_config(config_path, now) {
+    let loaded = match loader::load_config_v5(config_path, now) {
         Ok(l) => l,
         Err(errs) => {
             eprintln!(
@@ -120,7 +122,7 @@ pub fn run_show(
 ///
 /// The file itself is never opened unless at least one `auth_token_ref`
 /// exists — so benign configs without secrets have zero additional IO.
-fn print_secret_mask_footer(config_path: &Path, loaded: &LoadedConfig) {
+fn print_secret_mask_footer(config_path: &Path, loaded: &LoadedConfigV5) {
     let refs: Vec<(&str, &str)> = loaded
         .config
         .blocklists
@@ -174,7 +176,7 @@ const RESOLVED_SECTIONS: [&str; 3] = ["devices", "subnets", "server"];
 /// no resolved rendering (`upstream`, `cache`, `profiles`, …) must not
 /// silently fall back to printing everything, which is the defect this
 /// parameter exists to close.
-fn print_resolved_view(loaded: &LoadedConfig, section: Option<&str>) -> anyhow::Result<()> {
+fn print_resolved_view(loaded: &LoadedConfigV5, section: Option<&str>) -> anyhow::Result<()> {
     print!("{}", render_resolved_view(loaded, section)?);
     Ok(())
 }
@@ -185,7 +187,7 @@ fn print_resolved_view(loaded: &LoadedConfig, section: Option<&str>) -> anyhow::
 /// section filter actually excluded. Asserting "the command exited 0" is
 /// satisfied by the old ignore-the-filter behaviour, so the only honest
 /// test is one that reads the rendered text.
-fn render_resolved_view(loaded: &LoadedConfig, section: Option<&str>) -> anyhow::Result<String> {
+fn render_resolved_view(loaded: &LoadedConfigV5, section: Option<&str>) -> anyhow::Result<String> {
     use std::fmt::Write as _;
 
     if let Some(name) = section {
@@ -200,7 +202,15 @@ fn render_resolved_view(loaded: &LoadedConfig, section: Option<&str>) -> anyhow:
     let want = |block: &str| section.is_none() || section == Some(block);
     let mut out = String::new();
 
-    let resolver = ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
+    let projected = loaded
+        .config
+        .validation_projection()
+        .map_err(|error| anyhow::anyhow!("cannot project schema-5 resolver inputs: {error}"))?;
+    let admission =
+        CompileAdmission::new(loaded.config.custom_list_limits.max_compiled_bytes_total, 1)?;
+    let rules = compile_v5_operator_rules(&loaded.config, &loaded.pack_bodies, &admission)?;
+    let resolver =
+        ProfileResolver::build_with_operator_rules(&projected, std::sync::Arc::new(rules));
 
     let _ = writeln!(out, "# resolved view — what the 5-level chain would pick\n");
 
@@ -322,70 +332,75 @@ fn first_address(cidr: &str) -> Option<IpAddr> {
 mod tests {
     use super::*;
 
-    fn fixture(path: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
+    const FIXTURE: &str = r#"schema_version = 5
+
+[server]
+listen = "127.0.0.1:15353"
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+
+[[devices]]
+id = "phone"
+display_name = "Phone"
+ip = "192.0.2.10"
+profile = "default"
+
+[[subnets]]
+id = "guests"
+display_name = "Guests"
+cidrs = ["198.51.100.0/24"]
+profile = "default"
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#;
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, FIXTURE).expect("schema-5 fixture");
+        (dir, path)
     }
 
     #[test]
     fn show_default_prints_without_error() {
-        run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            false,
-            false,
-            None,
-        )
-        .unwrap();
+        let (_dir, path) = fixture();
+        run_show(&path, false, false, None).unwrap();
     }
 
     #[test]
     fn show_section_filters_to_named_key() {
-        run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            false,
-            false,
-            Some("devices"),
-        )
-        .unwrap();
+        let (_dir, path) = fixture();
+        run_show(&path, false, false, Some("devices")).unwrap();
     }
 
     #[test]
     fn show_section_errors_on_unknown_name() {
-        let err = run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            false,
-            false,
-            Some("bogus-section"),
-        );
+        let (_dir, path) = fixture();
+        let err = run_show(&path, false, false, Some("bogus-section"));
         assert!(err.is_err(), "unknown section must error");
     }
 
     #[test]
     fn show_with_annotate_runs_without_error() {
-        run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            false,
-            true,
-            None,
-        )
-        .unwrap();
+        let (_dir, path) = fixture();
+        run_show(&path, false, true, None).unwrap();
     }
 
     #[test]
     fn show_with_resolved_runs_without_error() {
-        run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            true,
-            false,
-            None,
-        )
-        .unwrap();
+        let (_dir, path) = fixture();
+        run_show(&path, true, false, None).unwrap();
     }
 
     /// Load the shared fixture for the resolved-view render tests.
-    fn loaded_fixture() -> LoadedConfig {
+    fn loaded_fixture() -> (tempfile::TempDir, LoadedConfigV5) {
+        let (dir, path) = fixture();
         let now = time::OffsetDateTime::now_utc();
-        loader::load_config(&fixture("tests/fixtures/minimal-v1/config.toml"), now)
-            .expect("fixture config loads")
+        let loaded = loader::load_config_v5(&path, now).expect("fixture config loads");
+        (dir, loaded)
     }
 
     /// The defect: `--section` was skipped entirely under `--resolved`, so
@@ -393,7 +408,7 @@ mod tests {
     /// the assertion has to be that the OTHER blocks are absent.
     #[test]
     fn resolved_section_devices_excludes_the_other_blocks() {
-        let loaded = loaded_fixture();
+        let (_dir, loaded) = loaded_fixture();
         let out = render_resolved_view(&loaded, Some("devices")).expect("devices is renderable");
         assert!(out.contains("## Devices"), "devices block must be present");
         assert!(
@@ -410,7 +425,7 @@ mod tests {
     /// future edit cannot fix one block's gating and leave another leaking.
     #[test]
     fn resolved_section_subnets_and_server_each_exclude_the_rest() {
-        let loaded = loaded_fixture();
+        let (_dir, loaded) = loaded_fixture();
 
         let subnets = render_resolved_view(&loaded, Some("subnets")).expect("subnets renderable");
         assert!(subnets.contains("## Subnets"));
@@ -427,7 +442,7 @@ mod tests {
     /// the unfiltered path into a partial one.
     #[test]
     fn resolved_without_section_still_renders_every_block() {
-        let loaded = loaded_fixture();
+        let (_dir, loaded) = loaded_fixture();
         let out = render_resolved_view(&loaded, None).expect("full view renders");
         for block in ["## Devices", "## Subnets", "## Global fallback"] {
             assert!(out.contains(block), "full view missing {block}:\n{out}");
@@ -439,7 +454,7 @@ mod tests {
     /// returned `Ok` and printed the whole view.
     #[test]
     fn resolved_section_without_a_rendering_is_refused_by_name() {
-        let loaded = loaded_fixture();
+        let (_dir, loaded) = loaded_fixture();
         for name in ["upstream", "cache", "profiles", "bogus"] {
             let err = render_resolved_view(&loaded, Some(name))
                 .expect_err("section with no resolved view must error");
@@ -455,12 +470,8 @@ mod tests {
     /// `run_show` into the renderer is covered too.
     #[test]
     fn run_show_resolved_refuses_unrenderable_section() {
-        let err = run_show(
-            &fixture("tests/fixtures/minimal-v1/config.toml"),
-            true,
-            false,
-            Some("upstream"),
-        );
+        let (_dir, path) = fixture();
+        let err = run_show(&path, true, false, Some("upstream"));
         assert!(
             err.is_err(),
             "`config show --resolved --section upstream` must not silently succeed"
@@ -469,12 +480,10 @@ mod tests {
 
     #[test]
     fn show_fails_cleanly_on_invalid_config() {
-        let err = run_show(
-            &fixture("tests/fixtures/broken-v1/cross_ref_miss.toml"),
-            false,
-            false,
-            None,
-        );
+        let (dir, path) = fixture();
+        std::fs::write(&path, "schema_version = 4\n").unwrap();
+        let _keep = dir;
+        let err = run_show(&path, false, false, None);
         assert!(err.is_err(), "invalid config should not silently pass");
     }
 
@@ -498,7 +507,7 @@ mod tests {
         let config_path = dir.join("config.toml");
         fs::write(
             &config_path,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 listen = "127.0.0.1:5353"
@@ -530,7 +539,7 @@ servers = ["192.0.2.1:53"]
         fs::set_permissions(&secrets_path, perm).unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&config_path, now).expect("config loads");
+        let loaded = loader::load_config_v5(&config_path, now).expect("config loads");
 
         // The masking helper is pure + prints via `println!`; we can't
         // easily capture stdout in a unit test without extra plumbing,

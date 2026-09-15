@@ -1,65 +1,25 @@
-//! Profiles tab modals (Add / Edit / Delete).
+//! Profile identity, properties, list overrides and custom-list mount drafts.
 //!
-//! Opens over [`crate::tui::app::Leaf::Profiles`] via `a` (Add), `e`
-//! (Edit), `d` / Delete (Remove). Submits through
-//! `ProfileCreate` / `ProfileUpdate` / `ProfileDelete` — driven
-//! from `tui/mod.rs::submit_profile_modal` via `IpcPoller::send_profile_*`.
-//! Unlike the Subnets modal (which writes via CLI `*_inner` helpers and
-//! then calls `attempt_reload`), the profile IPC handlers self-reload the
-//! daemon (`notify_reload`), so the submit path only refreshes the TUI's
-//! offline `loaded_config` cache.
+//! Add creates identity first, then reconciles the persisted profile into an
+//! Edit snapshot while retaining pending settings. Confirmed creations are not
+//! repeated after a readback failure; an uncertain outcome retains the draft.
+//! Property writes use profile IPC commands and refresh the cached configuration.
+//! Custom-list mounts use retained policy preview, Apply and receipt recovery.
 //!
-//! ## State machines
-//!
-//! Add / Edit (one `ProfileForm`, `mode` discriminates):
-//! ```text
-//! EditingForm(ProfileForm) ──Enter on Submit──▶ Submitted(Ok | Failed)
-//!                          ──Esc──▶ closed
-//! ```
-//!
-//! Remove:
-//! ```text
-//! ConfirmingRemove(RemoveConfirm) ──[y]──▶ Submitted(Ok | Failed)
-//!                                 ──[n / Esc]──▶ closed
-//! ```
-//!
-//! ## Capture-at-open invariant
-//!
-//! `e` / `d` snapshot the focused profile's full v1 field set into the
-//! modal at open time ([`OriginalSnapshot`] / [`RemoveConfirm`]).
-//! Subsequent renders / refreshes / scrolls cannot invalidate the
-//! snapshot; the submit path always diffs against the captured values,
-//! never re-reads `loaded_config`. Mirrors the `subnet_modal` precedent.
-//!
-//! ## Edit form → `ProfileUpdatePatch`
-//!
-//! The Edit form is a flat 6-mutate-field surface (D4). [`resolve_edit_patch`]
-//! is a **pure** function: it diffs the form against [`OriginalSnapshot`]
-//! and emits ONE atomic `ProfileUpdatePatch` carrying only the changed
-//! fields. Nullable enum fields (`block_response`, `ecs.mode`) get a
-//! synthetic `(inherit)` dropdown option = clear-to-inherit; nullable
-//! scalars (`blocked_ttl_secs`, ecs prefixes) use an empty text field as
-//! the inherit signal.
-//!
-//! ## Known limitation (D1, deferred — TODO `s-4.26-p2-disc-1`)
-//!
-//! `EcsPatch`'s `mode` / `source_prefix_*` fields are single-`Option`, so
-//! an individual ecs sub-field cannot be cleared back to inherit while the
-//! subtree survives — only the whole `ecs` subtree can be cleared (the
-//! `clear ecs` toggle). [`resolve_edit_patch`] detects an attempted
-//! per-field clear (`Some` → `None` on an existing subtree) and returns a
-//! friendly error pointing at the toggle, rather than silently dropping
-//! the operator's intent.
+//! Editing compares the draft with [`OriginalSnapshot`]. Background refreshes
+//! cannot replace that snapshot or reorder the captured list catalogues.
+//! ECS settings live under Advanced, which opens for existing settings or errors.
+//! Individual ECS fields cannot be cleared to inherit while their subtree remains;
+//! the form requires the whole-subtree clear toggle for that operation.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::schema::blocklist::{effective_direction, Blocklist, ListPolicy};
 use crate::config::schema::custom_list::CustomList;
 use crate::config::schema::{BlockResponseV1, Id, Profile, ProfileEcsConfig};
 use crate::config::settings::EcsMode;
-use crate::ipc::protocol::{
-    AdminRulesPatch, CustomListMountPatch, EcsPatch, ListPolicyPatch, ProfileUpdatePatch,
-};
+use crate::ipc::protocol::{CustomListMountPatch, EcsPatch, ListPolicyPatch, ProfileUpdatePatch};
 
 /// Synthetic `(inherit)` option at index 0 + the four `BlockResponseV1`
 /// variants. Frozen by `tests/frozen_strings_s49_profile_editor_tui.rs`.
@@ -149,6 +109,11 @@ pub const CUSTOM_LIST_BOX_OFF: &str = "[ ]";
 /// leaves the operator with nothing to do and nowhere to go.
 pub const CUSTOM_LIST_PANEL_EMPTY: &str = "add one on the Custom Lists tab";
 
+/// Shown when the daemon-owned catalogue has not been read successfully.
+/// This is deliberately distinct from [`CUSTOM_LIST_PANEL_EMPTY`]: an empty
+/// snapshot is a fact about configuration, while unavailable data is not.
+pub const CUSTOM_LIST_CATALOG_UNAVAILABLE: &str = "custom-list catalog unavailable";
+
 /// The resting hint under a focused custom-list row.
 ///
 /// Names the consequence rather than the mechanic: an operator reading
@@ -222,6 +187,8 @@ pub enum Stage {
     /// Add or Edit form. `ProfileForm::mode` selects the title bar, the
     /// visible field set, and the submit dispatch path.
     EditingForm(ProfileForm),
+    /// Scrollable submit error; returning restores the unsaved form.
+    ReviewingError(ErrorReview),
     /// Remove confirmation. Single-key y/n — profile deletes are
     /// backstopped by the daemon validator (refuses if a device / group /
     /// subnet / schedule still references the id), so no typed-phrase
@@ -238,6 +205,14 @@ pub enum SubmitOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct ErrorReview {
+    pub form: ProfileForm,
+    pub scroll: Cell<usize>,
+    /// Updated by rendering so scrolling uses the current terminal dimensions.
+    pub max_scroll: Cell<usize>,
+}
+
 /// Form mode discriminator — drives the title bar, the visible field
 /// set, and the submit dispatch (`ProfileCreate` vs `ProfileUpdate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,12 +221,9 @@ pub enum FormMode {
     Edit,
 }
 
-/// Every field the form can focus, in canonical tab order. Add mode
-/// shows only `Id` / `DisplayName` / `Submit`; Edit mode shows the 6
-/// MUTATE fields (D4) — `ecs` expands to three rows + a clear toggle —
-/// plus `Submit`, and skips `Id` (a profile's id is immutable after
-/// creation). [`ProfileForm::visible_fields`] returns the mode-specific
-/// slice; `focus_next` / `focus_prev` cycle within it.
+/// Every field the form can focus, in canonical tab order. Advanced ECS
+/// fields join that order only while the Advanced section is open.
+/// [`ProfileForm::visible_fields`] is the authority used by focus navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
     Id,
@@ -259,7 +231,7 @@ pub enum FormField {
     BlockResponse,
     BlockedTtl,
     BlockAll,
-    AdminRules,
+    Advanced,
     EcsMode,
     EcsPrefixV4,
     EcsPrefixV6,
@@ -314,12 +286,6 @@ pub enum FormField {
 }
 
 impl FormField {
-    const ADD_FIELDS: [FormField; 4] = [
-        FormField::Id,
-        FormField::DisplayName,
-        FormField::Submit,
-        FormField::Cancel,
-    ];
     /// Edit-mode fields ahead of the per-list override panel.
     ///
     /// Split from the tail because the panel between them is
@@ -329,12 +295,14 @@ impl FormField {
     /// express that, and the alternative — a fixed maximum — would either
     /// waste ring slots on lists that do not exist or silently drop the
     /// ones past the cap.
-    const EDIT_HEAD: [FormField; 9] = [
+    const CORE_HEAD: [FormField; 5] = [
         FormField::DisplayName,
         FormField::BlockResponse,
         FormField::BlockedTtl,
         FormField::BlockAll,
-        FormField::AdminRules,
+        FormField::Advanced,
+    ];
+    const ECS_FIELDS: [FormField; 4] = [
         FormField::EcsMode,
         FormField::EcsPrefixV4,
         FormField::EcsPrefixV6,
@@ -353,6 +321,9 @@ impl FormField {
 #[derive(Debug, Clone)]
 pub struct ProfileForm {
     pub mode: FormMode,
+    /// An accepted create awaiting readback must never be sent a second time.
+    pub creation_confirmed: bool,
+    pub creation_attempted: bool,
     /// Snapshot of the original profile at modal-open time. `Some` on
     /// Edit (the submit path diffs against it), `None` on Add.
     pub original: Option<OriginalSnapshot>,
@@ -365,9 +336,11 @@ pub struct ProfileForm {
     /// Raw operator input. Empty = inherit from `[server]` defaults.
     pub blocked_ttl_input: String,
     pub block_all: bool,
-    /// Comma-separated admin-rule ids as the operator typed them.
-    /// Diffed against `original.admin_rules` at submit to build the
-    /// `AdminRulesPatch` add/remove delta.
+    /// Production-only profile controls remain collapsed until requested.
+    /// Existing ECS configuration opens the section so it cannot be missed.
+    pub advanced_expanded: bool,
+    /// Retained only to preserve an opened schema snapshot. Schema-5 rejects
+    /// admin-rule mutations; this buffer is neither focusable nor submitted.
     pub admin_rules_input: String,
     /// Index into [`ECS_MODE_OPTIONS`]. 0 = `(inherit)`.
     pub ecs_mode_idx: usize,
@@ -384,8 +357,7 @@ pub struct ProfileForm {
     /// profiles: the running config can be reloaded under the modal's
     /// lifetime, and a panel whose rows re-ordered themselves mid-edit
     /// would move the operator's cursor onto a different list than the one
-    /// they were looking at. Empty and unused in Add mode — `ProfileCreate`
-    /// carries no list policy.
+    /// they were looking at. Both Add and Edit retain the catalogue while open.
     ///
     /// Whole [`Blocklist`] values rather than a projection because
     /// [`effective_direction`] takes one, and this panel must **ask** that
@@ -421,6 +393,10 @@ pub struct ProfileForm {
     /// carries — a projection built here would be a second copy to keep
     /// in step.
     pub custom_lists_snapshot: Vec<CustomList>,
+    /// Whether `custom_lists_snapshot` is an authoritative catalogue result.
+    /// Constructors default to `true` for direct callers and tests; the TUI
+    /// edit-modal builder sets this from the latest operator-policy read.
+    pub custom_lists_available: bool,
     /// The draft of `profiles.<id>.custom_lists` this form is editing.
     /// Seeded from the profile's existing mounts in [`Self::new_edit`].
     ///
@@ -454,8 +430,6 @@ pub struct OriginalSnapshot {
     pub block_response: Option<BlockResponseV1>,
     pub blocked_ttl_secs: Option<u32>,
     pub block_all: bool,
-    /// Admin-rule ids as plain strings (the `Profile.admin_rules: Vec<Id>`
-    /// field, each `Id::as_str().to_string()`).
     pub admin_rules: Vec<String>,
     pub ecs: Option<ProfileEcsConfig>,
     /// `profiles.<id>.lists` as the file had it at open time. Diffed
@@ -525,8 +499,17 @@ impl ProfileForm {
     /// Empty form for `Add`. Focus starts on `Id` so the operator can
     /// type immediately.
     pub fn new_add() -> Self {
+        Self::new_add_with(Vec::new(), Vec::new())
+    }
+
+    pub fn new_add_with(
+        lists_snapshot: Vec<Blocklist>,
+        custom_lists_snapshot: Vec<CustomList>,
+    ) -> Self {
         Self {
             mode: FormMode::Add,
+            creation_confirmed: false,
+            creation_attempted: false,
             original: None,
             focused: FormField::Id,
             id: String::new(),
@@ -534,14 +517,16 @@ impl ProfileForm {
             block_response_idx: 0,
             blocked_ttl_input: String::new(),
             block_all: false,
+            advanced_expanded: false,
             admin_rules_input: String::new(),
             ecs_mode_idx: 0,
             ecs_v4_input: String::new(),
             ecs_v6_input: String::new(),
             ecs_clear: false,
-            lists_snapshot: Vec::new(),
+            lists_snapshot,
             lists_draft: BTreeMap::new(),
-            custom_lists_snapshot: Vec::new(),
+            custom_lists_snapshot,
+            custom_lists_available: true,
             custom_lists_draft: BTreeSet::new(),
             ignore_armed: None,
             error_message: None,
@@ -574,7 +559,7 @@ impl ProfileForm {
             admin_rules: profile
                 .admin_rules
                 .iter()
-                .map(|r| r.as_str().to_string())
+                .map(|rule| rule.as_str().to_string())
                 .collect(),
             ecs: profile.ecs.clone(),
             lists: profile.lists.clone(),
@@ -583,6 +568,8 @@ impl ProfileForm {
         let ecs = profile.ecs.clone().unwrap_or_default();
         Self {
             mode: FormMode::Edit,
+            creation_confirmed: false,
+            creation_attempted: false,
             focused: FormField::DisplayName, // id is not editable
             id: id.to_string(),
             display_name: profile.display_name.clone(),
@@ -592,6 +579,7 @@ impl ProfileForm {
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             block_all: profile.block_all,
+            advanced_expanded: profile.ecs.is_some(),
             admin_rules_input: snapshot.admin_rules.join(", "),
             ecs_mode_idx: ecs_mode_idx_for(ecs.mode),
             ecs_v4_input: ecs
@@ -607,9 +595,21 @@ impl ProfileForm {
             lists_snapshot,
             custom_lists_draft: snapshot.custom_lists.clone(),
             custom_lists_snapshot,
+            custom_lists_available: true,
             ignore_armed: None,
             error_message: None,
             original: Some(snapshot),
+        }
+    }
+
+    pub(super) fn reconcile_created(&mut self, profile: &Profile) {
+        let persisted = Self::new_edit(&self.id, profile, Vec::new(), Vec::new());
+        self.mode = FormMode::Edit;
+        self.original = persisted.original;
+        self.creation_confirmed = false;
+        self.creation_attempted = false;
+        if self.focused == FormField::Id {
+            self.focused = FormField::DisplayName;
         }
     }
 
@@ -618,7 +618,7 @@ impl ProfileForm {
     /// Owned rather than `&'static [FormField]`: in Edit mode the ring
     /// splices one [`FormField::ListOverride`] per configured blocklist
     /// and one [`FormField::CustomListMount`] per declared custom list
-    /// between [`FormField::EDIT_HEAD`] and [`FormField::EDIT_TAIL`], and
+    /// between the fixed head and [`FormField::EDIT_TAIL`], and
     /// both counts are the operator's. A config with **zero** of either
     /// yields that panel no rows, which the ring handles without a special
     /// case — nothing indexes a snapshot here.
@@ -630,10 +630,27 @@ impl ProfileForm {
     /// differently would scroll to the wrong one.
     pub fn visible_fields(&self) -> Vec<FormField> {
         match self.mode {
-            FormMode::Add => FormField::ADD_FIELDS.to_vec(),
-            FormMode::Edit => FormField::EDIT_HEAD
+            FormMode::Add => std::iter::once(FormField::Id)
+                .chain(FormField::CORE_HEAD.iter().copied())
+                .chain(
+                    self.advanced_expanded
+                        .then_some(FormField::ECS_FIELDS)
+                        .into_iter()
+                        .flatten(),
+                )
+                .chain((0..self.lists_snapshot.len()).map(FormField::ListOverride))
+                .chain((0..self.custom_lists_snapshot.len()).map(FormField::CustomListMount))
+                .chain(FormField::EDIT_TAIL.iter().copied())
+                .collect(),
+            FormMode::Edit => FormField::CORE_HEAD
                 .iter()
                 .copied()
+                .chain(
+                    self.advanced_expanded
+                        .then_some(FormField::ECS_FIELDS)
+                        .into_iter()
+                        .flatten(),
+                )
                 .chain((0..self.lists_snapshot.len()).map(FormField::ListOverride))
                 .chain((0..self.custom_lists_snapshot.len()).map(FormField::CustomListMount))
                 .chain(FormField::EDIT_TAIL.iter().copied())
@@ -665,14 +682,16 @@ impl ProfileForm {
         // `FormField::ListOverride` reaching a `_ => None` here would look
         // right and read the operator's keystrokes into nothing.
         match self.focused {
-            FormField::Id => (self.mode == FormMode::Add).then_some(&mut self.id),
+            FormField::Id => {
+                (self.mode == FormMode::Add && !self.creation_attempted).then_some(&mut self.id)
+            }
             FormField::DisplayName => Some(&mut self.display_name),
             FormField::BlockedTtl => Some(&mut self.blocked_ttl_input),
-            FormField::AdminRules => Some(&mut self.admin_rules_input),
             FormField::EcsPrefixV4 => Some(&mut self.ecs_v4_input),
             FormField::EcsPrefixV6 => Some(&mut self.ecs_v6_input),
             FormField::BlockResponse
             | FormField::BlockAll
+            | FormField::Advanced
             | FormField::EcsMode
             | FormField::EcsClear
             | FormField::ListOverride(_)
@@ -691,6 +710,10 @@ impl ProfileForm {
         // field it does not name, so a panel row absorbed by a catch-all
         // would silently cycle whichever dropdown happens to be listed —
         // an edit to a field the operator is not looking at.
+        if self.focused == FormField::Advanced {
+            self.toggle_advanced();
+            return;
+        }
         let (idx, len) = match self.focused {
             FormField::BlockResponse => {
                 (&mut self.block_response_idx, BLOCK_RESPONSE_OPTIONS.len())
@@ -700,7 +723,7 @@ impl ProfileForm {
             | FormField::DisplayName
             | FormField::BlockedTtl
             | FormField::BlockAll
-            | FormField::AdminRules
+            | FormField::Advanced
             | FormField::EcsPrefixV4
             | FormField::EcsPrefixV6
             | FormField::EcsClear
@@ -716,18 +739,18 @@ impl ProfileForm {
         };
     }
 
-    /// Flip the focused toggle field (`block_all` or `ecs_clear`).
+    /// Flip the focused toggle field.
     /// No-op when the focused field is not a toggle.
     pub fn toggle(&mut self) {
         // Exhaustive for the reason spelled out on `text_field_buf`.
         match self.focused {
             FormField::BlockAll => self.block_all = !self.block_all,
+            FormField::Advanced => self.toggle_advanced(),
             FormField::EcsClear => self.ecs_clear = !self.ecs_clear,
             FormField::Id
             | FormField::DisplayName
             | FormField::BlockResponse
             | FormField::BlockedTtl
-            | FormField::AdminRules
             | FormField::EcsMode
             | FormField::EcsPrefixV4
             | FormField::EcsPrefixV6
@@ -740,6 +763,22 @@ impl ProfileForm {
             | FormField::Submit
             | FormField::Cancel => {}
         }
+    }
+
+    /// Open or collapse production-only fields without changing their drafts.
+    pub fn toggle_advanced(&mut self) {
+        if self.advanced_expanded
+            && matches!(
+                self.focused,
+                FormField::EcsMode
+                    | FormField::EcsPrefixV4
+                    | FormField::EcsPrefixV6
+                    | FormField::EcsClear
+            )
+        {
+            self.focused = FormField::Advanced;
+        }
+        self.advanced_expanded = !self.advanced_expanded;
     }
 
     /// The panel row index the focus is on, if any.
@@ -997,32 +1036,6 @@ pub fn resolve_edit_patch(
         patch.block_all = Some(form.block_all);
     }
 
-    // admin_rules — AdminRulesPatch delta (add/remove vs the snapshot).
-    let orig_rules: Vec<&str> = orig.admin_rules.iter().map(String::as_str).collect();
-    // Order-preserving de-dup: the operator may type the same id twice
-    // (`"rule-c, rule-c"`); keep the first occurrence only so the add
-    // delta stays clean instead of carrying a duplicate into the patch.
-    let mut now_rules: Vec<String> = Vec::new();
-    for entry in form.admin_rules_input.split(',') {
-        let trimmed = entry.trim();
-        if !trimmed.is_empty() && !now_rules.iter().any(|r| r == trimmed) {
-            now_rules.push(trimmed.to_string());
-        }
-    }
-    let add: Vec<String> = now_rules
-        .iter()
-        .filter(|r| !orig_rules.contains(&r.as_str()))
-        .cloned()
-        .collect();
-    let remove: Vec<String> = orig_rules
-        .iter()
-        .filter(|r| !now_rules.iter().any(|n| n == *r))
-        .map(|s| s.to_string())
-        .collect();
-    if !add.is_empty() || !remove.is_empty() {
-        patch.admin_rules = Some(AdminRulesPatch { add, remove });
-    }
-
     // lists — ListPolicyPatch MAP delta (set/clear vs the snapshot).
     //
     // A map delta, not the set delta `admin_rules` and the retired `tags`
@@ -1138,11 +1151,46 @@ pub fn resolve_edit_patch(
     Ok(patch)
 }
 
+/// Resolve the full Add draft against the defaults installed by
+/// `ProfileCreate`. The create command owns identity; this patch contains
+/// only the non-default properties and policy choices collected on the same
+/// screen.
+pub fn resolve_add_patch(
+    form: &ProfileForm,
+    id: &str,
+    display_name: &str,
+) -> Result<ProfileUpdatePatch, String> {
+    let defaults = OriginalSnapshot {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        block_response: None,
+        blocked_ttl_secs: None,
+        block_all: false,
+        admin_rules: Vec::new(),
+        ecs: None,
+        lists: BTreeMap::new(),
+        custom_lists: BTreeSet::new(),
+    };
+    resolve_edit_patch(form, &defaults)
+}
+
 impl ProfileModal {
     /// Open an Add modal.
     pub fn open_add() -> Self {
         Self {
             stage: Stage::EditingForm(ProfileForm::new_add()),
+        }
+    }
+
+    pub fn open_add_full(
+        lists_snapshot: Vec<Blocklist>,
+        custom_lists_snapshot: Vec<CustomList>,
+    ) -> Self {
+        Self {
+            stage: Stage::EditingForm(ProfileForm::new_add_with(
+                lists_snapshot,
+                custom_lists_snapshot,
+            )),
         }
     }
 
@@ -1192,6 +1240,31 @@ impl ProfileModal {
         self.stage = Stage::Submitted(outcome);
     }
 
+    pub(super) fn fail(&mut self, error: String) {
+        let previous = std::mem::replace(
+            &mut self.stage,
+            Stage::Submitted(SubmitOutcome::Failed(error.clone())),
+        );
+        if let Stage::EditingForm(mut form) = previous {
+            if error_requires_advanced(&error) {
+                form.advanced_expanded = true;
+            }
+            let needs_details =
+                modal_form::scrollable_error_rows(&format!("⚠ {error}"), MODAL_W - 5).len()
+                    > HELP_REGION.rows;
+            form.error_message = Some(error);
+            self.stage = if needs_details {
+                Stage::ReviewingError(ErrorReview {
+                    form,
+                    scroll: Cell::new(0),
+                    max_scroll: Cell::new(0),
+                })
+            } else {
+                Stage::EditingForm(form)
+            };
+        }
+    }
+
     /// Whether the modal is in its terminal submitted state.
     pub fn is_submitted(&self) -> bool {
         matches!(self.stage, Stage::Submitted(_))
@@ -1225,12 +1298,19 @@ impl ProfileModal {
     }
 }
 
+fn error_requires_advanced(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("ecs") || normalized.contains("source_prefix")
+}
+
 // ── Render helpers (called from tui/ui.rs) ───────────────────────────
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::tui::modal_form::{self, Action, ActionKind, ProseRow, ValueKind};
+use crate::tui::theme::{self, CardRole};
 
 /// Outer modal width. The interior is two columns narrower, and one
 /// narrower again while the field region scrolls — [`modal_form::render_modal`]
@@ -1274,6 +1354,29 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ProfileModal) {
                 render.place_cursor(f, row, modal_form::VALUE_COL as u16 + caret);
             }
         }
+        Stage::ReviewingError(review) => {
+            let render = modal_form::render_modal(f, anchor, MODAL_W, |w| {
+                let mut body = error_body(&review.form, w);
+                let (_, visible, _) = modal_form::scroll_layout(
+                    usize::from(anchor.height.saturating_sub(2)),
+                    body.head.len(),
+                    body.fields.len(),
+                    body.tail.len(),
+                );
+                body.focus_row = Some(
+                    review
+                        .scroll
+                        .get()
+                        .saturating_add(visible.saturating_sub(1)),
+                );
+                let total = body.fields.len();
+                (body, total)
+            });
+            review.scroll.set(render.view.offset);
+            review
+                .max_scroll
+                .set(render.cursor.saturating_sub(render.view.view_h));
+        }
         Stage::ConfirmingRemove(rc) => {
             let spec = remove_notice(rc);
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
@@ -1286,6 +1389,81 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ProfileModal) {
                 (modal_form::notice_body(&spec, w), ())
             });
         }
+    }
+}
+
+/// Render an add/edit form in the Profiles detail card. Its draft remains
+/// the modal's captured state — this only changes where the same fields,
+/// mounts, validation guidance and actions are painted.
+pub fn render_inline_editor(f: &mut Frame, area: Rect, modal: &ProfileModal) -> bool {
+    let Stage::EditingForm(form) = &modal.stage else {
+        return false;
+    };
+    let (title, _) = band_text(form);
+    let subtitle = match form.mode {
+        FormMode::Add => "core policy, list overrides, and custom-list mounts",
+        FormMode::Edit => "policy, list overrides, and custom-list mounts",
+    };
+    let body_area = theme::filled_card(f.buffer_mut(), area, &title, subtitle, CardRole::History);
+    let (mut body, mut cursor) = form_body(form, body_area.width);
+    // The card owns the paired title/subtitle bands; keep one deliberate
+    // spacer before the first form section.
+    body.head = vec![Line::default()];
+    if body.scrollable
+        && modal_form::will_scroll(
+            body_area.height as usize,
+            body.head.len(),
+            body.fields.len(),
+            body.tail.len(),
+        )
+    {
+        (body, cursor) = form_body(form, body_area.width.saturating_sub(1));
+        body.head = vec![Line::default()];
+    }
+    let view = modal_form::render_scroll_body(f, body_area, &body);
+    if let Some((row, caret)) = cursor {
+        if row >= view.offset && row < view.offset + view.view_h {
+            let position = Position {
+                x: body_area
+                    .x
+                    .saturating_add(modal_form::VALUE_COL as u16 + caret),
+                y: body_area
+                    .y
+                    .saturating_add((view.head_h + row - view.offset) as u16),
+            };
+            if position.x < body_area.right() && position.y < body_area.bottom() {
+                f.set_cursor_position(position);
+            }
+        }
+    }
+    true
+}
+
+fn error_body(form: &ProfileForm, width: u16) -> modal_form::ScrollBody {
+    let fields =
+        modal_form::scrollable_error_rows(form.error_message.as_deref().unwrap_or_default(), width);
+    modal_form::ScrollBody {
+        action_hits: Vec::new(),
+        field_hits: Vec::new(),
+        head: vec![
+            modal_form::title_band(TITLE_FAILED.trim(), width),
+            modal_form::desc_band("Your edits are kept. Review the error, then return.", width),
+        ],
+        fields,
+        tail: vec![
+            modal_form::nav_keys_line("↑/↓ scroll · Home/End first/last line"),
+            modal_form::action_row(
+                &[Action::new(
+                    "  [Enter / Esc] Back to editor  ",
+                    true,
+                    ActionKind::Neutral,
+                    "",
+                )],
+                width,
+            ),
+        ],
+        focus_row: None,
+        scrollable: true,
     }
 }
 
@@ -1335,8 +1513,8 @@ fn band_text(form: &ProfileForm) -> (String, [&'static str; 2]) {
         FormMode::Add => (
             TITLE_ADD.trim().to_string(),
             [
-                "A policy bundle devices and subnets point at. The id is",
-                "permanent. Lists come from profiles.<id>.lists + base.",
+                "A complete policy bundle for devices and subnets. The id is",
+                "permanent; properties and list choices are saved from this draft.",
             ],
         ),
         FormMode::Edit => (
@@ -1435,12 +1613,6 @@ fn form_body(form: &ProfileForm, width: u16) -> (modal_form::ScrollBody, Option<
         len(&form.display_name),
     );
 
-    if form.mode == FormMode::Add {
-        add_preview_sections(&mut rows, width);
-        let tail = form_tail_for(&rows, form);
-        return rows.finish(tail);
-    }
-
     // ── BLOCKING ──────────────────────────────────────────────────────
     rows.spacer();
     rows.section("Blocking");
@@ -1489,119 +1661,102 @@ fn form_body(form: &ProfileForm, width: u16) -> (modal_form::ScrollBody, Option<
         field_hint(FormField::BlockAll),
     );
 
-    // ── POLICY ────────────────────────────────────────────────────────
-    // The two read-only rows replace the old always-on footnote at the
-    // bottom of the modal. A row below the last *focusable* field is
-    // unreachable once the body scrolls — the viewport follows focus and
-    // there is no scroll key (D7′) — so the note lives beside the
-    // editable rule field it belongs to, where focus brings it on screen.
+    // ── ADVANCED / ECS ────────────────────────────────────────────────
     rows.spacer();
-    rows.section("Policy");
-    let ar_focus = focus == FormField::AdminRules;
-    rows.text_field(
-        modal_form::value_row(
-            "admin rules",
-            &form.admin_rules_input,
-            ar_focus,
-            ValueKind::Editable,
-            Some("(none)"),
+    rows.section("Advanced");
+    let advanced_focus = focus == FormField::Advanced;
+    rows.field(
+        modal_form::selector_row(
+            "advanced",
+            if form.advanced_expanded {
+                "Hide ECS controls"
+            } else {
+                "Show ECS controls"
+            },
+            advanced_focus,
             width,
         ),
-        ar_focus,
-        field_hint(FormField::AdminRules),
-        len(&form.admin_rules_input),
+        advanced_focus,
+        field_hint(FormField::Advanced),
     );
-    rows.line(modal_form::state_row(
-        "local records",
-        "read-only here",
-        ValueKind::Caution,
-        "  \u{2192} Local DNS tab",
-        width,
-    ));
-    rows.line(modal_form::state_row(
-        "rewrite rules",
-        "read-only here",
-        ValueKind::Caution,
-        "  \u{2192} warden rewrite",
-        width,
-    ));
 
-    // ── ECS ───────────────────────────────────────────────────────────
-    // The three sub-fields go inert while the whole-subtree `clear ecs`
-    // toggle is on — `resolve_edit_patch` ignores them in that case, so
-    // they drop the selector wrap and the caret (Caution, not Editable)
-    // without leaving the tab order.
-    rows.spacer();
-    rows.section("ECS");
-    let ecs_dim = form.ecs_clear;
-    let ecs_mode_label = ECS_MODE_OPTIONS
-        .get(form.ecs_mode_idx)
-        .copied()
-        .unwrap_or(ECS_MODE_OPTIONS[0]);
-    let mode_focus = focus == FormField::EcsMode;
-    rows.field(
-        if ecs_dim {
-            modal_form::value_row(
-                "ecs mode",
-                ecs_mode_label,
-                mode_focus,
-                ValueKind::Caution,
-                None,
-                width,
-            )
-        } else {
-            modal_form::selector_row("ecs mode", ecs_mode_label, mode_focus, width)
-        },
-        mode_focus,
-        field_hint(FormField::EcsMode),
-    );
-    for (field, label, buf) in [
-        (FormField::EcsPrefixV4, "ecs prefix v4", &form.ecs_v4_input),
-        (FormField::EcsPrefixV6, "ecs prefix v6", &form.ecs_v6_input),
-    ] {
-        let focused = focus == field;
-        if ecs_dim {
-            rows.field(
+    if form.advanced_expanded {
+        // The three sub-fields go inert while the whole-subtree `clear ecs`
+        // toggle is on — `resolve_edit_patch` ignores them in that case, so
+        // they drop the selector wrap and the caret without leaving the ring.
+        rows.spacer();
+        rows.section("ECS");
+        let ecs_dim = form.ecs_clear;
+        let ecs_mode_label = ECS_MODE_OPTIONS
+            .get(form.ecs_mode_idx)
+            .copied()
+            .unwrap_or(ECS_MODE_OPTIONS[0]);
+        let mode_focus = focus == FormField::EcsMode;
+        rows.field(
+            if ecs_dim {
                 modal_form::value_row(
-                    label,
-                    &inherit_display(buf),
-                    focused,
+                    "ecs mode",
+                    ecs_mode_label,
+                    mode_focus,
                     ValueKind::Caution,
                     None,
                     width,
-                ),
-                focused,
-                field_hint(field),
-            );
-        } else {
-            rows.text_field(
-                modal_form::value_row(
-                    label,
-                    buf,
+                )
+                .into()
+            } else {
+                modal_form::selector_row("ecs mode", ecs_mode_label, mode_focus, width)
+            },
+            mode_focus,
+            field_hint(FormField::EcsMode),
+        );
+        for (field, label, buf) in [
+            (FormField::EcsPrefixV4, "ecs prefix v4", &form.ecs_v4_input),
+            (FormField::EcsPrefixV6, "ecs prefix v6", &form.ecs_v6_input),
+        ] {
+            let focused = focus == field;
+            if ecs_dim {
+                rows.field(
+                    modal_form::value_row(
+                        label,
+                        &inherit_display(buf),
+                        focused,
+                        ValueKind::Caution,
+                        None,
+                        width,
+                    ),
                     focused,
-                    ValueKind::Editable,
-                    Some("(inherit)"),
-                    width,
-                ),
-                focused,
-                field_hint(field),
-                len(buf),
-            );
+                    field_hint(field),
+                );
+            } else {
+                rows.text_field(
+                    modal_form::value_row(
+                        label,
+                        buf,
+                        focused,
+                        ValueKind::Editable,
+                        Some("(inherit)"),
+                        width,
+                    ),
+                    focused,
+                    field_hint(field),
+                    len(buf),
+                );
+            }
         }
-    }
-    let clear_focus = focus == FormField::EcsClear;
-    rows.field(
-        modal_form::radio_row(
-            "clear ecs",
-            ("Yes", ValueKind::Caution),
-            ("No", ValueKind::Editable),
-            form.ecs_clear,
+        let clear_focus = focus == FormField::EcsClear;
+        rows.field(
+            modal_form::radio_row(
+                "clear ecs",
+                ("Yes", ValueKind::Caution),
+                ("No", ValueKind::Editable),
+                form.ecs_clear,
+                clear_focus,
+                width,
+            ),
             clear_focus,
-            width,
-        ),
-        clear_focus,
-        field_hint(FormField::EcsClear),
-    );
+            field_hint(FormField::EcsClear),
+        );
+    }
 
     // ── LISTS ─────────────────────────────────────────────────────────
     //
@@ -1612,7 +1767,7 @@ fn form_body(form: &ProfileForm, width: u16) -> (modal_form::ScrollBody, Option<
     // nothing after the plp cutover and therefore rendered inert history
     // wearing a control's clothes.
     rows.spacer();
-    rows.section("Lists");
+    rows.section_with_role("Lists", CardRole::Analytics);
     if form.lists_snapshot.is_empty() {
         // Not a focus target: there is nothing here to change, and a row
         // in the ring that answers no key is the "offers input it drops on
@@ -1696,16 +1851,24 @@ fn form_body(form: &ProfileForm, width: u16) -> (modal_form::ScrollBody, Option<
     // subscription every profile starts from, a custom list the exception
     // the operator wrote afterwards.
     rows.spacer();
-    rows.section("Custom lists");
+    rows.section_with_role("Custom lists", CardRole::History);
     if form.custom_lists_snapshot.is_empty() {
         // Not a focus target, for the reason the sibling empty state gives:
         // a ring entry that answers no key offers input it drops on the
         // floor.
         rows.line(modal_form::state_row(
             "custom lists",
-            "none declared",
+            if form.custom_lists_available {
+                "none declared"
+            } else {
+                "catalog unavailable"
+            },
             ValueKind::Caution,
-            CUSTOM_LIST_PANEL_EMPTY,
+            if form.custom_lists_available {
+                CUSTOM_LIST_PANEL_EMPTY
+            } else {
+                CUSTOM_LIST_CATALOG_UNAVAILABLE
+            },
             width,
         ));
     } else {
@@ -1853,78 +2016,6 @@ fn list_row_hint(
     LIST_OVERRIDE_HINT.to_string()
 }
 
-/// What Add shows below Identity: every section Edit has, every field
-/// named, **none of them offered**.
-///
-/// ## Why these are inert and not editable
-///
-/// `IpcCommand::ProfileCreate { id, display_name, token }` is the whole Add
-/// wire (`ipc/protocol.rs`). Eight of Edit's eleven fields have no transport
-/// on it, and the only routes to one are a protocol change or a
-/// non-atomic create-then-update — neither of which belongs in this
-/// leaf's layout.
-///
-/// So the operator's report ("Add opens only the name field") is answered
-/// by showing the **shape** of a profile rather than by widening the focus
-/// ring. `FormField::ADD_FIELDS` deliberately still holds four entries:
-/// putting `BlockResponse` in the ring would give the operator a field to
-/// fill that the submit path drops on the floor in silence — the same
-/// class of defect once fixed on the Devices form, where Promote
-/// offered an editable group its wire wrote as `None`. A row that says
-/// *when* it becomes available is worth more than a row that takes input
-/// and loses it.
-///
-/// The rows are [`modal_form::state_row`]s, the same vocabulary the Edit
-/// form already uses for `local records` / `rewrite rules` — "something you
-/// can see here and change elsewhere" — so this borrows an established
-/// reading rather than inventing one.
-fn add_preview_sections(rows: &mut modal_form::FormRows, width: u16) {
-    // Frozen so a reader of one row learns the rule for all of them.
-    const LATER: &str = "set after creating";
-
-    let preview = |rows: &mut modal_form::FormRows, label: &str| {
-        rows.line(modal_form::state_row(
-            label,
-            LATER,
-            ValueKind::Caution,
-            "",
-            width,
-        ));
-    };
-
-    rows.spacer();
-    rows.section("Blocking");
-    for label in ["block response", "blocked ttl", "block all"] {
-        preview(rows, label);
-    }
-
-    rows.spacer();
-    rows.section("Policy");
-    preview(rows, "admin rules");
-    // NOT `LATER`. These two are read-only in the Edit form as well —
-    // creating the profile does not make them editable here, so
-    // "set after creating" would be a promise the next screen breaks.
-    // They carry Edit's own copy verbatim, pointer included.
-    for (label, note) in [
-        ("local records", "  \u{2192} Local DNS tab"),
-        ("rewrite rules", "  \u{2192} warden rewrite"),
-    ] {
-        rows.line(modal_form::state_row(
-            label,
-            "read-only here",
-            ValueKind::Caution,
-            note,
-            width,
-        ));
-    }
-
-    rows.spacer();
-    rows.section("ECS");
-    for label in ["ecs mode", "ecs prefix v4", "ecs prefix v6", "clear ecs"] {
-        preview(rows, label);
-    }
-}
-
 /// The pinned tail: hint-or-error, the key legend, `[Esc] Discard` ·
 /// `[Enter] Save`.
 ///
@@ -1940,13 +2031,15 @@ fn form_tail_for(
             form.focused == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             "  [Enter] Save  ",
             form.focused == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
     modal_form::form_tail_with_note(
         rows,
@@ -2010,7 +2103,7 @@ fn field_hint(f: FormField) -> &'static str {
         }
         FormField::BlockedTtl => "TTL in seconds on blocked answers (blank = inherit)",
         FormField::BlockAll => "block every domain not explicitly allowed — ←/→ or Space toggles",
-        FormField::AdminRules => "comma-separated admin-rule ids applied to this profile",
+        FormField::Advanced => "production ECS controls — ←/→ to show or hide",
         FormField::EcsMode => "EDNS Client Subnet mode sent upstream — ←/→ to change",
         FormField::EcsPrefixV4 => "ECS source prefix length 0..=32 (blank = inherit)",
         FormField::EcsPrefixV6 => "ECS source prefix length 0..=128 (blank = inherit)",

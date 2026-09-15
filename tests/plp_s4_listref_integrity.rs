@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use purge_warden::cli::commands::blocklists::{
     profiles_where_list_is_allow, run_remove, run_set_trust, ACCEPT_UNSIGNED_ALLOW_FLAG_HINT,
 };
-use purge_warden::config::loader::load_config;
+use purge_warden::config::loader::load_current_config;
 use purge_warden::config::schema::{Id, ListPolicy};
 
 /// A socket path that does not exist. Every verb here ends with
@@ -52,7 +52,7 @@ fn dead_socket(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn load_ok(master: &Path) -> purge_warden::config::schema::ConfigV1 {
-    load_config(master, time::OffsetDateTime::now_utc())
+    load_current_config(master, time::OffsetDateTime::now_utc())
         .unwrap_or_else(|e| panic!("config must load: {e:?}"))
         .config
 }
@@ -80,7 +80,7 @@ fn write_master(dir: &tempfile::TempDir, body: &str) -> PathBuf {
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [upstream]
 mode = "plain"
@@ -489,7 +489,7 @@ async fn removing_a_list_cascades_into_a_profile_living_in_another_file() {
     // parses it as a member of the last one.
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 includes = ["conf.d/*.toml"]
 
 [upstream]

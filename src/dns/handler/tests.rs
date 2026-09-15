@@ -1388,7 +1388,7 @@ async fn cache_hit_ip_blocklist_match_invalidates_entry() {
     let mut blocked_ips: HashSet<IpAddr, ahash::RandomState> = HashSet::default();
     blocked_ips.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
     let ipf = IpFilter::with_ips(blocked_ips);
-    let hit = ipf.check_response(entry.records(), NamePolicy::Neutral);
+    let hit = ipf.check_response_with_grant(entry.records(), None);
     assert_eq!(
         hit,
         Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
@@ -1432,7 +1432,7 @@ async fn cache_hit_ip_blocklist_clean_passes_through() {
     other_ips.insert(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
     let ipf = IpFilter::with_ips(other_ips);
     assert!(ipf
-        .check_response(entry.records(), NamePolicy::Neutral)
+        .check_response_with_grant(entry.records(), None)
         .is_none());
     assert!(cache
         .lookup("clean.example.com", RecordType::A, DNSClass::IN, None)
@@ -1637,7 +1637,7 @@ async fn ecs_bucketed_cache_hit_ip_block_invalidates_correct_bucket() {
     blocked_ips.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
     let ipf = IpFilter::with_ips(blocked_ips);
     assert_eq!(
-        ipf.check_response(entry.records(), NamePolicy::Neutral),
+        ipf.check_response_with_grant(entry.records(), None),
         Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
     );
     invalidate_current_bucket(
@@ -1887,6 +1887,7 @@ impl Upstream for RecordingUpstream {
                 RData::A(A(Ipv4Addr::new(203, 0, 113, 9))),
             )],
             response_code: ResponseCode::NoError,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: Vec::new(),
@@ -1900,6 +1901,31 @@ impl Upstream for RecordingUpstream {
 /// upstream, silently defeating the `calls()` assertions.
 const NET_NAME_CLIENT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 7);
 
+fn resolver_with_empty_operator_policy(
+    config: &crate::config::schema::ConfigV1,
+) -> Arc<ProfileResolver> {
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, ProfileMounts, RuleCompileLimits,
+    };
+
+    let mounts: Vec<_> = config
+        .profiles
+        .keys()
+        .map(|profile_id| ProfileMounts {
+            profile_id,
+            custom_lists: &[],
+            block_all: false,
+        })
+        .collect();
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let compiled = CompiledOperatorRules::compile(&[], &mounts, limits, &admission).unwrap();
+    Arc::new(ProfileResolver::build_with_operator_rules(
+        config,
+        Arc::new(compiled),
+    ))
+}
+
 /// A resolver holding exactly one device with a `network_name`.
 /// `device_ip = None` builds the offline case: no pinned IP and no MAC,
 /// so `resolve_network_name` finds nothing to answer with while
@@ -1910,10 +1936,8 @@ fn resolver_with_network_name(
     device_ip: Option<IpAddr>,
 ) -> Arc<ProfileResolver> {
     use crate::config::schema::{ConfigV1, Device, Id, Profile};
-    use crate::lists::source_key::SourceBitMap;
-
     let mut config = ConfigV1 {
-        schema_version: 1,
+        schema_version: crate::config::schema::TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.server.default_profile = Some(Id::new("demo").unwrap());
@@ -1943,11 +1967,7 @@ fn resolver_with_network_name(
         network_name: Some(network_name.to_string()),
         network_name_wildcard: wildcard,
     });
-    Arc::new(ProfileResolver::build(
-        &config,
-        &SourceBitMap::default(),
-        &crate::config::custom_list::CustomListStore::new(),
-    ))
+    resolver_with_empty_operator_policy(&config)
 }
 
 /// `local_records = None` — a static-table miss is this branch's
@@ -2317,10 +2337,8 @@ async fn static_local_dns_record_wins_over_a_colliding_network_name() {
 /// legacy `is_blocked()` predates L-3 and is no longer accurate.
 fn permissive_test_resolver() -> Arc<ProfileResolver> {
     use crate::config::schema::{ConfigV1, Id, Profile};
-    use crate::lists::source_key::SourceBitMap;
-
     let mut config = ConfigV1 {
-        schema_version: 1,
+        schema_version: crate::config::schema::TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.server.default_profile = Some(Id::new("demo").unwrap());
@@ -2331,11 +2349,7 @@ fn permissive_test_resolver() -> Arc<ProfileResolver> {
             ..Default::default()
         },
     );
-    Arc::new(ProfileResolver::build(
-        &config,
-        &SourceBitMap::default(),
-        &crate::config::custom_list::CustomListStore::new(),
-    ))
+    resolver_with_empty_operator_policy(&config)
 }
 
 /// A handler with security/stats/local-records/ACL disabled and a
@@ -2374,6 +2388,446 @@ async fn query_handler(
     record_type: RecordType,
 ) -> CapturingHandler {
     drive(handler, &net_name_request(domain, record_type)).await
+}
+
+/// Fixed upstream used by post-fetch response tests. The response is rebuilt
+/// for every call so the test can prove whether the handler served its cache.
+struct FixedResponseUpstream {
+    records: Vec<Record>,
+    response_code: ResponseCode,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FixedResponseUpstream {
+    fn new(records: Vec<Record>, response_code: ResponseCode) -> Self {
+        Self {
+            records,
+            response_code,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Upstream for FixedResponseUpstream {
+    async fn lookup(
+        &self,
+        _name: &Name,
+        _record_type: RecordType,
+        _ecs: Option<crate::dns::edns::EdnsClientSubnet>,
+    ) -> Result<crate::upstream::UpstreamResponse, DnsError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::upstream::UpstreamResponse {
+            records: self.records.clone(),
+            response_code: self.response_code,
+            generation: None,
+            soa_minimum_ttl: None,
+            #[cfg(feature = "dnssec")]
+            authority: Vec::new(),
+        })
+    }
+}
+
+fn resolver_with_pack_and_rewrite(
+    content: &str,
+    rewrite_rules: Vec<crate::config::settings::RewriteRule>,
+) -> Arc<ProfileResolver> {
+    use crate::config::schema::{ConfigV1, Id, Profile};
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+    };
+
+    let mut config = ConfigV1 {
+        schema_version: 1,
+        ..Default::default()
+    };
+    config.server.default_profile = Some(Id::new("demo").unwrap());
+    config.profiles.insert(
+        "demo".to_string(),
+        Profile {
+            display_name: "demo".into(),
+            rewrite_rules,
+            ..Default::default()
+        },
+    );
+
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content,
+            }],
+            &[ProfileMounts {
+                profile_id: "demo",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    Arc::new(ProfileResolver::build_with_operator_rules(&config, rules))
+}
+
+fn operator_rules_handler(
+    upstream: Arc<FixedResponseUpstream>,
+    cache: DnsCache,
+    pack: &str,
+) -> ForwardHandler {
+    operator_rules_handler_with_rewrite_and_filter(
+        upstream,
+        cache,
+        pack,
+        Arc::new(FilterEngine::new()),
+    )
+}
+
+fn operator_rules_handler_with_rewrite_and_filter(
+    upstream: Arc<FixedResponseUpstream>,
+    cache: DnsCache,
+    pack: &str,
+    filter: Arc<FilterEngine>,
+) -> ForwardHandler {
+    ForwardHandler::new(
+        upstream,
+        filter,
+        cache,
+        Some(resolver_with_pack_and_rewrite(
+            pack,
+            vec![crate::config::settings::RewriteRule {
+                from: "original.example".into(),
+                to: "target.example".into(),
+                match_subdomains: false,
+            }],
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        60,
+        None,
+        0.0,
+        16,
+    )
+}
+
+#[test]
+fn block_all_with_overlapping_external_directions_uses_admin_attribution() {
+    use crate::filter::engine::DomainMasks;
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, ProfileMounts, RuleCompileLimits,
+    };
+
+    let mut domains = std::collections::HashMap::with_hasher(ahash::RandomState::new());
+    domains.insert(
+        CompactString::new("query.test"),
+        DomainMasks {
+            allow_mask: 1,
+            block_mask: 2,
+        },
+    );
+    let filter = FilterEngine::with_per_direction_domain_map(domains);
+    filter.fixture_subscribe("default", 3);
+
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let compiled = Arc::new(
+        CompiledOperatorRules::compile(
+            &[],
+            &[ProfileMounts {
+                profile_id: "default",
+                custom_lists: &[],
+                block_all: true,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    let mut profile = ResolvedProfile::permissive_default();
+    profile.unfiltered = false;
+    profile.bind_operator_rules(compiled);
+
+    let decision = filter.evaluate_active_operator_policy("query.test", &profile);
+    assert!(decision.blocked);
+    assert_eq!(decision.source, Some(BlockSource::AdminBlock));
+    assert!(decision.grant.is_none());
+}
+
+#[test]
+fn a_profile_without_compiled_operator_rules_fails_closed() {
+    let mut profile = ResolvedProfile::permissive_default();
+    profile.unfiltered = false;
+
+    let filter = FilterEngine::new();
+    let decision = filter.evaluate_active_operator_policy("query.test", &profile);
+
+    assert!(decision.blocked);
+    assert_eq!(decision.source, Some(BlockSource::AdminBlock));
+    assert!(decision.grant.is_none());
+}
+
+fn rewritten_target_record(record_type: RecordType) -> Record {
+    match record_type {
+        RecordType::A => Record::from_rdata(
+            Name::from_ascii("target.example.").unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ),
+        RecordType::AAAA => Record::from_rdata(
+            Name::from_ascii("target.example.").unwrap(),
+            60,
+            RData::AAAA(AAAA("2001:db8::1".parse().unwrap())),
+        ),
+        _ => unreachable!("fixture exercises only address queries"),
+    }
+}
+
+#[tokio::test]
+async fn rewrite_target_custom_list_deny_blocks_before_cache_or_upstream_for_a_and_aaaa() {
+    for record_type in [RecordType::A, RecordType::AAAA] {
+        for cached in [false, true] {
+            let cache = DnsCache::new(&crate::config::settings::CacheConfig::default());
+            if cached {
+                cache
+                    .insert(
+                        "target.example",
+                        record_type,
+                        DNSClass::IN,
+                        vec![rewritten_target_record(record_type)],
+                        ResponseCode::NoError,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            let upstream = Arc::new(FixedResponseUpstream::new(
+                vec![rewritten_target_record(record_type)],
+                ResponseCode::NoError,
+            ));
+            let handler = operator_rules_handler_with_rewrite_and_filter(
+                Arc::clone(&upstream),
+                cache,
+                "target.example",
+                Arc::new(FilterEngine::new()),
+            );
+
+            let response = query_handler(&handler, "original.example", record_type).await;
+
+            assert_eq!(
+                upstream.calls(),
+                0,
+                "a denied rewrite target must stop before the {} cache {} path reaches upstream",
+                if cached { "warm" } else { "cold" },
+                record_type,
+            );
+            assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+            assert_eq!(response.answer_count(), 1);
+            assert_eq!(
+                response.answers()[0].record_type(),
+                record_type,
+                "the synthetic edge block must retain the requested address family"
+            );
+            assert_eq!(
+                response.answers()[0].name,
+                Name::from_ascii("original.example.").unwrap(),
+                "the canned response remains owned by the client question, not the rewrite target"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn rewrite_target_grants_preserve_the_operator_rule_lattice_on_cache_miss_and_hit() {
+    for (pack, forwards, label) in [
+        (
+            "@@original.example\ntarget.example",
+            true,
+            "ordinary original grant beats ordinary target deny",
+        ),
+        (
+            "@@original.example\ntarget.example$important",
+            false,
+            "ordinary original grant loses to important target deny",
+        ),
+        (
+            "@@original.example$important\ntarget.example$important",
+            true,
+            "important original grant beats important target deny",
+        ),
+    ] {
+        for record_type in [RecordType::A, RecordType::AAAA] {
+            let upstream = Arc::new(FixedResponseUpstream::new(
+                vec![rewritten_target_record(record_type)],
+                ResponseCode::NoError,
+            ));
+            let handler = operator_rules_handler_with_rewrite_and_filter(
+                Arc::clone(&upstream),
+                DnsCache::new(&crate::config::settings::CacheConfig::default()),
+                pack,
+                Arc::new(FilterEngine::new()),
+            );
+
+            let first = query_handler(&handler, "original.example", record_type).await;
+            assert_eq!(first.rcode(), Some(ResponseCode::NoError), "{label}");
+            assert_eq!(
+                first.answer_count(),
+                if forwards { 2 } else { 1 },
+                "{label}: miss must {}",
+                if forwards {
+                    "serve the rewrite bridge and target"
+                } else {
+                    "block"
+                },
+            );
+            assert_eq!(
+                upstream.calls(),
+                if forwards { 1 } else { 0 },
+                "{label}: miss"
+            );
+
+            let second = query_handler(&handler, "original.example", record_type).await;
+            assert_eq!(second.rcode(), Some(ResponseCode::NoError), "{label}");
+            assert_eq!(second.answer_count(), first.answer_count(), "{label}: hit");
+            assert_eq!(
+                upstream.calls(),
+                if forwards { 1 } else { 0 },
+                "{label}: an allowed target is cached; a denied target never reaches upstream"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn rewrite_target_external_deny_blocks_before_upstream() {
+    let domains = [CompactString::new("target.example")].into_iter().collect();
+    let filter = Arc::new(FilterEngine::with_domains(domains));
+    filter.fixture_subscribe("demo", 1);
+
+    let upstream = Arc::new(FixedResponseUpstream::new(
+        vec![rewritten_target_record(RecordType::A)],
+        ResponseCode::NoError,
+    ));
+    let handler = operator_rules_handler_with_rewrite_and_filter(
+        Arc::clone(&upstream),
+        DnsCache::new(&crate::config::settings::CacheConfig::default()),
+        "",
+        filter,
+    );
+
+    let response = query_handler(&handler, "original.example", RecordType::A).await;
+    assert_eq!(
+        upstream.calls(),
+        0,
+        "external target deny must stop pre-upstream"
+    );
+    assert_eq!(response.answer_count(), 1);
+}
+
+#[tokio::test]
+async fn post_fetch_nxdomain_cname_target_blocks_on_first_response() {
+    let upstream = Arc::new(FixedResponseUpstream::new(
+        vec![cname_record("alias.example.", "tracker.example.", 60)],
+        ResponseCode::NXDomain,
+    ));
+    let handler = operator_rules_handler(
+        Arc::clone(&upstream),
+        DnsCache::new(&crate::config::settings::CacheConfig::default()),
+        "tracker.example",
+    );
+
+    let first = query_handler(&handler, "alias.example", RecordType::A).await;
+    assert_eq!(
+        upstream.calls(),
+        1,
+        "the first response must reach upstream"
+    );
+    assert_eq!(first.rcode(), Some(ResponseCode::NoError));
+    assert_eq!(first.answer_count(), 1, "the canned block A must be sent");
+
+    // CNAME blocks evict the response, so a repeat is a second post-fetch
+    // check rather than a stale policy decision cached under the old result.
+    let second = query_handler(&handler, "alias.example", RecordType::A).await;
+    assert_eq!(
+        upstream.calls(),
+        2,
+        "the blocked entry must not remain cached"
+    );
+    assert_eq!(second.rcode(), Some(ResponseCode::NoError));
+    assert_eq!(second.answer_count(), 1);
+}
+
+#[tokio::test]
+async fn cached_nxdomain_cname_target_blocks_before_serving_the_entry() {
+    let cache = DnsCache::new(&crate::config::settings::CacheConfig::default());
+    cache
+        .insert(
+            "alias.example",
+            RecordType::A,
+            DNSClass::IN,
+            vec![cname_record("alias.example.", "tracker.example.", 60)],
+            ResponseCode::NXDomain,
+            None,
+            None,
+        )
+        .await;
+    let upstream = Arc::new(FixedResponseUpstream::new(
+        Vec::new(),
+        ResponseCode::ServFail,
+    ));
+    let handler = operator_rules_handler(Arc::clone(&upstream), cache.clone(), "tracker.example");
+
+    let response = query_handler(&handler, "alias.example", RecordType::A).await;
+
+    assert_eq!(
+        upstream.calls(),
+        0,
+        "the fresh cache branch must inspect first"
+    );
+    assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+    assert_eq!(
+        response.answer_count(),
+        1,
+        "the cached entry must be blocked"
+    );
+    assert!(matches!(
+        cache
+            .lookup("alias.example", RecordType::A, DNSClass::IN, None)
+            .await,
+        CacheLookup::Miss
+    ));
+}
+
+#[tokio::test]
+async fn cached_nxdomain_cname_without_policy_hit_preserves_its_rcode() {
+    let upstream = Arc::new(FixedResponseUpstream::new(
+        vec![cname_record("alias.example.", "clean.example.", 60)],
+        ResponseCode::NXDomain,
+    ));
+    let handler = operator_rules_handler(
+        Arc::clone(&upstream),
+        DnsCache::new(&crate::config::settings::CacheConfig::default()),
+        "",
+    );
+
+    let first = query_handler(&handler, "alias.example", RecordType::A).await;
+    let second = query_handler(&handler, "alias.example", RecordType::A).await;
+
+    assert_eq!(
+        upstream.calls(),
+        1,
+        "the clean negative response must cache"
+    );
+    assert_eq!(first.rcode(), Some(ResponseCode::NXDomain));
+    assert_eq!(second.rcode(), Some(ResponseCode::NXDomain));
 }
 
 /// A closed gate refuses every query with SERVFAIL, before the
@@ -2584,6 +3038,10 @@ fn arm_gate_refusal_capture() {
         tracing::subscriber::set_global_default(GateRefusalCapture)
             .expect("no other lib test may install a global tracing subscriber");
     });
+    // Other tests use scoped subscribers, so either the WARN or DEBUG
+    // callsite may already have cached its interest before this capture
+    // was installed. Refresh both before arming the per-thread buffer.
+    tracing::callsite::rebuild_interest_cache();
     GATE_REFUSAL_LEVELS.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
 }
 

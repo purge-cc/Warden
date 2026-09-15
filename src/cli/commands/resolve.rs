@@ -1,6 +1,6 @@
 //! `warden resolve <ip>` — offline 5-level resolver attribution.
 //!
-//! Loads the v1 config from disk, builds a fresh [`ProfileResolver`],
+//! Loads the current config from disk, builds a fresh [`ProfileResolver`],
 //! evaluates the source IP, and prints the match level + device +
 //! profile in a human-friendly format.
 //!
@@ -38,7 +38,7 @@ use crate::profiles::ProfileResolver;
 /// time.
 pub fn run_resolve(config_path: &Path, ip: IpAddr) -> anyhow::Result<i32> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = match loader::load_config(config_path, now) {
+    let loaded = match loader::load_current_config(config_path, now) {
         Ok(l) => l,
         Err(errs) => {
             eprintln!(
@@ -215,7 +215,7 @@ mod tests {
         ip: IpAddr,
     ) -> (crate::config::schema::ConfigV1, crate::profiles::Resolution) {
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(path, now).expect("test config should load");
+        let loaded = loader::load_current_config(path, now).expect("test config should load");
         let resolver =
             ProfileResolver::build_without_list_bits(&loaded.config, &loaded.custom_lists);
         let resolution = resolver.resolve(&ip);
@@ -244,7 +244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let code = run_resolve(&p, "10.0.0.1".parse().unwrap()).unwrap();
         assert_eq!(code, NEGATIVE);
@@ -256,7 +256,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let code = run_resolve(&p, "10.0.0.1".parse().unwrap()).unwrap();
@@ -272,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let refused = write_cfg(
             &dir,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let refused_code = run_resolve(&refused, "10.0.0.1".parse().unwrap()).unwrap();
 
@@ -300,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -341,7 +341,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -375,7 +375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"laptop\"\ndisplay_name = \"Laptop\"\n\
@@ -413,7 +413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\
              lists = { tracking-block = \"ignore\" }\n\n\
@@ -443,7 +443,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_cfg(
             &dir,
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\nenforce_device_mac = false\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [[devices]]\nid = \"guest\"\ndisplay_name = \"Guest\"\n\

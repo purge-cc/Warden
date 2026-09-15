@@ -215,7 +215,7 @@ fn remove_id_keyed_missing_returns_false() {
 }
 
 #[test]
-fn upsert_profile_creates_named_map_entry() {
+fn create_profile_creates_named_map_entry() {
     let mut doc: Value = "".parse().unwrap();
     let entry: Value = toml::from_str(
         r#"
@@ -223,8 +223,7 @@ display_name = "Default"
 "#,
     )
     .unwrap();
-    let created = upsert_profile(&mut doc, "default", entry).unwrap();
-    assert!(created);
+    create_profile(&mut doc, "default", entry).unwrap();
     let out = toml::to_string(&doc).unwrap();
     assert!(out.contains("[profiles.default]"));
 }
@@ -244,14 +243,14 @@ fn read_or_empty_reads_existing_file() {
     let p = dir.path().join("x.toml");
     std::fs::write(
         &p,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let (val, orig) = read_or_empty(&p).unwrap();
-    assert_eq!(val.get("schema_version").unwrap().as_integer(), Some(4));
+    assert_eq!(val.get("schema_version").unwrap().as_integer(), Some(5));
     assert_eq!(
         orig.as_deref(),
-        Some("schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
+        Some("schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n")
     );
 }
 
@@ -411,7 +410,7 @@ fn find_target_for_id_named_map_searches_class_dir() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("profiles.d")).unwrap();
@@ -448,7 +447,7 @@ fn find_target_for_id_reaches_a_non_conventional_declared_include() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\nincludes = [\"custom/*.toml\"]\n\n\
+        "schema_version = 5\nincludes = [\"custom/*.toml\"]\n\n\
          [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
@@ -485,7 +484,7 @@ fn locked_owner_lookup_reaches_a_non_conventional_declared_include() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\nincludes = [\"custom/*.toml\"]\n\n\
+        "schema_version = 5\nincludes = [\"custom/*.toml\"]\n\n\
          [server]\ndefault_profile = \"kids\"\n\n\
          [upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -525,7 +524,7 @@ fn owner_candidate_files_keeps_an_undeclared_class_dir() {
     // No `includes` line at all — the loader reads only the master.
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("devices.d")).unwrap();
@@ -553,7 +552,7 @@ fn owner_candidate_files_dedups_a_doubly_reachable_file() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\nincludes = [\"devices.d/*.toml\"]\n\n\
+        "schema_version = 5\nincludes = [\"devices.d/*.toml\"]\n\n\
          [server]\ndefault_profile = \"default\"\n\n\
          [profiles.default]\ndisplay_name = \"D\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -606,7 +605,7 @@ fn resolve_existing_target_file_locates_owner_in_class_dir() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("devices.d")).unwrap();
@@ -636,7 +635,7 @@ fn resolve_existing_target_file_explicit_into_wins() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let into = dir.path().join("devices.d").join("explicit.toml");
@@ -654,7 +653,7 @@ fn resolve_existing_target_file_falls_back_to_master_when_absent() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let got = resolve_existing_target_file(&master, EntityClass::Devices, "ghost", None).unwrap();
@@ -672,7 +671,7 @@ fn effective_profile_counts_subnet_assigned_device() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -721,7 +720,7 @@ fn resolve_explicit_into_under_rejects_escapes_accepts_in_tree() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
@@ -760,7 +759,7 @@ fn valid_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let master = root.join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     (dir, master, dev)
@@ -793,6 +792,38 @@ fn locked_write_refuses_crossref_invalid() {
         before,
         "slice must be byte-identical after a refused write"
     );
+}
+
+#[test]
+fn locked_write_refuses_uncompilable_pack_before_change() {
+    let dir = tmpdir();
+    let master = dir.path().join("config.toml");
+    let before = r#"schema_version = 5
+
+[server]
+default_profile = "default"
+
+[[custom_lists]]
+id = "policy"
+
+[profiles.default]
+display_name = "Before"
+custom_lists = ["policy"]
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#;
+    std::fs::write(&master, before).unwrap();
+    std::fs::create_dir(dir.path().join("packs")).unwrap();
+    std::fs::write(dir.path().join("packs/policy.txt"), "bad..example\n").unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let (mut doc, _) = read_or_empty_locked(&guard, &master, &master).unwrap();
+    doc["profiles"]["default"]["display_name"] = Value::String("After".to_owned());
+
+    let error = write_value_validated_locked(&guard, &master, &master, &doc).unwrap_err();
+
+    assert!(error.to_string().contains("row 1"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
 }
 
 /// `s-tui-lists-edit-save-rejected`, message half. A rejected write has
@@ -1198,7 +1229,7 @@ fn locked_write_seats_reject_reserved_master_and_member_names() {
             &master,
             &[StagedWrite {
                 final_path: path.join("member.toml"),
-                content: "schema_version = 4".into()
+                content: "schema_version = 5".into()
             }]
         )
         .is_err());
@@ -1239,7 +1270,7 @@ fn historical_batch_uses_its_supplied_schema_contract() {
     let before = std::fs::read(&master).unwrap();
     let writes = [StagedWrite {
         final_path: master.clone(),
-        content: String::from("schema_version = 4\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"),
+        content: String::from("schema_version = 5\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"),
     }];
     let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
 
@@ -1316,7 +1347,7 @@ fn historical_batch_rolls_back_malformed_before_image_raw() {
 
     let (_d, master, _dev) = valid_tree();
     let final_master = std::fs::read_to_string(&master).unwrap().replacen(
-        "schema_version = 4",
+        "schema_version = 5",
         "schema_version = 3",
         1,
     );
@@ -1988,7 +2019,7 @@ fn guarded_promotion_refuses_a_master_leaf_redirected_into_another_locked_tree()
     for present in [false, true] {
         let dir = tmpdir();
         let master = dir.path().join("config.toml");
-        let content = "schema_version = 4\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+        let content = "schema_version = 5\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
         if present {
             std::fs::write(&master, content).unwrap();
         }
@@ -2033,7 +2064,7 @@ mod cs8_secondary_policy_guard {
 
     fn secondary_master(enabled: bool) -> String {
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 includes = ["cluster.d/*.toml", "devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -2059,7 +2090,7 @@ display_name = "Default"
 servers = ["192.0.2.1:53"]
 "#;
 
-    const PRIMARY_MASTER: &str = r#"schema_version = 4
+    const PRIMARY_MASTER: &str = r#"schema_version = 5
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -2081,7 +2112,7 @@ role = "primary"
 token_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#;
 
-    const DISABLED_SECONDARY_MASTER: &str = r#"schema_version = 4
+    const DISABLED_SECONDARY_MASTER: &str = r#"schema_version = 5
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -2206,6 +2237,57 @@ ip = "192.0.2.50"
         );
         write_value_validated_locked(&guard, &node.master, &node.master, &toml_value(&renamed))
             .expect("secondary owns cluster identity");
+    }
+
+    #[test]
+    fn secondary_refuses_server_policy_include_changes_and_role_clear_bypass() {
+        for candidate in [
+            secondary_master(true).replace(
+                "default_profile = \"default\"",
+                "default_profile = \"other\"",
+            ),
+            secondary_master(true).replace("devices.d/*.toml", "unreviewed.d/*.toml"),
+            format!("{}\n{DEVICE_SLICE}", secondary_master(false)),
+        ] {
+            let node = Node::secondary();
+            let original = std::fs::read(&node.master).unwrap();
+            let error = node.write_one("config.toml", &candidate).unwrap_err();
+            assert_is_cs8_refusal(&error);
+            assert_eq!(std::fs::read(&node.master).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn legacy_membership_seam_refuses_modern_identity_and_unreviewed_policy() {
+        for (candidate, expected) in [
+            (
+                secondary_master(true).replace(
+                    "role = \"secondary\"",
+                    "role = \"secondary\"\nmembership_version = 1",
+                ),
+                "modern membership requires",
+            ),
+            (
+                secondary_master(true).replace("devices.d/*.toml", "unreviewed.d/*.toml"),
+                "cannot alter unrelated includes",
+            ),
+            (
+                format!("{}\n{DEVICE_SLICE}", secondary_master(true)),
+                "cannot replace policy",
+            ),
+        ] {
+            let node = Node::secondary();
+            let original = std::fs::read(&node.master).unwrap();
+            let guard = crate::config::write_lock::acquire_for_write(&node.master).unwrap();
+            let error = write_legacy_membership_validated_locked(
+                &guard,
+                &node.master,
+                &toml_value(&candidate),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(std::fs::read(&node.master).unwrap(), original);
+        }
     }
 
     #[test]

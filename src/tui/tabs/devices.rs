@@ -24,25 +24,35 @@
 //! unmapped row dispatches to the Promote flow contextually. The
 //! previous `p` binding collided with the global `[p] pause`.
 
+use std::cmp::Ordering;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use crossterm::event::KeyCode;
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::config::cidr::Cidr;
 use crate::ipc::protocol::{DeviceViewDto, MappedDeviceDto, UnmappedDeviceDto};
 use crate::tui::app::{
     App, DeviceFormField, DeviceFormFocus, DeviceFormMode, DeviceFormState, DeviceGroupBy,
-    DeviceModal, FieldPicker,
+    DeviceModal, FieldPicker, Leaf,
 };
+use crate::tui::detail_panel;
 use crate::tui::format::count as format_count;
 use crate::tui::modal_form::{self, Action, ActionKind, ProseRow, ValueKind};
-use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
+use crate::tui::mouse::{self, MouseAction, SortOrder};
+use crate::tui::theme::{self, CardRole, T};
+
+/// Shared width for the Network master/detail pages' detail column.
+pub const DETAIL_COLUMN_WIDTH: u16 = 42;
+
+const DEVICE_COLUMN_SPACING: u16 = 3;
+const NARROW_DETAIL_THRESHOLD: u16 = 120;
+const DEVICE_HEADERS: [&str; 6] = ["IDENTITY", "IP", "PROFILE", "Q.TODAY", "BLK% ALL", "LAST"];
 
 /// One row in the unified Devices list. `GroupHeader` is rendered
 /// styled but is never the selection target — `next_selectable_index`
@@ -69,24 +79,33 @@ impl DeviceRow {
     }
 }
 
+pub(crate) fn panels(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < NARROW_DETAIL_THRESHOLD {
+        return (area, None);
+    }
+    let width = DETAIL_COLUMN_WIDTH.min(area.width.saturating_sub(79));
+    let columns = theme::split_card_columns(area, width);
+    (columns[0], Some(columns[1]))
+}
+
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let view = match &app.device_view {
-        Some(v) => v,
-        None => {
-            render_empty(f, area);
-            // Modal still renders on top of the empty state so a form
-            // opened before the first IPC poll lands isn't invisible.
-            render_modal_overlay(f, area, app);
-            return;
-        }
-    };
+    let (list, detail) = panels(area);
+    let table = crate::tui::filter_chips::render_card(f, list, app);
+    if app.device_view.is_none() {
+        render_empty(f, table);
+        // Modal still renders on top of the empty state so a form opened
+        // before the first IPC poll lands isn't invisible.
+        render_modal_overlay(f, area, app);
+        return;
+    }
+    let (mapped_count, unmapped_count) = app
+        .device_view
+        .as_ref()
+        .map(|view| (view.mapped.len(), view.unmapped.len()))
+        .unwrap_or_default();
 
     let now_secs = unix_now();
-    let (rows, filter_status) = build_filtered_rows(
-        view,
-        app.devices.group_by,
-        app.devices.filter_subnet.as_deref(),
-    );
+    let (rows, filter_status) = build_display_rows_with_status(app);
     // dev-03: resolve the operator's stable selection key to an index
     // every frame so a background poll reshuffle keeps the highlight on
     // the same device. Fall back to the positional cursor before the key
@@ -94,37 +113,51 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let selected =
         crate::tui::app::resolve_row_index(&rows, app.devices.selected_id.as_ref(), row_key)
             .or_else(|| current_selection(&app.devices.table_state, &rows));
+    let detail_key = selected
+        .and_then(|index| rows.get(index))
+        .and_then(row_key)
+        .unwrap_or_default();
+    detail_panel::prepare(app, Leaf::Devices, &detail_key);
 
-    // Two completely independent panels: the list on the left, the
-    // detail card on the right, separated by a 1-cell gutter so neither
-    // panel's frame touches the other. Width-wise the card is fixed at
-    // 38 cells (enough for the longest KV row) and the list takes the
-    // rest. On terminals narrower than ~95 cells the card collapses but
-    // the list still renders — the redesign target is ≥100 cols.
-    let cols = Layout::horizontal([
-        Constraint::Min(60),
-        Constraint::Length(1),
-        Constraint::Length(38),
-    ])
-    .split(area);
+    let Some(detail) = detail else {
+        if detail_panel::focused(app, Leaf::Devices) {
+            render_card_panel(f, table, app, &rows, selected, now_secs);
+        } else {
+            render_list_panel(
+                f,
+                table,
+                app,
+                DeviceListPanel {
+                    group_by: app.devices.group_by,
+                    mapped_count,
+                    unmapped_count,
+                    filter_status,
+                    rows: &rows,
+                    now_secs,
+                    selected,
+                },
+            );
+        }
+        render_modal_overlay(f, area, app);
+        return;
+    };
 
-    // The shared filter-card frame sits above the list, inside the list
-    // column only — the detail card on the right stays uncovered, same
-    // reasoning `render_modal_overlay` below already documents for the
-    // form modal.
-    let list_rows = Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).split(cols[0]);
     let group_by = app.devices.group_by;
-    render_subnet_filter_card(f, list_rows[0], app, filter_status);
     render_list_panel(
         f,
-        list_rows[1],
-        group_by,
-        view,
-        &rows,
-        now_secs,
-        (selected, &mut app.devices.table_state),
+        table,
+        app,
+        DeviceListPanel {
+            group_by,
+            mapped_count,
+            unmapped_count,
+            filter_status,
+            rows: &rows,
+            now_secs,
+            selected,
+        },
     );
-    render_card_panel(f, cols[2], &rows, selected, now_secs);
+    render_card_panel(f, detail, app, &rows, selected, now_secs);
 
     // Anchor the modal over the LIST column only. The detail card on
     // the right stays uncovered, so the operator filling out the form
@@ -132,13 +165,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     // they are mapping (they're looking at row N's fields in the
     // form AND row N's read-only context in the card simultaneously).
     // Card refreshes on every poll tick even while the modal is open.
-    render_modal_overlay(f, cols[0], app);
+    render_modal_overlay(f, list, app);
 }
 
 // ── Empty state ─────────────────────────────────────────────────────
 
 fn render_empty(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Devices", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "DEVICES",
+        "Waiting for Daemon",
+        CardRole::Analytics,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             " waiting for daemon\u{2026}",
@@ -148,121 +187,55 @@ fn render_empty(f: &mut Frame, area: Rect) {
     );
 }
 
-// ── Subnet filter card ──────────────────────────────────────────────
-
-/// Shared filter-card frame (`theme::render_filter_card`), same
-/// chrome as Query Log / Lists / Rules / Tags: rounded
-/// `T.text_primary` frame, height 3, no interior title — the field is
-/// the label. Devices has one field, not a search + chip pair, because
-/// there is exactly one dimension to narrow on: the operator filters
-/// one subnet at a time.
-///
-/// `SubnetFilterStatus::Invalid` renders the CIDR in `T.error` with an
-/// inline note instead of blanking the card — the on-screen row set is
-/// the full, unfiltered list in that state (see `build_filtered_rows`),
-/// and the card must say so or the operator reads "no rows changed" as
-/// "my filter matched everything" rather than "my filter didn't parse".
-fn render_subnet_filter_card(f: &mut Frame, area: Rect, app: &App, status: SubnetFilterStatus) {
-    let content_area = theme::render_filter_card(f, area);
-
-    // While `/` is focused the card shows the LIVE buffer with a cursor,
-    // not the committed value — same shape as the Lists card. Without
-    // this the operator types into a field that shows nothing back.
-    let live = match &app.input_mode {
-        crate::tui::app::InputMode::FilterDevicesSubnet(buf) => Some(buf.clone()),
-        _ => None,
-    };
-    let value: &str = match live.as_deref() {
-        Some(b) => b,
-        None => app.devices.filter_subnet.as_deref().unwrap_or(""),
-    };
-    let (value_style, note) = match status {
-        SubnetFilterStatus::Inactive => (Style::default().fg(T.text_secondary), ""),
-        SubnetFilterStatus::Active => (Style::default().fg(T.text_primary), ""),
-        SubnetFilterStatus::Invalid => (
-            Style::default().fg(T.error),
-            "  invalid CIDR \u{2014} showing all devices",
-        ),
-    };
-    let shown = if live.is_some() {
-        format!("{value}_")
-    } else if value.is_empty() {
-        "___________".to_string()
-    } else {
-        value.to_string()
-    };
-
-    // Budget the value against the fixed spans so the invalid-CIDR note
-    // and the clear hint cannot be pushed off the edge — the note is the
-    // whole reason the Invalid state renders at all. Tail-truncated, so a
-    // live edit's trailing `_` cursor stays visible.
-    let lead = Span::styled("Subnet [/]: ", Style::default().fg(T.text_muted));
-    let trailing = vec![
-        Span::styled(note, Style::default().fg(T.error)),
-        Span::styled("   [R] clear", Style::default().fg(T.text_muted)),
-    ];
-    let fixed: usize = lead.width() + trailing.iter().map(Span::width).sum::<usize>();
-    let budget = (content_area.width as usize).saturating_sub(fixed).max(11);
-    let shown = crate::tui::tabs::query_log::truncate_tail(&shown, budget);
-
-    let mut spans = Vec::with_capacity(trailing.len() + 2);
-    spans.push(lead);
-    spans.push(Span::styled(shown, value_style));
-    spans.extend(trailing);
-    f.render_widget(Paragraph::new(Line::from(spans)), content_area);
-}
-
 // ── Unified list panel ──────────────────────────────────────────────
 
-fn render_list_panel(
-    f: &mut Frame,
-    area: Rect,
+struct DeviceListPanel<'a> {
     group_by: DeviceGroupBy,
-    view: &DeviceViewDto,
-    rows: &[DeviceRow],
+    mapped_count: usize,
+    unmapped_count: usize,
+    filter_status: SubnetFilterStatus,
+    rows: &'a [DeviceRow],
     now_secs: u64,
-    cursor: (Option<usize>, &mut TableState),
-) {
-    let (selected, table_state) = cursor;
-    let title = format!(
-        "Devices ({} mapped \u{00b7} {} unmapped) \u{00b7} group: {}",
-        view.mapped.len(),
-        view.unmapped.len(),
+    selected: Option<usize>,
+}
+
+fn render_list_panel(f: &mut Frame, area: Rect, app: &mut App, panel: DeviceListPanel<'_>) {
+    let DeviceListPanel {
+        group_by,
+        mapped_count,
+        unmapped_count,
+        filter_status,
+        rows,
+        now_secs,
+        selected,
+    } = panel;
+    let mut subtitle = format!(
+        "{} Mapped \u{00b7} {} Unmapped \u{00b7} Group: {}",
+        mapped_count,
+        unmapped_count,
         group_by.label(),
     );
-    let content_area = render_section_chrome(f, area, &title, T.brand_red);
-
-    let header = Row::new(vec![
-        Cell::from("IDENTITY"),
-        Cell::from("IP"),
-        Cell::from("PROFILE"),
-        Cell::from("Q.TODAY"),
-        // Lifetime blocked ÷ lifetime queries, NOT today's — the column
-        // beside it (Q.TODAY) is today-scoped, and an unqualified "BLOCK%"
-        // reads as if it belonged to that neighbour.
-        Cell::from("BLK% ALL"),
-        Cell::from("LAST"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
+    if filter_status == SubnetFilterStatus::Invalid {
+        subtitle.push_str(" \u{00b7} Invalid CIDR \u{00b7} Showing All Devices");
+    }
+    let content_area = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "DEVICES",
+        &subtitle,
+        CardRole::Analytics,
     );
+    let table_area = content_area;
 
-    const COLUMN_SPACING: u16 = 3;
-    const IP_W: u16 = 15; // fits IPv4 xxx.xxx.xxx.xxx
-    const PROFILE_W: u16 = 10;
-    const Q_TODAY_W: u16 = 8;
-    const BLOCK_W: u16 = 8; // fits "BLK% ALL"
-    const LAST_W: u16 = 9;
-    let constraints = [
-        Constraint::Min(15), // identity (flex)
-        Constraint::Length(IP_W),
-        Constraint::Length(PROFILE_W),
-        Constraint::Length(Q_TODAY_W),
-        Constraint::Length(BLOCK_W),
-        Constraint::Length(LAST_W),
-    ];
+    let constraints = device_column_constraints();
+    let columns = solved_table_columns(table_area, &constraints);
+    let sort = app.mouse.sort(Leaf::Devices);
+    let header = Row::new(DEVICE_HEADERS.iter().enumerate().map(|(column, label)| {
+        Cell::from(sort_header(label, column, sort)).style(theme::table_heading_style(
+            sort.is_some_and(|order| order.column == column),
+        ))
+    }))
+    .style(theme::table_heading_style(false));
 
     let table_rows: Vec<Row> = rows
         .iter()
@@ -275,12 +248,40 @@ fn render_list_panel(
 
     let table = Table::new(table_rows, constraints)
         .header(header)
-        .column_spacing(COLUMN_SPACING)
+        .column_spacing(DEVICE_COLUMN_SPACING)
         .row_highlight_style(theme::highlight_style());
 
     // `selected` already snapped a possibly-stale cursor (left over from
     // a previous group_by snapshot) to a valid selectable row.
-    super::render_table(f, content_area, table, table_state, selected);
+    super::render_table(f, table_area, table, &mut app.devices.table_state, selected);
+
+    // Register against Ratatui's solved geometry rather than nominal widths:
+    // fixed columns are squeezed at the 80-column floor.
+    for (column, area) in columns.iter().enumerate() {
+        mouse::register(app, *area, MouseAction::Sort(Leaf::Devices, column));
+    }
+    let visible_rows = table_area.height.saturating_sub(1) as usize;
+    let offset = app.devices.table_state.offset();
+    for (visible, (index, row)) in rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+        .enumerate()
+    {
+        if row.is_selectable() {
+            mouse::register(
+                app,
+                Rect::new(
+                    table_area.x,
+                    table_area.y.saturating_add(1 + visible as u16),
+                    table_area.width,
+                    1,
+                ),
+                MouseAction::Row(Leaf::Devices, index),
+            );
+        }
+    }
 
     // qlog-05: paint the inter-column separators by re-running ratatui's
     // own column layout (`draw_table_column_separators`) on the same
@@ -290,7 +291,41 @@ fn render_list_panel(
     // trailing Length columns when the list panel is narrow (terminal
     // widths ~108..121), so the separators drifted through the
     // PROFILE/Q.TODAY/BLOCK%/LAST text.
-    crate::tui::ui::draw_table_column_separators(f, content_area, &constraints, COLUMN_SPACING);
+    crate::tui::ui::draw_table_column_separators(
+        f,
+        table_area,
+        &constraints,
+        DEVICE_COLUMN_SPACING,
+    );
+}
+
+fn device_column_constraints() -> [Constraint; DEVICE_HEADERS.len()] {
+    [
+        Constraint::Min(15),
+        Constraint::Length(15),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(9),
+    ]
+}
+
+fn solved_table_columns(area: Rect, constraints: &[Constraint]) -> Vec<Rect> {
+    Layout::horizontal(constraints.iter().copied())
+        .flex(Flex::Start)
+        .spacing(DEVICE_COLUMN_SPACING)
+        .split(Rect::new(0, 0, area.width, 1))
+        .iter()
+        .map(|column| Rect::new(area.x.saturating_add(column.x), area.y, column.width, 1))
+        .collect()
+}
+
+fn sort_header(label: &str, column: usize, sort: Option<SortOrder>) -> String {
+    match sort.filter(|sort| sort.column == column) {
+        Some(sort) if sort.descending => format!("{label} ▼"),
+        Some(_) => format!("{label} ▲"),
+        None => label.to_string(),
+    }
 }
 
 fn render_mapped_row<'a>(c: &'a MappedDeviceDto, now_secs: u64) -> Row<'a> {
@@ -446,19 +481,26 @@ fn render_group_header_row<'a>(label: &str, width: u16) -> Row<'a> {
 fn render_card_panel(
     f: &mut Frame,
     area: Rect,
+    app: &App,
     rows: &[DeviceRow],
     selected: Option<usize>,
     now_secs: u64,
 ) {
-    let title = match selected.and_then(|i| rows.get(i)) {
+    let subtitle = match selected.and_then(|i| rows.get(i)) {
         Some(DeviceRow::Mapped(c)) => {
             let head = if c.name.is_empty() { &c.ip } else { &c.name };
-            format!("Device \u{00b7} {head}")
+            format!("{head} \u{00b7} Live Identity & Activity")
         }
-        Some(DeviceRow::Unmapped(c)) => format!("Device \u{00b7} {}", c.ip),
-        _ => "Device".to_string(),
+        Some(DeviceRow::Unmapped(c)) => format!("{} \u{00b7} Observed Device", c.ip),
+        _ => "Select a device for live detail".to_string(),
     };
-    let content = render_section_chrome(f, area, &title, T.brand_red);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "DEVICE DETAILS",
+        &subtitle,
+        CardRole::History,
+    );
 
     let lines: Vec<Line<'static>> = match selected.and_then(|i| rows.get(i)) {
         Some(DeviceRow::Mapped(c)) => mapped_card_lines(c, now_secs),
@@ -469,7 +511,11 @@ fn render_card_panel(
         ))],
     };
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+    let key = selected
+        .and_then(|index| rows.get(index))
+        .and_then(row_key)
+        .unwrap_or_default();
+    detail_panel::render(f, content, app, Leaf::Devices, &key, lines);
 }
 
 fn mapped_card_lines(c: &MappedDeviceDto, now_secs: u64) -> Vec<Line<'static>> {
@@ -497,6 +543,26 @@ fn mapped_card_lines(c: &MappedDeviceDto, now_secs: u64) -> Vec<Line<'static>> {
     // exist. The `[⚠ UNFILTERED]` badge, which is what their `unfiltered`
     // branch was really about, renders independently below.
     out.push(notes_line(c.notes.as_deref()));
+    if c.network_name.is_some() || c.network_name_wildcard {
+        out.push(kv_opt(
+            "DNS name",
+            c.network_name.as_deref(),
+            T.text_primary,
+        ));
+        out.push(kv_str(
+            "Wildcard",
+            if c.network_name_wildcard {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if c.network_name_wildcard {
+                T.warning
+            } else {
+                T.text_muted
+            },
+        ));
+    }
 
     out.push(divider_line());
 
@@ -621,7 +687,6 @@ fn unmapped_card_lines(c: &UnmappedDeviceDto, now_secs: u64) -> Vec<Line<'static
 
 fn kv(label: &'static str, value: Span<'static>) -> Line<'static> {
     Line::from(vec![
-        Span::raw(" "),
         Span::styled(format!("{label:<11}"), Style::default().fg(T.text_muted)),
         value,
     ])
@@ -657,8 +722,8 @@ fn mac_line(mac: Option<&str>, aliases: &[String]) -> Line<'static> {
 }
 
 /// Group line on the side card — every membership, in file order,
-/// comma-joined. The card paragraph wraps (`Wrap { trim: false }`), so a
-/// long list costs a second row rather than being cut.
+/// comma-joined. The shared detail viewport wraps it into styled rows, so a
+/// long list costs scrollable detail rows rather than being cut.
 ///
 /// It used to show the first name and a muted `+N more (CLI)`, which was
 /// two claims: that the rest existed, and that only the CLI could touch
@@ -837,11 +902,9 @@ fn subnet_filtered_view(view: &DeviceViewDto, cidr: &str) -> Option<DeviceViewDt
 /// Build the row set for render, applying the operator's subnet filter
 /// on top of the existing group-by (`build_rows`).
 ///
-/// The row set every consumer must use: it is what `render` paints, so
-/// it is what a cursor index means. `build_rows` is the unfiltered
-/// builder underneath and is not a substitute for a live cursor — indexing
-/// it with a cursor taken against this one silently addresses a device
-/// that is not on screen.
+/// The filtered base sequence beneath [`build_display_rows`]. It deliberately
+/// does not apply mouse sorting; consumers that address a displayed index must
+/// call `build_display_rows` so the cursor and the painted table agree.
 pub fn build_filtered_rows(
     view: &DeviceViewDto,
     group_by: DeviceGroupBy,
@@ -854,6 +917,143 @@ pub fn build_filtered_rows(
             None => (build_rows(view, group_by), SubnetFilterStatus::Invalid),
         },
     }
+}
+
+/// The sole display order for Devices. Renderers and input handlers must use
+/// this rather than rebuilding from `device_view`: indexes carried by mouse
+/// events are indexes into this filtered, grouped, sorted sequence.
+pub fn build_display_rows(app: &App) -> Vec<DeviceRow> {
+    build_display_rows_with_status(app).0
+}
+
+fn build_display_rows_with_status(app: &App) -> (Vec<DeviceRow>, SubnetFilterStatus) {
+    let Some(view) = app.device_view.as_ref() else {
+        return (Vec::new(), SubnetFilterStatus::Inactive);
+    };
+    let (mut rows, status) = build_filtered_rows(
+        view,
+        app.devices.group_by,
+        app.devices.filter_subnet.as_deref(),
+    );
+    sort_display_rows(&mut rows, app.mouse.sort(Leaf::Devices));
+    (rows, status)
+}
+
+/// Sort each contiguous device run independently. Group headers stay in their
+/// existing order, so an owner/department/profile grouping remains legible
+/// while the devices inside it follow the requested column order.
+fn sort_display_rows(rows: &mut [DeviceRow], sort: Option<SortOrder>) {
+    let Some(sort) = sort else {
+        return;
+    };
+    let mut start = 0;
+    for end in 0..=rows.len() {
+        if end == rows.len() || !rows[end].is_selectable() {
+            rows[start..end].sort_by(|left, right| compare_device_rows(left, right, sort));
+            start = end.saturating_add(1);
+        }
+    }
+}
+
+fn compare_device_rows(left: &DeviceRow, right: &DeviceRow, sort: SortOrder) -> Ordering {
+    let order = match sort.column {
+        0 => device_identity(left).cmp(&device_identity(right)),
+        1 => optional_order(device_ip(left), device_ip(right), sort.descending),
+        2 => device_profile(left).cmp(&device_profile(right)),
+        3 => device_queries_today(left).cmp(&device_queries_today(right)),
+        4 => {
+            let (left_blocked, left_queries) = device_block_rate(left);
+            let (right_blocked, right_queries) = device_block_rate(right);
+            (left_blocked * right_queries).cmp(&(right_blocked * left_queries))
+        }
+        5 => optional_order(
+            device_last_seen(left),
+            device_last_seen(right),
+            sort.descending,
+        ),
+        _ => Ordering::Equal,
+    };
+    let order = if matches!(sort.column, 1 | 5) {
+        // `optional_order` applies direction only to present values, keeping
+        // invalid IPs and never-seen devices last in both directions.
+        order
+    } else if sort.descending {
+        order.reverse()
+    } else {
+        order
+    };
+    order.then_with(|| row_key(left).cmp(&row_key(right)))
+}
+
+fn optional_order<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let order = left.cmp(&right);
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn device_identity(row: &DeviceRow) -> String {
+    match row {
+        DeviceRow::Mapped(device) if device.name.is_empty() => device.ip.to_lowercase(),
+        DeviceRow::Mapped(device) => device.name.to_lowercase(),
+        DeviceRow::Unmapped(device) => device.ip.to_lowercase(),
+        DeviceRow::GroupHeader(_) => String::new(),
+    }
+}
+
+fn device_ip(row: &DeviceRow) -> Option<IpAddr> {
+    match row {
+        DeviceRow::Mapped(device) => device.ip.parse().ok(),
+        DeviceRow::Unmapped(device) => device.ip.parse().ok(),
+        DeviceRow::GroupHeader(_) => None,
+    }
+}
+
+fn device_profile(row: &DeviceRow) -> String {
+    match row {
+        DeviceRow::Mapped(device) => device.profile.to_lowercase(),
+        DeviceRow::Unmapped(_) | DeviceRow::GroupHeader(_) => String::new(),
+    }
+}
+
+fn device_queries_today(row: &DeviceRow) -> u64 {
+    match row {
+        DeviceRow::Mapped(device) => device.queries_today,
+        DeviceRow::Unmapped(device) => device.queries_today,
+        DeviceRow::GroupHeader(_) => 0,
+    }
+}
+
+fn device_block_rate(row: &DeviceRow) -> (u128, u128) {
+    let (blocked, queries) = match row {
+        DeviceRow::Mapped(device) => (device.blocked, device.queries),
+        DeviceRow::Unmapped(device) => (device.blocked, device.queries),
+        DeviceRow::GroupHeader(_) => (0, 0),
+    };
+    if queries == 0 {
+        // The rendered percentage is 0.0% when no denominator exists.
+        (0, 1)
+    } else {
+        (u128::from(blocked), u128::from(queries))
+    }
+}
+
+fn device_last_seen(row: &DeviceRow) -> Option<u64> {
+    let last_seen = match row {
+        DeviceRow::Mapped(device) => device.last_seen,
+        DeviceRow::Unmapped(device) => device.last_seen,
+        DeviceRow::GroupHeader(_) => 0,
+    };
+    (last_seen != 0).then_some(last_seen)
 }
 
 fn group_key(m: &MappedDeviceDto, group_by: DeviceGroupBy) -> String {
@@ -1007,67 +1207,111 @@ fn format_last_seen(secs_ago: u64, last_seen: u64) -> String {
 /// form when they're filling it out, not a confusing mix of tables
 /// bleeding through.
 pub(super) fn render_modal_overlay(f: &mut Frame, area: Rect, app: &App) {
+    if app.devices.inspect_open {
+        render_inspect_overlay(f, area, app);
+        return;
+    }
     let Some(modal) = &app.devices.modal else {
         return;
     };
     match modal {
         DeviceModal::Form(form) => {
-            render_form_modal(f, area, form);
+            let anchor = render_form_modal(f, area, form);
             // Popup radio picker (Profile / Group) drawn on top of the form
             // while the operator is choosing a value.
             if let Some(picker) = form.picker.as_ref() {
-                render_field_picker(f, area, picker);
+                render_field_picker_at(f, area, anchor, picker, form.picker_focus);
             }
         }
         DeviceModal::DeleteConfirm { display_name, .. } => {
-            render_delete_confirm(f, area, display_name)
+            render_delete_confirm(f, area, display_name, app.devices.delete_focus)
         }
     }
+}
+
+fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let rows = build_display_rows(app);
+    let selected =
+        crate::tui::app::resolve_row_index(&rows, app.devices.selected_id.as_ref(), row_key)
+            .or_else(|| current_selection(&app.devices.table_state, &rows));
+    let now_secs = unix_now();
+    let (subtitle, key, lines) = match selected.and_then(|index| rows.get(index)) {
+        Some(DeviceRow::Mapped(device)) => (
+            format!("{} · Mapped Device", device.name),
+            selected
+                .and_then(|index| rows.get(index))
+                .and_then(row_key)
+                .unwrap_or_default(),
+            mapped_card_lines(device, now_secs),
+        ),
+        Some(DeviceRow::Unmapped(device)) => (
+            format!("{} · Observed Device", device.ip),
+            selected
+                .and_then(|index| rows.get(index))
+                .and_then(row_key)
+                .unwrap_or_default(),
+            unmapped_card_lines(device, now_secs),
+        ),
+        _ => (
+            "No device selected".to_string(),
+            String::new(),
+            vec![Line::from(Span::styled(
+                " select a device",
+                Style::default().fg(T.text_muted),
+            ))],
+        ),
+    };
+    let height = area.height.saturating_sub(2).min(28);
+    let inner = modal_form::render_chrome_in(f, area, 68, height, "", T.text_primary, true);
+    let content = modal_form::render_header(f, inner, "DEVICE DETAILS", &subtitle);
+    let content = modal_form::close_footer(f, content);
+    detail_panel::render(
+        f,
+        content,
+        app,
+        Leaf::Devices,
+        &format!("inspect:{key}"),
+        lines,
+    );
 }
 
 /// Outer modal width. The interior is two columns narrower, and one
 /// narrower again while the field region scrolls —
 /// [`modal_form::render_modal`] resolves that, so nothing here measures
 /// against it by hand.
-const MODAL_W: u16 = 60;
+const MODAL_W: u16 = 68;
 
-/// Nav-key legend. Byte-identical to the copy this form carried before the
-/// migration (D7′: chrome, layout and colour change, keying does not).
-///
-/// Deliberately **not** the `←/→ change` legend the retired grid
-/// advertised for every surface: this form's select-only fields open a
-/// popup on `Enter` rather than cycling inline, and telling the operator
-/// about a key that does nothing is worse than silence.
-const FORM_KEYS: &str = "\u{2191}\u{2193}/\u{21b9} move \u{b7} Enter open/save \u{b7} Esc cancel";
+/// The footer keeps this row blank because the focused-field hint and compact
+/// actions already describe the available operation.
+const FORM_KEYS: &str = "";
 
 /// Placeholder for the two select-only rows. Carries the affordance the
 /// retired grid drew as a right-aligned muted `[Enter]`: the ecosystem row
 /// vocabulary has no picker variant, and a suffix span appended after
-/// [`modal_form::value_row`] would land past the focus bar's `◀` marker
-/// and overflow the row. The focused hint states it a second time.
+/// [`modal_form::value_row`] would overflow the value highlight. The focused
+/// hint states it a second time.
 const PICK_PLACEHOLDER: &str = "Enter to pick";
 
-/// The two sections' field order AND labels — the single source both the
+/// The three sections' field order and labels — the single source both the
 /// rendered rows and the cursor's row lookup read. Keeping them as one
-/// list is the point: when they were two (an array of `field_row` calls
-/// plus a separate order constant), adding a field to one and not the
-/// other silently put the hardware cursor on the wrong row, and no test
-/// could see it.
-const IDENTITY_FIELDS: [(DeviceFormField, &str); 3] = [
-    (DeviceFormField::Ip, "ip"),
-    (DeviceFormField::Mac, "mac"),
-    (DeviceFormField::MacAliases, "aliases"),
+/// set of arrays keeps field placement, mouse order and cursor lookup aligned.
+const IDENTITY_FIELDS: [(DeviceFormField, &str); 4] = [
+    (DeviceFormField::Ip, "IP"),
+    (DeviceFormField::Mac, "MAC"),
+    (DeviceFormField::Name, "Name"),
+    (DeviceFormField::MacAliases, "Aliases"),
 ];
-const ASSIGNMENT_FIELDS: [(DeviceFormField, &str); 9] = [
-    (DeviceFormField::Name, "name"),
-    (DeviceFormField::Profile, "profile"),
-    (DeviceFormField::Group, "group"),
-    (DeviceFormField::Owner, "owner"),
-    (DeviceFormField::Device, "type"),
-    (DeviceFormField::Department, "department"),
-    (DeviceFormField::Notes, "notes"),
-    (DeviceFormField::NetworkName, "net name"),
-    (DeviceFormField::NetworkNameWildcard, "wildcard"),
+const POLICY_FIELDS: [(DeviceFormField, &str); 5] = [
+    (DeviceFormField::Profile, "Profile"),
+    (DeviceFormField::Group, "Groups"),
+    (DeviceFormField::Owner, "Owner"),
+    (DeviceFormField::Device, "Type"),
+    (DeviceFormField::Department, "Department"),
+];
+const LOCAL_DNS_FIELDS: [(DeviceFormField, &str); 3] = [
+    (DeviceFormField::NetworkName, "Network Name"),
+    (DeviceFormField::NetworkNameWildcard, "Wildcard"),
+    (DeviceFormField::Notes, "Notes"),
 ];
 
 /// Per-mode title and description band strings. The description replaces
@@ -1079,10 +1323,7 @@ fn band_text(mode: DeviceFormMode) -> (&'static str, &'static str) {
             "ADD CLIENT",
             "MAC pins the device through DHCP changes. IP optional.",
         ),
-        DeviceFormMode::Edit => (
-            "EDIT CLIENT",
-            "Change the profile, group and metadata for this device.",
-        ),
+        DeviceFormMode::Edit => ("DEVICE", "Identity, Policy & Labels"),
         DeviceFormMode::Promote => (
             "PROMOTE UNMAPPED CLIENT",
             "Seen on the network \u{2014} give it a name and a profile.",
@@ -1100,6 +1341,7 @@ fn focus_hint(mode: DeviceFormMode, focus: DeviceFormFocus) -> &'static str {
         DeviceFormFocus::Field(DeviceFormField::MacAliases) => {
             "Extra MACs, comma-separated \u{2014} for devices that rotate theirs."
         }
+        DeviceFormFocus::Field(DeviceFormField::Name) => "Give this device a recognizable name.",
         DeviceFormFocus::Field(DeviceFormField::Profile) => "Enter opens the profile list.",
         // The two Group hints differ because the two wires differ, and the
         // operator should learn that from the form rather than from a
@@ -1164,6 +1406,13 @@ fn field_value(form: &DeviceFormState, field: DeviceFormField) -> &str {
 /// blocks the flat body needed — [`modal_form::FormRows`] cannot be handed
 /// a focused row without its hint, so the second `match focus { … }` table
 /// that used to drift out of step with the field list is gone.
+fn field_layout(width: u16) -> modal_form::ValueLayout {
+    modal_form::ValueLayout {
+        label_width: 14.min(width as usize / 2),
+        gap: 0,
+    }
+}
+
 fn push_field(
     rows: &mut modal_form::FormRows,
     form: &DeviceFormState,
@@ -1181,17 +1430,21 @@ fn push_field(
         // rather than `field` keeps it out of the viewport's anchor set.
         //
         // The ARP-pinned rows always carry a value, so they need no
-        // placeholder. Group on a Promote form is locked for a different
-        // reason — the wire has no field for it — and is empty, so it
-        // states when it becomes available instead of rendering blank.
-        let placeholder = (field == DeviceFormField::Group).then_some("after saving, via Edit");
-        rows.line(modal_form::value_row(
+        // Fields unavailable during promotion name the next step. Their
+        // values cannot be saved until the device has been created.
+        let placeholder = matches!(
+            field,
+            DeviceFormField::Group | DeviceFormField::MacAliases | DeviceFormField::Notes
+        )
+        .then_some("after saving, via Edit");
+        rows.line(modal_form::value_row_with_layout(
             label,
             value,
             false,
             ValueKind::Identity,
             placeholder,
             width,
+            field_layout(width),
         ));
         return;
     }
@@ -1201,29 +1454,31 @@ fn push_field(
         // keystrokes, so the row takes focus but NOT the hardware cursor
         // — there is no insertion point to put it on.
         DeviceFormField::Profile | DeviceFormField::Group => rows.field(
-            modal_form::value_row(
+            modal_form::value_row_with_layout(
                 label,
                 value,
                 focused,
                 ValueKind::Identity,
                 Some(PICK_PLACEHOLDER),
                 width,
+                field_layout(width),
             ),
             focused,
             hint,
         ),
         _ => rows.text_field(
-            modal_form::value_row(
+            modal_form::value_row_with_layout(
                 label,
                 value,
                 focused,
                 ValueKind::Editable,
                 Some("\u{2014}"),
                 width,
+                field_layout(width),
             ),
             focused,
             hint,
-            value.chars().count() as u16,
+            crate::tui::text::width(value) as u16,
         ),
     }
 }
@@ -1243,17 +1498,29 @@ fn push_id_row(rows: &mut modal_form::FormRows, form: &DeviceFormState) {
         format!("{value}{note}")
     };
     let width = rows.width();
-    rows.line(modal_form::value_row(
+    rows.line(modal_form::value_row_with_layout(
         "id",
         &shown,
         false,
         ValueKind::Identity,
         None,
         width,
+        field_layout(width),
     ));
 }
 
-/// Build the Archetype-F body: banded head, two labelled sections, one row
+fn form_section(label: &str, width: u16, role: CardRole) -> Line<'static> {
+    let label = modal_form::fit(&label.to_uppercase(), width as usize);
+    Line::styled(
+        crate::tui::text::pad(&label, width as usize),
+        Style::default()
+            .fg(T.text_inverse)
+            .bg(T.card_title_bg(role))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Build the Archetype-F body: banded head, three labelled sections, one row
 /// per field, pinned tail. Returns the [`modal_form::ScrollBody`] plus the
 /// real terminal cursor's target, exactly as `tabs/lists.rs::edit_form_body`
 /// and `profile_modal::form_body` do.
@@ -1266,9 +1533,10 @@ fn push_id_row(rows: &mut modal_form::FormRows, form: &DeviceFormState) {
 /// `HINT_ROWS`, so the two build passes agree.
 fn form_body(form: &DeviceFormState, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
     let (title, desc) = band_text(form.mode);
-    let mut rows = modal_form::FormRows::new(title, desc, width);
+    let mut rows =
+        modal_form::FormRows::new(title, desc, width).with_value_layout(field_layout(width));
 
-    rows.section("Identity \u{b7} Network");
+    rows.line(form_section("Identity & Network", width, CardRole::Summary));
     // `id` is derived, never typed, so it is not in IDENTITY_FIELDS and is
     // pushed as an inert row rather than a focusable one.
     push_id_row(&mut rows, form);
@@ -1277,8 +1545,14 @@ fn form_body(form: &DeviceFormState, width: u16) -> (modal_form::ScrollBody, Opt
     }
 
     rows.spacer();
-    rows.section("Assignments & Metadata");
-    for (field, label) in ASSIGNMENT_FIELDS {
+    rows.line(form_section("Policy & Labels", width, CardRole::Analytics));
+    for (field, label) in POLICY_FIELDS {
+        push_field(&mut rows, form, field, label);
+    }
+
+    rows.spacer();
+    rows.line(form_section("Local DNS & Notes", width, CardRole::History));
+    for (field, label) in LOCAL_DNS_FIELDS {
         push_field(&mut rows, form, field, label);
     }
 
@@ -1289,11 +1563,8 @@ fn form_body(form: &DeviceFormState, width: u16) -> (modal_form::ScrollBody, Opt
 /// The pinned tail: transient status / hint / error, the key legend, then
 /// `Cancel` · `Save`.
 ///
-/// Two colour-rule corrections land here. `Cancel` used to take a
-/// `brand_red` fill on focus — a filled red beside a filled `Save` is how
-/// an operator discards work they meant to keep — and is now
-/// `ActionKind::Neutral`. `Save` becomes the modal's one
-/// `ActionKind::Primary`, so the single teal fill is the only fill.
+/// `Cancel` is neutral and `Save` primary. The shared action renderer keeps
+/// both buttons compact and fills the focused one with its action color.
 ///
 /// `submitting` moves from the hint slot to the **status** slot: it used to
 /// be handed to every row in place of that row's own guidance, so it wore
@@ -1302,17 +1573,19 @@ fn form_body(form: &DeviceFormState, width: u16) -> (modal_form::ScrollBody, Opt
 fn form_tail_for(rows: &modal_form::FormRows, form: &DeviceFormState) -> Vec<Line<'static>> {
     let actions = [
         Action::new(
-            "  Cancel  ",
+            "Cancel",
             form.focused == DeviceFormFocus::Cancel,
             ActionKind::Neutral,
             focus_hint(form.mode, DeviceFormFocus::Cancel),
-        ),
+        )
+        .on_key(KeyCode::Esc),
         Action::new(
-            "  Save  ",
+            "Save",
             form.focused == DeviceFormFocus::Save,
             ActionKind::Primary,
             focus_hint(form.mode, DeviceFormFocus::Save),
-        ),
+        )
+        .on_save(),
     ];
     modal_form::form_tail_with_status(
         rows,
@@ -1331,151 +1604,166 @@ fn form_tail_for(rows: &modal_form::FormRows, form: &DeviceFormState) -> Vec<Lin
 /// open.
 ///
 /// Everything geometric belongs to [`modal_form::render_modal`]: the
-/// elevated rounded chrome, the height request, the anchor clamp, the
+/// elevated square chrome, the height request, the anchor clamp, the
 /// two-pass width resolution that keeps rows clear of the scrollbar column,
 /// and the focus-following viewport. What is left here is the width and
 /// where the real terminal cursor goes.
-fn render_form_modal(f: &mut Frame, area: Rect, form: &DeviceFormState) {
-    let render = modal_form::render_modal(f, area, MODAL_W, |w| form_body(form, w));
-    if let Some((row, caret)) = render.cursor {
-        render.place_cursor(f, row, modal_form::VALUE_COL as u16 + caret);
+fn render_form_modal(f: &mut Frame, area: Rect, form: &DeviceFormState) -> Rect {
+    let available = area.height.saturating_sub(2) as usize;
+    let render = modal_form::render_modal(f, area, MODAL_W, |w| {
+        let (mut body, cursor) = form_body(form, w);
+        // The Devices filter card leaves a seven-row modal interior at the
+        // terminal floor. Drop only ornamental breathing room until one field
+        // row fits beside the pinned heading and controls.
+        if body.head.len() + body.tail.len() >= available {
+            if body
+                .head
+                .last()
+                .is_some_and(|line| line.spans.iter().all(|span| span.content.is_empty()))
+            {
+                body.head.pop();
+            }
+            if body.head.len() + body.tail.len() >= available
+                && body
+                    .tail
+                    .first()
+                    .is_some_and(|line| line.spans.iter().all(|span| span.content.is_empty()))
+            {
+                body.tail.remove(0);
+            }
+        }
+        let focus_row = body.focus_row;
+        (
+            body,
+            (cursor, focus_row, field_layout(w).value_column() as u16),
+        )
+    });
+    if let Some((row, caret)) = render.cursor.0 {
+        render.place_cursor(f, row, render.cursor.2 + caret);
     }
+    let row = render.cursor.1.unwrap_or(render.view.offset);
+    Rect::new(
+        render.inner.x + render.cursor.2,
+        render.inner.y + (render.view.head_h + row.saturating_sub(render.view.offset)) as u16,
+        render.inner.width.saturating_sub(render.cursor.2),
+        1,
+    )
 }
 
-/// Outer width of the nested field picker. Deliberately narrower than
-/// [`MODAL_W`] so the nesting is legible: `render_chrome_in` centres on the
-/// anchor, and both modals are handed the **same** anchor, so a narrower
-/// popup sits concentrically inside the form it was opened from.
 const PICKER_W: u16 = 46;
 
-/// The nested "Select profile" / "Select group" popup as an Archetype-C
-/// option list — opened by `Enter` on a select-only row **inside** the
-/// Archetype-F form, and drawn after it.
-///
-/// ## Why Archetype C is right even though it nests
-///
-/// It is a picker, which is C's remit, and nesting turns out not to be a
-/// third case:
-///
-/// - **Anchor.** It takes the same anchor as its parent form (the list
-///   column). `overlay::centered_rect` centres within that rect, so a
-///   narrower, shorter popup nests concentrically rather than needing the
-///   form's own rect threaded down to it.
-/// - **Z-order.** By draw order alone: `render_modal_overlay` renders the
-///   form first, then this, and `render_chrome_in` renders `Clear` before
-///   its block — so the form underneath is wiped, not blended.
-/// - **Scrolling.** The hand-rolled `offset` arithmetic this replaced kept
-///   the cursor visible by subtracting a window height it computed itself.
-///   `notice_body` gives the focused `ChoiceRow` to `ScrollBody::focus_row`
-///   and `render_scroll_body` tracks it — the same focus-following viewport
-///   the form uses, and no keybinding changes because `picker.cursor`
-///   already moves in state and every keystroke re-renders.
-///
-/// The one thing lost is the `●`/`○` radio glyph pair: the ecosystem focus
-/// grammar is an emerald `▌` rule, a `bg_highlight` bar and a `◀` marker,
-/// which is three signals to the radio pair's one, and only one of them is
-/// colour. `brand_red` also leaves the border and the cursor row.
+#[cfg(test)]
 fn render_field_picker(f: &mut Frame, area: Rect, picker: &FieldPicker) {
-    let spec = picker_notice(picker);
-    modal_form::render_modal(f, area, PICKER_W, |w| {
-        (modal_form::notice_body(&spec, w), ())
-    });
+    render_field_picker_at(
+        f,
+        area,
+        Rect::new(area.x + 2, area.y, 1, 1),
+        picker,
+        crate::tui::query_log_controls::FilterFocus::Value,
+    );
 }
 
-/// The picker's Archetype-C spec.
-///
-/// With no options the list is empty, so the body is pure prose — which
-/// `notice_body` marks `scrollable: false`, correctly suppressing a
-/// scrollbar nothing could move. One prose row against a 6-row ceiling.
-fn picker_notice(picker: &FieldPicker) -> modal_form::NoticeSpec {
-    let (title, desc) = match picker.target {
-        DeviceFormField::Profile => ("Select profile", "the policy bundle this device points at"),
-        DeviceFormField::Group if picker.multi => (
-            "Select groups",
-            "every group this device belongs to \u{2014} Space toggles",
-        ),
-        DeviceFormField::Group => ("Select group", "the group this device belongs to"),
-        _ => ("Select", ""),
+fn render_field_picker_at(
+    f: &mut Frame,
+    area: Rect,
+    anchor: Rect,
+    picker: &FieldPicker,
+    focus: crate::tui::query_log_controls::FilterFocus,
+) {
+    use crate::tui::{filter_chips, query_log_controls::FilterFocus};
+    let title = match picker.target {
+        DeviceFormField::Profile => "Select profile",
+        DeviceFormField::Group if picker.multi => "Select groups",
+        DeviceFormField::Group => "Select group",
+        _ => "Select",
     };
-
-    let choices = picker
-        .options
-        .iter()
-        .enumerate()
-        .map(|(i, opt)| modal_form::ChoiceRow {
-            // The empty string is the explicit clear option on the three
-            // metadata pickers. It renders as a word rather than as a
-            // blank row, which would read as a rendering bug.
-            //
-            // A multi-select picker must show membership on EVERY row,
-            // not only on the one under the cursor — the focus grammar
-            // (`\u{25c0}` + highlight bar) says "here", and the operator
-            // also needs "chosen". A `[x]` / `[ ]` box carries that
-            // without colour, which the ecosystem reserves for focus.
-            label: if opt.is_empty() {
-                "(none)".to_string()
-            } else if picker.multi {
-                let mark = if picker.selected.iter().any(|s| s == opt) {
-                    '\u{00d7}'
-                } else {
-                    ' '
-                };
-                format!("[{mark}] {opt}")
-            } else {
-                opt.clone()
-            },
-            // Nothing to say about a bare id, and every option here is
-            // choosable — the daemon's snapshot only ever holds live ones.
-            detail: None,
-            note: None,
-            kind: ValueKind::Identity,
-            focused: i == picker.cursor,
-        })
-        .collect();
-
-    modal_form::NoticeSpec {
-        title: title.to_string(),
-        desc: desc.to_string(),
-        prose: if picker.options.is_empty() {
-            vec![ProseRow::plain("(none configured)")]
-        } else {
-            Vec::new()
-        },
-        choices,
-        error: None,
-        hint: String::new(),
-        hint_rows: None,
-        keys: if picker.multi {
-            "[j/k] move \u{b7} [Space] toggle \u{b7} [Enter] confirm \u{b7} [Esc] cancel"
-                .to_string()
-        } else {
-            "[j/k] move \u{b7} [Enter] select \u{b7} [Esc] cancel".to_string()
-        },
-        actions: Vec::new(),
+    let inner = filter_chips::popup(
+        f,
+        area,
+        anchor,
+        (PICKER_W, (picker.options.len().max(1) as u16 + 5).min(14)),
+        title,
+    );
+    if inner.is_empty() {
+        return;
     }
+    let visible = inner.height.saturating_sub(2) as usize;
+    let offset = picker.cursor.saturating_add(1).saturating_sub(visible);
+    for (index, option) in picker.options.iter().enumerate().skip(offset).take(visible) {
+        let selected = if picker.multi {
+            picker.selected.contains(option)
+        } else {
+            picker.cursor == index
+        };
+        let marker = if picker.multi {
+            if selected {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else if selected {
+            "(x)"
+        } else {
+            "( )"
+        };
+        let label = format!(
+            "{marker} {}",
+            if option.is_empty() { "(none)" } else { option }
+        );
+        let row = Rect::new(inner.x, inner.y + (index - offset) as u16, inner.width, 1);
+        f.render_widget(
+            Paragraph::new(crate::tui::text::fit(&label, inner.width as usize)).style(
+                filter_chips::chip_style(
+                    selected,
+                    index == picker.cursor && focus == FilterFocus::Value,
+                ),
+            ),
+            row,
+        );
+        mouse::register_overlay_action(row, MouseAction::OverlayChoice(index));
+    }
+    if picker.options.is_empty() && visible > 0 {
+        f.render_widget(
+            Paragraph::new("(none configured)").style(Style::default().fg(T.text_muted)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    if inner.height >= 2 {
+        let hint = if picker.multi {
+            "[Space] toggle · Enter applies"
+        } else {
+            "[Enter] select · Esc returns"
+        };
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(T.text_muted)),
+            Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
+        );
+    }
+    filter_chips::render_actions(
+        f,
+        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        focus,
+    );
 }
 
-/// Destructive confirm, as an Archetype-C notice. Same frame as the form
-/// (neutral, rounded, elevated) so the two read as one family.
+/// Destructive confirm, as an Archetype-C notice. Same neutral, square,
+/// elevated frame as the form so the two read as one family.
 ///
 /// Red is carried by the `y Delete` action alone — `ActionKind::Destructive`
 /// paints it `red_glow` and **never fills it**: a filled red beside
 /// a filled primary is how an operator deletes the thing they meant to keep.
 /// The banded title stays neutral like every other band.
 ///
-/// Both actions render unfocused because this modal genuinely has no focus
-/// ring — `y`/`Enter` confirm, `n`/`Esc` cancel, handled in `tui::mod`
-/// (unchanged, D7′). Marking one `focused` would put the emerald "you are
-/// here" rule on a target no key can move off, so the keys ride in the
-/// labels instead, and the legend states them a second time.
-fn render_delete_confirm(f: &mut Frame, area: Rect, name: &str) {
-    let spec = delete_notice(name);
+/// Both actions participate in the keyboard focus ring. The familiar
+/// `y`/`n` shortcuts remain available alongside Tab/arrows and Enter.
+fn render_delete_confirm(f: &mut Frame, area: Rect, name: &str, focus: usize) {
+    let spec = delete_notice(name, focus);
     modal_form::render_modal(f, area, MODAL_W, |w| {
         (modal_form::notice_body(&spec, w), ())
     });
 }
 
-fn delete_notice(name: &str) -> modal_form::NoticeSpec {
+fn delete_notice(name: &str, focus: usize) -> modal_form::NoticeSpec {
     modal_form::NoticeSpec {
         title: "DELETE CLIENT".to_string(),
         desc: "The device loses its mapping and its stats.".to_string(),
@@ -1491,8 +1779,9 @@ fn delete_notice(name: &str) -> modal_form::NoticeSpec {
         // cost of a mistaken delete is its stats, not authored policy.
         keys: "[y / Enter] delete \u{b7} [n / Esc] cancel".to_string(),
         actions: vec![
-            Action::new("  n  Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  y  Delete  ", false, ActionKind::Destructive, ""),
+            Action::new("  n  Cancel  ", focus == 0, ActionKind::Neutral, "").on_key(KeyCode::Esc),
+            Action::new("  y  Delete  ", focus == 1, ActionKind::Destructive, "")
+                .on_key(KeyCode::Char('y')),
         ],
     }
 }

@@ -11,6 +11,7 @@ use ahash::RandomState;
 use arc_swap::ArcSwap;
 use hickory_proto::rr::{RData, Record, RecordType};
 
+#[cfg(test)]
 use super::cname::NamePolicy;
 
 /// IP blocklist keyed with `ahash::RandomState` — the hasher the rest of
@@ -48,6 +49,11 @@ impl IpFilter {
         self.blocklist.store(Arc::new(ips));
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_prepared(&self, prepared: &Self) {
+        self.blocklist.store(prepared.blocklist.load_full());
+    }
+
     /// Check if any A/AAAA record in the response resolves to a blocked IP.
     /// Returns `Some(ip)` for the first match, `None` if all clean.
     ///
@@ -68,7 +74,8 @@ impl IpFilter {
     /// blind behaviour; callers with no client context (the prefetch
     /// paths, which populate the *shared* cache slot) pass
     /// [`NamePolicy::Neutral`] and stay fail-closed.
-    pub fn check_response(&self, records: &[Record], policy: NamePolicy) -> Option<IpAddr> {
+    #[cfg(test)]
+    fn check_response(&self, records: &[Record], policy: NamePolicy) -> Option<IpAddr> {
         if policy.outranks_external() {
             return None;
         }
@@ -89,6 +96,50 @@ impl IpFilter {
                     if set.contains(&ip) {
                         return Some(ip);
                     }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Response-IP check using the original-QNAME operator allow grant. The grant is
+    /// uniform across response targets and IPs; malformed CNAME state is
+    /// rejected by the CNAME walker before this method is reached.
+    pub fn check_response_with_grant(
+        &self,
+        records: &[Record],
+        grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
+    ) -> Option<IpAddr> {
+        self.check_response_for_profile_with_grant(records, None, grant)
+    }
+
+    /// Response-IP check with the compiled profile that is serving this
+    /// request. A grant suppresses the check only when it came from this exact
+    /// profile and immutable snapshot.
+    pub fn check_response_for_profile_with_grant(
+        &self,
+        records: &[Record],
+        profile: Option<&crate::filter::operator_rules::CompiledProfile>,
+        grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
+    ) -> Option<IpAddr> {
+        if grant
+            .zip(profile)
+            .is_some_and(|(grant, profile)| grant.is_issued_by(profile))
+        {
+            return None;
+        }
+        let set = self.blocklist.load();
+        if set.is_empty() {
+            return None;
+        }
+        for record in records {
+            match (record.record_type(), &record.data) {
+                (RecordType::A, RData::A(a)) if set.contains(&IpAddr::V4(a.0)) => {
+                    return Some(IpAddr::V4(a.0));
+                }
+                (RecordType::AAAA, RData::AAAA(a)) if set.contains(&IpAddr::V6(a.0)) => {
+                    return Some(IpAddr::V6(a.0));
                 }
                 _ => {}
             }
@@ -129,6 +180,11 @@ pub fn parse_ip_blocklist(content: &str) -> IpSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::Id;
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, ExternalMatches, PackSource, ProfileMounts,
+        RuleCompileLimits,
+    };
     use hickory_proto::rr::rdata::{A, AAAA};
     use hickory_proto::rr::{Name, RData, Record};
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -157,6 +213,25 @@ mod tests {
     /// coerces to the filter's `HashSet<IpAddr, ahash::RandomState>`.
     fn ipset<const N: usize>(ips: [&str; N]) -> IpSet {
         ips.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    fn compiled_allow_snapshot() -> CompiledOperatorRules {
+        let limits = RuleCompileLimits::default();
+        let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content: "@@query.test",
+            }],
+            &[ProfileMounts {
+                profile_id: "profile",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -271,6 +346,34 @@ mod tests {
                 "device allow (override_profile_deny={flag}) must beat the IP blocklist"
             );
         }
+    }
+
+    #[test]
+    fn request_grant_suppresses_ip_blocks_only_for_its_issuer() {
+        let filter = IpFilter::with_ips(ipset(["198.51.100.66"]));
+        let records = vec![a_record("198.51.100.66")];
+        let snapshot = compiled_allow_snapshot();
+        let profile = snapshot.profile(&Id::new("profile").unwrap()).unwrap();
+        let grant = profile
+            .evaluate_attributed("query.test", ExternalMatches::None)
+            .grant()
+            .unwrap();
+
+        assert!(filter
+            .check_response_for_profile_with_grant(&records, Some(profile), Some(&grant))
+            .is_none());
+
+        let replacement = compiled_allow_snapshot();
+        let replacement_profile = replacement.profile(&Id::new("profile").unwrap()).unwrap();
+        assert_eq!(
+            filter.check_response_for_profile_with_grant(
+                &records,
+                Some(replacement_profile),
+                Some(&grant),
+            ),
+            Some("198.51.100.66".parse().unwrap()),
+            "a replacement snapshot cannot replay an old response-IP grant"
+        );
     }
 
     #[test]

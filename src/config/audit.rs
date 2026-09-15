@@ -36,15 +36,11 @@
 //!
 //! # Concurrency & atomicity
 //!
-//! The writer opens the file with `O_APPEND | O_CREATE` and issues one
-//! `write(2)` per record (trailing newline included). On Linux the kernel
-//! serialises concurrent `O_APPEND` writes so two writers don't interleave
-//! within a line, as long as each record fits in a single `write(2)` of a
-//! practical size. (Not a `PIPE_BUF` guarantee — that 4 KB atomicity bound
-//! governs pipes / FIFOs, not regular files.) Records
-//! are kept small on purpose — the per-record `errors` list is capped at
-//! [`MAX_AUDIT_RECORD_ERRORS`] — so a `Rejected` reload over a badly broken
-//! multi-file config can't grow a line large enough to risk a torn write.
+//! The writer opens the file with `O_APPEND | O_CREATE` and holds an exclusive
+//! file lock through boundary repair, append, and synchronization. Short writes
+//! cannot interleave with another writer. If an append fails midway, the next
+//! append preserves the incomplete bytes and adds a newline before its record.
+//! The per-record `errors` list is capped at [`MAX_AUDIT_RECORD_ERRORS`].
 //!
 //! # Permissions
 //!
@@ -53,10 +49,13 @@
 //! matches the systemd service user/group deployed on the CT. If those bits
 //! need tightening further the daemon can re-apply on every open.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -84,6 +83,22 @@ pub const MAX_AUDIT_RECORD_ERRORS: usize = 32;
 /// Default audit directory name. Paired with the daemon's `/var/lib`
 /// parent to produce `/var/lib/purge-warden/audit/audit.log`.
 pub const AUDIT_DIR_NAME: &str = "audit";
+
+/// Maximum serialized size of one operator-rules audit event.
+pub const MAX_UOR_AUDIT_EVENT_BYTES: usize = 64 * 1024;
+
+/// Maximum number of list or profile identifiers retained in one event.
+pub const MAX_UOR_AUDIT_ENTITY_IDS: usize = 256;
+
+/// Maximum number of operation identities retained by the restart-safe
+/// deduplication index before old recorded entries become eligible for expiry.
+pub const MAX_UOR_AUDIT_DEDUP_ENTRIES: usize = 4_096;
+
+const UOR_AUDIT_DEDUP_RETENTION_SECS: u64 = 24 * 60 * 60;
+const UOR_AUDIT_INDEX_FORMAT: u32 = 2;
+const MAX_UOR_AUDIT_ID_BYTES: usize = 128;
+const MAX_UOR_AUDIT_ACTOR_BYTES: usize = 256;
+const MAX_UOR_AUDIT_OPERATION_BYTES: usize = 128;
 
 /// Classification of what triggered an audit record. The daemon emits one
 /// per lifecycle transition; `warden audit tail` reads them back verbatim.
@@ -125,6 +140,10 @@ pub enum AuditEvent {
     /// original qname; `cname_target` carries the offending hop; and
     /// `cname_source` carries `BlockSource::label()`.
     CnameBlock,
+    /// One durable operator-rules transaction outcome. The structured
+    /// `uor_operation` field carries bounded metadata and state; raw rules,
+    /// pack bodies, tokens and secrets have no representation in this event.
+    OperatorRulesOperation,
 }
 
 impl AuditEvent {
@@ -137,6 +156,7 @@ impl AuditEvent {
             Self::Restore => "restore",
             Self::CliMutation => "cli_mutation",
             Self::CnameBlock => "cname_block",
+            Self::OperatorRulesOperation => "operator_rules_operation",
         }
     }
 }
@@ -156,6 +176,127 @@ impl AuditResult {
             Self::Rejected => "rejected",
         }
     }
+}
+
+/// Authenticated source of an operator-rules transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UorAuditOrigin {
+    Cli,
+    Ipc,
+    Rest,
+    Replica,
+    Migration,
+    External,
+    Unknown,
+}
+
+/// Identity fields copied from durable transaction intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditIdentity {
+    pub operation_id: String,
+    pub request_id: String,
+    pub actor: String,
+    pub origin: UorAuditOrigin,
+    pub operation: String,
+}
+
+/// Byte revision and optional semantic hash on both sides of a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditRevisions {
+    pub before_config_revision: String,
+    pub after_config_revision: String,
+    pub before_operator_policy_hash: Option<String>,
+    pub after_operator_policy_hash: Option<String>,
+}
+
+/// Bounded entity identities involved in a transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditEntities {
+    pub list_ids: Vec<String>,
+    pub profile_ids: Vec<String>,
+}
+
+/// Aggregate mutation counts. Scalars keep the audit useful without storing
+/// rule text, pack bodies or a full semantic diff.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditCounts {
+    pub operations: u32,
+    pub changed_members: u32,
+    pub rules_added: u32,
+    pub rules_removed: u32,
+    pub rules_replaced: u32,
+    pub mounts_added: u32,
+    pub mounts_removed: u32,
+}
+
+/// Aggregate reachability impact known when the receipt is audited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditImpact {
+    pub affected_profiles: u32,
+    pub affected_destinations: u32,
+    pub potential_destinations: u32,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UorAuditPersistence {
+    Prepared,
+    Committed,
+    Aborted,
+    DurabilityUncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UorAuditActivation {
+    NotRequested,
+    Pending,
+    Active,
+    Failed,
+    Unknown,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UorAuditReplication {
+    NotConfigured,
+    Pending,
+    Converged,
+    Degraded,
+    Failed,
+    Unknown,
+}
+
+/// Durable receipt states captured by the audit attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorAuditOutcome {
+    pub persistence: UorAuditPersistence,
+    pub activation: UorAuditActivation,
+    pub replication: UorAuditReplication,
+}
+
+/// Redacted, bounded audit projection of one durable operator-rules intent and
+/// receipt. This type deliberately has no token, secret, raw-rule, domain,
+/// pattern, diff-body or pack-body field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UorOperationAuditEvent {
+    pub identity: UorAuditIdentity,
+    pub revisions: UorAuditRevisions,
+    pub entities: UorAuditEntities,
+    pub counts: UorAuditCounts,
+    pub impact: UorAuditImpact,
+    pub outcome: UorAuditOutcome,
+    pub changed: bool,
 }
 
 /// Serialisable single-line record. Matches the frozen schema comment at
@@ -284,6 +425,22 @@ pub struct AuditRecord {
     /// `rewrote_`) is the naming cue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrote_from: Option<String>,
+
+    /// Redacted operator-rules transaction metadata. Kept as one optional
+    /// additive object so legacy lifecycle and mutation records retain their
+    /// original JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uor_operation: Option<UorOperationAuditEvent>,
+    /// Versioned digest of the normalized `uor_operation` object. The durable
+    /// side index uses it to distinguish an exact retry from reuse of an
+    /// operation id with different audit data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uor_event_hash: Option<String>,
+    /// Durable index timestamp, at least the original receipt's creation time.
+    /// Kept outside the event digest so delivery timing never changes identity.
+    /// Absent when the caller did not supply a trusted receipt creation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uor_index_time_floor_unix_seconds: Option<u64>,
 }
 
 impl AuditRecord {
@@ -322,6 +479,9 @@ impl AuditRecord {
             rewrite_from: None,
             rewrite_to: None,
             rewrote_from: None,
+            uor_operation: None,
+            uor_event_hash: None,
+            uor_index_time_floor_unix_seconds: None,
         }
     }
 
@@ -468,6 +628,8 @@ impl AuditRecord {
 #[derive(Debug, Clone)]
 pub struct AuditWriter {
     path: PathBuf,
+    #[cfg(test)]
+    fail_after_bytes: Arc<Mutex<Option<usize>>>,
 }
 
 impl AuditWriter {
@@ -533,7 +695,11 @@ impl AuditWriter {
             }
         }
 
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            #[cfg(test)]
+            fail_after_bytes: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Path the writer appends to. Used by `warden audit tail` to find the
@@ -567,12 +733,20 @@ impl AuditWriter {
         };
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(AUDIT_FILE_MODE)
             .open(&self.path)?;
-        file.write_all(line.as_bytes())?;
+        let _advisory = AdvisoryFileLock::exclusive(&file)?;
+        restore_audit_line_boundary(&file)?;
+        #[cfg(test)]
+        if let Some(bytes) = lock_unpoisoned(&self.fail_after_bytes).take() {
+            (&file).write_all(&line.as_bytes()[..bytes.min(line.len() - 1)])?;
+            return Err(std::io::Error::other("injected partial audit write"));
+        }
+        (&file).write_all(line.as_bytes())?;
         file.sync_data()?;
         Ok(())
     }
@@ -587,6 +761,668 @@ impl AuditWriter {
         debug_assert_eq!(record.event, AuditEvent::CliMutation);
         self.append(record)
     }
+
+    /// Build a restart-safe, deduplicating sink over this audit log.
+    pub fn operator_rules_sink(&self) -> std::io::Result<UorAuditSink> {
+        UorAuditSink::open(self.clone())
+    }
+}
+
+/// Successful delivery status for one operator-rules audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UorAuditDelivery {
+    Recorded,
+    AlreadyRecorded,
+}
+
+/// A post-commit audit failure is pending work, never evidence that the
+/// transaction itself failed or should be rolled back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UorAuditSinkError {
+    #[error("operator-rules audit is pending for {operation_id}: {detail}")]
+    Pending {
+        operation_id: String,
+        detail: String,
+    },
+    #[error("operator-rules audit operation id {operation_id} has different event data")]
+    Conflict { operation_id: String },
+    #[error("invalid operator-rules audit field: {field}")]
+    Invalid { field: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UorAuditIndexState {
+    Pending,
+    Recorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UorAuditIndexEntry {
+    event_hash: String,
+    state: UorAuditIndexState,
+    updated_unix_seconds: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UorAuditIndex {
+    format_version: u32,
+    entries: BTreeMap<String, UorAuditIndexEntry>,
+    /// Receipt creation times at or below this watermark may have been pruned,
+    /// even if the wall clock subsequently moved backwards. Missing means legacy.
+    /// `u64::MAX` preserves recovery for legacy evidence with an unknown age floor.
+    #[serde(default)]
+    pruned_through_unix_seconds: Option<u64>,
+}
+
+impl Default for UorAuditIndex {
+    fn default() -> Self {
+        Self {
+            format_version: UOR_AUDIT_INDEX_FORMAT,
+            entries: BTreeMap::new(),
+            pruned_through_unix_seconds: Some(0),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UorAuditProbe {
+    #[serde(default)]
+    ts: Option<String>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    uor_operation: Option<UorOperationAuditEvent>,
+    #[serde(default)]
+    uor_event_hash: Option<String>,
+    #[serde(default)]
+    uor_index_time_floor_unix_seconds: Option<u64>,
+}
+
+enum ExistingAuditEvent {
+    Absent,
+    Matching,
+    Conflicting,
+}
+
+struct AdvisoryFileLock<'a> {
+    file: &'a File,
+}
+
+impl<'a> AdvisoryFileLock<'a> {
+    fn exclusive(file: &'a File) -> std::io::Result<Self> {
+        // SAFETY: flock only reads the live descriptor value and retains no
+        // userspace pointer. `file` is borrowed for the guard's full lifetime.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            Ok(Self { file })
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for AdvisoryFileLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the borrowed file remains live until after this guard drops.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Append-only operator-rules audit sink with a durable idempotency index.
+///
+/// A small process mutex handles cloned sinks; an advisory side lock handles
+/// independently opened sinks. Neither is used by DNS queries. All audit appends
+/// also lock the log file to protect line boundaries. The index records `pending`
+/// before the JSON append and `recorded` afterwards. Recovery checks the log for
+/// pending or expired entries; receipt delivery can outlive index retention.
+#[derive(Debug, Clone)]
+pub struct UorAuditSink {
+    writer: AuditWriter,
+    index_path: PathBuf,
+    lock_file: Arc<File>,
+    process_lock: Arc<Mutex<()>>,
+}
+
+impl UorAuditSink {
+    fn open(writer: AuditWriter) -> std::io::Result<Self> {
+        let index_path = suffixed_path(writer.path(), ".uor-index");
+        let lock_path = suffixed_path(writer.path(), ".uor-lock");
+        let index_exists = index_path.exists();
+        let lock_file = open_sidecar(&lock_path)?;
+        let sink = Self {
+            writer,
+            index_path,
+            lock_file: Arc::new(lock_file),
+            process_lock: Arc::new(Mutex::new(())),
+        };
+        if !index_exists {
+            let _process = lock_unpoisoned(&sink.process_lock);
+            let _advisory = AdvisoryFileLock::exclusive(&sink.lock_file)?;
+            if !sink.index_path.exists() {
+                let index = sink.rebuild_index()?;
+                sink.write_index(&index)?;
+            }
+        }
+        Ok(sink)
+    }
+
+    pub fn record(
+        &self,
+        event: &UorOperationAuditEvent,
+    ) -> Result<UorAuditDelivery, UorAuditSinkError> {
+        self.record_at(event, unix_seconds(), None)
+    }
+
+    /// Deliver a persisted receipt's event. Its trusted creation time keeps
+    /// fresh operations off the historical recovery scan: their index entries
+    /// cannot yet have expired, unless the persisted pruning watermark says
+    /// otherwise. Callers must use the original receipt timestamp.
+    pub(crate) fn record_for_receipt(
+        &self,
+        event: &UorOperationAuditEvent,
+        created_unix_seconds: u64,
+    ) -> Result<UorAuditDelivery, UorAuditSinkError> {
+        self.record_at(event, unix_seconds(), Some(created_unix_seconds))
+    }
+
+    fn record_at(
+        &self,
+        event: &UorOperationAuditEvent,
+        now: u64,
+        created_unix_seconds: Option<u64>,
+    ) -> Result<UorAuditDelivery, UorAuditSinkError> {
+        // A backward clock step must not age the index before its receipt.
+        let updated = now.max(created_unix_seconds.unwrap_or(now));
+        let event = normalize_uor_event(event.clone())?;
+        let event_bytes = serde_json::to_vec(&event).map_err(|_| UorAuditSinkError::Invalid {
+            field: "event encoding",
+        })?;
+        if event_bytes.len() > MAX_UOR_AUDIT_EVENT_BYTES {
+            return Err(UorAuditSinkError::Invalid {
+                field: "event size",
+            });
+        }
+        let event_hash = uor_event_hash(&event_bytes);
+        let operation_id = event.identity.operation_id.clone();
+        let pending = |detail: String| UorAuditSinkError::Pending {
+            operation_id: operation_id.clone(),
+            detail,
+        };
+
+        let _process = lock_unpoisoned(&self.process_lock);
+        let _advisory = AdvisoryFileLock::exclusive(&self.lock_file)
+            .map_err(|error| pending(error.to_string()))?;
+        let mut index = self
+            .read_index()
+            .map_err(|error| pending(error.to_string()))?;
+
+        if let Some(entry) = index.entries.get(&operation_id) {
+            if entry.event_hash != event_hash {
+                return Err(UorAuditSinkError::Conflict { operation_id });
+            }
+            if entry.state == UorAuditIndexState::Recorded {
+                return Ok(UorAuditDelivery::AlreadyRecorded);
+            }
+        }
+        // The receipt's pending marker has an independent lifetime, so expiry
+        // of this bounded index cannot authorize another logical event.
+        let needs_recovery = index.entries.contains_key(&operation_id)
+            || created_unix_seconds.is_none_or(|created| {
+                created <= index.pruned_through_unix_seconds.unwrap_or(u64::MAX)
+                    || now.saturating_sub(created) > UOR_AUDIT_DEDUP_RETENTION_SECS
+            });
+        if needs_recovery {
+            match self
+                .find_existing_event(&operation_id, &event_hash)
+                .map_err(|error| pending(error.to_string()))?
+            {
+                ExistingAuditEvent::Matching => {
+                    if let Some(entry) = index.entries.get_mut(&operation_id) {
+                        entry.state = UorAuditIndexState::Recorded;
+                        entry.updated_unix_seconds = updated;
+                        self.write_index(&index)
+                            .map_err(|error| pending(error.to_string()))?;
+                    }
+                    return Ok(UorAuditDelivery::AlreadyRecorded);
+                }
+                ExistingAuditEvent::Conflicting => {
+                    return Err(UorAuditSinkError::Conflict { operation_id });
+                }
+                ExistingAuditEvent::Absent => {}
+            }
+        }
+        if !index.entries.contains_key(&operation_id) {
+            let mut pruned_through = index.pruned_through_unix_seconds.unwrap_or(u64::MAX);
+            index.entries.retain(|_, entry| {
+                let retain = entry.state == UorAuditIndexState::Pending
+                    || now.saturating_sub(entry.updated_unix_seconds)
+                        <= UOR_AUDIT_DEDUP_RETENTION_SECS;
+                if !retain {
+                    pruned_through = pruned_through.max(entry.updated_unix_seconds);
+                }
+                retain
+            });
+            index.pruned_through_unix_seconds = Some(pruned_through);
+            if index.entries.len() >= MAX_UOR_AUDIT_DEDUP_ENTRIES {
+                return Err(pending("deduplication index is at capacity".into()));
+            }
+            index.entries.insert(
+                operation_id.clone(),
+                UorAuditIndexEntry {
+                    event_hash: event_hash.clone(),
+                    state: UorAuditIndexState::Pending,
+                    updated_unix_seconds: updated,
+                },
+            );
+            self.write_index(&index)
+                .map_err(|error| pending(error.to_string()))?;
+        }
+
+        let result = if event.outcome.persistence == UorAuditPersistence::Committed {
+            AuditResult::Ok
+        } else {
+            AuditResult::Rejected
+        };
+        let mut record = AuditRecord::new(AuditEvent::OperatorRulesOperation, result);
+        record.ts = OffsetDateTime::from_unix_timestamp(
+            i64::try_from(now).map_err(|error| pending(error.to_string()))?,
+        )
+        .map_err(|error| pending(error.to_string()))?
+        .format(&Rfc3339)
+        .map_err(|error| pending(error.to_string()))?;
+        record.uor_operation = Some(event);
+        record.uor_event_hash = Some(event_hash);
+        record.uor_index_time_floor_unix_seconds = created_unix_seconds.map(|_| updated);
+        self.writer
+            .append(&record)
+            .map_err(|error| pending(error.to_string()))?;
+
+        let entry = index
+            .entries
+            .get_mut(&operation_id)
+            .expect("new audit entry remains indexed");
+        entry.state = UorAuditIndexState::Recorded;
+        entry.updated_unix_seconds = updated;
+        self.write_index(&index)
+            .map_err(|error| pending(error.to_string()))?;
+        Ok(UorAuditDelivery::Recorded)
+    }
+
+    fn read_index(&self) -> std::io::Result<UorAuditIndex> {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.index_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let index = self.rebuild_index()?;
+                self.write_index(&index)?;
+                return Ok(index);
+            }
+            Err(error) => return Err(error),
+        };
+        let limit = MAX_UOR_AUDIT_EVENT_BYTES
+            .saturating_mul(MAX_UOR_AUDIT_DEDUP_ENTRIES)
+            .min(8 * 1024 * 1024);
+        if file.metadata()?.len() > limit as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "operator-rules audit index exceeds its size limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "operator-rules audit index exceeds its size limit",
+            ));
+        }
+        let mut index: UorAuditIndex =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if !matches!(index.format_version, 1 | UOR_AUDIT_INDEX_FORMAT)
+            || index.entries.len() > MAX_UOR_AUDIT_DEDUP_ENTRIES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported or oversized operator-rules audit index",
+            ));
+        }
+        if index.format_version != UOR_AUDIT_INDEX_FORMAT
+            || index.pruned_through_unix_seconds.is_none()
+        {
+            // Older indices may derive ages from wall-clock log timestamps,
+            // which do not bound receipt creation after a backwards clock step.
+            index.format_version = UOR_AUDIT_INDEX_FORMAT;
+            index.pruned_through_unix_seconds = Some(u64::MAX);
+            self.write_index(&index)?;
+        }
+        Ok(index)
+    }
+
+    fn write_index(&self, index: &UorAuditIndex) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(index).map_err(std::io::Error::other)?;
+        super::atomic_write::hardened_atomic_write(
+            &self.index_path,
+            &bytes,
+            super::atomic_write::AtomicWriteOpts {
+                mode: Some(AUDIT_FILE_MODE),
+                ..Default::default()
+            },
+        )
+        .map_err(std::io::Error::other)
+    }
+
+    fn rebuild_index(&self) -> std::io::Result<UorAuditIndex> {
+        self.rebuild_index_at(unix_seconds())
+    }
+
+    fn rebuild_index_at(&self, now: u64) -> std::io::Result<UorAuditIndex> {
+        let mut index = UorAuditIndex::default();
+        scan_uor_audit_lines(self.writer.path(), |probe, event, event_hash| {
+            let updated = match probe.uor_index_time_floor_unix_seconds {
+                Some(floor) => floor,
+                None => {
+                    // A legacy timestamp cannot bound receipt creation. Keep
+                    // missing identities recoverable regardless of clock age.
+                    index.pruned_through_unix_seconds = Some(u64::MAX);
+                    probe
+                        .ts
+                        .as_deref()
+                        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                        .and_then(|value| u64::try_from(value.unix_timestamp()).ok())
+                        .unwrap_or(now)
+                }
+            };
+            if now.saturating_sub(updated) > UOR_AUDIT_DEDUP_RETENTION_SECS {
+                index.pruned_through_unix_seconds =
+                    Some(index.pruned_through_unix_seconds.unwrap_or(0).max(updated));
+                return Ok(());
+            }
+            let operation_id = event.identity.operation_id.clone();
+            match index.entries.get(&operation_id) {
+                Some(existing) if existing.event_hash != event_hash => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "conflicting operator-rules events in audit log",
+                )),
+                Some(_) => Ok(()),
+                None if index.entries.len() >= MAX_UOR_AUDIT_DEDUP_ENTRIES => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "operator-rules audit index is at capacity",
+                    ))
+                }
+                None => {
+                    index.entries.insert(
+                        operation_id,
+                        UorAuditIndexEntry {
+                            event_hash: event_hash.to_string(),
+                            state: UorAuditIndexState::Recorded,
+                            updated_unix_seconds: updated,
+                        },
+                    );
+                    Ok(())
+                }
+            }
+        })?;
+        Ok(index)
+    }
+
+    fn find_existing_event(
+        &self,
+        operation_id: &str,
+        expected_hash: &str,
+    ) -> std::io::Result<ExistingAuditEvent> {
+        let mut found = ExistingAuditEvent::Absent;
+        scan_uor_audit_lines(self.writer.path(), |_, event, event_hash| {
+            if event.identity.operation_id == operation_id {
+                if event_hash != expected_hash {
+                    found = ExistingAuditEvent::Conflicting;
+                } else if !matches!(found, ExistingAuditEvent::Conflicting) {
+                    found = ExistingAuditEvent::Matching;
+                }
+            }
+            Ok(())
+        })?;
+        if matches!(found, ExistingAuditEvent::Matching) {
+            let file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(self.writer.path())?;
+            let _advisory = AdvisoryFileLock::exclusive(&file)?;
+            restore_audit_line_boundary(&file)?;
+            // A prior append may have written all JSON bytes but failed its
+            // final newline or sync. Recovery acknowledges only durable data.
+            file.sync_data()?;
+        }
+        Ok(found)
+    }
+}
+
+fn normalize_uor_event(
+    mut event: UorOperationAuditEvent,
+) -> Result<UorOperationAuditEvent, UorAuditSinkError> {
+    validate_bounded_text(
+        &event.identity.operation_id,
+        MAX_UOR_AUDIT_ID_BYTES,
+        "identity.operation_id",
+    )?;
+    validate_bounded_text(
+        &event.identity.request_id,
+        MAX_UOR_AUDIT_ID_BYTES,
+        "identity.request_id",
+    )?;
+    validate_bounded_text(
+        &event.identity.actor,
+        MAX_UOR_AUDIT_ACTOR_BYTES,
+        "identity.actor",
+    )?;
+    validate_bounded_text(
+        &event.identity.operation,
+        MAX_UOR_AUDIT_OPERATION_BYTES,
+        "identity.operation",
+    )?;
+    validate_digest(
+        &event.revisions.before_config_revision,
+        "revisions.before_config_revision",
+    )?;
+    validate_digest(
+        &event.revisions.after_config_revision,
+        "revisions.after_config_revision",
+    )?;
+    for (value, field) in [
+        (
+            event.revisions.before_operator_policy_hash.as_deref(),
+            "revisions.before_operator_policy_hash",
+        ),
+        (
+            event.revisions.after_operator_policy_hash.as_deref(),
+            "revisions.after_operator_policy_hash",
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_digest(value, field)?;
+        }
+    }
+
+    event.entities.list_ids.sort();
+    event.entities.list_ids.dedup();
+    event.entities.profile_ids.sort();
+    event.entities.profile_ids.dedup();
+    if event.entities.list_ids.len() > MAX_UOR_AUDIT_ENTITY_IDS {
+        return Err(UorAuditSinkError::Invalid {
+            field: "entities.list_ids",
+        });
+    }
+    if event.entities.profile_ids.len() > MAX_UOR_AUDIT_ENTITY_IDS {
+        return Err(UorAuditSinkError::Invalid {
+            field: "entities.profile_ids",
+        });
+    }
+    for id in &event.entities.list_ids {
+        validate_entity_id(id, "entities.list_ids")?;
+    }
+    for id in &event.entities.profile_ids {
+        validate_entity_id(id, "entities.profile_ids")?;
+    }
+    Ok(event)
+}
+
+fn validate_bounded_text(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<(), UorAuditSinkError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(|ch| ch.is_control()) {
+        Err(UorAuditSinkError::Invalid { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_entity_id(value: &str, field: &'static str) -> Result<(), UorAuditSinkError> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        Err(UorAuditSinkError::Invalid { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), UorAuditSinkError> {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Err(UorAuditSinkError::Invalid { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn uor_event_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"purge-warden/uor-audit-event/v1\0");
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn scan_uor_audit_lines(
+    path: &Path,
+    mut visit: impl FnMut(&UorAuditProbe, &UorOperationAuditEvent, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let _advisory = AdvisoryFileLock::exclusive(&file)?;
+    // Bound memory per line and scan only the file length seen on entry.
+    // Oversized evidence fails closed instead of silently losing an identity.
+    let mut reader = BufReader::new((&file).take(file.metadata()?.len()));
+    let mut line = Vec::new();
+    const MAX_LINE_BYTES: usize = MAX_UOR_AUDIT_EVENT_BYTES * 2;
+    loop {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if read > MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit line exceeds operator-rules recovery limit",
+            ));
+        }
+        let Ok(probe) = serde_json::from_slice::<UorAuditProbe>(&line) else {
+            continue;
+        };
+        if probe.event.as_deref() != Some("operator_rules_operation") {
+            continue;
+        }
+        let event = probe.uor_operation.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "operator-rules audit line is missing its event data",
+            )
+        })?;
+        let stored_hash = probe.uor_event_hash.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "operator-rules audit line is missing its event hash",
+            )
+        })?;
+        let normalized = normalize_uor_event(event.clone())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let bytes = serde_json::to_vec(&normalized).map_err(std::io::Error::other)?;
+        let calculated_hash = uor_event_hash(&bytes);
+        if calculated_hash != stored_hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "operator-rules audit event hash mismatch",
+            ));
+        }
+        visit(&probe, &normalized, &calculated_hash)?;
+    }
+    Ok(())
+}
+
+fn restore_audit_line_boundary(mut file: &File) -> std::io::Result<()> {
+    if file.metadata()?.len() != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn open_sidecar(path: &Path) -> std::io::Result<File> {
+    let existed = path.exists();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(AUDIT_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !existed {
+        fs::set_permissions(path, fs::Permissions::from_mode(AUDIT_FILE_MODE))?;
+    }
+    Ok(file)
+}
+
+fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn unix_seconds() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0)
 }
 
 /// SHA-256 of a single file, lowercase hex. Used to form the per-file
@@ -718,6 +1554,7 @@ impl<'de> serde::Deserialize<'de> for AuditEvent {
             "restore" => Ok(Self::Restore),
             "cli_mutation" => Ok(Self::CliMutation),
             "cname_block" => Ok(Self::CnameBlock),
+            "operator_rules_operation" => Ok(Self::OperatorRulesOperation),
             other => Err(serde::de::Error::custom(format!(
                 "unknown audit event: {other}"
             ))),
@@ -753,6 +1590,617 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("purge-audit-{pid}-{n}-{tag}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn uor_event(operation_id: &str) -> UorOperationAuditEvent {
+        UorOperationAuditEvent {
+            identity: UorAuditIdentity {
+                operation_id: operation_id.into(),
+                request_id: "request-1".into(),
+                actor: "uid:1000".into(),
+                origin: UorAuditOrigin::Ipc,
+                operation: "operator_rules.batch.v1".into(),
+            },
+            revisions: UorAuditRevisions {
+                before_config_revision: "1".repeat(64),
+                after_config_revision: "2".repeat(64),
+                before_operator_policy_hash: Some("3".repeat(64)),
+                after_operator_policy_hash: Some("4".repeat(64)),
+            },
+            entities: UorAuditEntities {
+                list_ids: vec!["household-rules".into()],
+                profile_ids: vec!["household".into()],
+            },
+            counts: UorAuditCounts {
+                operations: 2,
+                changed_members: 2,
+                rules_added: 1,
+                mounts_added: 1,
+                ..Default::default()
+            },
+            impact: UorAuditImpact {
+                affected_profiles: 1,
+                affected_destinations: 4,
+                potential_destinations: 7,
+                truncated: false,
+            },
+            outcome: UorAuditOutcome {
+                persistence: UorAuditPersistence::Committed,
+                activation: UorAuditActivation::Pending,
+                replication: UorAuditReplication::NotConfigured,
+            },
+            changed: true,
+        }
+    }
+
+    fn uor_line_count(path: &Path) -> usize {
+        tail(path, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, parsed)| {
+                parsed
+                    .as_ref()
+                    .is_ok_and(|record| record.event == AuditEvent::OperatorRulesOperation)
+            })
+            .count()
+    }
+
+    #[test]
+    fn uor_retry_is_one_logical_event_across_reopen() {
+        let root = tmp_dir("uor-reopen");
+        let path = root.join("audit.log");
+        let writer = AuditWriter::open(path.clone()).unwrap();
+        let sink = writer.operator_rules_sink().unwrap();
+        let event = uor_event("operation-reopen");
+
+        assert_eq!(sink.record(&event).unwrap(), UorAuditDelivery::Recorded);
+        assert_eq!(
+            sink.record(&event).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        drop(sink);
+
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        assert_eq!(
+            reopened.record(&event).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        assert_eq!(uor_line_count(&path), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uor_pending_index_recovers_append_without_duplicate() {
+        let root = tmp_dir("uor-pending-recovery");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-pending-recovery");
+        sink.record(&event).unwrap();
+
+        let mut index = sink.read_index().unwrap();
+        index
+            .entries
+            .get_mut(&event.identity.operation_id)
+            .unwrap()
+            .state = UorAuditIndexState::Pending;
+        sink.write_index(&index).unwrap();
+        drop(sink);
+
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        assert_eq!(
+            reopened.record(&event).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        assert_eq!(uor_line_count(&path), 1);
+        assert_eq!(
+            reopened
+                .read_index()
+                .unwrap()
+                .entries
+                .get(&event.identity.operation_id)
+                .unwrap()
+                .state,
+            UorAuditIndexState::Recorded
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uor_partial_append_preserves_evidence_and_retries_in_process() {
+        for cut in [37, usize::MAX] {
+            let root = tmp_dir("uor-partial-append");
+            let path = root.join("audit.log");
+            let writer = AuditWriter::open(path.clone()).unwrap();
+            let sink = writer.operator_rules_sink().unwrap();
+            let event = uor_event("operation-partial-append");
+            *lock_unpoisoned(&writer.fail_after_bytes) = Some(cut);
+
+            assert!(matches!(
+                sink.record(&event),
+                Err(UorAuditSinkError::Pending { .. })
+            ));
+            let fragment = fs::read(&path).unwrap();
+            assert!(!fragment.is_empty());
+            assert_ne!(fragment.last(), Some(&b'\n'));
+            assert_eq!(
+                sink.read_index().unwrap().entries[&event.identity.operation_id].state,
+                UorAuditIndexState::Pending
+            );
+
+            let delivery = sink.record(&event).unwrap();
+            assert_eq!(
+                delivery,
+                if cut == usize::MAX {
+                    UorAuditDelivery::AlreadyRecorded
+                } else {
+                    UorAuditDelivery::Recorded
+                }
+            );
+            let repaired = fs::read(&path).unwrap();
+            assert!(repaired.starts_with(&fragment));
+            assert_eq!(repaired[fragment.len()], b'\n');
+            assert_eq!(repaired.last(), Some(&b'\n'));
+            assert_eq!(uor_line_count(&path), 1);
+            assert_eq!(
+                sink.read_index().unwrap().entries[&event.identity.operation_id].state,
+                UorAuditIndexState::Recorded
+            );
+            assert_eq!(
+                sink.record(&event).unwrap(),
+                UorAuditDelivery::AlreadyRecorded
+            );
+            let reopened = AuditWriter::open(path.clone())
+                .unwrap()
+                .operator_rules_sink()
+                .unwrap();
+            assert_eq!(
+                reopened.record(&event).unwrap(),
+                UorAuditDelivery::AlreadyRecorded
+            );
+            assert_eq!(fs::read(&path).unwrap(), repaired);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn uor_partial_append_coordinates_independent_retries_and_lifecycle_writes() {
+        let root = tmp_dir("uor-partial-concurrent");
+        let path = root.join("audit.log");
+        let writer = AuditWriter::open(path.clone()).unwrap();
+        let sink = writer.operator_rules_sink().unwrap();
+        let event = uor_event("operation-partial-concurrent");
+        *lock_unpoisoned(&writer.fail_after_bytes) = Some(37);
+        assert!(matches!(
+            sink.record(&event),
+            Err(UorAuditSinkError::Pending { .. })
+        ));
+        let fragment = fs::read(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let sink = AuditWriter::open(path.clone())
+                    .unwrap()
+                    .operator_rules_sink()
+                    .unwrap();
+                let barrier = barrier.clone();
+                let event = &event;
+                scope.spawn(move || {
+                    barrier.wait();
+                    sink.record(event).unwrap();
+                });
+            }
+            scope.spawn(|| {
+                barrier.wait();
+                writer
+                    .append(&AuditRecord::new(AuditEvent::Reload, AuditResult::Ok))
+                    .unwrap();
+            });
+        });
+        assert!(fs::read(&path).unwrap().starts_with(&fragment));
+        let rows = tail(&path, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].1.is_err());
+        assert!(rows[1..].iter().all(|(_, record)| record.is_ok()));
+        assert_eq!(uor_line_count(&path), 1);
+        assert_eq!(
+            sink.record(&event).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_pending_receipt_replay_survives_recorded_index_pruning() {
+        let root = tmp_dir("uor-expired-index");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-pending-receipt");
+        let created = 100;
+        sink.record_at(&event, created, Some(created)).unwrap();
+        let later = created + UOR_AUDIT_DEDUP_RETENTION_SECS + 1;
+        sink.record_at(&uor_event("operation-pruning-trigger"), later, Some(later))
+            .unwrap();
+        assert!(!sink
+            .read_index()
+            .unwrap()
+            .entries
+            .contains_key(&event.identity.operation_id));
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            sink.record_at(&event, later, Some(created)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        let mut conflicting = event.clone();
+        conflicting.counts.rules_added += 1;
+        assert!(matches!(
+            sink.record_at(&conflicting, later, Some(created)),
+            Err(UorAuditSinkError::Conflict { .. })
+        ));
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        assert_eq!(
+            reopened.record_at(&event, later, Some(created)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(uor_line_count(&path), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_pruning_watermark_survives_clock_rollback_and_reopen() {
+        let root = tmp_dir("uor-prune-rollback");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-before-rollback");
+        sink.record_at(&event, 100, Some(100)).unwrap();
+        sink.record_at(&uor_event("operation-prune"), 86_501, Some(86_501))
+            .unwrap();
+        let index = sink.read_index().unwrap();
+        assert_eq!(index.pruned_through_unix_seconds, Some(100));
+        assert!(!index.entries.contains_key(&event.identity.operation_id));
+        drop(sink);
+
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            reopened.record_at(&event, 150, Some(100)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        let mut conflicting = event.clone();
+        conflicting.counts.rules_added += 1;
+        assert!(matches!(
+            reopened.record_at(&conflicting, 150, Some(100)),
+            Err(UorAuditSinkError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(uor_line_count(&path), 2);
+
+        // A genuinely new operation beyond the watermark still skips history.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_UOR_AUDIT_EVENT_BYTES * 2 + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        assert_eq!(
+            reopened
+                .record_at(&uor_event("operation-after-rollback"), 150, Some(150))
+                .unwrap(),
+            UorAuditDelivery::Recorded
+        );
+        assert_eq!(
+            reopened.read_index().unwrap().pruned_through_unix_seconds,
+            Some(100)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_rebuilt_index_preserves_pruning_watermark_after_clock_rollback() {
+        let root = tmp_dir("uor-rebuild-rollback");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-before-rebuild");
+        // Receipt creation predates a backward clock step during first delivery.
+        sink.record_at(&event, 50, Some(100)).unwrap();
+        let row = tail(&path, 1).unwrap().pop().unwrap().1.unwrap();
+        assert_eq!(row.ts, "1970-01-01T00:00:50Z");
+        assert_eq!(row.uor_index_time_floor_unix_seconds, Some(100));
+        assert_eq!(
+            row.uor_event_hash.unwrap(),
+            uor_event_hash(
+                &serde_json::to_vec(&normalize_uor_event(event.clone()).unwrap()).unwrap()
+            )
+        );
+        sink.record_at(
+            &uor_event("operation-rebuild-trigger"),
+            86_501,
+            Some(86_501),
+        )
+        .unwrap();
+        let rebuilt = sink.rebuild_index_at(86_501).unwrap();
+        assert_eq!(rebuilt.pruned_through_unix_seconds, Some(100));
+        assert!(!rebuilt.entries.contains_key(&event.identity.operation_id));
+        sink.write_index(&rebuilt).unwrap();
+        drop(sink);
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            reopened.record_at(&event, 150, Some(100)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(uor_line_count(&path), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_legacy_log_without_receipt_floor_recovers_after_rebuild_and_rollback() {
+        let root = tmp_dir("uor-legacy-log-floor");
+        let path = root.join("audit.log");
+        let writer = AuditWriter::open(path.clone()).unwrap();
+        let sink = writer.operator_rules_sink().unwrap();
+        let event = normalize_uor_event(uor_event("operation-legacy-clock")).unwrap();
+        let mut legacy = AuditRecord::new(AuditEvent::OperatorRulesOperation, AuditResult::Ok);
+        legacy.ts = "1970-01-01T00:00:50Z".into();
+        legacy.uor_event_hash = Some(uor_event_hash(&serde_json::to_vec(&event).unwrap()));
+        legacy.uor_operation = Some(event.clone());
+        assert!(!serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("uor_index_time_floor_unix_seconds"));
+        writer.append(&legacy).unwrap();
+        fs::remove_file(&sink.index_path).unwrap();
+
+        let rebuilt = sink.rebuild_index_at(86_501).unwrap();
+        assert!(rebuilt.entries.is_empty());
+        assert_eq!(rebuilt.pruned_through_unix_seconds, Some(u64::MAX));
+        sink.write_index(&rebuilt).unwrap();
+        drop(sink);
+        let reopened = writer.operator_rules_sink().unwrap();
+        let before = fs::read(&path).unwrap();
+        for created in [100, u64::MAX] {
+            assert_eq!(
+                reopened.record_at(&event, 150, Some(created)).unwrap(),
+                UorAuditDelivery::AlreadyRecorded
+            );
+            let mut conflicting = event.clone();
+            conflicting.counts.rules_added += 1;
+            assert!(matches!(
+                reopened.record_at(&conflicting, 150, Some(created)),
+                Err(UorAuditSinkError::Conflict { .. })
+            ));
+        }
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(uor_line_count(&path), 1);
+        assert_eq!(
+            reopened.read_index().unwrap().pruned_through_unix_seconds,
+            Some(u64::MAX)
+        );
+
+        // An older rebuild may already have persisted an unsafe finite watermark.
+        let mut old_index = reopened.read_index().unwrap();
+        old_index.format_version = 1;
+        old_index.pruned_through_unix_seconds = Some(50);
+        reopened.write_index(&old_index).unwrap();
+        drop(reopened);
+        let migrated = writer.operator_rules_sink().unwrap();
+        assert_eq!(
+            migrated.record_at(&event, 150, Some(u64::MAX)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        let index = migrated.read_index().unwrap();
+        assert_eq!(index.format_version, UOR_AUDIT_INDEX_FORMAT);
+        assert_eq!(index.pruned_through_unix_seconds, Some(u64::MAX));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_legacy_index_migrates_watermark_durably_without_duplicate() {
+        let root = tmp_dir("uor-legacy-watermark");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-legacy-pruned");
+        sink.record_at(&event, 100, Some(100)).unwrap();
+        sink.record_at(&uor_event("operation-legacy-trigger"), 86_501, Some(86_501))
+            .unwrap();
+        let mut legacy = serde_json::to_value(sink.read_index().unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("pruned_through_unix_seconds");
+        super::super::atomic_write::hardened_atomic_write(
+            &sink.index_path,
+            &serde_json::to_vec(&legacy).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        drop(sink);
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        assert_eq!(
+            reopened.record_at(&event, 150, Some(100)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        let migrated: UorAuditIndex =
+            serde_json::from_slice(&fs::read(&reopened.index_path).unwrap()).unwrap();
+        assert!(migrated.pruned_through_unix_seconds.unwrap() >= 86_501);
+        assert_eq!(uor_line_count(&path), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_fresh_receipt_skips_history_and_retention_tolerates_clock_rollback() {
+        let root = tmp_dir("uor-fresh-no-scan");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        // This oversized line makes recovery fail closed if history is scanned.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_UOR_AUDIT_EVENT_BYTES * 2 + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        let event = uor_event("operation-clock-rollback");
+        let created = 100;
+        assert_eq!(
+            sink.record_at(&event, 50, Some(created)).unwrap(),
+            UorAuditDelivery::Recorded
+        );
+        let later = created + UOR_AUDIT_DEDUP_RETENTION_SECS;
+        sink.record_at(&uor_event("operation-fresh-trigger"), later, Some(later))
+            .unwrap();
+        assert!(sink
+            .read_index()
+            .unwrap()
+            .entries
+            .contains_key(&event.identity.operation_id));
+        assert_eq!(
+            sink.record_at(&event, later, Some(created)).unwrap(),
+            UorAuditDelivery::AlreadyRecorded
+        );
+        assert!(matches!(
+            sink.record_at(&uor_event("operation-old"), later, Some(0)),
+            Err(UorAuditSinkError::Pending { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uor_changed_retry_is_a_conflict_and_does_not_append() {
+        let root = tmp_dir("uor-conflict");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let event = uor_event("operation-conflict");
+        sink.record(&event).unwrap();
+
+        let mut changed = event.clone();
+        changed.counts.rules_added += 1;
+        assert!(matches!(
+            sink.record(&changed),
+            Err(UorAuditSinkError::Conflict { operation_id })
+                if operation_id == "operation-conflict"
+        ));
+        assert_eq!(uor_line_count(&path), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uor_io_failure_is_pending_and_retryable_after_reopen() {
+        let root = tmp_dir("uor-io-retry");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let event = uor_event("operation-io-retry");
+
+        assert!(matches!(
+            sink.record(&event),
+            Err(UorAuditSinkError::Pending { operation_id, .. })
+                if operation_id == "operation-io-retry"
+        ));
+        drop(sink);
+        fs::remove_dir(&path).unwrap();
+
+        let reopened = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        assert_eq!(reopened.record(&event).unwrap(), UorAuditDelivery::Recorded);
+        assert_eq!(uor_line_count(&path), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uor_model_rejects_sensitive_extensions_and_bounds_entity_ids() {
+        let event = uor_event("operation-redaction");
+        let mut encoded = serde_json::to_value(&event).unwrap();
+        let root = encoded.as_object_mut().unwrap();
+        root.insert("pack_body".into(), serde_json::json!("||private.invalid^"));
+        root.insert("token".into(), serde_json::json!("secret-bearer"));
+        assert!(serde_json::from_value::<UorOperationAuditEvent>(encoded).is_err());
+
+        let root = tmp_dir("uor-bounds");
+        let path = root.join("audit.log");
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        let mut oversized = event;
+        oversized.entities.list_ids = (0..=MAX_UOR_AUDIT_ENTITY_IDS)
+            .map(|index| format!("list-{index}"))
+            .collect();
+        assert!(matches!(
+            sink.record(&oversized),
+            Err(UorAuditSinkError::Invalid {
+                field: "entities.list_ids"
+            })
+        ));
+        assert_eq!(uor_line_count(&path), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_and_uor_records_parse_together_through_tail() {
+        let root = tmp_dir("uor-legacy-tail");
+        let path = root.join("audit.log");
+        let legacy = r#"{"ts":"2026-04-22T16:09:55Z","event":"reload","uid":1000,"files":[],"pre_hash":"aaa","post_hash":"bbb","result":"ok","errors":[]}"#;
+        fs::write(&path, format!("{legacy}\n")).unwrap();
+        let sink = AuditWriter::open(path.clone())
+            .unwrap()
+            .operator_rules_sink()
+            .unwrap();
+        sink.record(&uor_event("operation-mixed-tail")).unwrap();
+
+        let rows = tail(&path, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1.as_ref().unwrap().event, AuditEvent::Reload);
+        let uor = rows[1].1.as_ref().unwrap();
+        assert_eq!(uor.event, AuditEvent::OperatorRulesOperation);
+        assert_eq!(
+            uor.uor_operation.as_ref().unwrap().identity.operation_id,
+            "operation-mixed-tail"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

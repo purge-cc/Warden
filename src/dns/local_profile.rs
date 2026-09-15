@@ -331,7 +331,7 @@ fn filter_or_cname_follow(
     };
 
     let mut target_str = CompactString::default();
-    let _ = write!(target_str, "{}", &**target);
+    let _ = write!(target_str, "{}", **target);
     if target_str.ends_with('.') {
         target_str.pop();
     }

@@ -24,7 +24,38 @@ use crate::config::settings::{EcsConfig, EcsMode};
 use crate::dns::edns::{AddressFamily, EdnsClientSubnet};
 use crate::dns::local_profile::ProfileLocalRecords;
 use crate::dns::rewrite::ProfileRewriteRules;
+use crate::filter::operator_rules::{CompiledOperatorRules, CompiledProfile};
 use crate::filter::rules::{self, DnsRule, RuleAction};
+
+/// Immutable link from a resolved runtime profile to the operator-rule
+/// snapshot that compiled its Custom List mounts.  The link owns the snapshot
+/// handle, so a request can retain its exact policy generation across an
+/// asynchronous upstream round-trip without consulting another ArcSwap.
+#[derive(Debug, Clone)]
+pub struct CompiledProfileBinding {
+    rules: Arc<CompiledOperatorRules>,
+    profile_index: usize,
+}
+
+impl CompiledProfileBinding {
+    pub(crate) fn new(rules: Arc<CompiledOperatorRules>, profile_id: Id) -> Option<Self> {
+        let profile_index = rules.profile_index(&profile_id)?;
+        Some(Self {
+            rules,
+            profile_index,
+        })
+    }
+
+    #[inline(always)]
+    pub fn profile(&self) -> &CompiledProfile {
+        // `new` proves this id exists and the immutable snapshot cannot lose
+        // it.  A missing entry would be a programmer error at map build, not
+        // a network-controlled condition.
+        self.rules
+            .profile_at(self.profile_index)
+            .expect("compiled profile binding index points into its snapshot")
+    }
+}
 
 /// The per-resolution ECS knob carried by every
 /// [`ResolvedProfile`]. Pre-flattened from `Profile.ecs` + the global
@@ -264,6 +295,11 @@ pub struct ResolvedProfile {
     /// call site — when `enabled = false`, the upstream skips the
     /// build_option call regardless of policy value.
     pub ecs_policy: EcsPolicy,
+    /// Schema-5 operator policy.  Production resolver construction always
+    /// fills this from the one shared `CompiledOperatorRules` snapshot.
+    /// `None` is retained solely for explicit V1 compatibility builders and
+    /// is fail-closed by the DNS runtime.
+    pub operator_rules: Option<CompiledProfileBinding>,
 }
 
 impl ResolvedProfile {
@@ -390,6 +426,7 @@ impl ResolvedProfile {
             local_records,
             rewrite_rules,
             ecs_policy: EcsPolicy::OFF,
+            operator_rules: None,
         }
     }
 
@@ -419,6 +456,7 @@ impl ResolvedProfile {
             local_records: Arc::new(ProfileLocalRecords::default()),
             rewrite_rules: Arc::new(ProfileRewriteRules::default()),
             ecs_policy: EcsPolicy::OFF,
+            operator_rules: None,
         }
     }
 
@@ -455,11 +493,28 @@ impl ResolvedProfile {
             local_records: self.local_records.clone(),
             rewrite_rules: self.rewrite_rules.clone(),
             ecs_policy: self.ecs_policy,
+            operator_rules: self.operator_rules.clone(),
         }
+    }
+
+    /// Attach the already-compiled V5 Custom List policy.  This is a cold
+    /// build-time operation; request evaluation only follows the immutable
+    /// binding and never parses V1 admin/custom-list fields.
+    pub(crate) fn bind_operator_rules(&mut self, rules: Arc<CompiledOperatorRules>) {
+        self.operator_rules = CompiledProfileBinding::new(
+            rules,
+            Id::new(self.name.as_str()).expect("resolved profile id"),
+        );
+        // The V1 parser is intentionally compatibility-only.  Clear every
+        // semantic field it populated so a production evaluator cannot
+        // accidentally branch back to V4 semantics.
+        self.allow_domains = Arc::new(HashSet::with_hasher(RandomState::new()));
+        self.deny_domains = Arc::new(HashSet::with_hasher(RandomState::new()));
+        self.rules = Arc::new(Vec::new());
     }
 }
 
-/// Per-device overlay attached to the resolver state.
+/// Per-device overlay attached to the legacy V1 compatibility resolver.
 ///
 /// Holds two `Arc<HashSet>` carrying the *exact-or-subdomain* allow / deny
 /// domains derived from the device's `allow_rules` / `deny_rules` admin
@@ -631,6 +686,9 @@ pub fn resolve_profile_blocklist_ids(profile: &Profile, blocklists: &[Blocklist]
 mod tests {
     use super::*;
     use crate::config::schema::{AdminRule, Group, Id, Profile, ServerGlobals};
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+    };
 
     fn mk_rule(id: &str, rule: &str) -> AdminRule {
         AdminRule {
@@ -641,6 +699,45 @@ mod tests {
 
     fn rules_by_id(rules: &[AdminRule]) -> BTreeMap<&Id, &AdminRule> {
         rules.iter().map(|r| (&r.id, r)).collect()
+    }
+
+    #[test]
+    fn compiled_binding_uses_the_profile_index_selected_at_build() {
+        let limits = RuleCompileLimits::default();
+        let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+        let rules = Arc::new(
+            CompiledOperatorRules::compile(
+                &[
+                    PackSource {
+                        list_id: "alpha",
+                        content: "alpha.test",
+                    },
+                    PackSource {
+                        list_id: "beta",
+                        content: "beta.test",
+                    },
+                ],
+                &[
+                    ProfileMounts {
+                        profile_id: "alpha",
+                        custom_lists: &["alpha"],
+                        block_all: false,
+                    },
+                    ProfileMounts {
+                        profile_id: "beta",
+                        custom_lists: &["beta"],
+                        block_all: false,
+                    },
+                ],
+                limits,
+                &admission,
+            )
+            .unwrap(),
+        );
+        let binding = CompiledProfileBinding::new(rules, Id::new("beta").unwrap()).unwrap();
+        assert_eq!(binding.profile().indexed_domains(), 1);
+        assert!(binding.profile().lookup("beta.test").is_some());
+        assert!(binding.profile().lookup("alpha.test").is_none());
     }
 
     #[test]

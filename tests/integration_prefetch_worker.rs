@@ -64,6 +64,7 @@ impl Upstream for CountingUpstream {
         Ok(UpstreamResponse {
             records: vec![rec],
             response_code: ResponseCode::NoError,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: vec![],

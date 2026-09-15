@@ -1,15 +1,15 @@
-# purge-warden configuration reference (schema v4)
+# purge-warden configuration reference (schema v5)
 # https://purge.cc
 #
 # Commented values show defaults — uncomment and edit as needed.
 # `warden init` generates a working starter config; this file documents
 # the option surface. Validate after editing: warden config lint
 #
-# v2 model in one line: lists live as [[blocklists]] entities carrying
-# `tags`; profiles/devices/subnets carry `tags` too; a list applies
-# where the tag sets intersect.
+# Lists live as [[blocklists]] entities with a global `base` direction.
+# Profiles inherit that direction or override it per list through `lists`.
+# Device/group/subnet resolution selects the profile; tags do not assign lists.
 
-schema_version = 4
+schema_version = 5
 
 # ── Server ───────────────────────────────────────────────────────
 [server]
@@ -30,8 +30,9 @@ schema_version = 4
 # [[groups]] or [[subnets]] row. Unset means REFUSED for unknown clients.
 # default_profile = "default"
 
-# Canned answer for blocked domains: "zero" (A→0.0.0.0 / AAAA→::) or
-# "nxdomain". Per-profile override: [profiles.<id>] block_response.
+# Canned answer for blocked domains: "zero" (A→0.0.0.0 / AAAA→::),
+# "nxdomain", "refused" or "soa_nodata".
+# Per-profile override: [profiles.<id>] block_response.
 # default_block_response = "zero"
 
 # TTL (seconds) for canned blocked responses.
@@ -42,8 +43,8 @@ schema_version = 4
 # Clients use TCP for large responses (DNSSEC, DKIM TXT records).
 # tcp_timeout_secs = 10
 
-# Verify device MAC addresses against /proc/net/arp at query time.
-# Prevents ARP-spoof profile hijack for MAC-pinned devices.
+# Verify configured device MAC addresses against the local ARP snapshot.
+# A mismatch falls back to subnet/default policy; this is not user authentication.
 # enforce_device_mac = true
 
 # ── Upstream DNS ─────────────────────────────────────────────────
@@ -69,9 +70,9 @@ schema_version = 4
 # mode = "plain"
 # servers = ["192.0.2.60:53", "192.0.2.61:53"]
 
-# ── Blocklists (v2 entities) ─────────────────────────────────────
-# Each subscribed list is a [[blocklists]] row. `tags` drives which
-# profiles/devices the list applies to (tag intersection). URLs for the
+# ── Blocklists (schema v3 entities) ───────────────────────────────
+# Each subscribed list is a [[blocklists]] row with base = "deny", "allow"
+# or "ignore". Profiles can override the direction per list. URLs for the
 # purge.cc catalog are FLAT: https://lists.purge.cc/<topic>.txt —
 # browse ids + URLs with: warden lists catalog
 # Add from the CLI: warden blocklist add <id> --url <url>
@@ -80,19 +81,18 @@ schema_version = 4
 # id = "security-malicious"
 # display_name = "Security: malicious"
 # url = "https://lists.purge.cc/malicious.txt"
-# tags = ["uncategorized"]
+# base = "deny"
 #
 # [[blocklists]]
 # id = "privacy-ads"
 # display_name = "Privacy: ads"
 # url = "https://lists.purge.cc/ads.txt"
-# tags = ["uncategorized"]
+# base = "deny"
 
 # ── Lists (download engine) ──────────────────────────────────────
 [lists]
 # Legacy slug channel. Leave empty: subscriptions belong in
-# [[blocklists]] rows above — only entities carry the tags that join
-# lists to profiles. Do NOT mirror an entity here as a slug; the two
+# [[blocklists]] rows above. Do NOT mirror an entity here as a slug; the two
 # channels get separate filter bits and the profile ends up masking
 # bits the downloads never populate (silent no-blocking).
 # sources = []
@@ -133,28 +133,30 @@ schema_version = 4
 # cname_max_depth = 16
 
 # ── Profiles ─────────────────────────────────────────────────────
-# Named filtering profiles. A profile's `tags` select which
-# [[blocklists]] apply (tag intersection). Custom allow/deny rules are
-# [[admin_rules]] entities referenced by id — see CONFIG_GUIDE.
+# Named filtering profiles inherit each blocklist's base direction.
+# A profile's `lists` map overrides individual list directions.
+# Admin allow/deny rules are [[admin_rules]] entities referenced by id;
+# operator-owned custom lists can also be mounted on profiles.
 #
 # [profiles.default]
 # display_name = "Default household profile"
-# tags = ["uncategorized"]
+# lists = { "privacy-ads" = "deny" }
 #
 # [profiles.kids]
 # display_name = "Kids"
-# tags = ["uncategorized", "kids-safe"]
-# safe_search = true           # force Google/Bing/DDG/YouTube SafeSearch
+# lists = { "privacy-ads" = "deny", "security-malicious" = "deny" }
+# SafeSearch needs explicit [[profiles.kids.rewrite_rules]] entries.
+# The legacy safe_search = true flag is inert and emits a warning.
 # block_response = "nxdomain"  # per-profile override of the canned answer
 #
 # [profiles.night]
 # display_name = "Night clamp"
-# tags = []
 # block_all = true
 
 # ── Devices / Groups / Subnets ───────────────────────────────────
-# Map sources to profiles. Resolution order: device > group > subnet >
-# server.default_profile. Manage from the CLI: warden device add …
+# Map sources to profiles. Resolution order: direct device profile > active
+# device/group schedule > group > subnet > server.default_profile.
+# Manage from the CLI: warden device add …
 #
 # [[devices]]
 # id = "laptop-anna"
@@ -198,18 +200,24 @@ schema_version = 4
 # top_n_interval_secs = 10
 
 # Maximum number of devices to track.
-# max_clients = 1024
+# max_devices = 1024
 
 # Enable query logging to file.
-# query_log_enabled = false
+# query_log_enabled = true
 
 # Path to the query log file.
 # query_log_path = "./query.log"
 
-# Max query log file size before rotation (MB).
+# Retain daily query-log files for this many days.
+# retention_days = 7
+# Logging mode: "all", "blocked_only", or a sampling table.
+# log_mode = "all"
+# Example: log_mode = { sampled = { allowed_rate = 0.1 } }
+
+# Per-day query log overflow size (MB); normal rotation is daily.
 # query_log_max_size_mb = 100
 
-# Max number of rotated log files to keep.
+# Max number of per-day overflow files; retention_days controls history.
 # query_log_max_files = 7
 
 # ── REST API ─────────────────────────────────────────────────────
@@ -233,7 +241,7 @@ schema_version = 4
 
 # ── Security ─────────────────────────────────────────────────────
 [security]
-# Master switch for all security features (RRL, rate limiting, tunneling).
+# Master switch for RRL, rate limiting, tunneling and the anti-bypass checker.
 # enabled = true
 
 # Response Rate Limiting — prevents DNS amplification attacks.
@@ -266,11 +274,11 @@ schema_version = 4
 
 # ── Anti-Bypass ──────────────────────────────────────────────────
 [anti_bypass]
-# Block queries to known public DoH/DoT resolver domains.
-# Prevents clients from circumventing the filter.
+# Block queries for the resolver domains listed explicitly below.
+# Requires security.enabled too; cannot stop direct IP or external VPN traffic.
 # enabled = true
 
-# Additional domains to block beyond the built-in list (40+ resolvers).
+# Entire domain set for this checker. No built-in resolver list is supplied.
 # extra_domains = []
 
 # ── Local DNS ────────────────────────────────────────────────────
@@ -316,7 +324,8 @@ schema_version = 4
 [ip_blocklists]
 # enabled = false
 # sources = ["https://example.com/bad-ips.txt"]
-# inline = ["203.0.113.0/24"]
+# Exact IPv4/IPv6 addresses only; CIDR ranges and GeoIP are not supported.
+# inline = ["203.0.113.10", "2001:db8::10"]
 
 # ── Backup ───────────────────────────────────────────────────────
 # Config backup engine (CLI: warden config backup / restore; TUI:

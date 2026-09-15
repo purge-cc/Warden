@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use crate::cli::exit_codes::{CONFIG, FAILURE, SUCCESS};
-use crate::config::loader::load_config;
+use crate::config::loader::load_current_config;
 use crate::config::schema::validator::{inert_blocklists, InertListReason};
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client;
@@ -138,6 +138,10 @@ fn print_live_status(
             // the text CLI summary; the field is destructured here to
             // keep the pattern exhaustive but intentionally not printed.
             resource_budget: _,
+            lists_memory_bytes: _,
+            query_log_client_ips_supported: _,
+            tracking_enabled: _,
+            top_lists_24h_supported: _,
             upstream_servers,
         } => {
             // Surface the daemon binary version in the header line when
@@ -303,7 +307,7 @@ fn print_live_status_json(
     // make consumers special-case the key, so it is always present
     // (possibly an empty array).
     let now = time::OffsetDateTime::now_utc();
-    let inert: Vec<serde_json::Value> = match load_config(config_path, now) {
+    let inert: Vec<serde_json::Value> = match load_current_config(config_path, now) {
         Ok(loaded) => inert_blocklists(&loaded.config)
             .into_iter()
             .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason.message(id) }))
@@ -333,6 +337,10 @@ fn print_live_status_json(
         lists_corpus_freeze,
         lc2_list_diagnostics,
         resource_budget,
+        lists_memory_bytes,
+        query_log_client_ips_supported,
+        tracking_enabled,
+        top_lists_24h_supported,
         upstream_servers,
     } = resp
     {
@@ -401,6 +409,16 @@ fn print_live_status_json(
         map.insert(
             "resource_budget".into(),
             serde_json::to_value(resource_budget).unwrap_or(serde_json::Value::Null),
+        );
+        map.insert("lists_memory_bytes".into(), lists_memory_bytes.into());
+        map.insert("tracking_enabled".into(), tracking_enabled.into());
+        map.insert(
+            "top_lists_24h_supported".into(),
+            top_lists_24h_supported.into(),
+        );
+        map.insert(
+            "query_log_client_ips_supported".into(),
+            query_log_client_ips_supported.into(),
         );
         // Emit the per-server upstream list (empty array for a
         // older daemon — `upstream_mode`/`upstream_count` above remain
@@ -530,7 +548,7 @@ fn print_offline_status(
     // The printed fields are pass-through sections on `ConfigV1`
     // (`server`/`upstream`/`lists`/`cache`).
     let now = time::OffsetDateTime::now_utc();
-    let loaded = match load_config(config_path, now) {
+    let loaded = match load_current_config(config_path, now) {
         Ok(l) => l,
         Err(errs) => {
             eprintln!(
@@ -624,7 +642,7 @@ fn print_offline_status_json(
     );
 
     let now = time::OffsetDateTime::now_utc();
-    let code = match load_config(config_path, now) {
+    let code = match load_current_config(config_path, now) {
         Ok(loaded) => {
             let cfg = &loaded.config;
             map.insert("listen".into(), cfg.server.listen.to_string().into());
@@ -701,7 +719,7 @@ fn format_inert_lists(rows: &[(&str, InertListReason)]) -> Vec<String> {
 /// An unreadable config yields no section, exactly like zero inert lists.
 fn inert_list_lines(config_path: &Path) -> Vec<String> {
     let now = time::OffsetDateTime::now_utc();
-    let Ok(loaded) = load_config(config_path, now) else {
+    let Ok(loaded) = load_current_config(config_path, now) else {
         return Vec::new();
     };
     format_inert_lists(&inert_blocklists(&loaded.config))
@@ -1291,7 +1309,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1328,7 +1346,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1362,7 +1380,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+            "schema_version = 5\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
              default_profile = \"default\"\n\n[profiles.default]\n\
              display_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
@@ -1845,7 +1863,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"

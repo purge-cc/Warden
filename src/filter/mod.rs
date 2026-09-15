@@ -4,6 +4,7 @@ pub mod cname;
 pub mod engine;
 pub mod evaluator;
 pub mod ip_filter;
+pub mod operator_rules;
 pub mod rules;
 
 pub use engine::FilterEngine;

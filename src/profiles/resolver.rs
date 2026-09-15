@@ -55,14 +55,16 @@ use arc_swap::ArcSwap;
 use compact_str::CompactString;
 
 use super::arp;
-use super::profile::{DeviceOverlay, ResolvedProfile};
+use super::profile::ResolvedProfile;
 use super::schedule::{self, ParsedSchedule};
 use crate::config::cidr::Cidr;
 use crate::config::custom_list::CustomListStore;
 use crate::config::list_state::ListState;
 use crate::config::schema::{AdminRule, ConfigV1, Group, Id, ScheduleTargetType};
+use crate::filter::operator_rules::CompiledOperatorRules;
 use crate::ipc::protocol::MappedDeviceDto;
 use crate::lists::source_key::SourceBitMap;
+use crate::operator_rules::activation::ActivePolicyIdentity;
 
 /// Which of the five resolver-chain levels matched a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,16 +117,12 @@ pub struct Resolution {
     pub matched_subnet: Option<Id>,
     /// Schedule id that overrode at level 2.
     pub matched_schedule: Option<Id>,
-    /// Per-device overlay attached when the matched device declared
-    /// `allow_rules` / `deny_rules`. `None` for devices with empty
-    /// overlay, anonymous sources (subnet/default level with no device
-    /// match), and the REFUSED sentinel — the hot path treats `None` as
-    /// "fall through to profile evaluation only".
-    pub overlay: Option<Arc<DeviceOverlay>>,
+    /// Resolver generation acquired with the profile and overlay.
+    pub policy_generation: u64,
 }
 
 impl Resolution {
-    fn refused() -> Self {
+    fn refused(policy_generation: u64) -> Self {
         Self {
             profile: None,
             level: None,
@@ -133,7 +131,7 @@ impl Resolution {
             matched_group: None,
             matched_subnet: None,
             matched_schedule: None,
-            overlay: None,
+            policy_generation,
         }
     }
 }
@@ -204,6 +202,10 @@ struct MacMismatchRing {
 /// load / reload and replaced atomically via [`ArcSwap::store`].
 #[derive(Clone)]
 struct ResolverMap {
+    policy_identity: ActivePolicyIdentity,
+    source_config: Arc<ConfigV1>,
+    source_custom_lists: Arc<CustomListStore>,
+    source_operator_rules: Option<Arc<CompiledOperatorRules>>,
     /// Every profile referenced by the config, pre-resolved. Shared as
     /// `Arc<ResolvedProfile>` so each indexed entry just clones a handle.
     /// Retained on the map even though every hot-path lookup goes
@@ -221,14 +223,6 @@ struct ResolverMap {
     /// Every `DeviceIndex` keyed by its stable id — used by the IPC
     /// snapshot builder and by group / schedule lookups.
     devices_by_id: HashMap<Id, Arc<DeviceIndex>>,
-    /// Per-device overlay, indexed by device id. Devices with both
-    /// `allow_rules` and `deny_rules` empty get NO entry here — the
-    /// resolver attaches `Resolution.overlay = None` for them, matching
-    /// the hot path byte-for-byte for devices with no overlay state.
-    /// Each `Arc<DeviceOverlay>` lives next to the per-device profile
-    /// pointer in this same `ResolverMap`, so a single `ArcSwap`
-    /// snapshot delivers both consistently.
-    device_overlays: HashMap<Id, Arc<DeviceOverlay>>,
     /// For each device: the groups it belongs to, pre-sorted by priority
     /// descending. Level-3 resolution picks the first entry.
     device_groups: HashMap<Id, Vec<GroupMatch>>,
@@ -378,7 +372,12 @@ impl ProfileResolver {
     /// Build a resolver without list-bit projection. List membership is
     /// published with the filter generation, not stored in this resolver.
     pub fn build_without_list_bits(config: &ConfigV1, custom_lists: &CustomListStore) -> Self {
-        let map = build_resolver_map(config, custom_lists);
+        let map = build_resolver_map(
+            Arc::new(config.clone()),
+            Arc::new(custom_lists.clone()),
+            None,
+            ActivePolicyIdentity::default(),
+        );
         let arp_by_ip = build_arp_snapshot();
         Self {
             inner: ArcSwap::from_pointee(map),
@@ -394,6 +393,76 @@ impl ProfileResolver {
         custom_lists: &CustomListStore,
     ) -> Self {
         Self::build_without_list_bits(config, custom_lists)
+    }
+
+    /// Production constructor: projected non-rule `ConfigV1` plus the one
+    /// shared immutable V5 Custom List snapshot.
+    pub fn build_with_operator_rules(config: &ConfigV1, rules: Arc<CompiledOperatorRules>) -> Self {
+        Self::build_with_operator_rules_and_policy_identity(
+            config,
+            rules,
+            ActivePolicyIdentity::default(),
+        )
+    }
+
+    /// Production constructor with the captured policy identity.  Root's
+    /// startup lane should use this form so resolver generation, projected
+    /// config revision and compiled snapshot are published as one unit.
+    pub fn build_with_operator_rules_and_policy_identity(
+        config: &ConfigV1,
+        rules: Arc<CompiledOperatorRules>,
+        identity: ActivePolicyIdentity,
+    ) -> Self {
+        let map = build_resolver_map(
+            Arc::new(config.clone()),
+            Arc::new(CustomListStore::new()),
+            Some(rules),
+            identity,
+        );
+        Self {
+            inner: ArcSwap::from_pointee(map),
+            arp_by_ip: ArcSwap::from_pointee(build_arp_snapshot()),
+            mac_mismatch_warns: MacMismatchRing::new(),
+        }
+    }
+
+    /// Atomically replace projected runtime data and its compiled V5 policy.
+    pub fn swap_with_operator_rules(&self, config: &ConfigV1, rules: Arc<CompiledOperatorRules>) {
+        let identity = self.inner.load().policy_identity.clone();
+        self.swap_with_operator_rules_and_policy_identity(config, rules, identity);
+    }
+
+    /// Atomically replace projected data, compiled V5 policy, and its
+    /// externally-captured identity.  The swap loop derives only the
+    /// monotonic resolver generation; all semantic identity comes from the
+    /// caller's capture.
+    pub fn swap_with_operator_rules_and_policy_identity(
+        &self,
+        config: &ConfigV1,
+        rules: Arc<CompiledOperatorRules>,
+        mut identity: ActivePolicyIdentity,
+    ) -> ActivePolicyIdentity {
+        let source_config = Arc::new(config.clone());
+        self.arp_by_ip.store(Arc::new(build_arp_snapshot()));
+        loop {
+            let current = self.inner.load_full();
+            identity.resolver_generation = current
+                .policy_identity
+                .resolver_generation
+                .saturating_add(1)
+                .max(1);
+            let map = build_resolver_map(
+                Arc::clone(&source_config),
+                Arc::new(CustomListStore::new()),
+                Some(Arc::clone(&rules)),
+                identity.clone(),
+            );
+            let previous = self.inner.compare_and_swap(&current, Arc::new(map));
+            if Arc::ptr_eq(&current, &previous) {
+                break;
+            }
+        }
+        identity
     }
 
     /// Compatibility rebuild entry point retaining the unused list-bit
@@ -415,11 +484,98 @@ impl ProfileResolver {
 
     /// Rebuild resolver state without constructing an unused list bitmap.
     pub fn swap_without_list_bits(&self, config: &ConfigV1, custom_lists: &CustomListStore) {
-        let map = build_resolver_map(config, custom_lists);
+        let mut identity = self.inner.load().policy_identity.clone();
+        // This compatibility entry has no captured revision. Carrying the
+        // previous digest across arbitrary inputs would certify stale policy.
+        identity.config_revision.clear();
+        identity.operator_policy_hash.clear();
+        self.swap_with_policy_identity(config, custom_lists, identity);
+    }
+
+    /// Build the initial resolver with the identity of the captured policy tree.
+    pub fn build_with_policy_identity(
+        config: &ConfigV1,
+        custom_lists: &CustomListStore,
+        identity: ActivePolicyIdentity,
+    ) -> Self {
+        let map = build_resolver_map(
+            Arc::new(config.clone()),
+            Arc::new(custom_lists.clone()),
+            None,
+            identity,
+        );
+        let arp_by_ip = build_arp_snapshot();
+        Self {
+            inner: ArcSwap::from_pointee(map),
+            arp_by_ip: ArcSwap::from_pointee(arp_by_ip),
+            mac_mismatch_warns: MacMismatchRing::new(),
+        }
+    }
+
+    /// Publish config, Custom Lists and their identity through one resolver swap.
+    pub fn swap_with_policy_identity(
+        &self,
+        config: &ConfigV1,
+        custom_lists: &CustomListStore,
+        mut identity: ActivePolicyIdentity,
+    ) -> ActivePolicyIdentity {
+        let source_config = Arc::new(config.clone());
+        let source_custom_lists = Arc::new(custom_lists.clone());
         let arp_by_ip = build_arp_snapshot();
         self.arp_by_ip.store(Arc::new(arp_by_ip));
-        self.inner.store(Arc::new(map));
-        tracing::info!("profile map swapped");
+        loop {
+            let current = self.inner.load_full();
+            identity.resolver_generation = current
+                .policy_identity
+                .resolver_generation
+                .saturating_add(1)
+                .max(1);
+            let map = build_resolver_map(
+                Arc::clone(&source_config),
+                Arc::clone(&source_custom_lists),
+                None,
+                identity.clone(),
+            );
+            let previous = self.inner.compare_and_swap(&current, Arc::new(map));
+            if Arc::ptr_eq(&current, &previous) {
+                break;
+            }
+        }
+        tracing::info!(
+            generation = identity.resolver_generation,
+            config_revision = %identity.config_revision,
+            operator_policy_hash = %identity.operator_policy_hash,
+            "profile map swapped"
+        );
+        identity
+    }
+
+    /// Return one coherent identity from the currently published resolver map.
+    pub fn active_policy_identity(&self) -> ActivePolicyIdentity {
+        self.inner.load().policy_identity.clone()
+    }
+
+    /// Re-evaluate schedule windows from the already-active policy snapshot.
+    ///
+    /// Reading the files here would let an unacknowledged disk edit bypass the
+    /// normal reload gates.  The temporal generation changes while the semantic
+    /// hash and config revision remain those of the accepted policy.
+    pub fn refresh_schedules(&self) -> ActivePolicyIdentity {
+        loop {
+            let current = self.inner.load_full();
+            let mut identity = current.policy_identity.clone();
+            identity.resolver_generation = identity.resolver_generation.saturating_add(1).max(1);
+            let map = build_resolver_map(
+                Arc::clone(&current.source_config),
+                Arc::clone(&current.source_custom_lists),
+                current.source_operator_rules.clone(),
+                identity.clone(),
+            );
+            let previous = self.inner.compare_and_swap(&current, Arc::new(map));
+            if Arc::ptr_eq(&current, &previous) {
+                return identity;
+            }
+        }
     }
 
     /// Resolve a query source IP through the 5-level chain. Each level
@@ -513,14 +669,6 @@ impl ProfileResolver {
             }
         };
 
-        // Overlay lookup runs once against the same ArcSwap snapshot
-        // (`map`) used by the rest of the resolution. Both the profile
-        // pointer and the overlay pointer come from a single load — no
-        // torn read possible across reload.
-        let overlay_for = |dev: &DeviceIndex| -> Option<Arc<DeviceOverlay>> {
-            map.device_overlays.get(&dev.id).cloned()
-        };
-
         if let Some(dev) = device_candidate.as_ref() {
             // Level 2 first — schedule overrides all non-direct levels,
             // but only takes effect when the device is resolved. A
@@ -544,7 +692,7 @@ impl ProfileResolver {
                     matched_group: None,
                     matched_subnet: None,
                     matched_schedule: Some(sched_hit.id.clone()),
-                    overlay: overlay_for(dev),
+                    policy_generation: map.policy_identity.resolver_generation,
                 };
             }
 
@@ -558,7 +706,7 @@ impl ProfileResolver {
                     matched_group: None,
                     matched_subnet: None,
                     matched_schedule: None,
-                    overlay: overlay_for(dev),
+                    policy_generation: map.policy_identity.resolver_generation,
                 };
             }
 
@@ -576,7 +724,7 @@ impl ProfileResolver {
                         matched_group: Some(first.id.clone()),
                         matched_subnet: None,
                         matched_schedule: None,
-                        overlay: overlay_for(dev),
+                        policy_generation: map.policy_identity.resolver_generation,
                     };
                 }
             }
@@ -624,7 +772,7 @@ impl ProfileResolver {
                     matched_group: None,
                     matched_subnet: Some(sn.id.clone()),
                     matched_schedule: None,
-                    overlay: device_candidate.as_ref().and_then(|d| overlay_for(d)),
+                    policy_generation: map.policy_identity.resolver_generation,
                 };
             }
         }
@@ -639,9 +787,9 @@ impl ProfileResolver {
                 matched_group: None,
                 matched_subnet: None,
                 matched_schedule: None,
-                overlay: device_candidate.as_ref().and_then(|d| overlay_for(d)),
+                policy_generation: map.policy_identity.resolver_generation,
             },
-            None => Resolution::refused(),
+            None => Resolution::refused(map.policy_identity.resolver_generation),
         }
     }
 
@@ -1060,7 +1208,15 @@ fn unfiltered_variant(
     }
 }
 
-fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> ResolverMap {
+fn build_resolver_map(
+    source_config: Arc<ConfigV1>,
+    source_custom_lists: Arc<CustomListStore>,
+    // The shared V5 runtime snapshot retained for schedule refreshes.
+    source_operator_rules: Option<Arc<CompiledOperatorRules>>,
+    policy_identity: ActivePolicyIdentity,
+) -> ResolverMap {
+    let config = source_config.as_ref();
+    let custom_lists = source_custom_lists.as_ref();
     // Pre-resolve every profile once. The order of insertion doesn't matter
     // for correctness (the map is used as a dictionary), but we iterate
     // BTreeMap for deterministic log messages.
@@ -1094,6 +1250,17 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
             profile.ecs.as_ref(),
             &config.upstream.ecs,
         );
+        if let Some(rules) = source_operator_rules.as_ref() {
+            resolved.bind_operator_rules(Arc::clone(rules));
+            if resolved.operator_rules.is_none() {
+                // A V5 snapshot without this profile is an invalid projection.
+                // Do not publish a resolved profile that could ever take the
+                // compatibility evaluator; every device referring to it will
+                // resolve to the existing fail-closed REFUSED sentinel.
+                tracing::warn!(profile = %id.as_str(), "compiled operator snapshot omitted projected profile; skipping profile");
+                continue;
+            }
+        }
         profiles.insert(id, Arc::new(resolved));
     }
 
@@ -1128,12 +1295,6 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
     let mut devices_by_mac: HashMap<CompactString, Arc<DeviceIndex>> = HashMap::new();
     let mut devices_by_id: HashMap<Id, Arc<DeviceIndex>> = HashMap::new();
     // Per-device overlays parallel the device index. Only
-    // populated for devices that declared `allow_rules` / `deny_rules` —
-    // empty-overlay devices are absent from the map, so their hot path
-    // sees `Resolution.overlay = None` and runs the unchanged hot path.
-    // `DeviceOverlay::build_v1` shares the already-built
-    // `admin_rules_by_id` map with `ResolvedProfile::build_v1`.
-    let mut device_overlays: HashMap<Id, Arc<DeviceOverlay>> = HashMap::new();
     // Device-network-name indexes. Both are config-static; the IP
     // behind a name is looked up at query time against the
     // independently-refreshed ARP snapshot.
@@ -1186,13 +1347,6 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
             if dev.network_name_wildcard {
                 network_name_wildcards.push((key, dev.id.clone()));
             }
-        }
-
-        // Build per-device overlay if the device declared
-        // any allow/deny rule references. The build helper returns
-        // `None` for empty / all-skipped rule sets.
-        if let Some(overlay) = DeviceOverlay::build_v1(dev, &admin_rules_by_id) {
-            device_overlays.insert(dev.id.clone(), overlay);
         }
 
         if let Some(ip) = dev.ip {
@@ -1449,11 +1603,11 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
     let slug_to_id = build_slug_to_id_map(config);
 
     ResolverMap {
+        policy_identity,
         profiles,
         devices_by_ip,
         devices_by_mac,
         devices_by_id,
-        device_overlays,
         device_groups,
         subnets,
         active_schedule_by_device,
@@ -1462,6 +1616,9 @@ fn build_resolver_map(config: &ConfigV1, custom_lists: &CustomListStore) -> Reso
         slug_to_id,
         network_names,
         network_name_wildcards,
+        source_config,
+        source_custom_lists,
+        source_operator_rules,
     }
 }
 
@@ -1809,6 +1966,7 @@ fn snapshots_from(
             // device's IPs); resolver builds the metadata-only
             // skeleton.
             hourly_queries: Vec::new(),
+            hourly_blocked: None,
             queries: 0,
             queries_today: 0,
             blocked: 0,
@@ -1886,3 +2044,169 @@ fn effective_profile_name(index: &DeviceIndex, map: &ResolverMap) -> String {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests;
+
+#[cfg(test)]
+mod policy_snapshot_tests {
+    use super::*;
+    use crate::config::custom_list::CompiledCustomList;
+    use crate::config::schema::Profile;
+    use std::collections::BTreeMap;
+
+    fn identity(revision: &str) -> ActivePolicyIdentity {
+        ActivePolicyIdentity {
+            daemon_instance_id: "daemon-test".into(),
+            config_revision: revision.into(),
+            operator_policy_hash: format!("hash-{revision}"),
+            resolver_generation: 1,
+        }
+    }
+
+    fn policy() -> (ConfigV1, CustomListStore) {
+        let mut config = ConfigV1::test_scaffold();
+        let pack = Id::new("local").unwrap();
+        config.server.default_profile = Some(Id::new("default").unwrap());
+        config.profiles.insert(
+            "default".into(),
+            Profile {
+                custom_lists: vec![pack.clone()],
+                ..Profile::default()
+            },
+        );
+        let store = BTreeMap::from([(
+            pack,
+            CompiledCustomList {
+                deny: vec!["blocked.example.test".into()],
+                ..CompiledCustomList::default()
+            },
+        )]);
+        (config, store)
+    }
+
+    #[test]
+    fn schedule_refresh_retains_active_config_pack_and_identity() {
+        let (mut config, mut store) = policy();
+        let resolver = ProfileResolver::build_with_policy_identity(&config, &store, identity("a"));
+        config.profiles.clear();
+        store.clear();
+
+        let refreshed = resolver.refresh_schedules();
+        let current = resolver.inner.load_full();
+        assert_eq!(refreshed.config_revision, "a");
+        assert_eq!(refreshed.operator_policy_hash, "hash-a");
+        assert_eq!(refreshed.resolver_generation, 2);
+        assert_eq!(current.source_config.profiles.len(), 1);
+        assert_eq!(current.source_custom_lists.len(), 1);
+        let resolved = resolver.resolve(&"192.0.2.55".parse().unwrap());
+        assert!(resolved.profile.is_some());
+        assert_eq!(resolved.policy_generation, refreshed.resolver_generation);
+    }
+
+    #[test]
+    fn schedule_refresh_shares_source_inputs_and_pack_buffers() {
+        let (config, mut store) = policy();
+        let pack_id = Id::new("local").unwrap();
+        store.get_mut(&pack_id).unwrap().allow = vec!["long-permitted-domain.example.test".into()];
+        let resolver = ProfileResolver::build_with_policy_identity(&config, &store, identity("a"));
+        let retained = resolver.inner.load_full();
+        let retained_pack = &retained.source_custom_lists[&pack_id];
+        assert!(!retained_pack.allow.is_empty());
+        assert!(!retained_pack.deny.is_empty());
+
+        for generation in 2..=4 {
+            let refreshed = resolver.refresh_schedules();
+            let current = resolver.inner.load_full();
+            assert!(!Arc::ptr_eq(&retained, &current));
+            assert!(Arc::ptr_eq(&retained.source_config, &current.source_config));
+            assert!(Arc::ptr_eq(
+                &retained.source_custom_lists,
+                &current.source_custom_lists
+            ));
+            let current_pack = &current.source_custom_lists[&pack_id];
+            assert_eq!(retained_pack.allow.as_ptr(), current_pack.allow.as_ptr());
+            assert_eq!(retained_pack.deny.as_ptr(), current_pack.deny.as_ptr());
+            assert_eq!(refreshed.resolver_generation, generation);
+            assert_eq!(refreshed.config_revision, "a");
+            assert_eq!(refreshed.operator_policy_hash, "hash-a");
+        }
+    }
+
+    #[test]
+    fn swap_preserves_inflight_profile_and_generation() {
+        let (config, store) = policy();
+        let resolver = ProfileResolver::build_with_policy_identity(&config, &store, identity("a"));
+        let old = resolver.resolve(&"192.0.2.55".parse().unwrap());
+        let old_map = resolver.inner.load_full();
+        let mut new_config = config.clone();
+        new_config
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .block_response = Some(crate::config::schema::BlockResponseV1::Nxdomain);
+        let pack = Id::new("local").unwrap();
+        let new_store = BTreeMap::from([(
+            pack,
+            CompiledCustomList {
+                deny: vec!["new.example.test".into()],
+                ..CompiledCustomList::default()
+            },
+        )]);
+        let published = resolver.swap_with_policy_identity(&new_config, &new_store, identity("b"));
+        let new = resolver.resolve(&"192.0.2.55".parse().unwrap());
+
+        assert_eq!(old.policy_generation, 1);
+        assert_eq!(old_map.policy_identity.config_revision, "a");
+        assert_eq!(new.policy_generation, published.resolver_generation);
+        assert_eq!(published.config_revision, "b");
+        let old_profile = old.profile.as_ref().unwrap();
+        let new_profile = new.profile.as_ref().unwrap();
+        assert!(old_profile.deny_domains.contains("blocked.example.test"));
+        assert!(!old_profile.deny_domains.contains("new.example.test"));
+        assert_eq!(
+            old_profile.block_response,
+            crate::config::schema::BlockResponseV1::Zero
+        );
+        assert!(new_profile.deny_domains.contains("new.example.test"));
+        assert!(!new_profile.deny_domains.contains("blocked.example.test"));
+        assert_eq!(
+            new_profile.block_response,
+            crate::config::schema::BlockResponseV1::Nxdomain
+        );
+        assert!(!Arc::ptr_eq(old_profile, new_profile));
+    }
+
+    #[test]
+    fn uncaptured_compatibility_swap_cannot_retain_a_known_identity() {
+        let (config, store) = policy();
+        let resolver = ProfileResolver::build_with_policy_identity(&config, &store, identity("a"));
+        resolver.swap_without_list_bits(&config, &store);
+        assert!(!resolver.active_policy_identity().is_known());
+    }
+
+    #[test]
+    fn concurrent_schedule_and_policy_swaps_never_lose_a_generation() {
+        let (config, store) = policy();
+        let resolver = Arc::new(ProfileResolver::build_with_policy_identity(
+            &config,
+            &store,
+            identity("a"),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let tick_resolver = Arc::clone(&resolver);
+        let tick_barrier = Arc::clone(&barrier);
+        let ticks = std::thread::spawn(move || {
+            tick_barrier.wait();
+            for _ in 0..30 {
+                tick_resolver.refresh_schedules();
+            }
+        });
+        barrier.wait();
+        for _ in 0..30 {
+            resolver.swap_with_policy_identity(&config, &store, identity("b"));
+        }
+        ticks.join().unwrap();
+        let active = resolver.active_policy_identity();
+        assert_eq!(active.config_revision, "b");
+        assert_eq!(active.operator_policy_hash, "hash-b");
+        assert_eq!(active.resolver_generation, 61);
+    }
+}

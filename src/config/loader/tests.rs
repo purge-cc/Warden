@@ -2933,6 +2933,249 @@ fn a_config_with_no_custom_lists_loads_with_an_empty_store() {
 }
 
 #[test]
+fn a_pack_overlay_and_toml_overlay_validate_as_one_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    fs::write(
+        &master,
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let guard = crate::config::write_lock::acquire_for_migration(&master).unwrap();
+    let plan = guard.tree_io().plan_master_target().unwrap();
+    let mut toml_overlay = LoaderOverlay::default();
+    toml_overlay
+        .stage_plan(
+            &plan,
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+             [[custom_lists]]\nid = \"streaming\"\n"
+                .to_string(),
+        )
+        .unwrap();
+    let id = crate::config::schema::Id::new("streaming").unwrap();
+    let mut pack_overlay = crate::config::custom_list::PackOverlay::default();
+    pack_overlay.stage(id.clone(), b"||ads.example.test^\n".to_vec());
+
+    let loaded = load_config_with_policy_overlays_under_migration_guard(
+        &guard,
+        &master,
+        4,
+        now(),
+        Some(&toml_overlay),
+        Some(&pack_overlay),
+    )
+    .expect("TOML declaration and staged pack must validate together");
+    assert_eq!(loaded.custom_lists[&id].deny, ["ads.example.test"]);
+    assert!(
+        !dir.path().join("packs/streaming.txt").exists(),
+        "candidate validation must not publish the pack"
+    );
+}
+
+#[test]
+fn a_pack_only_overlay_replaces_the_candidate_store_without_touching_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    fs::write(
+        &master,
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+         [[custom_lists]]\nid = \"streaming\"\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("packs")).unwrap();
+    fs::write(
+        dir.path().join("packs/streaming.txt"),
+        "||old.example.test^\n",
+    )
+    .unwrap();
+    let guard = crate::config::write_lock::acquire_for_migration(&master).unwrap();
+    let id = crate::config::schema::Id::new("streaming").unwrap();
+    let mut pack_overlay = crate::config::custom_list::PackOverlay::default();
+    pack_overlay.stage(id.clone(), b"@@||new.example.test^\n".to_vec());
+
+    let loaded = load_config_with_policy_overlays_under_migration_guard(
+        &guard,
+        &master,
+        4,
+        now(),
+        None,
+        Some(&pack_overlay),
+    )
+    .expect("pack-only candidate must load");
+    assert_eq!(loaded.custom_lists[&id].allow, ["new.example.test"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("packs/streaming.txt")).unwrap(),
+        "||old.example.test^\n"
+    );
+}
+
+#[test]
+fn loader_rejects_a_non_flat_or_hardlinked_pack_tree() {
+    fn rejected(populate: impl FnOnce(&Path)) {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        fs::write(
+            &master,
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("packs")).unwrap();
+        populate(dir.path());
+        let errors = load_config(&master, now()).expect_err("unsafe packs/ must fail load");
+        let joined = join_errs(&errors);
+        assert!(
+            joined.contains("unsupported flat Custom List pack tree"),
+            "{joined}"
+        );
+    }
+
+    rejected(|root| fs::create_dir(root.join("packs/sub")).unwrap());
+    rejected(|root| {
+        let source = root.join("source");
+        fs::write(&source, b"body").unwrap();
+        fs::hard_link(source, root.join("packs/orphan.txt")).unwrap();
+    });
+}
+
+#[test]
+fn schema5_loader_enforces_declared_raw_pack_budgets_before_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    let config = |members, total| {
+        format!(
+            "schema_version = 5\n\
+             \n[custom_list_limits]\nmax_lists = {members}\nmax_file_bytes = 2\nmax_total_bytes = {total}\n\
+             \n[[custom_lists]]\nid = \"a\"\n\
+             \n[[custom_lists]]\nid = \"b\"\n"
+        )
+    };
+    fs::write(&master, config(2, 2)).unwrap();
+    fs::create_dir(dir.path().join("packs")).unwrap();
+    fs::write(dir.path().join("packs/a.txt"), b"x").unwrap();
+    fs::write(dir.path().join("packs/b.txt"), b"y").unwrap();
+    let guard = crate::config::write_lock::acquire_for_migration(&master).unwrap();
+
+    assert!(load_merged_v5_with_policy_overlays_under_migration_guard(
+        &guard,
+        &master,
+        now(),
+        None,
+        None,
+    )
+    .is_ok());
+
+    fs::write(&master, config(2, 1)).unwrap();
+    let errors = load_merged_v5_with_policy_overlays_under_migration_guard(
+        &guard,
+        &master,
+        now(),
+        None,
+        None,
+    )
+    .expect_err("one byte over the declared total must reject the candidate");
+    assert!(
+        join_errs(&errors).contains("over the 1-byte aggregate limit"),
+        "{}",
+        join_errs(&errors)
+    );
+
+    fs::write(&master, config(1, 2)).unwrap();
+    let errors = load_merged_v5_with_policy_overlays_under_migration_guard(
+        &guard,
+        &master,
+        now(),
+        None,
+        None,
+    )
+    .expect_err("one declaration over the declared member cap must reject the candidate");
+    assert!(
+        join_errs(&errors).contains("exceeds the 1-member limit"),
+        "{}",
+        join_errs(&errors)
+    );
+}
+
+#[test]
+fn runtime_schema5_loader_captures_toml_and_advanced_pack_as_one_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    fs::write(
+        &master,
+        "schema_version = 5\n\
+         [server]\ndefault_profile = \"streaming\"\n\
+         [upstream]\nservers = [\"192.0.2.1:53\"]\n\
+         [profiles.streaming]\ncustom_lists = [\"streaming\"]\n\
+         [[custom_lists]]\nid = \"streaming\"\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("packs")).unwrap();
+    fs::write(
+        dir.path().join("packs/streaming.txt"),
+        "@@||media.example.test^$important\n/ads[0-9]+\\.example\\.test/\n",
+    )
+    .unwrap();
+
+    let loaded = load_config_v5(&master, now()).expect("schema-5 runtime policy must load");
+    assert_eq!(loaded.config.schema_version, TARGET_SCHEMA_VERSION_V5);
+    assert_eq!(loaded.files_loaded, vec![master.canonicalize().unwrap()]);
+    assert!(loaded.total_bytes > 0);
+    assert!(loaded.provenance.contains_key("profiles.streaming"));
+    assert_eq!(loaded.pack_bodies.len(), 1);
+    assert!(loaded
+        .pack_bodies
+        .get(&crate::config::schema::Id::new("streaming").unwrap())
+        .unwrap()
+        .contains("$important"));
+}
+
+#[test]
+fn runtime_schema5_loader_rejects_schema4_and_every_legacy_rule_seat() {
+    let cases = [
+        ("schema4", "schema_version = 4\n"),
+        (
+            "top-level admin_rules",
+            "schema_version = 5\nadmin_rules = []\n",
+        ),
+        (
+            "profile admin_rules",
+            "schema_version = 5\n[profiles.default]\nadmin_rules = []\n",
+        ),
+        (
+            "device allow_rules",
+            "schema_version = 5\n[[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\nallow_rules = []\n",
+        ),
+        (
+            "device deny_rules",
+            "schema_version = 5\n[[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\ndeny_rules = []\n",
+        ),
+        (
+            "device override_profile_deny",
+            "schema_version = 5\n[[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\noverride_profile_deny = false\n",
+        ),
+        (
+            "clients alias",
+            "schema_version = 5\n[[clients]]\nid = \"tv\"\ndisplay_name = \"TV\"\n",
+        ),
+        (
+            "ip_denylists alias",
+            "schema_version = 5\n[ip_denylists]\nenabled = false\n",
+        ),
+        (
+            "device metadata alias",
+            "schema_version = 5\n[[devices]]\nid = \"tv\"\ndisplay_name = \"TV\"\ndevice = \"television\"\n",
+        ),
+    ];
+
+    for (name, source) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        fs::write(&master, source).unwrap();
+        let errors = load_config_v5(&master, now()).expect_err(name);
+        assert!(!errors.is_empty(), "{name} must produce a diagnostic");
+    }
+}
+
+#[test]
 fn the_pack_path_is_anchored_to_the_master_not_to_the_declaring_fragment() {
     // `includes` is live, so a fragment is a legitimate declaration site.
     // Two readings of "the config parent" are each internally coherent and
@@ -3076,4 +3319,24 @@ fn mounting_a_custom_list_consumes_no_source_bit() {
             .is_none(),
         "a custom list id must never resolve to a list-source bit"
     );
+}
+
+#[test]
+fn guarded_load_failure_priority_does_not_degrade_safety_or_drift() {
+    let _scope = guarded_load_provenance();
+    mark_guarded_load_failure(GuardedLoadKind::Storage);
+    mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
+    mark_guarded_load_failure(GuardedLoadKind::UnsafePath);
+    mark_guarded_load_failure(GuardedLoadKind::Storage);
+    assert!(matches!(
+        GUARDED_LOAD_PROVENANCE.with(|slot| slot.borrow().as_ref().and_then(|marker| marker.get())),
+        Some(GuardedLoadKind::UnsafePath)
+    ));
+
+    mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
+    mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
+    assert!(matches!(
+        GUARDED_LOAD_PROVENANCE.with(|slot| slot.borrow().as_ref().and_then(|marker| marker.get())),
+        Some(GuardedLoadKind::TreeChanged)
+    ));
 }

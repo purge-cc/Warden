@@ -28,7 +28,6 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::dns::cache::{CacheLookup, DnsCache};
 use crate::dns::handler::cname_chain_blocked;
-use crate::filter::cname::NamePolicy;
 use crate::filter::ip_filter::IpFilter;
 use crate::filter::FilterEngine;
 use crate::tracking::HitTracker;
@@ -186,17 +185,15 @@ async fn refresh_one(
             // worker cached entries whose A/AAAA records the
             // request-path guard would refuse.
             //
-            // `check_response` takes a `NamePolicy`, and this worker
-            // passes `Neutral` for the same reason it passes the flat
-            // `filter.is_blocked` closure above — it has no per-client
-            // context and refreshes the SHARED cache slot, so the entry
-            // it stores must be one every client may see. Fail-closed: a
-            // name some device allows, whose answer is blocked, is simply
-            // never prefetched. Hit-rate cost only; the request path
-            // still allows it under that device's policy.
+            // This worker has no per-client grant, so this is only a
+            // conservative profile-independent admission check for the
+            // shared cache. Per-profile policy and grants remain
+            // authoritative when an entry is served. A response allowed
+            // only by a grant is not prefetched and pays the upstream round
+            // trip instead.
             let ip_blocked = ip_filter
                 .as_deref()
-                .and_then(|f| f.check_response(&resp.records, NamePolicy::Neutral))
+                .and_then(|f| f.check_response_with_grant(&resp.records, None))
                 .is_some();
             if cname_blocked || ip_blocked {
                 tracing::debug!(
@@ -209,7 +206,7 @@ async fn refresh_one(
                 return;
             }
             cache
-                .insert(
+                .insert_with_upstream_generation(
                     domain.as_str(),
                     RecordType::A,
                     DNSClass::IN,
@@ -217,6 +214,7 @@ async fn refresh_one(
                     ResponseCode::NoError,
                     None,
                     None, // ecs_prefix placeholder — prefetch worker has no client_ip
+                    resp.generation,
                 )
                 .await;
             tracing::debug!(
@@ -301,6 +299,7 @@ mod tests {
             Ok(UpstreamResponse {
                 records: vec![rec],
                 response_code: ResponseCode::NoError,
+                generation: None,
                 soa_minimum_ttl: None,
                 #[cfg(feature = "dnssec")]
                 authority: vec![],
@@ -425,6 +424,7 @@ mod tests {
         *upstream.response.lock().unwrap() = Some(Ok(UpstreamResponse {
             records: vec![],
             response_code: ResponseCode::ServFail,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: vec![],

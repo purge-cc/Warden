@@ -3,7 +3,7 @@
 //!
 //! Pins the regression net for the `find_target_for_id` named-map fix:
 //! the §4.26 §1/2 bug was that `warden profile create <id>` succeeded
-//! (writer used the dedicated [`upsert_profile`] path that already
+//! (writer used the dedicated [`create_profile`] path that already
 //! handled the v1 `[profiles.<id>]` named-map) but every subsequent
 //! mutate verb (`update`, `ecs`, `block-response`, `blocked-ttl`,
 //! `block-all`, `admin-rule-add`, `admin-rule-remove`, `ecs-clear`,
@@ -16,7 +16,7 @@
 //! socket → `socket_client::send_command` for every mutate verb → assert
 //! `IpcResponse::Ok` and verify the on-disk TOML reflects the change.
 //!
-//! [`upsert_profile`]: purge_warden::cli::commands::target::upsert_profile
+//! [`create_profile`]: purge_warden::cli::commands::target::create_profile
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use purge_warden::ipc::protocol::{EcsPatch, IpcCommand, IpcResponse, ProfileUpda
 use purge_warden::ipc::socket_client;
 use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 
-const MASTER_SEED: &str = r#"schema_version = 4
+const MASTER_SEED: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -78,6 +78,7 @@ async fn spawn_fixture() -> Fixture {
         upstream_mode: "plain".into(),
         upstream_count: 0,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -85,6 +86,7 @@ async fn spawn_fixture() -> Fixture {
         api_token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(Some(token_hash))),
         config_path: Some(master.clone()),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         list_statuses: None,
         list_state: None,
         local_records_hits: None,
@@ -103,6 +105,8 @@ async fn spawn_fixture() -> Fixture {
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
 
     let handle = spawn_ipc_server(socket_path.clone(), Arc::new(state))

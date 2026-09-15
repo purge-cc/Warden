@@ -94,9 +94,8 @@ fn zero_per_type() -> [u64; TYPE_BUCKET_COUNT] {
 
 /// Capacity of the hourly ring buffer. Sized at 168 (= 7 days × 24
 /// hours) to serve the hourly consumers: KPI rolling windows, the 24h
-/// trend chart slice, and `pulse_row_peak`. They all take the LAST N
-/// elements via `len().saturating_sub(n)` and work transparently
-/// regardless of buffer size.
+/// trend chart slice, and longer diagnostic history. Display windows select
+/// timestamps rather than assuming adjacent rows represent adjacent hours.
 const MAX_HOURLY: usize = 168;
 /// Capacity of the daily ring buffer. Backs the daily-totals barcharts
 /// (`Daily Queries`, `Daily Blocked`), which render a 10-day window
@@ -162,7 +161,6 @@ impl TimeSeries {
 
     /// Get hourly buckets (historical + current in-progress).
     pub fn hourly_snapshot(&self) -> Vec<TimeBucket> {
-        let current_snap = self.current_hour.load().snapshot();
         // Ignore lock poisoning. Every holder of these archive mutexes does
         // only saturating arithmetic (no panic ops), so a poisoned guard
         // would be spurious — recover the inner value rather than cascade
@@ -170,57 +168,34 @@ impl TimeSeries {
         // mutex still fires ≤1/hour on rollover; the common path stays on
         // ArcSwap (`current_hour`).
         let hourly = self.hourly.lock().unwrap_or_else(|e| e.into_inner());
+        let current_snap = self.current_hour.load().snapshot();
         let mut result: Vec<TimeBucket> = hourly.iter().cloned().collect();
         if current_snap.queries > 0 {
             merge_current_into_snapshot(&mut result, current_snap);
         }
-        result
+        dedupe_by_timestamp_summing(result)
     }
 
-    /// Sum the per-`TypeBucket` query and blocked counters across the
-    /// trailing 24 hourly buckets, including the in-flight current
-    /// bucket if non-empty (mirrors `hourly_snapshot()` semantics).
-    /// Returns `(per_type_24h, blocked_per_type_24h)`.
-    ///
-    /// No pro-ration of the trailing-edge bucket — the existing
-    /// `compute_24h_stats` (`socket_server.rs`) sums raw bucket
-    /// values the same way; staying consistent with that is more
-    /// important than any precision win.
+    /// Per-type sums for the current UTC hour and preceding 23 hours.
+    /// Uses the same timestamp window as the IPC traffic and cache aggregates.
     pub fn per_type_24h_snapshot(&self) -> ([u64; TYPE_BUCKET_COUNT], [u64; TYPE_BUCKET_COUNT]) {
-        let current_snap = self.current_hour.load().snapshot();
-        let hourly = self.hourly.lock().unwrap_or_else(|e| e.into_inner());
-        let mut q = [0u64; TYPE_BUCKET_COUNT];
-        let mut b = [0u64; TYPE_BUCKET_COUNT];
-        let mut taken = 0usize;
-        if current_snap.queries > 0 {
-            for i in 0..TYPE_BUCKET_COUNT {
-                q[i] = q[i].saturating_add(current_snap.per_type[i]);
-                b[i] = b[i].saturating_add(current_snap.blocked_per_type[i]);
-            }
-            taken += 1;
-        }
-        for bucket in hourly.iter().rev() {
-            if taken >= 24 {
-                break;
-            }
-            for i in 0..TYPE_BUCKET_COUNT {
-                q[i] = q[i].saturating_add(bucket.per_type[i]);
-                b[i] = b[i].saturating_add(bucket.blocked_per_type[i]);
-            }
-            taken += 1;
-        }
-        (q, b)
+        per_type_24h_from_buckets(&self.hourly_snapshot(), now_secs())
     }
 
-    /// Get daily buckets (historical + current in-progress).
+    /// Get up to ten UTC days, including the current partial day.
+    /// Missing intervals remain absent; they are not synthesized as zero traffic.
     pub fn daily_snapshot(&self) -> Vec<TimeBucket> {
-        let current_snap = self.current_day.load().snapshot();
+        self.daily_snapshot_at(now_secs())
+    }
+
+    pub(crate) fn daily_snapshot_at(&self, now: u64) -> Vec<TimeBucket> {
         let daily = self.daily.lock().unwrap_or_else(|e| e.into_inner());
+        let current_snap = self.current_day.load().snapshot();
         let mut result: Vec<TimeBucket> = daily.iter().cloned().collect();
         if current_snap.queries > 0 {
-            merge_current_into_snapshot(&mut result, current_snap);
+            result.push(current_snap);
         }
-        result
+        normalize_daily_buckets(result, now)
     }
 
     /// Load historical buckets from a snapshot (on startup).
@@ -236,7 +211,15 @@ impl TimeSeries {
     /// keep writing fragmented snapshots without breaking anything.
     pub fn load(&self, hourly: Vec<TimeBucket>, daily: Vec<TimeBucket>) {
         let hourly = dedupe_by_timestamp_summing(hourly);
-        let daily = dedupe_by_timestamp_summing(daily);
+        let daily = dedupe_by_timestamp_summing(
+            daily
+                .into_iter()
+                .map(|mut b| {
+                    b.timestamp = truncate_day(b.timestamp);
+                    b
+                })
+                .collect(),
+        );
 
         let mut h = self.hourly.lock().unwrap_or_else(|e| e.into_inner());
         *h = VecDeque::from(hourly);
@@ -249,6 +232,48 @@ impl TimeSeries {
             d.pop_front();
         }
     }
+}
+
+/// The 24 hourly slots ending in the current, incomplete UTC hour.
+/// Whole hourly aggregates cannot provide a minute-exact trailing cutoff.
+#[must_use]
+pub fn hour_in_24h_window(timestamp: u64, now: u64) -> bool {
+    let end = truncate_hour(now);
+    let timestamp = truncate_hour(timestamp);
+    timestamp >= end.saturating_sub(23 * SECS_PER_HOUR) && timestamp <= end
+}
+
+/// Aggregate query types from the same captured hourly snapshot as the rates.
+pub(crate) fn per_type_24h_from_buckets(
+    hourly: &[TimeBucket],
+    now: u64,
+) -> ([u64; TYPE_BUCKET_COUNT], [u64; TYPE_BUCKET_COUNT]) {
+    let mut q = [0u64; TYPE_BUCKET_COUNT];
+    let mut b = [0u64; TYPE_BUCKET_COUNT];
+    for bucket in hourly
+        .iter()
+        .filter(|b| hour_in_24h_window(b.timestamp, now))
+    {
+        for i in 0..TYPE_BUCKET_COUNT {
+            q[i] = q[i].saturating_add(bucket.per_type[i]);
+            b[i] = b[i].saturating_add(bucket.blocked_per_type[i]);
+        }
+    }
+    (q, b)
+}
+
+fn normalize_daily_buckets(buckets: Vec<TimeBucket>, now: u64) -> Vec<TimeBucket> {
+    let today = truncate_day(now);
+    let start = today.saturating_sub((MAX_DAILY as u64 - 1) * SECS_PER_DAY);
+    dedupe_by_timestamp_summing(
+        buckets
+            .into_iter()
+            .filter_map(|mut b| {
+                b.timestamp = truncate_day(b.timestamp);
+                (b.timestamp >= start && b.timestamp <= today).then_some(b)
+            })
+            .collect(),
+    )
 }
 
 /// Fold the in-flight current bucket into the snapshot vector,
@@ -411,6 +436,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hourly_window_normalizes_intrahour_fragments_before_comparing() {
+        let current = 100 * SECS_PER_HOUR;
+        let now = current + 30;
+        assert!(hour_in_24h_window(current + 10, now));
+        assert!(hour_in_24h_window(current, now));
+        assert!(hour_in_24h_window(current - 23 * SECS_PER_HOUR + 10, now));
+        assert!(!hour_in_24h_window(
+            current - 24 * SECS_PER_HOUR + 3599,
+            now
+        ));
+        assert!(!hour_in_24h_window(current + SECS_PER_HOUR, now));
+        assert!(hour_in_24h_window(10, 30));
+    }
+
+    #[test]
     fn truncate_hour_works() {
         // 2024-01-01 12:34:56 UTC = 1704110096
         // Truncated to hour = 1704110096 - (1704110096 % 3600)
@@ -498,8 +538,8 @@ mod tests {
             .collect();
         ts.load(vec![], buckets);
 
-        let daily = ts.daily_snapshot();
-        assert!(daily.len() <= MAX_DAILY + 1);
+        let daily = ts.daily_snapshot_at(11 * SECS_PER_DAY);
+        assert_eq!(daily.len(), MAX_DAILY);
     }
 
     #[test]
@@ -628,59 +668,75 @@ mod tests {
         assert_eq!(current.load().timestamp, next_hour);
     }
 
-    /// `per_type_24h_snapshot` sums the trailing 24 hourly buckets
-    /// (including in-flight current bucket if non-empty). Loaded ring of
-    /// 30 historical buckets + a few live records exercises both the cap
-    /// and the current-bucket inclusion.
     #[test]
-    fn per_type_24h_snapshot_sums_trailing_24() {
+    fn per_type_window_uses_timestamps_and_merges_restart_fragments() {
         let ts = TimeSeries::new();
-
-        // 30 historical buckets — 0..29. Each carries `i+1` queries on
-        // bucket A (per_type[0]) and `1` blocked on bucket AAAA
-        // (blocked_per_type[1]). With cap=24, the 24 newest are 6..29.
-        // Sum of per_type[0] = 7+8+...+30 = (7+30)*24/2 = 444.
-        // Sum of blocked_per_type[1] = 1 * 24 = 24.
-        let buckets: Vec<TimeBucket> = (0..30)
-            .map(|i| {
-                let mut pt = zero_per_type();
-                let mut bpt = zero_per_type();
-                pt[0] = i + 1;
-                bpt[1] = 1;
-                TimeBucket {
-                    timestamp: i * SECS_PER_HOUR,
-                    queries: i + 1,
-                    blocked: 1,
-                    cache_hits: 0,
-                    per_type: pt,
-                    blocked_per_type: bpt,
-                }
-            })
-            .collect();
-        ts.load(buckets, vec![]);
-
-        // No live records yet → current bucket empty → not counted.
-        let (q, b) = ts.per_type_24h_snapshot();
+        let now = truncate_hour(now_secs());
+        let mut old = bucket(now - 24 * SECS_PER_HOUR, 500, 100, 0);
+        old.per_type[0] = 500;
+        let mut edge = bucket(now - 23 * SECS_PER_HOUR, 11, 3, 0);
+        edge.per_type[0] = 11;
+        edge.blocked_per_type[0] = 3;
+        let mut current = bucket(now, 7, 1, 0);
+        current.per_type[0] = 7;
+        current.blocked_per_type[0] = 1;
+        let mut future = old.clone();
+        future.timestamp = now + SECS_PER_HOUR;
+        ts.load(vec![current.clone(), future, old, edge, current], vec![]);
+        ts.current_hour.store(Arc::new(CurrentBucket::new(now)));
+        increment(&ts.current_hour.load(), true, false, 1);
+        let hourly = ts.hourly_snapshot();
+        assert_eq!(hourly.iter().filter(|b| b.timestamp == now).count(), 1);
+        let (q, b) = per_type_24h_from_buckets(&hourly, now + 3599);
+        assert_eq!(q[0], 25);
+        assert_eq!(q[1], 1);
+        assert_eq!(b[0], 5);
+        assert_eq!(b[1], 1);
+        // No new traffic for over a day: the old tail is no longer 24h data.
         assert_eq!(
-            q[0], 444,
-            "per_type[0] sum across trailing 24 historical buckets"
+            per_type_24h_from_buckets(&hourly, now + 48 * SECS_PER_HOUR),
+            (zero_per_type(), zero_per_type())
         );
-        assert_eq!(b[1], 24, "blocked_per_type[1] sum across trailing 24");
+    }
 
-        // Add live records on the in-flight current bucket. They land
-        // in slot A (0) for queries and slot AAAA (1) for blocked.
-        ts.record(false, false, 0);
-        ts.record(false, false, 0);
-        ts.record(true, false, 1);
-        // Current bucket now has 3 queries → counted in the window.
-        // When the current bucket is added, the oldest historical (i=6,
-        // queries=7) is evicted from the trailing-24, so per_type[0]
-        // delta is `+2 (current) - 7 (evicted) = -5` → 444 - 5 = 439.
-        let (q2, b2) = ts.per_type_24h_snapshot();
-        assert_eq!(q2[0], 439);
-        // blocked_per_type[1]: was 24 (all 24 historical contribute 1),
-        // current adds 1, oldest historical also contributes 1 → -1 + 1 = 0.
-        assert_eq!(b2[1], 24);
+    #[test]
+    fn daily_normalization_sums_fragments_limits_dates_and_preserves_gaps() {
+        let today = 200 * SECS_PER_DAY;
+        let mut fragments: Vec<_> = (0..12)
+            .map(|i| bucket(today - i * SECS_PER_DAY, 10, 2, 3))
+            .collect();
+        fragments.retain(|b| b.timestamp != today - 4 * SECS_PER_DAY);
+        fragments.push(bucket(today + 123, 7, 1, 2));
+        fragments.push(bucket(today + SECS_PER_DAY, 999, 999, 0));
+        fragments.reverse();
+        let out = normalize_daily_buckets(fragments, today + 3600);
+        assert_eq!(out.len(), 9);
+        assert_eq!(out[0].timestamp, today - 9 * SECS_PER_DAY);
+        let last = out.last().unwrap();
+        assert_eq!(
+            (last.timestamp, last.queries, last.blocked, last.cache_hits),
+            (today, 17, 3, 5)
+        );
+        assert!(out.iter().all(|b| b.timestamp != today - 4 * SECS_PER_DAY));
+    }
+
+    #[test]
+    fn daily_snapshot_retention_includes_current_day_in_ten_day_cap() {
+        let ts = TimeSeries::new();
+        let today = truncate_day(now_secs());
+        ts.load(
+            vec![],
+            (1..=10)
+                .map(|i| bucket(today - i * SECS_PER_DAY, 10, 2, 3))
+                .collect(),
+        );
+        ts.current_day.store(Arc::new(CurrentBucket::new(today)));
+        increment(&ts.current_day.load(), false, false, 0);
+        let out = ts.daily_snapshot_at(today);
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[0].timestamp, today - 9 * SECS_PER_DAY);
+        assert_eq!(out.last().unwrap().queries, 1);
+        assert!(ts.daily_snapshot_at(today + 11 * SECS_PER_DAY).is_empty());
     }
 
     /// Construct a `TimeBucket` with zero `per_type` / `blocked_per_type`

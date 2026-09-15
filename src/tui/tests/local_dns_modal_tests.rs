@@ -12,16 +12,16 @@ fn rec(domain: &str, value: &str, ms: bool, ttl: Option<u32>) -> LocalDnsRecord 
 
 #[test]
 fn s44_form_field_next_cycles_through_all_eight_in_order() {
-    let mut f = FormField::Domain;
+    let mut f = FormField::Profile;
     let order = [
         FormField::RecordType,
+        FormField::Domain,
         FormField::Value,
         FormField::MatchSubdomains,
         FormField::Ttl,
-        FormField::Profile,
         FormField::Submit,
         FormField::Cancel,
-        FormField::Domain,
+        FormField::Profile,
     ];
     for expected in order {
         f = f.next();
@@ -31,9 +31,9 @@ fn s44_form_field_next_cycles_through_all_eight_in_order() {
 
 #[test]
 fn s44_form_field_prev_walks_backwards_and_wraps() {
-    let f = FormField::Domain;
+    let f = FormField::Profile;
     assert_eq!(f.prev(), FormField::Cancel);
-    assert_eq!(FormField::RecordType.prev(), FormField::Domain);
+    assert_eq!(FormField::RecordType.prev(), FormField::Profile);
 }
 
 #[test]
@@ -332,18 +332,73 @@ fn form_renders_banded_title_labelled_sections_and_actions() {
     form.domain = "nas".into(); // focus defaults to Domain
     let text = render_text(form, 60);
 
-    assert!(text.contains("Add local DNS record"), "banded title");
-    for section in ["RECORD", "MATCHING", "SCOPE"] {
+    assert!(text.contains("ADD LOCAL DNS"), "banded title");
+    for section in ["SCOPE & RECORD", "MATCHING & CACHE"] {
         assert!(text.contains(section), "missing {section} section band");
     }
+    let (body, cursor) = form_body(form, 60);
+    for (section, role) in [
+        ("SCOPE & RECORD", CardRole::Summary),
+        ("MATCHING & CACHE", CardRole::Analytics),
+    ] {
+        let span = body
+            .fields
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains(section))
+            .unwrap();
+        assert_eq!(
+            (span.style.fg, span.style.bg),
+            (Some(crate::tui::theme::T.card_title_bg(role)), None,)
+        );
+    }
     assert!(text.contains("nas"), "the typed value is on its row");
-    assert!(text.contains('◀'), "active row carries the focus marker");
+    assert!(cursor.is_some());
+    assert!(body
+        .fields
+        .iter()
+        .flat_map(|line| &line.spans)
+        .any(
+            |span| span.content.contains("nas") && span.style.bg == Some(crate::tui::theme::T.info)
+        ));
+    assert!(!text.contains('◀') && !text.contains('▌'));
     assert!(
         text.contains("name to answer locally"),
         "validation line shows the focused field's hint"
     );
     assert!(text.contains("Save"), "Save action present");
     assert!(text.contains("Discard"), "Discard action present");
+}
+
+#[test]
+fn form_uses_the_reference_field_order_without_extra_section_rows() {
+    let modal = floor_form(FormField::Domain);
+    let form = modal.form().unwrap();
+    let (body, _) = form_body(form, 60);
+    let text = body
+        .fields
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let row = |needle: &str| {
+        text.iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in {text:?}"))
+    };
+
+    assert_eq!(text.len(), 9);
+    assert_eq!(text.iter().filter(|line| line.is_empty()).count(), 1);
+    assert!(row("SCOPE & RECORD") < row("Scope"));
+    assert!(row("Scope") < row("Type"));
+    assert!(row("Type") < row("Domain"));
+    assert!(row("Domain") < row("Value"));
+    assert!(row("MATCHING & CACHE") < row("Subdomains"));
+    assert!(row("Subdomains") < row("TTL Seconds"));
 }
 
 #[test]
@@ -430,12 +485,12 @@ fn floor_form(focus: FormField) -> LocalDnsModal {
 /// strings that must land on the SAME screen row for that field to be
 /// genuinely visible.
 const FLOOR_ROWS: [(FormField, &str, &str); 6] = [
-    (FormField::Domain, "domain", "nas.home"),
-    (FormField::RecordType, "type", "\u{2039} A \u{203a}"),
-    (FormField::Value, "value", "10.9.9.9"),
-    (FormField::MatchSubdomains, "match subdomains", "No"),
-    (FormField::Ttl, "ttl", "300"),
-    (FormField::Profile, "profile", "\u{2039} Global \u{203a}"),
+    (FormField::Domain, "Domain", "nas.home"),
+    (FormField::RecordType, "Type", "\u{2039} A \u{203a}"),
+    (FormField::Value, "Value", "10.9.9.9"),
+    (FormField::MatchSubdomains, "Subdomains", "No"),
+    (FormField::Ttl, "TTL Seconds", "300"),
+    (FormField::Profile, "Scope", "\u{2039} Global \u{203a}"),
 ];
 
 #[test]
@@ -462,21 +517,23 @@ fn floor_action_row_and_focused_field_are_on_screen_together() {
 fn floor_viewport_follows_focus_to_the_last_field() {
     // DoD 4. A viewport pinned to page one would satisfy the test
     // above for the first fields and still hide the last.
-    let last = dump_at_floor(&floor_form(FormField::Profile));
+    let last = dump_at_floor(&floor_form(FormField::Ttl));
     assert!(
         last.lines()
-            .any(|l| l.contains("profile") && l.contains("\u{2039} Global \u{203a}")),
+            .any(|l| l.contains("TTL Seconds") && l.contains("300")),
         "focused last field is off-screen:\n{last}"
     );
-    let first = dump_at_floor(&floor_form(FormField::Domain));
+    let first = dump_at_floor(&floor_form(FormField::Profile));
     assert!(
         first
             .lines()
-            .any(|l| l.contains("domain") && l.contains("nas.home")),
+            .any(|l| l.contains("Scope") && l.contains("\u{2039} Global \u{203a}")),
         "focused first field is off-screen:\n{first}"
     );
     assert!(
-        !first.contains("\u{2039} Global \u{203a}"),
+        !first
+            .lines()
+            .any(|line| line.contains("TTL Seconds") && line.contains("300")),
         "a 4-row viewport cannot be showing both ends at once — the \
          viewport is not moving:\n{first}"
     );
@@ -895,17 +952,25 @@ fn floor_hardware_cursor_sits_in_the_focused_text_field() {
     let dump = dump_buffer(term.backend().buffer());
     let row = dump.lines().nth(pos.y as usize).unwrap_or("");
     assert!(
-        row.contains("domain") && row.contains("nas.home"),
+        row.contains("Domain") && row.contains("nas.home"),
         "cursor row {} is not the focused domain field:\n{dump}",
         pos.y
     );
-    // Column: modal inner-left + VALUE_COL + what has been typed.
-    let inner_x = (80 - MODAL_W) / 2 + 1;
+    let buffer = term.backend().buffer();
+    let value = "nas.home";
+    let value_x = (0..=buffer.area.width - value.len() as u16)
+        .find(|&x| {
+            value.chars().enumerate().all(|(offset, character)| {
+                buffer[(x + offset as u16, pos.y)].symbol() == character.to_string()
+            })
+        })
+        .expect("the complete typed value is visible on the cursor row");
     assert_eq!(
         pos.x,
-        inner_x + modal_form::VALUE_COL as u16 + "nas.home".chars().count() as u16,
-        "cursor is not at the end of the typed value:\n{dump}"
+        value_x + value.len() as u16,
+        "cursor is not at the end of the displayed value:\n{dump}"
     );
+    assert_eq!(buffer[(value_x, pos.y)].bg, crate::tui::theme::T.info);
 }
 
 #[test]

@@ -32,6 +32,7 @@ fn mk_mapped(name: &str, ip: &str) -> MappedDeviceDto {
         network_name_wildcard: false,
         id: None,
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
         unfiltered: false,
     }
 }
@@ -161,6 +162,7 @@ fn mk_unmapped(ip: &str, mac: Option<&str>) -> UnmappedDeviceDto {
         online: false,
         vendor: None,
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
     }
 }
 

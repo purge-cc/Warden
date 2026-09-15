@@ -4,7 +4,7 @@
 //! profile-scoped — no global rewrites. Mirrors [`super::local_dns`]'s
 //! shape: validator pre-flight on the merged `[existing..., new]` slice
 //! via [`crate::config::validator::validate_rewrite_rules`], TOML
-//! mutation via [`super::target::write_value_validated_locked`] (full v1 loader
+//! mutation via [`super::target::write_value_validated_locked`] (current loader
 //! run against the STAGED bytes before the rename, so a rejected tree
 //! never lands), reload feedback, then single-seat audit emit.
 //!
@@ -31,7 +31,7 @@ use super::target::{
     write_value_validated_locked,
 };
 use crate::config::loader::load_config_for_schema_under_guard;
-use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::schema::TARGET_SCHEMA_VERSION_V5;
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 // ── Frozen strings ────────────────────────────────────────────────────
@@ -149,8 +149,9 @@ pub(crate) fn add_inner_locked(
     into: Option<&Path>,
 ) -> anyhow::Result<AddOutcome> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(super::format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(super::format_config_errors)?;
     ensure_profile_exists_in(&loaded.config, profile_id, format_rewrite_profile_not_found)?;
 
     // Snapshot existing rules + local_records (profile + global, for
@@ -259,8 +260,9 @@ pub(crate) fn remove_inner_locked(
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(super::format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(super::format_config_errors)?;
     ensure_profile_exists_in(&loaded.config, profile_id, format_rewrite_profile_not_found)?;
     let canonical_from = from.to_ascii_lowercase();
 

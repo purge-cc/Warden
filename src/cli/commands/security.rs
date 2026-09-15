@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use toml::Value;
 
-use crate::config::loader::load_config;
+use crate::config::loader::load_current_config;
 
 use super::target::{read_or_empty_locked, write_value_validated_locked};
 
@@ -201,7 +201,7 @@ fn knob_list() -> String {
 /// settings, reading the same resolved config the daemon loads.
 pub fn run_show(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(|errs| {
+    let loaded = load_current_config(config_path, now).map_err(|errs| {
         anyhow::anyhow!(
             "cannot read config: {}",
             errs.iter()

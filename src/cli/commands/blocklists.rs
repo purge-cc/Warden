@@ -38,11 +38,16 @@ use crate::config::atomic_write::{
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
 use crate::config::loader::{
-    load_config, load_config_for_schema_under_guard, loaded_include_matches_root_file,
+    load_config_for_schema_under_guard, load_current_config, loaded_include_matches_root_file,
 };
 use crate::config::schema::blocklist::{Blocklist, BlocklistBase, BlocklistFormat, BlocklistTrust};
-use crate::config::schema::{Id, SCHEMA_VERSION_V1};
+use crate::config::schema::{Id, TARGET_SCHEMA_VERSION_V5};
 use crate::config::secrets::secrets_path_for;
+
+#[cfg(test)]
+tokio::task_local! {
+    static PROBE_TIMEOUT_OVERRIDE: std::time::Duration;
+}
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
 use crate::lists::source_key::{
@@ -430,7 +435,7 @@ fn format_show_enforcement(b: &crate::config::schema::Blocklist, e: &Enforcement
 
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     if loaded.config.blocklists.is_empty() {
         println!("no blocklists configured");
         println!("add one with: warden blocklist add <id> --url <url> --format domains");
@@ -458,7 +463,7 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 
 pub async fn run_show(config_path: &Path, socket_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let b = loaded
         .config
         .blocklists
@@ -960,7 +965,7 @@ pub async fn run_add_silent_with_direction(
         let loaded = load_config_for_schema_under_guard(
             &guard,
             config_path,
-            SCHEMA_VERSION_V1,
+            TARGET_SCHEMA_VERSION_V5,
             time::OffsetDateTime::now_utc(),
         )
         .map_err(format_config_errors)?;
@@ -1058,8 +1063,9 @@ pub(crate) fn run_add_silent_with_direction_locked(
     }
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     ensure_no_duplicate_blocklist(&loaded.config, id, url)?;
 
     let mut warnings: Vec<String> = Vec::new();
@@ -1264,7 +1270,7 @@ pub async fn run_remove(
         let guard = crate::config::write_lock::acquire_for_write(config_path)?;
         let now = time::OffsetDateTime::now_utc();
         let exists =
-            load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+            load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
                 .map(|l| l.config.blocklists.iter().any(|b| b.id.as_str() == id))
                 .unwrap_or(true);
         if !exists {
@@ -1363,7 +1369,7 @@ pub(crate) fn run_remove_silent_locked(
     let overriding_profiles: Vec<String> = match load_config_for_schema_under_guard(
         guard,
         config_path,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     ) {
         Ok(loaded) => loaded
@@ -1569,7 +1575,7 @@ fn apply_blocklist_field_locked(
             load_config_for_schema_under_guard(
                 guard,
                 config_path,
-                SCHEMA_VERSION_V1,
+                TARGET_SCHEMA_VERSION_V5,
                 time::OffsetDateTime::now_utc(),
             )
             .ok()
@@ -1750,7 +1756,8 @@ async fn probe_url_reachable(url: &str) -> anyhow::Result<()> {
     // pre-flight uses the same User-Agent / redirect / TLS policy as the
     // daemon's real fetch — a bare reqwest client could pass or fail
     // differently from the actual download. Keep the short 3s probe timeout.
-    let client = crate::lists::http_client::build_list_client(std::time::Duration::from_secs(3))
+    let timeout = probe_timeout();
+    let client = crate::lists::http_client::build_list_client(timeout)
         .map_err(|e| anyhow::anyhow!("{}", format_list_url_not_reachable(url, &e.to_string())))?;
 
     let head = client.head(url).send().await;
@@ -1773,7 +1780,7 @@ async fn probe_url_reachable(url: &str) -> anyhow::Result<()> {
         }
         Err(e) => {
             let detail = if e.is_timeout() {
-                "timeout after 3s".to_string()
+                format!("timeout after {}s", timeout.as_secs())
             } else if e.is_connect() {
                 "connection refused".to_string()
             } else {
@@ -1782,6 +1789,15 @@ async fn probe_url_reachable(url: &str) -> anyhow::Result<()> {
             bail!("{}", format_list_url_not_reachable(url, &detail));
         }
     }
+}
+
+fn probe_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(timeout) = PROBE_TIMEOUT_OVERRIDE.try_with(|timeout| *timeout) {
+        return timeout;
+    }
+
+    std::time::Duration::from_secs(3)
 }
 
 /// Wire token for a format, delegated to the schema enum.
@@ -2144,6 +2160,58 @@ pub async fn run_set_kind_with_ack(
     accept_unsigned_allow: bool,
     into: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let message = set_kind_write(
+        config_path,
+        list_id,
+        kind_str,
+        accept_unsigned_allow,
+        into,
+        |record| persist_cli_mutation_audit(config_path, || record),
+    )?;
+    println!("{message}");
+    let outcome = ipc_reload::attempt_reload(socket_path).await;
+    ipc_reload::report_reload_outcome(&outcome);
+    Ok(())
+}
+
+/// Set a list's direction without terminal output or daemon reload.
+/// Keeps the guarded validation, consent and audit behavior of the CLI seat;
+/// audit I/O failures are logged through tracing, without printing to stderr.
+pub(crate) fn set_kind_without_reload(
+    config_path: &Path,
+    list_id: &str,
+    kind_str: &str,
+    accept_unsigned_allow: bool,
+    into: Option<&Path>,
+) -> anyhow::Result<String> {
+    set_kind_write(
+        config_path,
+        list_id,
+        kind_str,
+        accept_unsigned_allow,
+        into,
+        |record| {
+            let path = super::audit::audit_log_path_for(config_path);
+            let result = crate::config::audit::AuditWriter::open(path.clone())
+                .and_then(|writer| writer.append_cli_mutation(&record));
+            if let Err(error) = result {
+                tracing::warn!(%error, path = %path.display(),
+                "blocklist.set_kind audit failed; mutation outcome is unchanged");
+            }
+        },
+    )
+}
+
+/// One guarded write implementation. Only the audit failure presentation differs
+/// between the CLI wrapper and the silent worker entry point.
+fn set_kind_write(
+    config_path: &Path,
+    list_id: &str,
+    kind_str: &str,
+    accept_unsigned_allow: bool,
+    into: Option<&Path>,
+    emit_audit: impl FnOnce(AuditRecord),
+) -> anyhow::Result<String> {
     let kind = parse_kind(kind_str)?;
     let now = time::OffsetDateTime::now_utc();
     let guard = crate::config::write_lock::acquire_for_write(config_path)?;
@@ -2184,20 +2252,24 @@ pub async fn run_set_kind_with_ack(
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("blocklist entry is not a TOML table"))?;
 
-    let blist =
-        match load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now) {
-            Ok(loaded) => loaded
-                .config
-                .blocklists
-                .iter()
-                .find(|b| b.id.as_str() == list_id)
-                .with_context(|| format!("blocklist '{list_id}' not found"))?
-                .clone(),
-            // Only the narrowing direction survives a config that will not
-            // load. `→ allow` widens what is permitted and stays gated on a
-            // config someone can read.
-            Err(errs) => degraded_mutation_view(tbl, list_id, kind == BlocklistBase::Deny, errs)?,
-        };
+    let blist = match load_config_for_schema_under_guard(
+        &guard,
+        config_path,
+        TARGET_SCHEMA_VERSION_V5,
+        now,
+    ) {
+        Ok(loaded) => loaded
+            .config
+            .blocklists
+            .iter()
+            .find(|b| b.id.as_str() == list_id)
+            .with_context(|| format!("blocklist '{list_id}' not found"))?
+            .clone(),
+        // Only the narrowing direction survives a config that will not
+        // load. `→ allow` widens what is permitted and stays gated on a
+        // config someone can read.
+        Err(errs) => degraded_mutation_view(tbl, list_id, kind == BlocklistBase::Deny, errs)?,
+    };
     let before = kind_label(blist.base).to_string();
     let after = kind_label(kind).to_string();
 
@@ -2232,26 +2304,17 @@ pub async fn run_set_kind_with_ack(
 
     match validate_outcome {
         Ok(()) => {
-            persist_audit(
-                config_path,
-                |files| {
-                    AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
-                        .with_uid(current_uid())
-                        .with_action("blocklist.set_kind")
-                        .with_target_id(list_id.to_string())
-                        .with_fields_before(before.clone())
-                        .with_fields_after(after.clone())
-                        .with_files(files)
-                },
-                &[config_path, &target_path],
+            emit_audit(
+                AuditRecord::new(AuditEvent::CliMutation, AuditResult::Ok)
+                    .with_uid(current_uid())
+                    .with_action("blocklist.set_kind")
+                    .with_target_id(list_id.to_string())
+                    .with_fields_before(before.clone())
+                    .with_fields_after(after.clone())
+                    .with_files([config_path, &target_path]),
             );
 
-            println!("{}", format_blocklist_set_kind_ok(list_id, &after));
-
-            drop(guard);
-            let outcome = ipc_reload::attempt_reload(socket_path).await;
-            ipc_reload::report_reload_outcome(&outcome);
-            Ok(())
+            Ok(format_blocklist_set_kind_ok(list_id, &after))
         }
         Err(e) => {
             // Still emit an audit row for the rejected attempt so the
@@ -2262,19 +2325,15 @@ pub async fn run_set_kind_with_ack(
             // but expressed in a field with no reader. `result =
             // rejected` already says it, and that one IS rendered.)
             let err_msg = e.to_string();
-            persist_audit(
-                config_path,
-                |files| {
-                    AuditRecord::new(AuditEvent::CliMutation, AuditResult::Rejected)
-                        .with_uid(current_uid())
-                        .with_action("blocklist.set_kind")
-                        .with_target_id(list_id.to_string())
-                        .with_fields_before(before.clone())
-                        .with_fields_after(after.clone())
-                        .with_errors([err_msg.clone()])
-                        .with_files(files)
-                },
-                &[config_path, &target_path],
+            emit_audit(
+                AuditRecord::new(AuditEvent::CliMutation, AuditResult::Rejected)
+                    .with_uid(current_uid())
+                    .with_action("blocklist.set_kind")
+                    .with_target_id(list_id.to_string())
+                    .with_fields_before(before.clone())
+                    .with_fields_after(after.clone())
+                    .with_errors([err_msg.clone()])
+                    .with_files([config_path, &target_path]),
             );
             Err(e)
         }
@@ -2365,8 +2424,9 @@ pub async fn run_set_trust(
     let trust = parse_trust(trust_str)?;
     let now = time::OffsetDateTime::now_utc();
     let guard = crate::config::write_lock::acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let blist = loaded
         .config
         .blocklists
@@ -2756,8 +2816,8 @@ pub async fn run_import_local(
     }
     // Do a read-only preflight before touching the external source.  The
     // guarded transaction below repeats these checks authoritatively.
-    let preflight =
-        load_config(config_path, time::OffsetDateTime::now_utc()).map_err(format_config_errors)?;
+    let preflight = load_current_config(config_path, time::OffsetDateTime::now_utc())
+        .map_err(format_config_errors)?;
     if preflight
         .config
         .blocklists
@@ -2914,8 +2974,9 @@ fn run_import_local_locked(
     ops: &mut impl ImportLocalOps,
 ) -> anyhow::Result<ImportedLocal> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let configured_cap = u64::try_from(loaded.config.lists.max_body_bytes).unwrap_or(u64::MAX);
     if snapshot.len > configured_cap {
         bail!(

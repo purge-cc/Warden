@@ -315,10 +315,24 @@ impl<'g> TreeIo<'g> {
         parent: &PinnedDirectory<'g>,
         name: &OsStr,
     ) -> anyhow::Result<(File, Metadata)> {
-        let file = inspect_at(parent.dirs.last().context("pinned backup directory")?, name)?
+        let file = self
+            .backup_inspect_optional_child(parent, name)?
             .context("backup member disappeared during inventory")?;
+        Ok(file)
+    }
+
+    /// Inspect an optional child without following it.
+    pub(crate) fn backup_inspect_optional_child(
+        self,
+        parent: &PinnedDirectory<'g>,
+        name: &OsStr,
+    ) -> anyhow::Result<Option<(File, Metadata)>> {
+        let Some(file) = inspect_at(parent.dirs.last().context("pinned backup directory")?, name)?
+        else {
+            return Ok(None);
+        };
         let metadata = file.metadata()?;
-        Ok((file, metadata))
+        Ok(Some((file, metadata)))
     }
 
     /// Descend only through a real directory held beneath the locked root.

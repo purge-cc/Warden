@@ -48,7 +48,7 @@ fn edit_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -318,7 +318,7 @@ fn local_dns_edit_uses_one_guard_and_restores_with_that_guard() {
         "got: {message}"
     );
     assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
-    let loaded = load_v1_config(&master).unwrap();
+    let loaded = load_current_config(&master).unwrap();
     assert_eq!(loaded.config.local_dns.records.len(), 1);
     assert_eq!(loaded.config.local_dns.records[0].domain, "old.home");
 }

@@ -1,4 +1,4 @@
-//! `warden label` — v1-native CRUD for `[[labels]]` entries.
+//! `warden label` — current-schema CRUD for `[[labels]]` entries.
 //!
 //! Sibling of `warden group` / `warden device`: list / show / add / set /
 //! remove, `--into <file>` target selection, and the pre-promote
@@ -38,8 +38,8 @@ use super::target::{
     write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::{load_config, load_config_for_schema_under_guard};
-use crate::config::schema::{ConfigV1, Id, Label, LabelKind, SCHEMA_VERSION_V1};
+use crate::config::loader::{load_config_for_schema_under_guard, load_current_config};
+use crate::config::schema::{ConfigV1, Id, Label, LabelKind, TARGET_SCHEMA_VERSION_V5};
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 /// How many referring entities `remove` names before eliding the rest.
@@ -47,7 +47,7 @@ const MAX_REFERENCES_SHOWN: usize = 5;
 
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     if loaded.config.labels.is_empty() {
         println!("no labels configured");
         println!(
@@ -84,7 +84,7 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 pub fn run_show(config_path: &Path, id: &str, kind: Option<&str>) -> anyhow::Result<()> {
     let kind = parse_kind_opt(kind)?;
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let label = select_label(&loaded.config.labels, id, kind)?;
     print!("{}", render_label_detail(label));
     Ok(())
@@ -206,8 +206,9 @@ pub(crate) fn add_inner_locked(
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if loaded
         .config
         .labels
@@ -292,8 +293,9 @@ pub(crate) fn set_fields_inner_locked(
     );
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     // Resolve which row we are editing BEFORE touching a file, so an
     // ambiguous id is refused rather than silently resolved to whichever
     // row happens to come first on disk.
@@ -367,8 +369,9 @@ pub(crate) fn set_inner_locked(
     }
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     // Resolve which row we are editing BEFORE touching a file, so an
     // ambiguous id is refused rather than silently resolved to whichever
     // row happens to come first on disk.
@@ -468,8 +471,9 @@ fn remove_if_present_locked(
     into: Option<&Path>,
 ) -> anyhow::Result<Option<RemovedLabel>> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
 
     let matches: Vec<&Label> = loaded
         .config

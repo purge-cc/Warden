@@ -1,5 +1,7 @@
 use super::*;
 use crate::config::schema::{ConfigV1, CustomList, Id};
+use crate::operator_rules::{Capabilities, ListDetail, Metadata, TransportLimits};
+use crate::tui::operator_policy::PolicyCatalog;
 
 fn loaded_with(ids: &[&str]) -> crate::config::loader::LoadedConfig {
     crate::config::loader::LoadedConfig {
@@ -26,6 +28,44 @@ fn app_with(ids: &[&str]) -> App {
     let mut app = App::new();
     app.active_leaf = Leaf::CustomLists;
     app.loaded_config = Some(loaded_with(ids));
+    app.operator_catalog = Some(PolicyCatalog {
+        capabilities: Capabilities {
+            contract_version: crate::operator_rules::CONTRACT_VERSION,
+            schema_version: 5,
+            operator_rule_grammar: 1,
+            operations: Vec::new(),
+            semantic_hash: true,
+            activation_ack: true,
+            cluster_artifact: false,
+            limits: TransportLimits::IPC,
+        },
+        metadata: Metadata {
+            contract_version: crate::operator_rules::CONTRACT_VERSION,
+            schema_version: 5,
+            config_revision: "config-r1".into(),
+            desired_operator_policy_hash: String::new(),
+            active_policy: None,
+            activation_in_sync: true,
+            lists: ids.len(),
+            mounted_lists: 0,
+            orphan_packs: 0,
+        },
+        lists: ids
+            .iter()
+            .map(|id| ListDetail {
+                id: (*id).to_string(),
+                display_name: (*id).to_string(),
+                description: String::new(),
+                config_revision: "config-r1".into(),
+                pack_revision: format!("{id}-r1"),
+                bytes: 0,
+                rule_count: 0,
+                invalid_rows: 0,
+                profiles: Vec::new(),
+            })
+            .collect(),
+        orphan_packs: Vec::new(),
+    });
     app
 }
 
@@ -64,21 +104,12 @@ fn home_and_end_jump_to_the_ends() {
     assert_eq!(app.custom_lists.selected_id.as_deref(), Some("a"));
 }
 
-/// **`h` and `l` are bound here; `j` and `k` are not — and the split is
-/// deliberate, not an oversight.**
-///
-/// The four vim aliases were deleted TUI-wide, and this leaf is the
-/// only place any of them came back. The operator asked for it, and
-/// the reason it is coherent is the axis: this is the one leaf with two
-/// side-by-side panes, so `h`/`l` name a movement that exists here and
-/// nowhere else. `j`/`k` would duplicate `↑`/`↓`, which every leaf
-/// already has, so they stay unbound.
-///
-/// Pinning both halves is what makes this a test rather than a note: a
-/// build that bound all four, or none, fails.
+/// Vim aliases are deliberately absent; the Rules pane is reachable with
+/// the explicit panel switch even at the narrow floor, where it replaces
+/// the master.
 #[test]
-fn h_and_l_move_the_focus_while_j_and_k_stay_unbound() {
-    for ch in ['j', 'k'] {
+fn vim_aliases_stay_unbound_and_arrows_reach_rules_at_narrow_width() {
+    for ch in ['h', 'j', 'k', 'l'] {
         let mut app = app_with(&["a", "b"]);
         app.custom_lists.selected_id = Some("a".to_string());
         press(&mut app, KeyCode::Char(ch));
@@ -95,34 +126,30 @@ fn h_and_l_move_the_focus_while_j_and_k_stay_unbound() {
 
     let mut app = app_with(&["a"]);
     app.custom_lists.focus = CustomListsFocus::Lists;
-    press(&mut app, KeyCode::Char('l'));
+    app.custom_lists.rules_pane_painted = false;
+    press(&mut app, KeyCode::Char('v'));
     assert_eq!(
         app.custom_lists.focus,
         CustomListsFocus::Rules,
-        "`l` must reach the rule pane"
+        "v must reach the full-width Rules pane"
     );
-    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Left);
     assert_eq!(
         app.custom_lists.focus,
         CustomListsFocus::Lists,
-        "`h` must come back"
+        "Left must return to the master pane"
     );
 }
 
-/// Focus must never rest on a pane the layout does not paint. At the
-/// 80x24 floor the split collapses, so this is the DEFAULT state there,
-/// not an edge case — and a `Rules` focus would leave the operator
-/// moving a cursor on a table that is not on screen.
+/// At 80×24 Rules takes the full body when focused, so a narrow terminal
+/// must not reject the explicit panel transition.
 #[test]
-fn the_focus_cannot_enter_a_rule_pane_the_layout_does_not_paint() {
+fn narrow_rules_focus_is_reachable() {
     let mut app = app_with(&["a"]);
     app.custom_lists.rules_pane_painted = false;
-    press(&mut app, KeyCode::Enter);
-    assert_eq!(app.custom_lists.focus, CustomListsFocus::Lists);
-    assert!(
-        app.leaf_key_unhandled,
-        "a refused focus move must report unhandled, not swallow the key"
-    );
+    press(&mut app, KeyCode::Char('v'));
+    assert_eq!(app.custom_lists.focus, CustomListsFocus::Rules);
+    assert!(!app.leaf_key_unhandled);
 }
 
 /// The anchor names a list the config no longer declares — the renderer
@@ -136,14 +163,14 @@ fn a_dangling_anchor_is_repaired_to_the_first_row() {
     assert_eq!(app.custom_lists.selected_id.as_deref(), Some("a"));
 }
 
-/// **"No config" is not "a config with no custom lists".** This runs on
+/// **"No catalogue" is not "a catalogue with no custom lists".** This runs on
 /// every dirty render, so without the guard a failed load would discard
 /// the operator's place with nobody pressing a key.
 #[test]
 fn a_failed_load_does_not_wipe_the_anchor() {
     let mut app = app_with(&["a"]);
     app.custom_lists.selected_id = Some("a".to_string());
-    app.loaded_config = None;
+    app.operator_catalog = None;
     ensure_custom_list_selection_seeded(&mut app);
     assert_eq!(app.custom_lists.selected_id.as_deref(), Some("a"));
     press(&mut app, KeyCode::Down);

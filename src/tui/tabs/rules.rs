@@ -325,9 +325,8 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Empty-state copy. Two variants:
-///   - **Truly empty** (no rules at all): leads with the `[a]` add-rule
-///     modal, then demotes the Query Log + scope_modal path and the
-///     `warden` CLI verbs to secondary hints.
+///   - **Truly empty** (no rules at all): explains that loose admin rules
+///     are retired and points operators at Custom Lists.
 ///   - **Filtered to zero** (rules exist, but the chip excludes them
 ///     all): hint that they should `[f]` cycle to see them.
 fn render_empty_state(f: &mut Frame, area: Rect, app: &App, has_filtered_out: bool) {
@@ -350,34 +349,30 @@ fn render_empty_state(f: &mut Frame, area: Rect, app: &App, has_filtered_out: bo
         vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  No admin rules yet.",
+                "  Loose admin rules are retired.",
                 Style::default()
                     .fg(T.text_primary)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                crate::tui::rule_add_modal::RULES_EMPTY_ADD_HINT,
+                "  Create a Custom List and mount it on a profile instead.",
                 Style::default()
                     .fg(T.brand_red)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  Or from the Query Log tab — focus a row,",
+                "  Custom Lists provide the supported allow and deny rules",
                 Style::default().fg(T.text_secondary),
             )),
             Line::from(Span::styled(
-                "  press Enter, pick allow or deny, choose the scope.",
+                "  for the profiles where they should apply.",
                 Style::default().fg(T.text_secondary),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  Or from the CLI: `warden default {allow,deny} <domain>`",
-                Style::default().fg(T.text_muted),
-            )),
-            Line::from(Span::styled(
-                "  / `warden device <id> {allow,deny} <domain>` / etc.",
+                "  Legacy add/edit/delete actions remain fail-closed.",
                 Style::default().fg(T.text_muted),
             )),
         ]
@@ -631,10 +626,9 @@ const EDIT_KEYS: &str =
 /// with [`modal_form::prose_field_row`] — a hardcoded row index is how the
 /// caret ends up one row above the text it is supposed to be sitting in.
 ///
-/// The column is structural: `prose_row` lays out a 2-cell indent before
-/// the `> ` prompt.
+/// The input follows the two-cell `> ` prompt at the content edge.
 const TYPED_PROSE_ORDINAL: usize = 2;
-const TYPED_PROMPT_COL: u16 = 4;
+const TYPED_PROMPT_COL: u16 = 2;
 
 /// Characters a read-only value cell can hold before
 /// `render_body_fixed`'s non-wrapping `Paragraph` cuts it mid-token at
@@ -1016,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_form_renders_banded_sections_and_the_focus_marker() {
+    fn edit_form_renders_banded_sections_and_the_value_focus() {
         // The Archetype-F body replaced the `label : value` grid. The
         // sections label themselves now, and the focused row carries the
         // shared ecosystem marker rather than a local `▶` chevron.
@@ -1043,16 +1037,25 @@ mod tests {
             text.contains("References"),
             "the reverse index rides POLICY, next to the Scope it resolves:\n{text}"
         );
-        // `▌`, not `◀`: the emerald focus rule is the signal EVERY
-        // ecosystem row carries. `modal_form::radio_row` — which is what
-        // the default focus (Action) renders — emits the rule and the
-        // highlight bar but no closing `◀`, where `value_row` emits all
-        // three. Asserting `◀` here would be asserting a `value_row`
-        // detail against a radio.
+        let action_row = body
+            .fields
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("Action"))
+            })
+            .expect("Action row is present");
+        assert!(action_row.spans[0].style.bg.is_none());
         assert!(
-            text.contains('\u{258c}'),
-            "focused row carries the emerald focus rule:\n{text}"
+            action_row
+                .spans
+                .iter()
+                .skip(1)
+                .any(|span| span.style.bg == Some(T.info)),
+            "only the focused action value carries the highlight:\n{text}"
         );
+        assert!(!text.contains('\u{258c}') && !text.contains('\u{25c0}'));
         assert!(text.contains("Delete rule"), "Delete action present");
         assert!(text.contains("Save"), "Save action present");
         assert!(
@@ -1099,10 +1102,7 @@ mod tests {
             dump.contains("\u{2039} default \u{203a}"),
             "the focused scope row is off-screen:\n{dump}"
         );
-        assert!(
-            dump.contains('\u{25c0}'),
-            "the focus marker must be on screen with the action row:\n{dump}"
-        );
+        assert!(!dump.contains('\u{25c0}') && !dump.contains('\u{258c}'));
         assert!(
             !dump.contains("Rule ID"),
             "a 3-row viewport cannot be showing both ends of the form:\n{dump}"
@@ -1577,160 +1577,24 @@ mod tests {
         ];
     }
 
-    // ── B2 — build_rule_rows reverse-index over devices/profiles ─────
+    #[test]
+    fn empty_rules_screen_explains_the_current_custom_list_path() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
 
-    /// Build an `App` with a single profile (the default), one device,
-    /// and three admin rules: one referenced by a device's allow_rules,
-    /// one referenced by the default profile, one orphan. Used to
-    /// exercise the scope-precedence + parse_rule + reverse-index logic.
-    fn app_with_three_rules() -> App {
-        use crate::config::loader::load_config;
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        let mut f = std::fs::File::create(&master).unwrap();
-        f.write_all(
-            br#"schema_version = 4
-
-[upstream]
-servers = ["192.0.2.1:53"]
-
-[server]
-default_profile = "default"
-
-[[admin_rules]]
-id = "dweller-allow-bank"
-rule = "@@||bank.example^"
-
-[[admin_rules]]
-id = "default-deny-tracker"
-rule = "||tracker.example^"
-
-[[admin_rules]]
-id = "lonely-orphan"
-rule = "||nobody-refs-me.example^"
-
-[[devices]]
-id = "iphone"
-display_name = "iPhone"
-mac = "aa:bb:cc:dd:ee:ff"
-allow_rules = ["dweller-allow-bank"]
-
-[profiles.default]
-display_name = "Default"
-admin_rules = ["default-deny-tracker"]
-"#,
-        )
-        .unwrap();
-        // Avoid leaking the tempdir before load_config reads.
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         let mut app = App::new();
-        app.loaded_config = Some(loaded);
-        // Hold the tempdir alive past load_config (the loader reads
-        // includes lazily; for a single-file master this is technically
-        // unnecessary, but it's the safe default).
-        std::mem::forget(dir);
-        app
-    }
-
-    #[test]
-    fn build_rule_rows_extracts_action_from_at_at_prefix() {
-        let app = app_with_three_rules();
-        let rows = build_rule_rows(&app);
-        let bank = rows
-            .iter()
-            .find(|r| r.id == "dweller-allow-bank")
-            .expect("bank rule must be in the row vec");
-        assert_eq!(bank.action, RuleAction::Allow);
-        assert_eq!(bank.domain_label, "bank.example");
-        let tracker = rows
-            .iter()
-            .find(|r| r.id == "default-deny-tracker")
-            .expect("tracker rule must be in the row vec");
-        assert_eq!(tracker.action, RuleAction::Block);
-    }
-
-    #[test]
-    fn build_rule_rows_resolves_scope_to_device_when_referenced() {
-        let app = app_with_three_rules();
-        let rows = build_rule_rows(&app);
-        let bank = rows.iter().find(|r| r.id == "dweller-allow-bank").unwrap();
-        match &bank.scope {
-            RuleScope::Device(id) => assert_eq!(id, "iphone"),
-            other => panic!("expected Device scope, got {other:?}"),
-        }
-        // References must include the device's allow_rules entry.
-        assert!(
-            bank.references.iter().any(
-                |r| matches!(&r.kind, RuleScope::Device(id) if id == "iphone")
-                    && r.via_field == "allow_rules"
-            ),
-            "bank rule's references must include the device's allow_rules; got {:?}",
-            bank.references
-        );
-    }
-
-    #[test]
-    fn build_rule_rows_resolves_scope_to_default_for_default_profile_ref() {
-        let app = app_with_three_rules();
-        let rows = build_rule_rows(&app);
-        let tracker = rows
-            .iter()
-            .find(|r| r.id == "default-deny-tracker")
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 100, 20), &mut app))
             .unwrap();
-        // Profile id "default" matches [server].default_profile so the
-        // scope renders as Default, not Profile("default").
-        assert!(
-            matches!(tracker.scope, RuleScope::Default),
-            "default-profile-only ref must be Default, got {:?}",
-            tracker.scope
-        );
-    }
-
-    #[test]
-    fn build_rule_rows_marks_orphan_when_no_references() {
-        let app = app_with_three_rules();
-        let rows = build_rule_rows(&app);
-        let orphan = rows.iter().find(|r| r.id == "lonely-orphan").unwrap();
-        assert!(
-            matches!(orphan.scope, RuleScope::Orphan),
-            "no-ref master entry must be Orphan, got {:?}",
-            orphan.scope
-        );
-        assert!(
-            orphan.references.is_empty(),
-            "orphan rule's references list must be empty"
-        );
-    }
-
-    #[test]
-    fn edit_modal_targets_the_row_under_cursor_with_text_filter_active() {
-        // rules-01 (P0): the edit/delete modal builder must index the
-        // SAME visible set the table renders — action chip AND `/` text
-        // search (`matches_rule_filters`). With the text filter narrowing
-        // the set to a single rule, the cursor at index 0 must resolve to
-        // THAT rule, not the first row of the wider action-only set —
-        // otherwise `Enter`/`Del` operate on a different rule than the one
-        // highlighted (and the delete dialog prints the wrong id).
-        let mut app = app_with_three_rules();
-        // `/`-search matching only the orphan rule (its id + raw rule).
-        app.rules.filter = RulesFilter::All;
-        app.rules.filter_text = Some("orphan".to_string());
-        app.rules.table_state.select(Some(0));
-
-        // Sanity: the visible (action + text) set is exactly one row.
-        let rows = build_rule_rows(&app);
-        let visible: Vec<&RuleRowMeta> = rows
-            .iter()
-            .filter(|r| matches_rule_filters(r, app.rules.filter, app.rules.filter_text.as_deref()))
-            .collect();
-        assert_eq!(visible.len(), 1, "text filter must narrow to one row");
-
-        let modal = build_rule_edit_modal_for(&app).expect("a row is focused");
-        assert_eq!(
-            modal.rule_id, "lonely-orphan",
-            "edit modal must target the highlighted (text-filtered) row, \
-             not the first row of the wider action-only set"
-        );
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("Loose admin rules are retired"));
+        assert!(text.contains("Custom List"));
     }
 }

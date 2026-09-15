@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event as CtEvent, KeyEvent};
+use crossterm::event::{self, Event as CtEvent, KeyEvent, MouseEvent};
 use tokio::sync::mpsc;
 
 /// How long the reader sleeps between checks while parked across the `$EDITOR`
@@ -17,6 +17,7 @@ const PARK_POLL: Duration = Duration::from_millis(20);
 pub enum Event {
     /// A key was pressed.
     Key(KeyEvent),
+    Mouse(MouseEvent),
     /// A bracketed-paste payload arrived as one atomic chunk (rather than a
     /// storm of synthetic key events). Routed to the focused text buffer only;
     /// inert in confirm stages. See `tui::handle_paste`.
@@ -105,13 +106,13 @@ struct ReaderEmit {
 /// `tick_due` (computed from `last_tick`) and the read outcome.
 ///
 /// `read` is `None` when `poll` timed out (no input), `Some(ev)` when an event
-/// was read. Mouse/focus events are ignored; a due tick still rides along.
+/// was read. Focus events are ignored; a due tick still rides along.
 fn classify(read: Option<CtEvent>, tick_due: bool) -> ReaderEmit {
     let event = match read {
         Some(CtEvent::Key(key)) => Some(Event::Key(key)),
         Some(CtEvent::Resize(_, _)) => Some(Event::Resize),
         Some(CtEvent::Paste(s)) => Some(Event::Paste(s)),
-        // Mouse/focus — ignored.
+        Some(CtEvent::Mouse(mouse)) => Some(Event::Mouse(mouse)),
         Some(_) => None,
         // poll timed out — no input event this iteration.
         None => None,
@@ -343,6 +344,19 @@ mod tests {
         // Focus events are ignored, but a due tick must not be dropped with them.
         let emit = classify(Some(CtEvent::FocusGained), true);
         assert_eq!(emit.event, None);
+        assert!(emit.tick);
+    }
+
+    #[test]
+    fn mouse_input_preserves_the_due_tick() {
+        let mouse = MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 4,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let emit = classify(Some(CtEvent::Mouse(mouse)), true);
+        assert_eq!(emit.event, Some(Event::Mouse(mouse)));
         assert!(emit.tick);
     }
 

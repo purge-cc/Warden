@@ -20,6 +20,14 @@ use crate::lists::status::BlocklistStatusDto;
 use crate::tracking::query_log::QueryLogCursor;
 use crate::tui::app::{DaemonStatus, TrackingData};
 
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileCreateFailure {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    Unknown(String),
+}
+
 pub struct IpcPoller {
     socket_path: PathBuf,
     /// Previous `prefetch_promotions_total` plus the
@@ -159,6 +167,10 @@ impl IpcPoller {
                 lists_active,
                 lists_total,
                 resource_budget,
+                lists_memory_bytes,
+                query_log_client_ips_supported,
+                tracking_enabled,
+                top_lists_24h_supported,
                 lists_corpus_refusal,
                 lists_corpus_freeze,
                 lists_cycle,
@@ -179,6 +191,10 @@ impl IpcPoller {
                 lists_active,
                 lists_total,
                 resource_budget,
+                lists_memory_bytes,
+                query_log_client_ips_supported,
+                tracking_enabled,
+                top_lists_24h_supported,
                 lists_corpus_refusal,
                 lists_corpus_freeze,
                 lists_cycle,
@@ -198,6 +214,108 @@ impl IpcPoller {
         match send_command(&self.socket_path, &IpcCommand::ClusterStatus).await? {
             IpcResponse::ClusterStatus { status } => Ok(status),
             other => Self::bail_unexpected("ClusterStatus", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn fetch_nodes_status(&self) -> Result<crate::cluster::lifecycle::LifecycleStatus> {
+        match send_command(&self.socket_path, &IpcCommand::NodesStatus).await? {
+            IpcResponse::NodesStatus { status } => Ok(*status),
+            other => Self::bail_unexpected("NodesStatus", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn fetch_node_control_status(
+        &self,
+    ) -> Result<crate::cluster::node_control::NodeControlStatus> {
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::NodeControl {
+                request: crate::cluster::node_control::NodeControlCommand::Status,
+                token: None,
+            },
+        )
+        .await?
+        {
+            IpcResponse::NodeControl { reply } => Ok(reply.status),
+            other => Self::bail_unexpected("NodeControl.Status", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn node_control(
+        &self,
+        request: crate::cluster::node_control::NodeControlCommand,
+    ) -> Result<crate::cluster::node_control::NodeControlReply> {
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::NodeControl {
+                request,
+                token: None,
+            },
+        )
+        .await?
+        {
+            IpcResponse::NodeControl { reply } => Ok(*reply),
+            other => Self::bail_unexpected("NodeControl", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn preview_nodes(
+        &self,
+        request: crate::cluster::lifecycle::LifecycleRequest,
+    ) -> Result<crate::cluster::lifecycle::LifecyclePreview> {
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::NodesPreview {
+                request,
+                token: None,
+            },
+        )
+        .await?
+        {
+            IpcResponse::NodesPreview { preview } => Ok(*preview),
+            other => Self::bail_unexpected("NodesPreview", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn apply_nodes(
+        &self,
+        preview_id: String,
+    ) -> Result<crate::cluster::lifecycle::LifecycleResult> {
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::NodesApply {
+                preview_id,
+                token: None,
+            },
+        )
+        .await?
+        {
+            IpcResponse::NodesResult { result } => Ok(*result),
+            other => Self::bail_unexpected("NodesApply", other),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub async fn cancel_nodes(
+        &self,
+        preview_id: String,
+    ) -> Result<crate::cluster::lifecycle::LifecycleResult> {
+        match send_command(
+            &self.socket_path,
+            &IpcCommand::NodesCancel {
+                preview_id,
+                token: None,
+            },
+        )
+        .await?
+        {
+            IpcResponse::NodesResult { result } => Ok(*result),
+            other => Self::bail_unexpected("NodesCancel", other),
         }
     }
 
@@ -366,9 +484,16 @@ impl IpcPoller {
     /// `cursor` of `None` reads the live tail (page 0). Anything else is
     /// a resume point minted by a previous response's `next_cursor`.
     pub async fn fetch_query_logs(&self, req: QueryLogRequest) -> Result<QueryLogPollResult> {
+        if !req.client_ips.is_empty() && !self.fetch_status().await?.query_log_client_ips_supported
+        {
+            anyhow::bail!(
+                "This daemon does not support exact client selection; upgrade the daemon."
+            );
+        }
         let QueryLogRequest {
             limit,
             client,
+            client_ips,
             blocked_only,
             domain,
             since_secs,
@@ -378,6 +503,7 @@ impl IpcPoller {
         let cmd = IpcCommand::QueryLogs {
             limit,
             client,
+            client_ips,
             blocked_only,
             domain,
             since_secs,
@@ -388,6 +514,7 @@ impl IpcPoller {
         match send_command(&self.socket_path, &cmd).await? {
             IpcResponse::QueryLogs {
                 entries,
+                client_ips_applied: _,
                 logging_enabled,
                 file_state,
                 next_cursor,
@@ -490,15 +617,27 @@ impl IpcPoller {
     /// self-reloads via `notify_reload` — the TUI only needs to refresh
     /// its offline `loaded_config` cache afterwards. `token: None` — the
     /// socket client auto-attaches the plaintext token for Mutating verbs.
-    pub async fn send_profile_create(&self, id: String, display_name: String) -> Result<String> {
+    pub async fn send_profile_create(
+        &self,
+        id: String,
+        display_name: String,
+    ) -> std::result::Result<String, ProfileCreateFailure> {
+        use crate::ipc::auth_token::{load_token, NO_TOKEN_FILE_MSG};
+        let token = load_token()
+            .map_err(|error| ProfileCreateFailure::Refused(error.to_string()))?
+            .ok_or_else(|| ProfileCreateFailure::Refused(NO_TOKEN_FILE_MSG.into()))?;
         let cmd = IpcCommand::ProfileCreate {
             id,
             display_name,
-            token: None,
+            token: Some(token),
         };
-        match send_command(&self.socket_path, &cmd).await? {
-            IpcResponse::Ok { message } => Ok(message),
-            other => Self::bail_unexpected("ProfileCreate", other),
+        match send_command(&self.socket_path, &cmd).await {
+            Ok(IpcResponse::Ok { message }) => Ok(message),
+            Ok(IpcResponse::Error { message }) => Err(ProfileCreateFailure::Refused(message)),
+            Ok(other) => Err(ProfileCreateFailure::Unknown(format!(
+                "unexpected ProfileCreate response: {other:?}"
+            ))),
+            Err(error) => Err(ProfileCreateFailure::Unknown(error.to_string())),
         }
     }
 
@@ -587,6 +726,10 @@ mod tests {
             lists_cycle: None,
             lists_corpus_freeze,
             lc2_list_diagnostics: Default::default(),
+            lists_memory_bytes: None,
+            query_log_client_ips_supported: false,
+            tracking_enabled: None,
+            top_lists_24h_supported: false,
             resource_budget: None,
             cache_weighted_size: 0,
         }
@@ -691,5 +834,108 @@ mod tests {
         assert!(status.lists_corpus_refusal.is_none());
         assert!(status.lists_corpus_freeze.is_none());
         assert_eq!(status.lists_truncated, 0);
+    }
+
+    #[test]
+    fn resource_estimate_and_client_capability_survive_status_projection() {
+        let mut response = status_response(None, None, 0);
+        let IpcResponse::Status {
+            lists_memory_bytes,
+            query_log_client_ips_supported,
+            ..
+        } = &mut response
+        else {
+            unreachable!()
+        };
+        *lists_memory_bytes = Some(123456);
+        *query_log_client_ips_supported = true;
+        let projected = IpcPoller::status_from_response(response).unwrap();
+        assert_eq!(projected.lists_memory_bytes, Some(123456));
+        assert!(projected.query_log_client_ips_supported);
+        let legacy = IpcPoller::status_from_response(status_response(None, None, 0)).unwrap();
+        assert_eq!(legacy.lists_memory_bytes, None);
+        assert!(!legacy.query_log_client_ips_supported);
+    }
+
+    #[tokio::test]
+    async fn unsupported_daemon_cannot_silently_ignore_exact_client_selection() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let response = status_response(None, None, 0);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drop the listener so an accidental follow-up QueryLogs fails, instead
+            // of hanging the test; its IO error would fail the assertion below.
+            drop(listener);
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<IpcCommand>(&line).unwrap(),
+                IpcCommand::Status
+            );
+            let mut wire = serde_json::to_value(response).unwrap();
+            wire.as_object_mut()
+                .unwrap()
+                .remove("query_log_client_ips_supported");
+            stream
+                .write_all(format!("{}\n", serde_json::to_string(&wire).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let err = IpcPoller::new(&path)
+            .fetch_query_logs(QueryLogRequest {
+                limit: 10,
+                client_ips: vec!["10.0.0.1".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support exact client selection"),
+            "{err}"
+        );
+        server.await.unwrap();
+    }
+    #[test]
+    fn tracking_enabled_projection_preserves_unknown_false_and_true() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut response = status_response(None, None, 0);
+            let IpcResponse::Status {
+                tracking_enabled, ..
+            } = &mut response
+            else {
+                unreachable!()
+            };
+            *tracking_enabled = enabled;
+            let status = IpcPoller::status_from_response(response).unwrap();
+            assert_eq!(status.tracking_enabled, enabled);
+        }
+    }
+    #[test]
+    fn top_lists_support_survives_status_projection_in_both_states() {
+        for supported in [false, true] {
+            let mut response = status_response(None, None, 0);
+            let IpcResponse::Status {
+                top_lists_24h_supported,
+                ..
+            } = &mut response
+            else {
+                unreachable!()
+            };
+            *top_lists_24h_supported = supported;
+            assert_eq!(
+                IpcPoller::status_from_response(response)
+                    .unwrap()
+                    .top_lists_24h_supported,
+                supported
+            );
+        }
     }
 }

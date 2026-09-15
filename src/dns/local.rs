@@ -370,7 +370,7 @@ fn resolve_forward(
         {
             if let RData::CNAME(ref target) = cname_rec.data {
                 let mut target_str = CompactString::default();
-                let _ = write!(target_str, "{}", &**target);
+                let _ = write!(target_str, "{}", **target);
                 if target_str.ends_with('.') {
                     target_str.pop();
                 }
@@ -433,7 +433,7 @@ fn ptr_apex(records: &[Record]) -> CompactString {
         return CompactString::default();
     };
     let mut apex = CompactString::default();
-    let _ = write!(apex, "{}", &**target);
+    let _ = write!(apex, "{}", **target);
     if apex.ends_with('.') {
         apex.pop();
     }

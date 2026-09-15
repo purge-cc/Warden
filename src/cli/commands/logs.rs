@@ -45,6 +45,7 @@ pub async fn run_logs(
     legacy_json: bool,
 ) -> anyhow::Result<()> {
     let cmd = IpcCommand::QueryLogs {
+        client_ips: Vec::new(),
         limit,
         client: client.map(|s| s.to_string()),
         blocked_only,
@@ -64,6 +65,7 @@ pub async fn run_logs(
     let entries = match resp {
         IpcResponse::QueryLogs {
             entries,
+            client_ips_applied: _,
             logging_enabled: _,
             file_state: _,
             next_cursor: _,

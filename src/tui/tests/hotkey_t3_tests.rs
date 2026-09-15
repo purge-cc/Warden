@@ -190,7 +190,7 @@ async fn all_eight_mnemonics_dispatch_correctly() {
         ('s', Leaf::Subnets),
         ('l', Leaf::LocalDns),
         ('i', Leaf::Lists),
-        ('u', Leaf::Rules),
+        ('t', Leaf::CustomLists),
         ('e', Leaf::Settings),
     ];
     for (ch, expected) in pairs {

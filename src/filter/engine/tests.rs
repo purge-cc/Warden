@@ -56,6 +56,7 @@ fn test_profile() -> ResolvedProfile {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     }
 }
 
@@ -323,6 +324,7 @@ fn block_all_blocks_everything() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("night", 0);
     assert_eq!(engine.evaluate("google.com", &profile), FilterResult::Block);
@@ -351,6 +353,7 @@ fn block_all_except_allow() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("night", 0);
     assert_eq!(
@@ -398,6 +401,7 @@ fn important_deny_overrides_normal_allow() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0);
     // $important deny beats normal allow in HashSet
@@ -426,6 +430,7 @@ fn important_allow_overrides_important_deny() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0);
     // important allow > important deny
@@ -454,6 +459,7 @@ fn wildcard_deny_blocks() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0);
     assert_eq!(
@@ -486,6 +492,7 @@ fn regex_deny_blocks() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0);
     assert_eq!(
@@ -517,6 +524,7 @@ fn block_all_with_important_allow_rule() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("night", 0);
     assert_eq!(
@@ -549,6 +557,7 @@ fn empty_rules_no_overhead() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(engine.evaluate("ads.com", &profile), FilterResult::Block);
@@ -585,6 +594,7 @@ fn lattice_profile(rules: Vec<crate::filter::rules::DnsRule>) -> ResolvedProfile
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     }
 }
 
@@ -677,6 +687,7 @@ fn priority_tier0_normal_deny_rule_fires_when_no_higher_tier_matches() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -714,6 +725,7 @@ fn unified_walk_allow_at_deeper_suffix_beats_deny_at_shallower() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -744,6 +756,7 @@ fn unified_walk_deny_at_one_suffix_and_bitmask_at_another() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -776,6 +789,7 @@ fn unified_walk_bitmask_only_when_other_sets_miss() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -911,6 +925,7 @@ fn priority_tier0_bitmask_fires_when_only_subscription_matches() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -1109,6 +1124,7 @@ fn w1_2_admin_important_deny_overrides_allow_list() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     // Admin $important deny is sovereign: BLOCK even though the
@@ -1144,6 +1160,7 @@ fn s50_t1_admin_normal_deny_rule_overrides_allow_list() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -1281,6 +1298,7 @@ fn s50_t1_admin_deny_domains_hashset_overrides_allow_list() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("test", 0b01);
     assert_eq!(
@@ -1312,6 +1330,7 @@ fn s50_t1_block_all_ignores_allow_list_per_t1_conservatism() {
         ),
         rewrite_rules: std::sync::Arc::new(crate::dns::rewrite::ProfileRewriteRules::default()),
         ecs_policy: crate::profiles::profile::EcsPolicy::OFF,
+        operator_rules: None,
     };
     engine.fixture_subscribe("night", 0b01);
     assert_eq!(

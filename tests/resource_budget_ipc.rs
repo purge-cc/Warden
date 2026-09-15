@@ -61,6 +61,7 @@ async fn spawn_fixture(tick: Duration, rss_warn_mb: u64) -> Fixture {
         upstream_mode: "plain".into(),
         upstream_count: 0,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -68,6 +69,7 @@ async fn spawn_fixture(tick: Duration, rss_warn_mb: u64) -> Fixture {
         api_token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         config_path: None,
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         list_statuses: None,
         list_state: None,
         local_records_hits: None,
@@ -83,6 +85,8 @@ async fn spawn_fixture(tick: Duration, rss_warn_mb: u64) -> Fixture {
         resource_budget_store: resource_budget_store.clone(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
 
     let server = spawn_ipc_server(socket_path.clone(), Arc::new(state))
@@ -198,6 +202,11 @@ async fn daemon_status_mirrors_injected_resource_budget_exactly() {
         fd_count: 42,
         cpu_user_pct: 7,
         rss_warn_mb: 256,
+        swap_mb: Some(21),
+        peak_rss_mb: Some(345),
+        mem_available_mb: Some(2048),
+        mem_total_mb: Some(4096),
+        sampled_at: Some(1700000123),
     };
     fx.store.store(Arc::new(Some(injected)));
 

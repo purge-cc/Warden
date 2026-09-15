@@ -6,11 +6,12 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{extract::DefaultBodyLimit, Router};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use super::handlers;
+use super::operator_rules;
 use super::state::ApiState;
 use crate::auth::middleware::auth_middleware;
 
@@ -48,6 +49,7 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
         )
         .route("/api/query/{domain}", get(handlers::query_domain))
         .route("/api/config", get(handlers::get_config))
+        // Retained only to return a deliberate 410 migration response.
         .route("/api/whitelist", get(handlers::get_whitelist))
         // Mutation endpoints
         .route("/api/lists/add", post(handlers::add_list))
@@ -76,6 +78,55 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
             auth_middleware,
         ));
 
+    // Operator-rule apply waits for the durable-intent callback before it
+    // answers. It therefore sits outside the legacy 30-second timeout: a
+    // timeout racing that callback could return 408 after acceptance. The
+    // bounded supervisor owns all work after enqueue, independently of the
+    // request future.
+    let operator_routes = Router::new()
+        .route(
+            "/api/v1/operator-rules/capabilities",
+            get(operator_rules::capabilities),
+        )
+        .route(
+            "/api/v1/operator-rules/custom-lists",
+            get(operator_rules::custom_lists),
+        )
+        .route(
+            "/api/v1/operator-rules/custom-lists/{id}",
+            get(operator_rules::custom_list),
+        )
+        .route(
+            "/api/v1/operator-rules/custom-lists/{id}/rules",
+            get(operator_rules::custom_list_rules),
+        )
+        .route(
+            "/api/v1/operator-rules/custom-lists/{id}/export",
+            get(operator_rules::custom_list_export),
+        )
+        .route(
+            "/api/v1/operator-rules/plans",
+            post(operator_rules::create_plan),
+        )
+        .route(
+            "/api/v1/operator-rules/plans/{plan_id}/impacts",
+            get(operator_rules::plan_impacts),
+        )
+        .route("/api/v1/operator-rules/apply", post(operator_rules::apply))
+        .route(
+            "/api/v1/operator-rules/operations/{operation_id}",
+            get(operator_rules::operation),
+        )
+        .layer(DefaultBodyLimit::max(operator_rules::JSON_BODY_LIMIT))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::rate_limit::rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     // Unauthenticated routes. `/healthz` is the always-on liveness probe
     // (Kubernetes / SRE convention). `/metrics` is opt-in via
     // `[api] metrics_enabled = true` so default deployments do not leak
@@ -88,10 +139,10 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
     let app = api_routes.merge(public_routes);
 
     // Cluster serve endpoints mount on THIS server, under their own
-    // cluster-token auth layer, only when the primary built a `ClusterState`
-    // (`cluster.enabled && role == primary && api.enabled`). Absent otherwise,
-    // so `/api/cluster/*` 404s exactly like `/metrics` when disabled — no
-    // enumeration surface. The outer `.with_state(state)` binds both sub-routers.
+    // cluster-token auth layer, only when the primary built a `ClusterState`.
+    // This router is started only when the administrative API is enabled;
+    // Nodes-only listeners mount the narrow replication router separately.
+    // The outer `.with_state(state)` binds both sub-routers.
     #[cfg(feature = "cluster")]
     let app = if state.cluster.is_some() {
         app.merge(crate::cluster::routes::cluster_router(state.clone()))
@@ -103,6 +154,7 @@ pub fn build_router(state: Arc<ApiState>, metrics_enabled: bool) -> Router {
         StatusCode::REQUEST_TIMEOUT,
         API_REQUEST_TIMEOUT,
     ))
+    .merge(operator_routes)
     .layer(TraceLayer::new_for_http())
     .with_state(state)
 }

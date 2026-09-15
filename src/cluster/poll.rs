@@ -1,60 +1,33 @@
-//! The secondary's convergence poll loop.
+//! Authenticated artifact polling preserves persisted and active identities separately.
 //!
-//! A NEW background tokio task (NOT bolted onto `signal_loop`), spawned only
-//! when `cluster.enabled && role == secondary`. Every `poll_interval_secs`:
-//!
-//! 1. `POST /api/cluster/heartbeat` with this node's stats + the plaintext
-//!    cluster token (verified against the primary's stored hash) and
-//!    reads back the primary's `config_hash`;
-//! 2. if `config_hash` differs from last-applied, `GET /bundle` and apply it
-//!    ([`crate::cluster::apply::apply_bundle`], stage→validate→install→reload).
-//!
-//! **Policy is the only thing on this wire.** The Tier-1 domain map used to be
-//! shipped alongside it; it is not, and must not be. The bitmask is a
-//! *positional* index into the process's own merged sources vector, so it is
-//! meaningful only inside the process that built it — publishing it produced a
-//! fixed size ceiling, a bit↔policy misalignment window, and the silent loss of
-//! list direction. The secondary now downloads and builds its own lists from
-//! the replicated policy, and derives identical bits by construction.
-//!
-//! Convergence is conditioned on the **content hash**, not the generation
-//! counter (the hash survives a primary restart; the counter resets). A failed
-//! poll = log + keep last-good + retry next tick: NO self-promotion, NO
-//! takeover (failover is not yet implemented; `failover_after_secs` stays
-//! parsed-unused).
-//!
-//! The last-applied hash lives in-memory: the first poll after a restart
-//! re-pulls the bundle. The bundle itself is on disk in `cluster.d/`, so a
-//! secondary that boots with the primary down still loads its last-good policy.
+//! A successful cycle requires the current resolver to match the owned artifact
+//! and the primary to acknowledge that identity in its fresh heartbeat response.
+//! Failed polling retains the last-good policy while invalidating convergence.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::IF_NONE_MATCH;
-use reqwest::StatusCode;
+use anyhow::Context;
 use tokio::sync::mpsc;
 
 use crate::tracking::StatsEngine;
 
-use super::apply::apply_bundle;
-use super::dto::{ClusterStats, HeartbeatRequest, HeartbeatResponse};
+use super::dto::ClusterStats;
 use super::observe::{ClusterObserve, SyncStatus};
 
 /// Per-request timeout for the poll HTTP client — bounded so a hung primary
 /// never stalls the loop past a tick or two.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Hard ceiling on the policy-bundle body the secondary will buffer.
-/// The bundle is policy-only TOML (KB–low-MB); 16 MB is a safe upper bound.
-const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+const MANAGEMENT_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(3);
+const MANAGEMENT_UPGRADE_RETRY: Duration = Duration::from_secs(300);
 
 /// Run the secondary poll loop forever. Captures clones of the daemon's
 /// shared handles; returns only if the reload channel closes (daemon
 /// shutdown). All identity (`peer`, `token`, `interval`) is fixed at boot.
 #[allow(clippy::too_many_arguments)]
-pub async fn run(
+pub(crate) async fn run(
     config_path: PathBuf,
     reload_tx: mpsc::Sender<Option<u32>>,
     peer: String,
@@ -63,46 +36,60 @@ pub async fn run(
     stats: Option<Arc<StatsEngine>>,
     observe: Arc<ClusterObserve>,
     node_name: Option<String>,
+    profiles: Option<Arc<crate::profiles::ProfileResolver>>,
+    candidate_runtime: Arc<crate::operator_rules::PolicyCandidateRuntime>,
+    node_controller: Arc<super::node_control::NodeController>,
 ) {
-    let peer = peer.trim_end_matches('/').to_string();
-    if peer.is_empty() {
-        tracing::error!("cluster secondary: no peer URL configured; poll loop will not start");
-        return;
-    }
-    if token.is_empty() {
-        tracing::warn!(
-            "cluster secondary: no plaintext cluster token found (run `warden cluster join \
-             --token …`); polls will fail authentication until one is present"
-        );
-    }
-    // The poll client trusts the primary's pinned certificate and NO
-    // public CA. Neither household box has a publicly-issued certificate, so
-    // this is what makes the channel exist at all — a bare builder
-    // (webpki roots only) could not complete a single poll against a
-    // non-loopback peer.
-    //
-    // Failing to build is FATAL to the loop, deliberately. The alternative —
-    // fall back to an unpinned client — is a sync that silently succeeds
-    // against anyone holding a public certificate for the peer's name, which
-    // is the one outcome worse than not syncing.
-    let peer_cert = peer_cert_from_config(&config_path);
-    let client = match super::pinned::build_pinned_client(
-        &peer,
-        peer_cert.as_deref(),
-        REQUEST_TIMEOUT,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "cluster secondary: cannot build the pinned poll client; poll loop aborting");
-            return;
+    let modern = modern_membership(&config_path).await;
+    let transport = if modern {
+        let master = config_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            super::pairing::load_secondary_credential(&master)
+        })
+        .await
+        {
+            Ok(Ok(credential)) => match super::pairing::secondary_client(&credential) {
+                Ok(client) => Some((
+                    client,
+                    credential.primary.trim_end_matches('/').to_owned(),
+                    credential.credential.0.clone(),
+                    Some(credential),
+                )),
+                Err(error) => {
+                    tracing::error!(%error, "node replication TLS setup failed");
+                    None
+                }
+            },
+            result => {
+                tracing::error!(?result, "node replication credential unavailable");
+                None
+            }
         }
+    } else {
+        let peer = peer.trim_end_matches('/').to_owned();
+        let peer_cert = peer_cert_from_config(&config_path);
+        match super::pinned::build_pinned_client(&peer, peer_cert.as_deref(), REQUEST_TIMEOUT) {
+            Ok(client) => Some((client, peer, token, None)),
+            Err(error) => {
+                tracing::error!(%error, "legacy replication TLS setup failed");
+                None
+            }
+        }
+    };
+    let Some((client, peer, token, credential)) = transport else {
+        observe.store_sync(SyncStatus {
+            last_config_hash: None,
+            last_sync: None,
+            last_poll_ok: false,
+            last_error: Some("node replication credential or pinned TLS setup unavailable".into()),
+            synced_at_least_once: false,
+        });
+        return;
     };
 
     tracing::info!(%peer, interval_secs = interval.as_secs(), "cluster secondary: poll loop started");
 
-    // In-memory last-applied content hash. `None` ⇒ pull on the first
-    // poll (and again after any restart). The bundle itself is on disk in
-    // `cluster.d/`, so a re-pull re-confirms rather than re-enables filtering.
+    // The ledger survives restart; this observation requires a new session ack.
     let mut last_config_hash: Option<String> = None;
 
     // Observe-only telemetry locals (NOT convergence state): the time
@@ -111,6 +98,9 @@ pub async fn run(
     // feed a convergence decision.
     let mut last_sync: Option<Instant> = None;
     let mut synced_once = false;
+    let mut management_ready = false;
+    let mut management_retry_at = Instant::now();
+    let mut primary_rebind_proof_complete = false;
 
     // `interval`'s first tick fires immediately, so the secondary converges on
     // boot without waiting a full period.
@@ -118,7 +108,26 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let result = poll_once(
+        if let Some(credential) = &credential {
+            if let Err(error) = super::pairing::activate(credential).await {
+                observe.store_sync(SyncStatus {
+                    last_config_hash: last_config_hash.clone(),
+                    last_sync,
+                    last_poll_ok: false,
+                    last_error: Some(error.to_string()),
+                    synced_at_least_once: synced_once,
+                });
+                continue;
+            }
+        }
+        let roster_error = if let Some(credential) = &credential {
+            super::pairing::refresh_roster(credential, &config_path)
+                .await
+                .err()
+        } else {
+            None
+        };
+        let result = poll_once_v2_observed(
             &client,
             &peer,
             &token,
@@ -127,8 +136,68 @@ pub async fn run(
             &mut last_config_hash,
             stats.as_ref(),
             node_name.as_deref(),
+            profiles.as_deref(),
+            &candidate_runtime,
+            Some(&observe),
         )
         .await;
+        let pinned_poll_succeeded = result.is_ok();
+        let result = result.and_then(|()| match roster_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        });
+        if pinned_poll_succeeded && !primary_rebind_proof_complete {
+            if let Some(credential) = &credential {
+                let endpoint = pinned_primary_endpoint(&credential.primary);
+                match endpoint {
+                    Ok(endpoint) => match node_controller
+                        .confirm_primary_endpoint_rebind(endpoint, &credential.fingerprint)
+                        .await
+                    {
+                        Ok(recorded) => {
+                            primary_rebind_proof_complete = true;
+                            if recorded {
+                                tracing::info!(%endpoint, "new primary transport proved by pinned heartbeat");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "primary transport proof remains pending");
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "saved primary transport cannot be proved");
+                    }
+                }
+            }
+        }
+        if pinned_poll_succeeded && !management_ready && Instant::now() >= management_retry_at {
+            if let Some(credential) = &credential {
+                match negotiate_management_capability(
+                    &client,
+                    &peer,
+                    &token,
+                    credential,
+                    &node_controller,
+                )
+                .await
+                {
+                    Ok(ManagementNegotiation::Ready | ManagementNegotiation::NotNeeded) => {
+                        management_ready = true;
+                    }
+                    Ok(ManagementNegotiation::UpgradeRequired) => {
+                        management_retry_at = Instant::now() + MANAGEMENT_UPGRADE_RETRY;
+                        tracing::warn!(
+                            peer_node_id = %credential.primary_node_id,
+                            "primary requires an explicit Nodes management capability upgrade"
+                        );
+                    }
+                    Err(error) => {
+                        management_retry_at = Instant::now() + interval;
+                        tracing::warn!(%error, "Nodes management capability negotiation failed");
+                    }
+                }
+            }
+        }
         let (last_poll_ok, last_error) = match &result {
             Ok(()) => {
                 last_sync = Some(Instant::now());
@@ -160,6 +229,656 @@ pub async fn run(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementNegotiation {
+    NotNeeded,
+    Ready,
+    UpgradeRequired,
+}
+
+async fn negotiate_management_capability(
+    client: &reqwest::Client,
+    peer: &str,
+    token: &str,
+    credential: &super::pairing::SecondaryCredential,
+    controller: &super::node_control::NodeController,
+) -> anyhow::Result<ManagementNegotiation> {
+    let Some(offer) = controller.management_offer().await? else {
+        return Ok(ManagementNegotiation::NotNeeded);
+    };
+    let exchange = async {
+        let response = client
+            .post(format!(
+                "{}/api/cluster/v2/management-capability",
+                peer.trim_end_matches('/')
+            ))
+            .bearer_auth(token)
+            .json(&super::dto::ManagementCapabilityRequest { offer })
+            .send()
+            .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                | reqwest::StatusCode::UPGRADE_REQUIRED
+        ) {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Nodes management capability HTTP {}",
+            response.status()
+        );
+        let response = serde_json::from_slice(
+            &read_body_capped(response, 16 * 1024, "management capability").await?,
+        )?;
+        Ok::<Option<super::dto::ManagementCapabilityResponse>, anyhow::Error>(Some(response))
+    };
+    let response = tokio::time::timeout(MANAGEMENT_NEGOTIATION_TIMEOUT, exchange)
+        .await
+        .map_err(|_| anyhow::anyhow!("Nodes management capability request timed out"))??;
+    let Some(response) = response else {
+        controller
+            .note_management_upgrade_required(&credential.primary_node_id)
+            .await?;
+        return Ok(ManagementNegotiation::UpgradeRequired);
+    };
+    let Some(grant) = response.grant else {
+        controller
+            .note_management_upgrade_required(&credential.primary_node_id)
+            .await?;
+        return Ok(ManagementNegotiation::UpgradeRequired);
+    };
+    anyhow::ensure!(
+        grant.node_id == credential.primary_node_id,
+        "management grant identity differs from authenticated primary"
+    );
+    let approved_ip = pinned_primary_endpoint(peer)?.ip();
+    anyhow::ensure!(
+        canonical_ip(grant.endpoint.ip()) == canonical_ip(approved_ip),
+        "management grant endpoint differs from authenticated primary"
+    );
+    controller.accept_management_grant(grant).await?;
+    Ok(ManagementNegotiation::Ready)
+}
+
+fn pinned_primary_endpoint(peer: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let url = reqwest::Url::parse(peer)?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(url.path(), "" | "/"),
+        "authenticated primary address is not a plain HTTPS origin"
+    );
+    let ip = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .context("authenticated primary address is not a literal IP")?;
+    let port = url
+        .port_or_known_default()
+        .context("authenticated primary port is absent")?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(ip), std::net::IpAddr::V4),
+        ip => ip,
+    }
+}
+
+async fn modern_membership(config_path: &Path) -> bool {
+    let path = config_path.to_owned();
+    // An unreadable modern configuration must not unlock origin transport.
+    tokio::task::spawn_blocking(move || {
+        crate::config::loader::load_config_v5(&path, time::OffsetDateTime::now_utc())
+            .map(|loaded| loaded.config.cluster.membership_version == Some(1))
+            .unwrap_or(true)
+    })
+    .await
+    .unwrap_or(true)
+}
+
+/// Complete node parser-input acquisition before the daemon's list readiness wait.
+/// A failed primary connection may reuse only a complete previously owned pair.
+pub(crate) async fn bootstrap(
+    config_path: &Path,
+    candidate_runtime: Arc<crate::operator_rules::PolicyCandidateRuntime>,
+) -> anyhow::Result<super::corpus::CorpusManifest> {
+    let attempt = async {
+        let path = config_path.to_owned();
+        let credential =
+            tokio::task::spawn_blocking(move || super::pairing::load_secondary_credential(&path))
+                .await??;
+        let client = super::pairing::secondary_client(&credential)?;
+        super::pairing::activate(&credential).await?;
+        if let Err(error) = super::pairing::refresh_roster(&credential, config_path).await {
+            tracing::warn!(%error, "node roster refresh failed during bootstrap");
+        }
+        let (tx, _rx) = mpsc::channel(2);
+        let mut last_hash = None;
+        poll_once_v2_observed(
+            &client,
+            credential.primary.trim_end_matches('/'),
+            &credential.credential.0,
+            config_path,
+            &tx,
+            &mut last_hash,
+            None,
+            None,
+            None,
+            &candidate_runtime,
+            None,
+        )
+        .await
+    }
+    .await;
+    let path = config_path.to_owned();
+    let local = tokio::task::spawn_blocking(move || {
+        let ledger = super::apply::load_persisted(&path)?
+            .ok_or_else(|| anyhow::anyhow!("CorpusBootstrapPending: no persisted policy"))?;
+        let store = super::corpus::CorpusStore::open(&path)?;
+        let manifest =
+            store.recover_committed_pair(&super::dto::ArtifactIdentity::from(&ledger.manifest))?;
+        Ok::<_, anyhow::Error>(manifest)
+    })
+    .await?;
+    match local {
+        Ok(manifest) => Ok(manifest),
+        Err(local_error) => match attempt {
+            Err(network_error) => Err(local_error.context(format!(
+                "primary corpus acquisition failed: {network_error}"
+            ))),
+            Ok(()) => Err(local_error),
+        },
+    }
+}
+
+pub(crate) async fn fetch_corpus(
+    client: &reqwest::Client,
+    peer: &str,
+    token: &str,
+    config_path: &Path,
+    identity: &super::dto::ArtifactIdentity,
+    expected_generation: &str,
+) -> anyhow::Result<super::corpus::CorpusManifest> {
+    tokio::time::timeout(
+        Duration::from_secs(30 * 60),
+        fetch_corpus_inner(
+            client,
+            peer,
+            token,
+            config_path,
+            identity,
+            expected_generation,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CorpusTransferDeadlineExceeded"))?
+}
+
+async fn fetch_corpus_inner(
+    client: &reqwest::Client,
+    peer: &str,
+    token: &str,
+    config_path: &Path,
+    identity: &super::dto::ArtifactIdentity,
+    expected_generation: &str,
+) -> anyhow::Result<super::corpus::CorpusManifest> {
+    let response = client
+        .get(format!("{peer}/api/cluster/v2/corpus/manifest"))
+        .query(&[("artifact", &identity.artifact_hash)])
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "corpus manifest HTTP {}",
+        response.status()
+    );
+    let manifest: super::corpus::CorpusManifest = serde_json::from_slice(
+        &read_body_capped(
+            response,
+            super::corpus::MAX_MANIFEST_BYTES,
+            "corpus manifest",
+        )
+        .await?,
+    )?;
+    manifest.validate()?;
+    anyhow::ensure!(
+        manifest.generation == expected_generation,
+        "CorpusGenerationChanged: retry heartbeat"
+    );
+    anyhow::ensure!(
+        &manifest.artifact == identity,
+        "CorpusArtifactIdentityMismatch"
+    );
+    let store = Arc::new(super::corpus::CorpusStore::open(config_path)?);
+    let _transfer_lease = store.record_desired(&manifest)?;
+    let mut objects = std::collections::BTreeMap::new();
+    for object in manifest.objects() {
+        if let Some(previous) = objects.insert(object.sha256.clone(), object.clone()) {
+            anyhow::ensure!(previous == *object, "CorpusConflictingObjectSize");
+        }
+    }
+    for object in objects.into_values() {
+        let owned_store = Arc::clone(&store);
+        let checked = object.clone();
+        if tokio::task::spawn_blocking(move || owned_store.has_object(&checked)).await? {
+            continue;
+        }
+        let owned_store = Arc::clone(&store);
+        let expected = object.clone();
+        let mut stage = tokio::task::spawn_blocking(move || owned_store.stage(&expected)).await??;
+        let mut response = client
+            .get(format!(
+                "{peer}/api/cluster/v2/corpus/objects/{}",
+                object.sha256
+            ))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "corpus object HTTP {}",
+            response.status()
+        );
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(length == object.bytes, "CorpusObjectLengthMismatch");
+        }
+        while let Some(chunk) = response.chunk().await? {
+            stage = tokio::task::spawn_blocking(move || {
+                stage.write_chunk(&chunk)?;
+                Ok::<_, anyhow::Error>(stage)
+            })
+            .await??;
+        }
+        let owned_store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || stage.finish(&owned_store)).await??;
+    }
+    let persisted = manifest.clone();
+    tokio::task::spawn_blocking(move || store.prepare_manifest(&persisted)).await??;
+    Ok(manifest)
+}
+
+#[cfg(test)]
+#[path = "poll_v2_tests.rs"]
+mod v2_tests;
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn poll_once_v2(
+    client: &reqwest::Client,
+    peer: &str,
+    token: &str,
+    config_path: &Path,
+    reload_tx: &mpsc::Sender<Option<u32>>,
+    last_config_hash: &mut Option<String>,
+    stats: Option<&Arc<StatsEngine>>,
+    node_name: Option<&str>,
+    profiles: Option<&crate::profiles::ProfileResolver>,
+    candidate_runtime: &Arc<crate::operator_rules::PolicyCandidateRuntime>,
+) -> anyhow::Result<()> {
+    poll_once_v2_observed(
+        client,
+        peer,
+        token,
+        config_path,
+        reload_tx,
+        last_config_hash,
+        stats,
+        node_name,
+        profiles,
+        candidate_runtime,
+        None,
+    )
+    .await
+}
+
+fn corpus_ack_ready(
+    modern: bool,
+    observe: Option<&ClusterObserve>,
+    identity: Option<&super::dto::ArtifactIdentity>,
+    pair: &super::corpus::PairState,
+) -> bool {
+    if !modern {
+        return true;
+    }
+    match (observe, identity, pair.active.as_deref()) {
+        (Some(observe), Some(artifact), Some(generation)) => {
+            pair.active == pair.persisted
+                && pair.active == pair.desired
+                && observe.active_pair_matches(artifact, generation)
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_once_v2_observed(
+    client: &reqwest::Client,
+    peer: &str,
+    token: &str,
+    config_path: &Path,
+    reload_tx: &mpsc::Sender<Option<u32>>,
+    last_config_hash: &mut Option<String>,
+    stats: Option<&Arc<StatsEngine>>,
+    node_name: Option<&str>,
+    profiles: Option<&crate::profiles::ProfileResolver>,
+    candidate_runtime: &Arc<crate::operator_rules::PolicyCandidateRuntime>,
+    observe: Option<&ClusterObserve>,
+) -> anyhow::Result<()> {
+    let active = profiles.map(crate::profiles::ProfileResolver::active_policy_identity);
+    let active_for_attestation = active.clone();
+    let master = config_path.to_path_buf();
+    let (persisted, active_revision_attested) =
+        tokio::task::spawn_blocking(move || match active_for_attestation {
+            Some(active) => super::apply::load_persisted_with_active(&master, &active),
+            None => super::apply::load_persisted(&master).map(|persisted| (persisted, false)),
+        })
+        .await??;
+    let identity = persisted
+        .as_ref()
+        .map(|ledger| super::dto::ArtifactIdentity::from(&ledger.manifest));
+    let modern = modern_membership(config_path).await;
+    let pair = if modern {
+        super::corpus::CorpusStore::open_existing(config_path)?
+            .map(|store| store.pair_state())
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let corpus_ack_ready = corpus_ack_ready(modern, observe, identity.as_ref(), &pair);
+    let ack = active_artifact_ack(
+        persisted.as_ref(),
+        active.as_ref(),
+        active_revision_attested,
+        corpus_ack_ready,
+    );
+    let request = super::dto::HeartbeatV2Request {
+        artifact_format: 2,
+        schema_version: crate::config::schema::TARGET_SCHEMA_VERSION_V5,
+        operator_rule_grammar: "1".into(),
+        compiled_cost_version: crate::filter::operator_rules::CompiledCostV1::VERSION,
+        node_name: node_name.map(str::to_owned),
+        stats: current_stats(stats),
+        persisted: identity.clone(),
+        active: ack.clone(),
+        persisted_corpus: pair.persisted.clone(),
+        active_corpus: ack.as_ref().and(pair.active.clone()),
+    };
+    let response = client
+        .post(format!("{peer}/api/cluster/v2/heartbeat"))
+        .bearer_auth(token)
+        .json(&request)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "artifact heartbeat HTTP {}",
+        response.status()
+    );
+    let heartbeat: super::dto::HeartbeatV2Response =
+        serde_json::from_slice(&read_body_capped(response, 16 * 1024, "heartbeat").await?)?;
+    heartbeat.desired.validate()?;
+    let corpus = if modern {
+        Some(
+            fetch_corpus(
+                client,
+                peer,
+                token,
+                config_path,
+                &heartbeat.desired,
+                heartbeat
+                    .desired_corpus
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("CorpusPrimaryUnavailable"))?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if identity.as_ref() != Some(&heartbeat.desired) {
+        let manifest_response = client
+            .get(format!(
+                "{peer}/api/cluster/v2/artifacts/{}/manifest",
+                heartbeat.desired.artifact_hash
+            ))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            manifest_response.status().is_success(),
+            "artifact manifest HTTP {}",
+            manifest_response.status()
+        );
+        let delivery: super::dto::ManifestResponse = serde_json::from_slice(
+            &read_body_capped(
+                manifest_response,
+                super::manifest::MAX_MANIFEST_BYTES + 128,
+                "manifest",
+            )
+            .await?,
+        )?;
+        delivery.manifest.validate()?;
+        anyhow::ensure!(
+            super::dto::ArtifactIdentity::from(&delivery.manifest) == heartbeat.desired,
+            "ArtifactIdentityMismatch: heartbeat and manifest"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        anyhow::ensure!(
+            delivery.available_until > now,
+            "ArtifactAvailabilityExpired"
+        );
+        let mut expected = std::collections::BTreeMap::from([(
+            delivery.manifest.policy_toml.sha256.clone(),
+            delivery.manifest.policy_toml.clone(),
+        )]);
+        expected.extend(
+            delivery
+                .manifest
+                .packs
+                .iter()
+                .map(|pack| (pack.sha256.clone(), pack.object())),
+        );
+        let mut objects = std::collections::BTreeMap::new();
+        for (digest, object) in expected {
+            let response = client
+                .get(format!(
+                    "{peer}/api/cluster/v2/artifacts/{}/objects/{digest}",
+                    heartbeat.desired.artifact_hash
+                ))
+                .bearer_auth(token)
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "artifact object HTTP {}",
+                response.status()
+            );
+            let bytes =
+                read_body_capped(response, usize::try_from(object.bytes)?, "artifact object")
+                    .await?;
+            object.verify(&bytes, super::manifest::MAX_TOML_BYTES)?;
+            objects.insert(digest, Arc::from(bytes));
+        }
+        super::apply::apply_artifact(
+            config_path,
+            delivery.manifest,
+            objects,
+            reload_tx,
+            Arc::clone(candidate_runtime),
+        )
+        .await?;
+        anyhow::bail!(
+            "ArtifactActivationPending: persisted policy awaits a fresh resolver acknowledgement"
+        );
+    }
+    if let Some(manifest) = &corpus {
+        let store = super::corpus::CorpusStore::open(config_path)?;
+        if store.pair_state()?.persisted.as_deref() != Some(&manifest.generation) {
+            let master = config_path.to_owned();
+            let artifact = manifest.artifact.clone();
+            tokio::task::spawn_blocking(move || {
+                let loaded =
+                    crate::config::loader::load_config_v5(&master, time::OffsetDateTime::now_utc())
+                        .map_err(|errors| {
+                            anyhow::anyhow!("candidate configuration invalid: {errors:?}")
+                        })?;
+                crate::cli::commands::start::preflight_received_corpus(
+                    &master,
+                    &loaded.config.validation_projection()?,
+                    &artifact,
+                )
+            })
+            .await??;
+        }
+        let pending = commit_received_corpus(config_path, manifest, reload_tx).await?;
+        if pending {
+            anyhow::bail!("CorpusActivationPending: persisted parser inputs await policy and corpus activation");
+        }
+    }
+    ensure_active_convergence(
+        identity.as_ref(),
+        ack.as_ref(),
+        &heartbeat.desired,
+        heartbeat.active_acknowledged,
+        reload_tx,
+    )?;
+    anyhow::ensure!(
+        !modern || heartbeat.corpus_acknowledged,
+        "CorpusAcknowledgementPending"
+    );
+    *last_config_hash = Some(heartbeat.desired.artifact_hash);
+    Ok(())
+}
+
+fn active_artifact_ack(
+    persisted: Option<&super::ledger::OwnershipLedger>,
+    active: Option<&crate::operator_rules::activation::ActivePolicyIdentity>,
+    active_revision_attested: bool,
+    corpus_ack_ready: bool,
+) -> Option<super::dto::ActiveArtifactAck> {
+    let ledger = persisted?;
+    let active = active?;
+    (corpus_ack_ready
+        && active.is_known()
+        && active_revision_attested
+        && active.operator_policy_hash == ledger.manifest.operator_policy_hash)
+        .then(|| super::dto::ActiveArtifactAck {
+            artifact: super::dto::ArtifactIdentity::from(&ledger.manifest),
+            local_config_revision: active.config_revision.clone(),
+            daemon_instance_id: active.daemon_instance_id.clone(),
+            resolver_generation: active.resolver_generation,
+        })
+}
+
+async fn commit_received_corpus(
+    config_path: &Path,
+    manifest: &super::corpus::CorpusManifest,
+    reload_tx: &mpsc::Sender<Option<u32>>,
+) -> anyhow::Result<bool> {
+    let master = config_path.to_owned();
+    let selected = manifest.clone();
+    let reload = reload_tx.clone();
+    tokio::task::spawn_blocking(move || {
+            let guard = crate::config::write_lock::acquire_for_migration(&master)?;
+            let loaded = crate::config::loader::load_config_v5_with_policy_overlays_under_service_migration_guard(
+                &guard,
+                guard.canonical_master(),
+                time::OffsetDateTime::now_utc(),
+                None,
+                None,
+            ).map_err(|error| anyhow::anyhow!("node configuration invalid: {error:?}"))?;
+            anyhow::ensure!(
+                loaded.config.cluster.enabled
+                    && loaded.config.cluster.membership_version == Some(1)
+                    && loaded.config.cluster.role == crate::config::schema::ClusterRole::Secondary,
+                "CorpusMembershipChanged"
+            );
+            let ownership = super::ledger::OwnershipStore::open(&guard)?;
+            let ledger = ownership
+                .current()
+                .ok_or_else(|| anyhow::anyhow!("CorpusPolicyOwnershipMissing"))?;
+            anyhow::ensure!(
+                super::dto::ArtifactIdentity::from(&ledger.manifest) == selected.artifact
+                    && ownership.pending().is_none(),
+                "CorpusPolicyChangedDuringPreparation"
+            );
+            let store = super::corpus::CorpusStore::open(&master)?;
+            store.install_manifest(&selected)?;
+            let pending = store.pair_state()?.active.as_deref() != Some(&selected.generation);
+            if pending {
+                match reload.try_send(None) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        anyhow::bail!("reload channel closed")
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(pending)
+        })
+    .await?
+}
+
+/// Ask the normal reload path to activate an already-persisted artifact.
+///
+/// A reload request is deliberately best-effort: a full one-slot channel
+/// already contains the same activation work, so another request would only
+/// amplify pressure. The next poll retries after a rejected or completed
+/// reload until both the local resolver and the primary acknowledge the exact
+/// artifact identity.
+fn ensure_active_convergence(
+    persisted: Option<&super::dto::ArtifactIdentity>,
+    active: Option<&super::dto::ActiveArtifactAck>,
+    desired: &super::dto::ArtifactIdentity,
+    active_acknowledged: bool,
+    reload_tx: &mpsc::Sender<Option<u32>>,
+) -> anyhow::Result<()> {
+    let acknowledged = active.is_some_and(|ack| {
+        ack.artifact == *desired && super::acknowledgement::valid_active_ack(ack)
+    }) && active_acknowledged;
+    if acknowledged {
+        return Ok(());
+    }
+
+    // This is only reachable after the fetch/apply branch, so a matching
+    // persisted identity means all durable artifact bytes are already owned.
+    // Never reapply them just to recover a failed activation.
+    if persisted == Some(desired) {
+        match reload_tx.try_send(None) {
+            Ok(()) => tracing::debug!(
+                artifact = %desired.artifact_hash,
+                "cluster secondary: requested activation retry for persisted artifact"
+            ),
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::debug!(
+                artifact = %desired.artifact_hash,
+                "cluster secondary: activation retry already queued"
+            ),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("reload channel closed; daemon shutting down?")
+            }
+        }
+    }
+    anyhow::bail!("ArtifactActivationPending: active policy is not freshly acknowledged")
+}
+
 /// Read `cluster.peer_cert` from the node's **merged** configuration.
 ///
 /// Read here rather than threaded in from the daemon's already-loaded config
@@ -183,61 +902,13 @@ pub async fn run(
 /// that differ by whether the file was missing, unparseable, or simply unset.
 fn peer_cert_from_config(config_path: &Path) -> Option<String> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = crate::config::loader::load_config(config_path, now).ok()?;
+    let loaded = crate::config::loader::load_config_v5(config_path, now).ok()?;
     loaded
         .config
         .cluster
         .peer_cert
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-}
-
-/// One poll cycle: heartbeat → policy bundle on a hash mismatch.
-#[allow(clippy::too_many_arguments)]
-async fn poll_once(
-    client: &reqwest::Client,
-    peer: &str,
-    token: &str,
-    config_path: &Path,
-    reload_tx: &mpsc::Sender<Option<u32>>,
-    last_config_hash: &mut Option<String>,
-    stats: Option<&Arc<StatsEngine>>,
-    node_name: Option<&str>,
-) -> anyhow::Result<()> {
-    // ── 1. heartbeat ────────────────────────────────────────────────
-    let hb_req = HeartbeatRequest {
-        // We track content hashes, not generations; the primary parses but
-        // drops this field, so 0 is correct.
-        config_generation: 0,
-        stats: current_stats(stats),
-        // Advertise our label so the primary's roster shows a name.
-        node_name: node_name.map(str::to_owned),
-    };
-    let resp = client
-        .post(format!("{peer}/api/cluster/heartbeat"))
-        .bearer_auth(token)
-        .json(&hb_req)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("heartbeat HTTP {}", resp.status());
-    }
-    let hb: HeartbeatResponse = resp.json().await?;
-
-    // ── 2. policy ───────────────────────────────────────────────────
-    // The fetched bundle's content hash is verified against `hb.config_hash`
-    // and its policy-only shape fenced inside `apply_bundle`.
-    // A 304 (None) means already current — fall through to advance the hash.
-    if last_config_hash.as_deref() != Some(hb.config_hash.as_str()) {
-        if let Some(bundle_toml) =
-            fetch_bundle(client, peer, token, last_config_hash.as_deref()).await?
-        {
-            apply_bundle(config_path, &bundle_toml, &hb.config_hash, reload_tx).await?;
-        }
-        *last_config_hash = Some(hb.config_hash.clone());
-    }
-
-    Ok(())
 }
 
 /// Buffer an HTTP response body with a hard ceiling. reqwest applies
@@ -253,38 +924,12 @@ async fn read_body_capped(
 ) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
-        if buf.len() + chunk.len() > max {
+        if chunk.len() > max.saturating_sub(buf.len()) {
             anyhow::bail!("{what} response exceeds the {max}-byte cap; aborting (possible resource-exhaustion)");
         }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
-}
-
-/// `GET /api/cluster/bundle`. `Ok(Some(toml))` on 200, `Ok(None)` on 304.
-async fn fetch_bundle(
-    client: &reqwest::Client,
-    peer: &str,
-    token: &str,
-    prev_hash: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let mut req = client
-        .get(format!("{peer}/api/cluster/bundle"))
-        .bearer_auth(token);
-    if let Some(h) = prev_hash {
-        req = req.header(IF_NONE_MATCH, format!("\"{h}\""));
-    }
-    let resp = req.send().await?;
-    if resp.status() == StatusCode::NOT_MODIFIED {
-        return Ok(None);
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("bundle HTTP {}", resp.status());
-    }
-    let bytes = read_body_capped(resp, MAX_BUNDLE_BYTES, "bundle").await?;
-    Ok(Some(String::from_utf8(bytes).map_err(|e| {
-        anyhow::anyhow!("bundle body is not valid UTF-8: {e}")
-    })?))
 }
 
 /// Snapshot this node's global counters for the heartbeat (mirrors the
@@ -307,7 +952,7 @@ mod tests {
     /// A minimal config the loader actually accepts. `peer_cert_from_config`
     /// goes through the real loader, so the fixture must be loadable — a bare
     /// `[cluster]` table is not.
-    const LOADABLE: &str = r#"schema_version = 4
+    const LOADABLE: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -404,3 +1049,7 @@ servers = ["192.0.2.1:53"]
         );
     }
 }
+
+#[cfg(test)]
+#[path = "corpus_transport_tests.rs"]
+mod corpus_transport_tests;

@@ -1,11 +1,16 @@
 //! Application state for the TUI.
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::widgets::{ListState, TableState};
 
+#[cfg(feature = "cluster")]
+use crate::cluster::lifecycle::LifecycleStatus;
+#[cfg(feature = "cluster")]
+use crate::cluster::node_control::NodeControlStatus;
 use crate::config::loader::LoadedConfig;
 use crate::config::schema::{Blocklist, BlocklistBase, BlocklistFormat};
 #[cfg(feature = "cluster")]
@@ -15,6 +20,8 @@ use crate::ipc::protocol::{
 };
 use crate::lists::status::BlocklistStatusDto;
 use crate::tracking::query_log::QueryLogCursor;
+use crate::tui::query_log_client_picker::QueryLogClientPicker;
+use crate::tui::query_log_detail::QueryLogDetail;
 use crate::tui::query_log_filter_modal::QueryLogFilterModal;
 
 // ── Sections + Leaves ───────────────────────────────────────────────────────
@@ -85,12 +92,23 @@ macro_rules! layout_table {
             // Configuration keeps landing on Labels.
             (
                 Section::Configuration,
-                &[Leaf::Labels, Leaf::Settings, Leaf::File, Leaf::Logs],
+                CONFIGURATION_LEAVES,
             ),
             $($tail),*
         ]
     };
 }
+
+#[cfg(feature = "cluster")]
+const CONFIGURATION_LEAVES: &[Leaf] = &[
+    Leaf::Labels,
+    Leaf::Nodes,
+    Leaf::Settings,
+    Leaf::File,
+    Leaf::Logs,
+];
+#[cfg(not(feature = "cluster"))]
+const CONFIGURATION_LEAVES: &[Leaf] = &[Leaf::Labels, Leaf::Settings, Leaf::File, Leaf::Logs];
 
 /// **Single source of truth for the TUI navigation hierarchy.**
 ///
@@ -110,15 +128,7 @@ macro_rules! layout_table {
 /// Adding a leaf is one row edit here plus `label()` / `mnemonic()` /
 /// `from_mnemonic()`. `layout_covers_every_variant` fails the build if a new
 /// enum variant is not also given a home in this table.
-#[cfg(not(feature = "cluster"))]
 const LAYOUT: &[(Section, &[Leaf])] = layout_table!();
-
-/// The `cluster`-build variant: the Cluster section is appended LAST so
-/// section indices 0-4, numeric hotkeys 1-5, and the linear `Tab` cycle order
-/// of the first ten leaves are byte-identical to the default build. The
-/// section bar runtime-filters it out when `!cluster_visible()`.
-#[cfg(feature = "cluster")]
-const LAYOUT: &[(Section, &[Leaf])] = layout_table!((Section::Cluster, &[Leaf::Cluster]));
 
 /// Total navigable leaves across every [`LAYOUT`] row — the length of
 /// [`Leaf::ALL`]. Derived, never written by hand.
@@ -144,12 +154,6 @@ pub enum Section {
     /// `Leaf::Tags` alongside `Leaf::Settings`; the Tags leaf is gone, and
     /// the section now holds Labels, Settings, File and Logs.
     Configuration,
-    /// Top-level cluster monitoring section.
-    /// Compile-gated behind `cluster` AND runtime-hidden from the nav unless
-    /// `[cluster].enabled` (`App::cluster_visible`). Appended last so the
-    /// existing section indices + numeric hotkeys are unchanged.
-    #[cfg(feature = "cluster")]
-    Cluster,
 }
 
 impl Section {
@@ -175,13 +179,11 @@ impl Section {
 
     pub fn label(self) -> &'static str {
         match self {
-            Section::Dashboard => "1 Dashboard",
-            Section::QueryLog => "2 Query Log",
-            Section::Network => "3 Network",
-            Section::Filters => "4 Filters",
-            Section::Configuration => "5 Configuration",
-            #[cfg(feature = "cluster")]
-            Section::Cluster => "6 Cluster",
+            Section::Dashboard => "Dashboard",
+            Section::QueryLog => "Query Log",
+            Section::Network => "Network",
+            Section::Filters => "Filters",
+            Section::Configuration => "Configuration",
         }
     }
 
@@ -291,15 +293,18 @@ pub enum Leaf {
     /// which answers "what did clients ask for". Labelled **Log Messages**
     /// so the two are not read as the same thing at a glance.
     Logs,
-    /// Cluster monitoring leaf, sole leaf of the top-level
-    /// `Section::Cluster`. Compile-gated behind `cluster` + runtime-hidden
-    /// from `Tab`/`g`/numeric nav unless `[cluster].enabled`. Appended last
-    /// so leaf indices 0-9 and the mnemonic table are unchanged.
+    /// Local node identity, membership lifecycle and cluster observability.
+    /// It remains visible while standalone so operators can create or join a
+    /// cluster from the same place they later monitor it.
     #[cfg(feature = "cluster")]
-    Cluster,
+    Nodes,
 }
 
 impl Leaf {
+    pub fn is_menu_leaf(self) -> bool {
+        !matches!(self, Leaf::Rules | Leaf::File)
+    }
+
     // `ALL` is FLATTENED from
     // `LAYOUT` at compile time, so the linear `Tab` order and the per-section
     // `]` order cannot disagree. They have to agree
@@ -371,7 +376,7 @@ impl Leaf {
             Leaf::Logs => "Log Messages",
             Leaf::Labels => "Labels",
             #[cfg(feature = "cluster")]
-            Leaf::Cluster => "Cluster",
+            Leaf::Nodes => "Nodes",
         }
     }
 
@@ -438,11 +443,8 @@ impl Leaf {
             // Labels takes `b` (laBels) — the second-strong-consonant rule
             // this table uses throughout.
             'b' => Some(Leaf::Labels),
-            // `c` is free in the mnemonic table (Devices owns `v`,
-            // Cache has no leaf). The `g c` jump is itself gated at the
-            // dispatch site so it no-ops when the Cluster section is hidden.
             #[cfg(feature = "cluster")]
-            'c' => Some(Leaf::Cluster),
+            'n' => Some(Leaf::Nodes),
             _ => None,
         }
     }
@@ -474,7 +476,7 @@ impl Leaf {
             Leaf::Logs => 'm',
             Leaf::Labels => 'b',
             #[cfg(feature = "cluster")]
-            Leaf::Cluster => 'c',
+            Leaf::Nodes => 'n',
         }
     }
 
@@ -549,33 +551,70 @@ pub enum InputMode {
     /// Tags tab is gone, so an input mode for it would be a variant
     /// nothing can ever enter.
     FilterLogs(String),
+    /// Nodes roster search. It filters presentation only and continues to
+    /// receive lifecycle and telemetry refreshes while global display pause is
+    /// active.
+    #[cfg(feature = "cluster")]
+    FilterNodes(String),
 }
 
 // ── Per-tab state ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
-pub struct DashboardState {
-    pub show_daily: bool,
+/// Dashboard owns its interaction/viewport state. Keeping this re-export at
+/// the historic `app::DashboardState` path lets older callers compile while
+/// leaving state and behaviour in one dashboard module.
+pub use crate::tui::tabs::dashboard::DashboardState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientFilterMode {
+    /// Exact IP selection from the searchable client picker. The IP set is
+    /// supplied to the daemon before it paginates results.
+    #[default]
+    Selected,
+    /// Historical/manual lookup. This is deliberately exclusive with the
+    /// selected-IP set: two client predicates must never overlap invisibly.
+    Text,
 }
+
+/// Local identity includes every field in the captured log record. Keep
+/// timestamp, domain and IP first for callers inspecting those components.
+/// Completely identical records remain indistinguishable without a daemon ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLogEntryKey(
+    pub String,
+    pub String,
+    pub String,
+    pub Option<String>,
+    pub String,
+    pub String,
+    pub u64,
+    pub Option<String>,
+);
 
 #[derive(Debug, Clone)]
 pub struct QueryLogState {
     pub table_state: TableState,
-    /// Stable per-entry selection key `(timestamp, domain,
-    /// client_ip)`. The Query Log is a sliding tail refreshed every 3s,
+    /// Stable per-entry selection key. The Query Log is refreshed every 3s,
     /// so a bare `TableState` index slides onto a different row when the
     /// window shifts; anchoring on this key keeps the cursor — and the
     /// Enter→scope-modal capture — on the row the operator is looking at.
     /// `None` until the first scroll seeds it.
-    pub selected_key: Option<(String, String, String)>,
+    pub selected_key: Option<QueryLogEntryKey>,
     pub entries: Vec<QueryLogDto>,
     pub filter_domain: Option<String>,
+    pub(crate) domain_focus: super::query_log_controls::FilterFocus,
     pub filter_client: Option<String>,
+    /// Exact OR-set selected in the client picker. Empty means every client.
+    pub client_ips: Vec<String>,
+    pub client_mode: ClientFilterMode,
     pub blocked_only: bool,
-    /// Time preset: cycles Off → 1h → 6h → 24h with the `t`
-    /// key. Rendered on row 3 of the Filters panel; threaded to the
-    /// daemon as `since_secs` via the IPC poller.
+    /// Applied time window, threaded to the daemon as `since_secs`.
     pub since: SincePreset,
+    /// Open period menu keeps a draft until Enter; Esc preserves the
+    /// currently applied window.
+    pub period_menu: bool,
+    pub period_draft: SincePreset,
+    pub(crate) period_focus: super::query_log_controls::FilterFocus,
     /// Daemon-reported `tracking.query_log_enabled` at the time of the
     /// last successful poll. Drives the empty-state picker
     /// together with `file_state`.
@@ -607,9 +646,31 @@ pub struct QueryLogState {
     /// The form while it is open. `None` when closed; the draft inside is
     /// discarded on Esc, so `advanced` above only ever changes on Apply.
     pub advanced_modal: Option<QueryLogFilterModal>,
+    /// Searchable multi-select popup. Its draft is separate from the applied
+    /// set so Esc genuinely discards a half-made selection.
+    pub(crate) client_picker: Option<QueryLogClientPicker>,
+    /// Row detail is read-only and captures the entry, so a refresh cannot
+    /// retarget it to whatever happens to occupy the old table index.
+    pub(crate) detail: Option<QueryLogDetail>,
+    /// Renderer-owned effective table capacity, used by PgUp/PgDn rather
+    /// than a fixed navigation constant.
+    pub visible_rows: usize,
+    /// A successful page (including an empty one) distinguishes first load
+    /// from a truthful "no queries recorded" state.
+    pub has_loaded: bool,
+    pub read_failed: bool,
 }
 
 impl QueryLogState {
+    pub fn has_active_filters(&self) -> bool {
+        self.filter_domain.as_ref().is_some_and(|v| !v.is_empty())
+            || self.filter_client.as_ref().is_some_and(|v| !v.is_empty())
+            || !self.client_ips.is_empty()
+            || self.blocked_only
+            || self.since != SincePreset::Off
+            || !self.advanced.is_empty()
+    }
+
     /// The cursor to send for the page currently being viewed.
     pub fn current_cursor(&self) -> Option<QueryLogCursor> {
         self.page_cursors.get(self.page_index).cloned().flatten()
@@ -642,12 +703,13 @@ impl QueryLogState {
     /// resume point, i.e. the current page is the oldest retained.
     pub fn page_older(&mut self) -> bool {
         if self.page_index + 1 >= self.page_cursors.len() {
-            let Some(next) = self.next_cursor.clone() else {
+            let Some(next) = self.next_cursor.take() else {
                 return false;
             };
             self.page_cursors.push(Some(next));
         }
         self.page_index += 1;
+        self.clear_page_rows();
         true
     }
 
@@ -657,7 +719,16 @@ impl QueryLogState {
             return false;
         }
         self.page_index -= 1;
+        self.clear_page_rows();
         true
+    }
+    fn clear_page_rows(&mut self) {
+        self.next_cursor = None;
+        self.entries.clear();
+        self.has_loaded = false;
+        self.read_failed = false;
+        self.selected_key = None;
+        self.table_state.select(None);
     }
 }
 
@@ -668,9 +739,15 @@ impl Default for QueryLogState {
             selected_key: None,
             entries: Vec::new(),
             filter_domain: None,
+            domain_focus: Default::default(),
             filter_client: None,
+            client_ips: Vec::new(),
+            client_mode: ClientFilterMode::Selected,
             blocked_only: false,
             since: SincePreset::Off,
+            period_menu: false,
+            period_draft: SincePreset::Off,
+            period_focus: Default::default(),
             // Optimistic defaults: the first successful poll overwrites
             // both. Until then the tab renders as if the writer is on
             // and the file is healthy — benign when the daemon is up.
@@ -683,50 +760,86 @@ impl Default for QueryLogState {
             next_cursor: None,
             advanced: AdvancedClientFilterDto::default(),
             advanced_modal: None,
+            client_picker: None,
+            detail: None,
+            visible_rows: 10,
+            has_loaded: false,
+            read_failed: false,
         }
     }
 }
 
-/// Time-window preset for the Query Log tab's filter. Cycles
-/// with the `t` key through four discrete states — free-form input was
-/// rejected in favour of a single-keystroke UX.
+/// Available Query Log time windows. The popup edits a draft before applying it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SincePreset {
     #[default]
     Off,
     LastHour,
+    Last3Hours,
     Last6Hours,
     Last24Hours,
 }
 
 impl SincePreset {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::LastHour,
+        Self::Last3Hours,
+        Self::Last6Hours,
+        Self::Last24Hours,
+    ];
+
     pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|preset| *preset == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|preset| *preset == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn compact_label(self) -> &'static str {
         match self {
-            Self::Off => Self::LastHour,
-            Self::LastHour => Self::Last6Hours,
-            Self::Last6Hours => Self::Last24Hours,
-            Self::Last24Hours => Self::Off,
+            Self::Off => "All",
+            Self::LastHour => "1h",
+            Self::Last3Hours => "3h",
+            Self::Last6Hours => "6h",
+            Self::Last24Hours => "24h",
         }
     }
 
-    /// Short label for the compact `Time: [<label>]` row. Fixed 4-char
-    /// inner width so the surrounding line does not reflow as the
-    /// preset rotates. Frozen — pinned by the query_log tests.
+    pub fn long_label(self) -> &'static str {
+        match self {
+            Self::Off => "Available history",
+            Self::LastHour => "Last hour",
+            Self::Last3Hours => "Last 3 hours",
+            Self::Last6Hours => "Last 6 hours",
+            Self::Last24Hours => "Last 24 hours",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => " off",
             Self::LastHour => " 1h ",
+            Self::Last3Hours => " 3h ",
             Self::Last6Hours => " 6h ",
             Self::Last24Hours => "24h ",
         }
     }
 
-    /// The duration as seconds, for the IPC `since_secs` field. `None`
-    /// in `Off` state so the daemon applies no cutoff.
     pub fn as_secs(self) -> Option<u64> {
         match self {
             Self::Off => None,
             Self::LastHour => Some(3_600),
+            Self::Last3Hours => Some(10_800),
             Self::Last6Hours => Some(21_600),
             Self::Last24Hours => Some(86_400),
         }
@@ -748,6 +861,33 @@ pub enum DeviceGroupBy {
 }
 
 impl DeviceGroupBy {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Owner => 1,
+            Self::Department => 2,
+            Self::Profile => 3,
+        }
+    }
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Owner,
+            2 => Self::Department,
+            3 => Self::Profile,
+            _ => Self::None,
+        }
+    }
+
+    pub(crate) const fn display_label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Owner => "Owner",
+            Self::Department => "Department",
+            Self::Profile => "Profile",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::None => Self::Owner,
@@ -788,6 +928,11 @@ pub struct DevicesState {
     /// Operator's subnet filter over the device list — a CIDR string
     /// (`10.10.1.0/24`). `None` means no filter.
     pub filter_subnet: Option<String>,
+    /// Full detail overlay opened with `i`. The selected device remains
+    /// anchored by `selected_id`; the boolean only controls presentation.
+    pub inspect_open: bool,
+    /// Focused action in the delete confirmation: 0 = Cancel, 1 = Remove.
+    pub delete_focus: usize,
 }
 
 /// The kind of work an open modal is doing. The state machine for a
@@ -987,6 +1132,7 @@ pub struct DeviceFormState {
     /// select-only field (Profile / Group / the three metadata kinds).
     /// `None` in normal field-editing mode.
     pub picker: Option<FieldPicker>,
+    pub(crate) picker_focus: super::query_log_controls::FilterFocus,
 }
 
 /// State for the device-form popup picker (Profile / Group / the three
@@ -1014,25 +1160,22 @@ pub struct FieldPicker {
 
 impl DeviceFormState {
     /// Field tab order, and the source `focus_ring` filters to build the
-    /// modal's focus sequence. IP + MAC + MAC aliases cluster at the top
-    /// as the identity block (locked on Promote). The metadata block
-    /// follows: Name, Profile, Group, Owner, Type, Department, Notes.
-    /// The renderer does NOT read this list — it lays rows out
-    /// from `devices::{IDENTITY_FIELDS, ASSIGNMENT_FIELDS}`, and a test
-    /// asserts every entry here appears in exactly one of those.
+    /// The keyboard and mouse order follows Identity & Network, Policy &
+    /// Labels, then Local DNS & Notes. Locked identity fields are skipped
+    /// when promoting a discovered device.
     pub const FIELDS: [DeviceFormField; 12] = [
         DeviceFormField::Ip,
         DeviceFormField::Mac,
-        DeviceFormField::MacAliases,
         DeviceFormField::Name,
+        DeviceFormField::MacAliases,
         DeviceFormField::Profile,
         DeviceFormField::Group,
         DeviceFormField::Owner,
         DeviceFormField::Device,
         DeviceFormField::Department,
-        DeviceFormField::Notes,
         DeviceFormField::NetworkName,
         DeviceFormField::NetworkNameWildcard,
+        DeviceFormField::Notes,
     ];
 
     /// Empty form for `Add`. Focus starts on the first editable field
@@ -1065,6 +1208,7 @@ impl DeviceFormState {
             device_types_snapshot: Vec::new(),
             departments_snapshot: Vec::new(),
             picker: None,
+            picker_focus: super::query_log_controls::FilterFocus::Value,
         }
     }
 
@@ -1111,6 +1255,7 @@ impl DeviceFormState {
             device_types_snapshot: Vec::new(),
             departments_snapshot: Vec::new(),
             picker: None,
+            picker_focus: super::query_log_controls::FilterFocus::Value,
         }
     }
 
@@ -1146,6 +1291,7 @@ impl DeviceFormState {
             device_types_snapshot: Vec::new(),
             departments_snapshot: Vec::new(),
             picker: None,
+            picker_focus: super::query_log_controls::FilterFocus::Value,
         }
     }
 
@@ -1228,6 +1374,8 @@ impl DeviceFormState {
     /// Whether the given field is read-only in the current form mode.
     /// Tab navigation skips locked fields; the renderer dims them and
     /// the key handler refuses keystrokes on them.
+    /// Notes and MAC aliases also stay locked until Edit: the Promote
+    /// command has no fields for them.
     /// Group is locked on **Promote** because the promote wire
     /// has no group field — `handle_device_promote` writes the device
     /// with `group: None` by design ("the operator can assign one later
@@ -1239,7 +1387,11 @@ impl DeviceFormState {
     pub fn is_locked(&self, field: DeviceFormField) -> bool {
         (self.ip_locked && field == DeviceFormField::Ip)
             || (self.mac_locked && field == DeviceFormField::Mac)
-            || (self.mode == DeviceFormMode::Promote && field == DeviceFormField::Group)
+            || (self.mode == DeviceFormMode::Promote
+                && matches!(
+                    field,
+                    DeviceFormField::Group | DeviceFormField::Notes | DeviceFormField::MacAliases
+                ))
     }
 
     /// Slug-derived v1 id preview from the current name. Read-only, and
@@ -1272,31 +1424,22 @@ impl DeviceFormState {
     }
 }
 
-/// Which of the Labels leaf's two panes has the cursor.
-///
-/// The leaf is drawn as two side-by-side cards, so it is navigated on
-/// that axis: `←` / `→` move **between** the cards, `↑` / `↓` move
-/// **inside** the focused one. `Tab` is deliberately not one of them —
-/// it stays the global leaf cycle. Before this existed there was no
-/// focus at all — `h`/`l` cycled the kind menu and `j`/`k` the table,
-/// unconditionally, which meant the vertical menu was walked with a
-/// horizontal key. That mismatch is what an operator reported as
-/// "VIM navigation"; `h`/`l` was the only such pair in the whole TUI.
-/// Those four aliases are **deleted** TUI-wide and
-/// not rebound — only the arrows reach this focus today.
+/// Keyboard focus within the Labels category/list/detail composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LabelsFocus {
-    KindMenu,
+pub enum LabelsFocus {
+    Categories,
     Entries,
+    Details,
 }
 
 /// Cursor state of the Labels leaf. `selected_kind` is which
 /// vocabulary the left menu has focused; `selected_id` anchors the row in
-/// the right table by **id**, not index — a config reload can add, remove
+/// the center table by **id**, not index — a config reload can add, remove
 /// or reorder entries.
 #[derive(Debug, Clone)]
 pub struct LabelsState {
     pub selected_kind: crate::config::schema::LabelKind,
+    pub category_state: ratatui::widgets::ListState,
     pub selected_id: Option<String>,
     /// Which pane `↑`/`↓` scroll. See [`LabelsFocus`].
     pub(crate) focus: LabelsFocus,
@@ -1304,22 +1447,7 @@ pub struct LabelsState {
     /// is `Some` it grabs every keystroke — the gate sits in `handle_key`
     /// ahead of the per-leaf dispatch, next to the Groups one.
     pub(crate) modal: Option<crate::tui::label_modal::LabelModal>,
-    /// Whether the last frame actually drew the kind menu.
-    ///
-    /// **The key handler cannot compute this and must not guess it.** It
-    /// never sees the viewport width; `clamp_labels_focus_to_layout` runs
-    /// in the render loop, which does, and writes the answer here. Without
-    /// it the two-pane key model is applied to a one-pane screen: below
-    /// `NARROW_THRESHOLD` the clamp pins focus to the table **every
-    /// frame**, so `←` cannot hold `KindMenu` long enough for the next
-    /// `↑`/`↓` to reach it and the kind becomes unreachable. That was
-    /// harmless while the leaf only read; with `a` writing into the
-    /// focused kind it meant two of the three vocabularies could not be
-    /// authored at the product's declared 80×24 minimum.
-    ///
-    /// Starts `true` so the first keystroke of a session that has not
-    /// rendered yet behaves like the wide layout, which is the common
-    /// case; the first frame corrects it either way.
+    /// Whether the detail card is visible alongside the list.
     pub(crate) menu_painted: bool,
     /// Visual scroll/highlight cache for the entries table. `selected_id`
     /// is the identity that survives a reload; this is only the viewport
@@ -1335,10 +1463,9 @@ impl Default for LabelsState {
             // Owner is the kind an operator reaches for first: it is the
             // one that names a person rather than a category.
             selected_kind: crate::config::schema::LabelKind::Owner,
+            category_state: ratatui::widgets::ListState::default(),
             selected_id: None,
-            // The menu, not the table: the kind decides what the table
-            // even contains, so it is the choice that comes first.
-            focus: LabelsFocus::KindMenu,
+            focus: LabelsFocus::Entries,
             table_state: TableState::default(),
         }
     }
@@ -1354,6 +1481,38 @@ impl Default for LabelsState {
 pub(crate) enum CustomListsFocus {
     Lists,
     Rules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CustomListInfoTarget {
+    List(String),
+    Rule { list_id: String, row_ref: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustomListInfo {
+    pub target: CustomListInfoTarget,
+    pub advanced_expanded: bool,
+}
+
+/// Complete, revision-fenced semantic counts for one custom-list pack.
+/// A missing entry means the background read has not completed. An error is
+/// retained separately from a zero count so the table never turns a partial
+/// page into a plausible-looking result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CustomListCounts {
+    Ready {
+        config_revision: String,
+        pack_revision: String,
+        allow: usize,
+        deny: usize,
+        skipped: usize,
+    },
+    Unavailable {
+        config_revision: String,
+        pack_revision: String,
+        error: String,
+    },
 }
 
 /// One line of a pack file as the rule pane draws it.
@@ -1402,6 +1561,9 @@ pub struct PackView {
 #[derive(Debug, Clone)]
 pub struct CustomListsState {
     pub selected_id: Option<String>,
+    /// Stable selected backend rule identity `(list_id, row_ref)`.
+    /// Unlike a displayed line number this survives sorting and polling.
+    pub selected_row_ref: Option<(String, String)>,
     /// 1-based file line the rule pane's cursor rests on.
     pub selected_line: Option<usize>,
     pub(crate) focus: CustomListsFocus,
@@ -1413,6 +1575,8 @@ pub struct CustomListsState {
     /// grabs every keystroke — the gate sits in `handle_key` ahead of the
     /// per-leaf dispatch, next to the Labels one.
     pub(crate) modal: Option<crate::tui::custom_list_modal::CustomListModal>,
+    pub(crate) info: Option<CustomListInfo>,
+    pub(crate) counts: std::collections::BTreeMap<String, CustomListCounts>,
     /// Lines of the selected list's pack, reloaded when the selection
     /// changes or a write lands. `None` before the first load.
     pub pack: Option<PackView>,
@@ -1442,12 +1606,15 @@ impl Default for CustomListsState {
     fn default() -> Self {
         Self {
             selected_id: None,
+            selected_row_ref: None,
             selected_line: None,
             // The list pane: which list is the choice that decides what the
             // other pane even contains.
             focus: CustomListsFocus::Lists,
             mount_picker: None,
             modal: None,
+            info: None,
+            counts: Default::default(),
             pack: None,
             rules_pane_painted: true,
             table_state: TableState::default(),
@@ -1470,6 +1637,8 @@ pub struct GroupsState {
     /// is the identity that survives a reload; this is only the viewport
     /// ratatui reads and writes back into on every render.
     pub table_state: TableState,
+    /// Full group detail overlay opened with `i`.
+    pub inspect_open: bool,
 }
 
 /// Everything the [`Leaf::File`] document viewer needs, split
@@ -1495,6 +1664,11 @@ pub struct FileState {
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
+    pub confirmation_primary: bool,
+    pub report_scroll: usize,
+    pub report_max_scroll: Cell<usize>,
+    pub restore_picker: Option<(Vec<crate::tui::backup_restore_modal::RestorePoint>, usize)>,
+    pub selected: usize,
     /// Interactive Tracking panel state. `None` when not
     /// in form mode — the landing view is rendered instead.
     /// `Some` when the operator pressed `t` from the Settings tab;
@@ -1555,6 +1729,8 @@ pub enum TrackingFocus {
     Enabled,
     Mode,
     Retention,
+    Discard,
+    Save,
 }
 
 impl TrackingFocus {
@@ -1562,14 +1738,18 @@ impl TrackingFocus {
         match self {
             Self::Enabled => Self::Mode,
             Self::Mode => Self::Retention,
-            Self::Retention => Self::Enabled,
+            Self::Retention => Self::Discard,
+            Self::Discard => Self::Save,
+            Self::Save => Self::Enabled,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            Self::Enabled => Self::Retention,
+            Self::Enabled => Self::Save,
             Self::Mode => Self::Enabled,
             Self::Retention => Self::Mode,
+            Self::Discard => Self::Retention,
+            Self::Save => Self::Discard,
         }
     }
 }
@@ -1615,6 +1795,17 @@ pub struct DaemonStatus {
     pub upstream_count: usize,
     pub domain_count: usize,
     pub cache_entries: u64,
+    /// Approximate installed list memory; absent on older daemons.
+    pub lists_memory_bytes: Option<u64>,
+    /// Whether this daemon accepts `QueryLogRequest::client_ips`.
+    /// An exact selection is never sent to a daemon which says no.
+    pub query_log_client_ips_supported: bool,
+    /// Tracking configuration when reported by the daemon. `None` means an
+    /// older daemon did not expose the capability, not that tracking is off.
+    pub tracking_enabled: Option<bool>,
+    /// Whether the daemon reports a real 24-hour top-lists ranking. Older
+    /// daemons leave this false so an empty ranking is not misread as zero.
+    pub top_lists_24h_supported: bool,
     pub list_count: usize,
     pub uptime_secs: u64,
     /// Daemon binary version string. Empty when polling an older
@@ -1869,10 +2060,20 @@ where
     rows.iter().position(|r| key_of(r).as_ref() == Some(key))
 }
 
+/// Owned disk-backed configuration views, loaded without borrowing `App`.
+pub struct ConfigSnapshot {
+    pub loaded_config: Option<crate::config::loader::LoadedConfig>,
+    pub file_sections: Vec<String>,
+    pub file_text: String,
+}
+
 /// A result delivered back to the UI loop from a background task.
 /// The loop applies it via `apply_job_result` and redraws, so
-/// long-running work (remote HTTP) never blocks the render/input path.
+/// long-running work never blocks the render/input path.
 pub enum UiJob {
+    ActionFinished(super::actions::ActionCompletion),
+    ActionProgress(super::actions::ActionProgress),
+    ReadFinished(super::jobs::ReadCompletion),
     /// A purge.cc catalog fetch finished — refresh the cache and the open
     /// picker. Carries the owned catalog so the spawned task touches no
     /// `App` state.
@@ -1882,7 +2083,15 @@ pub enum UiJob {
     /// loop keeps rendering the "restoring…" card throughout; the terminal
     /// outcome comes home through here. Owned `SubmitOutcome` — same rule as
     /// above, the task never touches `App`.
-    RestoreFinished(crate::tui::backup_restore_modal::SubmitOutcome),
+    RestoreFinished {
+        outcome: crate::tui::backup_restore_modal::SubmitOutcome,
+        /// Read after a successful disk swap, on the blocking pool. Present
+        /// even when the subsequent daemon reload fails.
+        config: Option<Box<ConfigSnapshot>>,
+        /// Reload failure after a successful disk swap. Kept separate so a
+        /// detached outcome can be sticky without demoting the disk restore.
+        reload_error: Option<String>,
+    },
     /// A Settings → backup finished (tui-14). The exact mirror of
     /// `RestoreFinished`: the tar+gzip runs on the blocking pool, so the event
     /// loop keeps rendering the "backing up…" card throughout.
@@ -1903,9 +2112,25 @@ pub enum UiJob {
 // ── Top-level app state ─────────────────────────────────────────────────────
 
 pub struct App {
+    pub theme: super::theme::ThemePreset,
+    pub mouse: super::mouse::MouseState,
+    pub filter_focus: Option<(Leaf, usize)>,
+    pub(crate) filter_editor_focus: super::query_log_controls::FilterFocus,
+    pub(crate) filter_editor_error: Option<String>,
+    pub(crate) filter_choice_editor: Option<super::filter_chips::ChoiceEditor>,
+    pub(crate) operator_policy: Option<super::operator_policy::PolicyDialog>,
+    pub(crate) operator_policy_scroll: Cell<usize>,
+    pub(crate) operator_policy_extent: Cell<usize>,
+    pub(crate) operator_policy_prefix: Option<super::operator_policy::ProfilePrefix>,
+    pub(crate) operator_catalog: Option<super::operator_policy::PolicyCatalog>,
+    pub(crate) operator_catalog_error: Option<String>,
+    pub(crate) operator_rules: Option<super::operator_policy::PolicyRules>,
+    pub(crate) operator_rules_error: Option<String>,
     pub active_leaf: Leaf,
     pub paused: bool,
     pub show_help: bool,
+    pub(crate) information: Option<crate::tui::detail_panel::Information>,
+    pub(crate) help_scroll: usize,
     /// N8 — did the leaf handler recognise the key it was just handed?
     ///
     /// Set **only** by the terminal `_` arm of a per-leaf key handler, read
@@ -1947,6 +2172,11 @@ pub struct App {
     /// by the IPC `GetAllDevices` poll on Dashboard and Devices tabs.
     /// `None` before the first successful fetch.
     pub device_view: Option<DeviceViewDto>,
+    /// Freshness metadata is stamped only after a successful resource read.
+    pub last_status_read: Option<Instant>,
+    pub last_tracking_read: Option<Instant>,
+    pub last_lists_read: Option<Instant>,
+    pub last_devices_read: Option<Instant>,
     pub connected: bool,
     /// Transient action feedback + its severity, rendered as an
     /// auto-expiring toast over the tab content. Set by
@@ -1972,6 +2202,10 @@ pub struct App {
     /// `PgDn` is a discrete request whose answer is the whole point of
     /// the keystroke. Cleared by the loop that consumes it.
     pub force_poll: bool,
+    pub(crate) catalog_fetching: bool,
+    pub(crate) pending_action: Option<super::actions::PendingAction>,
+    pub(crate) action_serial: u64,
+    pub(crate) read_jobs: Option<super::jobs::ReadScheduler>,
 
     // Per-tab state
     pub dashboard: DashboardState,
@@ -2028,7 +2262,7 @@ pub struct App {
     pub resolver_modal: Option<crate::tui::resolver_modal::ResolverModal>,
 
     /// Cached purge.cc catalog snapshot. Populated on the first
-    /// `[B]` press; subsequent opens within the 5-min TTL skip the
+    /// first catalog-source selection; subsequent opens within the 5-min TTL skip the
     /// network round-trip. Lives on `App` (not on `ListsState`) so a
     /// tab refresh / poll doesn't accidentally invalidate it.
     pub catalog_cache: Option<CatalogCache>,
@@ -2037,19 +2271,83 @@ pub struct App {
     /// contexts, where the catalog open falls back to the inline await.
     pub job_tx: Option<tokio::sync::mpsc::UnboundedSender<UiJob>>,
 
-    /// Live cluster view (`IpcCommand::ClusterStatus`),
-    /// polled on the heartbeat cadence when `[cluster].enabled`. `None` on a
-    /// standalone node or while the first poll is in flight. Drives both the
-    /// dashboard System-card dot and the Cluster tab.
+    /// Latest successful cluster view. A failed status poll clears this;
+    /// `cluster` retains the previous observation separately for stale display.
     #[cfg(feature = "cluster")]
     pub cluster_status: Option<ClusterStatusDto>,
     /// Cluster tab roster cursor. Operator-stable selection keyed
     /// by node name (survives roster reordering / stale-eviction).
     #[cfg(feature = "cluster")]
     pub cluster: ClusterState,
+    /// Latest authoritative local membership status. Failed reads retain the
+    /// last verified observation separately and never widen capabilities.
+    #[cfg(feature = "cluster")]
+    pub nodes_status: Option<LifecycleStatus>,
+    /// Live Nodes management status. It is deliberately separate from the
+    /// legacy membership status that remains the policy-authority guard.
+    #[cfg(feature = "cluster")]
+    pub(crate) node_control_status: Option<NodeControlStatus>,
+    #[cfg(feature = "cluster")]
+    pub(crate) nodes: crate::tui::nodes::NodesState,
 }
 
 impl App {
+    #[cfg(feature = "cluster")]
+    pub(super) fn apply_cluster_poll_result(&mut self, result: Result<ClusterStatusDto, String>) {
+        match result {
+            Ok(status) => {
+                self.cluster_status = Some(status);
+                self.cluster.last_observed_at = Some(Instant::now());
+                self.cluster.last_observation = None;
+                self.cluster.last_poll_error = None;
+            }
+            Err(error) => {
+                if let Some(status) = self.cluster_status.take() {
+                    self.cluster.last_observation = Some(status);
+                }
+                self.cluster.last_poll_error = Some(error);
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn apply_nodes_poll_result(&mut self, result: Result<LifecycleStatus, String>) {
+        match result {
+            Ok(status) => {
+                self.nodes_status = Some(status);
+                self.nodes.last_observed_at = Some(Instant::now());
+                self.nodes.last_observation = None;
+                self.nodes.last_poll_error = None;
+            }
+            Err(error) => {
+                if let Some(status) = self.nodes_status.take() {
+                    self.nodes.last_observation = Some(status);
+                }
+                self.nodes.last_poll_error = Some(error);
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn apply_node_control_poll_result(
+        &mut self,
+        result: Result<NodeControlStatus, String>,
+    ) {
+        match result {
+            Ok(status) => {
+                self.node_control_status = Some(status);
+                self.nodes.last_control_observation = None;
+                self.nodes.last_poll_error = None;
+            }
+            Err(error) => {
+                if let Some(status) = self.node_control_status.take() {
+                    self.nodes.last_control_observation = Some(status);
+                }
+                self.nodes.last_poll_error = Some(error);
+            }
+        }
+    }
+
     /// Set a success status (green `✓` toast).
     pub fn status_ok(&mut self, text: String) {
         self.last_status = Some(StatusLine {
@@ -2225,20 +2523,44 @@ impl App {
 
     pub fn new() -> Self {
         Self {
+            theme: super::theme::ThemePreset::default(),
+            mouse: super::mouse::MouseState::default(),
+            filter_focus: None,
+            filter_editor_focus: Default::default(),
+            filter_editor_error: None,
+            filter_choice_editor: None,
+            operator_policy: None,
+            operator_policy_scroll: Cell::new(0),
+            operator_policy_extent: Cell::new(0),
+            operator_policy_prefix: None,
+            operator_catalog: None,
+            operator_catalog_error: None,
+            operator_rules: None,
+            operator_rules_error: None,
             active_leaf: Leaf::Dashboard,
             paused: false,
             show_help: false,
+            information: None,
+            help_scroll: 0,
             leaf_key_unhandled: false,
             input_mode: InputMode::Normal,
             pending_goto: false,
             daemon_status: None,
             tracking: TrackingData::default(),
             device_view: None,
+            last_status_read: None,
+            last_tracking_read: None,
+            last_lists_read: None,
+            last_devices_read: None,
             connected: false,
             last_status: None,
             startup_warning: None,
             dashboard: DashboardState::default(),
             force_poll: false,
+            catalog_fetching: false,
+            pending_action: None,
+            action_serial: 0,
+            read_jobs: None,
             query_log: QueryLogState::default(),
             devices: DevicesState::default(),
             subnets: SubnetsState::default(),
@@ -2264,7 +2586,32 @@ impl App {
             cluster_status: None,
             #[cfg(feature = "cluster")]
             cluster: ClusterState::default(),
+            #[cfg(feature = "cluster")]
+            nodes_status: None,
+            #[cfg(feature = "cluster")]
+            node_control_status: None,
+            #[cfg(feature = "cluster")]
+            nodes: crate::tui::nodes::NodesState::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_standalone_for_test() -> Self {
+        let app = Self::new();
+        #[cfg(feature = "cluster")]
+        let mut app = app;
+        #[cfg(feature = "cluster")]
+        {
+            app.nodes_status = Some(LifecycleStatus {
+                node_id: Some("test-standalone-node".into()),
+                node_name: "test-standalone".into(),
+                saved_role: crate::cluster::lifecycle::NodeRole::Standalone,
+                active_role: Some(crate::cluster::lifecycle::NodeRole::Standalone),
+                can_edit_policy: true,
+                ..LifecycleStatus::default()
+            });
+        }
+        app
     }
 }
 
@@ -2274,27 +2621,21 @@ impl Default for App {
     }
 }
 
-// ── Cluster tab state ────────────────────────────────────────────────────
+// ── Legacy cluster telemetry state ───────────────────────────────────────
 //
-// Read-only roster view. The cursor is operator-stable: `selected_name`
-// carries the focused node's display name (roster `RosterEntryDto.name`), so
-// the selection survives the heartbeat re-sampling the roster, stale-eviction
-// reordering, or a peer dropping out. The renderer resolves it back to a row
-// index every frame (same idiom as `SubnetsState.selected_id`). Empty on a
-// secondary (no roster) — that view renders the single sync-state card.
+// LifecycleStatus owns identity and authority. This cache retains the older
+// QPS/block/share observation only so Nodes can preserve monitoring while the
+// lifecycle DTO remains the source of truth.
 
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Default)]
 pub struct ClusterState {
-    /// Focused node's name (the single source of truth for the roster cursor;
-    /// `None` until the first key seeds it). The renderer resolves it back to
-    /// a row index each frame, so the highlight follows the node even when
-    /// the roster reorders.
-    pub selected_name: Option<String>,
-    /// Visual scroll/highlight cache for the roster table. `selected_name`
-    /// is the identity that survives a reorder; this is only the viewport
-    /// ratatui reads and writes back into on every render.
-    pub table_state: TableState,
+    /// A failed poll retains historical policy identity without authorizing
+    /// any renderer to treat the observation as current.
+    pub last_observation: Option<ClusterStatusDto>,
+    /// The last successful IPC observation; failures never advance its age.
+    pub last_observed_at: Option<Instant>,
+    pub last_poll_error: Option<String>,
 }
 
 // ── Subnets tab state ───────────────────────────────────────────────────
@@ -2318,6 +2659,17 @@ pub struct SubnetsState {
     /// editing a form, confirming a removal, or has just received the
     /// submit outcome and not yet dismissed the modal.
     pub modal: Option<crate::tui::subnet_modal::SubnetModal>,
+    /// Full-page inspection surface opened from the subnet list.
+    pub inspect: Option<SubnetInspect>,
+    /// Keyboard focus for the client-table sort headers while the Clients
+    /// inspection surface is open.
+    pub client_sort_focus: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubnetInspect {
+    Details,
+    Clients,
 }
 
 // ── Profiles tab state ──────────────────────────────────────────────────
@@ -2340,6 +2692,9 @@ pub struct ProfilesState {
     /// Active modal lifecycle (Add / Edit / Delete). `None` while the
     /// tab is in normal navigation mode.
     pub modal: Option<crate::tui::profile_modal::ProfileModal>,
+    /// Full-detail overlay opened with `i`; the normal side card remains the
+    /// at-a-glance view.
+    pub info_open: bool,
 }
 
 // ── Local DNS tab state ─────────────────────────────────────────────────
@@ -2368,8 +2723,10 @@ pub struct LocalDnsState {
     /// which interleaves group headers with records. Headers are not
     /// selectable; the handler skips them.
     pub table_state: TableState,
-    /// Operator-stable selection key — `(scope, domain)`, the same tuple
-    /// the audit side-card already addresses a record by.
+    /// Operator-stable selection key — `(scope, domain, record type)`.
+    /// Hits and audit aggregation deliberately remain keyed by
+    /// `(scope, domain)`; the third component exists only to distinguish
+    /// valid sibling A and AAAA rows in the editor and remover.
     ///
     /// The visual index is not the identity: a config reload, an add, or
     /// a delete reshuffles the rows, and an index-only cursor silently
@@ -2383,7 +2740,7 @@ pub struct LocalDnsState {
     /// are case-normalised at ingestion and lookup elsewhere, but the on-disk
     /// record need not be, and a key that disagrees with itself on case
     /// loses the cursor on reload.
-    pub selected_id: Option<(String, String)>,
+    pub selected_id: Option<(String, String, String)>,
     /// Cached snapshot of `(scope, domain) → hits` from the daemon.
     /// `None` before the first IPC poll wires the field through — the
     /// wire is not yet implemented; field is reserved so a
@@ -2395,12 +2752,12 @@ pub struct LocalDnsState {
     /// editing a form, confirming a removal, or has just received the
     /// submit outcome and not yet dismissed the modal.
     pub modal: Option<crate::tui::local_dns_modal::LocalDnsModal>,
-    /// Open audit-history side-card.
-    /// `None` while the side-card is closed; `Some` carries the loaded
-    /// audit slice for the focused row. Refreshed on Enter (open) and on
-    /// any cursor move while open so the card follows the cursor; cleared
-    /// on Esc.
+    /// Audit slice carried by the `i` record-details surface. `None` while
+    /// details are closed; `Some` identifies the focused record and its
+    /// bounded history.
     pub audit_view: Option<LocalDnsAuditView>,
+    /// Full record-and-audit detail overlay opened with `i`.
+    pub inspect_open: bool,
 }
 
 /// Loaded audit-history slice rendered by the Local DNS side-card.
@@ -2477,8 +2834,8 @@ pub struct ListsState {
     pub filter_text: Option<String>,
     pub kind_filter: ListsKindFilter,
     pub edit_modal: Option<EditListModal>,
-    /// The purge.cc catalog picker opened by the
-    /// `[B]` hotkey on the Lists tab. Operator browses the curated
+    /// The purge.cc catalog picker opened from the Lists add-source chooser.
+    /// Operator browses the curated
     /// catalog (offline-safe via [`crate::lists::catalog::Catalog::fallback`])
     /// as a table, toggles the ON column on any number of rows, and
     /// commits the lot with one Save: a single `upsert`-per-row pass over
@@ -2493,6 +2850,14 @@ pub struct ListsState {
     /// would then be entitled to write. The two hosts share the notice
     /// builder and the strings, not the state.
     pub kind_confirm: Option<KindConfirm>,
+    /// Source-choice overlay for importing a list. `None` when closed;
+    /// otherwise the visible option ordinal selected by keyboard or mouse.
+    pub import_source: Option<usize>,
+    /// Source choice, Cancel, then Continue.
+    pub import_source_focus: usize,
+    /// Read-only details opened with `i`, addressed by the stable list key.
+    pub detail_id: Option<String>,
+    pub detail_advanced: bool,
 }
 
 /// Open-state for the `K`-hotkey consent gate.
@@ -2654,7 +3019,7 @@ impl CatalogPickerRow {
 }
 
 /// Cached purge.cc catalog snapshot stored on `App` so subsequent
-/// `[B]` openings within the same TUI session don't re-fetch on every
+/// repeated catalog openings within the same TUI session don't re-fetch on every
 /// keystroke. TTL is intentionally short (5 minutes): operators may
 /// add lists outside the TUI session, and we want the picker to reflect
 /// upstream catalog updates without forcing a TUI restart.
@@ -3263,6 +3628,33 @@ pub enum LogsLevelFilter {
 }
 
 impl LogsLevelFilter {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::All => 0,
+            Self::Error => 1,
+            Self::Warn => 2,
+            Self::Info => 3,
+        }
+    }
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Error,
+            2 => Self::Warn,
+            3 => Self::Info,
+            _ => Self::All,
+        }
+    }
+
+    pub(crate) const fn display_label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::All => Self::Error,
@@ -3329,6 +3721,9 @@ pub enum LogsFetch {
 /// exists to avoid.
 #[derive(Debug, Clone, Default)]
 pub struct LogsState {
+    pub selected: Option<crate::ipc::protocol::DaemonLogDto>,
+    /// Equal rows are distinguished from the oldest end, stable when new events arrive.
+    pub selected_occurrence: usize,
     /// Newest first, as the daemon returns them.
     pub entries: Vec<crate::ipc::protocol::DaemonLogDto>,
     pub level_filter: LogsLevelFilter,
@@ -3356,14 +3751,43 @@ pub enum ListsKindFilter {
     All,
     Block,
     Allow,
+    Off,
 }
 
 impl ListsKindFilter {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::All => 0,
+            Self::Block => 1,
+            Self::Allow => 2,
+            Self::Off => 3,
+        }
+    }
+
+    pub(crate) const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Block,
+            2 => Self::Allow,
+            3 => Self::Off,
+            _ => Self::All,
+        }
+    }
+
+    pub(crate) const fn display_label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Block => "Deny",
+            Self::Allow => "Allow",
+            Self::Off => "Off",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::All => Self::Block,
             Self::Block => Self::Allow,
-            Self::Allow => Self::All,
+            Self::Allow => Self::Off,
+            Self::Off => Self::All,
         }
     }
 
@@ -3372,6 +3796,7 @@ impl ListsKindFilter {
             Self::All => "all",
             Self::Block => "block",
             Self::Allow => "allow",
+            Self::Off => "off",
         }
     }
 }
@@ -3622,23 +4047,19 @@ mod tests {
     #[test]
     fn focus_next_walks_field_order_then_the_buttons_and_wraps() {
         let mut f = DeviceFormState::new_add();
-        // Expected order from FIELDS constant — identity block first
-        // (Ip, Mac, MacAliases), then the metadata block, and finally the
-        // two action buttons, which the ring now includes so the operator
-        // can reach Save/Cancel with ↓ instead of only via Enter/Esc.
         let order = [
             DeviceFormFocus::Field(DeviceFormField::Ip),
             DeviceFormFocus::Field(DeviceFormField::Mac),
-            DeviceFormFocus::Field(DeviceFormField::MacAliases),
             DeviceFormFocus::Field(DeviceFormField::Name),
+            DeviceFormFocus::Field(DeviceFormField::MacAliases),
             DeviceFormFocus::Field(DeviceFormField::Profile),
             DeviceFormFocus::Field(DeviceFormField::Group),
             DeviceFormFocus::Field(DeviceFormField::Owner),
             DeviceFormFocus::Field(DeviceFormField::Device),
             DeviceFormFocus::Field(DeviceFormField::Department),
-            DeviceFormFocus::Field(DeviceFormField::Notes),
             DeviceFormFocus::Field(DeviceFormField::NetworkName),
             DeviceFormFocus::Field(DeviceFormField::NetworkNameWildcard),
+            DeviceFormFocus::Field(DeviceFormField::Notes),
             DeviceFormFocus::Cancel,
             DeviceFormFocus::Save,
         ];
@@ -3665,29 +4086,29 @@ mod tests {
         f.focus_prev();
         assert_eq!(
             f.focused,
-            DeviceFormFocus::Field(DeviceFormField::NetworkNameWildcard),
-            "the last field in FIELDS, which the two net-name stops now end"
+            DeviceFormFocus::Field(DeviceFormField::Notes),
+            "the final Notes field immediately precedes the action buttons"
         );
     }
 
     #[test]
     fn locked_fields_stay_skipped_with_the_buttons_in_the_ring() {
-        // Promote locks ip + mac, so MacAliases is the first live field.
+        // Promote locks ip, mac and aliases, so Name is the first live field.
         // Stepping back off it must cross the ring boundary onto Save
         // rather than landing on a locked field.
         let mut f = DeviceFormState::new_promote("10.0.0.1".into(), "MAC".into());
-        f.focused = DeviceFormFocus::Field(DeviceFormField::MacAliases);
+        f.focused = DeviceFormFocus::Field(DeviceFormField::Name);
         f.focus_prev();
         assert_eq!(
             f.focused,
             DeviceFormFocus::Save,
-            "with Ip and Mac locked, stepping back off the first live field wraps to Save"
+            "stepping back off the first live field wraps to Save"
         );
         // And forward from Save lands on the first live field, not Ip.
         f.focus_next();
         assert_eq!(
             f.focused,
-            DeviceFormFocus::Field(DeviceFormField::MacAliases),
+            DeviceFormFocus::Field(DeviceFormField::Name),
             "the wrap-forward target is the first UNLOCKED field"
         );
     }
@@ -3702,7 +4123,7 @@ mod tests {
         f.focus_next();
         assert_eq!(
             f.focused,
-            DeviceFormFocus::Field(DeviceFormField::MacAliases),
+            DeviceFormFocus::Field(DeviceFormField::Name),
             "lands on the first unlocked field, not the one after it"
         );
 
@@ -3710,7 +4131,7 @@ mod tests {
         f.focus_prev();
         assert_eq!(
             f.focused,
-            DeviceFormFocus::Field(DeviceFormField::MacAliases),
+            DeviceFormFocus::Field(DeviceFormField::Name),
             "same snap walking backwards"
         );
     }
@@ -3728,10 +4149,7 @@ mod tests {
     #[test]
     fn promote_form_focus_skips_locked_ip_and_mac() {
         let mut f = DeviceFormState::new_promote("10.0.0.1".into(), "MAC".into());
-        // Promote starts at Name; next should skip the locked Ip + Mac
-        // and the always-editable MacAliases is the FIRST stop walking
-        // back, then forward we wrap to MacAliases too.
-        // From Name → next wraps through the order, skipping Ip + Mac.
+        // Promote starts at Name; Ip, Mac and MacAliases are locked.
         f.focus_next();
         assert_eq!(
             f.focused,
@@ -3741,12 +4159,12 @@ mod tests {
         // Back from Profile → Name (skipping nothing in between)
         f.focus_prev();
         assert_eq!(f.focused, DeviceFormFocus::Field(DeviceFormField::Name));
-        // Back again from Name → MacAliases (Mac and Ip are locked, skipped)
+        // Back again from Name → Save, skipping all locked identity fields.
         f.focus_prev();
         assert_eq!(
             f.focused,
-            DeviceFormFocus::Field(DeviceFormField::MacAliases),
-            "Mac is locked on Promote; focus_prev skips it"
+            DeviceFormFocus::Save,
+            "locked identity fields on Promote are skipped"
         );
     }
 
@@ -3831,23 +4249,15 @@ mod tests {
         // QueryLog are promoted out of the retired `Overview` hub.
         // The labels carry the numeric chrome prefix consumed by the
         // top bar Tabs widget (chrome-side strips it for the breadcrumb).
-        // The `cluster` build appends a 6th section (`6 Cluster`),
-        // runtime-hidden unless `[cluster].enabled`; the default build is
-        // unchanged at 5.
-        #[cfg(not(feature = "cluster"))]
         assert_eq!(Section::ALL.len(), 5);
-        #[cfg(feature = "cluster")]
-        assert_eq!(Section::ALL.len(), 6);
-        assert_eq!(Section::Dashboard.label(), "1 Dashboard");
-        assert_eq!(Section::QueryLog.label(), "2 Query Log");
-        assert_eq!(Section::Network.label(), "3 Network");
-        // "4 Filtering" → "4 Filters", "5 Settings" →
-        // "5 Configuration". The numeric prefix is chrome consumed by the
+        assert_eq!(Section::Dashboard.label(), "Dashboard");
+        assert_eq!(Section::QueryLog.label(), "Query Log");
+        assert_eq!(Section::Network.label(), "Network");
+        // "4 Filtering" → "Filters", "5 Settings" →
+        // "Configuration". The numeric prefix is chrome consumed by the
         // top-bar Tabs widget, so the hotkeys 1-5 are unmoved.
-        assert_eq!(Section::Filters.label(), "4 Filters");
-        assert_eq!(Section::Configuration.label(), "5 Configuration");
-        #[cfg(feature = "cluster")]
-        assert_eq!(Section::Cluster.label(), "6 Cluster");
+        assert_eq!(Section::Filters.label(), "Filters");
+        assert_eq!(Section::Configuration.label(), "Configuration");
     }
 
     #[test]
@@ -3960,9 +4370,21 @@ mod tests {
         // vocabulary-ish leaves read from.
         // Log Messages is appended too. `default_leaf` still does not
         // follow the row order — the section lands on Labels.
+        #[cfg(not(feature = "cluster"))]
         assert_eq!(
             Section::Configuration.leaves(),
             &[Leaf::Labels, Leaf::Settings, Leaf::File, Leaf::Logs]
+        );
+        #[cfg(feature = "cluster")]
+        assert_eq!(
+            Section::Configuration.leaves(),
+            &[
+                Leaf::Labels,
+                Leaf::Nodes,
+                Leaf::Settings,
+                Leaf::File,
+                Leaf::Logs
+            ]
         );
         // Was `Leaf::Settings`. Flipped on operator
         // authority, not by refactor drift: see `default_leaf` for why a
@@ -3989,19 +4411,13 @@ mod tests {
         // but not listed here.
         // `allow` not `expect`: the `mut` is live only under `cluster`, and
         // an `expect` would go red on the build where it IS needed.
-        #[allow(unused_mut)]
-        let mut sections = vec![
+        let sections = vec![
             Section::Dashboard,
             Section::QueryLog,
             Section::Network,
             Section::Filters,
             Section::Configuration,
         ];
-        // `#[cfg]` on a STATEMENT is stable; on an array/vec element it is
-        // not. Same constraint that shapes `LAYOUT` itself.
-        #[cfg(feature = "cluster")]
-        sections.push(Section::Cluster);
-
         for section in &sections {
             match section {
                 Section::Dashboard
@@ -4009,8 +4425,6 @@ mod tests {
                 | Section::Network
                 | Section::Filters
                 | Section::Configuration => {}
-                #[cfg(feature = "cluster")]
-                Section::Cluster => {}
             }
             assert!(
                 LAYOUT.iter().any(|(s, _)| s == section),
@@ -4042,7 +4456,7 @@ mod tests {
             Leaf::Labels,
         ];
         #[cfg(feature = "cluster")]
-        leaves.push(Leaf::Cluster);
+        leaves.push(Leaf::Nodes);
 
         for leaf in &leaves {
             match leaf {
@@ -4061,7 +4475,7 @@ mod tests {
                 | Leaf::Groups
                 | Leaf::Labels => {}
                 #[cfg(feature = "cluster")]
-                Leaf::Cluster => {}
+                Leaf::Nodes => {}
             }
             assert!(
                 LAYOUT.iter().any(|(_, ls)| ls.contains(leaf)),
@@ -4194,28 +4608,42 @@ mod tests {
         assert_eq!(Leaf::Profiles.prev_in_section(), Leaf::Rules);
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
-    fn next_in_section_wraps_within_configuration() {
-        // The Settings section grew from one leaf to four over time, so
-        // `[`/`]` there
-        // is not a no-op.
-        //
-        // **A ring of FOUR.** `Leaf::Tags` is gone
-        // with the tab; `Leaf::Logs` was added. The ring
-        // is Labels → Settings → File → Logs → Labels.
+    fn next_in_section_wraps_within_configuration_with_nodes() {
+        // Standard builds include the five-leaf ring:
+        // Labels → Nodes → Settings → File → Logs → Labels.
+        assert_eq!(Leaf::Labels.next_in_section(), Leaf::Nodes);
+        assert_eq!(Leaf::Nodes.next_in_section(), Leaf::Settings);
+        assert_eq!(Leaf::Settings.next_in_section(), Leaf::File);
+        assert_eq!(Leaf::File.next_in_section(), Leaf::Logs);
+        assert_eq!(Leaf::Logs.next_in_section(), Leaf::Labels);
+        assert_eq!(Leaf::Labels.prev_in_section(), Leaf::Logs);
+        assert_eq!(Leaf::Logs.prev_in_section(), Leaf::File);
+        assert_eq!(Leaf::File.prev_in_section(), Leaf::Settings);
+        assert_eq!(Leaf::Settings.prev_in_section(), Leaf::Nodes);
+        assert_eq!(Leaf::Nodes.prev_in_section(), Leaf::Labels);
 
+        // The letter Tags freed has been taken by Custom Lists. This line
+        // asserted `t` was still unbound, and was RIGHT when written — it
+        // is kept, inverted, because a letter being free is a fact about a
+        // moment and this is where the next lane will come looking.
+        assert_eq!(Leaf::from_mnemonic('t'), Some(Leaf::CustomLists));
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn next_in_section_wraps_within_configuration_without_nodes() {
+        // A custom minimal build omits Nodes but keeps the remaining ring:
+        // Labels → Settings → File → Logs → Labels.
         assert_eq!(Leaf::Labels.next_in_section(), Leaf::Settings);
         assert_eq!(Leaf::Settings.next_in_section(), Leaf::File);
         assert_eq!(Leaf::File.next_in_section(), Leaf::Logs);
         assert_eq!(Leaf::Logs.next_in_section(), Leaf::Labels);
         assert_eq!(Leaf::Labels.prev_in_section(), Leaf::Logs);
         assert_eq!(Leaf::Logs.prev_in_section(), Leaf::File);
-        assert_eq!(Leaf::Settings.prev_in_section(), Leaf::Labels);
         assert_eq!(Leaf::File.prev_in_section(), Leaf::Settings);
-        // The letter Tags freed has been taken by Custom Lists. This line
-        // asserted `t` was still unbound, and was RIGHT when written — it
-        // is kept, inverted, because a letter being free is a fact about a
-        // moment and this is where the next lane will come looking.
+        assert_eq!(Leaf::Settings.prev_in_section(), Leaf::Labels);
         assert_eq!(Leaf::from_mnemonic('t'), Some(Leaf::CustomLists));
     }
 
@@ -4314,7 +4742,7 @@ mod tests {
             ('b', Leaf::Labels),
             ('m', Leaf::Logs),
         ];
-        // The `cluster` build adds `g c` → Cluster as one more
+        // The `cluster` build adds `g n` → Nodes as one more
         // mnemonic; the inverse coverage check below then also sees that
         // leaf in `Leaf::ALL`.
         //
@@ -4344,7 +4772,7 @@ mod tests {
             ('f', Leaf::File),
             ('b', Leaf::Labels),
             ('m', Leaf::Logs),
-            ('c', Leaf::Cluster),
+            ('n', Leaf::Nodes),
         ];
         for (ch, expected) in pairs {
             assert_eq!(

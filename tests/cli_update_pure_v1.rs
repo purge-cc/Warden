@@ -39,7 +39,7 @@ fn write_pure_v1_fixture(dir: &Path, list_id: &str) -> PathBuf {
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 listen = "0.0.0.0:53"
@@ -87,7 +87,7 @@ fn write_empty_fixture(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 listen = "0.0.0.0:53"
@@ -116,7 +116,7 @@ fn write_disabled_blocklist_fixture(dir: &Path) -> PathBuf {
     let master = dir.join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 listen = "0.0.0.0:53"

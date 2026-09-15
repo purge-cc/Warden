@@ -29,8 +29,9 @@
 //!   ↑/↓             walk every record, skipping group headers
 //!   Home/End        first / last record
 //!   PgUp/PgDn       page, clamped at both ends
-//!   a / e / d       open the Add / Edit / Remove modal on the focused row
-//!   Enter / Esc     open / close the audit side-card on the focused row
+//!   a / d           open the Add / Remove modal on the focused row
+//!   Enter / e       edit the focused row
+//!   i / Esc         open / close record details and audit history
 //!
 //! `o`, `n` and `N` are **unbound** — retired with the stacked panels.
 //! `Tab` is untouched and still cycles leaves; that is never negotiable
@@ -49,7 +50,10 @@
 //! - State: `app::LocalDnsState` (`selected_id`, `modal`, `hits_snapshot`)
 //! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use std::cmp::Ordering;
+use std::net::IpAddr;
+
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
@@ -65,18 +69,32 @@ use crate::cli::commands::local_dns::LOCAL_RECORDS_TAB_EMPTY_GLOBAL;
 use crate::config::audit::AuditRecord;
 use crate::config::loader::LoadedConfig;
 use crate::config::settings::{LocalDnsRecord, LocalDnsRecordType};
-use crate::tui::app::{App, LocalDnsAuditView};
-use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
+use crate::tui::app::{App, Leaf, LocalDnsAuditView};
+use crate::tui::detail_panel;
+use crate::tui::local_dns_modal;
+use crate::tui::modal_form::{self, ValueKind};
+use crate::tui::mouse::{self, MouseAction, SortOrder};
+use crate::tui::theme::{self, CardRole, T};
 
 /// Side-card empty-state copy for a record with no `local_records.add`
 /// or `local_records.remove` audit history yet (`s44-tui-modal-audit-history`).
 pub const LOCAL_RECORDS_SIDE_CARD_AUDIT_EMPTY: &str = "no audit history for this record yet";
 
-/// Width (cells) of the drill-down side-card. Matches the Devices
-/// side-card (38 cells — enough for the longest KV row without
-/// truncation).
-const SIDE_CARD_WIDTH: u16 = 38;
+const NARROW_THRESHOLD: u16 = 108;
+const COLUMN_SPACING: u16 = 2;
+const HEADERS: [&str; 6] = ["DOMAIN", "TYPE", "VALUE", "SUBDOMAIN", "TTL", "HITS"];
+
+/// Whether the captured add/edit form is rendered inside the wide detail
+/// card. Confirmations and submitted outcomes remain overlays.
+pub fn inline_editor_visible(viewport_width: u16, app: &App) -> bool {
+    app.active_leaf == Leaf::LocalDns
+        && viewport_width >= NARROW_THRESHOLD
+        && app
+            .local_dns
+            .modal
+            .as_ref()
+            .is_some_and(|modal| matches!(modal.stage, local_dns_modal::Stage::EditingForm(_)))
+}
 
 // ── The unified row model ─────────────────────────────────────────────
 
@@ -96,9 +114,32 @@ pub enum LocalDnsRow<'a> {
     },
 }
 
-impl LocalDnsRow<'_> {
+/// Owned display rows used by rendering and input. Keeping the record clone
+/// here lets the table borrow `App` mutably for Ratatui's viewport while its
+/// stable row identities still come from the loaded configuration.
+#[derive(Debug, Clone)]
+pub enum LocalDnsDisplayRow {
+    Header(String),
+    Record {
+        scope: LocalRecordScope,
+        record: LocalDnsRecord,
+    },
+}
+
+impl LocalDnsDisplayRow {
     pub fn is_selectable(&self) -> bool {
-        matches!(self, LocalDnsRow::Record { .. })
+        matches!(self, Self::Record { .. })
+    }
+}
+
+pub fn display_row_key(row: &LocalDnsDisplayRow) -> Option<(String, String, String)> {
+    match row {
+        LocalDnsDisplayRow::Header(_) => None,
+        LocalDnsDisplayRow::Record { scope, record } => Some((
+            scope_key(scope),
+            record.domain.to_ascii_lowercase(),
+            record_type_to_str(record.record_type).to_string(),
+        )),
     }
 }
 
@@ -115,14 +156,16 @@ pub fn scope_key(scope: &LocalRecordScope) -> String {
     }
 }
 
-/// The operator-stable key for a row: `(scope_key, lowercased domain)`.
+/// The operator-stable key for a row: scope, lowercased domain and type.
 /// `None` for a header — the same contract `devices::row_key` has.
-pub fn row_key(row: &LocalDnsRow) -> Option<(String, String)> {
+pub fn row_key(row: &LocalDnsRow) -> Option<(String, String, String)> {
     match row {
         LocalDnsRow::Header(_) => None,
-        LocalDnsRow::Record { scope, record } => {
-            Some((scope_key(scope), record.domain.to_ascii_lowercase()))
-        }
+        LocalDnsRow::Record { scope, record } => Some((
+            scope_key(scope),
+            record.domain.to_ascii_lowercase(),
+            record_type_to_str(record.record_type).to_string(),
+        )),
     }
 }
 
@@ -164,13 +207,118 @@ pub fn build_rows(loaded: &LoadedConfig) -> Vec<LocalDnsRow<'_>> {
     out
 }
 
-/// Step the cursor to the next selectable row, skipping headers.
-///
-/// **Clamps**, does not wrap. Written here rather than reused from
-/// `devices::next_selectable_index` because that one still wraps, and
-/// a new list shipping with a wrap would be a regression on arrival.
-pub fn next_selectable_index(
-    rows: &[LocalDnsRow],
+/// The sole display order for Local DNS. Mouse and keyboard indexes are into
+/// this filtered-by-scope, grouped, sorted sequence rather than into TOML
+/// declaration order.
+pub fn build_display_rows(app: &App) -> Vec<LocalDnsDisplayRow> {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<LocalDnsDisplayRow> = build_rows(loaded)
+        .into_iter()
+        .map(|row| match row {
+            LocalDnsRow::Header(label) => LocalDnsDisplayRow::Header(label),
+            LocalDnsRow::Record { scope, record } => LocalDnsDisplayRow::Record {
+                scope,
+                record: record.clone(),
+            },
+        })
+        .collect();
+    let Some(sort) = app.mouse.sort(Leaf::LocalDns) else {
+        return rows;
+    };
+    let hits = app.local_dns.hits_snapshot.as_deref();
+    let mut start = 0;
+    for end in 0..=rows.len() {
+        if end == rows.len() || !rows[end].is_selectable() {
+            rows[start..end].sort_by(|left, right| compare_display_rows(left, right, sort, hits));
+            start = end.saturating_add(1);
+        }
+    }
+    rows
+}
+
+fn compare_display_rows(
+    left: &LocalDnsDisplayRow,
+    right: &LocalDnsDisplayRow,
+    sort: SortOrder,
+    hits: Option<&[(String, String, u64)]>,
+) -> Ordering {
+    let (left_scope, left_record) = display_record(left).expect("sortable display row");
+    let (right_scope, right_record) = display_record(right).expect("sortable display row");
+    let order = match sort.column {
+        0 => left_record
+            .domain
+            .to_ascii_lowercase()
+            .cmp(&right_record.domain.to_ascii_lowercase()),
+        1 => record_type_to_str(left_record.record_type)
+            .cmp(record_type_to_str(right_record.record_type)),
+        2 => ip_or_text_order(&left_record.value, &right_record.value, sort.descending),
+        3 => left_record
+            .match_subdomains
+            .cmp(&right_record.match_subdomains),
+        4 => optional_order(left_record.ttl_secs, right_record.ttl_secs, sort.descending),
+        5 => hits_for(hits, &scope_key(left_scope), &left_record.domain).cmp(&hits_for(
+            hits,
+            &scope_key(right_scope),
+            &right_record.domain,
+        )),
+        _ => Ordering::Equal,
+    };
+    let order = if matches!(sort.column, 2 | 4) {
+        order
+    } else if sort.descending {
+        order.reverse()
+    } else {
+        order
+    };
+    order.then_with(|| display_row_key(left).cmp(&display_row_key(right)))
+}
+
+/// A/AAAA values compare as addresses, not strings (`10.0.0.12` must sort
+/// after `10.0.0.2`). CNAME values retain a deterministic case-insensitive
+/// text order. A mixed column falls back to text, which avoids pretending a
+/// hostname has a numeric address order.
+fn ip_or_text_order(left: &str, right: &str, descending: bool) -> Ordering {
+    let order = match (left.parse::<IpAddr>(), right.parse::<IpAddr>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => left.to_lowercase().cmp(&right.to_lowercase()),
+    };
+    if descending {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+fn display_record(row: &LocalDnsDisplayRow) -> Option<(&LocalRecordScope, &LocalDnsRecord)> {
+    match row {
+        LocalDnsDisplayRow::Record { scope, record } => Some((scope, record)),
+        LocalDnsDisplayRow::Header(_) => None,
+    }
+}
+
+fn optional_order<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let order = left.cmp(&right);
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Move within the sorted display rows, skipping headers and clamping at either end.
+pub fn next_display_selectable_index(
+    rows: &[LocalDnsDisplayRow],
     current: Option<usize>,
     forward: bool,
 ) -> Option<usize> {
@@ -180,88 +328,118 @@ pub fn next_selectable_index(
                 rows.iter()
                     .enumerate()
                     .skip(i + 1)
-                    .find(|(_, r)| r.is_selectable())
-                    .map(|(n, _)| n)
-                    // Clamp: walking off the end stays put, it does not
-                    // teleport to the other end.
+                    .find(|(_, row)| row.is_selectable())
+                    .map(|(index, _)| index)
                     .or(Some(i))
-                    .filter(|n| rows.get(*n).is_some_and(LocalDnsRow::is_selectable))
+                    .filter(|index| {
+                        rows.get(*index)
+                            .is_some_and(LocalDnsDisplayRow::is_selectable)
+                    })
             } else {
                 rows[..i]
                     .iter()
-                    .rposition(LocalDnsRow::is_selectable)
+                    .rposition(LocalDnsDisplayRow::is_selectable)
                     .or(Some(i))
-                    .filter(|n| rows.get(*n).is_some_and(LocalDnsRow::is_selectable))
+                    .filter(|index| {
+                        rows.get(*index)
+                            .is_some_and(LocalDnsDisplayRow::is_selectable)
+                    })
             }
         }
-        // Nothing focused yet (or a stale index): seed at the near end.
-        _ => {
-            if forward {
-                rows.iter().position(LocalDnsRow::is_selectable)
-            } else {
-                rows.iter().rposition(LocalDnsRow::is_selectable)
-            }
-        }
+        _ if forward => rows.iter().position(LocalDnsDisplayRow::is_selectable),
+        _ => rows.iter().rposition(LocalDnsDisplayRow::is_selectable),
     }
 }
 
-/// Resolve the stable `(scope, domain)` key to its current index.
-pub fn index_of_key(rows: &[LocalDnsRow], want: Option<&(String, String)>) -> Option<usize> {
+/// Resolve the stable `(scope, domain, type)` key to its current index.
+pub fn index_of_key(
+    rows: &[LocalDnsRow],
+    want: Option<&(String, String, String)>,
+) -> Option<usize> {
     let want = want?;
     rows.iter().position(|r| row_key(r).as_ref() == Some(want))
 }
 
+pub fn index_of_display_key(
+    rows: &[LocalDnsDisplayRow],
+    want: Option<&(String, String, String)>,
+) -> Option<usize> {
+    let want = want?;
+    rows.iter()
+        .position(|row| display_row_key(row).as_ref() == Some(want))
+}
+
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some(loaded) = app.loaded_config.as_ref() else {
+    if app.loaded_config.is_none() {
         render_no_config(f, area);
         return;
-    };
+    }
 
-    // Side-card split: when the audit view is open and the terminal is
-    // wide enough, the list takes the left column and the card the
-    // right. The left column is one table, not a 50/50 vertical stack
-    // of two.
-    let (list_area, side_card) = match app.local_dns.audit_view.as_ref() {
-        Some(view) if area.width >= 60 + SIDE_CARD_WIDTH => {
-            let cols = Layout::horizontal([
-                Constraint::Min(60),
-                Constraint::Length(1),
-                Constraint::Length(SIDE_CARD_WIDTH),
-            ])
-            .split(area);
-            (cols[0], Some((cols[2], view)))
+    let rows = build_display_rows(app);
+    if !rows.is_empty() {
+        let detail_key = index_of_display_key(&rows, app.local_dns.selected_id.as_ref())
+            .and_then(|index| rows.get(index))
+            .or_else(|| rows.iter().find(|row| row.is_selectable()))
+            .and_then(display_row_key)
+            .map(|(scope, domain, record_type)| format!("{scope}\u{1f}{domain}\u{1f}{record_type}"))
+            .unwrap_or_default();
+        detail_panel::prepare(app, Leaf::LocalDns, &detail_key);
+    }
+
+    if !rows.is_empty()
+        && area.width < NARROW_THRESHOLD
+        && detail_panel::focused(app, Leaf::LocalDns)
+    {
+        if let (Some(loaded), Some(view)) = (
+            app.loaded_config.as_ref(),
+            app.local_dns.audit_view.as_ref(),
+        ) {
+            render_side_card(f, area, app, loaded, view);
+        } else {
+            render_detail_card(f, area, app, &rows);
         }
-        _ => (area, None),
-    };
+        return;
+    }
 
-    let rows = build_rows(loaded);
-    let record_count = rows.iter().filter(|r| r.is_selectable()).count();
-    let title = format!("Local DNS ({record_count})");
-    let content = render_section_chrome(f, list_area, &title, T.text_secondary);
+    let cols = (area.width >= NARROW_THRESHOLD).then(|| split_list_detail(area));
+    let list_area = cols.as_ref().map(|cols| cols[0]).unwrap_or(area);
 
     if rows.is_empty() {
         // Byte-identical to the CLI's empty state.
-        render_empty_state(f, content, LOCAL_RECORDS_TAB_EMPTY_GLOBAL);
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            list_area,
+            "LOCAL DNS",
+            "Local Records by Scope",
+            CardRole::Analytics,
+        );
+        render_empty_state(f, body, LOCAL_RECORDS_TAB_EMPTY_GLOBAL);
     } else {
         // Resolve the anchor here rather than trusting `table_state`: a
         // reload / add / delete reshuffles the rows, and an index-only
         // cursor silently re-points at whatever slid into that slot.
         // Falls back to the first selectable row so the tab never renders
         // with nothing highlighted while records exist.
-        let selected = index_of_key(&rows, app.local_dns.selected_id.as_ref())
-            .or_else(|| rows.iter().position(LocalDnsRow::is_selectable));
-        render_records_table(
-            f,
-            content,
-            &rows,
-            selected,
-            &mut app.local_dns.table_state,
-            app.local_dns.hits_snapshot.as_deref(),
-        );
+        let selected = index_of_display_key(&rows, app.local_dns.selected_id.as_ref())
+            .or_else(|| rows.iter().position(LocalDnsDisplayRow::is_selectable));
+        render_records_table(f, list_area, app, &rows, selected);
     }
 
-    if let Some((card_area, view)) = side_card {
-        render_side_card(f, card_area, app, loaded, view);
+    if let Some(cols) = cols {
+        if inline_editor_visible(area.width, app) {
+            local_dns_modal::render_inline_editor(
+                f,
+                cols[1],
+                app.local_dns.modal.as_ref().unwrap(),
+            );
+        } else if let (Some(loaded), Some(view)) = (
+            app.loaded_config.as_ref(),
+            app.local_dns.audit_view.as_ref(),
+        ) {
+            render_side_card(f, cols[1], app, loaded, view);
+        } else {
+            render_detail_card(f, cols[1], app, &rows);
+        }
     }
 }
 
@@ -275,50 +453,97 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
 fn render_records_table(
     f: &mut Frame,
     area: Rect,
-    rows: &[LocalDnsRow],
+    app: &mut App,
+    rows: &[LocalDnsDisplayRow],
     selected: Option<usize>,
-    state: &mut ratatui::widgets::TableState,
-    hits_snapshot: Option<&[(String, String, u64)]>,
 ) {
-    let header = Row::new(vec![
-        Cell::from("DOMAIN"),
-        Cell::from("TYPE"),
-        Cell::from("VALUE"),
-        Cell::from("SUBDOMAIN"),
-        Cell::from("TTL"),
-        Cell::from("HITS"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
+    let subtitle = format!(
+        "{} Records \u{00b7} Global and Profile Scopes",
+        rows.iter().filter(|row| row.is_selectable()).count()
     );
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "LOCAL DNS",
+        &subtitle,
+        CardRole::Analytics,
+    );
+    let constraints = record_constraints();
+    let columns = solved_columns(body, &constraints);
+    let sort = app.mouse.sort(Leaf::LocalDns);
+    let header = Row::new(HEADERS.iter().enumerate().map(|(index, label)| {
+        Cell::from(sort_header(label, index, sort)).style(theme::table_heading_style(
+            sort.is_some_and(|order| order.column == index),
+        ))
+    }))
+    .style(theme::table_heading_style(false));
 
     let table_rows: Vec<Row> = rows
         .iter()
         .map(|row| match row {
-            LocalDnsRow::Header(label) => render_group_header_row(label, area.width),
-            LocalDnsRow::Record { scope, record } => {
-                render_record_row(record, &scope_key(scope), hits_snapshot)
-            }
+            LocalDnsDisplayRow::Header(label) => render_group_header_row(label, body.width),
+            LocalDnsDisplayRow::Record { scope, record } => render_record_row(
+                record,
+                &scope_key(scope),
+                app.local_dns.hits_snapshot.as_deref(),
+            ),
         })
         .collect();
 
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Min(20),    // domain
-            Constraint::Length(5),  // type
-            Constraint::Min(20),    // value
-            Constraint::Length(10), // subdomain
-            Constraint::Length(8),  // ttl
-            Constraint::Length(8),  // hits
-        ],
-    )
-    .header(header)
-    .row_highlight_style(theme::highlight_style());
+    let table = Table::new(table_rows, constraints)
+        .header(header)
+        .column_spacing(COLUMN_SPACING)
+        .row_highlight_style(theme::highlight_style());
 
-    super::render_table(f, area, table, state, selected);
+    super::render_table(f, body, table, &mut app.local_dns.table_state, selected);
+    for (index, rect) in columns.iter().enumerate() {
+        mouse::register(app, *rect, MouseAction::Sort(Leaf::LocalDns, index));
+    }
+    let offset = app.local_dns.table_state.offset();
+    for (visible, (index, row)) in rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(body.height.saturating_sub(1) as usize)
+        .enumerate()
+    {
+        if row.is_selectable() {
+            mouse::register(
+                app,
+                Rect::new(body.x, body.y + 1 + visible as u16, body.width, 1),
+                MouseAction::Row(Leaf::LocalDns, index),
+            );
+        }
+    }
+}
+
+fn record_constraints() -> [Constraint; HEADERS.len()] {
+    [
+        Constraint::Min(20),
+        Constraint::Length(5),
+        Constraint::Min(20),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ]
+}
+
+fn solved_columns(area: Rect, constraints: &[Constraint]) -> Vec<Rect> {
+    Layout::horizontal(constraints.iter().copied())
+        .flex(Flex::Start)
+        .spacing(COLUMN_SPACING)
+        .split(Rect::new(0, 0, area.width, 1))
+        .iter()
+        .map(|column| Rect::new(area.x + column.x, area.y, column.width, 1))
+        .collect()
+}
+
+fn sort_header(label: &str, index: usize, sort: Option<SortOrder>) -> String {
+    match sort.filter(|sort| sort.column == index) {
+        Some(sort) if sort.descending => format!("{label} ▼"),
+        Some(_) => format!("{label} ▲"),
+        None => label.to_string(),
+    }
 }
 
 /// A group divider, styled like the Devices one: em-dash rule, muted,
@@ -393,7 +618,13 @@ fn render_empty_state(f: &mut Frame, area: Rect, msg: &str) {
 }
 
 fn render_no_config(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Local DNS", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "LOCAL DNS",
+        "Configuration Unavailable",
+        CardRole::Analytics,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             "  could not load config — fix it and press r to retry",
@@ -401,6 +632,151 @@ fn render_no_config(f: &mut Frame, area: Rect) {
         )),
         content,
     );
+}
+
+fn render_detail_card(f: &mut Frame, area: Rect, app: &App, rows: &[LocalDnsDisplayRow]) {
+    render_detail_content(f, area, app, rows, false);
+}
+
+fn render_detail_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[LocalDnsDisplayRow],
+    modal: bool,
+) {
+    let selected = index_of_display_key(rows, app.local_dns.selected_id.as_ref())
+        .and_then(|index| rows.get(index))
+        .or_else(|| rows.iter().find(|row| row.is_selectable()));
+    let subtitle = selected
+        .and_then(display_record)
+        .map(|(scope, record)| format!("{} \u{00b7} {}", scope_key(scope), record.domain))
+        .unwrap_or_else(|| "Select a local record".to_string());
+    let content = if modal {
+        let content = modal_form::render_header(f, area, "LOCAL DNS DETAILS", &subtitle);
+        modal_form::close_footer(f, content)
+    } else {
+        theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "LOCAL DNS DETAILS",
+            &subtitle,
+            CardRole::History,
+        )
+    };
+    let mut lines = Vec::new();
+    if let Some((scope, record)) = selected.and_then(display_record) {
+        lines.extend(modal_form::section_band_with_role(
+            "Record",
+            content.width,
+            CardRole::Summary,
+        ));
+        lines.push(modal_form::value_row(
+            "domain",
+            &record.domain,
+            false,
+            ValueKind::Identity,
+            None,
+            content.width,
+        ));
+        lines.push(modal_form::value_row(
+            "scope",
+            &scope_key(scope),
+            false,
+            ValueKind::Identity,
+            None,
+            content.width,
+        ));
+        lines.push(modal_form::value_row(
+            "type",
+            record_type_to_str(record.record_type),
+            false,
+            ValueKind::Healthy,
+            None,
+            content.width,
+        ));
+        lines.push(modal_form::value_row(
+            "value",
+            &record.value,
+            false,
+            ValueKind::Editable,
+            None,
+            content.width,
+        ));
+        lines.push(modal_form::value_row(
+            "subdomain",
+            if record.match_subdomains {
+                "true"
+            } else {
+                "false"
+            },
+            false,
+            if record.match_subdomains {
+                ValueKind::Caution
+            } else {
+                ValueKind::Identity
+            },
+            None,
+            content.width,
+        ));
+        let ttl = record
+            .ttl_secs
+            .map(|ttl| ttl.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        lines.push(modal_form::value_row(
+            "ttl",
+            &ttl,
+            false,
+            ValueKind::Editable,
+            None,
+            content.width,
+        ));
+        lines.push(Line::default());
+        lines.extend(modal_form::section_band_with_role(
+            "Activity",
+            content.width,
+            CardRole::Summary,
+        ));
+        let hits = hits_for(
+            app.local_dns.hits_snapshot.as_deref(),
+            &scope_key(scope),
+            &record.domain,
+        )
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_string());
+        lines.push(modal_form::value_row(
+            "hits",
+            &hits,
+            false,
+            ValueKind::Healthy,
+            None,
+            content.width,
+        ));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " select a record",
+            Style::default().fg(T.text_muted),
+        )));
+    }
+    let key = selected
+        .and_then(display_row_key)
+        .map(|(scope, domain, record_type)| format!("{scope}\u{1f}{domain}\u{1f}{record_type}"))
+        .unwrap_or_default();
+    detail_panel::render(f, content, app, Leaf::LocalDns, &key, lines);
+}
+
+fn split_list_detail(area: Rect) -> [Rect; 2] {
+    let list_width = ((u32::from(area.width) * 42) / 100) as u16;
+    let overlap = u16::from(list_width > 0 && area.width > 0);
+    [
+        Rect::new(area.x, area.y, list_width, area.height),
+        Rect::new(
+            area.x + list_width.saturating_sub(overlap),
+            area.y,
+            area.width.saturating_sub(list_width) + overlap,
+            area.height,
+        ),
+    ]
 }
 
 /// Render the audit-history side-card. The card always shows the loaded
@@ -416,8 +792,30 @@ fn render_side_card(
     loaded: &LoadedConfig,
     view: &LocalDnsAuditView,
 ) {
-    let title = format!("Local DNS \u{00b7} {}", view.domain);
-    let content = render_section_chrome(f, area, &title, T.brand_red);
+    render_audit_content(f, area, app, loaded, view, false);
+}
+
+fn render_audit_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    loaded: &LoadedConfig,
+    view: &LocalDnsAuditView,
+    modal: bool,
+) {
+    let subtitle = format!("{} \u{00b7} Audit History", view.domain);
+    let content = if modal {
+        let content = modal_form::render_header(f, area, "LOCAL DNS DETAILS", &subtitle);
+        modal_form::close_footer(f, content)
+    } else {
+        theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "LOCAL DNS DETAILS",
+            &subtitle,
+            CardRole::History,
+        )
+    };
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(20);
 
@@ -428,6 +826,11 @@ fn render_side_card(
     // operator what the audit slice belongs to.
     match focused_record_matching(app, loaded, view) {
         Some(rec) => {
+            lines.extend(modal_form::section_band_with_role(
+                "Record",
+                content.width,
+                CardRole::Summary,
+            ));
             lines.push(kv_str("Domain", rec.domain.as_str(), T.text_primary));
             lines.push(kv_str(
                 "Type",
@@ -458,19 +861,23 @@ fn render_side_card(
             ));
         }
         None => {
+            lines.extend(modal_form::section_band_with_role(
+                "Record",
+                content.width,
+                CardRole::Summary,
+            ));
             lines.push(kv_str("Domain", view.domain.as_str(), T.text_primary));
         }
     }
     lines.push(kv_str("Scope", scope_label(view).as_str(), T.text_primary));
     lines.push(kv("Hits", hits_span(app, view)));
 
-    lines.push(divider_line());
-    lines.push(Line::from(Span::styled(
-        " Audit history (last 10)",
-        Style::default()
-            .fg(T.text_secondary)
-            .add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::default());
+    lines.extend(modal_form::section_band_with_role(
+        "Audit history (last 10)",
+        content.width,
+        CardRole::History,
+    ));
 
     if view.entries.is_empty() {
         lines.push(Line::from(""));
@@ -486,7 +893,25 @@ fn render_side_card(
         }
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+    let key = format!(
+        "audit:{}\u{1f}{}\u{1f}{}",
+        view.scope_tag, view.target_id, view.domain
+    );
+    detail_panel::render(f, content, app, Leaf::LocalDns, &key, lines);
+}
+
+pub fn render_detail_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return;
+    };
+    let height = area.height.saturating_sub(2).min(30);
+    let inner = modal_form::render_chrome_in(f, area, 74, height, "", T.text_primary, true);
+    if let Some(view) = app.local_dns.audit_view.as_ref() {
+        render_audit_content(f, inner, app, loaded, view, true);
+    } else {
+        let rows = build_display_rows(app);
+        render_detail_content(f, inner, app, &rows, true);
+    }
 }
 
 /// Resolve the currently-focused record only when its `(scope, domain)`
@@ -600,7 +1025,6 @@ fn trim_audit_ts(ts: &str) -> String {
 
 fn kv(label: &'static str, value: Span<'static>) -> Line<'static> {
     Line::from(vec![
-        Span::raw(" "),
         Span::styled(format!("{label:<10}"), Style::default().fg(T.text_muted)),
         value,
     ])
@@ -611,13 +1035,6 @@ fn kv_str(label: &'static str, value: &str, color: Color) -> Line<'static> {
         label,
         Span::styled(value.to_string(), Style::default().fg(color)),
     )
-}
-
-fn divider_line() -> Line<'static> {
-    Line::from(Span::styled(
-        "\u{2500}".repeat(SIDE_CARD_WIDTH.saturating_sub(2) as usize),
-        Style::default().fg(T.text_muted),
-    ))
 }
 
 fn record_type_to_str(rt: LocalDnsRecordType) -> &'static str {
@@ -662,6 +1079,19 @@ mod tests {
             }
         }
         out
+    }
+
+    fn display_rows_of(globals: &[LocalDnsRecord]) -> Vec<LocalDnsDisplayRow> {
+        rows_of(globals, None)
+            .into_iter()
+            .map(|row| match row {
+                LocalDnsRow::Header(label) => LocalDnsDisplayRow::Header(label),
+                LocalDnsRow::Record { scope, record } => LocalDnsDisplayRow::Record {
+                    scope,
+                    record: record.clone(),
+                },
+            })
+            .collect()
     }
 
     fn rec(domain: &str, value: &str) -> LocalDnsRecord {
@@ -781,7 +1211,7 @@ mod tests {
                 content.push_str(buffer[(x, y)].symbol());
             }
         }
-        assert!(content.contains("Local DNS"));
+        assert!(content.contains("LOCAL DNS"));
     }
 
     #[test]
@@ -821,13 +1251,13 @@ mod tests {
                 ttl_secs: Some(7200),
             },
         ];
-        let rows = rows_of(&records, None);
-        let mut state = ratatui::widgets::TableState::default();
+        let rows = display_rows_of(&records);
+        let mut app = App::new();
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 10);
             // No snapshot in this test — `None` triggers the boot-fresh
             // `—` rendering, which the assertion below pins.
-            render_records_table(f, area, &rows, Some(1), &mut state, None);
+            render_records_table(f, area, &mut app, &rows, Some(1));
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -861,12 +1291,13 @@ mod tests {
             rec("nas.home", "192.168.1.50"),
             rec("intranet.home", "192.168.1.51"),
         ];
-        let rows = rows_of(&records, None);
+        let rows = display_rows_of(&records);
         let snap = vec![("global".to_string(), "nas.home".to_string(), 42_u64)];
-        let mut state = ratatui::widgets::TableState::default();
+        let mut app = App::new();
+        app.local_dns.hits_snapshot = Some(snap);
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 10);
-            render_records_table(f, area, &rows, Some(1), &mut state, Some(&snap));
+            render_records_table(f, area, &mut app, &rows, Some(1));
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -896,16 +1327,17 @@ mod tests {
         let backend = TestBackend::new(120, 6);
         let mut term = Terminal::new(backend).unwrap();
         let records = vec![rec("example.test", "10.10.1.50")];
-        let rows = rows_of(&records, None);
+        let rows = display_rows_of(&records);
         let snap = vec![(
             "profile:kids".to_string(),
             "example.test".to_string(),
             99_u64,
         )];
-        let mut state = ratatui::widgets::TableState::default();
+        let mut app = App::new();
+        app.local_dns.hits_snapshot = Some(snap);
         term.draw(|f| {
             let area = Rect::new(0, 0, 120, 6);
-            render_records_table(f, area, &rows, Some(1), &mut state, Some(&snap));
+            render_records_table(f, area, &mut app, &rows, Some(1));
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -942,7 +1374,7 @@ mod tests {
         // Synthesise the loaded_config so render() takes the populated
         // path (a None loaded_config short-circuits to render_no_config).
         let toml_src = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -961,9 +1393,13 @@ value = "192.168.1.50"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // One cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain, type) rather than by a
         // per-panel index.
-        app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
+        app.local_dns.selected_id = Some((
+            "global".to_string(),
+            "nas.home".to_string(),
+            "A".to_string(),
+        ));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
             scope_tag: "global".to_string(),
             target_id: "global".to_string(),
@@ -998,11 +1434,11 @@ value = "192.168.1.50"
             }
         }
         // Side-card title + KV lines for the focused record.
-        assert!(content.contains("Local DNS"), "side-card title missing");
+        assert!(content.contains("LOCAL DNS"), "side-card title missing");
         assert!(content.contains("nas.home"));
         assert!(content.contains("192.168.1.50"));
         // Audit history header + verbs.
-        assert!(content.contains("Audit history"));
+        assert!(content.contains("AUDIT HISTORY"));
         assert!(content.contains("added"));
         assert!(content.contains("removed"));
         assert!(content.contains("uid=1000"));
@@ -1017,7 +1453,7 @@ value = "192.168.1.50"
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new();
         let toml_src = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1036,9 +1472,13 @@ value = "192.168.1.51"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // One cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain, type) rather than by a
         // per-panel index.
-        app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
+        app.local_dns.selected_id = Some((
+            "global".to_string(),
+            "nas.home".to_string(),
+            "A".to_string(),
+        ));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
             scope_tag: "global".to_string(),
             target_id: "global".to_string(),
@@ -1081,7 +1521,7 @@ value = "192.168.1.51"
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new();
         let toml_src = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1100,9 +1540,13 @@ value = "192.168.1.50"
             provenance: Default::default(),
             custom_lists: Default::default(),
         });
-        // One cursor, anchored by (scope, domain) rather than by a
+        // One cursor, anchored by (scope, domain, type) rather than by a
         // per-panel index.
-        app.local_dns.selected_id = Some(("global".to_string(), "nas.home".to_string()));
+        app.local_dns.selected_id = Some((
+            "global".to_string(),
+            "nas.home".to_string(),
+            "A".to_string(),
+        ));
         app.local_dns.audit_view = Some(crate::tui::app::LocalDnsAuditView {
             scope_tag: "global".to_string(),
             target_id: "global".to_string(),
@@ -1124,7 +1568,7 @@ value = "192.168.1.50"
         }
         // Audit header should NOT appear on the collapsed layout.
         assert!(
-            !content.contains("Audit history"),
+            !content.contains("AUDIT HISTORY"),
             "side-card must collapse on narrow terminals"
         );
     }
@@ -1170,7 +1614,7 @@ value = "192.168.1.50"
     }
 
     const MIXED: &str = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1219,8 +1663,110 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
             ],
             "empty profile `empty` must contribute no header and no rows"
         );
-        assert!(!rows[0].is_selectable(), "a header is never selectable");
-        assert!(rows[1].is_selectable());
+        assert!(
+            matches!(rows[0], LocalDnsRow::Header(_)),
+            "a header is never selectable"
+        );
+        assert!(matches!(rows[1], LocalDnsRow::Record { .. }));
+    }
+
+    #[test]
+    fn display_value_sort_is_numeric_and_keeps_scope_headers_in_place() {
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_from(
+            r#"
+schema_version = 5
+
+[upstream]
+servers = ["1.1.1.1"]
+
+[[local_dns.records]]
+domain = "twelve.home"
+type = "A"
+value = "10.0.0.12"
+
+[[local_dns.records]]
+domain = "two.home"
+type = "A"
+value = "10.0.0.2"
+
+[profiles.kids]
+display_name = "Kids"
+local_records = [{ domain = "one.kids", type = "A", value = "10.0.0.1" }]
+"#,
+        ));
+        app.mouse.toggle_sort(Leaf::LocalDns, 2);
+        let rows = build_display_rows(&app);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                LocalDnsDisplayRow::Header(label) => format!("H:{label}"),
+                LocalDnsDisplayRow::Record { record, .. } => format!("R:{}", record.domain),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "H:Global",
+                "R:two.home",
+                "R:twelve.home",
+                "H:Profile: kids",
+                "R:one.kids",
+            ],
+            "IP values sort numerically inside their own scope without moving headers"
+        );
+
+        let selected = display_row_key(&rows[2]).unwrap();
+        app.mouse.toggle_sort(Leaf::LocalDns, 2);
+        let descending = build_display_rows(&app);
+        assert_eq!(
+            index_of_display_key(&descending, Some(&selected)),
+            Some(1),
+            "the stable key, not the old table index, follows a sorted row"
+        );
+    }
+
+    #[test]
+    fn value_sort_partitions_addresses_from_names_in_both_directions() {
+        assert_eq!(
+            ip_or_text_order("10.0.0.12", "router.home", false),
+            Ordering::Less
+        );
+        assert_eq!(
+            ip_or_text_order("10.0.0.12", "router.home", true),
+            Ordering::Greater
+        );
+        assert_eq!(
+            ip_or_text_order("10.0.0.12", "10.0.0.2", false),
+            Ordering::Greater,
+            "address values use numeric ordering"
+        );
+        assert_eq!(
+            ip_or_text_order("Zulu.home", "alpha.home", false),
+            Ordering::Greater,
+            "non-address values use case-insensitive text ordering"
+        );
+    }
+
+    #[test]
+    fn an_editing_local_dns_form_is_inline_only_at_the_master_detail_floor() {
+        let mut app = App::new();
+        app.active_leaf = Leaf::LocalDns;
+        app.local_dns.modal = Some(local_dns_modal::LocalDnsModal::open_add(Vec::new(), 0));
+
+        assert!(!inline_editor_visible(NARROW_THRESHOLD - 1, &app));
+        assert!(inline_editor_visible(NARROW_THRESHOLD, &app));
+    }
+
+    #[test]
+    fn solved_record_headers_have_exact_click_gutters() {
+        let body = Rect::new(3, 6, 100, 1);
+        let columns = solved_columns(body, &record_constraints());
+        assert_eq!(columns.first().unwrap().x, body.x);
+        assert!(columns.last().unwrap().right() <= body.right());
+        assert!(columns
+            .windows(2)
+            .all(|pair| pair[0].right().saturating_add(COLUMN_SPACING) == pair[1].x));
     }
 
     /// **The DoD case**: `↓` from the last global record must land on the
@@ -1228,12 +1774,13 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
     /// it. This is the whole point of merging the panels.
     #[test]
     fn n6_down_from_the_last_global_record_reaches_the_first_profile_record() {
-        let loaded = loaded_from(MIXED);
-        let rows = build_rows(&loaded);
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_from(MIXED));
+        let rows = build_display_rows(&app);
         // index 2 = printer.home, the last Global record.
-        let next = next_selectable_index(&rows, Some(2), true).unwrap();
+        let next = next_display_selectable_index(&rows, Some(2), true).unwrap();
         assert!(
-            matches!(&rows[next], LocalDnsRow::Record { record, .. } if record.domain == "youtube.local"),
+            matches!(&rows[next], LocalDnsDisplayRow::Record { record, .. } if record.domain == "youtube.local"),
             "Down must skip the `Profile: kids` header, not land on it"
         );
     }
@@ -1242,29 +1789,33 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
     /// wrap to be fixed later.
     #[test]
     fn n6_the_cursor_clamps_at_both_ends() {
-        let loaded = loaded_from(MIXED);
-        let rows = build_rows(&loaded);
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_from(MIXED));
+        let rows = build_display_rows(&app);
         let last = rows.len() - 1;
 
         assert_eq!(
-            next_selectable_index(&rows, Some(last), true),
+            next_display_selectable_index(&rows, Some(last), true),
             Some(last),
             "Down on the last record stays put, it does not wrap to the first"
         );
         assert_eq!(
-            next_selectable_index(&rows, Some(1), false),
+            next_display_selectable_index(&rows, Some(1), false),
             Some(1),
             "Up on the first record stays put — and must NOT land on the \
              header at index 0"
         );
         // Nothing focused seeds at the near end for either direction.
-        assert_eq!(next_selectable_index(&rows, None, true), Some(1));
-        assert_eq!(next_selectable_index(&rows, None, false), Some(last));
+        assert_eq!(next_display_selectable_index(&rows, None, true), Some(1));
+        assert_eq!(
+            next_display_selectable_index(&rows, None, false),
+            Some(last)
+        );
         // An empty vector has nowhere to go.
-        assert_eq!(next_selectable_index(&[], None, true), None);
+        assert_eq!(next_display_selectable_index(&[], None, true), None);
     }
 
-    /// The cursor is a `(scope, domain)` key, not an index — so deleting
+    /// The cursor is a `(scope, domain, type)` key, not an index — so deleting
     /// a record ABOVE the focused one keeps the highlight on the same
     /// record instead of sliding it onto a neighbour.
     #[test]
@@ -1272,7 +1823,14 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         let loaded = loaded_from(MIXED);
         let rows = build_rows(&loaded);
         let want = row_key(&rows[2]).unwrap();
-        assert_eq!(want, ("global".to_string(), "printer.home".to_string()));
+        assert_eq!(
+            want,
+            (
+                "global".to_string(),
+                "printer.home".to_string(),
+                "A".to_string(),
+            )
+        );
         assert_eq!(index_of_key(&rows, Some(&want)), Some(2));
 
         // Same config minus the first global record: `printer.home` is
@@ -1280,7 +1838,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         // pointing at 2 — which is the profile header.
         let shrunk = loaded_from(
             r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1318,8 +1876,16 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         assert_eq!(
             keys,
             vec![
-                ("global".to_string(), "shared.home".to_string()),
-                ("profile:kids".to_string(), "shared.home".to_string()),
+                (
+                    "global".to_string(),
+                    "shared.home".to_string(),
+                    "A".to_string(),
+                ),
+                (
+                    "profile:kids".to_string(),
+                    "shared.home".to_string(),
+                    "A".to_string(),
+                ),
             ],
             "scope disambiguates, and the domain half is lowercased so a \
              casing difference on disk cannot lose the cursor"
@@ -1333,7 +1899,7 @@ local_records = [{ domain = "youtube.local", type = "A", value = "10.10.1.9" }]
         use ratatui::Terminal;
         let mut app = App::new();
         app.loaded_config = Some(loaded_from(
-            "schema_version = 4\n\n[upstream]\nservers = [\"1.1.1.1\"]\n\n\
+            "schema_version = 5\n\n[upstream]\nservers = [\"1.1.1.1\"]\n\n\
              [profiles.kids]\ndisplay_name = \"Kids\"\n",
         ));
         assert!(build_rows(app.loaded_config.as_ref().unwrap()).is_empty());

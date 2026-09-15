@@ -80,6 +80,28 @@ sync_parent_by() {
 	bounded "$deadline" sync "$parent"
 }
 file_id_by() { bounded "$1" stat -Lc '%d:%i' "$2"; }
+# Only positive kernel-thread evidence can excuse an unreadable executable.
+# Linux include/linux/sched.h defines PF_KTHREAD = 0x00200000; proc stat
+# field 9 is the unsigned flags value. State I or a kworker-like name is not
+# evidence, nor does a zombie leader prove its entire thread group has exited.
+proc_is_kernel_thread_by() {
+	local deadline=$1 pid_dir=$2 record tail flags
+	if record=$(bounded "$deadline" cat "$pid_dir/stat" 2>/dev/null); then :; else return "$?"; fi
+	[[ $record == "${pid_dir##*/} ("* ]] || return 1
+	# comm is unescaped and may contain spaces, parentheses, and newlines.
+	# All fields after its LAST closing parenthesis must be numeric (except
+	# state); require at least the longstanding fields through starttime (22).
+	tail=${record##*)}
+	[[ $tail =~ ^\ ([RSDZTWtXxKPI])(\ -?[0-9]+){5}\ ([0-9]{1,10})(\ -?[0-9]+){13,}$ ]] || return 1
+	flags=${BASH_REMATCH[3]}
+	(( 10#$flags <= 4294967295 && (10#$flags & 0x00200000) != 0 ))
+}
+audit_deadline() {
+	if (( SECONDS >= forward_deadline )); then
+		echo "upgrade-gate: process audit deadline expired" >&2
+		exit 124
+	fi
+}
 forward() { bounded "$forward_deadline" "$@"; }
 # restorecon/reset-failed remain best-effort, but a consumed deadline is fatal.
 optional_forward() {
@@ -294,20 +316,29 @@ else
 fi
 printf 'process-audit:begin\n' >&2
 for pid_dir in "$PROC_ROOT"/[0-9]*; do
+	audit_deadline
 	[[ -d $pid_dir ]] || continue
 	exe="$pid_dir/exe"
-	[[ -e $exe || -L $exe ]] || continue
 	if exe_inode=$(file_id_by "$forward_deadline" "$exe" 2>/dev/null); then
 		[[ $exe_inode != "$old_inode" ]] || die "legacy process remains: PID ${pid_dir#"$PROC_ROOT"/}; close it before retrying"
 	else
 		rc=$?
-		if [[ -d $pid_dir && ( -e $exe || -L $exe ) ]]; then
+		[[ $rc -eq 124 ]] && { echo "upgrade-gate: process audit deadline expired" >&2; exit "$rc"; }
+		audit_deadline
+		[[ -d $pid_dir ]] || continue
+		if proc_is_kernel_thread_by "$forward_deadline" "$pid_dir"; then
+			audit_deadline
+			printf 'process-audit:kernel-thread:PID %s\n' "${pid_dir##*/}" >&2
+		else
+			rc=$?
 			[[ $rc -eq 124 ]] && { echo "upgrade-gate: process audit deadline expired" >&2; exit "$rc"; }
-			die "cannot audit legacy process: PID ${pid_dir#"$PROC_ROOT"/}"
+			audit_deadline
+			[[ -d $pid_dir ]] || continue
+			die "cannot audit legacy process: PID ${pid_dir#"$PROC_ROOT"/} (no verified kernel-thread stat)"
 		fi
-		continue
 	fi
 done
+audit_deadline
 printf 'process-audit:complete\n' >&2
 if current_unit_id=$(file_id_by "$forward_deadline" "$UNIT_DEST"); then
 	[[ $current_unit_id == "$old_unit_id" ]] || die "installed old daemon unit changed before preservation"

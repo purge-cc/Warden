@@ -10,7 +10,7 @@ use crate::filter::FilterEngine;
 use crate::lists::status::ListStatusRegistry;
 use crate::profiles::ProfileResolver;
 use crate::tracking::StatsEngine;
-use crate::upstream::resolver::UpstreamResolver;
+use crate::upstream::ReloadableUpstream;
 
 /// State shared across all API routes via `axum::extract::State`.
 pub struct ApiState {
@@ -37,8 +37,8 @@ pub struct ApiState {
     pub reload_tx: tokio::sync::mpsc::Sender<Option<u32>>,
     /// Daemon start time (for uptime calculation).
     pub started_at: Instant,
-    /// Upstream resolver for health checks.
-    pub upstream: Option<Arc<UpstreamResolver>>,
+    /// Active upstream generation for health and status reporting.
+    pub upstream: Option<Arc<ReloadableUpstream>>,
     // Metadata for /api/status
     pub listen_addr: String,
     pub upstream_mode: String,
@@ -63,21 +63,28 @@ pub struct ApiState {
     /// synchronous writer acquires its descriptor-pinned filesystem lock
     /// inside the mutation it runs.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Shared bounded plan/job registry used by every operator-rule adapter.
+    pub operator_rule_jobs: Option<crate::api::operator_rule_jobs::OperatorRuleJobClient>,
     /// Cluster serve-state: generations, content hashes, and the
     /// pre-serialised policy / domain-map artifacts the `/api/cluster/*`
     /// handlers return, plus the cluster bearer token + `allow_peer` gate. `Some`
-    /// only when `cluster.enabled && role == primary && api.enabled` at boot —
-    /// the cluster routes mount iff this is `Some` (`api::routes::build_router`).
+    /// when `cluster.enabled && role == primary` at boot. The routes can mount
+    /// on the administrative API and on active Nodes listeners.
     /// Behind the `cluster` feature so the default build is byte-identical.
     #[cfg(feature = "cluster")]
     pub cluster: Option<Arc<crate::cluster::ClusterState>>,
     /// Shared cluster observability handle. The heartbeat
     /// handler WRITES the per-peer roster through this; the IPC `ClusterStatus`
-    /// reader (on `DaemonState`) reads the same `Arc`. `Some` only on an
-    /// enabled primary (mirrors `cluster` above). Same handle, two readers —
-    /// the `list_statuses` "one registry, IPC + HTTP" pattern.
+    /// reader (on `DaemonState`) reads the same `Arc`. `Some` on either active
+    /// cluster role; the primary records peers and a secondary records its
+    /// convergence. Same handle, two readers — the `list_statuses` "one
+    /// registry, IPC + HTTP" pattern.
     #[cfg(feature = "cluster")]
     pub cluster_observe: Option<Arc<crate::cluster::ClusterObserve>>,
+    /// Nodes v2 controller used only by the cluster-authenticated capability
+    /// negotiation route.
+    #[cfg(feature = "cluster")]
+    pub node_controller: Option<Arc<crate::cluster::node_control::NodeController>>,
 }
 
 impl ApiState {

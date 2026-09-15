@@ -1,17 +1,14 @@
 //! `warden config edit` — open the config file in `$EDITOR` then validate.
 //!
-//! Fully v1: the editor opens the config file as-is, and the post-edit
-//! validation runs through the held write capability so every
-//! v1 validator error is surfaced on save. For fresh files the editor is
+//! The editor opens the config file as-is, and post-edit schema-5
+//! validation runs through the held write capability. For fresh files it is
 //! given the init scaffold via [`crate::cli::commands::init::default_config`].
 //!
-//! §4.28 b9 cli-h1 + DISC-1 (2026-05-13): the editor invocation is now
-//! a direct `Command::new(binary).args(extra).arg(config_path)` — the
-//! pre-fix `sh -c` wrapper would interpret `$()`, `;`, or backticks in
-//! the config path. The first-boot scaffold is now written through
+//! The editor invocation is a direct
+//! `Command::new(binary).args(extra).arg(config_path)` so shell metacharacters
+//! in paths are never interpreted. The first-boot scaffold is written through
 //! [`crate::config::atomic_write::hardened_atomic_create_only_at`] with an
-//! explicit `0o640` mode, matching the same pattern that
-//! `cli/commands/init.rs:155` adopted in §4.31.
+//! explicit `0o640` mode.
 
 use std::io::Write;
 use std::path::Path;
@@ -19,12 +16,13 @@ use std::path::Path;
 use crate::cli::commands::init::default_config;
 use crate::cli::exit_codes::{CONFIG, SUCCESS};
 use crate::config::atomic_write::{hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts};
-use crate::config::loader::{load_config_for_schema_under_editor_guard, EditorGuardedLoadFailure};
+use crate::config::loader::{
+    load_config_v5_executable_under_editor_guard, EditorGuardedLoadFailure,
+};
 use crate::config::migration_journal;
-use crate::config::schema::SCHEMA_VERSION_V1;
 use crate::config::write_lock;
 
-/// Open the config in `$EDITOR`; on exit, run the v1 loader + validator
+/// Open the config in `$EDITOR`; on exit, run the current loader + validator
 /// and print any resulting errors.
 ///
 /// Returns the intended process exit code: [`CONFIG`] when the file the
@@ -85,8 +83,10 @@ fn run_edit_with_runner(
                 &mut spool,
                 scaffold.len() as u64,
                 AtomicCreateOnlyAtOpts {
+                    validator: None,
                     mode: Some(0o640),
                     owner: Some(guard.admitted_side_lock_owner()?),
+                    staging: Default::default(),
                     #[cfg(test)]
                     test_failure: None,
                 },
@@ -97,7 +97,7 @@ fn run_edit_with_runner(
     };
     if created {
         println!(
-            "created default v1 config at {}",
+            "created default schema-5 config at {}",
             canonical_master.display()
         );
     }
@@ -116,15 +116,10 @@ fn run_edit_with_runner(
     write_lock::test_event(write_lock::TestEvent::BeforeGuardedValidation);
     verify_post_editor_integrity(&guard)?;
 
-    // Validate after editing via the v1 loader so the operator sees
+    // Validate after editing via the current loader so the operator sees
     // any typos / cross-ref misses with file:line attribution.
     let now = time::OffsetDateTime::now_utc();
-    let validation = load_config_for_schema_under_editor_guard(
-        &guard,
-        &canonical_master,
-        SCHEMA_VERSION_V1,
-        now,
-    );
+    let validation = load_config_v5_executable_under_editor_guard(&guard, &canonical_master, now);
     #[cfg(test)]
     write_lock::test_event(write_lock::TestEvent::AfterGuardedValidation);
     verify_post_editor_integrity(&guard)?;
@@ -183,8 +178,8 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn valid_config() -> &'static str {
-        "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
-         [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n\
+        "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
+         [profiles.default]\ndisplay_name = \"Default\"\n\n\
          [upstream]\nservers = [\"192.0.2.1:53\"]\n"
     }
 
@@ -384,11 +379,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn edit_rejects_schema_four_and_preserves_editor_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let master = tmp.path().join("config.toml");
+        let legacy = valid_config().replacen("schema_version = 5", "schema_version = 4", 1);
+        fs::write(&master, &legacy).unwrap();
+
+        let result =
+            run_edit_with_runner(&master, "editor", &[], |_, _, _| Ok(successful_status()))
+                .unwrap();
+
+        assert_eq!(result, CONFIG);
+        assert_eq!(fs::read_to_string(master).unwrap(), legacy);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn edit_keeps_invalid_rename_bytes_live_after_schema_validation() {
         let tmp = tempfile::tempdir().unwrap();
         let master = tmp.path().join("config.toml");
         fs::write(&master, valid_config()).unwrap();
-        let invalid = "schema_version = 4\n[server]\ndefault_profile = \"missing\"\n";
+        let invalid = "schema_version = 5\n[server]\ndefault_profile = \"missing\"\n";
         let observed_validation = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&observed_validation);
         let renamed = crate::config::write_lock::with_test_hook(
@@ -440,7 +451,7 @@ mod tests {
         let master = tmp.path().join("config.toml");
         fs::write(
             &master,
-            "schema_version = 4\nincludes = [\"slice.toml\"]\n\n[server]\ndefault_profile = \"default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\"slice.toml\"]\n\n[server]\ndefault_profile = \"default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         fs::write(
@@ -884,7 +895,7 @@ mod tests {
         // this also proves the full validator runs and not just a parse.
         std::fs::write(
             &config_path,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"ghost\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[server]\ndefault_profile = \"ghost\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
 
@@ -897,6 +908,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_edit_exits_config_when_a_saved_pack_cannot_compile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"schema_version = 5
+
+[server]
+default_profile = "default"
+
+[[custom_lists]]
+id = "policy"
+
+[profiles.default]
+custom_lists = ["policy"]
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("packs")).unwrap();
+        std::fs::write(tmp.path().join("packs/policy.txt"), "/(invalid/\n").unwrap();
+
+        let code = run_edit_with_runner(&config_path, "editor", &[], |_, _, _| {
+            Ok(successful_status())
+        })
+        .unwrap();
+
+        assert_eq!(code, CONFIG);
+    }
+
     /// Control arm for the test above: the same path over a *valid* config
     /// must still be 0. Without this, returning CONFIG unconditionally
     /// would pass the test above and break every real edit.
@@ -907,7 +951,7 @@ mod tests {
         let config_path = tmp.path().join("good.toml");
         std::fs::write(
             &config_path,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
+            "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();

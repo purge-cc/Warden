@@ -19,7 +19,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n\
+        "schema_version = 5\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n",
@@ -30,8 +30,8 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
 
 /// Help already open on the given leaf.
 fn helping(master: &Path, leaf: Leaf) -> App {
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(master);
     app.active_leaf = leaf;
     app.show_help = true;
     app
@@ -100,9 +100,10 @@ async fn n8_a_on_lists_opens_the_add_modal_and_closes_help() {
     press(&mut app, key(KeyCode::Char('a')), &master).await;
 
     assert!(!app.show_help, "a listed key closes the overlay behind it");
-    assert!(
-        app.lists.edit_modal.is_some(),
-        "and runs the action, as if help had never been open"
+    assert_eq!(
+        app.lists.import_source,
+        Some(0),
+        "and opens the source chooser, as if help had never been open"
     );
 }
 
@@ -172,10 +173,10 @@ async fn n8_an_unbound_key_leaves_help_open_on_dashboard_too() {
     );
 
     press(&mut app, key(KeyCode::Char('d')), &master).await;
-    assert!(
-        !app.show_help,
-        "and its one real binding must still dispatch"
-    );
+    assert!(app.show_help, "the retired detail key is unbound");
+    press(&mut app, key(KeyCode::Left), &master).await;
+    assert!(app.show_help, "dashboard has no hour inspection binding");
+    assert_eq!(app.active_leaf, Leaf::Dashboard);
 }
 
 /// `g` arms the mnemonic prefix and the overlay goes; the second key
@@ -204,8 +205,7 @@ async fn n8_g_arms_the_mnemonic_and_the_overlay_goes_first() {
 }
 
 /// **The overlay must not become a way to reach a key the leaf does
-/// not have.** `B` opens the catalog picker on Lists and is unbound on
-/// Profiles; from help on Profiles it must do neither.
+/// not have.** `B` is unbound on Profiles; from help it must do nothing.
 #[tokio::test]
 async fn n8_help_does_not_widen_a_leafs_bindings() {
     let dir = tempfile::tempdir().unwrap();

@@ -42,8 +42,8 @@ use crate::tui::modal_form::{self, Action, ActionKind, ScrollBody, ValueKind};
 /// Modal width, matching the ecosystem's form modals.
 const W: u16 = 66;
 
-const TITLE: &str = "Advanced search";
-const DESC: &str = "narrow the log by client \u{b7} ANDed with Domain / Client / Time";
+const TITLE: &str = "Advanced";
+const DESC: &str = "narrow the log by client \u{b7} ANDed with Domain / Client / Period";
 const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} flip include/exclude";
 
 /// Refused save because the subnet did not parse. Frozen — the operator
@@ -67,7 +67,7 @@ pub enum Field {
 }
 
 impl Field {
-    const ORDER: [Field; 8] = [
+    pub(crate) const ORDER: [Field; 8] = [
         Field::NamePattern,
         Field::NamePolarity,
         Field::IpPattern,
@@ -201,8 +201,8 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &QueryLogFilterModal) 
     }
 }
 
-fn chars(s: Option<&String>) -> u16 {
-    u16::try_from(s.map_or(0, |v| v.chars().count())).unwrap_or(u16::MAX)
+fn cells(s: Option<&String>) -> u16 {
+    u16::try_from(s.map_or(0, |v| crate::tui::text::width(v))).unwrap_or(u16::MAX)
 }
 
 fn form_body(modal: &QueryLogFilterModal, width: u16) -> (ScrollBody, Option<(usize, u16)>) {
@@ -231,7 +231,7 @@ fn form_body(modal: &QueryLogFilterModal, width: u16) -> (ScrollBody, Option<(us
             ),
             tf,
             field_hint(text_field),
-            chars(value),
+            cells(value),
         );
         let pf = focus == polarity_field;
         rows.field(
@@ -287,13 +287,15 @@ fn form_body(modal: &QueryLogFilterModal, width: u16) -> (ScrollBody, Option<(us
             focus == Field::Cancel,
             ActionKind::Neutral,
             field_hint(Field::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             "  [Enter] Apply  ",
             focus == Field::Apply,
             ActionKind::Primary,
             field_hint(Field::Apply),
-        ),
+        )
+        .on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -340,6 +342,13 @@ mod tests {
             subnet: subnet.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unicode_input_places_the_caret_in_terminal_cells() {
+        let modal = QueryLogFilterModal::open(&draft(Some("端末e\u{301}"), None, None));
+        let (_, cursor) = form_body(&modal, 64);
+        assert_eq!(cursor, Some((2, 5)));
     }
 
     /// Esc must not be able to half-apply. The draft is a copy; only a

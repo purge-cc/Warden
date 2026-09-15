@@ -163,11 +163,9 @@ fn n1_anti_bypass_enabled_no_domains_byte_pinned() {
     assert_eq!(
         ANTI_BYPASS_ENABLED_NO_DOMAINS,
         "[anti_bypass] enabled = true but has no domains to block — \
-         `anti_bypass.extra_domains` is empty, so no resolver name is refused \
-         and the setting protects nothing. warden ships no built-in resolver \
-         list; add the names you want refused to `anti_bypass.extra_domains`. \
-         A [[blocklists]] subscription does not feed this check — list domains \
-         are enforced by the filter engine, where allow rules can override them."
+         set `anti_bypass.extra_domains` to the resolver hostnames you want refused, \
+         or set `anti_bypass.enabled = false` if unused. `[[blocklists]]` does not \
+         feed this check."
     );
 }
 
@@ -176,6 +174,14 @@ fn n1_anti_bypass_warning_names_the_only_field_that_feeds_the_checker() {
     assert!(
         ANTI_BYPASS_ENABLED_NO_DOMAINS.contains("anti_bypass.extra_domains"),
         "the remedy must name the field `AntiBypass::new` actually reads"
+    );
+}
+
+#[test]
+fn n1_anti_bypass_warning_offers_the_disable_remedy() {
+    assert!(
+        ANTI_BYPASS_ENABLED_NO_DOMAINS.contains("anti_bypass.enabled = false"),
+        "an unused anti-bypass checker must have an explicit disable remedy"
     );
 }
 

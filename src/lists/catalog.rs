@@ -374,6 +374,12 @@ impl Catalog {
         &self.entries
     }
 
+    /// Reconstruct catalog resolution from an authenticated corpus inventory.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn from_verified_entries(entries: Vec<CatalogEntry>) -> Self {
+        Self { entries }
+    }
+
     /// Build a catalog from hand-written entries.
     ///
     /// Test-only: every production path arrives through [`Self::fetch_from`]

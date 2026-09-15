@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "purge-warden"
-version = "0.41.0"
+version = "0.42.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1923,6 +1923,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "base64",
  "clap",
  "clap_complete",
  "clap_mangen",
@@ -1948,6 +1949,8 @@ dependencies = [
  "ratatui",
  "rcgen",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "reqwest",
  "rustls",
  "serde",
@@ -1960,6 +1963,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tower",
@@ -1967,6 +1971,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
  "webpki-roots 0.26.11",
  "zeroize",
 ]

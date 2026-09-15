@@ -1,7 +1,7 @@
-//! `warden config lint` — validate the v1 config without touching the daemon.
+//! `warden config lint` — validate the current config without touching the daemon.
 //!
 //! Loads the config tree from `config_path` via
-//! [`crate::config::loader::load_config`], which runs the full include
+//! [`crate::config::loader::load_current_config`], which runs the full include
 //! resolution + cross-ref validator. On success, prints a one-line
 //! summary with the entity counts. On failure, prints every error on a
 //! separate line with file + line + entity + suggestion attached.
@@ -71,7 +71,7 @@
 //! routes those to journald at hot-reload, but the lint CLI installs no
 //! global subscriber, so they would vanish here — defeating lint's
 //! pre-flight-before-upgrade purpose. The validator therefore *also* returns
-//! them as data: [`crate::config::loader::load_config_collect`] hands back
+//! them as data: [`crate::config::loader::load_current_config_executable_collect`] hands back
 //! `(result, warnings)` and we print what it collected. The daemon
 //! boot/reload paths are untouched, so their journald output and exit
 //! behaviour are byte-for-byte unchanged.
@@ -172,7 +172,7 @@ fn lint_collect(config_path: &Path) -> (Result<LoadedConfig, Vec<ConfigError>>, 
     let now = time::OffsetDateTime::now_utc();
     // No subscriber, no thread-local, no shared state of any kind: the
     // validator hands its audit WARNs back in the return value.
-    let (result, mut warnings) = loader::load_config_collect(config_path, now);
+    let (result, mut warnings) = loader::load_current_config_executable_collect(config_path, now);
     let result = result.and_then(|loaded| {
         let (preflight, preflight_warnings) =
             preflight_source_plan_collect(config_path, &loaded.config);
@@ -254,10 +254,10 @@ fn print_clean_summary(config_path: &Path, loaded: &LoadedConfig) {
         c.schedules.len(),
     );
     println!(
-        "  {} profile(s), {} blocklist(s), {} admin rule(s)",
+        "  {} profile(s), {} blocklist(s), {} custom list(s)",
         c.profiles.len(),
         c.blocklists.len(),
-        c.admin_rules.len(),
+        c.custom_lists.len(),
     );
     match &c.server.default_profile {
         Some(p) => println!("  default_profile: {}", p.as_str()),
@@ -293,6 +293,43 @@ fn write_warnings(w: &mut dyn Write, config_path: &Path, warnings: &[String]) {
 mod tests {
     use super::*;
 
+    fn current_fixture_body(relative: &str) -> String {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let mut doc: toml::Value = std::fs::read_to_string(source).unwrap().parse().unwrap();
+        let root = doc.as_table_mut().unwrap();
+        root.insert("schema_version".into(), toml::Value::Integer(5));
+        root.remove("admin_rules");
+        if let Some(profiles) = root.get_mut("profiles").and_then(toml::Value::as_table_mut) {
+            for profile in profiles
+                .iter_mut()
+                .filter_map(|(_, value)| value.as_table_mut())
+            {
+                profile.remove("admin_rules");
+                profile.remove("tags");
+            }
+        }
+        if let Some(devices) = root.get_mut("devices").and_then(toml::Value::as_array_mut) {
+            for device in devices.iter_mut().filter_map(toml::Value::as_table_mut) {
+                device.remove("allow_rules");
+                device.remove("deny_rules");
+                device.remove("override_profile_deny");
+                device.remove("tags");
+                if let Some(value) = device.remove("device") {
+                    device.insert("device_type".into(), value);
+                }
+            }
+        }
+        toml::to_string_pretty(&doc).unwrap()
+    }
+
+    fn current_fixture(relative: &str) -> (tempfile::TempDir, PathBuf) {
+        let body = current_fixture_body(relative);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
     #[test]
     fn lint_returns_zero_for_minimal_valid_fixture() {
         // tests/fixtures/minimal-v1/config.toml is the canonical
@@ -303,8 +340,7 @@ mod tests {
         // defaults claim a protection that builds no checker. That is a
         // warning, so the code stays SUCCESS. See
         // `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture`.
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/minimal-v1/config.toml");
         let rc = run_lint(&path, false).unwrap();
         assert_eq!(rc, SUCCESS, "minimal-v1 fixture must lint clean");
     }
@@ -315,8 +351,7 @@ mod tests {
         // non-existent profile — the validator catches it. An invalid
         // config is exactly what CONFIG means; it used to be 1, which
         // the contract reserves for "the operation failed".
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/broken-v1/cross_ref_miss.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/broken-v1/cross_ref_miss.toml");
         let rc = run_lint(&path, false).unwrap();
         assert_eq!(rc, CONFIG, "broken-v1 fixture must lint with exit 2");
     }
@@ -328,6 +363,53 @@ mod tests {
         let missing = tmp.path().join("no-such-config.toml");
         let rc = run_lint(&missing, false).unwrap();
         assert_eq!(rc, CONFIG, "missing config must lint with exit 2");
+    }
+
+    #[test]
+    fn lint_rejects_invalid_pack_regex_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let body = r#"schema_version = 5
+
+[server]
+default_profile = "default"
+
+[[custom_lists]]
+id = "policy"
+
+[profiles.default]
+custom_lists = ["policy"]
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#;
+        std::fs::write(&path, body).unwrap();
+        std::fs::create_dir(dir.path().join("packs")).unwrap();
+        std::fs::write(dir.path().join("packs/policy.txt"), "/(invalid/\n").unwrap();
+
+        let (result, _) = lint_collect(&path);
+
+        let errors = result.expect_err("invalid regex must fail executable lint");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.to_string().contains("regex compilation failed")),
+            "{errors:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn lint_rejects_schema_four_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let body = "schema_version = 4\n\n[server]\ndefault_profile = \"default\"\n\n\
+                    [profiles.default]\ndisplay_name = \"Default\"\n\n\
+                    [upstream]\nservers = [\"192.0.2.1:53\"]\n";
+        std::fs::write(&path, body).unwrap();
+
+        assert_eq!(run_lint(&path, false).unwrap(), CONFIG);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
     }
 
     /// The reversal: a warnings-only config is valid, so it exits 0.
@@ -342,8 +424,7 @@ mod tests {
         // `base = "ignore"` blocklist — the inert WARN, no errors.
         // (The row was a tag orphan until the tag-model cutover retired
         // that diagnostic.)
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/warns-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/warns-v1/config.toml");
         let rc = run_lint(&path, false).unwrap();
         assert_eq!(rc, SUCCESS, "a warnings-only config is valid — it boots");
     }
@@ -358,8 +439,7 @@ mod tests {
     /// wired to anything.
     #[test]
     fn strict_makes_warnings_fatal_and_only_strict_does() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/warns-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/warns-v1/config.toml");
 
         let lenient = run_lint(&path, false).unwrap();
         let strict = run_lint(&path, true).unwrap();
@@ -402,14 +482,11 @@ mod tests {
     /// drift from it.
     #[test]
     fn strict_leaves_a_clean_config_alone() {
-        const MINIMAL_V1: &str = include_str!("../../../../tests/fixtures/minimal-v1/config.toml");
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            format!("{MINIMAL_V1}\n[anti_bypass]\nenabled = false\n"),
-        )
-        .unwrap();
+        let mut body = current_fixture_body("tests/fixtures/minimal-v1/config.toml");
+        body.push_str("\n[anti_bypass]\nenabled = false\n");
+        std::fs::write(&path, body).unwrap();
 
         let (_, warnings) = lint_collect(&path);
         assert!(
@@ -430,8 +507,7 @@ mod tests {
     /// capture, warnings would vanish with no signal at all.
     #[test]
     fn warnings_are_still_collected_even_though_they_no_longer_fail() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/warns-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/warns-v1/config.toml");
         let (result, warnings) = lint_collect(&path);
         assert!(result.is_ok());
         assert!(
@@ -453,8 +529,7 @@ mod tests {
         // from being silent.
         // Asserted through the on-disk fixture rather than an inline config
         // deliberately: this is the path an operator's file actually takes.
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/warns-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/warns-v1/config.toml");
         let (result, warnings) = lint_collect(&path);
         assert!(result.is_ok(), "warns-v1 must load without errors");
         let expected =
@@ -483,8 +558,7 @@ mod tests {
     /// have thrown that away along with the red.
     #[test]
     fn lint_captures_exactly_the_expected_warnings_for_the_reference_fixture() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-v1/config.toml");
+        let (_dir, path) = current_fixture("tests/fixtures/minimal-v1/config.toml");
         let (result, warnings) = lint_collect(&path);
         assert!(result.is_ok());
         assert_eq!(
@@ -518,7 +592,7 @@ mod tests {
 
     fn source_plan_config(sources: &str, blocklists: &str) -> String {
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -607,8 +681,8 @@ enabled = true
         let path = write_config(
             &dir,
             &master.replacen(
-                "schema_version = 4",
-                "schema_version = 4\nincludes = [\"blocklists.toml\"]",
+                "schema_version = 5",
+                "schema_version = 5\nincludes = [\"blocklists.toml\"]",
                 1,
             ),
         );
@@ -739,7 +813,7 @@ url = "https://example.test/raw.txt"
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -801,7 +875,7 @@ servers = ["192.0.2.1:53"]
     fn tmc_lint_reports_a_base_ignore_list_as_inert() {
         let config = |base: &str| {
             format!(
-                r#"schema_version = 4
+                r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -859,7 +933,7 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -898,7 +972,7 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -929,14 +1003,13 @@ servers = ["192.0.2.1:53"]
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
 
 [profiles.default]
 display_name = "Default"
-tags = ["uncategorized"]
 
 [[blocklists]]
 id = "privacy-ads"

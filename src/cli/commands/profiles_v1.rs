@@ -1,13 +1,13 @@
-//! §4.26 Phase 1: v1 profile CLI handlers.
+//! `warden profile` handlers for the current configuration schema.
 //!
-//! `warden profile <verb>` operates on the v1 schema `Profile`
+//! `warden profile <verb>` operates on the projected `Profile`
 //! ([`crate::config::schema::profile::Profile`]). Mutations are dispatched
 //! to the daemon over IPC ([`IpcCommand::ProfileCreate`] /
 //! [`IpcCommand::ProfileUpdate`] / [`IpcCommand::ProfileDelete`]); the
 //! handler runs `atomic_write_and_validate` + reload + audit emit.
 //!
 //! Read-only verbs (`list`, `show`) read the merged config tree locally
-//! via [`crate::config::loader::load_config`].
+//! via [`crate::config::loader::load_current_config`].
 
 use std::path::Path;
 
@@ -16,28 +16,28 @@ use clap::Subcommand;
 use time::OffsetDateTime;
 
 use super::format_config_errors;
-use crate::config::loader::load_config;
+use crate::config::loader::load_current_config;
 use crate::config::schema::blocklist::{effective_direction, Blocklist, ListPolicy};
 use crate::config::schema::profile::{BlockResponseV1, Profile};
 use crate::config::settings::EcsMode;
 use crate::ipc::protocol::{
-    AdminRulesPatch, EcsPatch, IpcCommand, IpcResponse, ListPolicyPatch, ProfileUpdatePatch,
+    EcsPatch, IpcCommand, IpcResponse, ListPolicyPatch, ProfileUpdatePatch,
 };
 use crate::ipc::socket_client;
 
 // ── read-only ────────────────────────────────────────────────────
 
-/// `warden profile list` — tabulate every v1 profile with summary stats.
+/// `warden profile list` — tabulate every profile with summary stats.
 pub fn run_list(config_path: &Path) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
 
     if loaded.config.profiles.is_empty() {
         println!("no profiles configured");
         return Ok(());
     }
 
-    println!("configured v1 profiles:");
+    println!("configured profiles:");
     for (id, prof) in &loaded.config.profiles {
         let display = if prof.display_name.is_empty() {
             "(no display name)"
@@ -45,7 +45,6 @@ pub fn run_list(config_path: &Path) -> Result<()> {
             prof.display_name.as_str()
         };
         let overrides = prof.lists.len();
-        let admin = prof.admin_rules.len();
         let local = prof.local_records.len();
         let rewrites = prof.rewrite_rules.len();
         let ecs = match &prof.ecs {
@@ -69,17 +68,16 @@ pub fn run_list(config_path: &Path) -> Result<()> {
         }
         println!("  {id}: {display}{flags}");
         println!(
-            "    list_overrides={overrides} admin_rules={admin} \
-             local_records={local} rewrites={rewrites} ecs={ecs}"
+            "    list_overrides={overrides} local_records={local} rewrites={rewrites} ecs={ecs}"
         );
     }
     Ok(())
 }
 
-/// `warden profile show <id>` — dump every v1 field for one profile.
+/// `warden profile show <id>` — dump every current profile field.
 pub fn run_show(config_path: &Path, id: &str) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
 
     let prof = loaded
         .config
@@ -127,13 +125,9 @@ fn render_profile_show(id: &str, prof: &Profile, blocklists: &[Blocklist]) -> Ve
 
     out.push(format!("  custom_lists ({}):", prof.custom_lists.len()));
     for c in &prof.custom_lists {
-        out.push(format!("    - {} (manage via `warden list`)", c.as_str()));
-    }
-    out.push(format!("  admin_rules ({}):", prof.admin_rules.len()));
-    for r in &prof.admin_rules {
         out.push(format!(
-            "    - {} (added by profile allow/deny; `warden rule undo` reverses the most recent)",
-            r.as_str()
+            "    - {} (manage via `warden custom-list`)",
+            c.as_str()
         ));
     }
     out.push(format!("  local_records ({}):", prof.local_records.len()));
@@ -435,26 +429,21 @@ fn parse_prefix(value: &str, max: u8, key: &str) -> Result<u8> {
 
 /// Sub-commands for `warden profile admin-rule …`.
 ///
-/// Admin rules are a list of references, not a scalar field, so they
-/// keep add/remove sub-verbs instead of folding into `set` — the same
-/// shape `warden profile tag add|remove` uses.
+/// Retained for command-line compatibility only. Both verbs fail with the
+/// Custom List migration guidance and never send a profile patch.
 ///
 /// Declared beside its handlers rather than with the other action enums
 /// in `cli/mod.rs`; clap derives `Subcommand` across modules either way.
 #[derive(Subcommand)]
 pub enum ProfileAdminRuleAction {
-    /// Reference an existing `[[admin_rules]]` row from this profile,
-    /// so the profile starts enforcing it.
+    /// Retired; use a Custom List mounted on the profile.
     Add {
         /// Profile id (the map key in `[profiles.<id>]`).
         id: String,
         /// Admin rule id, as `warden profile show` prints it.
         rule_id: String,
     },
-    /// Drop an admin rule reference from this profile. The
-    /// `[[admin_rules]]` row itself stays, and no verb deletes a row by
-    /// id: `warden rule undo` pops the most recently added row and
-    /// cascades the reference drop across every entity that named it.
+    /// Retired; manage Custom List mounts instead.
     Remove {
         /// Profile id (the map key in `[profiles.<id>]`).
         id: String,
@@ -463,36 +452,17 @@ pub enum ProfileAdminRuleAction {
     },
 }
 
-/// `warden profile admin-rule add <id> <rule-id>`
-pub async fn run_admin_rule_add(socket_path: &Path, id: &str, rule_id: &str) -> Result<()> {
-    let cmd = IpcCommand::ProfileUpdate {
-        id: id.to_string(),
-        patch: ProfileUpdatePatch {
-            admin_rules: Some(AdminRulesPatch {
-                add: vec![rule_id.to_string()],
-                remove: vec![],
-            }),
-            ..Default::default()
-        },
-        token: None,
-    };
-    send_and_print(socket_path, cmd).await
+/// `warden profile admin-rule add <id> <rule-id>`.
+///
+/// Retained only to give old CLI invocations an actionable failure before
+/// they can send a legacy patch to the daemon.
+pub async fn run_admin_rule_add(_socket_path: &Path, _id: &str, _rule_id: &str) -> Result<()> {
+    bail!(crate::cli::commands::rules::LEGACY_RULES_RETIRED)
 }
 
-/// `warden profile admin-rule remove <id> <rule-id>`
-pub async fn run_admin_rule_remove(socket_path: &Path, id: &str, rule_id: &str) -> Result<()> {
-    let cmd = IpcCommand::ProfileUpdate {
-        id: id.to_string(),
-        patch: ProfileUpdatePatch {
-            admin_rules: Some(AdminRulesPatch {
-                add: vec![],
-                remove: vec![rule_id.to_string()],
-            }),
-            ..Default::default()
-        },
-        token: None,
-    };
-    send_and_print(socket_path, cmd).await
+/// `warden profile admin-rule remove <id> <rule-id>`.
+pub async fn run_admin_rule_remove(_socket_path: &Path, _id: &str, _rule_id: &str) -> Result<()> {
+    bail!(crate::cli::commands::rules::LEGACY_RULES_RETIRED)
 }
 
 /// `warden profile remove <id>` — refuses if any device, subnet, or
@@ -763,7 +733,7 @@ pub async fn run_list_policy_clear(socket_path: &Path, id: &str, list_id: &str) 
 /// applies, per list, and where each direction came from.
 pub fn run_list_policy_show(config_path: &Path, id: &str) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
 
     let prof = loaded
         .config
@@ -1060,7 +1030,7 @@ mod tests {
 
     // ── `profile show` dumps EVERY field, and stays that way ─────────
 
-    /// The doc on `run_show` promises "every v1 field", and prose does
+    /// The doc on `run_show` promises every current field, and prose does
     /// not fail a build: `safe_search` and `custom_lists` were both on
     /// `Profile` and neither was printed. `safe_search` is the
     /// consequential one — opt-in, applied at resolve time, and with no
@@ -1081,7 +1051,7 @@ mod tests {
             display_name: "Kids".into(),
             block_response: Some(BlockResponseV1::Nxdomain),
             blocked_ttl_secs: Some(30),
-            admin_rules: vec![crate::config::schema::Id::new("allow-school").unwrap()],
+            admin_rules: Vec::new(),
             block_all: true,
             local_records: vec![LocalDnsRecord {
                 domain: "nas.home".into(),
@@ -1112,7 +1082,7 @@ mod tests {
             display_name,
             block_response,
             blocked_ttl_secs,
-            admin_rules,
+            admin_rules: _,
             block_all,
             local_records,
             ecs,
@@ -1142,7 +1112,10 @@ mod tests {
             out.contains(&blocked_ttl_secs.unwrap().to_string()),
             "blocked_ttl_secs: {out}"
         );
-        assert!(out.contains(admin_rules[0].as_str()), "admin_rules: {out}");
+        assert!(
+            !out.contains("admin_rules"),
+            "retired schema-4 rule references must not be rendered: {out}"
+        );
         assert!(
             out.contains(&format!("block_all: {block_all}")),
             "block_all: {out}"
@@ -1163,6 +1136,10 @@ mod tests {
         assert!(
             out.contains(custom_lists[0].as_str()),
             "custom_lists: {out}"
+        );
+        assert!(
+            out.contains("manage via `warden custom-list`"),
+            "custom-list hint: {out}"
         );
         // Every declared override must be visible, with its policy: this
         // is the one field whose rendering can silently drop an entry.
@@ -1189,5 +1166,25 @@ mod tests {
 
         assert!(out.contains("safe_search: false"), "{out}");
         assert!(out.contains("custom_lists (0)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn legacy_profile_admin_rule_commands_fail_without_contacting_the_daemon() {
+        let socket = Path::new("/definitely/not/a/warden.sock");
+        let err = run_admin_rule_add(socket, "default", "old-rule")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::cli::commands::rules::LEGACY_RULES_RETIRED
+        );
+
+        let err = run_admin_rule_remove(socket, "default", "old-rule")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            crate::cli::commands::rules::LEGACY_RULES_RETIRED
+        );
     }
 }

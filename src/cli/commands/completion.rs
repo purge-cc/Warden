@@ -78,7 +78,7 @@ mod tests {
         assert!(
             script.contains("_warden()"),
             "bash script should define _warden(): first 200 chars: {}",
-            &script.chars().take(200).collect::<String>()
+            script.chars().take(200).collect::<String>()
         );
         assert!(script.contains("complete -F"), "must register completion");
     }

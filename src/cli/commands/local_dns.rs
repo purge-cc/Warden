@@ -10,7 +10,7 @@
 //!   1. Validator pre-flight against the merged `[existing..., new]`
 //!      slice via `validate_local_records_v2`.
 //!   2. TOML mutation via [`super::target::write_value_validated_locked`]: the
-//!      full v1 loader runs against the STAGED bytes before the rename,
+//!      current loader runs against the STAGED bytes before the rename,
 //!      so a tree the loader would reject never lands on disk.
 //!   3. `super::ipc_reload::attempt_reload` fires the reload feedback.
 //!   4. Audit emit via `AuditWriter::append_cli_mutation` inside the
@@ -806,8 +806,10 @@ pub(crate) mod profile_scoped {
     use toml::Value;
 
     use crate::cli::commands::target::{self, EntityClass};
-    use crate::config::loader::{load_config, load_config_for_schema_under_guard, MAX_TOTAL_BYTES};
-    use crate::config::schema::{ConfigV1, SCHEMA_VERSION_V1};
+    use crate::config::loader::{
+        load_config_for_schema_under_guard, load_current_config, MAX_TOTAL_BYTES,
+    };
+    use crate::config::schema::{ConfigV1, TARGET_SCHEMA_VERSION_V5};
     use crate::config::tree_io::CappedRead;
     use crate::config::write_lock::ConfigWriteLock;
 
@@ -952,7 +954,7 @@ pub(crate) mod profile_scoped {
 
     pub(crate) fn load_for_resolution(config_path: &Path) -> anyhow::Result<ConfigV1> {
         let now = time::OffsetDateTime::now_utc();
-        load_config(config_path, now)
+        load_current_config(config_path, now)
             .map(|loaded| loaded.config)
             .map_err(|errs| {
                 let mut msg = format!("cannot load config ({} error(s)):", errs.len());
@@ -969,7 +971,7 @@ pub(crate) mod profile_scoped {
         config_path: &Path,
     ) -> anyhow::Result<ConfigV1> {
         let now = time::OffsetDateTime::now_utc();
-        load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
             .map(|loaded| loaded.config)
             .map_err(|errs| {
                 let mut msg = format!("cannot load config ({} error(s)):", errs.len());
@@ -1255,7 +1257,7 @@ mod tests {
     }
 
     fn v1_master_with_default_profile() -> &'static str {
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"

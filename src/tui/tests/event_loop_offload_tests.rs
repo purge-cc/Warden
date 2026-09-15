@@ -20,7 +20,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -60,7 +60,7 @@ fn app_with_restore_modal(
     stage: RestoreStage,
 ) -> (App, tokio::sync::mpsc::UnboundedReceiver<app::UiJob>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<app::UiJob>();
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::Settings;
     app.job_tx = Some(tx);
     app.settings.restore_modal = Some(RestoreModal { stage });
@@ -98,7 +98,12 @@ async fn restore_confirm_hands_off_to_a_background_job() {
         .await
         .expect("the restore job must report back through job_rx")
         .expect("job channel open");
-    let app::UiJob::RestoreFinished(outcome) = job else {
+    let app::UiJob::RestoreFinished {
+        outcome,
+        config,
+        reload_error,
+    } = job
+    else {
         panic!("expected UiJob::RestoreFinished");
     };
     // The archive is a real backup of a valid tree, so the swap lands. Only
@@ -109,7 +114,18 @@ async fn restore_confirm_hands_off_to_a_background_job() {
         "real archive + valid tree must restore: {outcome:?}"
     );
 
-    apply_job_result(&mut app, app::UiJob::RestoreFinished(outcome));
+    assert!(
+        config.is_some(),
+        "a successful swap carries its refreshed views"
+    );
+    apply_job_result(
+        &mut app,
+        app::UiJob::RestoreFinished {
+            outcome,
+            config,
+            reload_error,
+        },
+    );
     assert!(
         matches!(
             app.settings.restore_modal.as_ref().unwrap().stage,
@@ -170,7 +186,11 @@ fn restore_outcome_falls_back_to_the_footer_when_the_card_is_gone() {
     let mut app = App::new();
     apply_job_result(
         &mut app,
-        app::UiJob::RestoreFinished(SubmitOutcome::Failed("restore failed: boom".into())),
+        app::UiJob::RestoreFinished {
+            outcome: SubmitOutcome::Failed("restore failed: boom".into()),
+            config: None,
+            reload_error: None,
+        },
     );
     let status = app.last_status.expect("the outcome must surface somewhere");
     assert!(status.text.contains("boom"), "got: {}", status.text);

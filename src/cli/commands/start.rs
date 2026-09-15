@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -27,18 +28,29 @@ use crate::dns::local::LocalRecords;
 use crate::dns::server::DnsServer;
 use crate::filter::engine::FilterEngine;
 use crate::filter::ip_filter::{parse_ip_blocklist, IpFilter};
+use crate::filter::operator_rules::{CompiledOperatorRules, RuleCompileLimits};
 use crate::ipc::socket_server::{spawn_ipc_server, DaemonState, ListManagerEndpoint};
 use crate::lists::catalog::Catalog;
 use crate::lists::manager::{ListManager, ListManagerTask, RefreshMode};
 use crate::lists::readiness::ReadinessGate;
 use crate::lists::source_key::{ResolvedSourcePlan, SourceBitMap, SourceTokenMap, SourceTrustMap};
 use crate::lists::status::{CycleOutcome, ListStatusRegistry};
+use crate::operator_rules::activation::{
+    new_daemon_instance_id, ActivationRequest, ActivationResult, ActivePolicyIdentity,
+};
 use crate::profiles::ProfileResolver;
 use crate::tracking::StatsEngine;
-use crate::upstream::forwarding::ForwardingRouter;
-use crate::upstream::UpstreamResolver;
+use crate::upstream::ReloadableUpstream;
 
 use super::pid;
+
+#[cfg(feature = "cluster")]
+mod nodes_runtime;
+
+#[cfg(feature = "cluster")]
+pub(crate) use nodes_runtime::preflight_received as preflight_received_corpus;
+#[cfg(feature = "cluster")]
+pub(crate) use nodes_runtime::preflight_received_manifest;
 
 /// Build the hardcoded safe-mode configuration.
 ///
@@ -68,14 +80,16 @@ use super::pid;
 ///   `warden status` / `warden config …` against the running safe-mode
 ///   daemon and repair the live config.
 pub fn safe_mode_config() -> crate::config::schema::ConfigV1 {
-    use crate::config::schema::{ConfigV1, ResourceBudgetConfig, ServerGlobals, SCHEMA_VERSION_V1};
+    use crate::config::schema::{
+        ConfigV1, ResourceBudgetConfig, ServerGlobals, TARGET_SCHEMA_VERSION_V5,
+    };
     use crate::config::settings::{
         AntiBypassConfig, ApiConfig, CacheConfig, DnssecConfig, IpBlocklistConfig, ListsConfig,
         LocalDnsConfig, SecurityConfig, SocketConfig, TrackingConfig, UpstreamConfig, UpstreamMode,
     };
 
     ConfigV1 {
-        schema_version: SCHEMA_VERSION_V1,
+        schema_version: TARGET_SCHEMA_VERSION_V5,
         includes: Vec::new(),
         server: ServerGlobals {
             listen: "127.0.0.1:5335"
@@ -143,6 +157,7 @@ pub fn safe_mode_config() -> crate::config::schema::ConfigV1 {
         backup: Default::default(),
         // Clustering off in safe mode; the section is inert.
         cluster: Default::default(),
+        node: Default::default(),
     }
 }
 
@@ -182,6 +197,184 @@ type ClusterReloadHandle<'a> = Option<&'a Arc<crate::cluster::ClusterState>>;
 #[cfg(not(feature = "cluster"))]
 type ClusterReloadHandle<'a> = std::marker::PhantomData<&'a ()>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestartOnlyRuntimeFingerprint {
+    server: String,
+    custom_list_limits: String,
+    cache: String,
+    tracking: String,
+    socket: String,
+    api: String,
+    local_dns: String,
+    ip_blocklists: String,
+    anti_bypass: String,
+    security_topology: String,
+    resource_budget: String,
+    cluster: String,
+    node_identity: Option<String>,
+    node_control_listen: Option<std::net::SocketAddr>,
+}
+
+impl RestartOnlyRuntimeFingerprint {
+    fn from_config(config: &crate::config::schema::ConfigV1) -> anyhow::Result<Self> {
+        #[derive(serde::Serialize)]
+        struct ServerRuntime<'a> {
+            listen: std::net::SocketAddr,
+            log_level: &'a str,
+            tcp_timeout_secs: u64,
+        }
+
+        #[derive(serde::Serialize)]
+        struct TrackingRuntime<'a> {
+            enabled: bool,
+            snapshot_interval_secs: u64,
+            top_n_limit: usize,
+            top_n_interval_secs: u64,
+            max_devices: usize,
+            query_log_path: &'a Path,
+            query_log_max_size_mb: u64,
+            query_log_max_files: usize,
+            retention_days: u32,
+            log_mode: &'a crate::config::settings::LogMode,
+        }
+
+        #[derive(serde::Serialize)]
+        struct ApiRuntime<'a> {
+            enabled: bool,
+            metrics_enabled: bool,
+            listen: std::net::SocketAddr,
+            tls_cert: &'a Option<PathBuf>,
+            tls_key: &'a Option<PathBuf>,
+            rate_limit_per_minute: u32,
+        }
+
+        #[derive(serde::Serialize)]
+        struct SecurityTopology {
+            enabled: bool,
+            rrl_enabled: bool,
+            rate_limit_enabled: bool,
+            tunneling_enabled: bool,
+        }
+
+        Ok(Self {
+            server: toml::to_string(&ServerRuntime {
+                listen: config.server.listen,
+                log_level: &config.server.log_level,
+                tcp_timeout_secs: config.server.tcp_timeout_secs,
+            })?,
+            custom_list_limits: toml::to_string(&config.custom_list_limits)?,
+            cache: toml::to_string(&config.cache)?,
+            tracking: toml::to_string(&TrackingRuntime {
+                enabled: config.tracking.enabled,
+                snapshot_interval_secs: config.tracking.snapshot_interval_secs,
+                top_n_limit: config.tracking.top_n_limit,
+                top_n_interval_secs: config.tracking.top_n_interval_secs,
+                max_devices: config.tracking.max_devices,
+                query_log_path: &config.tracking.query_log_path,
+                query_log_max_size_mb: config.tracking.query_log_max_size_mb,
+                query_log_max_files: config.tracking.query_log_max_files,
+                retention_days: config.tracking.retention_days,
+                log_mode: &config.tracking.log_mode,
+            })?,
+            socket: toml::to_string(&config.socket)?,
+            api: toml::to_string(&ApiRuntime {
+                enabled: config.api.enabled,
+                metrics_enabled: config.api.metrics_enabled,
+                listen: config.api.listen,
+                tls_cert: &config.api.tls_cert,
+                tls_key: &config.api.tls_key,
+                rate_limit_per_minute: config.api.rate_limit_per_minute,
+            })?,
+            local_dns: toml::to_string(&config.local_dns)?,
+            ip_blocklists: if config.cluster.enabled && config.cluster.membership_version == Some(1)
+            {
+                String::new()
+            } else {
+                toml::to_string(&config.ip_blocklists)?
+            },
+            anti_bypass: toml::to_string(&config.anti_bypass)?,
+            security_topology: toml::to_string(&SecurityTopology {
+                enabled: config.security.enabled,
+                rrl_enabled: config.security.rrl.enabled,
+                rate_limit_enabled: config.security.rate_limit.enabled,
+                tunneling_enabled: config.security.tunneling.enabled,
+            })?,
+            resource_budget: toml::to_string(&config.resource_budget)?,
+            cluster: toml::to_string(&config.cluster)?,
+            node_identity: config.node.id.clone(),
+            node_control_listen: config.node.control_listen,
+        })
+    }
+
+    fn changed_sections(&self, candidate: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.node_identity != candidate.node_identity {
+            changed.push("node identity");
+        }
+        if self.node_control_listen != candidate.node_control_listen {
+            changed.push("node control listener");
+        }
+        if self.server != candidate.server {
+            changed.push("server startup fields");
+        }
+        if self.custom_list_limits != candidate.custom_list_limits {
+            changed.push("custom_list_limits");
+        }
+        if self.cache != candidate.cache {
+            changed.push("cache");
+        }
+        if self.tracking != candidate.tracking {
+            changed.push("tracking runtime");
+        }
+        if self.socket != candidate.socket {
+            changed.push("socket");
+        }
+        if self.api != candidate.api {
+            changed.push("api runtime");
+        }
+        if self.local_dns != candidate.local_dns {
+            changed.push("local_dns");
+        }
+        if self.ip_blocklists != candidate.ip_blocklists {
+            changed.push("ip_blocklists");
+        }
+        if self.anti_bypass != candidate.anti_bypass {
+            changed.push("anti_bypass");
+        }
+        if self.security_topology != candidate.security_topology {
+            changed.push("security enabled flags");
+        }
+        if self.resource_budget != candidate.resource_budget {
+            changed.push("resource_budget");
+        }
+        if self.cluster != candidate.cluster {
+            changed.push("cluster");
+        }
+        changed
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeReloadContext<'a> {
+    client: &'a reqwest::Client,
+    upstream: &'a Arc<ReloadableUpstream>,
+    cache: &'a DnsCache,
+    restart_only: &'a RestartOnlyRuntimeFingerprint,
+    #[cfg(feature = "cluster")]
+    node_ip_filter: Option<&'a Arc<crate::filter::ip_filter::IpFilter>>,
+    #[cfg(feature = "cluster")]
+    node_observe: Option<&'a Arc<crate::cluster::ClusterObserve>>,
+}
+
+fn modern_primary_auxiliary(config: &crate::config::schema::ConfigV1) -> bool {
+    cfg!(feature = "cluster")
+        && config.cluster.enabled
+        && config.cluster.membership_version == Some(1)
+        && config.cluster.role == crate::config::schema::ClusterRole::Primary
+        && config.ip_blocklists.enabled
+        && !config.ip_blocklists.sources.is_empty()
+}
+
 /// Refuse to start when clustering is enabled on a binary built without the
 /// `cluster` feature (mirrors [`check_dnssec_build`]). The `[cluster]` section
 /// deserialises on any build, so a config can request a serve role a
@@ -200,28 +393,23 @@ pub(crate) fn check_cluster_build(config: &crate::config::schema::ConfigV1) -> a
     Ok(())
 }
 
-/// Build the cluster serve-state when this node is an enabled primary with
-/// the API server on. Returns `None` for a standalone node, a secondary (no
-/// serve side), or a primary whose `[api]` is disabled (the cluster routes
-/// mount on the API server — warn and stay inert). Seeds
-/// `config_generation = 1`; the map artifact is seeded by the first refresh.
+/// Build the replication serve-state when this node is an enabled primary.
+/// Returns `None` for a standalone node or a secondary. The state serves on
+/// the administrative API when enabled and on an active Nodes listener in all
+/// cases. Seeds `config_generation = 1`; the map artifact is seeded by the
+/// first refresh.
 #[cfg(feature = "cluster")]
 fn build_cluster_state(
     config: &crate::config::schema::ConfigV1,
-) -> Option<Arc<crate::cluster::ClusterState>> {
+    config_path: &Path,
+    snapshot: Option<Arc<crate::cluster::artifact::PolicySnapshot>>,
+    active: Option<ActivePolicyIdentity>,
+) -> anyhow::Result<Option<Arc<crate::cluster::ClusterState>>> {
     use crate::config::schema::ClusterRole;
 
     let c = &config.cluster;
     if !c.enabled || c.role != ClusterRole::Primary {
-        return None;
-    }
-    if !config.api.enabled {
-        tracing::warn!(
-            "cluster: node is an enabled primary but [api] is disabled — \
-             /api/cluster/* endpoints mount on the API server and will NOT be \
-             served. Enable [api] to serve cluster peers."
-        );
-        return None;
+        return Ok(None);
     }
     // `token_hash` is validator-guaranteed `Some` when `enabled`; the
     // unwrap_or_default fail-closes (an empty hash never verifies). Each
@@ -232,14 +420,36 @@ fn build_cluster_state(
         .iter()
         .filter_map(|s| crate::config::cidr::Cidr::parse(s).ok())
         .collect();
-    let state = crate::cluster::ClusterState::new(c.role, c.priority, token_hash, allow_peer);
-    state.update_policy(config);
+    let mut state = crate::cluster::ClusterState::new(c.role, c.priority, token_hash, allow_peer);
+    if c.membership_version == Some(1) {
+        state.configure_membership(
+            config_path.to_path_buf(),
+            c.cluster_id.clone().context("cluster identity missing")?,
+            c.primary_node_id
+                .clone()
+                .context("primary node identity missing")?,
+        )?;
+    }
+    let snapshot = snapshot.ok_or_else(|| {
+        anyhow::anyhow!("cluster publication requires a coherent active policy capture")
+    })?;
+    let guard = crate::config::write_lock::acquire_for_migration(config_path)?;
+    if state.membership_context().is_some() {
+        state.record_membership_roster(
+            crate::cluster::membership::MembershipStore::open(&guard)?
+                .views(crate::cluster::membership::now()?),
+        );
+    }
+    state.update_policy(&guard, snapshot)?;
+    if let Some(active) = active {
+        state.set_primary_active_identity(active);
+    }
     tracing::info!(
         priority = c.priority,
         allow_peer = c.allow_peer.len(),
-        "cluster: primary serve-side active (§4.11-2) — /api/cluster/* mounted"
+        "cluster: primary replication state ready"
     );
-    Some(Arc::new(state))
+    Ok(Some(Arc::new(state)))
 }
 
 /// True when this node is an enabled cluster secondary. Gates the one
@@ -325,6 +535,25 @@ Import the file as a list, then start:
 
 The imported list is filtered for a client whose tags match it, the same as any other.";
 
+/// Whether DNS readiness attests that the authoritative schema-5 tree was loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCapabilityAttestation {
+    /// The in-memory config did not come from the authoritative tree.
+    Disabled,
+    /// The in-memory config is a validated schema-5 load of that tree.
+    AuthoritativeSchema5Tree,
+}
+
+/// Why the foreground daemon returned after completing graceful cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// An operator or process signal stopped the daemon.
+    Stopped,
+    /// A durable node operation requested a fresh supervised process.
+    #[cfg(feature = "cluster")]
+    ManagedRestart(crate::cluster::managed_restart::ManagedRestartRequest),
+}
+
 /// Start the DNS filtering server from a validated v1 [`ConfigV1`](crate::config::schema::ConfigV1).
 pub async fn run_start(
     config: &crate::config::schema::ConfigV1,
@@ -332,19 +561,13 @@ pub async fn run_start(
     config_path: &Path,
     pid_file: &Path,
     blocklist_path: Option<&str>,
-    daemon: bool,
-) -> anyhow::Result<()> {
-    // Refuse a DNSSEC mode the binary cannot honor — before the daemon fork, so
-    // the error reaches the operator's terminal rather than the child's log.
+    runtime_lease: crate::config::runtime_lease::RuntimeLease,
+    runtime_attestation: RuntimeCapabilityAttestation,
+) -> anyhow::Result<StartOutcome> {
+    // Refuse a DNSSEC mode the binary cannot honor before binding sockets.
     check_dnssec_build(config)?;
-    // Refuse to start if clustering is enabled on a feature-less binary,
-    // before the daemon fork so the error reaches the operator.
+    // Refuse clustering on a feature-less binary before binding sockets.
     check_cluster_build(config)?;
-
-    // Daemon mode: re-exec as background process and exit parent
-    if daemon {
-        return fork_daemon(pid_file, &daemon_log_dir(config_path));
-    }
 
     tracing::info!(
         listen = %config.server.listen,
@@ -380,7 +603,15 @@ pub async fn run_start(
     // or panic), dropping the File releases the flock. We still remove
     // the PID file as a courtesy so `warden status` doesn't see a stale
     // file, but the lock is what actually prevents double-start.
-    let result = run_server(config, custom_lists, config_path, blocklist_path).await;
+    let result = run_server(
+        config,
+        custom_lists,
+        config_path,
+        blocklist_path,
+        &runtime_lease,
+        runtime_attestation,
+    )
+    .await;
 
     pid::remove_pid_file(pid_file);
 
@@ -406,8 +637,18 @@ async fn run_server(
     custom_lists: &CustomListStore,
     config_path: &Path,
     blocklist_path: Option<&str>,
-) -> anyhow::Result<()> {
+    runtime_lease: &crate::config::runtime_lease::RuntimeLease,
+    runtime_attestation: RuntimeCapabilityAttestation,
+) -> anyhow::Result<StartOutcome> {
     let started_at = Instant::now();
+    let daemon_instance_id = new_daemon_instance_id()?;
+    let compile_admission_bytes = RuleCompileLimits::HARD_CEILINGS
+        .max_compiled_bytes_total
+        .checked_mul(2)
+        .context("operator-rule admission ceiling overflow")?;
+    let candidate_runtime = Arc::new(crate::operator_rules::PolicyCandidateRuntime::new(
+        crate::filter::operator_rules::CompileAdmission::new(compile_admission_bytes, 1)?,
+    ));
 
     // Load the separate secrets file BEFORE anything else
     // binds a port or touches the network. The loader hard-refuses any
@@ -452,26 +693,9 @@ async fn run_server(
         }
     };
 
-    // Load-bearing beyond the hash it feeds. `collect_loaded_files` runs a
-    // full `load_config`, and this is the FIRST such load after
-    // `init_tracing` (main.rs must read `server.log_level` from the
-    // config, so its own boot load necessarily precedes the subscriber
-    // and every WARN raised there is dropped). That makes this call the
-    // only reason any validator audit WARN is visible at daemon startup
-    // at all — verified by running the daemon and reading the boot log,
-    // which carries both ANTI_BYPASS_ENABLED_NO_DOMAINS and
-    // PROFILE_CONTRIBUTES_NO_TAGS.
-    //
-    // So: do not "optimise" this into a cheaper include-list walk that
-    // skips validation. It would silently take every operator WARN off
-    // the boot log while every test stayed green — the tests read the
-    // collector's return value, not the tracing output. If this ever
-    // needs to stop validating, re-emit the collected warnings
-    // explicitly right here instead.
-    //
-    // (The `LIST_PRUNE_WARN` comment in `schema::validator` still says
-    // boot warns are "dropped entirely". That was true of main.rs's load
-    // and is stale for the daemon as a whole.)
+    // This is the boot lifecycle owner for validator audit warnings. The
+    // first config read precedes tracing setup, while later policy capture is
+    // intentionally quiet to avoid reporting the same configuration twice.
     let boot_files = collect_loaded_files(config_path);
     let boot_hash = audit::tree_hash(boot_files.iter());
     let _ = audit_writer.append(
@@ -537,31 +761,13 @@ async fn run_server(
         .no_gzip()
         .build()?;
 
-    let upstream_resolver = Arc::new(UpstreamResolver::from_config(
+    let upstream_runtime = Arc::new(ReloadableUpstream::from_config(
         &config.upstream,
+        &config.forwarding,
         &upstream_client,
+        &config.dnssec,
     )?);
-    let base_upstream: Arc<dyn crate::upstream::Upstream> = upstream_resolver.clone();
-
-    // Wrap in ForwardingRouter if forwarding zones are configured
-    let upstream: Arc<dyn crate::upstream::Upstream> = if !config.forwarding.is_empty() {
-        let timeout = Duration::from_millis(config.upstream.timeout_ms);
-        let router = ForwardingRouter::new(
-            &config.forwarding,
-            base_upstream,
-            &upstream_client,
-            timeout,
-            config.upstream.dot.pool_size,
-            config.upstream.ecs.enabled,
-        )?;
-        tracing::info!(
-            zones = config.forwarding.len(),
-            "conditional forwarding enabled"
-        );
-        Arc::new(router)
-    } else {
-        base_upstream
-    };
+    let upstream: Arc<dyn crate::upstream::Upstream> = upstream_runtime.clone();
 
     // `--blocklist` is refused rather than honoured — see
     // [`START_BLOCKLIST_FLAG_RETIRED`] for why loading the file was worse
@@ -571,11 +777,38 @@ async fn run_server(
     }
     let filter = Arc::new(FilterEngine::new());
 
-    let has_enabled_sources = config_declares_list_sources(config);
+    #[cfg(feature = "cluster")]
+    let node_corpus = nodes_runtime::NodeCorpusRuntime::load(
+        config_path,
+        config,
+        runtime_attestation == RuntimeCapabilityAttestation::AuthoritativeSchema5Tree,
+    )?;
+    #[cfg(feature = "cluster")]
+    let (node_ip_filter, node_auxiliary) = match &node_corpus {
+        Some(context) => nodes_runtime::prepare_ip_filter(config, &list_client, context).await?,
+        None => (None, Vec::new()),
+    };
+
+    let has_enabled_sources =
+        config_declares_list_sources(config) || modern_primary_auxiliary(config);
     let lists_dir = has_enabled_sources.then(|| lists_cache_dir(config_path, config));
-    let catalog = match &lists_dir {
-        Some(dir) => fetch_catalog_or_fallback(&list_client, dir, CatalogPreference::Disk).await,
-        None => Catalog::fallback(),
+    #[cfg(feature = "cluster")]
+    let received_catalog = node_corpus.as_ref().and_then(|context| {
+        context
+            .secondary
+            .as_ref()
+            .map(|manifest| manifest.catalog())
+    });
+    #[cfg(not(feature = "cluster"))]
+    let received_catalog: Option<Catalog> = None;
+    let catalog = match received_catalog {
+        Some(catalog) => catalog,
+        None => match &lists_dir {
+            Some(dir) => {
+                fetch_catalog_or_fallback(&list_client, dir, CatalogPreference::Disk).await
+            }
+            None => Catalog::fallback(),
+        },
     };
     let source_plan = ResolvedSourcePlan::build_for_schema(
         &catalog,
@@ -609,7 +842,33 @@ async fn run_server(
     // Tokens follow the representative that owns each fetch.
     let source_tokens = SourceTokenMap::from_plan(&source_plan, &secrets);
 
-    let profiles = Some(build_profile_resolver(config, custom_lists));
+    // Overrides and safe mode may intentionally differ from disk. Such a boot
+    // must not certify the disk revision as the policy it actually serves.
+    let captured = match runtime_attestation {
+        RuntimeCapabilityAttestation::Disabled => None,
+        RuntimeCapabilityAttestation::AuthoritativeSchema5Tree => Some(capture_operator_policy(
+            config_path,
+            &daemon_instance_id,
+            &candidate_runtime,
+            AuditWarningEmission::Quiet,
+        )?),
+    };
+    let boot_capture = admit_boot_capture(captured, config, runtime_attestation)?;
+    let boot_identity = boot_capture
+        .as_ref()
+        .map(|captured| captured.identity.clone())
+        .unwrap_or_else(|| ActivePolicyIdentity {
+            daemon_instance_id: daemon_instance_id.clone(),
+            ..ActivePolicyIdentity::default()
+        });
+    let profiles = Some(Arc::new(match boot_capture.as_ref() {
+        Some(captured) => ProfileResolver::build_with_operator_rules_and_policy_identity(
+            config,
+            Arc::clone(&captured.compiled),
+            boot_identity,
+        ),
+        None => ProfileResolver::build_with_policy_identity(config, custom_lists, boot_identity),
+    }));
 
     // Initial list download
     let mut refresh_handle: Option<ListManagerTask> = None;
@@ -649,24 +908,90 @@ async fn run_server(
     // `top_blocked_lists` vec.
     let mut list_labels_vec: Vec<Option<String>> = vec![None; 64];
 
-    // Cluster serve-state when this node is an enabled primary with the API
-    // on; `None` otherwise. Bound before the list-manager block so the boot
-    // manager can arm the map-refresh hook and the API server + reload path
-    // can share it. Seeds config_generation = 1.
+    // Cluster serve-state for an enabled primary. Bound before the
+    // list-manager block so the boot manager can arm the map-refresh hook and
+    // every replication listener plus the reload path can share it.
     #[cfg(feature = "cluster")]
-    let cluster_state = build_cluster_state(config);
+    let cluster_state = build_cluster_state(
+        config,
+        config_path,
+        boot_capture
+            .as_ref()
+            .and_then(|captured| captured.cluster_snapshot.clone()),
+        profiles
+            .as_ref()
+            .map(|resolver| resolver.active_policy_identity()),
+    )?;
 
-    // A cluster secondary downloads and builds its OWN lists, exactly like a
-    // standalone node. The Tier-1 bitmask is a positional index into this
-    // process's representative source vector, so it is derived here rather than
-    // received — each node computes identical bits from the identical
-    // policy the bundle replicated.
-    //
-    // Kept as a named predicate rather than an inline `!merged_sources
-    // .is_empty()` so that invariant is pinned by a test in both feature
-    // configurations rather than re-derived by eye — see
-    // `boot_spawns_list_manager`.
-    let spawn_lists = boot_spawns_list_manager(&merged_sources, config);
+    #[cfg(feature = "cluster")]
+    let enrollment_artifact = match &node_corpus {
+        Some(context) => match &context.secondary {
+            Some(manifest) => Some(manifest.artifact.clone()),
+            None => {
+                let snapshot = boot_capture
+                    .as_ref()
+                    .and_then(|captured| captured.cluster_snapshot.clone())
+                    .context("authoritative runtime has no enrollment policy snapshot")?;
+                Some(crate::cluster::node_control::capture_enrollment_policy(
+                    config_path,
+                    snapshot,
+                )?)
+            }
+        },
+        None => None,
+    };
+
+    #[cfg(feature = "cluster")]
+    let node_active_provider: Arc<dyn crate::cluster::node_control::ActivePairProvider> =
+        match &node_corpus {
+            Some(context) => context.active_pair_provider(
+                config.cluster.enabled && config.cluster.membership_version == Some(1),
+            ),
+            None => nodes_runtime::RuntimeActivePairProvider::unavailable(),
+        };
+
+    // Build the shared cluster observability handle ONCE, before
+    // DaemonState, so the same `Arc` can be cloned into the IPC state (the
+    // `ClusterStatus` reader), the API server's heartbeat handler (the roster
+    // writer), and the secondary poll loop (the sync-telemetry writer). Only the
+    // active role's half is populated.
+    #[cfg(feature = "cluster")]
+    let cluster_observe: Option<Arc<crate::cluster::ClusterObserve>> = {
+        use crate::config::schema::ClusterRole;
+        // A peer is stale once its last sample is older than 3 poll intervals.
+        let stale_secs = config.cluster.poll_interval_secs.saturating_mul(3);
+        let node_name = config
+            .node
+            .name
+            .clone()
+            .or_else(|| config.cluster.node_name.clone());
+        match (config.cluster.enabled, config.cluster.role) {
+            (false, _) => None,
+            // Primary: needs the serve-state for generations/hashes. Roster cap
+            // 64 is far beyond any realistic LAN cluster; eviction is logged
+            // (observe::Roster).
+            (true, ClusterRole::Primary) => cluster_state.as_ref().map(|cs| {
+                Arc::new(crate::cluster::ClusterObserve::new_primary(
+                    node_name,
+                    cs.clone(),
+                    stale_secs,
+                    64,
+                ))
+            }),
+            (true, ClusterRole::Secondary) => {
+                Some(Arc::new(crate::cluster::ClusterObserve::new_secondary(
+                    node_name,
+                    config.cluster.peer.clone().unwrap_or_default(),
+                    stale_secs,
+                )))
+            }
+        }
+    };
+
+    // Secondaries derive process-local filter bits from verified primary bytes.
+    // An IP-only primary still needs a manager to drive periodic acquisition.
+    let spawn_lists =
+        boot_spawns_list_manager(&merged_sources, config) || modern_primary_auxiliary(config);
 
     // Readiness gate. Seeded CLOSED exactly when this node will build its
     // own filter map, and OPEN
@@ -745,6 +1070,26 @@ async fn run_server(
         // boot-owned registry before loading baselines so IPC and every
         // manager generation retain one stable Arc.
         mgr.attach_status_registry(list_status_registry.clone());
+        #[cfg(feature = "cluster")]
+        if let Some(context) = &node_corpus {
+            nodes_runtime::wire_live_manager(
+                &mut mgr,
+                config,
+                node_ip_filter.as_ref(),
+                cluster_observe.as_ref(),
+                cluster_state.as_ref(),
+            );
+            context.configure_secondary(&mut mgr)?;
+            if context.secondary.is_none() {
+                mgr.set_node_corpus_primary(
+                    Arc::clone(&context.store),
+                    enrollment_artifact
+                        .clone()
+                        .context("enrollment artifact unavailable")?,
+                    node_auxiliary.clone(),
+                )?;
+            }
+        }
         mgr.set_status_persistence_path(list_stats_path(config_path));
         list_status_registry.sync_plan(&source_plan);
 
@@ -778,9 +1123,32 @@ async fn run_server(
         // two calls this replaced are inside it, not dropped.
         let count = load_corpus_before_bind(&mut mgr, BIND_RETRY_INITIAL_BACKOFF).await;
         tracing::info!(count, "initial blocklist loaded");
+        #[cfg(feature = "cluster")]
+        if let Some(context) = &node_corpus {
+            mgr.verify_node_corpus()?;
+            context.mark_secondary_active()?;
+            context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
+        }
         refresh_handle = Some(mgr.spawn_refresh_loop());
     } else {
         tracing::info!("no lists configured, filtering disabled");
+        #[cfg(feature = "cluster")]
+        if let Some(context) = &node_corpus {
+            context.mark_secondary_active()?;
+            if context.secondary.is_none() {
+                context.publish_primary(
+                    None,
+                    enrollment_artifact
+                        .as_ref()
+                        .context("enrollment artifact unavailable")?,
+                    node_auxiliary.clone(),
+                )?;
+            }
+        }
+    }
+    #[cfg(feature = "cluster")]
+    if let Some(context) = &node_corpus {
+        context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
     }
     // Build stats engine (if tracking enabled)
     let stats: Option<Arc<StatsEngine>> = if config.tracking.enabled {
@@ -899,7 +1267,15 @@ async fn run_server(
     // and the bounded-body reader: HTTPS-only, literal private hosts
     // rejected, body capped at MAX_BODY_SIZE to prevent OOM from servers that
     // omit Content-Length.
-    let ip_filter: Option<Arc<IpFilter>> = if config.ip_blocklists.enabled {
+    #[cfg(not(feature = "cluster"))]
+    let node_ip_filter: Option<Arc<IpFilter>> = None;
+    #[cfg(feature = "cluster")]
+    let ip_is_cluster_managed = node_corpus.is_some();
+    #[cfg(not(feature = "cluster"))]
+    let ip_is_cluster_managed = false;
+    let ip_filter: Option<Arc<IpFilter>> = if ip_is_cluster_managed {
+        node_ip_filter.clone()
+    } else if config.ip_blocklists.enabled {
         // ahash-keyed to match `IpFilter`'s hot-path set (filter/ip_filter.rs).
         let mut ips: std::collections::HashSet<std::net::IpAddr, ahash::RandomState> =
             std::collections::HashSet::default();
@@ -1061,25 +1437,6 @@ async fn run_server(
     .with_nodata_for_missing_types_network_name(config.local_dns.nodata_for_missing_types)
     .with_filter_ready(filter_ready.clone());
 
-    // Attach the DNSSEC response-path validator when enabled. It is
-    // given its OWN DO-on upstream (same targets + failover, DO bit set); the
-    // client-facing `upstream` above stays DO-off so normal resolution is
-    // byte-identical. `mode = Off` and the default (feature-off) build skip this
-    // block entirely, so they pay nothing.
-    #[cfg(feature = "dnssec")]
-    let handler = if config.dnssec.mode != crate::config::settings::DnssecMode::Off {
-        let do_upstream: Arc<dyn crate::upstream::Upstream> = Arc::new(
-            UpstreamResolver::from_config_validator(&config.upstream, &upstream_client)?,
-        );
-        let validator = Arc::new(crate::dns::dnssec_validator::DnssecValidator::new(
-            do_upstream,
-            &config.dnssec,
-        ));
-        handler.with_dnssec_validator(validator)
-    } else {
-        handler
-    };
-
     // Hot-reload: grab a clone of the handler's shared ACL cell BEFORE it
     // is moved into the DNS server, so `signal_loop` → `handle_reload` can
     // live-swap `server.allow_from` on reload without a daemon restart.
@@ -1087,6 +1444,11 @@ async fn run_server(
 
     let tcp_timeout = Duration::from_secs(config.server.tcp_timeout_secs);
     let server = DnsServer::new(handler, config.server.listen, tcp_timeout).await?;
+    attest_runtime_capability_after_dns_ready(
+        runtime_lease,
+        runtime_attestation,
+        config.schema_version,
+    )?;
 
     // Shutdown channel: signal loop sends () to stop the DNS server
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1099,6 +1461,7 @@ async fn run_server(
     // audit log writer.
     let (ipc_shutdown_tx, mut ipc_shutdown_rx) = mpsc::channel::<Option<u32>>(1);
     let (ipc_reload_tx, mut ipc_reload_rx) = mpsc::channel::<Option<u32>>(1);
+    let (activation_tx, mut activation_rx) = mpsc::channel::<ActivationRequest>(32);
 
     // Clone reload sender for API before moving into DaemonState
     let api_reload_tx = ipc_reload_tx.clone();
@@ -1143,6 +1506,48 @@ async fn run_server(
     // read-modify-write window.
     let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+    // The plan registry and mutation queue are process-wide so every adapter
+    // shares the same capacity and idempotency view. Recovery completes before
+    // an adapter can submit work; a failure leaves the control plane available
+    // for reads but makes plan/apply return an honest 503.
+    let operator_rule_service =
+        Arc::new(crate::operator_rules::OperatorRulesService::with_runtime(
+            config_path.to_path_buf(),
+            Arc::clone(&candidate_runtime),
+        ));
+    let (operator_rule_supervisor, operator_rule_jobs) =
+        crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+            operator_rule_service,
+            crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+            Some(activation_tx),
+            Arc::new(|receipt| {
+                tracing::info!(
+                    target: "audit",
+                    action = "operator_rules.intent",
+                    operation_id = %receipt.operation_id,
+                    request_id = %receipt.request_id,
+                    "operator-rule intent is durable"
+                );
+            }),
+        );
+    operator_rule_jobs.attach_profile_resolver(profiles.clone());
+    match operator_rule_jobs.recover().await {
+        Ok(summary) => tracing::info!(
+            state = %summary.state,
+            operation_id = ?summary.operation_id,
+            "operator-rule transaction recovery complete"
+        ),
+        Err(error) => tracing::error!(
+            error = %error,
+            "operator-rule transaction recovery failed; mutations remain unavailable"
+        ),
+    }
+    let (operator_jobs_shutdown_tx, operator_jobs_shutdown_rx) = oneshot::channel();
+    let mut operator_jobs_shutdown_tx = Some(operator_jobs_shutdown_tx);
+    let mut operator_jobs_handle = Some(tokio::spawn(
+        operator_rule_supervisor.run(operator_jobs_shutdown_rx),
+    ));
+
     // MAC OUI vendor table — disk-resident, mmap'd. Searched once
     // alongside the binary's directory and at the production install
     // path. Missing or malformed file is non-fatal: the daemon logs a
@@ -1159,38 +1564,36 @@ async fn run_server(
     // `DaemonState` (read by `handle_status`) and the sampler task
     // (writes the latest snapshot via `ArcSwap::store`).
     let resource_budget_store = crate::resource_budget::types::new_store();
-    // Build the shared cluster observability handle ONCE, before
-    // DaemonState, so the same `Arc` can be cloned into the IPC state (the
-    // `ClusterStatus` reader), the API server's heartbeat handler (the roster
-    // writer), and the secondary poll loop (the sync-telemetry writer). Only the
-    // active role's half is populated.
+
     #[cfg(feature = "cluster")]
-    let cluster_observe: Option<Arc<crate::cluster::ClusterObserve>> = {
-        use crate::config::schema::ClusterRole;
-        // A peer is stale once its last sample is older than 3 poll intervals.
-        let stale_secs = config.cluster.poll_interval_secs.saturating_mul(3);
-        let node_name = config.cluster.node_name.clone();
-        match (config.cluster.enabled, config.cluster.role) {
-            (false, _) => None,
-            // Primary: needs the serve-state for generations/hashes; `None` when
-            // the API is off (no heartbeats arrive, so no roster — already
-            // warned by `build_cluster_state`). Roster cap 64 is far beyond any
-            // realistic LAN cluster; eviction is logged (observe::Roster).
-            (true, ClusterRole::Primary) => cluster_state.as_ref().map(|cs| {
-                Arc::new(crate::cluster::ClusterObserve::new_primary(
-                    node_name,
-                    cs.clone(),
-                    stale_secs,
-                    64,
-                ))
-            }),
-            (true, ClusterRole::Secondary) => {
-                Some(Arc::new(crate::cluster::ClusterObserve::new_secondary(
-                    node_name,
-                    config.cluster.peer.clone().unwrap_or_default(),
-                    stale_secs,
-                )))
-            }
+    let (managed_restart, mut managed_restart_rx) = crate::cluster::managed_restart::channel(1);
+    #[cfg(not(feature = "cluster"))]
+    let mut managed_restart_rx = std::marker::PhantomData;
+    #[cfg(feature = "cluster")]
+    let node_runtime_enabled =
+        runtime_attestation == RuntimeCapabilityAttestation::AuthoritativeSchema5Tree;
+    #[cfg(feature = "cluster")]
+    let node_transport = crate::api::node_transport::NodeTransport::new(
+        node_runtime_enabled.then_some(&config.api),
+    )?;
+    #[cfg(feature = "cluster")]
+    let node_controller = {
+        let listener_control: Arc<dyn crate::cluster::node_control::NodeListenerControl> =
+            node_transport.clone();
+        crate::cluster::node_control::NodeController::new(
+            config_path.to_path_buf(),
+            listener_control,
+            managed_restart,
+            node_active_provider,
+        )
+    };
+    #[cfg(feature = "cluster")]
+    let node_runtime_plan = if node_runtime_enabled {
+        node_controller.runtime_start().await?
+    } else {
+        crate::cluster::node_control::NodeRuntimePlan {
+            listeners: Vec::new(),
+            operations_to_resume: Vec::new(),
         }
     };
     let ipc_state = Arc::new(DaemonState {
@@ -1214,6 +1617,7 @@ async fn run_server(
                 kind: mode.to_string(),
             })
             .collect(),
+        upstream_runtime: Some(upstream_runtime.clone()),
         list_count: config.lists.sources.len(),
         started_at,
         shutdown_tx: Some(ipc_shutdown_tx),
@@ -1221,6 +1625,7 @@ async fn run_server(
         api_token_hash: api_token_hash_for_state,
         config_path: Some(config_path.to_path_buf()),
         config_write_lock: config_write_lock.clone(),
+        operator_rule_jobs: Some(operator_rule_jobs.clone()),
         list_statuses: Some(list_status_registry.clone()),
         list_state: list_state_handle.clone(),
         local_records_hits: Some(local_records_hits),
@@ -1240,12 +1645,71 @@ async fn run_server(
         resource_budget_store: resource_budget_store.clone(),
         #[cfg(feature = "cluster")]
         cluster_observe: cluster_observe.clone(),
+        #[cfg(feature = "cluster")]
+        node_controller: node_runtime_enabled.then(|| node_controller.clone()),
     });
     let ipc_handle = spawn_ipc_server(socket_path.clone(), ipc_state).await?;
 
+    let api_state = Arc::new(crate::api::state::ApiState {
+        filter: filter.clone(),
+        cache: cache.clone(),
+        profiles: profiles.clone(),
+        stats: stats.clone(),
+        config_path: config_path.to_path_buf(),
+        token_hash: config.api.token_hash.clone().unwrap_or_default(),
+        rate_limiter: crate::auth::middleware::AuthRateLimiter::new(),
+        api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(
+            config.api.rate_limit_per_minute,
+        ),
+        reload_tx: api_reload_tx,
+        upstream: Some(upstream_runtime.clone()),
+        started_at,
+        listen_addr: config.server.listen.to_string(),
+        upstream_mode: config.upstream.mode.to_string(),
+        upstream_count: config.upstream.servers.len(),
+        list_count: config.lists.sources.len(),
+        list_statuses: Some(list_status_registry.clone()),
+        list_labels: list_labels.clone(),
+        config_write_lock: config_write_lock.clone(),
+        operator_rule_jobs: Some(operator_rule_jobs.clone()),
+        #[cfg(feature = "cluster")]
+        cluster: cluster_state.clone(),
+        #[cfg(feature = "cluster")]
+        cluster_observe: cluster_observe.clone(),
+        #[cfg(feature = "cluster")]
+        node_controller: node_runtime_enabled.then(|| node_controller.clone()),
+    });
+
+    #[cfg(feature = "cluster")]
+    {
+        node_transport.install_node_router(crate::cluster::node_control::node_router(
+            node_controller.clone(),
+        ))?;
+        if cluster_state.is_some() {
+            node_transport.install_replication_router(
+                crate::cluster::routes::replication_router(api_state.clone())
+                    .with_state(api_state.clone()),
+            )?;
+        }
+    }
+
     // Start REST API server (if enabled)
     let mut api_handle: Option<JoinHandle<()>> = None;
-    let mut api_cleanup_handle: Option<JoinHandle<()>> = None;
+    #[cfg(feature = "cluster")]
+    let api_transport_active = config.api.enabled || cluster_state.is_some();
+    #[cfg(not(feature = "cluster"))]
+    let api_transport_active = config.api.enabled;
+    let mut api_cleanup_handle = api_transport_active.then(|| {
+        let rl_state = api_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rl_state.rate_limiter.cleanup();
+                rl_state.api_rate_limiter.cleanup();
+            }
+        })
+    });
     if config.api.enabled {
         // A deliberate public API bind deserves the same are-you-sure
         // WARN as `server.listen`. The validator already FORCES
@@ -1261,71 +1725,60 @@ async fn run_server(
                  but it is reachable from the internet — confirm this is intended"
             );
         }
-
-        let api_state = Arc::new(crate::api::state::ApiState {
-            filter: filter.clone(),
-            cache: cache.clone(),
-            profiles: profiles.clone(),
-            stats: stats.clone(),
-            config_path: config_path.to_path_buf(),
-            // `check_api` (API_ENABLED_REQUIRES_TOKEN_HASH) rejects the config at
-            // load when `api.enabled = true` and `token_hash` is unset
-            // or blank, so this branch sees `Some` in practice; the
-            // unwrap_or_default is a fail-closed safety net — `verify_token`
-            // against `""` always returns false because `subtle::ct_eq`
-            // rejects on length mismatch (a 64-hex SHA never equals a
-            // 0-byte slice).
-            token_hash: config.api.token_hash.clone().unwrap_or_default(),
-            rate_limiter: crate::auth::middleware::AuthRateLimiter::new(),
-            api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(
-                config.api.rate_limit_per_minute,
-            ),
-            reload_tx: api_reload_tx,
-            upstream: Some(upstream_resolver.clone()),
-            started_at,
-            listen_addr: config.server.listen.to_string(),
-            upstream_mode: config.upstream.mode.to_string(),
-            upstream_count: config.upstream.servers.len(),
-            list_count: config.lists.sources.len(),
-            // Same registry the IPC handler reads. The HTTP surface is
-            // always token-gated by the `/api/...` middleware — IPC's
-            // "ReadOnly = no token" does NOT extend to HTTP.
-            list_statuses: Some(list_status_registry.clone()),
-            // Same bit→label snapshot DaemonState holds, so /api/query
-            // can name the blocking list. Cheap Arc clone.
-            list_labels: list_labels.clone(),
-            // Share the IPC mutation lock so concurrent
-            // POSTs against `/api/lists/add` (and the symmetric IPC
-            // path) cannot lose updates.
-            config_write_lock: config_write_lock.clone(),
-            #[cfg(feature = "cluster")]
-            cluster: cluster_state.clone(),
-            #[cfg(feature = "cluster")]
-            cluster_observe: cluster_observe.clone(),
-        });
-
-        // Spawn rate limiter cleanup task (every 60s) — sweeps both the
-        // auth-failure lockout map and the per-IP request-rate windows.
-        let rl_state = api_state.clone();
-        let rl_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                rl_state.rate_limiter.cleanup();
-                rl_state.api_rate_limiter.cleanup();
-            }
-        });
-
+        #[cfg(not(feature = "cluster"))]
         match crate::api::server::spawn_api_server(&config.api, api_state).await {
-            Ok(h) => {
-                api_handle = Some(h);
-                // Store cleanup handle for shutdown (added below via stats_handles)
-                api_cleanup_handle = Some(rl_handle);
-            }
+            Ok(h) => api_handle = Some(h),
             Err(e) => {
-                rl_handle.abort();
+                if let Some(handle) = api_cleanup_handle.take() {
+                    handle.abort();
+                }
+                #[cfg(feature = "cluster")]
+                if config.cluster.enabled
+                    && config.cluster.membership_version == Some(1)
+                    && config.cluster.role == crate::config::schema::ClusterRole::Primary
+                {
+                    return Err(e).context("primary node API failed to become ready");
+                }
                 tracing::error!(error = %e, "failed to start REST API server");
             }
+        }
+        #[cfg(feature = "cluster")]
+        {
+            node_transport.install_api_router(crate::api::routes::build_router(
+                api_state,
+                config.api.metrics_enabled,
+            ))?;
+            match node_transport.start_api().await {
+                Ok(()) => {}
+                Err(error) => {
+                    if let Some(handle) = api_cleanup_handle.take() {
+                        handle.abort();
+                    }
+                    if config.cluster.enabled
+                        && config.cluster.membership_version == Some(1)
+                        && config.cluster.role == crate::config::schema::ClusterRole::Primary
+                    {
+                        return Err(error).context("primary node API failed to become ready");
+                    }
+                    tracing::error!(%error, "failed to start REST API server");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    let mut node_ready_endpoints = Vec::with_capacity(node_runtime_plan.listeners.len());
+    #[cfg(feature = "cluster")]
+    {
+        for listener in node_runtime_plan.listeners {
+            let endpoint = listener.endpoint;
+            crate::cluster::node_control::NodeListenerControl::prepare(
+                node_transport.as_ref(),
+                listener,
+            )
+            .await
+            .with_context(|| format!("failed to restore Nodes listener {endpoint}"))?;
+            node_ready_endpoints.push(endpoint);
         }
     }
 
@@ -1356,7 +1809,14 @@ async fn run_server(
             poll_interval,
             stats.clone(),
             observe,
-            config.cluster.node_name.clone(),
+            config
+                .node
+                .name
+                .clone()
+                .or_else(|| config.cluster.node_name.clone()),
+            profiles.clone(),
+            Arc::clone(&candidate_runtime),
+            node_controller.clone(),
         ));
     }
 
@@ -1404,7 +1864,6 @@ async fn run_server(
     stats_handles.push(rb_handle);
 
     // Enter signal loop (now also listens for IPC-triggered events).
-    // signal_loop only needs the list_client — reloads re-fetch catalogs and lists.
     let has_schedules = !config.schedules.is_empty();
     let mut current_files = boot_files.clone();
     let mut current_hash = boot_hash.clone();
@@ -1415,16 +1874,61 @@ async fn run_server(
     let cluster_reload_handle: ClusterReloadHandle = cluster_state.as_ref();
     #[cfg(not(feature = "cluster"))]
     let cluster_reload_handle: ClusterReloadHandle = std::marker::PhantomData;
+    #[cfg(feature = "cluster")]
+    {
+        let master = config_path.to_owned();
+        let active = config.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::cluster::lifecycle::acknowledge_runtime_start(&master, &active)
+        })
+        .await
+        .context("node readiness worker failed")??;
+        for endpoint in node_ready_endpoints {
+            node_controller.runtime_ready(endpoint).await?;
+        }
+        if node_runtime_enabled {
+            let controller = node_controller.clone();
+            stats_handles.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(2));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    match controller.runtime_tick().await {
+                        Ok(advanced) if advanced > 0 => {
+                            tracing::info!(advanced, "durable Nodes operation reconciled");
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "durable Nodes reconciliation failed");
+                        }
+                    }
+                }
+            }));
+        }
+    }
+    let restart_only = RestartOnlyRuntimeFingerprint::from_config(config)?;
     let exit_result = signal_loop(
         config_path,
         &list_client,
+        Some(RuntimeReloadContext {
+            client: &upstream_client,
+            upstream: &upstream_runtime,
+            cache: &cache,
+            restart_only: &restart_only,
+            #[cfg(feature = "cluster")]
+            node_ip_filter: node_ip_filter.as_ref(),
+            #[cfg(feature = "cluster")]
+            node_observe: cluster_observe.as_ref(),
+        }),
         &filter,
         profiles.as_ref(),
+        &candidate_runtime,
         &mut refresh_handle,
         &mut lists_fingerprint,
         has_schedules,
         &mut ipc_shutdown_rx,
         &mut ipc_reload_rx,
+        &mut activation_rx,
         &audit_writer,
         &mut current_files,
         &mut current_hash,
@@ -1437,6 +1941,8 @@ async fn run_server(
         cluster_reload_handle,
         security.as_ref(),
         &mut api_handle,
+        &mut operator_jobs_handle,
+        &mut managed_restart_rx,
     )
     .await;
 
@@ -1444,12 +1950,18 @@ async fn run_server(
     // before audit or cleanup gives every already-spawned handler the same
     // retiring endpoint rather than a still-running sender.
     publish_list_manager_transitioning(&list_cmd_tx_swap);
+    retire_activation_queue(
+        &mut activation_rx,
+        profiles
+            .as_ref()
+            .map(|resolver| resolver.active_policy_identity()),
+    );
 
     // Audit the shutdown before we tear anything down so a rollover that
     // crashes mid-cleanup still leaves a trail. `shutdown_uid` is
     // Some(peer_uid) for an IPC Shutdown command and None for SIGTERM /
     // SIGINT / channel-closed exits.
-    let shutdown_uid = exit_result.as_ref().ok().and_then(|uid| *uid);
+    let shutdown_uid = exit_result.as_ref().ok().and_then(SignalLoopExit::peer_uid);
     let shutdown_rec = AuditRecord::new(AuditEvent::Shutdown, AuditResult::Ok)
         .with_uid(shutdown_uid)
         .with_files(current_files.iter())
@@ -1478,8 +1990,25 @@ async fn run_server(
     if let Some(h) = api_handle {
         h.abort();
     }
+    #[cfg(feature = "cluster")]
+    {
+        if node_runtime_enabled {
+            if let Err(error) = node_controller.runtime_shutdown().await {
+                tracing::error!(%error, "Nodes controller shutdown failed");
+            }
+        }
+        node_transport.shutdown().await;
+    }
     if let Some(h) = api_cleanup_handle {
         h.abort();
+    }
+    if let Some(shutdown) = operator_jobs_shutdown_tx.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(handle) = operator_jobs_handle {
+        if let Err(error) = handle.await {
+            tracing::error!(error = %error, "operator-rule supervisor failed during shutdown");
+        }
     }
 
     // Drain the query-log writer's final buffer before the runtime tears
@@ -1529,7 +2058,29 @@ async fn run_server(
         Err(e) => tracing::error!("server task panicked: {e}"),
     }
 
-    exit_result.map(|_peer_uid| ())
+    exit_result.map(|reason| match reason {
+        SignalLoopExit::Stopped(_) => StartOutcome::Stopped,
+        #[cfg(feature = "cluster")]
+        SignalLoopExit::ManagedRestart(request) => {
+            StartOutcome::ManagedRestart(crate::cluster::managed_restart::ManagedRestartRequest {
+                operation_id: request.operation_id,
+                step_id: request.step_id,
+            })
+        }
+    })
+}
+
+fn attest_runtime_capability_after_dns_ready(
+    runtime_lease: &crate::config::runtime_lease::RuntimeLease,
+    attestation: RuntimeCapabilityAttestation,
+    schema_version: u32,
+) -> anyhow::Result<()> {
+    match attestation {
+        RuntimeCapabilityAttestation::Disabled => Ok(()),
+        RuntimeCapabilityAttestation::AuthoritativeSchema5Tree => {
+            runtime_lease.attest_schema5_runtime(schema_version)
+        }
+    }
 }
 
 /// Hand the manager the bulk download client, for the background refresh
@@ -1674,17 +2225,65 @@ fn parse_allow_from(
 /// `list_client` must be the hardened client from
 /// `http_client::build_bulk_list_client`; it is used exclusively for catalog
 /// and list refreshes inside `handle_reload`.
+/// `runtime_reload` carries the startup fingerprint and the independently
+/// hardened resolver generation replaced after candidate validation succeeds.
+#[derive(Debug)]
+struct ManagedRestartSignal {
+    operation_id: String,
+    step_id: String,
+}
+
+#[derive(Debug)]
+enum SignalLoopExit {
+    Stopped(Option<u32>),
+    #[cfg(feature = "cluster")]
+    ManagedRestart(ManagedRestartSignal),
+}
+
+impl SignalLoopExit {
+    fn peer_uid(&self) -> Option<u32> {
+        match self {
+            Self::Stopped(uid) => *uid,
+            #[cfg(feature = "cluster")]
+            Self::ManagedRestart(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+type ManagedRestartLoop<'a> = &'a mut crate::cluster::managed_restart::ManagedRestartReceiver;
+#[cfg(not(feature = "cluster"))]
+type ManagedRestartLoop<'a> = &'a mut std::marker::PhantomData<()>;
+
+#[cfg(feature = "cluster")]
+async fn receive_managed_restart(receiver: ManagedRestartLoop<'_>) -> Option<ManagedRestartSignal> {
+    receiver.recv().await.map(|request| ManagedRestartSignal {
+        operation_id: request.operation_id,
+        step_id: request.step_id,
+    })
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn receive_managed_restart(
+    _receiver: ManagedRestartLoop<'_>,
+) -> Option<ManagedRestartSignal> {
+    std::future::pending().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn signal_loop(
     config_path: &Path,
     list_client: &reqwest::Client,
+    runtime_reload: Option<RuntimeReloadContext<'_>>,
     filter: &Arc<FilterEngine>,
     profiles: Option<&Arc<ProfileResolver>>,
+    candidate_runtime: &Arc<crate::operator_rules::PolicyCandidateRuntime>,
     refresh_handle: &mut Option<ListManagerTask>,
     lists_fingerprint: &mut Option<ListsFingerprint>,
     mut has_schedules: bool,
     ipc_shutdown_rx: &mut mpsc::Receiver<Option<u32>>,
     ipc_reload_rx: &mut mpsc::Receiver<Option<u32>>,
+    activation_rx: &mut mpsc::Receiver<ActivationRequest>,
     audit_writer: &AuditWriter,
     current_files: &mut Vec<PathBuf>,
     current_hash: &mut Option<String>,
@@ -1697,7 +2296,9 @@ async fn signal_loop(
     cluster_state: ClusterReloadHandle<'_>,
     security: Option<&Arc<SecurityLayer>>,
     api_handle: &mut Option<JoinHandle<()>>,
-) -> anyhow::Result<Option<u32>> {
+    operator_jobs_handle: &mut Option<JoinHandle<()>>,
+    managed_restart_rx: ManagedRestartLoop<'_>,
+) -> anyhow::Result<SignalLoopExit> {
     #[cfg(not(feature = "cluster"))]
     let _ = cluster_state;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -1726,26 +2327,47 @@ async fn signal_loop(
     // (recv() returns None immediately on a closed channel).
     let mut ipc_shutdown_live = true;
     let mut ipc_reload_live = true;
+    let mut activation_live = true;
+    let mut managed_restart_live = true;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT received");
-                return Ok(None);
+                return Ok(SignalLoopExit::Stopped(None));
             }
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received");
-                return Ok(None);
+                return Ok(SignalLoopExit::Stopped(None));
             }
             result = ipc_shutdown_rx.recv(), if ipc_shutdown_live => {
                 match result {
                     Some(peer_uid) => {
                         tracing::info!("shutdown requested via IPC");
-                        return Ok(peer_uid);
+                        return Ok(SignalLoopExit::Stopped(peer_uid));
                     }
                     None => {
                         tracing::warn!("IPC shutdown channel closed (IPC server may have crashed)");
                         ipc_shutdown_live = false;
+                    }
+                }
+            }
+            request = receive_managed_restart(managed_restart_rx), if managed_restart_live => {
+                match request {
+                    Some(request) => {
+                        tracing::info!(
+                            operation_id = %request.operation_id,
+                            step_id = %request.step_id,
+                            "managed Nodes restart requested"
+                        );
+                        #[cfg(feature = "cluster")]
+                        return Ok(SignalLoopExit::ManagedRestart(request));
+                        #[cfg(not(feature = "cluster"))]
+                        unreachable!("feature-less managed restart future never resolves");
+                    }
+                    None => {
+                        tracing::error!("managed restart channel closed");
+                        managed_restart_live = false;
                     }
                 }
             }
@@ -1756,8 +2378,10 @@ async fn signal_loop(
                 if let Some(h) = handle_reload(
                     config_path,
                     list_client,
+                    runtime_reload,
                     filter,
                     profiles,
+                    candidate_runtime,
                     refresh_handle,
                     lists_fingerprint,
                     audit_writer,
@@ -1787,8 +2411,10 @@ async fn signal_loop(
                         if let Some(h) = handle_reload(
                             config_path,
                             list_client,
+                            runtime_reload,
                             filter,
                             profiles,
+                            candidate_runtime,
                             refresh_handle,
                             lists_fingerprint,
                             audit_writer,
@@ -1815,6 +2441,63 @@ async fn signal_loop(
                     }
                 }
             }
+            request = activation_rx.recv(), if activation_live => {
+                let Some(request) = request else {
+                    activation_live = false;
+                    continue;
+                };
+                tracing::info!(
+                    target: "audit",
+                    operation_id = %request.operation_id,
+                    request_id = %request.request_id,
+                    actor = %request.actor,
+                    correlation_id = %request.correlation_id,
+                    "operator-policy activation requested"
+                );
+                let active = profiles.map(|resolver| resolver.active_policy_identity());
+                if active.as_ref().is_some_and(|identity| {
+                    identity.is_known()
+                        && identity.config_revision == request.expected_config_revision
+                        && identity.operator_policy_hash == request.expected_policy_hash
+                }) {
+                    let result = classify_activation(&request, active, Ok(true));
+                    let _ = request.completion.send(result);
+                    continue;
+                }
+                let reload = handle_reload(
+                    config_path,
+                    list_client,
+                    runtime_reload,
+                    filter,
+                    profiles,
+                    candidate_runtime,
+                    refresh_handle,
+                    lists_fingerprint,
+                    audit_writer,
+                    current_files,
+                    current_hash,
+                    api_token_hash,
+                    acl_handle,
+                    stats,
+                    list_status_registry,
+                    notification_tx,
+                    list_cmd_tx_swap,
+                    None,
+                    cluster_state,
+                    security,
+                ).await;
+                let active = profiles.map(|resolver| resolver.active_policy_identity());
+                let outcome = match &reload {
+                    Ok(Some(_)) => Ok(true),
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(error.to_string()),
+                };
+                let result = classify_activation(&request, active, outcome);
+                let _ = request.completion.send(result);
+                if let Some(schedules) = reload? {
+                    has_schedules = schedules;
+                }
+            }
             result = api_task_exit(&mut *api_handle), if api_handle.is_some() => {
                 match result {
                     Ok(()) => tracing::error!(
@@ -1829,8 +2512,20 @@ async fn signal_loop(
                     ),
                 }
             }
+            result = operator_jobs_task_exit(&mut *operator_jobs_handle), if operator_jobs_handle.is_some() => {
+                match result {
+                    Ok(()) => tracing::error!(
+                        "operator-rule supervisor exited; plan/apply is unavailable until restart"
+                    ),
+                    Err(error) => tracing::error!(
+                        error = %error,
+                        panicked = error.is_panic(),
+                        "operator-rule supervisor failed; plan/apply is unavailable until restart"
+                    ),
+                }
+            }
             _ = schedule_tick.tick(), if has_schedules => {
-                handle_schedule_tick(config_path, profiles);
+                handle_schedule_tick(profiles);
             }
         }
     }
@@ -1850,6 +2545,17 @@ async fn signal_loop(
 async fn api_task_exit(handle: &mut Option<JoinHandle<()>>) -> Result<(), tokio::task::JoinError> {
     let result = match handle.as_mut() {
         Some(h) => h.await,
+        None => std::future::pending().await,
+    };
+    *handle = None;
+    result
+}
+
+async fn operator_jobs_task_exit(
+    handle: &mut Option<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    let result = match handle.as_mut() {
+        Some(handle) => handle.await,
         None => std::future::pending().await,
     };
     *handle = None;
@@ -1894,15 +2600,72 @@ pub(crate) fn daemon_log_dir(config_path: &Path) -> PathBuf {
 /// is always `/var/lib/<leaf>` regardless of any deeper subdirs operators
 /// may have set up under `/etc/<pkg>/`.
 pub(crate) fn state_dir_for(config_parent: &Path) -> PathBuf {
-    if let Ok(stripped) = config_parent.strip_prefix("/etc") {
-        if let Some(first) = stripped.components().next() {
-            return Path::new("/var/lib").join(first.as_os_str());
-        }
-    }
-    config_parent.to_path_buf()
+    crate::config::state_dir::for_config_parent(config_parent)
 }
 
-/// Enumerate every file the loader considered when parsing the v1 config:
+/// Acquire the first complete secondary corpus before configuration-dependent
+/// startup state is assembled. An existing complete pair survives an outage.
+#[cfg(feature = "cluster")]
+pub async fn prepare_nodes_before_load(config_path: &Path) -> anyhow::Result<()> {
+    let master = config_path.to_owned();
+    tokio::task::spawn_blocking(move || crate::cluster::lifecycle::recover_before_load(&master))
+        .await
+        .context("node recovery worker failed")??;
+    let loaded =
+        crate::config::loader::load_config_v5(config_path, time::OffsetDateTime::now_utc())
+            .map_err(|errors| anyhow::anyhow!("node bootstrap config rejected: {errors:?}"))?;
+    if loaded.config.cluster.enabled
+        && loaded.config.cluster.membership_version == Some(1)
+        && loaded.config.cluster.role == crate::config::schema::ClusterRole::Secondary
+    {
+        let bytes = RuleCompileLimits::HARD_CEILINGS
+            .max_compiled_bytes_total
+            .checked_mul(2)
+            .context("node bootstrap admission ceiling overflow")?;
+        let runtime = Arc::new(crate::operator_rules::PolicyCandidateRuntime::new(
+            crate::filter::operator_rules::CompileAdmission::new(bytes, 1)?,
+        ));
+        crate::cluster::poll::bootstrap(config_path, runtime).await?;
+    }
+    Ok(())
+}
+
+/// Recover an interrupted policy transaction before the daemon loads config.
+pub fn recover_policy_transaction_before_load(config_path: &Path) -> anyhow::Result<()> {
+    let recovery = {
+        let guard = crate::config::write_lock::acquire_for_migration(config_path)?;
+        let state_directory = crate::config::state_dir::open_for_migration(&guard)?;
+        let receipts =
+            crate::config::policy_transaction::ReceiptStore::open(&state_directory, &guard)?;
+        let recovered = crate::config::policy_transaction::recover_active(&guard, &receipts)?;
+        #[cfg(feature = "cluster")]
+        {
+            let mut publications = crate::cluster::publication::PublicationStore::open(&guard)?;
+            crate::cluster::publisher::recover(&guard, &receipts, &mut publications)?;
+        }
+        recovered
+    };
+    match recovery {
+        crate::config::policy_transaction::RecoveryOutcome::Absent => {}
+        crate::config::policy_transaction::RecoveryOutcome::SetupRemoved => {
+            eprintln!("recovered an interrupted policy-transaction setup");
+        }
+        crate::config::policy_transaction::RecoveryOutcome::Recovered(receipt) => {
+            eprintln!(
+                "recovered policy transaction {} with persistence {:?}",
+                receipt.transaction_id, receipt.persistence
+            );
+        }
+        crate::config::policy_transaction::RecoveryOutcome::LegacyActive => {
+            anyhow::bail!(
+                "an interrupted v3-to-v4 migration requires `warden migrate v3-to-v4` recovery before the daemon can start"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate every file the loader considered when parsing the current config:
 /// the master + everything reached via `includes`. Duplicates are removed.
 /// Missing master → returns just the master path (which is what tree_hash
 /// will skip). Used for the audit log's `files` field AND its
@@ -1917,7 +2680,9 @@ pub(crate) fn state_dir_for(config_parent: &Path) -> PathBuf {
 fn collect_loaded_files(config_path: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     let now = time::OffsetDateTime::now_utc();
-    if let Ok(loaded) = crate::config::loader::load_config(config_path, now) {
+    if let (Ok(loaded), _) =
+        crate::config::loader::load_current_config_emitting_collect(config_path, now)
+    {
         for (_, (path, _line)) in loaded.provenance {
             files.push(path);
         }
@@ -1931,6 +2696,7 @@ fn collect_loaded_files(config_path: &Path) -> Vec<PathBuf> {
 /// Always returns an owned resolver — the non-`Option` return type
 /// pins the resolver's unconditional presence so future refactors don't
 /// silently skip construction for an "empty `[[devices]]`" optimisation.
+#[cfg(test)]
 fn build_profile_resolver(
     config: &crate::config::schema::ConfigV1,
     custom_lists: &CustomListStore,
@@ -1941,71 +2707,334 @@ fn build_profile_resolver(
     ))
 }
 
-/// Re-evaluate schedules by re-reading the v1 config and rebuilding
-/// profiles. Called every 60 s by the signal loop.
-///
-/// Also prunes expired schedules from disk: a lapsed one-shot row —
-/// typically a `warden device quiet`
-/// leftover — is dropped from the file that defines it via per-file
-/// surgery, NOT `write_config_v1` (which would flatten multi-file
-/// layouts). Prune failure is non-fatal: expired rows are inert at
-/// resolver-build time anyway.
-fn handle_schedule_tick(config_path: &Path, profiles: Option<&Arc<ProfileResolver>>) {
+struct CapturedOperatorPolicy {
+    files_loaded: Vec<PathBuf>,
+    projected: crate::config::schema::ConfigV1,
+    compiled: Arc<CompiledOperatorRules>,
+    identity: ActivePolicyIdentity,
+    audit_hash: Option<String>,
+    #[cfg(feature = "cluster")]
+    cluster_snapshot: Option<Arc<crate::cluster::artifact::PolicySnapshot>>,
+}
+
+fn admit_boot_capture(
+    captured: Option<CapturedOperatorPolicy>,
+    runtime_config: &crate::config::schema::ConfigV1,
+    attestation: RuntimeCapabilityAttestation,
+) -> anyhow::Result<Option<CapturedOperatorPolicy>> {
+    match (attestation, captured) {
+        (RuntimeCapabilityAttestation::Disabled, None) => Ok(None),
+        (RuntimeCapabilityAttestation::Disabled, Some(_)) => {
+            anyhow::bail!("safe-mode boot unexpectedly captured an authoritative policy")
+        }
+        (RuntimeCapabilityAttestation::AuthoritativeSchema5Tree, None) => {
+            anyhow::bail!("authoritative schema-5 boot has no compiled policy capture")
+        }
+        (RuntimeCapabilityAttestation::AuthoritativeSchema5Tree, Some(captured)) => {
+            let mut effective_projection = captured.projected.clone();
+            effective_projection.server.listen = runtime_config.server.listen;
+            effective_projection
+                .upstream
+                .servers
+                .clone_from(&runtime_config.upstream.servers);
+            effective_projection.lists.update_interval_secs =
+                runtime_config.lists.update_interval_secs;
+
+            if toml::to_string(&effective_projection).ok() != toml::to_string(runtime_config).ok() {
+                anyhow::bail!(
+                    "authoritative schema-5 tree changed between initial load and policy capture; retry startup"
+                );
+            }
+            Ok(Some(captured))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuditWarningEmission {
+    Quiet,
+    Emit,
+}
+
+fn capture_operator_policy(
+    config_path: &Path,
+    daemon_instance_id: &str,
+    candidate_runtime: &crate::operator_rules::PolicyCandidateRuntime,
+    audit_warning_emission: AuditWarningEmission,
+) -> anyhow::Result<CapturedOperatorPolicy> {
+    use crate::config::policy_revision::{PolicyMemberKind, PolicyMemberState};
+    use sha2::{Digest, Sha256};
+
+    let guard = crate::config::write_lock::acquire_for_read(config_path)?;
+    let now = time::OffsetDateTime::now_utc();
+    let loaded = if matches!(audit_warning_emission, AuditWarningEmission::Emit) {
+        crate::config::loader::load_config_v5_with_policy_overlays_emitting_under_service_read_guard(
+            &guard,
+            guard.canonical_master(),
+            now,
+            None,
+            None,
+        )
+    } else {
+        crate::config::loader::load_config_v5_with_policy_overlays_under_service_read_guard(
+            &guard,
+            guard.canonical_master(),
+            now,
+            None,
+            None,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!(format_guarded_load_error(error)))?;
+    let (snapshot, loaded) =
+        crate::config::policy_revision::capture_coherent_loaded_v5_under_read_guard(
+            &guard, &loaded, now,
+        )?;
+    let semantic_packs = loaded
+        .pack_bodies
+        .iter()
+        .map(|(id, body)| crate::operator_rules::SemanticPack {
+            id: id.as_str(),
+            body: body.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    let config_revision = snapshot.revision().to_string();
+    let operator_policy_hash =
+        crate::operator_rules::hash_policy_candidate(&loaded.config, &semantic_packs)?.to_string();
+    let candidate = match candidate_runtime.matching(&config_revision, &operator_policy_hash)? {
+        Some(candidate) => candidate,
+        None => {
+            let candidate = candidate_runtime.compile(
+                config_revision.clone(),
+                operator_policy_hash.clone(),
+                &loaded.config,
+                &loaded.pack_bodies,
+            )?;
+            candidate_runtime.remember_candidate(Arc::clone(&candidate))?;
+            candidate
+        }
+    };
+    let projected = candidate.config().validation_projection()?;
+    let identity = ActivePolicyIdentity {
+        daemon_instance_id: daemon_instance_id.to_string(),
+        config_revision,
+        operator_policy_hash,
+        resolver_generation: 1,
+    };
+    // Preserve the lifecycle audit encoding, but hash captured bytes so a
+    // later disk edit cannot relabel the policy being published.
+    let mut members = BTreeMap::new();
+    for member in snapshot.inventory().members() {
+        if member.kind() == PolicyMemberKind::Pack {
+            continue;
+        }
+        if let PolicyMemberState::Present(bytes) = member.state() {
+            members.insert(
+                guard.tree_io().identity.root.join(member.path()),
+                hex::encode(Sha256::digest(bytes)),
+            );
+        }
+    }
+    let mut digest = Sha256::new();
+    for (path, hash) in &members {
+        digest.update(path.display().to_string().as_bytes());
+        digest.update(b":");
+        digest.update(hash.as_bytes());
+        digest.update(b"\n");
+    }
+    #[cfg(feature = "cluster")]
+    let cluster_snapshot = Some(Arc::new(
+        crate::cluster::artifact::PolicySnapshot::from_verified_candidate(&candidate)?,
+    ));
+    Ok(CapturedOperatorPolicy {
+        files_loaded: loaded.files_loaded,
+        projected,
+        compiled: candidate.compiled(),
+        identity,
+        audit_hash: (!members.is_empty()).then(|| hex::encode(digest.finalize())),
+        #[cfg(feature = "cluster")]
+        cluster_snapshot,
+    })
+}
+
+fn format_guarded_load_error(error: crate::config::loader::GuardedLoadFailure) -> String {
+    use crate::config::loader::GuardedLoadFailure;
+    match error {
+        GuardedLoadFailure::Diagnostics(errors) => format_config_errors(&errors),
+        GuardedLoadFailure::UnsafePath(error)
+        | GuardedLoadFailure::BudgetExceeded(error)
+        | GuardedLoadFailure::TreeChanged(error)
+        | GuardedLoadFailure::RecoveryRequired(error)
+        | GuardedLoadFailure::Storage(error) => format!("{error:#}"),
+    }
+}
+
+fn format_config_errors(errors: &[crate::config::error::ConfigError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn publish_active_policy(
+    profiles: Option<&Arc<ProfileResolver>>,
+    config: &crate::config::schema::ConfigV1,
+    compiled: Arc<CompiledOperatorRules>,
+    identity: ActivePolicyIdentity,
+    cluster_state: ClusterReloadHandle<'_>,
+) {
+    let active_identity = profiles.map(|resolver| {
+        resolver.swap_with_operator_rules_and_policy_identity(config, compiled, identity)
+    });
+
+    #[cfg(not(feature = "cluster"))]
+    let _ = (active_identity, cluster_state);
+
+    #[cfg(feature = "cluster")]
+    if let (Some(state), Some(identity)) = (cluster_state, active_identity) {
+        state.set_primary_active_identity(identity);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_runtime_reload(
+    runtime_reload: Option<RuntimeReloadContext<'_>>,
+    prepared_upstream: &mut Option<crate::upstream::PreparedUpstream>,
+    prepared_acl: &Option<Arc<Vec<crate::config::cidr::Cidr>>>,
+    stats: Option<&Arc<StatsEngine>>,
+    security: Option<&Arc<SecurityLayer>>,
+    config: &crate::config::schema::ConfigV1,
+    config_path: &Path,
+    api_token_hash: &Arc<arc_swap::ArcSwap<Option<String>>>,
+    acl_handle: &Arc<arc_swap::ArcSwapOption<Vec<crate::config::cidr::Cidr>>>,
+) {
+    // Install only after the list pipeline has either completed or proved it
+    // can be reused. An activation identity published after this function
+    // therefore describes every live reloadable consumer, not a candidate
+    // that can still fail in the long-running list preparation phase.
+    if let (Some(context), Some(prepared)) = (runtime_reload, prepared_upstream.take()) {
+        context.upstream.install(prepared);
+        // Resident entries are removed before activation is acknowledged.
+        // Pre-swap misses and prefetches carry their generation into the
+        // cache and evict a completed fill if this swap superseded it. That
+        // check stays on the miss path; ordinary cache hits pay nothing.
+        context.cache.clear().await;
+    }
+
+    if let Some(engine) = stats {
+        apply_query_log_reload(engine, &config.tracking, config_path);
+    }
+
+    // Only parameters of already-built checkers reload. Their enabled
+    // topology is part of RestartOnlyRuntimeFingerprint, because rebuilding
+    // a checker here would reset live rate counters.
+    if let Some(sec) = security {
+        if let Some(td) = sec.tunneling.as_ref() {
+            td.set_params(&config.security.tunneling);
+        }
+        if let Some(rl) = sec.rate_limiter.as_ref() {
+            rl.set_params(&config.security.rate_limit);
+        }
+        if let Some(rrl) = sec.rrl.as_ref() {
+            rrl.set_params(&config.security.rrl);
+        }
+    }
+
+    api_token_hash.store(Arc::new(config.api.token_hash.clone()));
+    acl_handle.store(prepared_acl.clone());
+    let acl_count = prepared_acl.as_ref().map_or(0, |cidrs| cidrs.len());
+    tracing::info!(count = acl_count, "server.allow_from ACL reloaded");
+}
+
+#[cfg(feature = "cluster")]
+async fn prepare_cluster_policy(
+    config_path: &Path,
+    cluster_state: ClusterReloadHandle<'_>,
+    snapshot: Option<Arc<crate::cluster::artifact::PolicySnapshot>>,
+) -> anyhow::Result<Option<crate::cluster::state::PreparedPolicyArtifact>> {
+    let (Some(state), Some(snapshot)) = (cluster_state, snapshot) else {
+        return Ok(None);
+    };
+    let state = Arc::clone(state);
+    let master = config_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let guard = crate::config::write_lock::acquire_for_migration(&master)?;
+        state.prepare_policy(&guard, snapshot).map(Some)
+    })
+    .await?
+}
+
+#[cfg(feature = "cluster")]
+fn install_cluster_policy(
+    cluster_state: ClusterReloadHandle<'_>,
+    prepared: Option<crate::cluster::state::PreparedPolicyArtifact>,
+) {
+    if let (Some(state), Some(prepared)) = (cluster_state, prepared) {
+        state.install_policy(prepared);
+    }
+}
+
+fn classify_activation(
+    request: &ActivationRequest,
+    active: Option<ActivePolicyIdentity>,
+    reload: Result<bool, String>,
+) -> ActivationResult {
+    let active = active.filter(ActivePolicyIdentity::is_known);
+    match reload {
+        Err(reason) => ActivationResult::Unknown { active, reason },
+        Ok(false) => ActivationResult::Rejected {
+            active,
+            reason:
+                "policy reload rejected by validation or source admission; see reload diagnostics"
+                    .into(),
+        },
+        Ok(true) => match active {
+            Some(identity) if identity.config_revision != request.expected_config_revision => {
+                ActivationResult::Superseded {
+                    active: identity,
+                    superseding_operation_id: None,
+                }
+            }
+            Some(identity) if identity.operator_policy_hash == request.expected_policy_hash => {
+                ActivationResult::Applied(identity)
+            }
+            active => ActivationResult::Unknown {
+                active,
+                reason: "reload completed without the expected immutable policy identity".into(),
+            },
+        },
+    }
+}
+
+fn retire_activation_queue(
+    receiver: &mut mpsc::Receiver<ActivationRequest>,
+    active: Option<ActivePolicyIdentity>,
+) {
+    receiver.close();
+    let active = active.filter(ActivePolicyIdentity::is_known);
+    while let Ok(request) = receiver.try_recv() {
+        let _ = request.completion.send(ActivationResult::Unknown {
+            active: active.clone(),
+            reason: "daemon stopped before processing the activation request".into(),
+        });
+    }
+}
+
+/// Re-evaluate schedules from the active policy snapshot. Called every 60 s by
+/// the signal loop so an unrelated disk edit cannot become active without a
+/// successful reload.
+/// Expired rows remain inert until an explicit configuration mutation removes
+/// them: automatic pruning could activate unrelated pending edits on disk.
+fn handle_schedule_tick(profiles: Option<&Arc<ProfileResolver>>) {
     let resolver = match profiles {
         Some(r) => r,
         None => return,
     };
-    let now = time::OffsetDateTime::now_utc();
-    let loaded = match crate::config::loader::load_config(config_path, now) {
-        Ok(l) => l,
-        Err(errs) => {
-            // Log the actual errors, not just the count — a tick that
-            // fails every 60 s with "N error(s)" gives the operator
-            // nothing actionable in the journal.
-            let detail = errs
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            tracing::warn!(
-                errors = errs.len(),
-                "schedule tick: config load failed: {detail}"
-            );
-            return;
-        }
-    };
-    if loaded.config.schedules.is_empty() {
-        return;
-    }
-    resolver.swap_without_list_bits(&loaded.config, &loaded.custom_lists);
-    tracing::debug!("schedule tick: profile map rebuilt");
-
-    // Drop lapsed one-shot rows from disk. Best-effort: a failure (e.g.
-    // a read-only config tree under a hardened unit) only means the
-    // inert rows stay until a CLI path prunes them.
-    // The resolver above deliberately uses its reader snapshot. Pruning is a
-    // mutation, so it takes a fresh guarded snapshot instead.
-    let prune_result =
-        crate::config::write_lock::acquire_for_write(config_path).and_then(|guard| {
-            crate::cli::commands::schedules::prune_expired_schedules_locked(
-                &guard,
-                config_path,
-                now,
-            )
-        });
-    match prune_result {
-        Ok(pruned) if !pruned.is_empty() => {
-            tracing::info!(
-                count = pruned.len(),
-                ids = %pruned.join(", "),
-                "schedule tick: pruned expired schedule(s) from config"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "schedule tick: expired-schedule prune failed");
-        }
-    }
+    let identity = resolver.refresh_schedules();
+    tracing::debug!(
+        generation = identity.resolver_generation,
+        "schedule tick: active profile map rebuilt"
+    );
 }
 
 /// Everything the list pipeline consumes, distilled into a value two
@@ -2285,8 +3314,10 @@ tokio::task_local! {
 async fn handle_reload(
     config_path: &Path,
     list_client: &reqwest::Client,
+    runtime_reload: Option<RuntimeReloadContext<'_>>,
     filter: &Arc<FilterEngine>,
     profiles: Option<&Arc<ProfileResolver>>,
+    candidate_runtime: &Arc<crate::operator_rules::PolicyCandidateRuntime>,
     refresh_handle: &mut Option<ListManagerTask>,
     lists_fingerprint: &mut Option<ListsFingerprint>,
     audit_writer: &AuditWriter,
@@ -2306,35 +3337,101 @@ async fn handle_reload(
     let _ = cluster_state;
     let pre_hash = current_hash.clone();
 
-    let loaded =
-        match crate::config::loader::load_config(config_path, time::OffsetDateTime::now_utc()) {
-            Ok(l) => l,
-            Err(errs) => {
-                tracing::error!("config reload failed: {} error(s)", errs.len());
-                for err in &errs {
-                    tracing::error!(%err, "reload error");
-                }
-                let err_strings: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
-                let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+    let daemon_instance_id = match profiles.map(|resolver| resolver.active_policy_identity()) {
+        Some(identity) if !identity.daemon_instance_id.is_empty() => identity.daemon_instance_id,
+        _ => new_daemon_instance_id()?,
+    };
+    let capture_path = config_path.to_path_buf();
+    let candidate_runtime = Arc::clone(candidate_runtime);
+    let captured = match tokio::task::spawn_blocking(move || {
+        capture_operator_policy(
+            &capture_path,
+            &daemon_instance_id,
+            &candidate_runtime,
+            AuditWarningEmission::Emit,
+        )
+    })
+    .await?
+    {
+        Ok(captured) => captured,
+        Err(error) => {
+            tracing::error!(%error, "config reload failed");
+            let err_strings = vec![error.to_string()];
+            let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                .with_uid(invoker_uid)
+                .with_files(current_files.iter())
+                .with_pre_hash(pre_hash.clone())
+                .with_post_hash(pre_hash)
+                .with_errors(err_strings);
+            if let Err(e) = audit_writer.append(&rec) {
+                tracing::warn!(error = %e, "failed to write audit record");
+            }
+            // A rejected config still ENDS the reload the caller asked
+            // for. Without a mark the counter never moves and a waiter
+            // burns its whole timeout to report that it does not know,
+            // about a cycle the daemon closed deliberately.
+            if let Some(reg) = list_status_registry {
+                reg.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+    };
+    let CapturedOperatorPolicy {
+        files_loaded,
+        projected,
+        compiled,
+        identity,
+        audit_hash: new_hash,
+        #[cfg(feature = "cluster")]
+        cluster_snapshot,
+    } = captured;
+    let config = &projected;
+
+    if let Some(context) = runtime_reload {
+        let candidate = match check_cluster_build(config)
+            .and_then(|()| check_dnssec_build(config))
+            .and_then(|()| RestartOnlyRuntimeFingerprint::from_config(config))
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                tracing::error!(%error, "reload aborted: runtime fingerprint rejected");
+                let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
                     .with_uid(invoker_uid)
                     .with_files(current_files.iter())
                     .with_pre_hash(pre_hash.clone())
                     .with_post_hash(pre_hash)
-                    .with_errors(err_strings);
-                if let Err(e) = audit_writer.append(&rec) {
-                    tracing::warn!(error = %e, "failed to write audit record");
+                    .with_errors([error.to_string()]);
+                if let Err(write_error) = audit_writer.append(&record) {
+                    tracing::warn!(error = %write_error, "failed to write audit record");
                 }
-                // A rejected config still ENDS the reload the caller asked
-                // for. Without a mark the counter never moves and a waiter
-                // burns its whole timeout to report that it does not know,
-                // about a cycle the daemon closed deliberately.
-                if let Some(reg) = list_status_registry {
-                    reg.record_cycle(CycleOutcome::ConfigRejected);
+                if let Some(registry) = list_status_registry {
+                    registry.record_cycle(CycleOutcome::ConfigRejected);
                 }
                 return Ok(None);
             }
         };
-    let config = &loaded.config;
+        let changed = context.restart_only.changed_sections(&candidate);
+        if !changed.is_empty() {
+            let error = format!(
+                "reload requires daemon restart for runtime sections: {}",
+                changed.join(", ")
+            );
+            tracing::error!(%error, "config reload rejected");
+            let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                .with_uid(invoker_uid)
+                .with_files(current_files.iter())
+                .with_pre_hash(pre_hash.clone())
+                .with_post_hash(pre_hash)
+                .with_errors([error]);
+            if let Err(write_error) = audit_writer.append(&record) {
+                tracing::warn!(error = %write_error, "failed to write audit record");
+            }
+            if let Some(registry) = list_status_registry {
+                registry.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+    }
 
     // Report this accepted config's schedule presence
     // back to the signal loop so it re-arms (or disarms) the 60 s schedule
@@ -2347,16 +3444,6 @@ async fn handle_reload(
     // aborts on one of those gates leaves the in-memory admin token untouched
     // too — "a rejected reload changes nothing".
     log_empty_profile_lists_warning(config);
-    log_inert_custom_lists(config, &loaded.custom_lists);
-
-    // Keep the query log writer's attach state in sync
-    // with the reloaded `tracking.query_log_enabled`. Attaches when the
-    // operator flipped the flag from `false` to `true`, detaches (and
-    // schedules the writer's flush-and-exit) on the inverse transition.
-    // No-op when the state hasn't changed.
-    if let Some(engine) = stats {
-        apply_query_log_reload(engine, &config.tracking, config_path);
-    }
 
     // Secrets live in a separate file; reload them here so
     // that `auth_token_ref` additions or edits take effect without a full
@@ -2395,11 +3482,81 @@ async fn handle_reload(
     // manager retires it itself: the empty-sources branch and the rebuild
     // path.
 
-    let has_enabled_sources = config_declares_list_sources(config);
+    #[cfg(feature = "cluster")]
+    let node_corpus = match nodes_runtime::NodeCorpusRuntime::load(config_path, config, true) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(%error, "reload rejected: node corpus unavailable");
+            if let Some(registry) = list_status_registry {
+                registry.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+    };
+    #[cfg(feature = "cluster")]
+    let (prepared_node_ip, node_auxiliary) = match &node_corpus {
+        Some(context) => match nodes_runtime::prepare_ip_filter(config, list_client, context).await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::error!(%error, "reload rejected: IP corpus preparation failed");
+                if let Some(registry) = list_status_registry {
+                    registry.record_cycle(CycleOutcome::ConfigRejected);
+                }
+                return Ok(None);
+            }
+        },
+        None => (None, Vec::new()),
+    };
+    #[cfg(feature = "cluster")]
+    let enrollment_artifact = match &node_corpus {
+        Some(context) => match &context.secondary {
+            Some(manifest) => Some(manifest.artifact.clone()),
+            None => match cluster_snapshot.clone() {
+                Some(snapshot) => match crate::cluster::node_control::capture_enrollment_policy(
+                    config_path,
+                    snapshot,
+                ) {
+                    Ok(artifact) => Some(artifact),
+                    Err(error) => {
+                        tracing::error!(%error, "reload rejected: enrollment policy capture failed");
+                        if let Some(registry) = list_status_registry {
+                            registry.record_cycle(CycleOutcome::ConfigRejected);
+                        }
+                        return Ok(None);
+                    }
+                },
+                None => {
+                    tracing::error!("reload rejected: enrollment policy snapshot unavailable");
+                    if let Some(registry) = list_status_registry {
+                        registry.record_cycle(CycleOutcome::ConfigRejected);
+                    }
+                    return Ok(None);
+                }
+            },
+        },
+        None => None,
+    };
+    let has_enabled_sources =
+        config_declares_list_sources(config) || modern_primary_auxiliary(config);
     let lists_dir = has_enabled_sources.then(|| lists_cache_dir(config_path, config));
-    let catalog = match &lists_dir {
-        Some(dir) => fetch_catalog_or_fallback(list_client, dir, CatalogPreference::Network).await,
-        None => Catalog::fallback(),
+    #[cfg(feature = "cluster")]
+    let received_catalog = node_corpus.as_ref().and_then(|context| {
+        context
+            .secondary
+            .as_ref()
+            .map(|manifest| manifest.catalog())
+    });
+    #[cfg(not(feature = "cluster"))]
+    let received_catalog: Option<Catalog> = None;
+    let catalog = match received_catalog {
+        Some(catalog) => catalog,
+        None => match &lists_dir {
+            Some(dir) => {
+                fetch_catalog_or_fallback(list_client, dir, CatalogPreference::Network).await
+            }
+            None => Catalog::fallback(),
+        },
     };
     let source_plan = match ResolvedSourcePlan::build_for_schema(
         &catalog,
@@ -2473,92 +3630,91 @@ async fn handle_reload(
         }
     };
 
+    let mut prepared_upstream = match runtime_reload {
+        Some(context) => {
+            let upstream = config.upstream.clone();
+            let forwarding = config.forwarding.clone();
+            let dnssec = config.dnssec.clone();
+            let client = context.client.clone();
+            let runtime = Arc::clone(context.upstream);
+            let prepared = tokio::task::spawn_blocking(move || {
+                runtime.prepare(&upstream, &forwarding, &client, &dnssec)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("upstream generation worker failed: {error}"))
+            .and_then(|result| result);
+
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::error!(%error, "reload aborted: upstream generation rejected");
+                    let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                        .with_uid(invoker_uid)
+                        .with_files(current_files.iter())
+                        .with_pre_hash(pre_hash.clone())
+                        .with_post_hash(pre_hash)
+                        .with_errors([error.to_string()]);
+                    if let Err(write_error) = audit_writer.append(&record) {
+                        tracing::warn!(error = %write_error, "failed to write audit record");
+                    }
+                    if let Some(registry) = list_status_registry {
+                        registry.record_cycle(CycleOutcome::ConfigRejected);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        None => None,
+    };
+
+    let prepared_acl = match parse_allow_from(&config.server.allow_from) {
+        Ok(acl) => acl,
+        Err(error) => {
+            tracing::error!(%error, "reload aborted: server.allow_from preparation rejected");
+            let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                .with_uid(invoker_uid)
+                .with_files(current_files.iter())
+                .with_pre_hash(pre_hash.clone())
+                .with_post_hash(pre_hash)
+                .with_errors([error.to_string()]);
+            if let Err(write_error) = audit_writer.append(&record) {
+                tracing::warn!(error = %write_error, "failed to write audit record");
+            }
+            if let Some(registry) = list_status_registry {
+                registry.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+    };
+
+    #[cfg(feature = "cluster")]
+    let prepared_cluster =
+        match prepare_cluster_policy(config_path, cluster_state, cluster_snapshot).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::error!(%error, "reload aborted: cluster artifact preparation rejected");
+                let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+                    .with_uid(invoker_uid)
+                    .with_files(current_files.iter())
+                    .with_pre_hash(pre_hash.clone())
+                    .with_post_hash(pre_hash)
+                    .with_errors([error.to_string()]);
+                if let Err(write_error) = audit_writer.append(&record) {
+                    tracing::warn!(error = %write_error, "failed to write audit record");
+                }
+                if let Some(registry) = list_status_registry {
+                    registry.record_cycle(CycleOutcome::ConfigRejected);
+                }
+                return Ok(None);
+            }
+        };
+
     // Derived from the map just built — one build, not two.
     let policy_masks = source_bits.project_policy(&config.blocklists, &config.profiles);
 
-    if let Some(resolver) = profiles {
-        resolver.swap_without_list_bits(config, &loaded.custom_lists);
-    }
+    let new_files = files_loaded;
 
-    // Live-swap the tunneling thresholds + `exempt_domains`, the
-    // per-client rate limiter's qps/burst, and the RRL
-    // responses_per_second/window_secs/slip_rate — so `warden security
-    // set …` and `warden security tunneling exempt …` apply without a
-    // restart. The tunneling escape hatch exists because the tunneling
-    // gates run before the filter engine and no allow rule can reach
-    // them; costing ~30 s of downed DNS to use it would make the remedy
-    // dearer than the fault. The rate/RRL knobs exist for the same
-    // reason `warden security set` exists at all: tuning a live incident
-    // response should not cost a restart either.
-    //
-    // Deliberately narrow: only the *parameters* swap. Rebuilding
-    // `SecurityLayer` here would reconstruct `RateLimiter`, `Rrl` and the
-    // per-(client, base) subdomain map, zeroing every counter — handing
-    // an attacker a fresh budget on each config edit, and resetting the
-    // very gates this change leans on as primary defences.
-    //
-    // Not reachable from here by construction: `tunneling.enabled`,
-    // `rate_limit.enabled`, `rrl.enabled`. Each sub-checker is an
-    // `Option` decided when `SecurityLayer` is built, so flipping any of
-    // the three flags still needs a restart. `warden security set`
-    // reports that explicitly instead of printing unqualified success —
-    // see `cli::commands::security::run_set`.
-    if let Some(sec) = security {
-        if let Some(td) = sec.tunneling.as_ref() {
-            td.set_params(&config.security.tunneling);
-        }
-        if let Some(rl) = sec.rate_limiter.as_ref() {
-            rl.set_params(&config.security.rate_limit);
-        }
-        if let Some(rrl) = sec.rrl.as_ref() {
-            rrl.set_params(&config.security.rrl);
-        }
-    }
-
-    // Atomically swap the auth hash so a freshly-rotated token
-    // from `warden token regenerate` goes live the instant this reload lands —
-    // not on the next daemon restart. If the new config has an empty hash (API
-    // disabled / token revoked), store `None` so the auth gate falls back to
-    // "no token configured" rather than silently keeping the old hash.
-    // This store sits AFTER the config-validate, secrets, and
-    // source-bitmap gates (each early-returns `Rejected` on failure) and after
-    // the resolver swap — every success path (cluster-secondary, empty-sources,
-    // normal) flows through here, every abort path returns before it. So a
-    // reload reported `Rejected` rotates neither the policy nor the token hash.
-    api_token_hash.store(Arc::new(config.api.token_hash.clone()));
-
-    // Live-swap the source-IP ACL (`server.allow_from`) so a tightened
-    // ACL applies on reload without a daemon restart. Placed alongside the
-    // token-hash store — past every reject gate and the resolver swap — so a
-    // reload reported `Rejected` leaves the ACL untouched ("a rejected reload
-    // changes nothing"). The load-time validator already checks each entry, so
-    // a parse error here is should-never-happen; on error we KEEP the previous
-    // ACL rather than widening to accept-all (storing `None` would be a
-    // security regression). The DNS handler reads the same cell lock-free.
-    match parse_allow_from(&config.server.allow_from) {
-        Ok(acl) => {
-            let count = acl.as_ref().map_or(0, |c| c.len());
-            acl_handle.store(acl);
-            tracing::info!(count, "server.allow_from ACL reloaded");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "reload: server.allow_from re-parse failed; keeping previous ACL");
-        }
-    }
-
-    // Re-serialise the policy bundle + bump config_generation on
-    // every successful reload. After the resolver swap, both the empty-sources
-    // and normal paths flow through here; the earlier abort points already
-    // returned. No-op when not a clustering primary.
-    #[cfg(feature = "cluster")]
-    if let Some(cs) = cluster_state {
-        cs.update_policy(config);
-    }
-
-    let new_files = collect_loaded_files(config_path);
-    let new_hash = audit::tree_hash(new_files.iter());
-
-    if merged_sources.is_empty() {
+    if merged_sources.is_empty() && !modern_primary_auxiliary(config) {
         tracing::info!("no list sources in config, clearing blocklist");
         // The operator removed every source: retire the live manager so
         // its refresh loop cannot re-download the old sources and
@@ -2570,7 +3726,51 @@ async fn handle_reload(
             }
         }
         *lists_fingerprint = None;
+        #[cfg(feature = "cluster")]
+        if node_corpus.is_some() {
+            nodes_runtime::clear_active(
+                runtime_reload.and_then(|runtime| runtime.node_observe),
+                cluster_state,
+            );
+        }
         filter.swap_blocklist(Default::default());
+        install_runtime_reload(
+            runtime_reload,
+            &mut prepared_upstream,
+            &prepared_acl,
+            stats,
+            security,
+            config,
+            config_path,
+            api_token_hash,
+            acl_handle,
+        )
+        .await;
+        publish_active_policy(profiles, config, compiled, identity, cluster_state);
+        #[cfg(feature = "cluster")]
+        install_cluster_policy(cluster_state, prepared_cluster);
+        #[cfg(feature = "cluster")]
+        if let Some(context) = &node_corpus {
+            if let (Some(live), Some(prepared)) = (
+                runtime_reload.and_then(|runtime| runtime.node_ip_filter),
+                prepared_node_ip.as_ref(),
+            ) {
+                live.install_prepared(prepared);
+            }
+            if let Err(error) = context.finish_activation(
+                None,
+                runtime_reload.and_then(|runtime| runtime.node_observe),
+                cluster_state,
+                enrollment_artifact.as_ref(),
+                node_auxiliary.clone(),
+            ) {
+                nodes_runtime::clear_active(
+                    runtime_reload.and_then(|runtime| runtime.node_observe),
+                    cluster_state,
+                );
+                tracing::error!(%error, "node corpus activation proof unavailable; DNS continues with installed policy");
+            }
+        }
         let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Ok)
             .with_uid(invoker_uid)
             .with_files(new_files.iter())
@@ -2612,15 +3812,16 @@ async fn handle_reload(
 
     // ── reuse gate ──────────────────────────
     //
-    // Everything above this point has already applied: the profile
-    // resolver swap (which is how an operator's new device allow rule
-    // goes live), the token hash, the ACL, the query-log writer. What
-    // follows is the 9.9 M-domain rebuild — 16-25 s warm, 164 s once
+    // Everything above this point has been prepared but not published. Each
+    // success branch installs the runtime consumers, resolver, and policy
+    // identity only after the list path succeeds or is proven reusable.
+    // What follows is the 9.9 M-domain rebuild — 16-25 s warm, 164 s once
     // the disk caches expire — and it is worth doing only when the list
     // pipeline's own inputs moved.
     //
-    // The gate sits BELOW the resolver swap on purpose. Hoisting it
-    // above would skip the very change the operator asked for.
+    // The reuse branch must still publish the prepared profile policy;
+    // otherwise an unrelated list fingerprint would hide the operator's
+    // profile or device change.
     //
     // A present, unfinished `refresh_handle` is the proof that a live
     // `ListManager` exists to reuse. A finished handle is dead generation
@@ -2631,11 +3832,17 @@ async fn handle_reload(
         &source_tokens,
         &bridge_config_dir_for_fingerprint,
     );
-    if should_reuse_live_lists(
-        has_live_list_manager(refresh_handle.as_ref()),
-        lists_fingerprint.as_ref(),
-        &fingerprint,
-    ) {
+    #[cfg(feature = "cluster")]
+    let node_requires_preparation = node_corpus.is_some();
+    #[cfg(not(feature = "cluster"))]
+    let node_requires_preparation = false;
+    if !node_requires_preparation
+        && should_reuse_live_lists(
+            has_live_list_manager(refresh_handle.as_ref()),
+            lists_fingerprint.as_ref(),
+            &fingerprint,
+        )
+    {
         // The registry follows the accepted alias plan even when the
         // manager is reused.
         if let Some(reg) = list_status_registry {
@@ -2660,6 +3867,22 @@ async fn handle_reload(
             "reload: list pipeline inputs unchanged, reusing live blocklist (no rebuild)"
         );
 
+        install_runtime_reload(
+            runtime_reload,
+            &mut prepared_upstream,
+            &prepared_acl,
+            stats,
+            security,
+            config,
+            config_path,
+            api_token_hash,
+            acl_handle,
+        )
+        .await;
+        publish_active_policy(profiles, config, compiled, identity, cluster_state);
+        #[cfg(feature = "cluster")]
+        install_cluster_policy(cluster_state, prepared_cluster);
+
         // A skip is a SUCCESS path and still owes exactly
         // one audit record plus the post-hash write-back — drop either
         // and the next reload's `pre_hash` describes a config that was
@@ -2682,12 +3905,19 @@ async fn handle_reload(
     // Unpublish before retiring so no IPC sender can target the old
     // generation. Retire before constructing the replacement: an old worker
     // must never publish cache/filter state after the new generation exists.
-    list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
-    if let Some(h) = refresh_handle.take() {
-        if let Err(error) = h.retire().await {
-            tracing::error!(%error, "list manager controller ended abnormally during reload");
+    if !node_requires_preparation {
+        list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
+        if let Some(h) = refresh_handle.take() {
+            if let Err(error) = h.retire().await {
+                tracing::error!(%error, "list manager controller ended abnormally during reload");
+            }
         }
     }
+    let prepared_filter = if node_requires_preparation {
+        Arc::new(FilterEngine::new())
+    } else {
+        filter.clone()
+    };
 
     let interval = Duration::from_secs(config.lists.update_interval_secs);
     // Same value the fingerprint above was stamped against — computed once
@@ -2696,7 +3926,7 @@ async fn handle_reload(
 
     let mut mgr = ListManager::with_plan_and_tokens(
         list_client.clone(),
-        filter.clone(),
+        prepared_filter.clone(),
         source_plan.clone(),
         interval,
         source_bits.clone(),
@@ -2718,23 +3948,39 @@ async fn handle_reload(
         &source_plan,
         bridge_config_dir,
         policy_masks,
-        ListStateWriteback::Persist,
+        if node_requires_preparation {
+            ListStateWriteback::ReadOnly
+        } else {
+            ListStateWriteback::Persist
+        },
     )
     .apply(&mut mgr);
+    #[cfg(feature = "cluster")]
+    if let Some(context) = &node_corpus {
+        if context.secondary.is_some() {
+            context.configure_secondary(&mut mgr)?;
+        } else {
+            mgr.isolate_candidate_cache(&context.store)?;
+        }
+    }
 
     // Keep the registry handle DaemonState reads so stats switch with the
     // plan. `sync_plan` publishes aliases after slots exist, then retires
     // obsolete slots.
-    if let Some(reg) = list_status_registry {
-        reg.sync_plan(&source_plan);
-        mgr.attach_status_registry(reg.clone());
+    if !node_requires_preparation {
+        if let Some(reg) = list_status_registry {
+            reg.sync_plan(&source_plan);
+            mgr.attach_status_registry(reg.clone());
+        }
     }
     // Re-attach the broadcast publisher so the post-reload
     // manager keeps emitting `ListStatsUpdated`. Same Sender clone
     // already wired to `DaemonState.notification_tx`, so future
     // subscribers see the post-reload events without re-subscribing.
-    mgr.set_notification_channel(notification_tx.clone());
-    mgr.set_status_persistence_path(list_stats_path(config_path));
+    if !node_requires_preparation {
+        mgr.set_notification_channel(notification_tx.clone());
+        mgr.set_status_persistence_path(list_stats_path(config_path));
+    }
 
     // Wire a fresh out-of-band command channel for the post-reload manager,
     // but keep its sender private until the controller exists. Publishing it
@@ -2762,6 +4008,13 @@ async fn handle_reload(
     let (mut mgr, count) = match mgr.refresh_in_blocking(RefreshMode::Scheduled).await {
         Ok(result) => result,
         Err(error) => {
+            if node_requires_preparation {
+                tracing::error!(%error, "node corpus preparation failed; previous manager remains active");
+                if let Some(registry) = list_status_registry {
+                    registry.record_cycle(CycleOutcome::ConfigRejected);
+                }
+                return Ok(None);
+            }
             // Config consumers have changed and the old manager is gone.
             // Only daemon teardown can safely resolve this half-applied reload.
             tracing::error!(%error, uid = ?invoker_uid, pre_hash = ?pre_hash,
@@ -2784,18 +4037,94 @@ async fn handle_reload(
             );
         }
     };
+    #[cfg(feature = "cluster")]
+    if node_requires_preparation {
+        if let Err(error) = mgr.verify_node_corpus() {
+            tracing::error!(%error, "node corpus rejected; previous policy remains active");
+            if let Some(registry) = list_status_registry {
+                registry.record_cycle(CycleOutcome::ConfigRejected);
+            }
+            return Ok(None);
+        }
+        list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
+        if let Some(controller) = refresh_handle.take() {
+            controller.retire().await?;
+        }
+        nodes_runtime::clear_active(
+            runtime_reload.and_then(|runtime| runtime.node_observe),
+            cluster_state,
+        );
+        filter.install_prepared_shards(&prepared_filter);
+        mgr.install_prepared_filter(filter.clone());
+        if let Some(registry) = list_status_registry {
+            mgr.install_prepared_status_registry(registry.clone());
+        }
+        mgr.set_notification_channel(notification_tx.clone());
+        mgr.set_status_persistence_path(list_stats_path(config_path));
+    }
     tracing::info!(count, "lists reloaded");
     // The completed rebuild used the tight client above; only the background
     // controller receives the bulk client.
     install_bulk_download_client(&mut mgr);
-    let manager_task = mgr.spawn_refresh_loop_after_refresh();
-    list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::running(list_cmd_tx)));
-    *refresh_handle = Some(manager_task);
+
     // Describe the manager that is now live, so
     // the next reload can compare against it. Stored only once the
     // rebuild has actually happened — an earlier store would let a
     // reload that died mid-refresh advertise a pipeline that never ran.
     *lists_fingerprint = Some(fingerprint);
+
+    // Each installed shard carries the profile-id policy projected against
+    // its own source-bit assignment, so the shard-at-a-time list publication
+    // above cannot pair new bits with masks from ProfileResolver. The resolver
+    // swap below changes client-to-profile selection only after all other
+    // reloadable consumers are ready.
+    install_runtime_reload(
+        runtime_reload,
+        &mut prepared_upstream,
+        &prepared_acl,
+        stats,
+        security,
+        config,
+        config_path,
+        api_token_hash,
+        acl_handle,
+    )
+    .await;
+    publish_active_policy(profiles, config, compiled, identity, cluster_state);
+    #[cfg(feature = "cluster")]
+    install_cluster_policy(cluster_state, prepared_cluster);
+    #[cfg(feature = "cluster")]
+    if let Some(context) = &node_corpus {
+        if let (Some(live), Some(prepared)) = (
+            runtime_reload.and_then(|runtime| runtime.node_ip_filter),
+            prepared_node_ip.as_ref(),
+        ) {
+            live.install_prepared(prepared);
+        }
+        nodes_runtime::wire_live_manager(
+            &mut mgr,
+            config,
+            runtime_reload.and_then(|runtime| runtime.node_ip_filter),
+            runtime_reload.and_then(|runtime| runtime.node_observe),
+            cluster_state,
+        );
+        if let Err(error) = context.finish_activation(
+            Some(&mut mgr),
+            runtime_reload.and_then(|runtime| runtime.node_observe),
+            cluster_state,
+            enrollment_artifact.as_ref(),
+            node_auxiliary.clone(),
+        ) {
+            nodes_runtime::clear_active(
+                runtime_reload.and_then(|runtime| runtime.node_observe),
+                cluster_state,
+            );
+            tracing::error!(%error, "node corpus activation proof unavailable; DNS continues with installed policy");
+        }
+    }
+    let manager_task = mgr.spawn_refresh_loop_after_refresh();
+    list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::running(list_cmd_tx)));
+    *refresh_handle = Some(manager_task);
 
     let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Ok)
         .with_uid(invoker_uid)
@@ -3426,6 +4755,455 @@ fn fork_daemon(pid_file: &Path, log_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn spawn_daemon(pid_file: &Path, config_path: &Path) -> anyhow::Result<()> {
+    fork_daemon(pid_file, &daemon_log_dir(config_path))
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests;
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use crate::config::atomic_write::{hardened_atomic_write, AtomicWriteOpts};
+    use crate::config::schema::{ConfigV5, CustomList, Id, ProfileV5};
+
+    fn candidate_runtime() -> Arc<crate::operator_rules::PolicyCandidateRuntime> {
+        Arc::new(crate::operator_rules::PolicyCandidateRuntime::new(
+            crate::filter::operator_rules::CompileAdmission::new(
+                RuleCompileLimits::HARD_CEILINGS.max_compiled_bytes_total * 2,
+                1,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn identity(revision: &str, hash: &str) -> ActivePolicyIdentity {
+        ActivePolicyIdentity {
+            daemon_instance_id: "daemon-test".into(),
+            config_revision: revision.into(),
+            operator_policy_hash: hash.into(),
+            resolver_generation: 7,
+        }
+    }
+
+    fn request() -> ActivationRequest {
+        ActivationRequest {
+            operation_id: "operation-test".into(),
+            request_id: "request-test".into(),
+            actor: "test".into(),
+            correlation_id: "correlation-test".into(),
+            expected_config_revision: "revision-a".into(),
+            expected_policy_hash: "hash-a".into(),
+            completion: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    #[test]
+    fn activation_requires_exact_published_revision_and_hash() {
+        let request = request();
+        let expected = identity("revision-a", "hash-a");
+        assert_eq!(
+            classify_activation(&request, Some(expected.clone()), Ok(true)),
+            ActivationResult::Applied(expected.clone())
+        );
+        let newer = identity("revision-b", "hash-a");
+        assert_eq!(
+            classify_activation(&request, Some(newer.clone()), Ok(true)),
+            ActivationResult::Superseded {
+                active: newer,
+                superseding_operation_id: None,
+            }
+        );
+        for active in [
+            None,
+            Some(ActivePolicyIdentity::default()),
+            Some(identity("revision-a", "different-hash")),
+        ] {
+            assert!(matches!(
+                classify_activation(&request, active, Ok(true)),
+                ActivationResult::Unknown { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_activation(&request, Some(expected.clone()), Ok(false)),
+            ActivationResult::Rejected { .. }
+        ));
+        assert!(matches!(
+            classify_activation(&request, Some(expected), Err("worker failed".into())),
+            ActivationResult::Unknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_queued_activations_without_certifying_a_swap() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut request = request();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        request.completion = completion;
+        sender.try_send(request).ok().unwrap();
+        retire_activation_queue(&mut receiver, Some(identity("revision-a", "hash-a")));
+        assert!(sender.is_closed());
+        assert!(matches!(
+            completed.await.unwrap(),
+            ActivationResult::Unknown { .. }
+        ));
+    }
+
+    fn disk_policy(root: &Path) -> (PathBuf, PathBuf) {
+        let id = Id::new("local").unwrap();
+        let mut config = ConfigV5::default();
+        config.upstream.servers = vec!["192.0.2.1:53".into()];
+        config.custom_lists.push(CustomList {
+            id: id.clone(),
+            display_name: String::new(),
+            description: String::new(),
+        });
+        config.server.default_profile = Some(Id::new("default").unwrap());
+        config.profiles.insert(
+            "default".into(),
+            ProfileV5 {
+                custom_lists: vec![id.clone()],
+                ..ProfileV5::default()
+            },
+        );
+        let master = root.join("config.toml");
+        let pack = crate::config::custom_list::pack_path(root, &id);
+        hardened_atomic_write(
+            &master,
+            toml::to_string(&config).unwrap().as_bytes(),
+            AtomicWriteOpts::default(),
+        )
+        .unwrap();
+        hardened_atomic_write(
+            &pack,
+            b"||blocked.example.test^\n",
+            AtomicWriteOpts::default(),
+        )
+        .unwrap();
+        (master, pack)
+    }
+
+    #[test]
+    fn audit_warnings_emit_once_per_lifecycle_owner() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Messages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut visitor = Visitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (master, _) = disk_policy(root.path());
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Messages(messages.clone()));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
+                .unwrap();
+            crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
+                .unwrap();
+            collect_loaded_files(&master);
+            capture_operator_policy(
+                &master,
+                "daemon-test",
+                &candidate_runtime(),
+                AuditWarningEmission::Quiet,
+            )
+            .unwrap();
+            capture_operator_policy(
+                &master,
+                "daemon-test",
+                &candidate_runtime(),
+                AuditWarningEmission::Emit,
+            )
+            .unwrap();
+        }
+        let count = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.contains("has no domains to block"))
+            .count();
+        assert_eq!(
+            count, 2,
+            "boot emits once, its quiet capture does not duplicate it, and reload emits once"
+        );
+    }
+
+    #[test]
+    fn captured_revision_hash_and_compiled_pack_do_not_follow_later_disk_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, pack) = disk_policy(root.path());
+        let runtime = candidate_runtime();
+        let captured = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        let captured_identity = captured.identity.clone();
+        hardened_atomic_write(
+            &pack,
+            b"||changed.example.test^\n",
+            AtomicWriteOpts::default(),
+        )
+        .unwrap();
+        let later = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        assert_ne!(
+            captured.identity.config_revision,
+            later.identity.config_revision
+        );
+        assert_ne!(
+            captured.identity.operator_policy_hash,
+            later.identity.operator_policy_hash
+        );
+        let resolver = Arc::new(
+            ProfileResolver::build_with_operator_rules_and_policy_identity(
+                &captured.projected,
+                Arc::clone(&captured.compiled),
+                captured.identity,
+            ),
+        );
+        assert_eq!(resolver.active_policy_identity(), captured_identity);
+        assert!(captured
+            .compiled
+            .profile(&Id::new("default").unwrap())
+            .is_some());
+        let bytes_before_tick = std::fs::read(&pack).unwrap();
+        handle_schedule_tick(Some(&resolver));
+        assert_eq!(std::fs::read(&pack).unwrap(), bytes_before_tick);
+        let refreshed = resolver.active_policy_identity();
+        assert_eq!(refreshed.config_revision, captured_identity.config_revision);
+        assert_eq!(
+            refreshed.operator_policy_hash,
+            captured_identity.operator_policy_hash
+        );
+    }
+
+    #[test]
+    fn exact_committed_candidate_is_reused_without_recompiling_on_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, _) = disk_policy(root.path());
+        let runtime = candidate_runtime();
+        let first = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        let cached = runtime
+            .matching(
+                &first.identity.config_revision,
+                &first.identity.operator_policy_hash,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.compiled, &cached.compiled()));
+
+        let second = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first.compiled, &second.compiled));
+    }
+
+    #[test]
+    fn policy_affecting_boot_drift_is_rejected_instead_of_using_legacy_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, _) = disk_policy(root.path());
+        let captured = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &candidate_runtime(),
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        let mut runtime_config = captured.projected.clone();
+        runtime_config
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .custom_lists
+            .clear();
+
+        let error = admit_boot_capture(
+            Some(captured),
+            &runtime_config,
+            RuntimeCapabilityAttestation::AuthoritativeSchema5Tree,
+        )
+        .err()
+        .expect("policy drift must abort boot");
+        assert!(error.to_string().contains("retry startup"));
+    }
+
+    #[test]
+    fn startup_only_overrides_keep_the_admitted_schema5_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, _) = disk_policy(root.path());
+        let captured = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &candidate_runtime(),
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        let compiled = Arc::clone(&captured.compiled);
+        let mut runtime_config = captured.projected.clone();
+        runtime_config.server.listen = "127.0.0.1:15354".parse().unwrap();
+        runtime_config.upstream.servers = vec!["192.0.2.54:53".into()];
+        runtime_config.lists.update_interval_secs = 900;
+
+        let admitted = admit_boot_capture(
+            Some(captured),
+            &runtime_config,
+            RuntimeCapabilityAttestation::AuthoritativeSchema5Tree,
+        )
+        .expect("startup-only overrides remain coherent")
+        .expect("authoritative boot must retain its capture");
+        assert!(Arc::ptr_eq(&compiled, &admitted.compiled));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_reload_carries_the_same_complete_capture_as_the_resolver() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, pack) = disk_policy(root.path());
+        let mut config: ConfigV5 =
+            toml::from_str(&std::fs::read_to_string(&master).unwrap()).unwrap();
+        config.cluster.enabled = true;
+        config.cluster.token_hash = Some("a".repeat(64));
+        std::fs::write(&master, toml::to_string(&config).unwrap()).unwrap();
+        let captured = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &candidate_runtime(),
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        let snapshot = captured.cluster_snapshot.as_ref().unwrap();
+        assert_eq!(
+            snapshot.config_revision(),
+            captured.identity.config_revision
+        );
+        assert_eq!(
+            snapshot.operator_policy_hash(),
+            captured.identity.operator_policy_hash
+        );
+        let captured_body = Arc::clone(&snapshot.packs()[&Id::new("local").unwrap()].bytes);
+        std::fs::write(&pack, b"||later.example.test^\n").unwrap();
+        let state = crate::cluster::ClusterState::new(
+            crate::config::schema::ClusterRole::Primary,
+            1,
+            "a".repeat(64),
+            Vec::new(),
+        );
+        let guard = crate::config::write_lock::acquire_for_migration(&master).unwrap();
+        state.update_policy(&guard, Arc::clone(snapshot)).unwrap();
+        assert!(Arc::ptr_eq(
+            snapshot,
+            state.policy().snapshot.as_ref().unwrap()
+        ));
+        assert_eq!(captured_body.as_ref(), b"||blocked.example.test^\n");
+        assert_eq!(
+            state
+                .policy()
+                .manifest
+                .as_ref()
+                .unwrap()
+                .operator_policy_hash,
+            captured.identity.operator_policy_hash
+        );
+    }
+
+    #[test]
+    fn cosmetic_pack_edit_changes_revision_but_not_semantic_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let (master, pack) = disk_policy(root.path());
+        let runtime = candidate_runtime();
+        let before = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        hardened_atomic_write(
+            &pack,
+            b"# operator comment\n||blocked.example.test^\n",
+            AtomicWriteOpts::default(),
+        )
+        .unwrap();
+        let after = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        assert_ne!(
+            before.identity.config_revision,
+            after.identity.config_revision
+        );
+        assert_eq!(
+            before.identity.operator_policy_hash,
+            after.identity.operator_policy_hash
+        );
+        assert_eq!(before.audit_hash, after.audit_hash);
+
+        hardened_atomic_write(
+            &pack,
+            b"||blocked.example.test^\n# inactive note\n",
+            AtomicWriteOpts::default(),
+        )
+        .unwrap();
+        let skipped = capture_operator_policy(
+            &master,
+            "daemon-test",
+            &runtime,
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        assert_ne!(
+            after.identity.config_revision,
+            skipped.identity.config_revision
+        );
+        assert_eq!(
+            after.identity.operator_policy_hash,
+            skipped.identity.operator_policy_hash
+        );
+    }
+}

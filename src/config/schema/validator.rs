@@ -189,6 +189,11 @@ pub fn validate_collect_for_schema(
     );
     check_admin_rules(config, &mut errs);
     check_resource_budget(config, &mut errs);
+    if let Err(error) = config.node.validate() {
+        errs.push(ConfigError::ValidationFailed(
+            ErrorContext::new(error).with_entity("node"),
+        ));
+    }
     check_cluster(config, &mut errs);
     check_secondary_master_is_policy_free(config, provenance, &mut errs);
     check_api(config, &mut errs, warns);
@@ -705,11 +710,9 @@ pub const SECURITY_TUNNELING_WINDOW_ZERO: &str =
 /// frozen strings too.
 pub const ANTI_BYPASS_ENABLED_NO_DOMAINS: &str =
     "[anti_bypass] enabled = true but has no domains to block — \
-     `anti_bypass.extra_domains` is empty, so no resolver name is refused \
-     and the setting protects nothing. warden ships no built-in resolver \
-     list; add the names you want refused to `anti_bypass.extra_domains`. \
-     A [[blocklists]] subscription does not feed this check — list domains \
-     are enforced by the filter engine, where allow rules can override them.";
+     set `anti_bypass.extra_domains` to the resolver hostnames you want refused, \
+     or set `anti_bypass.enabled = false` if unused. `[[blocklists]]` does not \
+     feed this check.";
 
 /// Whether `[anti_bypass]` claims to be on while having nothing to
 /// enforce — the condition behind [`ANTI_BYPASS_ENABLED_NO_DOMAINS`].
@@ -1629,7 +1632,7 @@ fn check_cluster(config: &ConfigV1, errs: &mut Vec<ConfigError>) {
             .token_hash
             .as_deref()
             .is_some_and(|h| !h.trim().is_empty());
-        if !has_hash {
+        if !has_hash && cluster.membership_version != Some(1) {
             errs.push(ConfigError::MissingRequired(
                 ErrorContext::new(CLUSTER_ENABLED_REQUIRES_TOKEN_HASH.to_string())
                     .with_entity("cluster.token_hash"),
@@ -1644,6 +1647,58 @@ fn check_cluster(config: &ConfigV1, errs: &mut Vec<ConfigError>) {
                 ErrorContext::new(CLUSTER_POLL_INTERVAL_ZERO.to_string())
                     .with_entity("cluster.poll_interval_secs"),
             ));
+        }
+    }
+
+    if let Some(version) = cluster.membership_version {
+        if version != 1 {
+            errs.push(ConfigError::ValidationFailed(
+                ErrorContext::new("unsupported cluster membership version; upgrade the node")
+                    .with_entity("cluster.membership_version"),
+            ));
+        }
+        if cluster.enabled {
+            for (field, value) in [
+                ("node.id", config.node.id.as_deref()),
+                ("cluster.cluster_id", cluster.cluster_id.as_deref()),
+                (
+                    "cluster.primary_node_id",
+                    cluster.primary_node_id.as_deref(),
+                ),
+            ] {
+                if !value.is_some_and(super::node::valid_node_id) {
+                    errs.push(ConfigError::ValidationFailed(
+                        ErrorContext::new(format!("{field} requires a canonical node identity"))
+                            .with_entity(field),
+                    ));
+                }
+            }
+            if cluster.role == ClusterRole::Secondary {
+                if !cluster
+                    .peer
+                    .as_deref()
+                    .is_some_and(|peer| peer.starts_with("https://"))
+                {
+                    errs.push(ConfigError::ValidationFailed(
+                        ErrorContext::new("node pairing requires HTTPS, including loopback")
+                            .with_entity("cluster.peer"),
+                    ));
+                }
+                if !cluster
+                    .primary_cert_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| {
+                        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    errs.push(ConfigError::ValidationFailed(
+                        ErrorContext::new(
+                            "paired secondary requires a SHA-256 certificate fingerprint",
+                        )
+                        .with_entity("cluster.primary_cert_fingerprint"),
+                    ));
+                }
+            }
         }
     }
 
@@ -1755,7 +1810,10 @@ fn check_api(config: &ConfigV1, errs: &mut Vec<ConfigError>, warns: &mut AuditWa
         .token_hash
         .as_deref()
         .is_some_and(|h| !h.trim().is_empty());
-    if !has_hash {
+    let membership_only = config.cluster.enabled
+        && config.cluster.role == ClusterRole::Primary
+        && config.cluster.membership_version == Some(1);
+    if !has_hash && !membership_only {
         errs.push(ConfigError::MissingRequired(
             ErrorContext::new(API_ENABLED_REQUIRES_TOKEN_HASH.to_string())
                 .with_entity("api.token_hash"),

@@ -79,6 +79,7 @@ fn ipc_command_action_names_are_frozen() {
         (IpcCommand::GetAllDevices, "devices.get_all"),
         (
             IpcCommand::QueryLogs {
+                client_ips: Vec::new(),
                 limit: 0,
                 client: None,
                 blocked_only: false,

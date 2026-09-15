@@ -149,7 +149,7 @@ fn app_with_rules(rules: &[(&str, &str)]) -> App {
 }
 
 /// Simulate a reload: rewrite `loaded_config` with a new rule set, as
-/// every `app.loaded_config = load_v1_config(…)` site does.
+/// every `app.loaded_config = load_current_config(…)` site does.
 fn reload_rules(app: &mut App, rules: &[(&str, &str)]) {
     let admin_rules: Vec<AdminRule> = rules
         .iter()

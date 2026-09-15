@@ -58,14 +58,18 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use hickory_server::zone_handler::MessageResponse;
 
 use purge_warden::cluster::observe::{ClusterObserve, SyncHealth, SyncStatus};
-use purge_warden::config::schema::{AdminRule, ConfigV1, Device, Id, Profile};
+use purge_warden::config::schema::{
+    ConfigV1, CustomList, Device, Id, Profile, TARGET_SCHEMA_VERSION_V5,
+};
 use purge_warden::config::settings::CacheConfig;
 use purge_warden::dns::cache::DnsCache;
 use purge_warden::dns::edns::EdnsClientSubnet;
 use purge_warden::dns::error::DnsError;
 use purge_warden::dns::handler::ForwardHandler;
+use purge_warden::filter::operator_rules::{
+    CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+};
 use purge_warden::filter::FilterEngine;
-use purge_warden::lists::source_key::SourceBitMap;
 use purge_warden::profiles::ProfileResolver;
 use purge_warden::upstream::{Upstream, UpstreamResponse};
 
@@ -112,6 +116,7 @@ impl Upstream for CountingUpstream {
                 RData::A(A(UPSTREAM_A)),
             )],
             response_code: ResponseCode::NoError,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: Vec::new(),
@@ -176,22 +181,23 @@ fn request_for(qname: &str) -> Request {
 }
 
 /// The policy a secondary would be left holding after its last successful
-/// sync: one device, one profile, one deny rule.
+/// sync: one device, one profile, one deny rule in its Custom List.
 fn resolver() -> Arc<ProfileResolver> {
     let profile = Profile {
         display_name: "replicated".into(),
-        admin_rules: vec![Id::new("deny-tracker").unwrap()],
+        custom_lists: vec![Id::new("replicated-rules").unwrap()],
         ..Default::default()
     };
     let mut config = ConfigV1 {
-        schema_version: 1,
+        schema_version: TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.server.allow_from = vec!["10.0.0.0/8".into()];
     config.server.default_profile = Some(Id::new("replicated").unwrap());
-    config.admin_rules.push(AdminRule {
-        id: Id::new("deny-tracker").unwrap(),
-        rule: "||tracker.example^".into(),
+    config.custom_lists.push(CustomList {
+        id: Id::new("replicated-rules").unwrap(),
+        display_name: "Replicated rules".into(),
+        description: String::new(),
     });
     config.profiles.insert("replicated".to_string(), profile);
     // `Device` has no `Default`; the field list is spelled out, exactly as the
@@ -215,11 +221,25 @@ fn resolver() -> Arc<ProfileResolver> {
         network_name: None,
         network_name_wildcard: false,
     });
-    Arc::new(ProfileResolver::build(
-        &config,
-        &SourceBitMap::default(),
-        &purge_warden::config::custom_list::CustomListStore::new(),
-    ))
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "replicated-rules",
+                content: "||tracker.example^",
+            }],
+            &[ProfileMounts {
+                profile_id: "replicated",
+                custom_lists: &["replicated-rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    Arc::new(ProfileResolver::build_with_operator_rules(&config, rules))
 }
 
 fn handler(upstream: Arc<CountingUpstream>) -> ForwardHandler {

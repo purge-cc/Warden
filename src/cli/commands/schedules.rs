@@ -24,8 +24,10 @@ use super::target::{
     read_or_empty_locked, remove_id_keyed, write_value_validated_locked,
     write_values_validated_locked, StagedWrite,
 };
-use crate::config::loader::{load_config, load_config_for_schema_under_guard, LoadedConfig};
-use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::loader::{
+    load_config_for_schema_under_guard, load_current_config, LoadedConfig,
+};
+use crate::config::schema::TARGET_SCHEMA_VERSION_V5;
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 use crate::profiles::schedule::{local_now, ParsedSchedule};
 
@@ -57,8 +59,9 @@ pub(crate) fn prune_expired_schedules_locked(
     config_path: &Path,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<Vec<String>> {
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let expired: Vec<String> = loaded
         .config
         .schedules
@@ -131,7 +134,7 @@ fn target_type_toml_value(t: crate::config::schema::schedule::ScheduleTargetType
 /// and current state. Works offline (reads config directly).
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     if loaded.config.schedules.is_empty() {
         println!("no schedules configured");
         println!(
@@ -181,8 +184,9 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 pub async fn run_remove(config_path: &Path, socket_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if !loaded.config.schedules.iter().any(|s| s.id.as_str() == id) {
         bail!(
             "no schedule named \"{id}\". Run `warden schedule list` to see configured schedules."
@@ -292,7 +296,7 @@ mod tests {
         );
     }
 
-    const MASTER_WITH_INCLUDES: &str = r#"schema_version = 4
+    const MASTER_WITH_INCLUDES: &str = r#"schema_version = 5
 includes = ["schedules.d/*.toml"]
 
 [server]
@@ -366,13 +370,13 @@ expires_at = "2999-01-01T00:00:00Z"
     fn prune_drops_expired_row_from_slice_keeps_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let master = mk_multi_file(&dir);
-        let loaded = load_config(&master, now()).expect("fixture loads");
+        let loaded = load_current_config(&master, now()).expect("fixture loads");
         assert_eq!(loaded.config.schedules.len(), 3);
 
         let pruned = prune_expired_schedules(&master, &loaded, now()).unwrap();
         assert_eq!(pruned, vec!["quiet-tablet-001122".to_string()]);
 
-        let reloaded = load_config(&master, now()).expect("post-prune reload");
+        let reloaded = load_current_config(&master, now()).expect("post-prune reload");
         let ids: Vec<&str> = reloaded
             .config
             .schedules
@@ -394,7 +398,7 @@ expires_at = "2999-01-01T00:00:00Z"
         let dir = tempfile::tempdir().unwrap();
         let master = dir.path().join("config.toml");
         std::fs::write(&master, MASTER_WITH_INCLUDES).unwrap();
-        let loaded = load_config(&master, now()).unwrap();
+        let loaded = load_current_config(&master, now()).unwrap();
         let pruned = prune_expired_schedules(&master, &loaded, now()).unwrap();
         assert!(pruned.is_empty());
         assert_eq!(
@@ -411,7 +415,7 @@ expires_at = "2999-01-01T00:00:00Z"
         run_remove(&master, &sock, "quiet-tablet-998877")
             .await
             .expect("remove must succeed");
-        let reloaded = load_config(&master, now()).unwrap();
+        let reloaded = load_current_config(&master, now()).unwrap();
         assert!(!reloaded
             .config
             .schedules

@@ -17,21 +17,23 @@
 //! - State: `app::SettingsState` (`tracking_panel`, `restore_modal`, `backup_modal`, `auto_backup`)
 //! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use crossterm::event::KeyCode;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::config::settings::LogMode;
 use crate::tui::app::{App, TrackingFocus, TrackingPanelState};
-use crate::tui::theme::T;
-use crate::tui::ui::render_section_chrome;
+use crate::tui::mouse::{self, MouseAction};
+use crate::tui::theme::{self, T};
 
 // Frozen strings for the Tracking form. Tests below pin these; changing
 // them without updating the frozen-string audit is a regression.
 pub const TRACKING_VALIDATION_RETENTION_OUT_OF_RANGE: &str =
     "retention_days must be between 1 and 365.";
+#[cfg(test)]
 pub const TRACKING_SAMPLED_LABEL: &str = "Sampled (10%)";
 
 // Frozen strings for the auto-backup status line and the failure
@@ -44,59 +46,225 @@ pub const AUTO_BACKUP_FAILED_PREFIX: &str = "auto-backup failed: ";
 pub const AUTO_BACKUP_DISABLED_PREFIX: &str = "auto-backup disabled after ";
 pub const AUTO_BACKUP_REENABLE_HINT: &str = "re-enable: warden config backup --reset-auto-failure";
 
+const ITEMS: [(&str, &str); 3] = [
+    ("Tracking", "Query Log, Sampling & Retention"),
+    ("Backup", "Archives & Automatic Backup Status"),
+    ("Restore", "Browse Available Restore Points"),
+];
+
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    match app.settings.tracking_panel.as_ref() {
-        Some(panel) => render_tracking_panel(f, area, panel),
-        None => render_landing(f, area, app),
+    let columns = crate::tui::detail_panel::columns(area);
+    if app.settings.tracking_panel.is_none() || columns.is_some() {
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            columns.map_or(area, |c| c[0]),
+            "Settings",
+            "Tracking, Backup & Restore",
+            theme::CardRole::Analytics,
+        );
+        for (index, (title, subtitle)) in ITEMS.iter().enumerate() {
+            let y = body.y + index as u16 * 3;
+            if y >= body.bottom() {
+                break;
+            }
+            let rect = Rect::new(body.x, y, body.width, 2.min(body.bottom() - y));
+            let lines = vec![
+                Line::styled(*title, Style::default().add_modifier(Modifier::BOLD)),
+                Line::styled(*subtitle, Style::default().fg(T.text_secondary)),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).style(if index == app.settings.selected {
+                    theme::highlight_style()
+                } else {
+                    Style::default()
+                }),
+                rect,
+            );
+            mouse::register(
+                app,
+                rect,
+                MouseAction::Row(crate::tui::app::Leaf::Settings, index),
+            );
+        }
+    }
+    if let Some(panel) = app.settings.tracking_panel.as_ref() {
+        render_tracking_panel(f, columns.map_or(area, |c| c[1]), app, panel);
+    } else if let Some(cols) = columns {
+        let info = information_with_width(app, cols[1].width.saturating_sub(4));
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            cols[1],
+            &info.title,
+            &info.subtitle,
+            theme::CardRole::History,
+        );
+        crate::tui::detail_panel::render(
+            f,
+            Rect::new(body.x, body.y, body.width, body.height.saturating_sub(2)),
+            app,
+            crate::tui::app::Leaf::Settings,
+            ITEMS[app.settings.selected.min(2)].0,
+            info.lines,
+        );
+        if body.height > 2 {
+            use crate::tui::modal_form::{self, Action, ActionKind};
+            let row = Rect::new(body.x, body.bottom() - 1, body.width, 1);
+            let label = ["Edit", "Create Backup", "Choose Archive"][app.settings.selected.min(2)];
+            let actions = [
+                Action::new(label, false, ActionKind::Primary, "Open setting")
+                    .on_key(KeyCode::Enter),
+            ];
+            f.render_widget(
+                Paragraph::new(modal_form::action_row(&actions, row.width)),
+                row,
+            );
+            for (area, key) in modal_form::action_regions(&actions, row) {
+                mouse::register(app, area, MouseAction::Key(key.code));
+            }
+        }
     }
 }
 
-/// The actions this leaf owns, spelled out on screen. The footer carries
-/// them too, but the footer is chrome an operator learns to stop reading —
-/// without this, the pane would otherwise be a status line on an
-/// empty rectangle.
-const LANDING_ACTIONS: &[(&str, &str)] = &[
-    ("t", "Tracking — query-log retention and sampling"),
-    ("b", "Backup — write a config archive now"),
-    ("R", "Restore — pick an archive to roll back to"),
-];
+pub fn information(app: &App) -> crate::tui::detail_panel::Information {
+    information_with_width(app, 74)
+}
 
-/// The default view of `Leaf::Settings`.
-///
-/// The card is titled after its LEAF, which is what every other tab does
-/// (Devices → "Devices", Lists → "Lists", …). This module was the single
-/// exception before the split — it titled its card "Configuration" while
-/// its leaf said "Settings". Fixed here rather than inherited.
-fn render_landing(f: &mut Frame, area: Rect, app: &App) {
-    let content = render_section_chrome(f, area, "Settings", T.text_secondary);
-
-    let now = time::OffsetDateTime::now_utc();
-    let av = &app.settings.auto_backup;
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(auto_backup_status_line(av.last_archive, now));
-    lines.extend(auto_backup_banner_lines(
-        av.consecutive_failures,
-        av.last_error.as_deref(),
-        av.disabled,
-    ));
-    lines.push(Line::from(""));
-
-    for (key, what) in LANDING_ACTIONS {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("[{key}]"),
-                Style::default()
-                    .fg(T.brand_red)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled((*what).to_string(), Style::default().fg(T.text_secondary)),
-        ]));
+fn information_with_width(app: &App, width: u16) -> crate::tui::detail_panel::Information {
+    let selected = app.settings.selected.min(2);
+    let mut lines = Vec::new();
+    if selected == 0 {
+        if let Some(loaded) = app.loaded_config.as_ref() {
+            let tracking = &loaded.config.tracking;
+            lines.extend([
+                crate::tui::modal_form::section_rule(
+                    "Query Logging",
+                    width,
+                    theme::CardRole::Summary,
+                ),
+                detail_value(
+                    "Query Log",
+                    if tracking.query_log_enabled {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
+                ),
+                detail_value("Mode", log_mode_label(&tracking.log_mode)),
+                Line::default(),
+                crate::tui::modal_form::section_rule("Retention", width, theme::CardRole::History),
+                detail_value("Keep History", format!("{} Days", tracking.retention_days)),
+                detail_value("Allowed Range", "1–365 Days"),
+            ]);
+        } else {
+            lines.push(Line::from("Tracking configuration unavailable"));
+        }
+    } else {
+        let av = &app.settings.auto_backup;
+        let now = time::OffsetDateTime::now_utc();
+        lines.push(crate::tui::modal_form::section_rule(
+            if selected == 1 {
+                "Automatic Backup"
+            } else {
+                "Restore Points"
+            },
+            width,
+            if selected == 1 {
+                theme::CardRole::Summary
+            } else {
+                theme::CardRole::History
+            },
+        ));
+        if selected == 1 {
+            lines.extend([
+                detail_value(
+                    "Status",
+                    if av.disabled {
+                        "Disabled"
+                    } else if av.consecutive_failures > 0 {
+                        "Failing"
+                    } else {
+                        "No failures recorded"
+                    },
+                ),
+                last_archive_detail(av.last_archive, now),
+                detail_value("Failures", av.consecutive_failures.to_string()),
+            ]);
+            lines.extend(auto_backup_banner_lines(
+                av.consecutive_failures,
+                av.last_error.as_deref(),
+                av.disabled,
+            ));
+            lines.push(Line::default());
+            lines.push(crate::tui::modal_form::section_rule(
+                "Archive Storage",
+                width,
+                theme::CardRole::History,
+            ));
+        } else {
+            lines.push(last_archive_detail(av.last_archive, now));
+        }
+        if let Some(loaded) = app.loaded_config.as_ref() {
+            lines.push(detail_value(
+                "Directory",
+                loaded
+                    .config
+                    .backup
+                    .resolve_dir(&loaded.master_path)
+                    .display()
+                    .to_string(),
+            ));
+        }
+        lines.push(detail_value("Scope", "Complete configuration tree"));
+        if selected == 2 {
+            lines.push(Line::styled(
+                "Browse archives to choose a restore point.",
+                Style::default().fg(T.text_primary),
+            ));
+        }
     }
+    let title = ["Tracking Details", "Backup Details", "Restore Details"][selected];
+    crate::tui::detail_panel::Information::new(title, ITEMS[selected].1, lines)
+}
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+fn detail_value(label: &str, value: impl Into<String>) -> Line<'static> {
+    let value = value.into();
+    Line::from(vec![
+        Span::styled(format!("{label:<14} "), Style::default().fg(T.text_muted)),
+        Span::styled(
+            if value.is_empty() {
+                "—".into()
+            } else {
+                value
+            },
+            Style::default().fg(T.text_primary),
+        ),
+    ])
+}
+
+fn last_archive_detail(
+    last_archive: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> Line<'static> {
+    let status = auto_backup_status_line(last_archive, now);
+    let text = status
+        .spans
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+    let value = text
+        .trim_start()
+        .strip_prefix(AUTO_BACKUP_LABEL)
+        .unwrap_or(text.trim_start())
+        .to_string();
+    detail_value("Last Archive", value)
+}
+
+fn log_mode_label(mode: &LogMode) -> String {
+    match mode {
+        LogMode::All => "All".into(),
+        LogMode::BlockedOnly => "Blocked Only".into(),
+        LogMode::Sampled { allowed_rate } => format!("Sampled ({:.0}%)", allowed_rate * 100.0),
+    }
 }
 
 /// The "Last auto-backup" status line. `None` archive ⇒ a
@@ -163,135 +331,103 @@ pub(crate) fn auto_backup_banner_lines(
 /// (checkbox / radio / numeric input) plus a help + footer line.
 /// Focused row is highlighted; unfocused rows render at muted
 /// intensity so the operator always sees WHICH control is live.
-pub fn render_tracking_panel(f: &mut Frame, area: Rect, panel: &TrackingPanelState) {
-    let content = render_section_chrome(f, area, "Tracking", T.text_secondary);
-
-    // Reserve the bottom row for the submit/validation message FIRST so it
-    // can never be starved: on a short panel ratatui shrinks trailing
-    // constraints, and the submit line — the only feedback channel,
-    // including TRACKING_VALIDATION_* errors — used to be the lowest-
-    // priority `Min(1)` row and collapsed first. The dismissable help line
-    // absorbs the squeeze instead. (set-02)
-    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(content);
-    let body = outer[0];
-    let footer = outer[1];
-
-    // 1 checkbox + 1 radio + 1 numeric + blank + help
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(body);
-
-    f.render_widget(
-        Paragraph::new(row_enabled(panel)).wrap(Wrap { trim: false }),
-        rows[0],
+pub fn render_tracking_panel(f: &mut Frame, area: Rect, app: &App, panel: &TrackingPanelState) {
+    use crate::tui::modal_form::{self, Action, ActionKind, FormRows, ValueKind};
+    let body_area = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "Edit Tracking",
+        "Query Logging & Retention",
+        theme::CardRole::History,
     );
-    f.render_widget(
-        Paragraph::new(row_mode(panel)).wrap(Wrap { trim: false }),
-        rows[1],
-    );
-    f.render_widget(
-        Paragraph::new(row_retention(panel)).wrap(Wrap { trim: false }),
-        rows[2],
-    );
-
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  Tab: next field · Space/Enter: toggle · ←/→: mode · digits: retention · s: submit · Esc: back",
-            Style::default().fg(T.text_muted),
-        ))),
-        rows[4],
-    );
-
-    if let Some(msg) = &panel.submit_message {
-        let color = if msg.starts_with("error:") {
-            T.error
-        } else {
-            T.success
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("  {msg}"),
-                Style::default().fg(color),
-            ))),
-            footer,
-        );
+    let mut rows = FormRows::new("", "", body_area.width.saturating_sub(1));
+    for line in
+        modal_form::section_band_with_role("Query Logging", rows.width(), theme::CardRole::Summary)
+    {
+        rows.line(line);
     }
-}
-
-fn row_enabled(panel: &TrackingPanelState) -> Line<'static> {
-    let focused = panel.focus == TrackingFocus::Enabled;
-    let marker = if focused { "▸" } else { " " };
-    let check = if panel.query_log_enabled {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let style = if focused {
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(T.text_secondary)
-    };
-    Line::from(vec![
-        Span::styled(format!("{marker} "), style),
-        Span::styled(check.to_string(), style),
-        Span::styled(" Query log enabled".to_string(), style),
-    ])
-}
-
-fn row_mode(panel: &TrackingPanelState) -> Line<'static> {
-    let focused = panel.focus == TrackingFocus::Mode;
-    let marker = if focused { "▸" } else { " " };
-    let label_style = if focused {
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(T.text_secondary)
-    };
-    let current = match &panel.log_mode {
-        LogMode::All => "All",
-        LogMode::BlockedOnly => "Blocked only",
-        LogMode::Sampled { .. } => TRACKING_SAMPLED_LABEL,
-    };
-    Line::from(vec![
-        Span::styled(format!("{marker} Log mode: "), label_style),
-        Span::styled(
-            format!("< {current} >"),
-            Style::default().fg(if focused {
-                T.brand_red
+    rows.choice_field(
+        modal_form::value_row(
+            "Query Log",
+            if panel.query_log_enabled {
+                "Enabled"
             } else {
-                T.text_secondary
-            }),
+                "Disabled"
+            },
+            panel.focus == TrackingFocus::Enabled,
+            ValueKind::Editable,
+            None,
+            body_area.width.saturating_sub(1),
         ),
-    ])
-}
-
-fn row_retention(panel: &TrackingPanelState) -> Line<'static> {
-    let focused = panel.focus == TrackingFocus::Retention;
-    let marker = if focused { "▸" } else { " " };
-    let label_style = if focused {
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(T.text_secondary)
-    };
-    let value = if focused {
-        format!("[ {} _ ]", panel.retention_input)
-    } else {
-        format!("  {}  ", panel.retention_days)
-    };
-    Line::from(vec![
-        Span::styled(format!("{marker} Retention days (1..365): "), label_style),
-        Span::styled(value, Style::default().fg(T.warning)),
-    ])
+        panel.focus == TrackingFocus::Enabled,
+        "Space changes query logging",
+    );
+    rows.choice_field(
+        modal_form::value_row(
+            "Mode",
+            &log_mode_label(&panel.log_mode),
+            panel.focus == TrackingFocus::Mode,
+            ValueKind::Editable,
+            None,
+            body_area.width.saturating_sub(1),
+        ),
+        panel.focus == TrackingFocus::Mode,
+        "Left/Right changes the logging mode",
+    );
+    for line in
+        modal_form::section_band_with_role("Retention", rows.width(), theme::CardRole::History)
+    {
+        rows.line(line);
+    }
+    rows.text_field(
+        modal_form::value_row(
+            "Keep Days",
+            &panel.retention_input,
+            panel.focus == TrackingFocus::Retention,
+            ValueKind::Editable,
+            None,
+            body_area.width.saturating_sub(1),
+        ),
+        panel.focus == TrackingFocus::Retention,
+        "Keep 1–365 days",
+        panel.retention_input.len() as u16,
+    );
+    let actions = [
+        Action::new(
+            " Discard ",
+            panel.focus == TrackingFocus::Discard,
+            ActionKind::Neutral,
+            "Discard draft",
+        )
+        .on_key(KeyCode::Esc),
+        Action::new(
+            " Save ",
+            panel.focus == TrackingFocus::Save,
+            ActionKind::Primary,
+            "Save tracking settings",
+        )
+        .on_save(),
+    ];
+    let tail = modal_form::form_tail(
+        &rows,
+        panel.submit_message.as_deref(),
+        "",
+        "Tab Move · Ctrl+S Save · Esc Discard",
+        &actions,
+    );
+    let (mut body, cursor) = rows.finish(tail);
+    body.head = vec![Line::default()];
+    let view = modal_form::render_scroll_body(f, body_area, &body);
+    if let Some((row, caret)) = cursor {
+        if row >= view.offset && row < view.offset + view.view_h {
+            let x = body_area.x + modal_form::VALUE_COL as u16 + caret;
+            let y = body_area.y + (view.head_h + row - view.offset) as u16;
+            if x < body_area.right() && y < body_area.bottom() {
+                f.set_cursor_position((x, y));
+            }
+        }
+    }
+    let _ = app;
 }
 
 #[cfg(test)]

@@ -3,23 +3,42 @@
 //! Launched via `warden dashboard`. Connects to the running daemon over IPC
 //! and displays live stats, query logs, device activity, and configuration.
 
+mod action_handlers;
+mod actions;
 mod app;
 mod backup_restore_modal;
 mod custom_list_modal;
 mod event;
 mod format;
+mod query_log_client_picker;
+mod query_log_controls;
+mod query_log_detail;
 // The Groups Add / Edit / Delete modal. Private, unlike
 // `subnet_modal` — that one was promoted so a frozen-string integration
 // test could reach `SUBNET_SUGGESTED_TAG` through it; this module exports
 // no frozen string, and `app::GroupsState` reaches it as a sibling
 // descendant of `crate::tui`.
+mod detail_panel;
+mod filter_chips;
 mod group_modal;
 mod help;
 mod ipc_poller;
+mod jobs;
 mod label_modal;
 mod local_dns_modal;
 mod modal_form;
+mod mouse;
+mod mouse_focus;
+#[cfg(feature = "cluster")]
+mod node_modal;
+#[cfg(feature = "cluster")]
+mod nodes;
+mod operator_policy;
 mod overlay;
+mod reads;
+#[cfg(test)]
+#[path = "tests/tui_port_interaction_tests.rs"]
+mod tui_port_interaction_tests;
 // Profiles tab modal (Add / Edit / Delete).
 //
 // Promoted to `pub mod` on the same
@@ -69,6 +88,7 @@ pub use tabs::lists::{
     UNSIGNED_ALLOW_CONFIRM_HINT, UNSIGNED_ALLOW_CONFIRM_MISMATCH, UNSIGNED_ALLOW_CONFIRM_PROMPT,
     UNSIGNED_ALLOW_CONFIRM_RISK_1, UNSIGNED_ALLOW_CONFIRM_RISK_2, UNSIGNED_ALLOW_CONFIRM_TITLE,
 };
+pub(crate) mod text;
 mod theme;
 // The transient action-feedback overlay. Lives beside `ui`
 // rather than inside it — `ui` owns the four-chunk frame layout, the
@@ -133,7 +153,8 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyCode,
+    KeyEvent, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -152,6 +173,8 @@ use event::Event;
 use ipc_poller::IpcPoller;
 use tabs::file;
 
+#[cfg(feature = "cluster")]
+use crate::cluster::node_control::MAX_ASSOCIATION_TOKEN_BYTES;
 use crate::config::settings::ClientConfig;
 use crate::ipc::protocol::DevicePatch;
 
@@ -232,7 +255,12 @@ pub async fn run(
     // with DisableBracketedPaste in `restore_terminal`, which both the guard
     // and the panic hook run — a half-pair would leave the operator's terminal
     // in bracketed mode after exit.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -300,6 +328,7 @@ fn restore_terminal() {
         std::io::stdout(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableMouseCapture,
         crossterm::cursor::Show
     );
 }
@@ -347,7 +376,8 @@ async fn run_app(
         }
     };
 
-    let poller = IpcPoller::new(socket_path);
+    let poller = std::sync::Arc::new(IpcPoller::new(socket_path));
+    app.read_jobs = Some(jobs::ReadScheduler::new(std::sync::Arc::clone(&poller)));
     // Clone the editor-handoff flags into the reader thread: the `e`
     // handler sets `reader_suspended` and waits on `reader_parked` around the
     // blocking $EDITOR spawn so two readers never race the same tty.
@@ -364,6 +394,7 @@ async fn run_app(
     // can spawn jobs without threading it through every handler.
     let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<app::UiJob>();
     app.job_tx = Some(job_tx);
+    operator_policy::spawn_startup_resume(&mut app, &poller, config_path);
 
     // SIGHUP/SIGTERM/SIGINT → exit. Defense-in-depth alongside the reader
     // thread's dead-tty detection: if the kernel delivers a terminating signal
@@ -376,14 +407,9 @@ async fn run_app(
     // pattern (src/cli/commands/start.rs), which installs terminate() as well
     // as hangup(); the TUI previously copied only the hangup half.
     //
-    // Every signal handled here is exit-desired. tokio's process-wide signal
-    // delivery can land EINTR on the hangup watchdog thread's `poll()` (which
-    // `event::spawn_event_reader` does not auto-restart — a known deferred
-    // issue), but because an EINTR-induced
-    // early `Event::Eof` only triggers teardown — the very outcome TERM/INT/HUP
-    // ask for — widening the handler set here stays benign. Do NOT add a
-    // *non-exit* handler (e.g. a SIGUSR1 stats dump) without first fixing that
-    // EINTR conflation, or a stray signal would become a spurious dashboard exit.
+    // Every signal handled here requests exit. The reader's hangup watchdog
+    // treats EINTR as still alive and resumes polling; an interrupted syscall
+    // alone does not fabricate Event::Eof (see event::hangup_from_poll_error).
     //
     // Keyboard Ctrl+C is unaffected: raw mode disables ISIG, so ^C arrives as a
     // key event (handled below), not a signal. The interrupt() arm catches only
@@ -404,7 +430,7 @@ async fn run_app(
     // Resolver tabs and the Devices source-annotation. Silent failure is
     // fine: each consuming tab renders a "config unreadable — press r"
     // hint when `loaded_config` is None.
-    app.loaded_config = load_v1_config(config_path);
+    app.loaded_config = load_current_config(config_path);
 
     // Prime the Settings-tab auto-backup snapshot so the
     // status line / failure banner are correct on first render.
@@ -416,6 +442,14 @@ async fn run_app(
     let mut dirty = true;
 
     loop {
+        // Explicit navigation/filter requests also run while paused. Restart
+        // the automatic cadence here, where the request is actually scheduled.
+        if reads::flush_explicit(&mut app) {
+            last_poll = Instant::now();
+            dirty = true;
+        }
+        reads::refresh_status(&mut app);
+        reads::spawn_ready(&mut app);
         // Render if dirty
         if dirty {
             // Re-anchor the active tab's cursor to the rows it is
@@ -432,7 +466,11 @@ async fn run_app(
                 clamp_custom_lists_focus_to_layout(&mut app, size.width);
             }
             reconcile_active_leaf_selection(&mut app);
-            terminal.draw(|f| ui::render(f, &mut app))?;
+            terminal.draw(|f| {
+                ui::render(f, &mut app);
+                reads::render_loading(f, &app);
+                actions::render_saving(f, &app);
+            })?;
             dirty = false;
         }
 
@@ -469,6 +507,12 @@ async fn run_app(
                     break; // quit
                 }
             }
+            Event::Mouse(event) => {
+                dirty = true;
+                if handle_mouse(&mut app, event, &poller, config_path).await {
+                    break;
+                }
+            }
             Event::Paste(pasted) => {
                 // Atomic paste — append to the focused text buffer only, inert
                 // in confirm/menu/nav contexts. Sync, no await:
@@ -491,19 +535,6 @@ async fn run_app(
                 // 33ms, and repainting unconditionally would pin the
                 // render loop at ~30 FPS on a box also serving DNS.
                 if app.expire_status() {
-                    dirty = true;
-                }
-                // An explicit fetch request from a key
-                // handler, honoured ahead of — and outside — the pause gate.
-                // `[p]` suspends the *automatic* refresh; `PgDn` is the
-                // operator asking for a specific page, and advancing
-                // `page_index` without fetching would paint page N-1's rows
-                // under the label "page N". Refusing instead would need a
-                // second explanation surface for a state `p` already exits.
-                if app.force_poll {
-                    app.force_poll = false;
-                    poll_active_leaf(&mut app, &poller).await;
-                    last_poll = Instant::now();
                     dirty = true;
                 }
                 if !app.paused {
@@ -552,28 +583,28 @@ async fn run_app(
                         | Leaf::Groups
                         | Leaf::Labels
                         | Leaf::CustomLists => Duration::from_secs(3600),
-                        // The Cluster tab reads `app.cluster_status`,
-                        // which the always-on heartbeat refreshes; no active-leaf
-                        // poll of its own. Joins the offline 3600s cohort.
+                        // Nodes receives authoritative membership status from
+                        // the heartbeat and therefore needs no separate tick.
                         #[cfg(feature = "cluster")]
-                        Leaf::Cluster => Duration::from_secs(3600),
+                        Leaf::Nodes => Duration::from_secs(3600),
                     };
 
                     if now.duration_since(last_poll) >= poll_interval {
-                        poll_active_leaf(&mut app, &poller).await;
+                        reads::request_active(&mut app, jobs::ReadReason::Automatic);
                         last_poll = now;
                         dirty = true;
                     }
 
                     // Background heartbeat (status only)
                     if now.duration_since(last_heartbeat) >= POLL_HEARTBEAT {
-                        poll_heartbeat(&mut app, &poller).await;
+                        reads::request_heartbeat(&mut app, jobs::ReadReason::Automatic);
                         last_heartbeat = now;
                         dirty = true;
                     }
                 }
             }
             Event::Resize => {
+                app.mouse.clear_row_click();
                 dirty = true;
             }
         }
@@ -582,8 +613,343 @@ async fn run_app(
     Ok(())
 }
 
+async fn handle_mouse(
+    app: &mut App,
+    event: crossterm::event::MouseEvent,
+    poller: &IpcPoller,
+    config_path: &Path,
+) -> bool {
+    let Some(action) = mouse::action(app, event) else {
+        app.mouse.clear_row_click();
+        return false;
+    };
+    if !matches!(
+        action,
+        mouse::MouseAction::Row(..) | mouse::MouseAction::CustomRuleRow(_)
+    ) {
+        app.mouse.clear_row_click();
+    }
+    if matches!(action, mouse::MouseAction::Key(_)) && !mouse::overlay_open(app) {
+        app.filter_focus = None;
+        app.mouse.blur_sort();
+    }
+    match action {
+        mouse::MouseAction::Row(..)
+        | mouse::MouseAction::LabelKind(_)
+        | mouse::MouseAction::LabelsPanel(_)
+        | mouse::MouseAction::LabelsScroll(..)
+        | mouse::MouseAction::CustomRuleRow(_)
+        | mouse::MouseAction::DetailPanel(_)
+        | mouse::MouseAction::DetailScroll(..)
+        | mouse::MouseAction::Leaf(_)
+        | mouse::MouseAction::Section(_) => {
+            app.filter_focus = None;
+            app.mouse.blur_sort();
+        }
+        mouse::MouseAction::Sort(..) | mouse::MouseAction::SubnetClientSort(_) => {
+            app.filter_focus = None;
+        }
+        mouse::MouseAction::Filter(..) => app.mouse.blur_sort(),
+        _ => {}
+    }
+    match action {
+        mouse::MouseAction::DetailPanel(leaf) => {
+            detail_panel::focus(app, leaf);
+        }
+        mouse::MouseAction::DetailScroll(leaf, code) => {
+            detail_panel::scroll(app, leaf, code);
+        }
+        mouse::MouseAction::SubnetPanel(panel) if app.active_leaf == Leaf::Subnets => {
+            app.mouse.subnet_panel = panel.min(4)
+        }
+        mouse::MouseAction::SubnetScroll(panel, code) if app.active_leaf == Leaf::Subnets => {
+            app.mouse.subnet_panel = panel.min(4);
+            return handle_key(
+                app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                poller,
+                config_path,
+            )
+            .await;
+        }
+        mouse::MouseAction::SubnetClientSort(column) if app.active_leaf == Leaf::Subnets => {
+            let previous = app.mouse.subnet_client_sort;
+            app.mouse.subnet_client_sort = Some(mouse::SortOrder {
+                column,
+                descending: previous.is_some_and(|sort| sort.column == column && !sort.descending),
+            });
+        }
+        mouse::MouseAction::OverlayField(index) => mouse_focus::field(app, index),
+        mouse::MouseAction::OverlayChoice(index) => {
+            if let Some(DeviceModal::Form(form)) = app.devices.modal.as_mut() {
+                if let Some(picker) = form.picker.as_mut() {
+                    if index < picker.options.len() {
+                        picker.cursor = index;
+                        form.picker_focus = query_log_controls::FilterFocus::Value;
+                        if picker.multi {
+                            handle_form_picker_key(form, KeyCode::Char(' '));
+                        }
+                    }
+                    return false;
+                }
+            }
+            if let Some(code) = mouse_focus::choice(app, index) {
+                return handle_key(
+                    app,
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    poller,
+                    config_path,
+                )
+                .await;
+            }
+        }
+        mouse::MouseAction::OverlayKey(key) => {
+            if let Some(modal) = app.query_log_rule_modal.as_mut() {
+                modal.focus_pointer_action(key.code);
+            }
+            return handle_key(app, key, poller, config_path).await;
+        }
+        mouse::MouseAction::Key(code) => {
+            return handle_key(
+                app,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                poller,
+                config_path,
+            )
+            .await;
+        }
+        mouse::MouseAction::CustomRuleRow(index) if app.active_leaf == Leaf::CustomLists => {
+            if let Some((list, rows)) = current_custom_rule_rows(app) {
+                if let Some(row) = rows.get(index) {
+                    app.custom_lists.focus = CustomListsFocus::Rules;
+                    app.custom_lists.selected_row_ref =
+                        Some((list.id, tabs::custom_lists::rule_row_key(row).to_owned()));
+                    app.custom_lists.rules_table_state.select(Some(index));
+                    let identity = format!("rule:{:?}", app.custom_lists.selected_row_ref);
+                    if app
+                        .mouse
+                        .row_click(Leaf::CustomLists, identity, std::time::Instant::now())
+                    {
+                        return handle_key(app, KeyCode::Enter.into(), poller, config_path).await;
+                    }
+                }
+            }
+        }
+        mouse::MouseAction::LabelKind(index) if app.active_leaf == Leaf::Labels => {
+            if let Some(kind) = tabs::labels::menu_kinds().get(index).copied() {
+                select_label_kind(app, kind);
+            }
+        }
+        mouse::MouseAction::LabelsPanel(focus) if app.active_leaf == Leaf::Labels => {
+            app.mouse.blur_detail(Leaf::Labels);
+            app.labels.focus = focus;
+        }
+        mouse::MouseAction::LabelsScroll(focus, code) if app.active_leaf == Leaf::Labels => {
+            app.mouse.blur_detail(Leaf::Labels);
+            app.labels.focus = focus;
+            handle_labels_key(app, code.into());
+        }
+        mouse::MouseAction::Section(section) => {
+            let leaf = section.default_leaf();
+            if app.active_leaf != leaf {
+                actions::detach_presentation(app);
+            }
+            app.active_leaf = leaf;
+            app.pending_goto = false;
+            poll_active_leaf(app, poller).await;
+            if leaf == Leaf::Settings {
+                refresh_auto_backup_view(app, config_path);
+            }
+        }
+        mouse::MouseAction::Leaf(leaf) if leaf_visible(leaf, app) => {
+            if app.active_leaf != leaf {
+                actions::detach_presentation(app);
+            }
+            app.active_leaf = leaf;
+            app.pending_goto = false;
+            poll_active_leaf(app, poller).await;
+            if leaf == Leaf::Settings {
+                refresh_auto_backup_view(app, config_path);
+            }
+        }
+        mouse::MouseAction::Row(leaf, index) if leaf == app.active_leaf => {
+            select_mouse_row(app, leaf, index);
+            if let Some(identity) = selected_mouse_identity(app, leaf) {
+                if app
+                    .mouse
+                    .row_click(leaf, identity, std::time::Instant::now())
+                {
+                    return handle_key(app, KeyCode::Enter.into(), poller, config_path).await;
+                }
+            }
+        }
+        mouse::MouseAction::Sort(leaf, column) if leaf == app.active_leaf => {
+            app.mouse.blur_detail(leaf);
+            if leaf == Leaf::Labels {
+                app.labels.focus = LabelsFocus::Entries;
+            }
+            #[cfg(feature = "cluster")]
+            if leaf == Leaf::Nodes {
+                if let Some(sort) = nodes::NodeSort::from_column(column) {
+                    if app.nodes.sort == sort {
+                        app.nodes.descending = !app.nodes.descending;
+                    } else {
+                        app.nodes.sort = sort;
+                        app.nodes.descending = false;
+                    }
+                }
+            } else {
+                app.mouse.toggle_sort(leaf, column);
+            }
+            #[cfg(not(feature = "cluster"))]
+            app.mouse.toggle_sort(leaf, column);
+        }
+        mouse::MouseAction::Filter(leaf, index)
+            if leaf == app.active_leaf && app.pending_action.is_none() =>
+        {
+            filter_chips::activate(app, index);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn selected_mouse_identity(app: &App, leaf: Leaf) -> Option<String> {
+    match leaf {
+        Leaf::Devices => app.devices.selected_id.as_ref().map(|id| format!("{id:?}")),
+        Leaf::QueryLog => app
+            .query_log
+            .selected_key
+            .as_ref()
+            .map(|id| format!("{id:?}")),
+        Leaf::Groups => app.groups.selected_id.clone(),
+        Leaf::Subnets => app.subnets.selected_id.clone(),
+        Leaf::Profiles => app.profiles.selected_id.clone(),
+        Leaf::LocalDns => app
+            .local_dns
+            .selected_id
+            .as_ref()
+            .map(|id| format!("{id:?}")),
+        Leaf::Lists => app.lists.selected_id.as_ref().map(|id| format!("{id:?}")),
+        Leaf::CustomLists => app.custom_lists.selected_id.clone(),
+        Leaf::Labels => app.labels.selected_id.clone(),
+        Leaf::Settings => Some(app.settings.selected.to_string()),
+        Leaf::Logs => app
+            .logs
+            .selected
+            .as_ref()
+            .map(|entry| format!("{entry:?}:{}", app.logs.selected_occurrence)),
+        #[cfg(feature = "cluster")]
+        Leaf::Nodes => app.nodes.selected_id.clone(),
+        _ => None,
+    }
+}
+
+fn select_mouse_row(app: &mut App, leaf: Leaf, index: usize) {
+    app.mouse.blur_detail(leaf);
+    match leaf {
+        Leaf::Settings => app.settings.selected = index.min(2),
+        Leaf::Logs => tabs::logs::select(app, index),
+        Leaf::Devices => {
+            let key = tabs::devices::build_display_rows(app)
+                .get(index)
+                .and_then(tabs::devices::row_key);
+            if let Some(key) = key {
+                app.devices.table_state.select(Some(index));
+                app.devices.selected_id = Some(key);
+            }
+        }
+        Leaf::QueryLog if index < app.query_log.entries.len() => {
+            app.query_log.table_state.select(Some(index));
+            sync_query_log_selection(app);
+        }
+        Leaf::Profiles if index < profiles_len(app) => {
+            app.profiles.table_state.select(Some(index));
+            sync_profile_selection(app);
+        }
+        Leaf::Subnets if index < subnets_master_len(app) => {
+            app.subnets.table_state.select(Some(index));
+            sync_subnet_selection(app);
+        }
+        Leaf::Groups => {
+            if let Some(group) = tabs::groups::build_display_rows(app).get(index) {
+                app.groups.selected_id = Some(group.id.to_string());
+                app.groups.table_state.select(Some(index));
+            }
+        }
+        Leaf::LocalDns => {
+            let key = tabs::local_dns::build_display_rows(app)
+                .get(index)
+                .and_then(tabs::local_dns::display_row_key);
+            if let Some(key) = key {
+                app.local_dns.selected_id = Some(key);
+                app.local_dns.table_state.select(Some(index));
+            }
+        }
+        Leaf::Lists => {
+            if let Some(key) = tabs::lists::build_grouped_rows(app)
+                .get(index)
+                .and_then(tabs::lists::row_key)
+            {
+                app.lists.selected_id = Some(key);
+                app.lists.table_state.select(Some(index));
+            }
+        }
+        Leaf::CustomLists => {
+            if let Some(row) = tabs::custom_lists::build_display_rows(app).get(index) {
+                app.custom_lists.selected_id = Some(row.id.clone());
+                app.custom_lists.table_state.select(Some(index));
+                app.custom_lists.focus = CustomListsFocus::Lists;
+                app.custom_lists.selected_row_ref = None;
+                request_custom_list_rules(app, false);
+            }
+        }
+        Leaf::Labels => {
+            let key = tabs::labels::build_display_rows(app)
+                .get(index)
+                .map(|row| row.key.clone());
+            if let Some(key) = key {
+                app.labels.selected_id = Some(key);
+                app.labels.focus = app::LabelsFocus::Entries;
+                app.labels.table_state.select(Some(index));
+            }
+        }
+        #[cfg(feature = "cluster")]
+        Leaf::Nodes => {
+            if let Some(row) = tabs::nodes::build_rows(app).get(index) {
+                app.nodes.selected_id = Some(row.id.clone());
+                app.nodes.table_state.select(Some(index));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_save_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s' | 'S')) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// Returns true if the app should quit.
 async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) -> bool {
+    if let Some(quit) = actions::handle_busy_key(app, key) {
+        return quit;
+    }
+    let socket = poller.socket_path().to_owned();
+    handle_key_with_reload(app, key, poller, config_path, async move {
+        IpcPoller::new(&socket).send_reload().await
+    })
+    .await
+}
+
+/// The reload future is lazy and is consumed only by manual refresh. Keeping
+/// it explicit lets dispatcher regressions use an isolated reload outcome.
+async fn handle_key_with_reload(
+    app: &mut App,
+    key: KeyEvent,
+    poller: &IpcPoller,
+    config_path: &Path,
+    reload: impl std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
+) -> bool {
     // Welcome banner has the absolute highest priority.
     // Any keypress dismisses it AND records the version on disk so it
     // does NOT re-show on subsequent launches. The keystroke is
@@ -604,6 +970,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
+    app.mouse.clear_row_click();
+
+    if detail_panel::handle_information(app, key.code) {
+        return false;
+    }
+
     // An `Error` toast is sticky — it has no TTL, because an
     // error the operator never read is a lost error. It is dismissed by
     // the next key that acts on the tab, which is any key at all once
@@ -614,12 +986,78 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // incapable of swallowing a keystroke.
     app.dismiss_sticky_status();
 
+    #[cfg(feature = "cluster")]
+    {
+        if nodes::close_replicated_editor_if_locked(app) {
+            return false;
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    if app.active_leaf == Leaf::Nodes && app.nodes.dialog.is_some() {
+        handle_nodes_dialog_key(app, key, poller).await;
+        return false;
+    }
+
+    if app.operator_policy.is_some()
+        && (key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+    {
+        return true;
+    }
+    // Keep the accepted request and its underlying draft intact while moving
+    // between screens. A navigation key must never edit the hidden form.
+    if app.operator_policy.is_some() && actions::navigate_screen(app, key.code) {
+        return false;
+    }
+    if operator_policy::handle_key(app, key, poller, config_path).await {
+        return false;
+    }
+
+    if app.active_leaf == Leaf::Lists {
+        if let Some(selected) = app.lists.import_source {
+            match key.code {
+                KeyCode::Esc => app.lists.import_source = None,
+                KeyCode::Tab => {
+                    app.lists.import_source_focus = (app.lists.import_source_focus + 1) % 3
+                }
+                KeyCode::BackTab => {
+                    app.lists.import_source_focus = (app.lists.import_source_focus + 2) % 3
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                    if app.lists.import_source_focus == 0 =>
+                {
+                    app.lists.import_source = Some(1 - selected.min(1))
+                }
+                KeyCode::Enter if app.lists.import_source_focus == 1 => {
+                    app.lists.import_source = None
+                }
+                KeyCode::Enter | KeyCode::Char('p' | 'u') => {
+                    let choice = match key.code {
+                        KeyCode::Char('p') => 0,
+                        KeyCode::Char('u') => 1,
+                        _ => selected,
+                    };
+                    app.lists.import_source = None;
+                    if choice == 0 {
+                        open_catalog_picker(app).await;
+                    } else {
+                        app.lists.edit_modal = Some(tabs::lists::build_add_modal());
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+    }
+
     // Modal overlay on the Devices tab takes absolute priority — every
     // key while a form or confirmation dialog is open must reach the
     // modal handler, NOT fall through to tab navigation. Without this
     // gate, typing "1" inside the form's name field would jump to
     // Dashboard.
-    if app.active_leaf == Leaf::Devices && app.devices.modal.is_some() {
+    if app.active_leaf == Leaf::Devices && (app.devices.modal.is_some() || app.devices.inspect_open)
+    {
         handle_modal_key(app, key, poller).await;
         return false;
     }
@@ -651,12 +1089,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         handle_rules_edit_modal_key(app, key, poller, config_path).await;
         return false;
     }
-    // Same gate pattern as the edit_modal gate just
-    // above — the add-rule modal (opened with `[a]` in `handle_rules_key`)
-    // captures a typed domain, so every keystroke must route here while
-    // it's open rather than falling into the global keybindings below
-    // (`q`, `1`-`5`, `Tab`, …). Key handling itself lives in
-    // `rule_add_modal::handle_key`, not in this function.
+    // Compatibility gate for an already-instantiated legacy add modal.
+    // No current key opens it, but while one exists it must still capture
+    // every keystroke instead of leaking into global navigation.
     if app.active_leaf == Leaf::Rules && app.rules.add_modal.is_some() {
         rule_add_modal::handle_key(app, key, poller, config_path).await;
         return false;
@@ -669,12 +1104,34 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
+    // Query Log overlays own keys before the table (and therefore before
+    // Enter's rule action). Both hold drafts/captured entries, so a poll or
+    // resize cannot make a key act on a different row.
+    if app.query_log.client_picker.is_some() {
+        handle_query_log_client_picker_key(app, key);
+        return false;
+    }
+    if app.query_log.detail.is_some() {
+        handle_query_log_detail_key(app, key);
+        return false;
+    }
+    if app.query_log.period_menu {
+        handle_query_log_period_key(app, key);
+        return false;
+    }
+
     // Local DNS modal (Add / Remove / Edit) opened
     // from Leaf::LocalDns via `a` / `d`|`Delete` / `e`. Same gate pattern
     // as the Devices / Lists / rule-picker modals — once open, the modal
     // owns every keystroke until submit lands or Esc closes.
-    if app.active_leaf == Leaf::LocalDns && app.local_dns.modal.is_some() {
-        handle_local_dns_modal_key(app, key, poller, config_path).await;
+    if app.active_leaf == Leaf::LocalDns
+        && (app.local_dns.modal.is_some() || app.local_dns.inspect_open)
+    {
+        if app.local_dns.inspect_open {
+            handle_local_dns_inspect_key(app, key);
+        } else {
+            handle_local_dns_modal_key(app, key, poller, config_path).await;
+        }
         return false;
     }
 
@@ -711,15 +1168,25 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // Subnets modal (Add / Edit / Delete) opened from
     // Leaf::Subnets via `a` / `e` / `d`. Same gate pattern as the
     // Local DNS modal.
-    if app.active_leaf == Leaf::Subnets && app.subnets.modal.is_some() {
-        handle_subnet_modal_key(app, key, poller, config_path).await;
+    if app.active_leaf == Leaf::Subnets
+        && (app.subnets.modal.is_some() || app.subnets.inspect.is_some())
+    {
+        if app.subnets.inspect.is_some() {
+            handle_subnet_inspect_key(app, key);
+        } else {
+            handle_subnet_modal_key(app, key, poller, config_path).await;
+        }
         return false;
     }
 
     // Groups modal (Add / Edit / Delete) opened from
     // Leaf::Groups via `a` / `e` / `d`. Same gate pattern as Subnets.
-    if app.active_leaf == Leaf::Groups && app.groups.modal.is_some() {
-        handle_group_modal_key(app, key, poller, config_path).await;
+    if app.active_leaf == Leaf::Groups && (app.groups.modal.is_some() || app.groups.inspect_open) {
+        if app.groups.inspect_open {
+            handle_group_inspect_key(app, key);
+        } else {
+            handle_group_modal_key(app, key, poller, config_path).await;
+        }
         return false;
     }
 
@@ -727,6 +1194,21 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // Leaf::Labels via `a` / `e` / `d`. Same gate pattern as Groups.
     if app.active_leaf == Leaf::Labels && app.labels.modal.is_some() {
         handle_label_modal_key(app, key, poller, config_path).await;
+        return false;
+    }
+
+    // Read-only detail overlays are modal surfaces too: global navigation
+    // must not move them onto another leaf or let an underlying action fire.
+    if app.active_leaf == Leaf::Profiles && app.profiles.info_open {
+        handle_profiles_key(app, key);
+        return false;
+    }
+    if app.active_leaf == Leaf::Lists && app.lists.detail_id.is_some() {
+        handle_lists_key(app, key, poller, config_path).await;
+        return false;
+    }
+    if app.active_leaf == Leaf::CustomLists && app.custom_lists.info.is_some() {
+        handle_custom_lists_key(app, key);
         return false;
     }
 
@@ -762,6 +1244,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
+    if filter_chips::choice_editor_open(app) {
+        filter_chips::handle_choice_key(app, key);
+        return false;
+    }
+
     // Source-IP resolver modal opened from any leaf via the
     // global hotkey `s`. The gate is global (not leaf-scoped) because
     // the modal is reachable from anywhere; once open the modal owns
@@ -772,35 +1259,29 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         return false;
     }
 
+    // File search is an input mode: global shortcuts are literal text here.
+    if app.active_leaf == Leaf::File && app.file.section_jump.is_some() {
+        handle_file_key(app, key, poller, config_path).await;
+        return false;
+    }
+
     // Text input mode takes priority. Both filter prompts share the
     // same edit contract — `drive_text_input` routes the keystroke and
     // returns where the buffer ended up so each caller decides which
     // `app.query_log` slot the committed string lands in.
     match &mut app.input_mode {
-        InputMode::FilterDomain(buf) => {
-            match drive_text_input(buf, key) {
-                TextInputOutcome::Submit(val) => {
-                    app.query_log.filter_domain = if val.is_empty() { None } else { Some(val) };
-                    app.input_mode = InputMode::Normal;
-                    // Filters run DURING the walk, so a cursor minted
-                    // under the previous predicate set names a boundary
-                    // that no longer exists. `reset_paging` on every
-                    // commit, not just on `R`.
-                    app.query_log.reset_paging();
-                }
-                TextInputOutcome::Cancel => {
-                    app.input_mode = InputMode::Normal;
-                }
-                TextInputOutcome::Continue => {}
-            }
+        InputMode::FilterDomain(_) => {
+            handle_query_log_domain_key(app, key);
             return false;
         }
         InputMode::FilterClient(buf) => {
             match drive_text_input(buf, key) {
                 TextInputOutcome::Submit(val) => {
                     app.query_log.filter_client = if val.is_empty() { None } else { Some(val) };
+                    app.query_log.client_ips.clear();
+                    app.query_log.client_mode = app::ClientFilterMode::Text;
                     app.input_mode = InputMode::Normal;
-                    app.query_log.reset_paging();
+                    request_query_log_filter_fetch(app);
                 }
                 TextInputOutcome::Cancel => {
                     app.input_mode = InputMode::Normal;
@@ -809,48 +1290,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             }
             return false;
         }
-        InputMode::FilterLists(buf) => {
-            match drive_text_input(buf, key) {
-                TextInputOutcome::Submit(val) => {
-                    app.lists.filter_text = if val.is_empty() { None } else { Some(val) };
-                    app.input_mode = InputMode::Normal;
-                    reconcile_lists_selection(app);
-                }
-                TextInputOutcome::Cancel => {
-                    app.input_mode = InputMode::Normal;
-                }
-                TextInputOutcome::Continue => {}
-            }
-            return false;
-        }
-        InputMode::FilterLogs(buf) => {
-            match drive_text_input(buf, key) {
-                TextInputOutcome::Submit(val) => {
-                    app.logs.filter_text = if val.is_empty() { None } else { Some(val) };
-                    app.input_mode = InputMode::Normal;
-                    // The daemon applies this during its walk, so the page
-                    // that comes back is a different set of rows — an old
-                    // offset would point into a page that no longer exists.
-                    app.logs.scroll_offset = 0;
-                }
-                TextInputOutcome::Cancel => {
-                    app.input_mode = InputMode::Normal;
-                }
-                TextInputOutcome::Continue => {}
-            }
-            return false;
-        }
-        InputMode::FilterDevicesSubnet(buf) => {
-            match drive_text_input(buf, key) {
-                TextInputOutcome::Submit(val) => {
-                    app.devices.filter_subnet = if val.is_empty() { None } else { Some(val) };
-                    app.input_mode = InputMode::Normal;
-                }
-                TextInputOutcome::Cancel => {
-                    app.input_mode = InputMode::Normal;
-                }
-                TextInputOutcome::Continue => {}
-            }
+        InputMode::FilterLists(_)
+        | InputMode::FilterLogs(_)
+        | InputMode::FilterDevicesSubnet(_) => {
+            filter_chips::handle_text_key(app, key);
             return false;
         }
         InputMode::FilterRules(buf) => {
@@ -867,7 +1310,24 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             }
             return false;
         }
+        #[cfg(feature = "cluster")]
+        InputMode::FilterNodes(buf) => {
+            match drive_text_input(buf, key) {
+                TextInputOutcome::Submit(value) => {
+                    app.nodes.search = value;
+                    app.nodes.selected_id = None;
+                    app.input_mode = InputMode::Normal;
+                }
+                TextInputOutcome::Cancel => app.input_mode = InputMode::Normal,
+                TextInputOutcome::Continue => {}
+            }
+            return false;
+        }
         InputMode::Normal => {}
+    }
+
+    if !app.show_help && filter_chips::handle_key(app, key) {
+        return false;
     }
 
     // ── `?` is a menu you can press ───────────────────────────────────────
@@ -901,6 +1361,22 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
     // open" holds structurally, not by a check that could rot.
     let dispatched_from_help = if app.show_help {
         match key.code {
+            KeyCode::PageUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(NAV_PAGE);
+                return false;
+            }
+            KeyCode::PageDown => {
+                app.help_scroll = app.help_scroll.saturating_add(NAV_PAGE);
+                return false;
+            }
+            KeyCode::Home => {
+                app.help_scroll = 0;
+                return false;
+            }
+            KeyCode::End => {
+                app.help_scroll = usize::MAX;
+                return false;
+            }
             // Close, and do nothing else. `?` is special-cased so the
             // fall-through below cannot toggle it straight back on, and `q`
             // closes help rather than quitting.
@@ -951,6 +1427,17 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
         false
     };
 
+    #[cfg(feature = "cluster")]
+    if !mnemonic_dispatched && nodes::block_policy_mutation(app, key) {
+        if dispatched_from_help {
+            app.show_help = true;
+        }
+        return false;
+    }
+
+    if !mnemonic_dispatched && mouse::handle_sort_key(app, key) {
+        return false;
+    }
     if !mnemonic_dispatched {
         match key.code {
             KeyCode::Char('q') => return true,
@@ -969,21 +1456,14 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
             KeyCode::Char('3') => app.active_leaf = Section::Network.default_leaf(),
             KeyCode::Char('4') => app.active_leaf = Section::Filters.default_leaf(),
             KeyCode::Char('5') => app.active_leaf = Section::Configuration.default_leaf(),
-            // `6` jumps to the Cluster section, but only when it is
-            // visible (built with `cluster` + `[cluster].enabled`). Otherwise
-            // it falls through as an unbound key, matching the 7-9 drop.
-            #[cfg(feature = "cluster")]
-            KeyCode::Char('6') if app.cluster_visible() => {
-                app.active_leaf = Section::Cluster.default_leaf()
-            }
             // `[` / `]` cycle the leaves of the active
             // section (wraps within the section). `Tab` / `Shift-Tab`
             // keep cycling ALL leaves linearly so the existing operator
             // muscle memory of "press Tab to walk through everything"
             // survives the grouped chrome. The linear cycle skips
             // a runtime-hidden cluster leaf via `next_visible`/`prev_visible`.
-            KeyCode::Char('[') => app.active_leaf = app.active_leaf.prev_in_section(),
-            KeyCode::Char(']') => app.active_leaf = app.active_leaf.next_in_section(),
+            KeyCode::Char('[') => app.active_leaf = visible_leaf_in_section(app, false),
+            KeyCode::Char(']') => app.active_leaf = visible_leaf_in_section(app, true),
             // `Tab` was once asked to switch the Labels leaf's two
             // panes, and it was built that way and then **reverted**.
             // Kept as a comment because it is the decision a future
@@ -1014,32 +1494,26 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
                 app.show_help = !app.show_help;
             }
             KeyCode::Char('r') => {
-                // Global refresh re-reads the on-disk config so the
-                // Subnets / Resolver / Devices-annotation tabs pick up
-                // operator edits without a full TUI restart.
-                app.loaded_config = load_v1_config(config_path);
-                refresh_auto_backup_view(app, config_path);
+                #[cfg(feature = "cluster")]
+                let may_reload = nodes::policy_access(app).editable;
+                #[cfg(not(feature = "cluster"))]
+                let may_reload = true;
+                if may_reload {
+                    action_handlers::reload(app, Some(config_path.to_owned()), reload).await;
+                } else {
+                    app.status_info("Refreshed read-only replica; daemon reload suppressed".into());
+                }
                 poll_active_leaf(app, poller).await;
                 poll_heartbeat(app, poller).await;
-                // Also tell the daemon to reload. Without this, the TUI
-                // would show the new on-disk config while the daemon kept
-                // serving DNS with the old in-memory one — a misleading
-                // split that surprised operators who expected `r` to mean
-                // "apply my edits". Outcome goes to the footer status line.
-                match poller.send_reload().await {
-                    Ok(msg) => app.status_ok(format!("reload: {msg}")),
-                    Err(e) => app.status_err(format!("reload failed: {e}")),
-                }
             }
             KeyCode::Char('p') => {
                 app.paused = !app.paused;
             }
-            // Open the global resolver modal. Pre-fills the
-            // input from QueryLog/Devices when the active leaf has a
-            // focused row (`prefill_from_active_leaf`); otherwise opens
-            // blank. Distinct from the two-key `g s` (Subnets) — the
-            // mnemonic prefix is consumed before this match runs.
-            KeyCode::Char('s') => {
+            KeyCode::Char('T') => {
+                app.theme = app.theme.next();
+                app.status_info(format!("Theme: {}", app.theme.name()));
+            }
+            KeyCode::Char('S') => {
                 let modal = match resolver_modal::prefill_from_active_leaf(app) {
                     Some((ip, source)) => resolver_modal::ResolverModal::open_with(ip, source),
                     None => resolver_modal::ResolverModal::open_blank(),
@@ -1082,18 +1556,25 @@ async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_pat
 /// owns its own key contract; this match is intentionally a 9-line
 /// router so adding a new tab requires touching one place, not
 /// chasing through a 400-line dispatcher.
-/// A leaf is nav-visible iff its owning section is shown. The only
-/// hideable section is `Section::Cluster` (hidden unless `cluster_visible()`);
-/// every other leaf is always visible. On a default build there is no cluster
-/// leaf, so this is unconditionally `true`.
-fn leaf_visible(leaf: Leaf, app: &App) -> bool {
-    #[cfg(feature = "cluster")]
-    if matches!(leaf, Leaf::Cluster) {
-        return app.cluster_visible();
+/// Hidden implementation leaves stay out of navigation; every menu leaf,
+/// including Nodes while standalone, is visible.
+fn leaf_visible(leaf: Leaf, _app: &App) -> bool {
+    leaf.is_menu_leaf()
+}
+
+fn visible_leaf_in_section(app: &App, forward: bool) -> Leaf {
+    let mut leaf = app.active_leaf;
+    for _ in app.active_leaf.section().leaves() {
+        leaf = if forward {
+            leaf.next_in_section()
+        } else {
+            leaf.prev_in_section()
+        };
+        if leaf_visible(leaf, app) {
+            return leaf;
+        }
     }
-    #[cfg(not(feature = "cluster"))]
-    let _ = (leaf, app);
-    true
+    app.active_leaf
 }
 
 /// `Tab` cycle that skips any runtime-hidden leaf. On a default build no leaf
@@ -1142,49 +1623,197 @@ async fn handle_tab_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
         Leaf::Labels => handle_labels_key(app, key),
         Leaf::CustomLists => handle_custom_lists_key(app, key),
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => handle_cluster_key(app, key),
+        Leaf::Nodes => handle_nodes_key(app, key, poller).await,
     }
 }
 
-/// Cluster tab key handling: `↑`/`↓` move the roster cursor
-/// (primary only; the secondary view is a single non-navigable card). The
-/// cursor is `selected_name` — resolve it to the current row index, step, and
-/// write the new node's name back, so the selection survives a roster reorder.
 #[cfg(feature = "cluster")]
-fn handle_cluster_key(app: &mut App, key: KeyEvent) {
-    let Some(status) = app.cluster_status.as_ref() else {
-        app.leaf_key_unhandled = true;
-        return;
-    };
-    let roster = &status.roster;
-    if roster.is_empty() {
-        // Secondary / no nodes yet — nothing to move, so nothing this
-        // key could have meant.
-        app.leaf_key_unhandled = true;
+async fn handle_nodes_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
+    if detail_panel::handle_detail_key(app, key.code) {
         return;
     }
-    // Current index from the stable name key; default to the top row.
-    let cur = app
-        .cluster
-        .selected_name
+    if key.code == KeyCode::Right && detail_panel::focus(app, Leaf::Nodes) {
+        return;
+    }
+    if matches!(key.code, KeyCode::Left | KeyCode::Esc) && detail_panel::focused(app, Leaf::Nodes) {
+        app.mouse.blur_detail(Leaf::Nodes);
+        return;
+    }
+    let rows = tabs::nodes::build_rows(app);
+    let current = app
+        .nodes
+        .selected_id
         .as_ref()
-        .and_then(|name| roster.iter().position(|r| &r.name == name))
+        .and_then(|id| rows.iter().position(|row| &row.id == id))
         .unwrap_or(0);
-    let last = roster.len() - 1;
-    let next = match key.code {
-        KeyCode::Down => (cur + 1).min(last),
-        KeyCode::Up => cur.saturating_sub(1),
-        // Jump / page. Already clamped above; these just travel further.
-        KeyCode::Home => 0,
-        KeyCode::End => last,
-        KeyCode::PageDown => (cur + NAV_PAGE).min(last),
-        KeyCode::PageUp => cur.saturating_sub(NAV_PAGE),
-        _ => {
-            app.leaf_key_unhandled = true;
+    if !rows.is_empty() {
+        let last = rows.len() - 1;
+        let next = match key.code {
+            KeyCode::Down => Some((current + 1).min(last)),
+            KeyCode::Up => Some(current.saturating_sub(1)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(last),
+            KeyCode::PageDown => Some((current + NAV_PAGE).min(last)),
+            KeyCode::PageUp => Some(current.saturating_sub(NAV_PAGE)),
+            _ => None,
+        };
+        if let Some(index) = next {
+            app.nodes.selected_id = Some(rows[index].id.clone());
+            app.nodes.table_state.select(Some(index));
             return;
         }
+    }
+
+    match key.code {
+        KeyCode::Char('i') => {
+            app.information = Some(tabs::nodes::information(app));
+            return;
+        }
+        KeyCode::Enter | KeyCode::Char('e') => {
+            if let Some(row) = rows.get(current) {
+                nodes::open_edit(app, row.id.clone(), row.name.clone(), row.endpoint);
+            }
+            return;
+        }
+        KeyCode::Char('a') => {
+            nodes::open_add(app);
+            return;
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            if let Some(row) = rows.get(current) {
+                if row.is_self {
+                    app.status_err("This node cannot be removed".into());
+                } else {
+                    nodes::preview_remove(app, row.id.clone(), poller).await;
+                }
+            }
+            return;
+        }
+        KeyCode::Char('/') => {
+            app.input_mode = InputMode::FilterNodes(app.nodes.search.clone());
+            return;
+        }
+        KeyCode::Char('R') => {
+            app.nodes.search.clear();
+            app.nodes.selected_id = None;
+            return;
+        }
+        KeyCode::Char('o') => {
+            app.nodes.sort = app.nodes.sort.next();
+            return;
+        }
+        KeyCode::Char('O') => {
+            app.nodes.descending = !app.nodes.descending;
+            return;
+        }
+        _ => {}
+    }
+
+    if key.code == KeyCode::Char('u') {
+        nodes::open_recovery(app);
+        return;
+    }
+    app.leaf_key_unhandled = true;
+}
+
+#[cfg(feature = "cluster")]
+async fn handle_nodes_dialog_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
+    use nodes::NodesDialog;
+
+    let mut preview = false;
+    let mut apply = false;
+    let mut cancel_preview = false;
+    let mut resume = false;
+    let mut close = false;
+    let cancelled_cleanup_resumable = match app.nodes.dialog.as_ref() {
+        Some(NodesDialog::Recovery { progress, .. }) => nodes::control_status_for_display(app)
+            .is_some_and(|status| nodes::is_cancelled_add_cleanup_pending(status, progress)),
+        _ => false,
     };
-    app.cluster.selected_name = Some(roster[next].name.clone());
+    match app.nodes.dialog.as_mut() {
+        Some(NodesDialog::Form(draft)) => match key.code {
+            KeyCode::Esc => close = true,
+            KeyCode::Tab | KeyCode::Down => {
+                draft.focus = (draft.focus + 1) % (draft.visible_fields() + 3);
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                draft.focus =
+                    (draft.focus + draft.visible_fields() + 2) % (draft.visible_fields() + 3);
+            }
+            KeyCode::Enter if draft.focus == draft.visible_fields() => {
+                draft.advanced = !draft.advanced;
+                draft.focus = draft.visible_fields();
+            }
+            KeyCode::Backspace if draft.focus < draft.visible_fields() => {
+                if let Some(field) = (draft.focus < draft.visible_fields())
+                    .then(|| draft.field_value_mut(draft.focus))
+                {
+                    field.pop();
+                    draft.error = None;
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() && draft.focus < draft.visible_fields() =>
+            {
+                if let Some(field) = (draft.focus < draft.visible_fields())
+                    .then(|| draft.field_value_mut(draft.focus))
+                {
+                    field.push(ch);
+                    draft.error = None;
+                }
+            }
+            KeyCode::Enter if draft.focus == draft.visible_fields() + 1 => close = true,
+            KeyCode::Enter => preview = true,
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => preview = true,
+            _ => {}
+        },
+        Some(NodesDialog::Review { .. }) => match key.code {
+            KeyCode::Enter => apply = true,
+            KeyCode::Char('c') => cancel_preview = true,
+            KeyCode::Esc => close = true,
+            _ => {}
+        },
+        Some(NodesDialog::Recovery { progress, .. }) => match key.code {
+            KeyCode::Enter
+                if progress.phase
+                    != crate::cluster::node_control::NodeOperationPhase::Cancelled
+                    || cancelled_cleanup_resumable =>
+            {
+                resume = true;
+            }
+            KeyCode::Char('c')
+                if progress.kind == crate::cluster::node_control::NodeOperationKind::Add
+                    && matches!(
+                        progress.phase,
+                        crate::cluster::node_control::NodeOperationPhase::PreparingTarget
+                            | crate::cluster::node_control::NodeOperationPhase::Prepared
+                            | crate::cluster::node_control::NodeOperationPhase::Paused
+                    ) =>
+            {
+                cancel_preview = true;
+            }
+            KeyCode::Esc => close = true,
+            _ => {}
+        },
+        Some(NodesDialog::Outcome { .. }) if matches!(key.code, KeyCode::Enter | KeyCode::Esc) => {
+            close = true;
+        }
+        Some(NodesDialog::Applying { .. }) if key.code == KeyCode::Esc => {
+            close = true;
+        }
+        _ => {}
+    }
+    if close {
+        app.nodes.dialog = None;
+    } else if preview {
+        nodes::submit_preview(app, poller).await;
+    } else if apply {
+        nodes::submit_apply(app, poller).await;
+    } else if resume {
+        nodes::submit_resume(app, poller).await;
+    } else if cancel_preview {
+        nodes::submit_cancel(app, poller).await;
+    }
 }
 
 // Subnets is master/detail with modal-driven CRUD. ↑/↓
@@ -1246,6 +1875,16 @@ fn handle_subnets_key(app: &mut App, key: KeyEvent) {
                 app.subnets.modal = Some(modal);
             }
         }
+        KeyCode::Char('i') => {
+            app.subnets.inspect = Some(crate::tui::app::SubnetInspect::Details);
+            app.subnets.client_sort_focus = None;
+            app.mouse.subnet_panel = 4;
+        }
+        KeyCode::Char('c') => {
+            app.subnets.inspect = Some(crate::tui::app::SubnetInspect::Clients);
+            app.subnets.client_sort_focus = None;
+            app.mouse.subnet_panel = 2;
+        }
         KeyCode::Enter => {
             // Promote-from-suggestion: open Add pre-filled with the
             // candidate's CIDR. Only fires when the focused row is a
@@ -1254,6 +1893,8 @@ fn handle_subnets_key(app: &mut App, key: KeyEvent) {
             // for now; per-subnet rule shortcuts are parked future work).
             if let Some(cidr) = focused_candidate_cidr(app) {
                 app.subnets.modal = Some(build_subnet_promote_modal(app, &cidr));
+            } else if let Some(modal) = build_subnet_edit_modal(app) {
+                app.subnets.modal = Some(modal);
             }
         }
         _ => app.leaf_key_unhandled = true,
@@ -1325,6 +1966,95 @@ fn ensure_subnet_selection_seeded(app: &mut App) {
     }
 }
 
+fn handle_subnet_inspect_key(app: &mut App, key: KeyEvent) {
+    use crate::tui::app::SubnetInspect;
+
+    match app.subnets.inspect {
+        Some(SubnetInspect::Details) => match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+                app.subnets.inspect = None;
+                app.mouse.subnet_panel = 0;
+            }
+            KeyCode::Char('c') => {
+                app.subnets.inspect = Some(SubnetInspect::Clients);
+                app.subnets.client_sort_focus = None;
+                app.mouse.subnet_panel = 2;
+            }
+            _ => {}
+        },
+        Some(SubnetInspect::Clients) => {
+            if let Some(column) = app.subnets.client_sort_focus {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Up | KeyCode::Down => {
+                        app.subnets.client_sort_focus = None;
+                    }
+                    KeyCode::Left | KeyCode::BackTab => {
+                        app.subnets.client_sort_focus = Some((column + 3) % 4);
+                    }
+                    KeyCode::Right | KeyCode::Tab => {
+                        app.subnets.client_sort_focus = Some((column + 1) % 4);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        app.mouse.subnet_client_sort = Some(match app.mouse.subnet_client_sort {
+                            Some(sort) if sort.column == column => mouse::SortOrder {
+                                column,
+                                descending: !sort.descending,
+                            },
+                            _ => mouse::SortOrder {
+                                column,
+                                descending: false,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    app.subnets.inspect = None;
+                    app.mouse.subnet_panel = 0;
+                }
+                KeyCode::Char('i') => {
+                    app.subnets.inspect = Some(SubnetInspect::Details);
+                    app.mouse.subnet_panel = 4;
+                }
+                KeyCode::Char('s') => {
+                    app.subnets.client_sort_focus = Some(
+                        app.mouse
+                            .subnet_client_sort
+                            .map(|sort| sort.column.min(3))
+                            .unwrap_or(0),
+                    );
+                }
+                code if tabs::subnets::handle_panel_key(app, code) => {}
+                _ => {}
+            }
+        }
+        None => {}
+    }
+}
+
+fn handle_group_inspect_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+            app.groups.inspect_open = false;
+            app.mouse.blur_detail(Leaf::Groups);
+        }
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => {
+            detail_panel::focus(app, Leaf::Groups);
+            detail_panel::scroll(app, Leaf::Groups, key.code);
+        }
+        _ => {}
+    }
+}
+
 /// Combined length of the master row list: configured subnets first,
 /// then auto-discovered candidates. Both counts are derived from
 /// `app.loaded_config` + `app.device_view`, so the math here mirrors
@@ -1341,7 +2071,11 @@ fn sync_subnet_selection(app: &mut App) {
         app.subnets.selected_id = None;
         return;
     };
-    app.subnets.selected_id = keys.get(idx).cloned();
+    let next = keys.get(idx).cloned();
+    if next != app.subnets.selected_id {
+        app.mouse.subnet_clients_scroll = 0;
+    }
+    app.subnets.selected_id = next;
 }
 
 // ── Subnet modal openers + key handler + submit ──────────────────────
@@ -1550,8 +2284,21 @@ async fn handle_subnet_modal_key(
             }
             app.subnets.modal = Some(modal);
         }
-        Stage::ConfirmingRemove(_) => match key.code {
+        Stage::ConfirmingRemove(confirm) => match key.code {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                confirm.focus = 1 - confirm.focus.min(1);
+                app.subnets.modal = Some(modal);
+            }
+            KeyCode::Enter if confirm.focus == 0 => {}
             KeyCode::Char('y') | KeyCode::Char('Y') => {
+                submit_subnet_modal(app, modal, poller, config_path).await;
+            }
+            KeyCode::Enter => {
                 submit_subnet_modal(app, modal, poller, config_path).await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1623,126 +2370,11 @@ fn subnet_text_field_buf(form: &mut subnet_modal::AddForm) -> Option<&mut String
 /// ...)` cabling on the Apply path. Mirrors `submit_local_dns_modal`.
 async fn submit_subnet_modal(
     app: &mut App,
-    mut modal: subnet_modal::SubnetModal,
+    modal: subnet_modal::SubnetModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use crate::cli::commands::subnets::{add_inner, remove_inner, RemoveOutcome};
-    use subnet_modal::{Stage, SubmitOutcome};
-
-    // The armed tag valve, captured before the form is consumed.
-    let outcome: SubmitOutcome = match &modal.stage {
-        Stage::EditingForm(form) => match form.try_resolve() {
-            Err(msg) => SubmitOutcome::Failed(msg),
-            Ok(resolved) => match form.mode {
-                subnet_modal::FormMode::Add => {
-                    match add_inner(
-                        config_path,
-                        &resolved.id,
-                        Some(&resolved.display_name),
-                        &resolved.cidrs,
-                        &resolved.profile,
-                        Some(resolved.priority),
-                        None,
-                    ) {
-                        Ok(report) => {
-                            tracing::info!(
-                                target: "audit",
-                                action = "subnet.add",
-                                surface = "tui",
-                                id = %resolved.id,
-                                profile = %resolved.profile,
-                                source_file = %report.target_path.display(),
-                                "TUI mutation"
-                            );
-                            SubmitOutcome::Ok(format!("added subnet {}", resolved.id))
-                        }
-                        Err(e) => SubmitOutcome::Failed(e.to_string()),
-                    }
-                }
-                subnet_modal::FormMode::Edit => match form.original.as_ref() {
-                    Some(original) => submit_subnet_edit(config_path, original, &resolved),
-                    // The Add/Edit constructors keep `mode == Edit` and
-                    // `original.is_some()` in lock-step; degrade a broken
-                    // invariant to a footer error instead of a panic that
-                    // would unwind out of the dashboard's main task.
-                    None => SubmitOutcome::Failed(
-                        "internal error: edit modal lost its original snapshot".into(),
-                    ),
-                },
-            },
-        },
-        Stage::ConfirmingRemove(rc) => match remove_inner(config_path, &rc.id, None) {
-            Ok(RemoveOutcome::Removed(report)) => {
-                tracing::info!(
-                    target: "audit",
-                    action = "subnet.delete",
-                    surface = "tui",
-                    id = %rc.id,
-                    source_file = %report.target_path.display(),
-                    "TUI mutation"
-                );
-                SubmitOutcome::Ok(format!("removed subnet {}", rc.id))
-            }
-            Ok(RemoveOutcome::NotFound { .. }) => {
-                SubmitOutcome::Failed(format!("subnet '{}' not found — already removed?", rc.id))
-            }
-            Err(e) => SubmitOutcome::Failed(e.to_string()),
-        },
-        Stage::Submitted(_) => return,
-    };
-
-    // A form (Add/Edit) failure — pre-flight validation (empty field, bad
-    // priority) or an apply/validator rejection — keeps the modal open
-    // with the message on the grid's inline validation line instead of
-    // dropping to the terminal "failed" screen. The operator fixes the
-    // offending field and re-submits without retyping the rest. Remove
-    // failures still finish (their confirm screen has no form to keep).
-    // Mirrors `submit_local_dns_modal`.
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            app.status_err(format!("subnet modal: {msg}"));
-            form.error_message = Some(msg.clone());
-            app.subnets.modal = Some(modal);
-            return;
-        }
-    }
-
-    let was_ok = matches!(outcome, SubmitOutcome::Ok(_));
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => {
-            app.status_err(format!("subnet modal: {msg}"));
-        }
-    }
-    modal.finish(outcome);
-    app.subnets.modal = Some(modal);
-
-    if was_ok {
-        let outcome = attempt_reload(poller.socket_path()).await;
-        // The reload arms REPLACE the status set above. `Reloaded` is the
-        // one arm that stays silent and therefore keeps it.
-        match outcome {
-            ReloadOutcome::Reloaded => {}
-            ReloadOutcome::DaemonUnreachable => {
-                app.status_err(
-                    "subnet saved on disk — daemon not running, will activate on next start".into(),
-                );
-            }
-            ReloadOutcome::NoToken { .. } => {
-                app.status_err(
-                    "subnet saved on disk but no admin token is available to request a reload"
-                        .into(),
-                );
-            }
-            ReloadOutcome::ReloadFailed(msg) => {
-                app.status_err(format!("subnet saved but daemon rejected reload: {msg}"));
-            }
-        }
-        app.loaded_config = load_v1_config(config_path);
-        poll_active_leaf(app, poller).await;
-    }
+    action_handlers::subnets(app, modal, poller, config_path).await;
 }
 
 /// Apply the diff between `original` and `resolved`. The scalar fields
@@ -1841,6 +2473,15 @@ mod group_edit_tests;
 // the side-card re-renders the focused profile on the next frame.
 
 fn handle_profiles_key(app: &mut App, key: KeyEvent) {
+    if app.profiles.info_open {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i')) {
+            app.profiles.info_open = false;
+        }
+        return;
+    }
+    if detail_panel::handle_detail_key(app, key.code) {
+        return;
+    }
     // Seed the selection on first keystroke so `e` / `d` land on a real
     // profile from the very first interaction (mirrors the Subnets seed).
     ensure_profile_selection_seeded(app);
@@ -1875,8 +2516,14 @@ fn handle_profiles_key(app: &mut App, key: KeyEvent) {
             sync_profile_selection(app);
         }
         KeyCode::Char('a') => {
-            app.profiles.modal = Some(profile_modal::ProfileModal::open_add());
+            let (lists, custom_lists) = profile_editor_catalogs(app);
+            let mut modal = profile_modal::ProfileModal::open_add_full(lists, custom_lists);
+            if let profile_modal::Stage::EditingForm(form) = &mut modal.stage {
+                form.custom_lists_available = app.operator_catalog.is_some();
+            }
+            app.profiles.modal = Some(modal);
         }
+        KeyCode::Char('i') => app.profiles.info_open = focused_profile(app).is_some(),
         // Enter is the primary action on the focused row, and on
         // Profiles the primary action is edit. Same branch as `e`, not a
         // new modal: Lists / Rules / mapped Devices already read this way,
@@ -1896,6 +2543,27 @@ fn handle_profiles_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn profile_editor_catalogs(
+    app: &App,
+) -> (
+    Vec<crate::config::schema::blocklist::Blocklist>,
+    Vec<crate::config::schema::custom_list::CustomList>,
+) {
+    let mut lists = app
+        .loaded_config
+        .as_ref()
+        .map(|loaded| loaded.config.blocklists.clone())
+        .unwrap_or_default();
+    lists.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    let mut custom_lists = app
+        .loaded_config
+        .as_ref()
+        .map(|loaded| loaded.config.custom_lists.clone())
+        .unwrap_or_default();
+    custom_lists.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    (lists, custom_lists)
+}
+
 /// Master row count = the configured profile count.
 fn profiles_len(app: &App) -> usize {
     app.loaded_config
@@ -1909,66 +2577,30 @@ fn profiles_len(app: &App) -> usize {
 /// auto-places the visual cursor on row 0, but the modal openers
 /// (`e` / `d`) consult `selected_id` directly.
 fn ensure_profile_selection_seeded(app: &mut App) {
-    let ids: Vec<String> = app
-        .loaded_config
-        .as_ref()
-        .map(|l| l.config.profiles.keys().cloned().collect())
-        .unwrap_or_default();
-
-    // Repair a *dangling* id, not just an unset one.
-    // The old guard returned early whenever the id was `Some`, so an id
-    // whose profile had been deleted (a second operator, an external edit
-    // + `r`) survived — and master and detail then disagreed:
-    // `render_master` falls back to highlighting row 0 on a *local*
-    // `TableState`, while `render_detail` re-reads that same dead id,
-    // matches nothing, and paints "select a profile on the left". Both
-    // sides resolve the id, so re-anchoring it here — the `&mut App` the
-    // renderer doesn't have — is what makes them agree.
-    if app
-        .profiles
-        .selected_id
-        .as_deref()
-        .is_some_and(|id| ids.iter().any(|k| k == id))
-    {
-        return;
-    }
-
-    match ids.first() {
-        // Row 0 — the same row `render_master` falls back to, and the
-        // first key of the `BTreeMap` the master rows are built from.
-        Some(id) => {
-            app.profiles.selected_id = Some(id.clone());
-            app.profiles.table_state.select(Some(0));
-        }
-        None => {
-            app.profiles.selected_id = None;
-            app.profiles.table_state.select(None);
-        }
-    }
+    let rows = tabs::profiles::build_display_rows(app);
+    let index = tabs::profiles::index_of_display_key(&rows, app.profiles.selected_id.as_deref())
+        .or_else(|| (!rows.is_empty()).then_some(0));
+    app.profiles.selected_id = index.map(|i| rows[i].id.clone());
+    app.profiles.table_state.select(index);
 }
 
-/// Recompute `selected_id` from the cursor position after ↑/↓ scroll so
-/// the side-card stays in sync. The master list is the `BTreeMap` key
-/// order — same order `tabs::profiles::master_rows` paints.
+/// Both keyboard and pointer selection use the table's sorted projection.
 fn sync_profile_selection(app: &mut App) {
-    let ids: Vec<String> = app
-        .loaded_config
-        .as_ref()
-        .map(|l| l.config.profiles.keys().cloned().collect())
-        .unwrap_or_default();
-    match app.profiles.table_state.selected() {
-        Some(idx) => app.profiles.selected_id = ids.get(idx).cloned(),
-        None => app.profiles.selected_id = None,
-    }
+    let rows = tabs::profiles::build_display_rows(app);
+    app.profiles.selected_id = app
+        .profiles
+        .table_state
+        .selected()
+        .and_then(|index| rows.get(index))
+        .map(|row| tabs::profiles::display_row_key(row).to_owned());
 }
 
-/// The currently-focused profile `(id, Profile)`, captured by value so
-/// the modal opener holds an owned snapshot rather than borrowing
-/// `loaded_config` for the modal's lifetime.
 fn focused_profile(app: &App) -> Option<(String, crate::config::schema::Profile)> {
-    let key = app.profiles.selected_id.as_deref()?;
-    let profiles = app.loaded_config.as_ref().map(|l| &l.config.profiles)?;
-    profiles.get(key).map(|p| (key.to_string(), p.clone()))
+    let rows = tabs::profiles::build_display_rows(app);
+    let row = tabs::profiles::index_of_display_key(&rows, app.profiles.selected_id.as_deref())
+        .and_then(|index| rows.get(index))
+        .or(rows.first())?;
+    Some((row.id.clone(), row.profile.clone()))
 }
 
 fn build_profile_edit_modal(app: &App) -> Option<profile_modal::ProfileModal> {
@@ -2004,15 +2636,14 @@ fn build_profile_edit_modal(app: &App) -> Option<profile_modal::ProfileModal> {
     let mut custom_lists: Vec<crate::config::schema::custom_list::CustomList> = app
         .loaded_config
         .as_ref()
-        .map(|l| l.config.custom_lists.clone())
+        .map(|loaded| loaded.config.custom_lists.clone())
         .unwrap_or_default();
     custom_lists.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    Some(profile_modal::ProfileModal::open_edit(
-        &id,
-        &profile,
-        lists,
-        custom_lists,
-    ))
+    let mut modal = profile_modal::ProfileModal::open_edit(&id, &profile, lists, custom_lists);
+    if let profile_modal::Stage::EditingForm(form) = &mut modal.stage {
+        form.custom_lists_available = app.operator_catalog.is_some();
+    }
+    Some(modal)
 }
 
 fn build_profile_remove_modal(app: &App) -> Option<profile_modal::ProfileModal> {
@@ -2074,6 +2705,22 @@ async fn handle_profile_modal_key(
     }
 
     match &mut modal.stage {
+        Stage::ReviewingError(review) => {
+            let row = review.scroll.get_mut();
+            match key.code {
+                KeyCode::Up => *row = row.saturating_sub(1),
+                KeyCode::Down => *row = row.saturating_add(1).min(review.max_scroll.get()),
+                KeyCode::Home => *row = 0,
+                KeyCode::End => *row = review.max_scroll.get(),
+                KeyCode::Enter | KeyCode::Esc => {
+                    let mut form = review.form.clone();
+                    form.error_message = None;
+                    modal.stage = Stage::EditingForm(form);
+                }
+                _ => {}
+            }
+            app.profiles.modal = Some(modal);
+        }
         Stage::EditingForm(form) => {
             match key.code {
                 KeyCode::Esc => {
@@ -2122,7 +2769,9 @@ async fn handle_profile_modal_key(
                 KeyCode::Right => match form.focused {
                     // Toggles read as 2-state selectors — ←/→ flips them,
                     // matching the shared "←/→ change" legend.
-                    FormField::BlockAll | FormField::EcsClear => form.toggle(),
+                    FormField::BlockAll | FormField::Advanced | FormField::EcsClear => {
+                        form.toggle()
+                    }
                     // A panel row walks `inherit → Block → Allow`. Named
                     // explicitly rather than left to the `_` arm below:
                     // `cycle_dropdown` would silently do nothing here, so
@@ -2139,7 +2788,9 @@ async fn handle_profile_modal_key(
                     _ => form.cycle_dropdown(true),
                 },
                 KeyCode::Left => match form.focused {
-                    FormField::BlockAll | FormField::EcsClear => form.toggle(),
+                    FormField::BlockAll | FormField::Advanced | FormField::EcsClear => {
+                        form.toggle()
+                    }
                     FormField::ListOverride(_) => form.cycle_list_policy(false),
                     FormField::CustomListMount(_) => form.toggle_custom_list_mount(),
                     _ => form.cycle_dropdown(false),
@@ -2149,7 +2800,9 @@ async fn handle_profile_modal_key(
                     // focused button, or is a literal space inside a text
                     // field (display names may contain spaces).
                     match form.focused {
-                        FormField::BlockAll | FormField::EcsClear => form.toggle(),
+                        FormField::BlockAll | FormField::Advanced | FormField::EcsClear => {
+                            form.toggle()
+                        }
                         // Same step `→` takes, and safe for the same
                         // reason: `POLICY_CYCLE` cannot produce `Ignore`,
                         // so the casual keypress cannot make a list inert.
@@ -2224,124 +2877,13 @@ async fn handle_profile_modal_key(
     }
 }
 
-/// Submit path for all three Profile modals. Branches on the stage:
-///
-/// - Add → `send_profile_create` once.
-/// - Edit → `resolve_edit_patch` diffs the form against the captured
-///   snapshot, then ONE atomic `send_profile_update`. An all-`None`
-///   patch short-circuits with an "unchanged" outcome.
-/// - Remove → `send_profile_delete` once.
-///
-/// Unlike `submit_subnet_modal`, there is NO `attempt_reload` here: the
-/// daemon's `handle_profile_*` IPC handlers self-reload via
-/// `notify_reload`. The TUI only refreshes its offline `loaded_config`
-/// cache so the next render reflects the mutation.
 async fn submit_profile_modal(
     app: &mut App,
-    mut modal: profile_modal::ProfileModal,
+    modal: profile_modal::ProfileModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::ipc::protocol::ProfileUpdatePatch;
-    use profile_modal::{FormMode, Stage, SubmitOutcome};
-
-    // The tag valve this path used to capture is gone with the picker it
-    // guarded. Its notice was earned: a slug awaiting its second `Enter`
-    // was typed state, so a save that dropped it lost work the operator
-    // could see themselves doing, and saying nothing would have been a
-    // silent loss.
-    //
-    // The `ignore` valve that replaced it is NOT typed state. An unspent
-    // one leaves the panel row displaying exactly the policy that gets
-    // saved, so there is nothing to lose and nothing to report — a notice
-    // here would announce a non-event on every save, which is how a real
-    // notice stops being read. The subnet and group modals still capture
-    // their own valve; only this form's picker went away.
-    let outcome: SubmitOutcome = match &modal.stage {
-        Stage::EditingForm(form) => match form.mode {
-            FormMode::Add => match form.try_resolve_add() {
-                Err(msg) => SubmitOutcome::Failed(msg),
-                Ok((id, display_name)) => {
-                    match poller.send_profile_create(id.clone(), display_name).await {
-                        Ok(_) => SubmitOutcome::Ok(format!("created profile {id}")),
-                        Err(e) => SubmitOutcome::Failed(e.to_string()),
-                    }
-                }
-            },
-            FormMode::Edit => match form.original.as_ref() {
-                // The Add/Edit constructors keep `mode == Edit` and
-                // `original.is_some()` in lock-step; degrade a broken
-                // invariant to a footer error instead of a panic that
-                // would unwind out of the dashboard's main task.
-                None => SubmitOutcome::Failed(
-                    "internal error: edit modal lost its original snapshot".into(),
-                ),
-                Some(original) => match profile_modal::resolve_edit_patch(form, original) {
-                    Err(msg) => SubmitOutcome::Failed(msg),
-                    Ok(patch) if patch == ProfileUpdatePatch::default() => {
-                        SubmitOutcome::Ok(format!("profile {} unchanged", original.id))
-                    }
-                    Ok(patch) => {
-                        match poller.send_profile_update(original.id.clone(), patch).await {
-                            Ok(_) => SubmitOutcome::Ok(format!("updated profile {}", original.id)),
-                            Err(e) => SubmitOutcome::Failed(e.to_string()),
-                        }
-                    }
-                },
-            },
-        },
-        Stage::ConfirmingRemove(rc) => match poller.send_profile_delete(rc.id.clone()).await {
-            Ok(_) => SubmitOutcome::Ok(format!("removed profile {}", rc.id)),
-            Err(e) => SubmitOutcome::Failed(e.to_string()),
-        },
-        Stage::Submitted(_) => return,
-    };
-
-    // A form (Add/Edit) failure — pre-flight validation or an apply/
-    // validator rejection — keeps the modal open with the message on the
-    // form's own error line instead of dropping to the terminal "failed"
-    // screen. The operator fixes the offending field and re-submits
-    // without retyping the rest (this form especially: 9 head fields plus
-    // one row per configured blocklist override). Remove failures still
-    // finish — their confirm screen has no form to keep. Mirrors
-    // `submit_subnet_modal` / `submit_local_dns_modal` (`profile-01`).
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            app.status_err(format!("profile modal: {msg}"));
-            form.error_message = Some(msg.clone());
-            app.profiles.modal = Some(modal);
-            return;
-        }
-    }
-
-    let was_ok = matches!(outcome, SubmitOutcome::Ok(_));
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => {
-            app.status_err(format!("profile modal: {msg}"));
-        }
-    }
-    modal.finish(outcome);
-    app.profiles.modal = Some(modal);
-
-    if was_ok {
-        app.loaded_config = load_v1_config(config_path);
-        // A delete leaves `selected_id` dangling (the id is gone). Clear
-        // + re-seed so the side-card and the next e/d keypress land on a
-        // real profile instead of an empty "select a profile" card.
-        let still_valid = app
-            .loaded_config
-            .as_ref()
-            .zip(app.profiles.selected_id.as_deref())
-            .map(|(l, id)| l.config.profiles.contains_key(id))
-            .unwrap_or(false);
-        if !still_valid {
-            app.profiles.selected_id = None;
-            app.profiles.table_state.select(None);
-            ensure_profile_selection_seeded(app);
-        }
-        poll_active_leaf(app, poller).await;
-    }
+    action_handlers::profile(app, modal, poller, config_path).await;
 }
 
 // Local DNS tab. `a` / `d`|`Delete` / `e` open
@@ -2364,11 +2906,14 @@ async fn submit_profile_modal(
 /// every record in every scope, skipping the group headers. `Tab` is
 /// untouched and still cycles leaves (`ldns_04_tab_still_cycles_leaf`).
 fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
-    let Some(loaded) = app.loaded_config.as_ref() else {
+    if detail_panel::handle_detail_key(app, key.code) {
+        return;
+    }
+    let Some(_) = app.loaded_config.as_ref() else {
         app.leaf_key_unhandled = true;
         return;
     };
-    let rows = tabs::local_dns::build_rows(loaded);
+    let rows = tabs::local_dns::build_display_rows(app);
 
     // Seed the anchor on the first keystroke, before the openers run.
     //
@@ -2382,13 +2927,13 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
     if app.local_dns.selected_id.is_none() {
         if let Some(idx) = rows
             .iter()
-            .position(tabs::local_dns::LocalDnsRow::is_selectable)
+            .position(tabs::local_dns::LocalDnsDisplayRow::is_selectable)
         {
-            app.local_dns.selected_id = tabs::local_dns::row_key(&rows[idx]);
+            app.local_dns.selected_id = tabs::local_dns::display_row_key(&rows[idx]);
             app.local_dns.table_state.select(Some(idx));
         }
     }
-    let current = tabs::local_dns::index_of_key(&rows, app.local_dns.selected_id.as_ref());
+    let current = tabs::local_dns::index_of_display_key(&rows, app.local_dns.selected_id.as_ref());
 
     // `focus` moves the cursor and re-anchors the stable key together —
     // separating them is how the two drift.
@@ -2396,40 +2941,42 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
         ($idx:expr) => {
             if let Some(i) = $idx {
                 app.local_dns.table_state.select(Some(i));
-                app.local_dns.selected_id = tabs::local_dns::row_key(&rows[i]);
+                app.local_dns.selected_id = tabs::local_dns::display_row_key(&rows[i]);
             }
         };
     }
 
     match key.code {
-        KeyCode::Down => focus!(tabs::local_dns::next_selectable_index(&rows, current, true)),
-        KeyCode::Up => focus!(tabs::local_dns::next_selectable_index(
+        KeyCode::Down => focus!(tabs::local_dns::next_display_selectable_index(
+            &rows, current, true
+        )),
+        KeyCode::Up => focus!(tabs::local_dns::next_display_selectable_index(
             &rows, current, false
         )),
         // Jump / page, headers skipped and clamped at both ends.
         KeyCode::Home => {
             focus!(first_selectable_idx(
                 &rows,
-                tabs::local_dns::LocalDnsRow::is_selectable
+                tabs::local_dns::LocalDnsDisplayRow::is_selectable
             ))
         }
         KeyCode::End => {
             focus!(last_selectable_idx(
                 &rows,
-                tabs::local_dns::LocalDnsRow::is_selectable
+                tabs::local_dns::LocalDnsDisplayRow::is_selectable
             ))
         }
         KeyCode::PageDown => focus!(page_selectable_idx(
             &rows,
             current,
             true,
-            tabs::local_dns::LocalDnsRow::is_selectable
+            tabs::local_dns::LocalDnsDisplayRow::is_selectable
         )),
         KeyCode::PageUp => focus!(page_selectable_idx(
             &rows,
             current,
             false,
-            tabs::local_dns::LocalDnsRow::is_selectable
+            tabs::local_dns::LocalDnsDisplayRow::is_selectable
         )),
         // s44-tui-modals: open Add modal, scoped to the focused row.
         KeyCode::Char('a') => {
@@ -2451,7 +2998,8 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        // s44-tui-modals: open Edit modal pre-filled from the focused row.
+        // Open Edit pre-filled from the focused row. Enter is the primary
+        // row action; `e` remains as a discoverable compatibility shortcut.
         KeyCode::Char('e') => {
             if let Some(modal) = build_local_dns_edit_modal(app) {
                 app.local_dns.modal = Some(modal);
@@ -2461,27 +3009,25 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        // Enter toggles the side-card. When
-        // closed and the focused row is valid → load + open. When open →
-        // close. The audit log is read off the master config path stored
-        // in `loaded_config` so we don't need to thread `config_path`
-        // through the per-tab dispatch signature.
         KeyCode::Enter => {
-            if app.local_dns.audit_view.is_some() {
-                app.local_dns.audit_view = None;
-            } else if let Some(view) = build_local_dns_audit_view(app) {
-                app.local_dns.audit_view = Some(view);
+            if let Some(modal) = build_local_dns_edit_modal(app) {
+                app.local_dns.modal = Some(modal);
             } else {
                 app.status_err(
                     "no local DNS row selected — ↑/↓ to pick one before pressing Enter".into(),
                 );
             }
         }
-        // Esc closes the side-card without affecting cursor state. Only
-        // consumes the key when the side-card was open; otherwise the
-        // global Esc handler keeps the existing semantics.
-        KeyCode::Esc if app.local_dns.audit_view.is_some() => {
-            app.local_dns.audit_view = None;
+        KeyCode::Char('i') => {
+            if let Some(view) = build_local_dns_audit_view(app) {
+                app.local_dns.audit_view = Some(view);
+                app.local_dns.inspect_open = true;
+                detail_panel::focus(app, Leaf::LocalDns);
+            } else {
+                app.status_err(
+                    "no local DNS row selected — ↑/↓ to pick one before pressing i".into(),
+                );
+            }
         }
         _ => app.leaf_key_unhandled = true,
     }
@@ -2509,6 +3055,26 @@ fn handle_local_dns_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
+    }
+}
+
+fn handle_local_dns_inspect_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+            app.local_dns.inspect_open = false;
+            app.local_dns.audit_view = None;
+            app.mouse.blur_detail(Leaf::LocalDns);
+        }
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => {
+            detail_panel::focus(app, Leaf::LocalDns);
+            detail_panel::scroll(app, Leaf::LocalDns, key.code);
+        }
+        _ => {}
     }
 }
 
@@ -2576,12 +3142,8 @@ fn handle_resolver_modal_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_dashboard_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Char('d') => app.dashboard.show_daily = !app.dashboard.show_daily,
-        // An `if let` cannot report the miss, and Dashboard is the
-        // leaf an operator is most likely to be standing on when they open
-        // `?`. Widened to a match for the one arm that matters.
-        _ => app.leaf_key_unhandled = true,
+    if !crate::tui::tabs::dashboard::handle_key(app, key) {
+        app.leaf_key_unhandled = true;
     }
 }
 
@@ -2625,6 +3187,12 @@ fn handle_query_log_filter_modal_key(app: &mut App, key: KeyEvent) {
     let Some(modal) = app.query_log.advanced_modal.as_mut() else {
         return;
     };
+    let key = if is_save_key(key) {
+        modal.focus = Field::Apply;
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    } else {
+        key
+    };
     match key.code {
         KeyCode::Esc => {
             app.query_log.advanced_modal = None;
@@ -2649,8 +3217,7 @@ fn handle_query_log_filter_modal_key(app: &mut App, key: KeyEvent) {
                 // the previous predicate set name boundaries that no
                 // longer exist. Same reason `b` / `t` / `R` / `/` / `c`
                 // all reset — see `QueryLogState::reset_paging`.
-                app.query_log.reset_paging();
-                app.force_poll = true;
+                request_query_log_filter_fetch(app);
                 app.status_info(QUERY_LOG_ADVANCED_APPLIED.to_string());
             }
         }
@@ -2709,17 +3276,8 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             // that promises a bounded jump unbounded.
             if matches!(key.code, KeyCode::PageDown) && was_at_end && len > 0 {
                 if app.query_log.page_older() {
-                    // Land on the newest row of the page about to arrive.
-                    // The rows on screen are still the previous page for
-                    // one tick, so this reads as travel, not a jump.
-                    //
-                    // `selected_key` is dropped rather than re-synced: it
-                    // is the anchor for a *sliding tail*, and the
-                    // row it names belongs to the page being left. Keeping
-                    // it would let a coincidentally identical row on the
-                    // incoming page yank the cursor off row 0.
-                    app.query_log.selected_key = None;
-                    app.query_log.table_state.select(Some(0));
+                    // The old page has been cleared; selection is established
+                    // only when rows for the requested cursor arrive.
                     app.force_poll = true;
                     app.status_info(query_log_page_label(app.query_log.page_index));
                 } else {
@@ -2730,7 +3288,11 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             if matches!(key.code, KeyCode::End) {
                 jump_table_end(&mut app.query_log.table_state, len);
             } else {
-                page_table_down(&mut app.query_log.table_state, len);
+                page_table_down_by(
+                    &mut app.query_log.table_state,
+                    len,
+                    app.query_log.visible_rows,
+                );
             }
             sync_query_log_selection(app);
             if len > 0 && app.query_log.table_state.selected() == Some(len - 1) && !was_at_end {
@@ -2754,8 +3316,6 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
             // forward walker at all.
             let at_top = matches!(app.query_log.table_state.selected(), None | Some(0));
             if at_top && app.query_log.page_newer() {
-                app.query_log.selected_key = None;
-                app.query_log.table_state.select(Some(0));
                 app.force_poll = true;
                 if app.query_log.page_index == 0 {
                     app.status_info(QUERY_LOG_LIVE_TAIL.to_string());
@@ -2764,7 +3324,7 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
                 }
                 return;
             }
-            page_table_up(&mut app.query_log.table_state);
+            page_table_up_by(&mut app.query_log.table_state, app.query_log.visible_rows);
             sync_query_log_selection(app);
         }
         KeyCode::Char('G') => {
@@ -2779,55 +3339,6 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
         // `g`-jumps-to-top handler is unreachable now and was removed;
         // jump-to-top is uncovered (operator scrolls with
         // `Up`). The help overlay no longer cites `g` for Query Log.
-        KeyCode::Char('/') => {
-            app.input_mode = InputMode::FilterDomain(String::new());
-        }
-        KeyCode::Char('c') => {
-            app.input_mode = InputMode::FilterClient(String::new());
-        }
-        // `f` opens the advanced client search. Additive by construction:
-        // `c` above is untouched and keeps its substring-over-name-or-IP
-        // meaning, and an operator who never presses `f` sees no change.
-        // Seeded from what is applied, so re-opening shows the live filter
-        // instead of a blank form to retype.
-        KeyCode::Char('f') => {
-            app.query_log.advanced_modal = Some(
-                crate::tui::query_log_filter_modal::QueryLogFilterModal::open(
-                    &app.query_log.advanced,
-                ),
-            );
-        }
-        // Both toggles change the predicate set immediately, so both
-        // must drop the cursor stack — see `reset_paging`.
-        KeyCode::Char('b') => {
-            app.query_log.blocked_only = !app.query_log.blocked_only;
-            app.query_log.reset_paging();
-        }
-        // Cycle the time preset on `t`. One keystroke,
-        // no text entry mode.
-        KeyCode::Char('t') => {
-            app.query_log.since = app.query_log.since.next();
-            app.query_log.reset_paging();
-        }
-        // `R` resets all four filters. `Esc` no longer resets
-        // here — it now cancels an in-progress filter *edit* only (handled
-        // in the `InputMode::Filter*` arms of `handle_key`, which discard
-        // the edit buffer and keep the committed filters). Dropping `Esc`
-        // from this arm fixes the footgun where one stray Esc in Normal
-        // mode nuked every filter; a Normal-mode Esc now falls through to
-        // the `_ => {}` no-op below.
-        KeyCode::Char('R') => {
-            app.query_log.filter_domain = None;
-            app.query_log.filter_client = None;
-            app.query_log.blocked_only = false;
-            app.query_log.since = crate::tui::app::SincePreset::Off;
-            // `R` is documented as "reset all filters". Leaving the
-            // advanced form applied would make it the one filter the
-            // reset key does not reach — invisible on the card's single
-            // chip and impossible to clear without reopening the form.
-            app.query_log.advanced = Default::default();
-            app.query_log.reset_paging();
-        }
         // Single Enter opens the custom-list picker with the
         // highlighted row's domain + client captured at this moment
         // (NOT a file-tail re-read — the row may scroll out before the
@@ -2844,33 +3355,198 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
                 app.status_info(footer_message_for_neutral_row(app).to_string());
             }
         }
+        // Detail intentionally uses a free key. Enter stays the established
+        // allow/block action for the focused row.
+        KeyCode::Char('i') => {
+            if let Some(entry) = selected_query_log_entry(app).cloned() {
+                app.query_log.detail =
+                    Some(crate::tui::query_log_detail::QueryLogDetail::open(entry));
+            }
+        }
         _ => app.leaf_key_unhandled = true,
     }
 }
 
+fn handle_query_log_client_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(mut picker) = app.query_log.client_picker.take() else {
+        return;
+    };
+    let options = crate::tui::query_log_client_picker::QueryLogClientPicker::options(
+        app.device_view.as_ref(),
+        &picker.selected,
+    );
+    match picker.handle_key(key, &options, picker.visible_rows) {
+        crate::tui::query_log_client_picker::PickerOutcome::KeepOpen => {
+            app.query_log.client_picker = Some(picker)
+        }
+        crate::tui::query_log_client_picker::PickerOutcome::Cancel => {}
+        crate::tui::query_log_client_picker::PickerOutcome::Apply(ips) => {
+            let Some(status) = app.daemon_status.as_ref() else {
+                app.status_info("Checking daemon support for exact client selection…".to_string());
+                app.query_log.client_picker = Some(picker);
+                reads::request_query_log_picker_metadata(app);
+                return;
+            };
+            let supports = status.query_log_client_ips_supported;
+            if !ips.is_empty() && !supports {
+                app.status_err("Connected daemon does not support exact multi-client filtering; update the daemon or use Advanced name/IP filters.".to_string());
+                app.query_log.client_picker = Some(picker);
+                return;
+            }
+            app.query_log.client_ips = ips;
+            app.query_log.filter_client = None;
+            app.query_log.client_mode = app::ClientFilterMode::Selected;
+            request_query_log_filter_fetch(app);
+        }
+    }
+}
+
+fn handle_query_log_detail_key(app: &mut App, key: KeyEvent) {
+    let Some(mut detail) = app.query_log.detail.take() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {}
+        KeyCode::Up => {
+            detail.scroll_up(1);
+            app.query_log.detail = Some(detail);
+        }
+        KeyCode::Down => {
+            detail.scroll_down(1);
+            app.query_log.detail = Some(detail);
+        }
+        KeyCode::PageUp => {
+            detail.scroll_up(detail.visible_rows);
+            app.query_log.detail = Some(detail);
+        }
+        KeyCode::PageDown => {
+            detail.scroll_down(detail.visible_rows);
+            app.query_log.detail = Some(detail);
+        }
+        KeyCode::Home => {
+            detail.scroll = 0;
+            app.query_log.detail = Some(detail);
+        }
+        KeyCode::End => {
+            detail.scroll = detail.max_scroll;
+            app.query_log.detail = Some(detail);
+        }
+        _ => app.query_log.detail = Some(detail),
+    }
+}
+
+fn handle_query_log_domain_key(app: &mut App, key: KeyEvent) {
+    use query_log_controls::FilterFocus;
+    let key = if is_save_key(key) {
+        app.query_log.domain_focus = FilterFocus::Apply;
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    } else {
+        key
+    };
+    match key.code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Tab | KeyCode::Down => {
+            app.query_log.domain_focus = app.query_log.domain_focus.next()
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.query_log.domain_focus = app.query_log.domain_focus.prev()
+        }
+        KeyCode::Enter if app.query_log.domain_focus == FilterFocus::Discard => {
+            app.input_mode = InputMode::Normal
+        }
+        KeyCode::Enter => {
+            if let InputMode::FilterDomain(draft) =
+                std::mem::replace(&mut app.input_mode, InputMode::Normal)
+            {
+                let value = draft.trim().to_owned();
+                app.query_log.filter_domain = (!value.is_empty()).then_some(value);
+                request_query_log_filter_fetch(app);
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let InputMode::FilterDomain(draft) = &mut app.input_mode {
+                draft.clear();
+                app.query_log.domain_focus = FilterFocus::Value;
+            }
+        }
+        _ if app.query_log.domain_focus == FilterFocus::Value => {
+            if let InputMode::FilterDomain(draft) = &mut app.input_mode {
+                drive_text_input(draft, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_query_log_period_key(app: &mut App, key: KeyEvent) {
+    use query_log_controls::FilterFocus;
+    let key = if is_save_key(key) {
+        app.query_log.period_focus = FilterFocus::Apply;
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    } else {
+        key
+    };
+    match key.code {
+        KeyCode::Esc => app.query_log.period_menu = false,
+        KeyCode::Tab => app.query_log.period_focus = app.query_log.period_focus.next(),
+        KeyCode::BackTab => app.query_log.period_focus = app.query_log.period_focus.prev(),
+        KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End => {
+            app.query_log.period_focus = FilterFocus::Value;
+            app.query_log.period_draft = match key.code {
+                KeyCode::Up => app.query_log.period_draft.prev(),
+                KeyCode::Down => app.query_log.period_draft.next(),
+                KeyCode::Home => app::SincePreset::Off,
+                _ => app::SincePreset::Last24Hours,
+            };
+        }
+        KeyCode::Enter => {
+            app.query_log.period_menu = false;
+            if app.query_log.period_focus != FilterFocus::Discard {
+                app.query_log.since = app.query_log.period_draft;
+                request_query_log_filter_fetch(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn selected_query_log_entry(app: &App) -> Option<&crate::ipc::protocol::QueryLogDto> {
+    crate::tui::app::resolve_row_index(
+        &app.query_log.entries,
+        app.query_log.selected_key.as_ref(),
+        |entry| Some(tabs::query_log::entry_key(entry)),
+    )
+    .or_else(|| app.query_log.table_state.selected())
+    .and_then(|index| app.query_log.entries.get(index))
+}
+
+fn open_device_inspect(app: &mut App) {
+    let rows = tabs::devices::build_display_rows(app);
+    let current = app::resolve_row_index(
+        &rows,
+        app.devices.selected_id.as_ref(),
+        tabs::devices::row_key,
+    )
+    .or_else(|| tabs::devices::current_selection(&app.devices.table_state, &rows));
+    if let Some(index) = current.filter(|index| rows[*index].is_selectable()) {
+        app.devices.table_state.select(Some(index));
+        app.devices.selected_id = tabs::devices::row_key(&rows[index]);
+        app.devices.inspect_open = true;
+        detail_panel::focus(app, Leaf::Devices);
+    }
+}
+
 fn handle_devices_key(app: &mut App, key: KeyEvent) {
+    if detail_panel::handle_detail_key(app, key.code) {
+        return;
+    }
     // Unified-list navigation. `↑` / `↓` move the cursor through the
     // merged mapped + unmapped list, skipping group-header rows
     // (`devices::next_selectable_index` does the heavy lifting). Enter
     // / e / d / p dispatch on the row variant: mapped rows go to
     // edit-or-delete, unmapped rows go to promote.
-    let rows = match &app.device_view {
-        // `build_filtered_rows`, NOT `build_rows`: this is the row set
-        // Enter / e / d act on, and it must be the row set on screen. If
-        // the two diverge a stale index opens the edit or delete modal on
-        // a device that is not visible. Lane C's note on
-        // `build_filtered_rows` names this hazard, and it is why the
-        // keybinding below could not land in a commit without this line.
-        Some(view) => {
-            tabs::devices::build_filtered_rows(
-                view,
-                app.devices.group_by,
-                app.devices.filter_subnet.as_deref(),
-            )
-            .0
-        }
-        None => Vec::new(),
-    };
+    // Selection, keyboard actions and mouse hits share the rendered order.
+    let rows = tabs::devices::build_display_rows(app);
     // Resolve the operator's stable key to the current index so
     // navigation and the modal openers act on the device the highlight
     // is on — even after a background poll reshuffled the rows. Seed the
@@ -2989,6 +3665,7 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
                     .with_label_vocab(owners, types, depts),
             ));
         }
+        KeyCode::Char('i') => open_device_inspect(app),
         KeyCode::Char('d') => match selected_row(&rows, current) {
             Some(tabs::devices::DeviceRow::Mapped(m)) => {
                 let id =
@@ -3000,6 +3677,7 @@ fn handle_devices_key(app: &mut App, key: KeyEvent) {
                     id,
                     display_name: m.name.clone(),
                 });
+                app.devices.delete_focus = 0;
             }
             Some(tabs::devices::DeviceRow::Unmapped(_)) => {
                 app.status_err("delete (d) only works on mapped rows".into());
@@ -3034,6 +3712,14 @@ fn selected_row(
 // category-grouping ↑/↓ skip + `[c]`/`[m]` modals are gone — the
 // Category entity is retired and the Lists tab now renders a flat table.
 async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) {
+    if app.lists.detail_id.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('i') => app.lists.detail_id = None,
+            KeyCode::Enter => app.lists.detail_advanced = !app.lists.detail_advanced,
+            _ => {}
+        }
+        return;
+    }
     // Seed the cursor on the first selectable row so the very first
     // Enter / m / K press lands on a list — without this, an operator
     // who tabs into Lists and presses Enter sees only a footer hint
@@ -3069,15 +3755,14 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
                 InputMode::FilterLists(app.lists.filter_text.clone().unwrap_or_default());
         }
         KeyCode::Char('f') => {
-            app.lists.kind_filter = app.lists.kind_filter.next();
-            reconcile_lists_selection(app);
+            filter_chips::handle_key(app, key);
         }
         KeyCode::Char('R') => {
             app.lists.filter_text = None;
             app.lists.kind_filter = app::ListsKindFilter::All;
             reconcile_lists_selection(app);
         }
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Char('e') => {
             // ENTER opens the edit modal in
             // place of the retired drill-down split-pane.
             //
@@ -3090,7 +3775,12 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             // managed v1 entry (Ctrl+S) or discard it from
             // `[lists].sources` (Tab → Discard → Enter).
             match tabs::lists::build_edit_modal_for(app, config_path) {
-                Ok(Some(modal)) => app.lists.edit_modal = Some(modal),
+                Ok(Some(mut modal)) => {
+                    modal.advanced_expanded = tabs::lists::focused_list(app).is_some_and(|row| {
+                        row.inert_reason.is_some() || row.dto.last_outcome != "ok"
+                    });
+                    app.lists.edit_modal = Some(modal);
+                }
                 Ok(None) => {
                     if let Some(modal) = tabs::lists::build_promote_modal_for(app) {
                         app.lists.edit_modal = Some(modal);
@@ -3107,22 +3797,30 @@ async fn handle_lists_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, conf
             }
         }
         KeyCode::Char('a') => {
-            // Open the form modal in Add mode. No focused
-            // row required — adding a brand-new list is independent of
-            // the cursor position. Operator types id + URL +
-            // display_name (+ optional fields) and Ctrl+S persists via
-            // the same `run_add` path the Promote flow uses.
-            app.lists.edit_modal = Some(tabs::lists::build_add_modal());
+            app.lists.import_source = Some(0);
+            app.lists.import_source_focus = 0;
         }
-        KeyCode::Char('B') => {
-            // Open the purge.cc
-            // catalog picker. The first open per 5-min TTL fetches both
-            // lists.purge.cc and rules.purge.cc; the fetch runs
-            // OFF the render loop (it used to await inline here, freezing
-            // input for up to ~4s with no feedback). A fresh cache builds
-            // the picker synchronously; a stale cache shows a responsive
-            // "Loading…" placeholder and fetches on a background task.
-            open_catalog_picker(app).await;
+        KeyCode::Char('i') => {
+            app.lists.detail_id =
+                tabs::lists::focused_list(app).and_then(|row| tabs::lists::row_key(&row));
+            app.lists.detail_advanced = tabs::lists::focused_list(app)
+                .is_some_and(|row| row.inert_reason.is_some() || row.dto.last_outcome != "ok");
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            match tabs::lists::build_edit_modal_for(app, config_path) {
+                Ok(Some(mut modal)) => {
+                    modal.mode = app::EditModalMode::ConfirmDelete {
+                        typed: String::new(),
+                    };
+                    modal.error_message = None;
+                    modal.status_message = None;
+                    app.lists.edit_modal = Some(modal);
+                }
+                Ok(None) => app.status_err(
+                    "unmanaged sources must be promoted before they can be safely deleted".into(),
+                ),
+                Err(message) => app.status_err(message),
+            }
         }
         KeyCode::Char('K') => {
             // `[K]` not `[k]`: lowercase `k` was the vim-style scroll-up
@@ -3193,6 +3891,10 @@ async fn open_catalog_picker(app: &mut App) {
     match app.job_tx.clone() {
         Some(tx) => {
             app.lists.catalog_picker = Some(tabs::lists::loading_catalog_picker_modal());
+            if app.catalog_fetching {
+                return;
+            }
+            app.catalog_fetching = true;
             tokio::spawn(async move {
                 let catalog = fetch_catalog().await;
                 let _ = tx.send(app::UiJob::CatalogFetched(catalog));
@@ -3228,7 +3930,11 @@ fn apply_job_result(app: &mut App, job: app::UiJob) {
     use backup_restore_modal::{RestoreStage, SubmitOutcome};
 
     match job {
+        app::UiJob::ReadFinished(completion) => reads::apply(app, completion),
+        app::UiJob::ActionFinished(completion) => actions::apply(app, completion),
+        app::UiJob::ActionProgress(progress) => actions::progress(app, progress),
         app::UiJob::CatalogFetched(catalog) => {
+            app.catalog_fetching = false;
             app.catalog_cache = Some(app::CatalogCache {
                 fetched_at: Instant::now(),
                 catalog,
@@ -3238,6 +3944,14 @@ fn apply_job_result(app: &mut App, job: app::UiJob) {
             // rebuild carries their staged ticks across: the fetch is
             // slow enough to toggle rows under, and dropping them would
             // be silent, keystroke-less data loss.
+            if app
+                .lists
+                .catalog_picker
+                .as_ref()
+                .is_some_and(|modal| modal.submitting)
+            {
+                return;
+            }
             if let Some(previous) = app.lists.catalog_picker.take() {
                 let catalog = app.catalog_cache.as_ref().unwrap().catalog.clone();
                 let mut modal = tabs::lists::build_catalog_picker_modal_from(app, &catalog);
@@ -3248,20 +3962,32 @@ fn apply_job_result(app: &mut App, job: app::UiJob) {
         // tui-02: the restore finished. Land it on the card the operator is
         // watching; if that card is somehow gone, fall back to the footer rather
         // than dropping the outcome of a live-config swap on the floor.
-        app::UiJob::RestoreFinished(outcome) => match app.settings.restore_modal.as_mut() {
-            Some(modal) if matches!(modal.stage, RestoreStage::Restoring { .. }) => {
-                modal.stage = RestoreStage::Submitted(outcome);
+        app::UiJob::RestoreFinished {
+            outcome,
+            config,
+            reload_error,
+        } => {
+            actions::finish_external(app, actions::Surface::Restore);
+            if let Some(config) = config {
+                apply_config_snapshot(app, *config);
             }
-            _ => match outcome {
-                SubmitOutcome::Ok(msg) => app.status_ok(msg),
-                SubmitOutcome::Failed(msg) => app.status_err(msg),
-            },
-        },
+            match app.settings.restore_modal.as_mut() {
+                Some(modal) if matches!(modal.stage, RestoreStage::Restoring { .. }) => {
+                    modal.stage = RestoreStage::Submitted(outcome);
+                }
+                _ => match outcome {
+                    SubmitOutcome::Ok(msg) if reload_error.is_some() => app.status_err(msg),
+                    SubmitOutcome::Ok(msg) => app.status_ok(msg),
+                    SubmitOutcome::Failed(msg) => app.status_err(msg),
+                },
+            }
+        }
         // tui-14: the backup finished — the mirror of the arm above.
         app::UiJob::BackupFinished {
             outcome,
             auto_backup,
         } => {
+            actions::finish_external(app, actions::Surface::Backup);
             match app.settings.backup_modal {
                 Some(backup_restore_modal::BackupModal::Running { .. }) => {
                     app.settings.backup_modal = Some(backup_submitted_card(outcome));
@@ -3450,33 +4176,15 @@ async fn apply_kind_change(
     target: crate::config::schema::BlocklistBase,
     accept_unsigned_allow: bool,
 ) {
-    let new_kind = target.wire_str();
-    match crate::cli::commands::blocklists::run_set_kind_with_ack(
+    action_handlers::kind(
+        app,
+        poller,
         config_path,
-        poller.socket_path(),
         list_id,
-        new_kind,
+        target,
         accept_unsigned_allow,
-        None,
     )
-    .await
-    {
-        Ok(()) => {
-            // Was `status_err` — success painted red, with the `✕`
-            // glyph, left over from the `last_error` → `last_status`
-            // migration where both outcomes shared one red footer.
-            app.status_ok(if accept_unsigned_allow {
-                tabs::lists::format_list_allow_consent_saved(list_id)
-            } else {
-                tabs::lists::format_kind_toggle_ok(list_id, target)
-            });
-            app.loaded_config = load_v1_config(config_path);
-            poll_active_leaf(app, poller).await;
-        }
-        Err(e) => {
-            app.status_err(format!("kind toggle refused: {e}"));
-        }
-    }
+    .await;
 }
 
 /// Keys for the `K`-hotkey consent notice. Same gate as the editor's
@@ -3610,13 +4318,8 @@ fn handle_rules_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        // `[a]` opens the add-rule modal — no row
-        // focus needed (unlike `Enter`/`d` above, which edit/delete the
-        // row under the cursor). Blocked while another Rules modal is
-        // already open; the top-level gates route keys away from this
-        // fn in that case, so `edit_modal` is always `None` here.
         KeyCode::Char('a') => {
-            app.rules.add_modal = Some(rule_add_modal::RuleAddModal::open(app));
+            app.status_info(crate::cli::commands::rules::LEGACY_RULES_RETIRED.to_owned());
         }
         _ => app.leaf_key_unhandled = true,
     }
@@ -3670,7 +4373,7 @@ fn reconcile_active_leaf_selection(app: &mut App) {
             // The rule pane follows the list cursor without a keystroke,
             // so the load belongs on the render reconcile rather than on a
             // key: entering the leaf already has to show the file.
-            refresh_custom_list_pack(app, false);
+            request_custom_list_rules(app, false);
         }
         _ => {}
     }
@@ -3797,6 +4500,8 @@ fn reconcile_lists_selection(app: &mut App) {
 /// a comment with an `assert!` around it. Reaching the arm in situ needs
 /// a live daemon; reaching this function needs a `QueryLogPollResult`.
 fn apply_query_log_page(app: &mut App, result: crate::tui::ipc_poller::QueryLogPollResult) {
+    app.query_log.has_loaded = true;
+    app.query_log.read_failed = false;
     app.query_log.logging_enabled = result.logging_enabled;
     app.query_log.file_state = result.file_state;
     if result.cursor_stale {
@@ -3809,16 +4514,14 @@ fn apply_query_log_page(app: &mut App, result: crate::tui::ipc_poller::QueryLogP
         app.query_log.next_cursor = result.next_cursor;
         clamp_query_log_cursor(app);
     } else if result.entries.is_empty() && app.query_log.page_index > 0 {
-        // A cursor is minted whenever a page fills, so the last page of a
-        // log whose size is an exact multiple of the limit hands back one
-        // that yields nothing. Step back rather than blank the table:
-        // `entries` still holds the page the operator was reading, and
-        // dropping the dead cursor makes `PgDn` refuse instead of
-        // offering the same empty page again.
+        // A full final page can issue a cursor that yields no entries.
+        // Refetch the preceding page explicitly, including while paused;
+        // its old rows were cleared when navigation changed the cursor.
         app.query_log
             .page_cursors
             .truncate(app.query_log.page_index + 1);
         app.query_log.page_newer();
+        app.force_poll = true;
         app.query_log.next_cursor = None;
         app.status_info(QUERY_LOG_OLDEST.to_string());
     } else {
@@ -3994,31 +4697,7 @@ async fn handle_rule_delete_confirm_key(
                 app.rules.edit_modal = Some(modal.clone());
                 return;
             }
-            modal.submitting = true;
-            modal.status_message = Some("removing\u{2026}".into());
-            app.rules.edit_modal = Some(modal.clone());
-            let result = crate::cli::commands::rules::remove_admin_rule_by_id(
-                config_path,
-                poller.socket_path(),
-                &modal.rule_id,
-            )
-            .await;
-            match result {
-                Ok(_) => {
-                    app.rules.edit_modal = None;
-                    app.status_ok(format!("rule '{}' deleted", modal.rule_id));
-                    app.loaded_config = load_v1_config(config_path);
-                    poll_active_leaf(app, poller).await;
-                }
-                Err(e) => {
-                    if let Some(m) = app.rules.edit_modal.as_mut() {
-                        m.submitting = false;
-                        m.status_message = None;
-                        m.mode = app::RuleEditMode::Edit;
-                        m.error_message = Some(format!("delete failed: {e}"));
-                    }
-                }
-            }
+            action_handlers::rule_delete(app, modal.clone(), poller, config_path).await;
         }
         _ => {
             app.rules.edit_modal = Some(modal.clone());
@@ -4032,96 +4711,11 @@ async fn handle_rule_delete_confirm_key(
 /// modal open with the error.
 async fn submit_rule_edit_modal(
     app: &mut App,
-    mut modal: app::RuleEditModal,
+    modal: app::RuleEditModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::rules::Action as CliAction;
-    use crate::cli::commands::rules::{move_admin_rule, MoveOutcome, Scope};
-    use crate::filter::rules::RuleAction;
-
-    modal.submitting = true;
-    modal.error_message = None;
-    modal.status_message = Some("saving\u{2026}".into());
-    app.rules.edit_modal = Some(modal.clone());
-
-    let to_cli_action = |a: RuleAction| match a {
-        RuleAction::Allow => CliAction::Allow,
-        RuleAction::Block => CliAction::Deny,
-    };
-    let old_action = to_cli_action(modal.original_action);
-    let new_action = to_cli_action(modal.current_action);
-
-    // Resolve the original scope in a single match that borrows `modal`
-    // directly. Orphan rules can't be edited — short-circuit here so
-    // there is exactly one match over `original_scope` and no second,
-    // refactor-fragile `unreachable!` arm. (`&modal.rule_id` is already
-    // borrowed across the await below, so borrowing `original_scope` for
-    // `old_scope` too is consistent.)
-    let old_scope = match &modal.original_scope {
-        app::RuleScope::Default => Scope::Default,
-        app::RuleScope::Profile(id) => Scope::Profile(id.as_str()),
-        app::RuleScope::Device(id) => Scope::Device(id.as_str()),
-        app::RuleScope::Orphan => {
-            if let Some(m) = app.rules.edit_modal.as_mut() {
-                m.submitting = false;
-                m.status_message = None;
-                m.error_message = Some("cannot edit an orphan rule — delete it instead".into());
-            }
-            return;
-        }
-    };
-    let new_scope_id: String = match &modal.current_scope_choice {
-        app::ScopeChoice::Default => String::new(),
-        app::ScopeChoice::Profile(id) => id.clone(),
-        app::ScopeChoice::Device(id) => id.clone(),
-    };
-    let new_scope = match &modal.current_scope_choice {
-        app::ScopeChoice::Default => Scope::Default,
-        app::ScopeChoice::Profile(_) => Scope::Profile(new_scope_id.as_str()),
-        app::ScopeChoice::Device(_) => Scope::Device(new_scope_id.as_str()),
-    };
-
-    let outcome = move_admin_rule(
-        config_path,
-        poller.socket_path(),
-        &modal.rule_id,
-        old_scope,
-        old_action,
-        new_scope,
-        new_action,
-    )
-    .await;
-
-    match outcome {
-        Ok(MoveOutcome::NoOp) => {
-            app.rules.edit_modal = None;
-            app.status_info(format!("rule '{}' unchanged", modal.rule_id));
-        }
-        Ok(MoveOutcome::Applied {
-            master_rewritten, ..
-        }) => {
-            app.rules.edit_modal = None;
-            app.status_ok(format!(
-                "rule '{}' updated{}",
-                modal.rule_id,
-                if master_rewritten {
-                    " (action flipped)"
-                } else {
-                    ""
-                }
-            ));
-            app.loaded_config = load_v1_config(config_path);
-            poll_active_leaf(app, poller).await;
-        }
-        Err(e) => {
-            if let Some(m) = app.rules.edit_modal.as_mut() {
-                m.submitting = false;
-                m.status_message = None;
-                m.error_message = Some(format!("save failed: {e}"));
-            }
-        }
-    }
+    action_handlers::rule_edit(app, modal, poller, config_path).await;
 }
 
 // The Tags-tab handlers that once stood here — the table
@@ -4145,6 +4739,37 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, c
         return;
     }
 
+    let mut key = key;
+    if detail_panel::handle_detail_key(app, key.code) {
+        return;
+    }
+    match key.code {
+        KeyCode::Up => {
+            app.settings.selected = app.settings.selected.saturating_sub(1);
+            return;
+        }
+        KeyCode::Down => {
+            app.settings.selected = (app.settings.selected + 1).min(2);
+            return;
+        }
+        KeyCode::Home => {
+            app.settings.selected = 0;
+            return;
+        }
+        KeyCode::End => {
+            app.settings.selected = 2;
+            return;
+        }
+        KeyCode::Char('i') => {
+            app.information = Some(tabs::settings::information(app));
+            return;
+        }
+        KeyCode::Enter => {
+            key.code = [KeyCode::Char('t'), KeyCode::Char('b'), KeyCode::Char('R')]
+                [app.settings.selected.min(2)]
+        }
+        _ => {}
+    }
     match key.code {
         KeyCode::Char('t') => {
             // Enter the Tracking form. Load the current
@@ -4152,17 +4777,18 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, c
             // picked up; fall back to a default TrackingConfig when
             // the loader fails (operator can still make edits; submit
             // will surface the real load error from the daemon).
-            let tracking = load_v1_config(config_path)
+            let tracking = load_current_config(config_path)
                 .map(|lc| lc.config.tracking.clone())
                 .unwrap_or_default();
             app.settings.tracking_panel =
                 Some(crate::tui::app::TrackingPanelState::from_config(&tracking));
         }
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            match poller.send_reload().await {
-                Ok(msg) => app.status_ok(format!("reload: {msg}")),
-                Err(e) => app.status_err(format!("reload failed: {e}")),
-            }
+            let socket = poller.socket_path().to_owned();
+            action_handlers::reload(app, Some(config_path.to_owned()), async move {
+                IpcPoller::new(&socket).send_reload().await
+            })
+            .await;
         }
         KeyCode::Char('b') => {
             // Open the backup confirm modal. The actual backup runs in
@@ -4172,13 +4798,22 @@ async fn handle_settings_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, c
             // `T.success`/`T.error`) instead of the red `last_error`
             // footer that swallowed the success styling before.
             let dir = crate::cli::commands::config::resolved_backup_dir(config_path);
+            app.settings.confirmation_primary = false;
+            app.settings.report_scroll = 0;
+            app.settings.report_max_scroll.set(0);
             app.settings.backup_modal = Some(backup_restore_modal::BackupModal::Confirm { dir });
         }
         KeyCode::Char('R') => {
             // Open the restore picker. No backups → footer hint instead
             // of an empty modal.
             match backup_restore_modal::RestoreModal::from_config(config_path) {
-                Some(modal) => app.settings.restore_modal = Some(modal),
+                Some(modal) => {
+                    app.settings.restore_picker = None;
+                    app.settings.confirmation_primary = false;
+                    app.settings.report_scroll = 0;
+                    app.settings.report_max_scroll.set(0);
+                    app.settings.restore_modal = Some(modal);
+                }
                 None => {
                     let dir = crate::cli::commands::config::resolved_backup_dir(config_path);
                     app.status_err(format!("no backups in {}", dir.display()));
@@ -4219,66 +4854,19 @@ fn step_labels_entry(app: &mut App, code: KeyCode) {
     app.labels.selected_id = Some(ids[next].clone());
 }
 
-/// Force the Labels focus onto a pane the layout actually paints.
-///
-/// Below `tabs::labels::NARROW_THRESHOLD` the leaf collapses to the
-/// entry table alone, so a `KindMenu` focus is unhonourable: `↑`/`↓`
-/// would swap the whole table's contents while the operator, seeing only
-/// a table, expects its rows to move. At the minimum-terminal floor of
-/// 80×24 that is the *default* state, not an edge case.
-///
-/// Clamped in state rather than derived at draw time so the **key
-/// handler** is correct too — it has no idea how wide the terminal is,
-/// and a renderer-only fix would leave the keys behaving as if a menu
-/// nobody can see still had the cursor.
-///
-/// Runs in the render loop because that is the only place the viewport
-/// width is known. Widening the terminal again does not restore the
-/// previous focus: `←` does, and inventing a remembered focus would be
-/// state nobody asked for.
+/// Keep keyboard focus on visible content after a resize.
 fn clamp_labels_focus_to_layout(app: &mut App, viewport_width: u16) {
     if app.active_leaf != Leaf::Labels {
         return;
     }
-    // Record it as well as act on it. The key handler has no viewport
-    // width and this is the only place that does; see
-    // `LabelsState::menu_painted` for what went wrong when the handler
-    // was left to assume two panes on a one-pane screen.
     let painted = crate::tui::tabs::labels::menu_is_painted(viewport_width);
     app.labels.menu_painted = painted;
     if !painted {
-        app.labels.focus = LabelsFocus::Entries;
+        app.mouse.blur_detail(Leaf::Labels);
+        if app.labels.focus == LabelsFocus::Details {
+            app.labels.focus = LabelsFocus::Entries;
+        }
     }
-}
-
-/// Step the focused vocabulary one place, and re-anchor the row.
-///
-/// Extracted so the two callers cannot drift: `↑`/`↓` drive it when the
-/// kind menu has focus, and `←`/`→` drive it when the menu is not painted
-/// at all and there is no focus to move. A second copy would be a second
-/// place for the tag filter or the re-seed to be forgotten.
-fn cycle_labels_kind(app: &mut App, forward: bool) {
-    // The menu's own list — never `LabelKind::ALL`, which still carries
-    // `Tag`. Cycling into a kind the menu does not paint would blank the
-    // highlight and empty the table with nothing on screen to explain it.
-    let kinds = crate::tui::tabs::labels::menu_kinds();
-    if kinds.is_empty() {
-        return;
-    }
-    let cur = kinds
-        .iter()
-        .position(|k| *k == app.labels.selected_kind)
-        .unwrap_or(0);
-    let next = if forward {
-        (cur + 1) % kinds.len()
-    } else {
-        (cur + kinds.len() - 1) % kinds.len()
-    };
-    app.labels.selected_kind = kinds[next];
-    // An id from the previous vocabulary means nothing here; re-seed
-    // rather than leave the gap open.
-    app.labels.selected_id = None;
-    ensure_labels_selection_seeded(app);
 }
 
 /// The ids of every label of `kind`, in config order.
@@ -4287,17 +4875,10 @@ fn cycle_labels_kind(app: &mut App, forward: bool) {
 /// straight afterwards, and handing back a borrow of `app.loaded_config`
 /// would keep the immutable borrow alive across that write.
 fn labels_ids_of_kind(app: &App, kind: crate::config::schema::LabelKind) -> Vec<String> {
-    app.loaded_config
-        .as_ref()
-        .map(|l| {
-            l.config
-                .labels
-                .iter()
-                .filter(|x| x.kind == kind)
-                .map(|x| x.id.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    tabs::labels::build_display_rows_for_kind(app, kind)
+        .into_iter()
+        .map(|row| row.key)
+        .collect()
 }
 
 /// Seed `app.labels.selected_id` to the first entry of the focused kind
@@ -4337,140 +4918,77 @@ fn ensure_labels_selection_seeded(app: &mut App) {
     app.labels.selected_id = ids.into_iter().next();
 }
 
-/// Labels navigation on the axis the
-/// leaf is drawn, plus `a` / `e` / `d` to author the vocabulary.
-///
-/// **This leaf shipped as a view first, and that was never the design.**
-/// Groups' read-only phase was *structural* — its handler took neither
-/// `config_path` nor `IpcPoller`, so a write could not arrive unannounced.
-/// Labels never had that bar: writing was inside the leaf's own scope and
-/// simply did not land at first. This signature stays `(&mut App, KeyEvent)` for
-/// the same reason Groups' did: the openers only need the app, and every
-/// write lives in `handle_label_modal_key` / `submit_label_modal`, which
-/// take both.
-///
-/// **The axis was the defect, not the key names.** `←`/`→` already
-/// worked, aliased to `h`/`l` — but they *cycled the kind menu*, which is
-/// painted as stacked rows, one per kind. A vertical list walked by a horizontal
-/// key is what an operator reported as "VIM navigation"; `h`/`l` was the
-/// only such pair in the TUI. Now the horizontal keys move between the
-/// two cards and the vertical keys move inside the focused one, which is
-/// how the leaf looks.
-///
-/// **`←`/`→` are absolute, not toggles.** `Left` always means the left
-/// card, which is what the operator sees. That is also what makes an
-/// omitted arm detectable: with a two-variant focus, toggling keys are
-/// behaviourally identical, so no test could distinguish a missing
-/// `Left` arm from a present one — nor a build with the `Left` and
-/// `Right` bodies swapped. Verified by mutation, both ways.
-///
-/// **`Tab` is deliberately NOT bound here.** It stays the global leaf
-/// cycle; see the arm in `handle_key` for why the shadow was built and
-/// then reverted.
-///
-/// **`h`/`l` were remapped once and then DELETED.** The paragraph above
-/// is kept because it is the
-/// argument, not the state: they used to cycle the kind, then that
-/// job moved to `↑`/`↓` while the menu has focus, and the two could not both
-/// hold. The four vim aliases were then removed TUI-wide — bound but
-/// undocumented is the one state that is wrong in both directions. The
-/// arrows are unchanged; `h`/`l`/`j`/`k` are unbound here and are
-/// deliberately NOT rebound. Pinned by
-/// `ux8_h_and_l_are_no_longer_bound_on_labels`.
-fn handle_labels_key(app: &mut App, key: KeyEvent) {
-    // The guard comes FIRST. Seeding against a failed load would find no
-    // labels and write `selected_id = None`, so a single keystroke while
-    // the config is broken would wipe an anchor that had survived it —
-    // and the operator's next `r` would land them on row 0 of a table
-    // they had already navigated away from.
+fn select_label_kind(app: &mut App, kind: crate::config::schema::LabelKind) {
     if app.loaded_config.is_none() {
         return;
     }
-    // Every keystroke, like Subnets: the leaf must be operable from the
-    // first interaction rather than after a wake-up press.
-    //
-    // This leans on it harder now than the read-only view did. It is what makes
-    // `selected_id` name the row the table highlights, and `focused_label`
-    // — which `e` and `d` resolve through — reads that anchor. Seeding
-    // after the openers would let the first `e` on a freshly entered tab
-    // act on a row the operator has not seen highlighted.
+    app.mouse.blur_detail(Leaf::Labels);
+    app.labels.focus = LabelsFocus::Categories;
+    if app.labels.selected_kind != kind {
+        app.labels.selected_kind = kind;
+        app.labels.selected_id = None;
+        app.labels.table_state = Default::default();
+    }
     ensure_labels_selection_seeded(app);
+}
 
-    // Add first, and above every emptiness check: it is the one verb whose
-    // whole purpose is to work when the vocabulary is empty. **Zero**
-    // `[[labels]]` rows is measured on live boxes, so "empty" is
-    // not the corner case here — it is the state the operator meets. The
-    // kind comes from the focused pane and is not a form field; see the
-    // `label_modal` module doc for the context-desync argument that
-    // settled it.
-    if key.code == KeyCode::Char('a') {
-        app.labels.modal = Some(build_label_add_modal(app));
+fn handle_labels_key(app: &mut App, key: KeyEvent) {
+    if app.loaded_config.is_none() {
         return;
     }
-
-    match key.code {
-        // `e` / `d` resolve a row first: there is nothing to edit or
-        // remove when the focused kind has no entries, and
-        // `build_label_*_modal` returns `None` in exactly that case.
-        // Enter is the primary action on the focused row; on Labels
-        // that is edit. Same branch as `e`, no new modal.
-        KeyCode::Enter | KeyCode::Char('e') => {
-            if let Some(modal) = build_label_edit_modal(app) {
-                app.labels.modal = Some(modal);
-            }
-        }
-        KeyCode::Char('d') | KeyCode::Delete => {
-            if let Some(modal) = build_label_remove_modal(app) {
-                app.labels.modal = Some(modal);
-            }
-        }
-        // **`←`/`→` mean one of two things, and which one is a property of
-        // the layout rather than a mode the operator chose.**
-        //
-        // Wide: they move focus between the two cards — a vertically drawn
-        // menu must not be walked by a horizontal
-        // key.
-        //
-        // Narrow: there is no second card. `menu_is_painted` is false below
-        // `NARROW_THRESHOLD`, the clamp pins focus to the table every frame,
-        // and a `←` that sets `KindMenu` is undone before the next keystroke
-        // is read — so the kind was **unreachable**, and with it two of the
-        // three vocabularies at the declared 80×24 floor. The axis argument
-        // does not apply to a menu that is not drawn: there is no vertical
-        // list to walk, so the horizontal keys are free to carry the kind,
-        // which is exactly what they did before the axis fix.
-        KeyCode::Left => {
-            if app.labels.menu_painted {
-                app.labels.focus = LabelsFocus::KindMenu;
-            } else {
-                cycle_labels_kind(app, false);
-            }
-        }
-        KeyCode::Right => {
-            if app.labels.menu_painted {
+    if matches!(key.code, KeyCode::Char('f' | 'F'))
+        || (key.code == KeyCode::Left && !detail_panel::focused(app, Leaf::Labels))
+    {
+        app.mouse.blur_detail(Leaf::Labels);
+        app.labels.focus = LabelsFocus::Categories;
+        return;
+    }
+    if app.labels.focus == LabelsFocus::Categories && !detail_panel::focused(app, Leaf::Labels) {
+        let kinds = tabs::labels::menu_kinds();
+        let index = kinds
+            .iter()
+            .position(|kind| *kind == app.labels.selected_kind)
+            .unwrap_or(0);
+        let next = match key.code {
+            KeyCode::Up => Some((index + kinds.len() - 1) % kinds.len()),
+            KeyCode::Down => Some((index + 1) % kinds.len()),
+            KeyCode::Home | KeyCode::PageUp => Some(0),
+            KeyCode::End | KeyCode::PageDown => Some(kinds.len() - 1),
+            KeyCode::Right | KeyCode::Enter | KeyCode::Esc => {
                 app.labels.focus = LabelsFocus::Entries;
-            } else {
-                cycle_labels_kind(app, true);
+                return;
             }
+            _ => None,
+        };
+        if let Some(next) = next {
+            select_label_kind(app, kinds[next]);
+            return;
         }
-        KeyCode::Down | KeyCode::Up => {
-            let forward = matches!(key.code, KeyCode::Down);
-            match app.labels.focus {
-                // The kind menu is a three-item value cycler, not a list —
-                // one of a small set of `rem_euclid` sites where wrap is
-                // load-bearing. It keeps
-                // wrapping; only the ENTRIES table is a list.
-                LabelsFocus::KindMenu => cycle_labels_kind(app, forward),
-                LabelsFocus::Entries => step_labels_entry(app, key.code),
-            }
-        }
-        // Jump / page, entries only. `Home` / `End` on the kind menu
-        // would be a jump within a three-item cycler; there is nothing to
-        // jump past, so they stay unbound there rather than aliasing
-        // `↑`/`↓`.
-        KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown
-            if app.labels.focus == LabelsFocus::Entries =>
-        {
+    }
+    if key.code == KeyCode::Right && !app.labels.menu_painted {
+        return;
+    }
+    if detail_panel::handle_detail_key(app, key.code) {
+        app.labels.focus = if detail_panel::focused(app, Leaf::Labels) {
+            LabelsFocus::Details
+        } else {
+            LabelsFocus::Entries
+        };
+        return;
+    }
+    ensure_labels_selection_seeded(app);
+    match key.code {
+        KeyCode::Char('a') => app.labels.modal = Some(build_label_add_modal(app)),
+        KeyCode::Enter | KeyCode::Char('e') => app.labels.modal = build_label_edit_modal(app),
+        KeyCode::Char('d') | KeyCode::Delete => app.labels.modal = build_label_remove_modal(app),
+        KeyCode::Char('i') => app.information = Some(tabs::labels::information(app)),
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown => {
+            app.labels.focus = LabelsFocus::Entries;
             step_labels_entry(app, key.code);
         }
         _ => app.leaf_key_unhandled = true,
@@ -4485,16 +5003,10 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
 /// straight afterwards, and handing back a borrow of `app.loaded_config`
 /// would keep the immutable borrow alive across that write.
 fn custom_list_ids(app: &App) -> Vec<String> {
-    app.loaded_config
-        .as_ref()
-        .map(|l| {
-            l.config
-                .custom_lists
-                .iter()
-                .map(|c| c.id.as_str().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    tabs::custom_lists::build_display_rows(app)
+        .into_iter()
+        .map(|row| tabs::custom_lists::display_row_key(&row).to_owned())
+        .collect()
 }
 
 /// Seed the list cursor to the first row when it is unset, or repair it
@@ -4510,93 +5022,95 @@ fn custom_list_ids(app: &App) -> Vec<String> {
 /// otherwise find zero lists, write `None`, and discard the operator's
 /// place without anyone pressing a key.
 fn ensure_custom_list_selection_seeded(app: &mut App) {
-    if app.loaded_config.is_none() {
+    if app.operator_catalog.is_none() {
         return;
     }
-    let ids = custom_list_ids(app);
-    if let Some(want) = app.custom_lists.selected_id.as_deref() {
-        if ids.iter().any(|i| i == want) {
-            return;
-        }
-    }
-    app.custom_lists.selected_id = ids.into_iter().next();
+    let rows = tabs::custom_lists::build_display_rows(app);
+    let index =
+        tabs::custom_lists::index_of_display_key(&rows, app.custom_lists.selected_id.as_deref())
+            .or_else(|| (!rows.is_empty()).then_some(0));
+    app.custom_lists.selected_id = index.map(|i| rows[i].id.clone());
+    app.custom_lists.table_state.select(index);
 }
 
-/// Reload the rule pane's lines when the selection has moved.
-///
-/// Runs on every dirty render, but reads the file only when the loaded
-/// pack does not match the anchor — otherwise the draw path would do I/O
-/// at the frame rate. `force` re-reads the same list after a write.
-fn refresh_custom_list_pack(app: &mut App, force: bool) {
-    use crate::config::custom_list::{pack_path, read_pack_lines};
-    use crate::tui::app::PackView;
-
-    let Some(loaded) = app.loaded_config.as_ref() else {
-        app.custom_lists.pack = None;
-        return;
-    };
-    let Some(want) = app.custom_lists.selected_id.clone() else {
-        app.custom_lists.pack = None;
-        return;
-    };
-    if !force && app.custom_lists.pack.as_ref().is_some_and(|p| p.id == want) {
+/// Request a revision-matched daemon page when the list selection changes.
+/// This scheduling hook performs no filesystem or socket I/O while drawing.
+fn request_custom_list_rules(app: &mut App, force: bool) {
+    if !force
+        && app.operator_rules.as_ref().is_some_and(|rules| {
+            app.custom_lists.selected_id.as_deref() == Some(rules.id.as_str())
+                && app.operator_catalog.as_ref().is_some_and(|catalog| {
+                    catalog.lists.iter().any(|list| {
+                        list.id == rules.id
+                            && list.config_revision == rules.config_revision
+                            && list.pack_revision == rules.pack_revision
+                    })
+                })
+        })
+    {
         return;
     }
-    let Ok(id) = crate::config::schema::Id::new(want.as_str()) else {
-        app.custom_lists.pack = None;
-        return;
-    };
-    let Some(root) = loaded.master_path.parent() else {
-        app.custom_lists.pack = None;
-        return;
-    };
-    let max = loaded.config.custom_list_limits.max_file_bytes;
-    let view = match read_pack_lines(&pack_path(root, &id), max) {
-        Ok(views) => PackView {
-            id: want,
-            rows: crate::tui::tabs::custom_lists::rows_from_views(&views),
-            error: None,
+    reads::request_active(
+        app,
+        if force {
+            jobs::ReadReason::Explicit
+        } else {
+            jobs::ReadReason::Automatic
         },
-        // An unreadable FILE is an error the pane states; an unparseable
-        // LINE is a row. Collapsing the two would hide the difference
-        // between "no rules" and "cannot be read".
-        Err(e) => PackView {
-            id: want,
-            rows: Vec::new(),
-            error: Some(e.to_string()),
-        },
-    };
-    app.custom_lists.pack = Some(view);
+    );
+}
+
+/// Return only a revision-matched rule snapshot from the daemon.
+fn current_custom_rule_rows(
+    app: &App,
+) -> Option<(
+    tabs::custom_lists::CustomListRow,
+    Vec<tabs::custom_lists::CustomListRuleRow>,
+)> {
+    let rows = tabs::custom_lists::build_display_rows(app);
+    let index =
+        tabs::custom_lists::index_of_display_key(&rows, app.custom_lists.selected_id.as_deref())
+            .unwrap_or(0);
+    let selected = rows.into_iter().nth(index)?;
+    match tabs::custom_lists::display_rule_rows(app, &selected) {
+        tabs::custom_lists::CustomListRules::Ready(rules) => Some((selected, rules)),
+        _ => None,
+    }
 }
 
 /// Step the rule cursor, clamped at both ends.
 ///
-/// Anchored on the 1-based FILE LINE, not on a row index: a reload that
-/// adds or removes lines above the cursor would otherwise silently move
-/// what the next action operates on.
+/// The cursor follows the backend row reference so external edits cannot
+/// retarget a pending action through a shifted display index.
 fn step_custom_list_rule(app: &mut App, code: KeyCode) {
-    let Some(pack) = app.custom_lists.pack.as_ref() else {
+    let Some((list, rows)) = current_custom_rule_rows(app) else {
         return;
     };
-    if pack.rows.is_empty() {
+    if rows.is_empty() {
         return;
     }
-    let last = pack.rows.len() - 1;
-    let cur = app
+    let last = rows.len() - 1;
+    let current = app
         .custom_lists
-        .selected_line
-        .and_then(|n| pack.rows.iter().position(|r| r.number == n))
+        .selected_row_ref
+        .as_ref()
+        .and_then(|(id, row_ref)| {
+            (id == &list.id)
+                .then(|| rows.iter().position(|row| &row.row_ref == row_ref))
+                .flatten()
+        })
         .unwrap_or(0);
     let next = match code {
-        KeyCode::Down => (cur + 1).min(last),
-        KeyCode::Up => cur.saturating_sub(1),
+        KeyCode::Down => (current + 1).min(last),
+        KeyCode::Up => current.saturating_sub(1),
         KeyCode::Home => 0,
         KeyCode::End => last,
-        KeyCode::PageDown => (cur + NAV_PAGE).min(last),
-        KeyCode::PageUp => cur.saturating_sub(NAV_PAGE),
+        KeyCode::PageDown => (current + NAV_PAGE).min(last),
+        KeyCode::PageUp => current.saturating_sub(NAV_PAGE),
         _ => return,
     };
-    app.custom_lists.selected_line = Some(pack.rows[next].number);
+    app.custom_lists.selected_row_ref = Some((list.id, rows[next].row_ref.clone()));
+    app.custom_lists.rules_table_state.select(Some(next));
 }
 
 /// Force the Custom Lists focus onto a pane the layout actually paints.
@@ -4614,11 +5128,8 @@ fn clamp_custom_lists_focus_to_layout(app: &mut App, viewport_width: u16) {
     if app.active_leaf != Leaf::CustomLists {
         return;
     }
-    let painted = crate::tui::tabs::custom_lists::rules_pane_is_painted(viewport_width);
-    app.custom_lists.rules_pane_painted = painted;
-    if !painted {
-        app.custom_lists.focus = CustomListsFocus::Lists;
-    }
+    app.custom_lists.rules_pane_painted = tabs::custom_lists::rules_pane_is_painted(viewport_width)
+        || app.custom_lists.focus == CustomListsFocus::Rules;
 }
 
 /// Step the list cursor, clamped at both ends.
@@ -4656,12 +5167,47 @@ fn step_custom_list(app: &mut App, code: KeyCode) {
 /// would be the only one that answers to them. The arrows are the motion
 /// keys.
 fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
-    // The guard comes FIRST, as on Labels: seeding against a failed load
-    // would find no lists and wipe an anchor that had survived it.
-    if app.loaded_config.is_none() {
+    if let Some(info) = app.custom_lists.info.as_mut() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('i') => app.custom_lists.info = None,
+            KeyCode::Enter => info.advanced_expanded = !info.advanced_expanded,
+            _ => {}
+        }
+        return;
+    }
+
+    // Seeding against a failed load would find no lists and wipe an anchor
+    // that had survived it. Overlay dismissal remains available above this
+    // guard if a refresh fails while details are open.
+    if app.operator_catalog.is_none() {
         return;
     }
     ensure_custom_list_selection_seeded(app);
+
+    if key.code == KeyCode::Char('i') {
+        app.custom_lists.info = match app.custom_lists.focus {
+            CustomListsFocus::Lists => app
+                .custom_lists
+                .selected_id
+                .clone()
+                .map(app::CustomListInfoTarget::List)
+                .map(|target| app::CustomListInfo {
+                    target,
+                    advanced_expanded: focused_custom_list_row(app)
+                        .is_some_and(|row| row.invalid_rows > 0 || row.count_error.is_some()),
+                }),
+            CustomListsFocus::Rules => {
+                focused_custom_rule(app).map(|(list_id, row)| app::CustomListInfo {
+                    advanced_expanded: !row.valid || row.duplicate,
+                    target: app::CustomListInfoTarget::Rule {
+                        list_id,
+                        row_ref: row.row_ref,
+                    },
+                })
+            }
+        };
+        return;
+    }
 
     // **`a`, `e` and `d` mean different things per pane, and the focused
     // pane is what says which.** The rule pane's cursor glyph and the
@@ -4684,6 +5230,12 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
                 }
                 return;
             }
+            KeyCode::Enter => {
+                if let Some(modal) = build_rule_edit_modal(app) {
+                    app.custom_lists.modal = Some(modal);
+                }
+                return;
+            }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(modal) = build_rule_remove_modal(app) {
                     app.custom_lists.modal = Some(modal);
@@ -4701,7 +5253,9 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
             ));
             return;
         }
-        KeyCode::Char('e') => {
+        KeyCode::Enter | KeyCode::Char('e')
+            if app.custom_lists.focus == CustomListsFocus::Lists =>
+        {
             if let Some(entity) = focused_custom_list(app) {
                 app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_edit(
                     &entity,
@@ -4714,10 +5268,15 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
             if let Some(entity) = focused_custom_list(app) {
                 let mounted = profiles_mounting(app, entity.id.as_str());
                 let rules = app
-                    .loaded_config
+                    .operator_catalog
                     .as_ref()
-                    .and_then(|l| l.custom_lists.get(&entity.id))
-                    .map(|c| c.allow.len() + c.deny.len())
+                    .and_then(|catalog| {
+                        catalog
+                            .lists
+                            .iter()
+                            .find(|list| list.id == entity.id.as_str())
+                    })
+                    .map(|list| list.rule_count)
                     .unwrap_or(0);
                 app.custom_lists.modal = Some(custom_list_modal::CustomListModal::open_remove(
                     &entity, mounted, rules,
@@ -4742,20 +5301,17 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
     // keys have somewhere to go. `h`/`l` ride alongside them here by the
     // operator's decision; they are bound on no other leaf.
     match key.code {
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
-            if app.custom_lists.focus == CustomListsFocus::Lists =>
-        {
-            // Never hand focus to a pane the layout does not paint.
-            if app.custom_lists.rules_pane_painted {
-                app.custom_lists.focus = CustomListsFocus::Rules;
+        KeyCode::Char('v') => {
+            app.custom_lists.focus = match app.custom_lists.focus {
+                CustomListsFocus::Lists => CustomListsFocus::Rules,
+                CustomListsFocus::Rules => CustomListsFocus::Lists,
+            };
+            if app.custom_lists.focus == CustomListsFocus::Rules {
                 ensure_custom_list_rule_seeded(app);
-            } else {
-                app.leaf_key_unhandled = true;
+                request_custom_list_rules(app, false);
             }
         }
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc
-            if app.custom_lists.focus == CustomListsFocus::Rules =>
-        {
+        KeyCode::Left | KeyCode::Esc if app.custom_lists.focus == CustomListsFocus::Rules => {
             app.custom_lists.focus = CustomListsFocus::Lists;
         }
         KeyCode::Down
@@ -4769,8 +5325,8 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
                 // The rule pane FOLLOWS the list cursor with no keystroke:
                 // that is what makes the selection legible at a glance,
                 // and it is the answer to "which list holds this domain".
-                refresh_custom_list_pack(app, false);
-                app.custom_lists.selected_line = None;
+                request_custom_list_rules(app, false);
+                app.custom_lists.selected_row_ref = None;
             }
             CustomListsFocus::Rules => step_custom_list_rule(app, key.code),
         },
@@ -4778,44 +5334,53 @@ fn handle_custom_lists_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The removal confirm for the rule under the cursor, if there is one.
-///
-/// Returns `None` on a comment, a blank or a refused line: those carry no
-/// domain, so there is nothing for `remove_rule` to match. Silently doing
-/// nothing there is right — the alternative is a confirm that offers to
-/// remove a comment and then removes something else.
+fn focused_custom_list_row(app: &App) -> Option<tabs::custom_lists::CustomListRow> {
+    let rows = tabs::custom_lists::build_display_rows(app);
+    tabs::custom_lists::selected_display_row(app, &rows).cloned()
+}
+
+/// Resolve the highlighted semantic row against the captured backend page.
+fn focused_custom_rule(app: &App) -> Option<(String, tabs::custom_lists::CustomListRuleRow)> {
+    let (list, rows) = current_custom_rule_rows(app)?;
+    let index = app
+        .custom_lists
+        .selected_row_ref
+        .as_ref()
+        .filter(|(id, _)| id == &list.id)
+        .and_then(|(_, row_ref)| rows.iter().position(|row| &row.row_ref == row_ref))
+        .or_else(|| (!rows.is_empty()).then_some(0))?;
+    Some((list.id, rows.into_iter().nth(index)?))
+}
+
+/// Removal previews the exact captured rows. Simple domains retain the
+/// existing remove-both-directions behavior; advanced syntax targets one row.
 fn build_rule_remove_modal(app: &App) -> Option<custom_list_modal::CustomListModal> {
-    let list_id = app.custom_lists.selected_id.clone()?;
-    let pack = app.custom_lists.pack.as_ref()?;
-    let line = app.custom_lists.selected_line?;
-    let row = pack.rows.iter().find(|r| r.number == line)?;
-    let domain = row.domain.clone()?;
-    let affected = rule_lines_naming(app, &domain);
+    use crate::config::custom_list::{parse_pack_line, PackLine};
+    let (list_id, row) = focused_custom_rule(app)?;
+    let (label, affected) = match parse_pack_line(&row.raw) {
+        Ok(PackLine::Allow(domain) | PackLine::Deny(domain)) => {
+            let affected = rule_lines_naming(app, domain.as_str());
+            (domain.to_string(), affected)
+        }
+        _ => (
+            format!("Line {}", row.line),
+            vec![custom_list_modal::BackendRuleRef {
+                row_ref: row.row_ref,
+                line: row.line,
+                raw: row.raw,
+            }],
+        ),
+    };
     Some(custom_list_modal::CustomListModal::open_remove_rule(
-        list_id, domain, affected,
+        list_id, label, affected,
     ))
 }
 
-/// The edit form for the rule under the cursor, if there is one.
-///
-/// `None` on a comment, a blank, or a line the grammar refused. The first
-/// two are unreachable — the pane does not draw them — but a REFUSED line
-/// is drawn, and it carries no domain: it cannot state what the operator
-/// saw, so there is nothing the writer could check the file against. A key
-/// that opens nothing beats a form that can never save.
+/// Complex and refused rows keep their raw source; reducing them to a domain
+/// would lose modifiers when the operator saves.
 fn build_rule_edit_modal(app: &App) -> Option<custom_list_modal::CustomListModal> {
-    use crate::tui::app::PackRowAction;
-    let list_id = app.custom_lists.selected_id.clone()?;
-    let pack = app.custom_lists.pack.as_ref()?;
-    let line = app.custom_lists.selected_line?;
-    let row = pack.rows.iter().find(|r| r.number == line)?;
-    let domain = row.domain.clone()?;
-    Some(custom_list_modal::CustomListModal::open_edit_rule(
-        list_id,
-        line,
-        domain,
-        matches!(row.action, PackRowAction::Allow),
-    ))
+    let (list_id, row) = focused_custom_rule(app)?;
+    Some(tabs::custom_lists::rule_editor_modal(list_id, &row))
 }
 
 /// Seed the rule cursor to the first line when it is unset or dangling.
@@ -4824,16 +5389,22 @@ fn build_rule_edit_modal(app: &App) -> Option<custom_list_modal::CustomListModal
 /// cursor while the state says `None` — and any verb reading the anchor
 /// would no-op on exactly the row that looks selected.
 fn ensure_custom_list_rule_seeded(app: &mut App) {
-    let Some(pack) = app.custom_lists.pack.as_ref() else {
+    let Some((list, rows)) = current_custom_rule_rows(app) else {
         return;
     };
-    let resolves = app
+    let selected = app
         .custom_lists
-        .selected_line
-        .is_some_and(|n| pack.rows.iter().any(|r| r.number == n));
-    if !resolves {
-        app.custom_lists.selected_line = pack.rows.first().map(|r| r.number);
-    }
+        .selected_row_ref
+        .as_ref()
+        .and_then(|(id, row_ref)| {
+            (id == &list.id)
+                .then(|| rows.iter().position(|row| &row.row_ref == row_ref))
+                .flatten()
+        })
+        .or_else(|| (!rows.is_empty()).then_some(0));
+    app.custom_lists.selected_row_ref =
+        selected.map(|index| (list.id, rows[index].row_ref.clone()));
+    app.custom_lists.rules_table_state.select(selected);
 }
 
 /// The list the openers act on: the anchored selection, else the first row.
@@ -4844,28 +5415,21 @@ fn ensure_custom_list_rule_seeded(app: &mut App) {
 /// would mount a list other than the highlighted one and nothing on screen
 /// would say so.
 fn focused_custom_list(app: &App) -> Option<crate::config::schema::CustomList> {
-    let loaded = app.loaded_config.as_ref()?;
-    let lists = &loaded.config.custom_lists;
-    let want = app.custom_lists.selected_id.as_deref();
-    lists
-        .iter()
-        .find(|c| Some(c.id.as_str()) == want)
-        .or_else(|| lists.first())
-        .cloned()
+    let rows = tabs::custom_lists::build_display_rows(app);
+    let row = tabs::custom_lists::selected_display_row(app, &rows)?;
+    Some(crate::config::schema::CustomList {
+        id: crate::config::schema::Id::new(&row.id).ok()?,
+        display_name: row.display_name.clone(),
+        description: row.description.clone(),
+    })
 }
 
 /// Profiles that mount `id`, in config order.
 fn profiles_mounting(app: &App, id: &str) -> Vec<String> {
-    app.loaded_config
+    app.operator_catalog
         .as_ref()
-        .map(|l| {
-            l.config
-                .profiles
-                .iter()
-                .filter(|(_, p)| p.custom_lists.iter().any(|c| c.as_str() == id))
-                .map(|(name, _)| name.clone())
-                .collect()
-        })
+        .and_then(|catalog| catalog.lists.iter().find(|list| list.id == id))
+        .map(|list| list.profiles.clone())
         .unwrap_or_default()
 }
 
@@ -4881,18 +5445,15 @@ fn packs_dir_display(app: &App) -> String {
 /// Every declared profile in config order, each with whether it already
 /// mounts `list_id`.
 fn profiles_with_mount_state(app: &App, list_id: &str) -> Vec<(String, bool)> {
+    let mounted = profiles_mounting(app, list_id);
     app.loaded_config
         .as_ref()
-        .map(|l| {
-            l.config
+        .map(|loaded| {
+            loaded
+                .config
                 .profiles
-                .iter()
-                .map(|(name, p)| {
-                    (
-                        name.clone(),
-                        p.custom_lists.iter().any(|c| c.as_str() == list_id),
-                    )
-                })
+                .keys()
+                .map(|id| (id.clone(), mounted.contains(id)))
                 .collect()
         })
         .unwrap_or_default()
@@ -4946,6 +5507,11 @@ async fn handle_custom_list_modal_key(
     };
     if modal.is_submitted() {
         // Any keypress on the outcome card closes it.
+        return;
+    }
+
+    if is_save_key(key) && matches!(modal.stage, Stage::EditingForm(_) | Stage::AddingRule(_)) {
+        submit_custom_list_modal(app, modal, poller, config_path).await;
         return;
     }
 
@@ -5030,11 +5596,39 @@ async fn handle_custom_list_modal_key(
             match key.code {
                 KeyCode::Esc => return,
                 KeyCode::Tab | KeyCode::Down => {
-                    form.focused = form.focused.next();
+                    let fields = if form.is_raw_edit() {
+                        &[RuleField::Raw, RuleField::Submit, RuleField::Cancel][..]
+                    } else {
+                        &[
+                            RuleField::Domain,
+                            RuleField::Direction,
+                            RuleField::Submit,
+                            RuleField::Cancel,
+                        ][..]
+                    };
+                    let index = fields
+                        .iter()
+                        .position(|field| *field == form.focused)
+                        .unwrap_or(0);
+                    form.focused = fields[(index + 1) % fields.len()];
                     form.error_message = None;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    form.focused = form.focused.prev();
+                    let fields = if form.is_raw_edit() {
+                        &[RuleField::Raw, RuleField::Submit, RuleField::Cancel][..]
+                    } else {
+                        &[
+                            RuleField::Domain,
+                            RuleField::Direction,
+                            RuleField::Submit,
+                            RuleField::Cancel,
+                        ][..]
+                    };
+                    let index = fields
+                        .iter()
+                        .position(|field| *field == form.focused)
+                        .unwrap_or(0);
+                    form.focused = fields[(index + fields.len() - 1) % fields.len()];
                     form.error_message = None;
                 }
                 // The shared modal grammar: Left/Right change the value on
@@ -5059,8 +5653,12 @@ async fn handle_custom_list_modal_key(
                 // The focus check rides the guard rather than an inner
                 // `if`: a keystroke aimed at a non-text field then falls to
                 // the catch-all, which is where it already ended up.
-                KeyCode::Backspace if form.focused == RuleField::Domain => {
-                    form.domain.pop();
+                KeyCode::Backspace
+                    if matches!(form.focused, RuleField::Domain | RuleField::Raw) =>
+                {
+                    if let Some(buffer) = custom_list_rule_paste_buf(form) {
+                        buffer.pop();
+                    }
                     form.error_message = None;
                 }
                 // **The CONTROL mask is not decoration.** The footer, while
@@ -5070,10 +5668,12 @@ async fn handle_custom_list_modal_key(
                 // would do something worse than nothing and type an `s`
                 // into the domain.
                 KeyCode::Char(c)
-                    if form.focused == RuleField::Domain
+                    if matches!(form.focused, RuleField::Domain | RuleField::Raw)
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    form.domain.push(c);
+                    if let Some(buffer) = custom_list_rule_paste_buf(form) {
+                        buffer.push(c);
+                    }
                     form.error_message = None;
                 }
                 _ => {}
@@ -5100,297 +5700,31 @@ async fn handle_custom_list_modal_key(
 /// it the operator creates a list and the DNS does not change.
 async fn submit_custom_list_modal(
     app: &mut App,
-    mut modal: custom_list_modal::CustomListModal,
+    modal: custom_list_modal::CustomListModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use custom_list_modal::{FormMode, Stage, SubmitOutcome};
+    action_handlers::custom_lists(app, modal, poller, config_path).await;
+}
 
-    // An Edit that changes nothing must not write. Rewriting the
-    // operator's TOML and reloading the daemon for a no-op is the same
-    // waste the mount picker refuses when nothing is staged — and here it
-    // would also churn the file's mtime, which is what the leaf's UPDATED
-    // column reports.
-    let mut wrote = true;
-    let outcome: SubmitOutcome = match &modal.stage {
-        Stage::EditingForm(form) => match form.try_resolve() {
-            Err(msg) => SubmitOutcome::Failed(msg),
-            Ok(resolved) => {
-                let unchanged = form.original.as_ref().is_some_and(|o| {
-                    o.id == resolved.id
-                        && o.display_name == resolved.display_name
-                        && o.description == resolved.description
-                });
-                if form.mode == FormMode::Edit && unchanged {
-                    wrote = false;
-                    SubmitOutcome::Ok(format!("custom list {} unchanged", resolved.id))
-                } else {
-                    let r = match form.mode {
-                        FormMode::Add => create_custom_list(config_path, &resolved),
-                        FormMode::Edit => form
-                            .original
-                            .as_ref()
-                            .ok_or_else(|| {
-                                "custom-list edit lost its original snapshot".to_string()
-                            })
-                            .and_then(|original| {
-                                update_custom_list_meta(config_path, &resolved, original)
-                            }),
-                    };
-                    match r {
-                        Ok(msg) => SubmitOutcome::Ok(msg),
-                        Err(msg) => SubmitOutcome::Failed(msg),
-                    }
-                }
-            }
-        },
-        Stage::ConfirmingRemove(rc) => match remove_custom_list(config_path, &rc.id) {
-            Ok(msg) => SubmitOutcome::Ok(msg),
-            Err(msg) => SubmitOutcome::Failed(msg),
-        },
-        Stage::AddingRule(form) => {
-            // An edit that changes nothing must not write, for the reason
-            // the list form gives one arm up: it would churn the file's
-            // mtime, which the leaf's UPDATED column reports, and spend a
-            // daemon reload on a no-op.
-            let written = match form.replacing() {
-                None => {
-                    add_rule_to_pack(config_path, &form.list_id, form.domain.trim(), form.allow)
-                }
-                Some((line, ..)) if form.is_unchanged() => {
-                    wrote = false;
-                    Ok(format!("line {line} of {} unchanged", form.list_id))
-                }
-                Some((line, was_domain, was_allow)) => replace_rule_in_pack(
-                    config_path,
-                    &form.list_id,
-                    line,
-                    (was_domain, was_allow),
-                    form.domain.trim(),
-                    form.allow,
-                ),
-            };
-            match written {
-                Ok(msg) => SubmitOutcome::Ok(msg),
-                Err(msg) => SubmitOutcome::Failed(msg),
-            }
-        }
-        Stage::ConfirmingRuleRemove(rc) => {
-            match remove_rule_from_pack(config_path, &rc.list_id, &rc.domain) {
-                Ok(msg) => SubmitOutcome::Ok(msg),
-                Err(msg) => SubmitOutcome::Failed(msg),
-            }
-        }
-        Stage::Submitted(_) => return,
+/// Capture backend row references for every simple rule naming this domain.
+fn rule_lines_naming(app: &App, domain: &str) -> Vec<custom_list_modal::BackendRuleRef> {
+    use crate::config::custom_list::{parse_pack_line, PackLine};
+    let Some((_, rows)) = current_custom_rule_rows(app) else {
+        return Vec::new();
     };
-
-    // A form failure keeps the modal OPEN with the message inline, so the
-    // operator fixes the offending field instead of retyping the rest. A
-    // remove failure has no form to keep, so it finishes.
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        match &mut modal.stage {
-            Stage::EditingForm(form) => {
-                app.status_err(format!("custom list: {msg}"));
-                form.error_message = Some(msg.clone());
-                app.custom_lists.modal = Some(modal);
-                return;
-            }
-            // A rejected domain keeps the form and its typing: the
-            // grammar refuses wildcards and paths, and retyping the whole
-            // domain to fix one character is the cost of dropping it.
-            Stage::AddingRule(form) => {
-                app.status_err(format!("rule: {msg}"));
-                form.error_message = Some(msg.clone());
-                app.custom_lists.modal = Some(modal);
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    let was_ok = wrote && matches!(outcome, SubmitOutcome::Ok(_));
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => app.status_err(format!("custom list: {msg}")),
-    }
-    modal.finish(outcome);
-    app.custom_lists.modal = Some(modal);
-
-    if was_ok {
-        let reload = attempt_reload(poller.socket_path()).await;
-        // The reload arms REPLACE the status set above. `Reloaded` is the
-        // one arm that stays silent and therefore keeps it.
-        match reload {
-            ReloadOutcome::Reloaded => {}
-            ReloadOutcome::DaemonUnreachable => {
-                app.status_err(
-                    "saved on disk — daemon not running, will activate on next start".into(),
-                );
-            }
-            ReloadOutcome::NoToken { .. } => {
-                app.status_err(
-                    "saved on disk but no admin token is available to request a reload".into(),
-                );
-            }
-            ReloadOutcome::ReloadFailed(msg) => {
-                app.status_err(format!("saved but daemon rejected reload: {msg}"));
-            }
-        }
-        app.loaded_config = load_v1_config(config_path);
-        // The anchor may name a list that no longer exists after a remove.
-        ensure_custom_list_selection_seeded(app);
-        // FORCED: a rule write changes the file under an unchanged
-        // selection, so the "same id, already loaded" fast path would
-        // leave the pane showing the file as it was before the write.
-        refresh_custom_list_pack(app, true);
-        ensure_custom_list_rule_seeded(app);
-        poll_active_leaf(app, poller).await;
-    }
-}
-
-/// Append one rule to the selected list's pack.
-///
-/// **`add_rule` and `remove_rule` are the only two writers this leaf may
-/// reach for.** Reading a pack is permissive — an unparseable line is
-/// skipped and counted, and the file loads — while `write_pack` refuses the
-/// whole write at the first invalid line. So a save that rebuilt the file
-/// from the rows this pane drew would either fail on a file that had loaded
-/// cleanly, or "repair" it by deleting every comment and every line the
-/// reader had skipped. A pack in the field carries more comment lines than
-/// rules.
-fn add_rule_to_pack(
-    config_path: &Path,
-    list_id: &str,
-    domain: &str,
-    allow: bool,
-) -> Result<String, String> {
-    use crate::config::custom_list::AddOutcome;
-
-    if domain.is_empty() {
-        return Err("a domain is required".into());
-    }
-    crate::config::custom_list::normalise_domain(domain).map_err(|error| error.to_string())?;
-    let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
-        return Err("no longer declared".to_string());
-    }
-    match crate::tui::tabs::custom_lists::append_rule_locked(&guard, &loaded, &id, domain, allow)
-        .map_err(|e| e.to_string())?
-    {
-        AddOutcome::Added => Ok(format!(
-            "added {} rule for {domain}",
-            if allow { "allow" } else { "deny" }
-        )),
-        // Idempotent, and saying so beats reporting a no-op as a success:
-        // the operator would otherwise look for a second line that is not
-        // there.
-        AddOutcome::AlreadyPresent => Ok(format!("{domain} is already in {list_id}")),
-    }
-}
-
-/// Replace the rule on one file line of the selected list's pack.
-///
-/// **Not remove-then-add, and the difference is data loss.**
-/// `remove_rule` matches the domain and ignores the direction, so a flip
-/// composed from the two primitives takes the opposite direction of the
-/// same domain with it — a rule the operator never touched, in a file
-/// they diff.
-///
-/// `expect` is what the pane RENDERED on that line, and it is what makes
-/// the file line number safe to key on: the pack view is only re-read
-/// when the selection changes or a write lands here, so a write from
-/// anywhere else moves the numbering under it.
-fn replace_rule_in_pack(
-    config_path: &Path,
-    list_id: &str,
-    line: usize,
-    expect: (&str, bool),
-    domain: &str,
-    allow: bool,
-) -> Result<String, String> {
-    if domain.is_empty() {
-        return Err("a domain is required".into());
-    }
-    crate::config::custom_list::normalise_domain(domain).map_err(|error| error.to_string())?;
-    let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
-        return Err("no longer declared".to_string());
-    }
-    crate::tui::tabs::custom_lists::replace_rule_locked(
-        &guard, &loaded, &id, line, expect, domain, allow,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(format!("replaced line {line} of {list_id}"))
-}
-
-/// Drop every rule naming `domain`, **in both directions**.
-fn remove_rule_from_pack(
-    config_path: &Path,
-    list_id: &str,
-    domain: &str,
-) -> Result<String, String> {
-    let id = crate::config::schema::Id::new(list_id).map_err(|e| format!("list id: {e}"))?;
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    if !loaded.config.custom_lists.iter().any(|list| list.id == id) {
-        return Err("no longer declared".to_string());
-    }
-    let removed = crate::tui::tabs::custom_lists::delete_rule_locked(&guard, &loaded, &id, domain)
-        .map_err(|e| e.to_string())?;
-    if removed {
-        Ok(format!("removed {domain} from {list_id}"))
-    } else {
-        Err(format!("{domain} is not in {list_id}"))
-    }
-}
-
-/// Every rendered line naming `domain`, in file order.
-///
-/// Feeds the removal confirm so it can state what a single `y` actually
-/// takes. `remove_rule` matches the domain and ignores the direction, so
-/// this is where an allow and a deny for one domain become visible as two
-/// lines rather than one.
-fn rule_lines_naming(app: &App, domain: &str) -> Vec<(usize, String)> {
-    app.custom_lists
-        .pack
-        .as_ref()
-        .map(|p| {
-            p.rows
-                .iter()
-                .filter(|r| r.domain.as_deref() == Some(domain))
-                .map(|r| (r.number, r.raw.clone()))
-                .collect()
+    rows.into_iter()
+        .filter(|row| {
+            matches!(parse_pack_line(&row.raw),
+                Ok(PackLine::Allow(value) | PackLine::Deny(value)) if value.as_str() == domain
+            )
         })
-        .unwrap_or_default()
-}
-
-/// The `[[custom_lists]]` table an entity saves as.
-///
-/// **`upsert_id_keyed` REPLACES the entry it finds**, so every field this
-/// omits is reset to its serde default on the next save — of anything, not
-/// of that field. `every_custom_list_field_is_written` pins that by
-/// exhaustive destructuring, so a fourth field on `CustomList` breaks the
-/// build instead of vanishing on the next save.
-fn custom_list_value(resolved: &custom_list_modal::ResolvedForm) -> toml::Value {
-    let mut tbl = toml::map::Map::new();
-    tbl.insert("id".into(), toml::Value::String(resolved.id.clone()));
-    tbl.insert(
-        "display_name".into(),
-        toml::Value::String(resolved.display_name.clone()),
-    );
-    tbl.insert(
-        "description".into(),
-        toml::Value::String(resolved.description.clone()),
-    );
-    toml::Value::Table(tbl)
+        .map(|row| custom_list_modal::BackendRuleRef {
+            row_ref: row.row_ref,
+            line: row.line,
+            raw: row.raw,
+        })
+        .collect()
 }
 
 /// One owner document plus the source text used for preserving rendering.
@@ -5398,15 +5732,6 @@ struct OwnedConfigDocument {
     path: PathBuf,
     value: toml::Value,
     raw: String,
-}
-
-fn custom_list_owner_document_locked(
-    guard: &crate::config::write_lock::ConfigWriteLock,
-    master: &Path,
-    loaded: &crate::config::loader::LoadedConfig,
-    id: &str,
-) -> Result<Option<OwnedConfigDocument>, String> {
-    array_entry_owner_document_locked(guard, master, loaded, "custom_lists", id)
 }
 
 fn blocklist_owner_document_locked(
@@ -5456,177 +5781,8 @@ fn document_declares_id(doc: &toml::Value, array_key: &str, id: &str) -> bool {
         })
 }
 
-/// Create a custom list under one tree guard: publish the create-only pack,
-/// then promote its declaration through that same guard.
-///
-/// The loader cannot validate a declaration whose pack is missing, so pack
-/// publication precedes declaration promotion. A pre-commit or durably
-/// restored declaration failure can roll back only this operation's inode;
-/// an uncertain commit deliberately retains the pack and reports recovery.
-fn create_custom_list(
-    config_path: &Path,
-    resolved: &custom_list_modal::ResolvedForm,
-) -> Result<String, String> {
-    use crate::cli::commands::target::{
-        commit_prevalidated_single_write, prepare_value_validated_single_locked,
-        read_or_empty_locked, upsert_id_keyed,
-    };
-    use crate::config::custom_list::io::create_pack_with_receipt;
-    use crate::config::custom_list::pack_path;
-    use crate::config::schema::Id;
-    use crate::tui::tabs::custom_lists;
-
-    let id = Id::new(resolved.id.as_str()).map_err(|e| format!("id: {e}"))?;
-    let guard = custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    if loaded.config.custom_lists.iter().any(|c| c.id == id) {
-        return Err(format!(
-            "a custom list named {} already exists",
-            resolved.id
-        ));
-    }
-    let path = pack_path(&guard.identity().root, &id);
-    let (mut doc, _) = read_or_empty_locked(&guard, config_path, &loaded.master_path)
-        .map_err(|e| e.to_string())?;
-    upsert_id_keyed(
-        &mut doc,
-        "custom_lists",
-        &resolved.id,
-        custom_list_value(resolved),
-    )
-    .map_err(|e| e.to_string())?;
-    let receipt = create_pack_with_receipt(
-        &guard,
-        &path,
-        &resolved.display_name,
-        custom_lists::max_pack_bytes(&loaded),
-    )
-    .map_err(|e| e.to_string())?;
-    let prepared =
-        match prepare_value_validated_single_locked(&guard, config_path, &loaded.master_path, &doc)
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return match receipt.rollback() {
-                    Ok(()) => Err(format!("validator: {error}")),
-                    Err(rollback_error) => Err(format!(
-                        "recovery required: declaration validation failed ({error}); \
-                     could not remove newly created {}: {rollback_error:#}",
-                        path.display()
-                    )),
-                };
-            }
-        };
-    if let Err(commit_error) = commit_prevalidated_single_write(prepared) {
-        return finish_custom_list_declaration_commit_failure(receipt, &path, commit_error);
-    }
-    Ok(format!("created custom list {}", resolved.id))
-}
-
-fn finish_custom_list_declaration_commit_failure(
-    receipt: crate::config::custom_list::io::CreatedPack<'_>,
-    path: &Path,
-    commit_error: crate::cli::commands::target::ConfigCommitFailure,
-) -> Result<String, String> {
-    use crate::cli::commands::target::ConfigCommitDisposition;
-
-    match commit_error.disposition() {
-        ConfigCommitDisposition::Untouched | ConfigCommitDisposition::RestoredDurably => {
-            match receipt.rollback() {
-                Ok(()) => Err(format!("validator: {commit_error}")),
-                Err(rollback_error) => Err(format!(
-                    "recovery required: declaration commit failed ({commit_error}); \
-                     could not remove newly created {}: {rollback_error:#}",
-                    path.display()
-                )),
-            }
-        }
-        ConfigCommitDisposition::Uncertain => Err(format!(
-            "recovery required: declaration commit is uncertain ({commit_error}); \
-             retaining newly created {}",
-            path.display()
-        )),
-    }
-}
-
-/// Rewrite an entity's metadata. The pack file is not touched.
-fn update_custom_list_meta(
-    config_path: &Path,
-    resolved: &custom_list_modal::ResolvedForm,
-    original: &custom_list_modal::OriginalSnapshot,
-) -> Result<String, String> {
-    use crate::cli::commands::target::write_value_validated_locked;
-
-    if resolved.id != original.id {
-        return Err("custom list identity changed — reopen the list".to_string());
-    }
-
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    let mut owner = custom_list_owner_document_locked(&guard, config_path, &loaded, &original.id)?
-        .ok_or_else(|| format!("custom list '{}' no longer declared", original.id))?;
-    patch_custom_list_metadata(&mut owner.value, original, resolved)?;
-    write_value_validated_locked(&guard, config_path, &owner.path, &owner.value)
-        .map_err(|e| format!("validator: {e}"))?;
-    Ok(format!("updated custom list {}", resolved.id))
-}
-
-/// Apply only the metadata fields the edit form changed since it opened.
-fn patch_custom_list_metadata(
-    doc: &mut toml::Value,
-    original: &custom_list_modal::OriginalSnapshot,
-    resolved: &custom_list_modal::ResolvedForm,
-) -> Result<(), String> {
-    let lists = doc
-        .get_mut("custom_lists")
-        .and_then(|value| value.as_array_mut())
-        .ok_or_else(|| "no [[custom_lists]] entries in the owning file".to_string())?;
-    let live = lists
-        .iter_mut()
-        .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(&original.id))
-        .and_then(|entry| entry.as_table_mut())
-        .ok_or_else(|| format!("custom list '{}' no longer declared", original.id))?;
-
-    if resolved.display_name != original.display_name {
-        live.insert(
-            "display_name".to_string(),
-            toml::Value::String(resolved.display_name.clone()),
-        );
-    }
-    if resolved.description != original.description {
-        live.insert(
-            "description".to_string(),
-            toml::Value::String(resolved.description.clone()),
-        );
-    }
-    Ok(())
-}
-
-/// Remove the declaration. **The pack file is left on disk.**
-///
-/// Unlinking first and then failing the config write would leave the config
-/// naming a file that is gone, and `build_store` fails the whole config on
-/// one missing pack — so the next reload would drop every other list too.
-/// Leaving the file costs a stale `packs/<id>.txt`; the confirm says so,
-/// and `create_custom_list` refuses a taken id rather than adopting it.
-fn remove_custom_list(config_path: &Path, id: &str) -> Result<String, String> {
-    use crate::cli::commands::target::{remove_id_keyed, write_value_validated_locked};
-
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    let mut owner = custom_list_owner_document_locked(&guard, config_path, &loaded, id)?
-        .ok_or_else(|| format!("no file declares custom list '{id}'"))?;
-    if !remove_id_keyed(&mut owner.value, "custom_lists", id).map_err(|e| e.to_string())? {
-        return Err(format!("custom list '{id}' not found — already removed?"));
-    }
-    write_value_validated_locked(&guard, config_path, &owner.path, &owner.value)
-        .map_err(|e| format!("validator: {e}"))?;
-    Ok(format!("removed custom list {id}"))
-}
-
-/// Mount-picker keys. `Space` toggles, `Enter` saves, `Esc` discards.
+/// Mount-picker keys. Tab walks rows / Discard / Apply; Space or Enter
+/// toggles a row, and Enter activates the focused action.
 ///
 /// `Esc` discards and that is only meaningful because the toggles stage:
 /// a picker that wrote on each keypress would leave nothing to discard.
@@ -5644,13 +5800,34 @@ async fn handle_custom_list_mount_key(
         app.custom_lists.mount_picker = None;
         return;
     }
+    let key = if is_save_key(key) {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    } else {
+        key
+    };
+    let mut apply = false;
     match key.code {
         KeyCode::Esc => app.custom_lists.mount_picker = None,
-        KeyCode::Down => picker.step(true),
-        KeyCode::Up => picker.step(false),
-        KeyCode::Char(' ') => picker.toggle(),
-        KeyCode::Enter => submit_custom_list_mount(app, poller, config_path).await,
+        KeyCode::Tab => picker.focus = picker.focus.next(),
+        KeyCode::BackTab => picker.focus = picker.focus.prev(),
+        KeyCode::Down if picker.focus == custom_list_modal::MountFocus::Profiles => {
+            picker.step(true)
+        }
+        KeyCode::Up if picker.focus == custom_list_modal::MountFocus::Profiles => {
+            picker.step(false)
+        }
+        KeyCode::Char(' ') if picker.focus == custom_list_modal::MountFocus::Profiles => {
+            picker.toggle()
+        }
+        KeyCode::Enter => match picker.focus {
+            custom_list_modal::MountFocus::Profiles => picker.toggle(),
+            custom_list_modal::MountFocus::Discard => app.custom_lists.mount_picker = None,
+            custom_list_modal::MountFocus::Apply => apply = true,
+        },
         _ => {}
+    }
+    if apply {
+        submit_custom_list_mount(app, poller, config_path).await;
     }
 }
 
@@ -5661,261 +5838,12 @@ async fn handle_custom_list_mount_key(
 /// reaches the daemon only through SIGHUP or the IPC reload. Without this
 /// the operator mounts a list, sees the row change, and the DNS does not.
 async fn submit_custom_list_mount(app: &mut App, poller: &IpcPoller, config_path: &Path) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-
-    let Some(picker) = app.custom_lists.mount_picker.as_mut() else {
-        return;
-    };
-    let changes: Vec<(String, bool)> = picker
-        .changes()
-        .into_iter()
-        .map(|(p, on)| (p.to_string(), on))
-        .collect();
-    if changes.is_empty() {
-        // Nothing staged is not a failure, and it must not write: a
-        // no-op save that still promoted a file would rewrite the
-        // operator's TOML for nothing.
-        app.custom_lists.mount_picker = None;
-        app.status_info("nothing to mount".into());
-        return;
-    }
-    let list_id = picker.list_id.clone();
-
-    match apply_custom_list_mounts(config_path, &list_id, &changes) {
-        Err(msg) => {
-            if let Some(p) = app.custom_lists.mount_picker.as_mut() {
-                p.error = Some(msg.clone());
-            }
-            app.status_err(format!("mount: {msg}"));
-            return;
-        }
-        Ok(summary) => {
-            if let Some(p) = app.custom_lists.mount_picker.as_mut() {
-                p.outcome = Some(summary.clone());
-                p.failed = false;
-            }
-            app.status_ok(summary);
-        }
-    }
-
-    let outcome = attempt_reload(poller.socket_path()).await;
-    // The reload arms REPLACE the status set above. `Reloaded` is the one
-    // arm that stays silent and therefore keeps it.
-    match outcome {
-        ReloadOutcome::Reloaded => {}
-        ReloadOutcome::DaemonUnreachable => {
-            app.status_err(
-                "mount saved on disk — daemon not running, will activate on next start".into(),
-            );
-        }
-        ReloadOutcome::NoToken { .. } => {
-            app.status_err(
-                "mount saved on disk but no admin token is available to request a reload".into(),
-            );
-        }
-        ReloadOutcome::ReloadFailed(msg) => {
-            app.status_err(format!("mount saved but daemon rejected reload: {msg}"));
-        }
-    }
-    app.loaded_config = load_v1_config(config_path);
-    poll_active_leaf(app, poller).await;
-}
-
-/// The file that declares `[profiles.<id>]`.
-///
-/// `profiles` is a named map merged across the include graph, so an entry
-/// may legitimately live in a fragment. A write aimed at the master would
-/// then create a SECOND declaration of the same profile, which the loader
-/// refuses as a duplicate key — the whole config, not just this write.
-///
-/// Walks `files_loaded`, the loader's own record of what it read.
-/// `Err` is a file in `files_loaded` that can no longer be read or parsed —
-/// see [`custom_list_owner_document_locked`], which carries the same rule and the
-/// same reason.
-fn profile_owner_document_locked(
-    guard: &crate::config::write_lock::ConfigWriteLock,
-    master: &Path,
-    loaded: &crate::config::loader::LoadedConfig,
-    profile: &str,
-) -> Result<Option<OwnedConfigDocument>, String> {
-    for path in &loaded.files_loaded {
-        let (value, raw) = crate::cli::commands::target::read_or_empty_locked(guard, master, path)
-            .map_err(|e| e.to_string())?;
-        if raw.is_none() {
-            return Err(format!(
-                "cannot read {}: file disappeared after config load",
-                path.display()
-            ));
-        }
-        let declares_profile = value
-            .get("profiles")
-            .and_then(|v| v.as_table())
-            .map(|t| t.contains_key(profile))
-            .unwrap_or(false);
-        if declares_profile {
-            return Ok(Some(OwnedConfigDocument {
-                path: path.clone(),
-                value,
-                raw: raw.expect("the preceding missing-file check found source text"),
-            }));
-        }
-    }
-    Ok(None)
-}
-
-/// Set `[profiles.<id>].custom_lists`, **touching nothing else on that
-/// table**.
-///
-/// This is the whole point of the function and the reason `upsert_profile`
-/// is not called here: it does `profiles.insert(id, entry)`, and inserting
-/// into a TOML table REPLACES the value whole. Every caller of it today is
-/// a *create*, which is why the semantics have never bitten; a mount is an
-/// *update*, and building a profile value from scratch would silently drop
-/// that profile's `display_name`, its `lists` map and its `admin_rules`.
-/// On a live box the `kids` profile carries a display name and fourteen
-/// blocklist mounts.
-///
-/// The key is REMOVED rather than written as `[]` when nothing is mounted,
-/// because `Profile::custom_lists` carries `skip_serializing_if` for
-/// exactly that reason: an empty mount list declares nothing, and writing
-/// it would grow `custom_lists = []` into profiles that never opted in.
-fn set_profile_custom_lists(
-    doc: &mut toml::Value,
-    profile: &str,
-    ids: &[String],
-) -> Result<(), String> {
-    let table = doc
-        .as_table_mut()
-        .ok_or_else(|| "config root is not a TOML table".to_string())?;
-    let profiles = table
-        .get_mut("profiles")
-        .and_then(|v| v.as_table_mut())
-        .ok_or_else(|| "no [profiles] table in this file".to_string())?;
-    let entry = profiles
-        .get_mut(profile)
-        .ok_or_else(|| format!("profile '{profile}' is not declared in this file"))?;
-    let t = entry
-        .as_table_mut()
-        .ok_or_else(|| format!("[profiles.{profile}] is not a table"))?;
-    if ids.is_empty() {
-        t.remove("custom_lists");
-    } else {
-        t.insert(
-            "custom_lists".to_string(),
-            toml::Value::Array(ids.iter().cloned().map(toml::Value::String).collect()),
-        );
-    }
-    Ok(())
-}
-
-/// Apply every staged mount in ONE validated promotion.
-///
-/// Grouped by owning file and promoted together through one held guard rather
-/// than one profile at a time: separate guarded promotions would run one full
-/// validation and one rename each, so a refusal half-way would leave the
-/// operator's intent partly applied with nothing saying which half landed.
-///
-/// **This is the second of two writers of `[profiles.<id>].custom_lists`,
-/// and the file path is chosen here rather than inherited.** The profile
-/// modal mounts through
-/// [`ProfileUpdatePatch::custom_lists`](crate::ipc::protocol::ProfileUpdatePatch::custom_lists),
-/// which is right for its gesture — one profile, N lists, one atomic patch
-/// alongside that profile's other edits. This gesture is the transpose: one
-/// list, N profiles, and those profiles need not share a file. Routing it
-/// through the per-profile seat would trade the guarantee above for N
-/// independent round-trips, so it writes the documents itself and reloads.
-fn apply_custom_list_mounts(
-    config_path: &Path,
-    list_id: &str,
-    changes: &[(String, bool)],
-) -> Result<String, String> {
-    use crate::cli::commands::target::{write_values_validated_locked, StagedWrite};
-    use crate::cli::commands::toml_write::render_preserving;
-
-    let guard =
-        crate::tui::tabs::custom_lists::claim_tree(config_path).map_err(|e| e.to_string())?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
-    if !loaded
-        .config
-        .custom_lists
-        .iter()
-        .any(|custom_list| custom_list.id.as_str() == list_id)
-    {
-        return Err(format!("custom list '{list_id}' no longer declared"));
-    }
-
-    // path -> (original text, edited doc)
-    let mut edits: Vec<(PathBuf, String, toml::Value)> = Vec::new();
-    for (profile, mount) in changes {
-        let owner = profile_owner_document_locked(&guard, config_path, &loaded, profile)?
-            .ok_or_else(|| format!("no file declares profile '{profile}'"))?;
-
-        let slot = match edits.iter().position(|(p, _, _)| p == &owner.path) {
-            Some(i) => i,
-            None => {
-                edits.push((owner.path, owner.raw, owner.value));
-                edits.len() - 1
-            }
-        };
-
-        // Read the CURRENT list off the doc being edited, not off
-        // `loaded.config`: two profiles in one file are two edits to the
-        // same document, and the merged view would not carry the first.
-        let mut ids = current_custom_lists(&edits[slot].2, profile);
-        ids.retain(|id| id != list_id);
-        if *mount {
-            ids.push(list_id.to_string());
-        }
-        let doc = &mut edits[slot].2;
-        set_profile_custom_lists(doc, profile, &ids)?;
-    }
-
-    let writes: Vec<StagedWrite> = edits
-        .iter()
-        .map(|(path, original, doc)| {
-            render_preserving(original, doc)
-                .map(|content| StagedWrite {
-                    final_path: path.clone(),
-                    content,
-                })
-                .map_err(|e| format!("serialise {}: {e}", path.display()))
-        })
-        .collect::<Result<_, String>>()?;
-
-    write_values_validated_locked(&guard, config_path, &writes)
-        .map_err(|e| format!("validator: {e}"))?;
-
-    let mounted = changes.iter().filter(|(_, on)| *on).count();
-    let unmounted = changes.len() - mounted;
-    Ok(match (mounted, unmounted) {
-        (m, 0) => format!("{list_id} mounted on {m} profile(s)"),
-        (0, u) => format!("{list_id} unmounted from {u} profile(s)"),
-        (m, u) => format!("{list_id}: {m} mounted, {u} unmounted"),
-    })
-}
-
-/// The `custom_lists` array currently on `[profiles.<id>]` in this doc.
-fn current_custom_lists(doc: &toml::Value, profile: &str) -> Vec<String> {
-    doc.get("profiles")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get(profile))
-        .and_then(|v| v.get("custom_lists"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    action_handlers::mount(app, poller, config_path).await;
 }
 
 #[cfg(test)]
 #[path = "tests/custom_lists_advertised_keys_tests.rs"]
 mod custom_lists_advertised_keys_tests;
-
-#[cfg(test)]
-#[path = "tests/custom_list_write_tests.rs"]
-mod custom_list_write_tests;
 
 // ── Labels modal openers, key handler and submit path ────────────────
 //
@@ -5937,10 +5865,18 @@ mod custom_list_write_tests;
 /// the filter and the ordering cannot drift apart either.
 fn focused_label(app: &App) -> Option<crate::config::schema::Label> {
     let loaded = app.loaded_config.as_ref()?;
-    let rows = tabs::labels::rows_for_kind(&loaded.config.labels, app.labels.selected_kind);
-    let idx =
-        tabs::labels::resolve_selected_index(&rows, app.labels.selected_id.as_deref()).unwrap_or(0);
-    rows.get(idx).map(|l| (*l).clone())
+    let rows = tabs::labels::build_display_rows(app);
+    let selected = app.labels.selected_id.as_deref();
+    let row = rows
+        .iter()
+        .find(|row| Some(row.key.as_str()) == selected)
+        .or(rows.first())?;
+    loaded
+        .config
+        .labels
+        .iter()
+        .find(|label| label.kind == app.labels.selected_kind && label.id.as_str() == row.key)
+        .cloned()
 }
 
 /// Usage count of the focused label, by the same collector the table's
@@ -5986,7 +5922,6 @@ async fn handle_label_modal_key(
     use label_modal::{FormField, Stage};
 
     if modal.is_submitted() {
-        // Any keypress in the submitted stage closes the modal.
         return;
     }
 
@@ -6084,17 +6019,19 @@ async fn handle_label_modal_key(
             }
             app.labels.modal = Some(modal);
         }
-        Stage::ConfirmingRemove(_) => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                submit_label_modal(app, modal, poller, config_path).await;
+        Stage::ConfirmingRemove(confirm) => {
+            match confirmation_key(&mut confirm.primary, key.code) {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    submit_label_modal(app, modal, poller, config_path).await;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    // Drop the modal — returning without re-stashing.
+                }
+                _ => {
+                    app.labels.modal = Some(modal);
+                }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                // Drop the modal — returning without re-stashing.
-            }
-            _ => {
-                app.labels.modal = Some(modal);
-            }
-        },
+        }
         Stage::Submitted(_) => {
             // Already handled above.
         }
@@ -6163,209 +6100,11 @@ fn label_text_field_buf(form: &mut label_modal::AddForm) -> Option<&mut String> 
 /// rather than against history.
 async fn submit_label_modal(
     app: &mut App,
-    mut modal: label_modal::LabelModal,
+    modal: label_modal::LabelModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::labels::{add_inner, remove_inner};
-    use label_modal::{Stage, SubmitOutcome};
-
-    // `landed` names the fields that actually reached disk. Empty means the
-    // file is untouched; **non-empty alongside a `Failed` outcome is the
-    // partial write** this function exists to handle honestly.
-    let (outcome, landed): (SubmitOutcome, Vec<String>) = match &modal.stage {
-        Stage::EditingForm(form) => match form.try_resolve() {
-            Err(msg) => (SubmitOutcome::Failed(msg), Vec::new()),
-            Ok(resolved) => match form.mode {
-                label_modal::FormMode::Add => {
-                    match add_inner(
-                        config_path,
-                        &resolved.id,
-                        form.kind,
-                        Some(&resolved.display_name),
-                        // Empty means "no description" on Add — passing
-                        // `Some("")` would write an empty key instead of
-                        // omitting it.
-                        Some(resolved.description.as_str()).filter(|d| !d.is_empty()),
-                        None,
-                    ) {
-                        // Report the id the writer says it wrote, not the
-                        // one the form holds. They agree today; a toast
-                        // that echoes the operator's own input back is
-                        // reporting the request, not the outcome.
-                        Ok(report) => {
-                            tracing::info!(
-                                target: "audit",
-                                action = "label.add",
-                                surface = "tui",
-                                id = %report.id,
-                                kind = %form.kind,
-                                source_file = %report.target_path.display(),
-                                "TUI mutation"
-                            );
-                            (
-                                SubmitOutcome::Ok(format!(
-                                    "added {} {}",
-                                    form.kind.as_str(),
-                                    report.id
-                                )),
-                                vec!["id".to_string()],
-                            )
-                        }
-                        Err(e) => (SubmitOutcome::Failed(e.to_string()), Vec::new()),
-                    }
-                }
-                label_modal::FormMode::Edit => match form.original.as_ref() {
-                    Some(original) => {
-                        submit_label_edit(config_path, form.kind, original, &resolved)
-                    }
-                    // The Add/Edit constructors keep `mode == Edit` and
-                    // `original.is_some()` in lock-step; degrade a broken
-                    // invariant to a footer error instead of a panic that
-                    // would unwind out of the dashboard's main task.
-                    None => (
-                        SubmitOutcome::Failed(
-                            "internal error: edit modal lost its original snapshot".into(),
-                        ),
-                        Vec::new(),
-                    ),
-                },
-            },
-        },
-        Stage::ConfirmingRemove(rc) => {
-            // `kind` is passed, never `None`: the pane the operator is
-            // looking at IS the disambiguation, and letting `select_label`
-            // resolve a bare id would refuse an id that legally exists
-            // under two kinds — a refusal the operator could not act on
-            // from here.
-            match remove_inner(config_path, &rc.id, Some(rc.kind), None) {
-                Ok(report) => {
-                    tracing::info!(
-                        target: "audit",
-                        action = "label.delete",
-                        surface = "tui",
-                        id = %report.id,
-                        kind = %rc.kind,
-                        source_file = %report.target_path.display(),
-                        "TUI mutation"
-                    );
-                    (
-                        SubmitOutcome::Ok(format!("removed {} {}", rc.kind.as_str(), report.id)),
-                        vec!["id".to_string()],
-                    )
-                }
-                // **`labels::remove_inner` is NOT `groups::remove_inner`.**
-                // Groups returns `Ok(None)` for an absent id and the caller
-                // turns that into a message; labels has no such variant —
-                // its own doc calls an already-absent label an error "so a
-                // caller holding a row that has since vanished learns it
-                // instead of being told the removal succeeded". That is the
-                // right answer for a TUI and it arrives here as `Err`,
-                // together with every other refusal. Recognise the
-                // not-found spelling so the operator gets the reason rather
-                // than a bare repeat of the verb's words.
-                Err(e) => {
-                    let msg = e.to_string();
-                    let text = if msg.starts_with("label not found") {
-                        format!(
-                            "{} \"{}\" is already gone — the table was stale",
-                            rc.kind.as_str(),
-                            rc.id
-                        )
-                    } else {
-                        msg
-                    };
-                    // A refused remove writes nothing — `remove_if_present`
-                    // bails before touching the file — so the disk is
-                    // untouched and there is nothing to reload.
-                    (SubmitOutcome::Failed(text), Vec::new())
-                }
-            }
-        }
-        Stage::Submitted(_) => return,
-    };
-
-    // **The disk changed, so refresh — whatever the verdict was.** This runs
-    // before the form-failure branch below on purpose: a partial Edit is a
-    // `Failed` outcome over a file that really did change, and keying the
-    // refresh on success left the table rendering the old row.
-    let wrote = !landed.is_empty();
-    if wrote {
-        // Re-anchor the form to what landed, so a retry diffs against the
-        // file rather than against a snapshot the file no longer matches —
-        // otherwise the operator's second Save re-writes a field that is
-        // already correct and audits it as a change.
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            // Resolve first, then take the mutable borrow: `try_resolve`
-            // reads the whole form.
-            if let Ok(resolved) = form.try_resolve() {
-                if let Some(original) = form.original.as_mut() {
-                    for field in &landed {
-                        match field.as_str() {
-                            "display_name" => original.display_name = resolved.display_name.clone(),
-                            "description" => original.description = resolved.description.clone(),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        refresh_after_label_write(app, poller, config_path).await;
-    }
-
-    // A form (Add/Edit) failure — pre-flight validation or a validator
-    // rejection — keeps the modal open with the message on the inline
-    // validation line instead of dropping to the terminal "failed" screen.
-    // The operator fixes the offending field and re-submits without
-    // retyping the rest. Remove failures still finish (their confirm
-    // screen has no form to keep).
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            app.status_err(format!("label modal: {msg}"));
-            form.error_message = Some(msg.clone());
-            app.labels.modal = Some(modal);
-            return;
-        }
-    }
-
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => app.status_err(format!("label modal: {msg}")),
-    }
-    modal.finish(outcome);
-    app.labels.modal = Some(modal);
-}
-
-/// Tell the daemon, then re-read the cached config.
-///
-/// Split out because it is reached from two places that used to be one: a
-/// clean save and a **partially applied** one. Labels is in the offline
-/// cohort — `poll_active_leaf` is a no-op for this leaf and
-/// `tabs::labels::render` reads `loaded_config` every frame — so this
-/// assignment IS how the table learns the file moved.
-async fn refresh_after_label_write(app: &mut App, poller: &IpcPoller, config_path: &Path) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    match attempt_reload(poller.socket_path()).await {
-        ReloadOutcome::Reloaded => {}
-        ReloadOutcome::DaemonUnreachable => {
-            app.status_err(
-                "label saved on disk — daemon not running, will activate on next start".into(),
-            );
-        }
-        ReloadOutcome::NoToken { .. } => {
-            app.status_err(
-                "label saved on disk but no admin token is available to request a reload".into(),
-            );
-        }
-        ReloadOutcome::ReloadFailed(msg) => {
-            app.status_err(format!("label saved but daemon rejected reload: {msg}"));
-        }
-    }
-    app.loaded_config = load_v1_config(config_path);
-    // A no-op for Leaf::Labels today (see the offline cohort in
-    // `poll_active_leaf`), kept so a future leaf that does poll cannot
-    // acquire a stale-until-next-tick bug by inheriting this path.
-    poll_active_leaf(app, poller).await;
+    action_handlers::label(app, modal, poller, config_path).await;
 }
 
 /// Apply the diff between `original` and `resolved` in one validated write.
@@ -6466,6 +6205,9 @@ fn submit_label_edit(
 /// still require a resolved selection: there is nothing to edit or
 /// remove.
 fn handle_groups_key(app: &mut App, key: KeyEvent) {
+    if detail_panel::handle_detail_key(app, key.code) {
+        return;
+    }
     // **"No config" is not "a config with no groups", and conflating them
     // makes the modal lie.** A config that failed to parse yields no
     // profile snapshot, so an Add form opened over it resolves to
@@ -6477,15 +6219,13 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
     //
     // This guard is therefore ABOVE `a`, while the zero-groups guard
     // below it is not. They are different predicates.
-    let Some(loaded) = app.loaded_config.as_ref() else {
+    let Some(_) = app.loaded_config.as_ref() else {
         app.leaf_key_unhandled = true;
         return;
     };
-    let ids: Vec<String> = loaded
-        .config
-        .groups
+    let ids: Vec<String> = tabs::groups::build_display_rows(app)
         .iter()
-        .map(|g| g.id.as_str().to_string())
+        .map(|group| group.id.to_string())
         .collect();
 
     // Add next, and before the empty-list guard: it is the one verb whose
@@ -6512,6 +6252,13 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') | KeyCode::Delete => {
             if let Some(modal) = build_group_remove_modal(app) {
                 app.groups.modal = Some(modal);
+            }
+            return;
+        }
+        KeyCode::Char('i') => {
+            if focused_group(app).is_some() {
+                app.groups.inspect_open = true;
+                detail_panel::focus(app, Leaf::Groups);
             }
             return;
         }
@@ -6555,8 +6302,8 @@ fn handle_groups_key(app: &mut App, key: KeyEvent) {
 /// first row — matching what `tabs::groups::render_master` highlights, so
 /// `e` and `d` always land on the row the operator can see is selected.
 fn focused_group(app: &App) -> Option<crate::config::schema::Group> {
-    let groups = app.loaded_config.as_ref().map(|l| &l.config.groups)?;
-    tabs::groups::resolve_selected_index(groups, app.groups.selected_id.as_deref())
+    let groups = tabs::groups::build_display_rows(app);
+    tabs::groups::resolve_selected_index(&groups, app.groups.selected_id.as_deref())
         .and_then(|i| groups.get(i))
         .or_else(|| groups.first())
         .cloned()
@@ -6721,8 +6468,18 @@ async fn handle_group_modal_key(
             }
             app.groups.modal = Some(modal);
         }
-        Stage::ConfirmingRemove(_) => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+        Stage::ConfirmingRemove(confirm) => match key.code {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                confirm.focus = 1 - confirm.focus.min(1);
+                app.groups.modal = Some(modal);
+            }
+            KeyCode::Enter if confirm.focus == 0 => {}
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 submit_group_modal(app, modal, poller, config_path).await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -6794,139 +6551,11 @@ fn group_text_field_buf(form: &mut group_modal::AddForm) -> Option<&mut String> 
 /// the operator as a failed write.
 async fn submit_group_modal(
     app: &mut App,
-    mut modal: group_modal::GroupModal,
+    modal: group_modal::GroupModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::groups::add_inner;
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use group_modal::{Stage, SubmitOutcome};
-
-    let outcome: SubmitOutcome = match &modal.stage {
-        Stage::EditingForm(form) => match form.try_resolve() {
-            Err(msg) => SubmitOutcome::Failed(msg),
-            Ok(resolved) => match form.mode {
-                group_modal::FormMode::Add => {
-                    match add_inner(
-                        config_path,
-                        &resolved.id,
-                        Some(&resolved.display_name),
-                        &resolved.profile,
-                        Some(resolved.priority),
-                        &resolved.devices,
-                        None,
-                    ) {
-                        // Report the id the writer says it wrote, not the
-                        // one the form holds. They agree today; a toast
-                        // that echoes the operator's own input back is
-                        // reporting the request, not the outcome.
-                        Ok(report) => {
-                            tracing::info!(
-                                target: "audit",
-                                action = "group.add",
-                                surface = "tui",
-                                id = %report.id,
-                                profile = %resolved.profile,
-                                source_file = %report.target_path.display(),
-                                "TUI mutation"
-                            );
-                            SubmitOutcome::Ok(format!("added group {}", report.id))
-                        }
-                        Err(e) => SubmitOutcome::Failed(e.to_string()),
-                    }
-                }
-                group_modal::FormMode::Edit => match form.original.as_ref() {
-                    Some(original) => submit_group_edit(config_path, original, &resolved),
-                    // The Add/Edit constructors keep `mode == Edit` and
-                    // `original.is_some()` in lock-step; degrade a broken
-                    // invariant to a footer error instead of a panic that
-                    // would unwind out of the dashboard's main task.
-                    None => SubmitOutcome::Failed(
-                        "internal error: edit modal lost its original snapshot".into(),
-                    ),
-                },
-            },
-        },
-        Stage::ConfirmingRemove(rc) => {
-            match crate::cli::commands::groups::remove_inner(config_path, &rc.id, None) {
-                Ok(Some(report)) => {
-                    tracing::info!(
-                        target: "audit",
-                        action = "group.delete",
-                        surface = "tui",
-                        id = %report.id,
-                        source_file = %report.target_path.display(),
-                        "TUI mutation"
-                    );
-                    SubmitOutcome::Ok(format!("removed group {}", report.id))
-                }
-                // `remove_inner` returns `Ok(None)` for an absent id —
-                // idempotent by verbs-02. From the TUI that means the row
-                // the operator was looking at is already gone, which is
-                // worth saying rather than reporting a success that wrote
-                // nothing.
-                Ok(None) => {
-                    SubmitOutcome::Failed(format!("group '{}' not found — already removed?", rc.id))
-                }
-                Err(e) => SubmitOutcome::Failed(e.to_string()),
-            }
-        }
-        Stage::Submitted(_) => return,
-    };
-
-    // A form (Add/Edit) failure — pre-flight validation or an
-    // apply/validator rejection — keeps the modal open with the message on
-    // the inline validation line instead of dropping to the terminal
-    // "failed" screen. The operator fixes the offending field and
-    // re-submits without retyping the rest. Remove failures still finish
-    // (their confirm screen has no form to keep).
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            app.status_err(format!("group modal: {msg}"));
-            form.error_message = Some(msg.clone());
-            app.groups.modal = Some(modal);
-            return;
-        }
-    }
-
-    let was_ok = matches!(outcome, SubmitOutcome::Ok(_));
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => app.status_err(format!("group modal: {msg}")),
-    }
-    modal.finish(outcome);
-    app.groups.modal = Some(modal);
-
-    if was_ok {
-        let outcome = attempt_reload(poller.socket_path()).await;
-        // The reload arms REPLACE the status set above. `Reloaded` is the
-        // one arm that stays silent and therefore keeps it.
-        match outcome {
-            ReloadOutcome::Reloaded => {}
-            ReloadOutcome::DaemonUnreachable => {
-                app.status_err(
-                    "group saved on disk — daemon not running, will activate on next start".into(),
-                );
-            }
-            ReloadOutcome::NoToken { .. } => {
-                app.status_err(
-                    "group saved on disk but no admin token is available to request a reload"
-                        .into(),
-                );
-            }
-            ReloadOutcome::ReloadFailed(msg) => {
-                app.status_err(format!("group saved but daemon rejected reload: {msg}"));
-            }
-        }
-        // Mandatory, not symmetry with Subnets: this leaf renders from
-        // `loaded_config` and never polls, so this assignment IS how the
-        // table learns the write happened.
-        app.loaded_config = load_v1_config(config_path);
-        // A no-op for Leaf::Groups today (see the offline cohort in
-        // `poll_active_leaf`), kept so a future leaf that does poll cannot
-        // acquire a stale-until-next-tick bug by inheriting this path.
-        poll_active_leaf(app, poller).await;
-    }
+    action_handlers::groups(app, modal, poller, config_path).await;
 }
 
 /// Apply the diff between `original` and `resolved`.
@@ -7011,51 +6640,45 @@ fn submit_group_edit(
     ))
 }
 
-/// `logs-tab`: keys of the [`Leaf::Logs`] viewer.
-///
-/// Scrolling is `tabs::file`'s convention verbatim — one line on the
-/// arrows, [`NAV_PAGE`] on the page keys, `Home`/`End` to the ends, every
-/// bound through the same saturating `u16` conversion. The filters are
-/// the shared filter card's: `/` opens the search buffer, `f` cycles the
-/// severity chip, `R` clears both.
-///
-/// Every filter change resets `scroll_offset`. The daemon applies the
-/// filters during its own walk, so the next poll returns a **different
-/// set of rows** — an offset minted against the previous set points into
-/// a page that no longer exists.
+/// Applied server-side predicates cannot label rows from an older request.
+fn request_query_log_filter_fetch(app: &mut App) {
+    app.query_log.reset_paging();
+    app.query_log.entries.clear();
+    app.query_log.selected_key = None;
+    app.query_log.table_state = Default::default();
+    app.query_log.has_loaded = false;
+    app.query_log.read_failed = false;
+    app.force_poll = true;
+}
+
+fn request_logs_filter_fetch(app: &mut App) {
+    app.logs.entries.clear();
+    app.logs.selected = None;
+    app.logs.selected_occurrence = 0;
+    app.logs.scroll_offset = 0;
+    app.logs.dropped = 0;
+    app.logs.capacity = 0;
+    app.logs.fetch = app::LogsFetch::Never;
+    app.force_poll = true;
+}
+
 fn handle_logs_key(app: &mut App, key: KeyEvent) {
-    let last = tabs::logs::last_row(app);
-    let page = tabs::logs::page_step();
-    match key.code {
-        KeyCode::Char('/') => {
-            app.input_mode =
-                InputMode::FilterLogs(app.logs.filter_text.clone().unwrap_or_default());
+    let current = tabs::logs::selected_index(app).unwrap_or(0);
+    let last = app.logs.entries.len().saturating_sub(1);
+    let next = match key.code {
+        KeyCode::Up => current.saturating_sub(1),
+        KeyCode::Down => (current + 1).min(last),
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        KeyCode::PageUp => current.saturating_sub(NAV_PAGE),
+        KeyCode::PageDown => (current + NAV_PAGE).min(last),
+        KeyCode::Enter | KeyCode::Char('i') => {
+            app.information = tabs::logs::information(app);
+            return;
         }
-        KeyCode::Char('f') => {
-            app.logs.level_filter = app.logs.level_filter.next();
-            app.logs.scroll_offset = 0;
-        }
-        KeyCode::Char('R') => {
-            app.logs.level_filter = crate::tui::app::LogsLevelFilter::All;
-            app.logs.filter_text = None;
-            app.logs.scroll_offset = 0;
-        }
-        KeyCode::Down => {
-            app.logs.scroll_offset = app.logs.scroll_offset.saturating_add(1).min(last);
-        }
-        KeyCode::Up => {
-            app.logs.scroll_offset = app.logs.scroll_offset.saturating_sub(1);
-        }
-        KeyCode::Home => app.logs.scroll_offset = 0,
-        KeyCode::End => app.logs.scroll_offset = last,
-        KeyCode::PageDown => {
-            app.logs.scroll_offset = app.logs.scroll_offset.saturating_add(page).min(last);
-        }
-        KeyCode::PageUp => {
-            app.logs.scroll_offset = app.logs.scroll_offset.saturating_sub(page);
-        }
-        _ => {}
-    }
+        _ => return,
+    };
+    tabs::logs::select(app, next);
 }
 
 /// Keys of the [`Leaf::File`] document viewer, split out of
@@ -7153,29 +6776,40 @@ async fn handle_file_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, confi
                 return;
             }
             let refresh_error = edit.edit_error;
-            match attempt_reload(poller.socket_path()).await {
-                ReloadOutcome::Reloaded => match refresh_error {
-                    Some(error) => app.status_err(format!("{error}; config reloaded")),
-                    None => app.status_ok("config reloaded".into()),
+            let socket = poller.socket_path().to_owned();
+            actions::dispatch(
+                app,
+                actions::Surface::Global,
+                "Reloading edited configuration",
+                async move { attempt_reload(&socket).await },
+                move |app, _, outcome| match outcome {
+                    ReloadOutcome::Reloaded => match refresh_error {
+                        Some(error) => app.status_err(format!("{error}; config reloaded")),
+                        None => app.status_ok("config reloaded".into()),
+                    },
+                    ReloadOutcome::DaemonUnreachable => app.status_err(match refresh_error {
+                        Some(error) => {
+                            format!("{error}; daemon not running, will apply on next start")
+                        }
+                        None => "edit saved — daemon not running, will apply on next start".into(),
+                    }),
+                    ReloadOutcome::NoToken { .. } => app.status_err(match refresh_error {
+                        Some(error) => {
+                            format!("{error}; no admin token is available to request a reload")
+                        }
+                        None => {
+                            "edit saved but no admin token is available to request a reload".into()
+                        }
+                    }),
+                    ReloadOutcome::ReloadFailed(msg) => app.status_err(match refresh_error {
+                        Some(error) => format!("{error}; daemon rejected reload: {msg}"),
+                        None => format!("edit saved but daemon rejected reload: {msg}"),
+                    }),
                 },
-                ReloadOutcome::DaemonUnreachable => app.status_err(match refresh_error {
-                    Some(error) => {
-                        format!("{error}; daemon not running, will apply on next start")
-                    }
-                    None => "edit saved — daemon not running, will apply on next start".into(),
-                }),
-                ReloadOutcome::NoToken { .. } => app.status_err(match refresh_error {
-                    Some(error) => {
-                        format!("{error}; no admin token is available to request a reload")
-                    }
-                    None => "edit saved but no admin token is available to request a reload".into(),
-                }),
-                ReloadOutcome::ReloadFailed(msg) => app.status_err(match refresh_error {
-                    Some(error) => format!("{error}; daemon rejected reload: {msg}"),
-                    None => format!("edit saved but daemon rejected reload: {msg}"),
-                }),
-            }
+            )
+            .await;
         }
+
         _ => app.leaf_key_unhandled = true,
     }
 }
@@ -7323,7 +6957,12 @@ fn run_file_editor_guarded(app: &mut App, config_path: &Path, editor: &str) -> F
              Editor output may be garbled. Press 'q' to exit and re-launch the dashboard."
         ));
     }
-    if let Err(error) = execute!(std::io::stdout(), LeaveAlternateScreen) {
+    if let Err(error) = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    ) {
         step_error.get_or_insert(format!(
             "could not leave alternate screen before launching $EDITOR ({editor}): {error}. \
              Press 'q' to exit and re-launch the dashboard."
@@ -7349,7 +6988,12 @@ fn run_file_editor_guarded(app: &mut App, config_path: &Path, editor: &str) -> F
              TUI input may be unreliable. Press 'q' to exit cleanly."
         ));
     }
-    if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
+    if let Err(error) = execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    ) {
         step_error.get_or_insert(format!(
             "could not re-enter alternate screen after $EDITOR ({editor}): {error}. \
              TUI may render in scrollback. Press 'q' to exit cleanly."
@@ -7444,7 +7088,7 @@ fn refresh_file_editor_caches_locked(
     guard: &crate::config::write_lock::ConfigWriteLock,
     canonical_master: &Path,
 ) -> Result<(crate::config::loader::LoadedConfig, String), String> {
-    let loaded = load_v1_config_locked(guard, canonical_master)?;
+    let loaded = load_current_config_locked(guard, canonical_master)?;
     let live_text = match crate::cli::commands::target::read_raw_or_empty_locked(
         guard,
         canonical_master,
@@ -7489,7 +7133,7 @@ fn file_sections_from_raw(text: &str) -> Vec<String> {
 /// `handle_key` while `app.settings.restore_modal.is_some()`. Picking
 /// moves the selection or advances to the confirm prompt; Confirming hands the
 /// restore to a background task on `y` and parks the modal in `Restoring`;
-/// Submitted closes on any key. Mirrors `handle_local_dns_modal_key`.
+/// Submitted scrolls the complete report; other keys close it.
 async fn handle_restore_modal_key(
     app: &mut App,
     key: KeyEvent,
@@ -7497,52 +7141,61 @@ async fn handle_restore_modal_key(
     config_path: &Path,
 ) {
     use backup_restore_modal::RestoreStage;
-
     let Some(mut modal) = app.settings.restore_modal.take() else {
         return;
     };
-
-    // Submitted — any key closes (drop by not re-stashing).
     if modal.is_submitted() {
+        if scroll_settings_report(&mut app.settings, key.code) {
+            app.settings.restore_modal = Some(modal);
+        }
         return;
     }
-
-    // Restoring — the background task owns this modal. Swallow every key and
-    // re-stash: a second `y` would race a second extraction against the same
-    // live config tree, and letting the operator close the card would orphan an
-    // outcome that is still coming (`apply_job_result` would have nowhere to
-    // land it). The card says "please wait" and means it.
     if matches!(modal.stage, RestoreStage::Restoring { .. }) {
         app.settings.restore_modal = Some(modal);
         return;
     }
-
-    // Confirming handled first so the stage transition happens before any
-    // `&mut modal.stage` borrow is taken.
     if let RestoreStage::Confirming { point } = &modal.stage {
-        match key.code {
+        let code = confirmation_key(&mut app.settings.confirmation_primary, key.code);
+        match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let point = point.clone();
+                app.settings.restore_picker = None;
                 start_restore(app, modal, point, poller, config_path).await;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {} // cancel: drop the modal
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                if let Some((entries, selected)) = app.settings.restore_picker.take() {
+                    modal.stage = RestoreStage::Picking { entries, selected };
+                    app.settings.restore_modal = Some(modal);
+                }
+            }
             _ => app.settings.restore_modal = Some(modal),
         }
         return;
     }
-
-    // Picking — pure in-place navigation, no await.
     if let RestoreStage::Picking { entries, selected } = &mut modal.stage {
         match key.code {
-            KeyCode::Esc => return, // cancel: drop the modal
-            KeyCode::Down if *selected + 1 < entries.len() => {
-                *selected += 1;
+            KeyCode::Esc => {
+                app.settings.restore_picker = None;
+                return;
             }
-            KeyCode::Up => {
-                *selected = selected.saturating_sub(1);
+            KeyCode::Down => {
+                *selected = selected
+                    .saturating_add(1)
+                    .min(entries.len().saturating_sub(1))
             }
-            KeyCode::Enter => {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Home => *selected = 0,
+            KeyCode::End => *selected = entries.len().saturating_sub(1),
+            KeyCode::PageDown => {
+                *selected = selected
+                    .saturating_add(8)
+                    .min(entries.len().saturating_sub(1))
+            }
+            KeyCode::PageUp => *selected = selected.saturating_sub(8),
+            KeyCode::Enter if !entries.is_empty() => {
                 let point = entries[*selected].clone();
+                app.settings.restore_picker = Some((entries.clone(), *selected));
+                app.settings.confirmation_primary = false;
                 modal.stage = RestoreStage::Confirming { point };
             }
             _ => {}
@@ -7551,10 +7204,46 @@ async fn handle_restore_modal_key(
     app.settings.restore_modal = Some(modal);
 }
 
+fn confirmation_key(primary: &mut bool, code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            *primary = !*primary;
+            code
+        }
+        KeyCode::Enter => {
+            if *primary {
+                KeyCode::Char('y')
+            } else {
+                KeyCode::Esc
+            }
+        }
+        _ => code,
+    }
+}
+
+fn scroll_settings_report(settings: &mut app::SettingsState, code: KeyCode) -> bool {
+    let max = settings.report_max_scroll.get();
+    let current = settings.report_scroll.min(max);
+    settings.report_scroll = match code {
+        KeyCode::Up => current.saturating_sub(1),
+        KeyCode::Down => current.saturating_add(1).min(max),
+        KeyCode::PageUp => current.saturating_sub(8),
+        KeyCode::PageDown => current.saturating_add(8).min(max),
+        KeyCode::Home => 0,
+        KeyCode::End => max,
+        _ => {
+            settings.report_scroll = 0;
+            settings.report_max_scroll.set(0);
+            return false;
+        }
+    };
+    true
+}
+
 /// Keyboard handler for the Settings → backup confirm modal. Gated in
 /// `handle_key` while `app.settings.backup_modal.is_some()`. Confirm hands the
 /// backup to a background task on `y` and parks the modal in `Running`;
-/// `n`/`Esc` drops the modal without writing; Submitted closes on any key.
+/// `n`/`Esc` drops the modal without writing; Submitted exposes a scrollable report.
 /// Mirrors `handle_restore_modal_key` but does not need an `IpcPoller` — backup
 /// is a pure filesystem op, no daemon reload involved.
 async fn handle_backup_modal_key(app: &mut App, key: KeyEvent, config_path: &Path) {
@@ -7564,8 +7253,10 @@ async fn handle_backup_modal_key(app: &mut App, key: KeyEvent, config_path: &Pat
         return;
     };
 
-    // Submitted — any key closes (drop by not re-stashing).
     if matches!(modal, BackupModal::Submitted { .. }) {
+        if scroll_settings_report(&mut app.settings, key.code) {
+            app.settings.backup_modal = Some(modal);
+        }
         return;
     }
 
@@ -7581,7 +7272,7 @@ async fn handle_backup_modal_key(app: &mut App, key: KeyEvent, config_path: &Pat
         return; // unreachable: Submitted + Running handled above
     };
 
-    match key.code {
+    match confirmation_key(&mut app.settings.confirmation_primary, key.code) {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             start_backup(app, dir, config_path).await;
         }
@@ -7611,31 +7302,28 @@ async fn handle_backup_modal_key(app: &mut App, key: KeyEvent, config_path: &Pat
 /// non-loop callers), the same escape hatch [`start_restore`] uses.
 async fn start_backup(app: &mut App, dir: PathBuf, config_path: &Path) {
     use backup_restore_modal::BackupModal;
-
-    let config_path = config_path.to_path_buf();
-
-    match app.job_tx.clone() {
-        Some(tx) => {
-            app.settings.backup_modal = Some(BackupModal::Running { dir: dir.clone() });
-            tokio::spawn(async move {
-                let (outcome, auto_backup) = execute_backup(config_path, dir).await;
-                // Send on EVERY path (`execute_backup` maps a panicked or
-                // cancelled archive to a `Failed` outcome rather than returning
-                // nothing): the `Running` stage swallows keys, so an outcome that
-                // never arrives would leave the card unclosable.
-                let _ = tx.send(app::UiJob::BackupFinished {
-                    outcome,
-                    auto_backup,
-                });
-            });
-        }
-        None => {
+    if !actions::reserve_external(app, actions::Surface::Backup, "Creating backup") {
+        return;
+    }
+    let config_path = config_path.to_owned();
+    app.settings.backup_modal = Some(BackupModal::Running { dir: dir.clone() });
+    if let Some(tx) = app.job_tx.clone() {
+        tokio::spawn(async move {
             let (outcome, auto_backup) = execute_backup(config_path, dir).await;
-            app.settings.backup_modal = Some(backup_submitted_card(outcome));
-            if let Some(view) = auto_backup {
-                app.settings.auto_backup = view;
-            }
-        }
+            let _ = tx.send(app::UiJob::BackupFinished {
+                outcome,
+                auto_backup,
+            });
+        });
+    } else {
+        let (outcome, auto_backup) = execute_backup(config_path, dir).await;
+        apply_job_result(
+            app,
+            app::UiJob::BackupFinished {
+                outcome,
+                auto_backup,
+            },
+        );
     }
 }
 
@@ -7756,32 +7444,35 @@ async fn start_restore(
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use backup_restore_modal::RestoreStage;
-
+    if !actions::reserve_external(app, actions::Surface::Restore, "Restoring configuration") {
+        return;
+    }
     let archive = point.path.clone();
-    let config_path = config_path.to_path_buf();
-    // Own the socket path rather than the `&IpcPoller`: the task must be
-    // 'static, and `send_reload` needs nothing but the path.
-    let socket_path = poller.socket_path().to_path_buf();
-
-    match app.job_tx.clone() {
-        Some(tx) => {
-            modal.stage = RestoreStage::Restoring { point };
-            app.settings.restore_modal = Some(modal);
-            tokio::spawn(async move {
-                let outcome = execute_restore(archive, config_path, socket_path).await;
-                // Send on EVERY path (`execute_restore` maps a panicked or
-                // cancelled extraction to a `Failed` outcome rather than
-                // returning nothing): the `Restoring` stage swallows keys, so an
-                // outcome that never arrives would leave the card unclosable.
-                let _ = tx.send(app::UiJob::RestoreFinished(outcome));
+    let config_path = config_path.to_owned();
+    let socket_path = poller.socket_path().to_owned();
+    modal.stage = backup_restore_modal::RestoreStage::Restoring { point };
+    app.settings.restore_modal = Some(modal);
+    if let Some(tx) = app.job_tx.clone() {
+        tokio::spawn(async move {
+            let (outcome, config, reload_error) =
+                execute_restore(archive, config_path, socket_path).await;
+            let _ = tx.send(app::UiJob::RestoreFinished {
+                outcome,
+                config,
+                reload_error,
             });
-        }
-        None => {
-            let outcome = execute_restore(archive, config_path, socket_path).await;
-            modal.stage = RestoreStage::Submitted(outcome);
-            app.settings.restore_modal = Some(modal);
-        }
+        });
+    } else {
+        let (outcome, config, reload_error) =
+            execute_restore(archive, config_path, socket_path).await;
+        apply_job_result(
+            app,
+            app::UiJob::RestoreFinished {
+                outcome,
+                config,
+                reload_error,
+            },
+        );
     }
 }
 
@@ -7799,7 +7490,24 @@ async fn execute_restore(
     archive: PathBuf,
     config_path: PathBuf,
     socket_path: PathBuf,
-) -> backup_restore_modal::SubmitOutcome {
+) -> (
+    backup_restore_modal::SubmitOutcome,
+    Option<Box<app::ConfigSnapshot>>,
+    Option<String>,
+) {
+    let poller = IpcPoller::new(&socket_path);
+    execute_restore_with_reload(archive, config_path, poller.send_reload()).await
+}
+
+async fn execute_restore_with_reload(
+    archive: PathBuf,
+    config_path: PathBuf,
+    reload: impl std::future::Future<Output = anyhow::Result<String>>,
+) -> (
+    backup_restore_modal::SubmitOutcome,
+    Option<Box<app::ConfigSnapshot>>,
+    Option<String>,
+) {
     use crate::cli::commands::config::{restore_archive, RestoreOutcome};
     use backup_restore_modal::SubmitOutcome;
 
@@ -7808,18 +7516,29 @@ async fn execute_restore(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| archive.display().to_string());
 
-    let extracted =
-        tokio::task::spawn_blocking(move || restore_archive(&config_path, &archive)).await;
+    let extracted = tokio::task::spawn_blocking(move || {
+        let result = restore_archive(&config_path, &archive);
+        let config = matches!(&result, Ok(RestoreOutcome::Restored { .. }))
+            .then(|| Box::new(load_config_snapshot(&config_path)));
+        (result, config)
+    })
+    .await;
+    let (extracted, config) = match extracted {
+        Ok((result, config)) => (Ok(result), config),
+        Err(error) => (Err(error), None),
+    };
 
-    match extracted {
-        Ok(Ok(RestoreOutcome::Restored { .. })) => {
-            match IpcPoller::new(&socket_path).send_reload().await {
-                Ok(_) => SubmitOutcome::Ok(format!("restored {name} and reloaded the daemon")),
-                Err(e) => SubmitOutcome::Ok(format!(
-                    "restored {name}; reload failed ({e}) — run `systemctl reload purge-warden`"
-                )),
+    let mut reload_error = None;
+    let outcome = match extracted {
+        Ok(Ok(RestoreOutcome::Restored { .. })) => match reload.await {
+            Ok(_) => SubmitOutcome::Ok(format!("restored {name} and reloaded the daemon")),
+            Err(error) => {
+                reload_error = Some(error.to_string());
+                SubmitOutcome::Ok(format!(
+                    "restored {name}; reload failed ({error}) — run `systemctl reload purge-warden`"
+                ))
             }
-        }
+        },
         Ok(Ok(RestoreOutcome::ValidationFailed(errs))) => SubmitOutcome::Failed(format!(
             "{name} failed validation ({} error(s)); live config untouched",
             errs.len()
@@ -7830,19 +7549,13 @@ async fn execute_restore(
         // card (which eats every key) never closes. The live tree is whatever
         // `restore_archive`'s own rollback left behind.
         Err(e) => SubmitOutcome::Failed(format!("restore failed: {e}")),
-    }
+    };
+    (outcome, config, reload_error)
 }
 
 // ── Tracking form handler ────────────────────────────────────────────────────
 
-/// Keyboard handler for the Settings → Tracking form.
-/// Called only when `app.settings.tracking_panel.is_some()`. All keys
-/// are consumed by the form; Esc exits back to the TOML viewer.
-///
-/// Submits via `IpcCommand::TrackingConfigUpdate` on `s`; surfaces
-/// the daemon's response (success message or verbatim error) in the
-/// panel's footer so the operator sees the frozen validation string
-/// (e.g. "retention_days must be between 1 and 365.") inline.
+/// Edit the captured tracking values; a failed save keeps the draft open.
 async fn handle_tracking_panel_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
     // Esc exits the form — handled outside the mut-borrow scope so
     // the borrow checker lets us reset the Option.
@@ -7850,6 +7563,23 @@ async fn handle_tracking_panel_key(app: &mut App, key: KeyEvent, poller: &IpcPol
         app.settings.tracking_panel = None;
         return;
     }
+    if key.code == KeyCode::Enter
+        && app
+            .settings
+            .tracking_panel
+            .as_ref()
+            .is_some_and(|p| p.focus == crate::tui::app::TrackingFocus::Discard)
+    {
+        app.settings.tracking_panel = None;
+        return;
+    }
+    let save = is_save_key(key)
+        || (key.code == KeyCode::Enter
+            && app
+                .settings
+                .tracking_panel
+                .as_ref()
+                .is_some_and(|p| p.focus == crate::tui::app::TrackingFocus::Save));
     let Some(panel) = app.settings.tracking_panel.as_mut() else {
         return;
     };
@@ -7878,7 +7608,9 @@ async fn handle_tracking_panel_key(app: &mut App, key: KeyEvent, poller: &IpcPol
             panel.log_mode = cycle_log_mode_prev(&panel.log_mode);
             clear_message_on_edit(panel);
         }
-        KeyCode::Right if panel.focus == TrackingFocus::Mode => {
+        KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+            if panel.focus == TrackingFocus::Mode =>
+        {
             panel.log_mode = cycle_log_mode_next(&panel.log_mode);
             clear_message_on_edit(panel);
         }
@@ -7894,7 +7626,7 @@ async fn handle_tracking_panel_key(app: &mut App, key: KeyEvent, poller: &IpcPol
             commit_retention_from_input(panel);
             clear_message_on_edit(panel);
         }
-        KeyCode::Char('s') => {
+        _ if save => {
             // Commit retention buffer first (user may have Tab'd
             // away but still typed).
             commit_retention_from_input(panel);
@@ -7908,14 +7640,7 @@ async fn handle_tracking_panel_key(app: &mut App, key: KeyEvent, poller: &IpcPol
                 return;
             }
             let patch = panel.to_patch();
-            match poller.send_tracking_update(patch).await {
-                Ok(msg) => {
-                    panel.submit_message = Some(msg);
-                }
-                Err(e) => {
-                    panel.submit_message = Some(format!("error: {e}"));
-                }
-            }
+            action_handlers::tracking(app, patch, poller).await;
         }
         _ => {}
     }
@@ -7978,16 +7703,34 @@ const MAX_PASTE: usize = 256;
 ///
 /// Control characters (newlines, tabs, ESC) are stripped so a multi-line paste
 /// collapses to one line and cannot synthesize an Enter/submit, and the chunk is
-/// capped at [`MAX_PASTE`]. Dropping the paste in non-text contexts is the safety
+/// capped at [`MAX_PASTE`], except the bounded association-token field.
+/// Dropping the paste in non-text contexts is the safety
 /// property: a pasted `y` can never confirm a destructive Remove, a pasted `q`
 /// can never quit.
 fn handle_paste(app: &mut App, pasted: String) {
+    if app.pending_action.is_some() {
+        return;
+    }
     let cleaned: String = pasted
         .chars()
         .filter(|c| !c.is_control())
         .take(MAX_PASTE)
         .collect();
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || app.welcome_banner.is_some() {
+        return;
+    }
+
+    // The client picker owns its searchable draft just as it owns literal
+    // keys. A bracketed paste must not leak through and alter a filter or
+    // the row underneath the popup.
+    if let Some(picker) = app.query_log.client_picker.as_mut() {
+        picker.append_search(&cleaned);
+        return;
+    }
+
+    if app.active_leaf == Leaf::QueryLog
+        && (app.query_log.detail.is_some() || app.query_log.period_menu)
+    {
         return;
     }
 
@@ -8012,6 +7755,14 @@ fn handle_paste(app: &mut App, pasted: String) {
         }
     }
 
+    // Local DNS owns text before the global resolver, just as for keys.
+    if app.active_leaf == Leaf::LocalDns && app.local_dns.modal.is_some() {
+        if let Some(buf) = focused_text_buffer(app) {
+            buf.push_str(&cleaned);
+        }
+        return;
+    }
+
     // The resolver modal's input mutation carries a
     // side effect (drop the now-stale prior result) that a bare
     // `&mut String` from `focused_text_buffer` can't express — handle
@@ -8019,6 +7770,29 @@ fn handle_paste(app: &mut App, pasted: String) {
     if let Some(modal) = app.resolver_modal.as_mut() {
         modal.paste_into_input(&cleaned);
         return;
+    }
+
+    #[cfg(feature = "cluster")]
+    if app.active_leaf == Leaf::Nodes && app.query_log_rule_modal.is_none() {
+        if let Some(nodes::NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() {
+            if draft.kind == nodes::NodeFormKind::Add && draft.focus == 2 {
+                let token: String = pasted
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(MAX_ASSOCIATION_TOKEN_BYTES + 1)
+                    .collect();
+                if draft.token.len().saturating_add(token.len()) > MAX_ASSOCIATION_TOKEN_BYTES {
+                    draft.error = Some(
+                        "Association token is too long; paste only the token printed by Warden."
+                            .into(),
+                    );
+                } else {
+                    draft.token.push_str(&token);
+                    draft.error = None;
+                }
+                return;
+            }
+        }
     }
 
     if let Some(buf) = focused_text_buffer(app) {
@@ -8114,6 +7888,7 @@ fn custom_list_rule_paste_buf(form: &mut custom_list_modal::RuleForm) -> Option<
     use custom_list_modal::RuleField;
     match form.focused {
         RuleField::Domain => Some(&mut form.domain),
+        RuleField::Raw => Some(&mut form.raw_rule),
         RuleField::Direction | RuleField::Submit | RuleField::Cancel => None,
     }
 }
@@ -8197,6 +7972,37 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
         }
     }
 
+    // Query Log rule picker (global). The marker list and the report
+    // take no text; the create form is the Custom Lists add form, so it
+    // pastes through the same buffer that leaf uses rather than a copy.
+    if let Some(modal) = app.query_log_rule_modal.as_mut() {
+        return match &mut modal.stage {
+            query_log_rule_modal::Stage::NewList(inner) => custom_list_paste_buf(inner),
+            _ => None,
+        };
+    }
+
+    // Local DNS uses the same text fields as keyboard input. Confirmations
+    // and choice/action rows consume paste without changing hidden buffers.
+    if app.active_leaf == Leaf::LocalDns {
+        if let Some(modal) = app.local_dns.modal.as_mut() {
+            if let local_dns_modal::Stage::EditingForm(form) = &mut modal.stage {
+                use local_dns_modal::FormField;
+                let buf = match form.focused {
+                    FormField::Domain => Some(&mut form.domain),
+                    FormField::Value => Some(&mut form.value),
+                    FormField::Ttl => Some(&mut form.ttl_input),
+                    _ => None,
+                };
+                if buf.is_some() {
+                    form.error_message = None;
+                }
+                return buf;
+            }
+            return None;
+        }
+    }
+
     // Groups: the whole modal is handled in `handle_paste` (the Tags chip
     // picker needs side effects a borrowed `&mut String` cannot carry — see
     // `paste_into_group_modal`), so nothing here is borrowable.
@@ -8265,20 +8071,21 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
         return None;
     }
 
+    #[cfg(feature = "cluster")]
+    if app.active_leaf == Leaf::Nodes {
+        if let Some(nodes::NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() {
+            if draft.focus < draft.visible_fields() {
+                draft.error = None;
+                return Some(draft.field_value_mut(draft.focus));
+            }
+        }
+        return None;
+    }
+
     // Source-IP resolver modal (global) is handled directly in
     // `handle_paste` (its input mutation carries a side effect that a bare
     // `&mut String` can't express), so it
     // never reaches this generic path. No arm needed here.
-
-    // Query Log rule picker (global). The marker list and the report
-    // take no text; the create form is the Custom Lists add form, so it
-    // pastes through the same buffer that leaf uses rather than a copy.
-    if let Some(modal) = app.query_log_rule_modal.as_mut() {
-        return match &mut modal.stage {
-            query_log_rule_modal::Stage::NewList(inner) => custom_list_paste_buf(inner),
-            _ => None,
-        };
-    }
 
     // Query Log advanced search (global, not leaf-gated — mirrors
     // `handle_key`'s placement after the rule-picker gate). Three
@@ -8288,14 +8095,22 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
         return query_log_filter_paste_buf(m);
     }
 
+    if app.active_leaf == Leaf::File && app.file.section_jump.is_some() {
+        return app.file.section_jump.as_mut();
+    }
+
     // `/`-filter prompts.
     match &mut app.input_mode {
-        InputMode::FilterDomain(buf)
-        | InputMode::FilterClient(buf)
+        InputMode::FilterDomain(buf) => {
+            (app.query_log.domain_focus == query_log_controls::FilterFocus::Value).then_some(buf)
+        }
+        InputMode::FilterClient(buf)
         | InputMode::FilterLists(buf)
         | InputMode::FilterRules(buf)
         | InputMode::FilterDevicesSubnet(buf)
         | InputMode::FilterLogs(buf) => Some(buf),
+        #[cfg(feature = "cluster")]
+        InputMode::FilterNodes(buf) => Some(buf),
         InputMode::Normal => None,
     }
 }
@@ -8464,21 +8279,31 @@ fn jump_table_end(state: &mut ratatui::widgets::TableState, len: usize) {
 
 /// `PgDn` — forward one page, clamped at the last row.
 fn page_table_down(state: &mut ratatui::widgets::TableState, len: usize) {
+    page_table_down_by(state, len, NAV_PAGE);
+}
+
+/// Viewport-aware table step. Query Log records this from the renderer;
+/// other leaves retain their stable `NAV_PAGE` convention.
+fn page_table_down_by(state: &mut ratatui::widgets::TableState, len: usize, step: usize) {
     if len == 0 {
         return;
     }
     let i = state
         .selected()
-        .map(|i| (i + NAV_PAGE).min(len - 1))
+        .map(|i| (i + step.max(1)).min(len - 1))
         .unwrap_or(0);
     state.select(Some(i));
 }
 
 /// `PgUp` — back one page, clamped at row 0.
 fn page_table_up(state: &mut ratatui::widgets::TableState) {
+    page_table_up_by(state, NAV_PAGE);
+}
+
+fn page_table_up_by(state: &mut ratatui::widgets::TableState, step: usize) {
     let i = state
         .selected()
-        .map(|i| i.saturating_sub(NAV_PAGE))
+        .map(|i| i.saturating_sub(step.max(1)))
         .unwrap_or(0);
     state.select(Some(i));
 }
@@ -8560,7 +8385,17 @@ fn page_selectable_idx<T>(
 /// renders; a failure that recovered is simply not re-raised and is
 /// gone. An action's error — a Save the operator watched fail — carries
 /// `StatusOrigin::Action` and is untouched by any of this.
-async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
+async fn poll_active_leaf(app: &mut App, _poller: &IpcPoller) {
+    if app.read_jobs.is_some() {
+        reads::request_active(app, jobs::ReadReason::Explicit);
+    } else {
+        #[cfg(test)]
+        poll_active_leaf_inline(app, _poller).await;
+    }
+}
+
+#[cfg(test)]
+async fn poll_active_leaf_inline(app: &mut App, poller: &IpcPoller) {
     // Poll errors describe a condition, not an event. Drop last pass's
     // before re-testing it; the arms below re-raise if it still holds.
     app.clear_poll_status();
@@ -8648,6 +8483,11 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 since_secs: app.query_log.since.as_secs(),
                 cursor: app.query_log.current_cursor(),
                 advanced: app.query_log.advanced_for_request(),
+                client_ips: if app.query_log.client_mode == app::ClientFilterMode::Selected {
+                    app.query_log.client_ips.clone()
+                } else {
+                    Vec::new()
+                },
             })
             .await
         {
@@ -8659,10 +8499,11 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 // makes decisions on outdated data with only footer
                 // last_error as cue.
                 app.query_log.entries.clear();
+                app.query_log.read_failed = true;
                 app.status_err_poll(e.to_string());
             }
         },
-        Leaf::Devices => match poller.fetch_device_view().await {
+        Leaf::Devices | Leaf::Subnets => match poller.fetch_device_view().await {
             Ok(view) => {
                 app.device_view = Some(view);
             }
@@ -8707,7 +8548,7 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 app.status_err_poll(e.to_string());
             }
         },
-        // Subnets / Resolver tabs read from the cached
+        // Offline configuration tabs read from the cached
         // LoadedConfig. No IPC call, so nothing to poll here. The `r`
         // keybinding in handle_key re-reads the config file. Rules
         // is also data-source-less — kept here to preserve the no-poll
@@ -8747,50 +8588,99 @@ async fn poll_active_leaf(app: &mut App, poller: &IpcPoller) {
                 app.status_err_poll(e.to_string());
             }
         },
-        Leaf::Subnets
-        | Leaf::Rules
+        Leaf::Rules
         | Leaf::Settings
         | Leaf::Profiles
         | Leaf::File
         | Leaf::Groups
         | Leaf::Labels
         | Leaf::CustomLists => {} // no polling
-        // The Cluster tab is fed by `poll_heartbeat`; no
-        // active-leaf poll of its own.
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => {}
+        Leaf::Nodes => {}
     }
 }
 
-/// Read the v1 config once for the TUI's offline-backed tabs (Subnets,
+/// Read the current config once for the TUI's offline-backed tabs (Subnets,
 /// Resolver, Devices source annotation). Errors are swallowed and
 /// translated to `None` — the consuming tabs render a "could not load"
 /// state rather than bubbling up into the footer error slot (which is
 /// reserved for daemon / IPC failures).
-fn load_v1_config(config_path: &Path) -> Option<crate::config::loader::LoadedConfig> {
-    crate::config::loader::load_config(config_path, time::OffsetDateTime::now_utc()).ok()
+fn load_current_config(config_path: &Path) -> Option<crate::config::loader::LoadedConfig> {
+    crate::config::loader::load_current_config(config_path, time::OffsetDateTime::now_utc()).ok()
 }
 
-/// Load the live v1 tree while its writer guard is held.
+/// Read all disk-backed representations together; restore calls this on the
+/// blocking pool so applying the result performs no filesystem work.
+fn load_config_snapshot(config_path: &Path) -> app::ConfigSnapshot {
+    let (file_sections, file_text) = file::load_config(config_path);
+    app::ConfigSnapshot {
+        loaded_config: load_current_config(config_path),
+        file_sections,
+        file_text,
+    }
+}
+
+fn apply_config_snapshot(app: &mut App, snapshot: app::ConfigSnapshot) {
+    app.loaded_config = snapshot.loaded_config;
+    app.file.sections = snapshot.file_sections;
+    app.file.config_text = snapshot.file_text;
+    app.file.scroll_offset = app.file.scroll_offset.min(
+        u16::try_from(app.file.config_text.lines().count().saturating_sub(1)).unwrap_or(u16::MAX),
+    );
+    // Fence asynchronous policy reads across external edits and restores.
+    if let Some(jobs) = app.read_jobs.as_mut() {
+        jobs.invalidate(jobs::ReadResource::OperatorCatalog);
+        jobs.invalidate(jobs::ReadResource::OperatorRules);
+    }
+    app.operator_catalog = None;
+    app.operator_rules = None;
+    app.operator_catalog_error = None;
+    app.operator_rules_error = None;
+    app.custom_lists.selected_row_ref = None;
+    app.custom_lists.pack = None;
+    app.custom_lists.selected_line = None;
+    app.custom_lists.rules_table_state = Default::default();
+    ensure_profile_selection_seeded(app);
+    ensure_subnet_selection_seeded(app);
+    ensure_labels_selection_seeded(app);
+    ensure_custom_list_selection_seeded(app);
+}
+
+#[cfg(test)]
+fn refresh_config_caches(app: &mut App, config_path: &Path) {
+    apply_config_snapshot(app, load_config_snapshot(config_path));
+}
+
+/// Load the live current tree while its writer guard is held.
 ///
 /// TUI state is deliberately only a rendering/form snapshot. Any mutation
 /// must obtain its authoritative declaration set, include ownership and
 /// limits through this guarded loader before it makes a decision.
-fn load_v1_config_locked(
+fn load_current_config_locked(
     guard: &crate::config::write_lock::ConfigWriteLock,
     master: &Path,
 ) -> Result<crate::config::loader::LoadedConfig, String> {
     crate::config::loader::load_config_for_schema_under_guard(
         guard,
         master,
-        crate::config::schema::SCHEMA_VERSION_V1,
+        crate::config::schema::TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     )
     .map_err(crate::cli::commands::format_config_errors)
     .map_err(|error| error.to_string())
 }
 
-async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
+async fn poll_heartbeat(app: &mut App, _poller: &IpcPoller) {
+    if app.read_jobs.is_some() {
+        reads::request_heartbeat(app, jobs::ReadReason::Explicit);
+    } else {
+        #[cfg(test)]
+        poll_heartbeat_inline(app, _poller).await;
+    }
+}
+
+#[cfg(test)]
+async fn poll_heartbeat_inline(app: &mut App, poller: &IpcPoller) {
     match poller.fetch_status().await {
         Ok(status) => {
             app.daemon_status = Some(status);
@@ -8801,16 +8691,30 @@ async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
         }
     }
 
-    // The always-on heartbeat is the single cadence feeding BOTH
-    // the dashboard dot and the Cluster tab — no second polling loop in
-    // the TUI. Only fetch when clustering is enabled. On error keep the
-    // last-known view, exactly like `daemon_status` above — `connected`
-    // drives the dot's stale / red state.
+    #[cfg(feature = "cluster")]
+    app.apply_nodes_poll_result(
+        poller
+            .fetch_nodes_status()
+            .await
+            .map_err(|error| error.to_string()),
+    );
+
+    #[cfg(feature = "cluster")]
+    app.apply_node_control_poll_result(
+        poller
+            .fetch_node_control_status()
+            .await
+            .map_err(|error| error.to_string()),
+    );
+
     #[cfg(feature = "cluster")]
     if app.cluster_visible() {
-        if let Ok(status) = poller.fetch_cluster_status().await {
-            app.cluster_status = Some(status);
-        }
+        app.apply_cluster_poll_result(
+            poller
+                .fetch_cluster_status()
+                .await
+                .map_err(|error| error.to_string()),
+        );
     }
 }
 
@@ -8822,6 +8726,25 @@ async fn poll_heartbeat(app: &mut App, poller: &IpcPoller) {
 /// form and the delete confirmation each get their own minimal
 /// state machine.
 async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
+    if app.devices.inspect_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => {
+                app.devices.inspect_open = false;
+                app.mouse.blur_detail(Leaf::Devices);
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
+                detail_panel::focus(app, Leaf::Devices);
+                detail_panel::scroll(app, Leaf::Devices, key.code);
+            }
+            _ => {}
+        }
+        return;
+    }
     // Take the modal out so we can mutate the form without holding
     // a borrow on `app.devices`. Put it back at the end unless the
     // submit succeeded (which closes the modal).
@@ -8847,18 +8770,21 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
             // `s` into whichever field held focus — measured
             // on the CT via pty-smoke — the field silently corrupted,
             // it did not simply ignore the chord.
+            if form.picker.is_some() {
+                let code = if is_save_key(key) {
+                    form.picker_focus = query_log_controls::FilterFocus::Apply;
+                    KeyCode::Enter
+                } else {
+                    key.code
+                };
+                handle_form_picker_key(&mut form, code);
+                app.devices.modal = Some(DeviceModal::Form(form));
+                return;
+            }
             if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
                 submit_form(app, form, poller).await;
-                return;
-            }
-            // Popup picker open → route keys to it (Profile / Group are
-            // select-only). The form stays open underneath; Esc/Enter in
-            // the picker close only the picker, not the form.
-            if form.picker.is_some() {
-                handle_form_picker_key(&mut form, key.code);
-                app.devices.modal = Some(DeviceModal::Form(form));
                 return;
             }
             match key.code {
@@ -8922,21 +8848,18 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
             }
         }
         DeviceModal::DeleteConfirm { id, display_name } => match key.code {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                app.devices.delete_focus = 1 - app.devices.delete_focus.min(1);
+                app.devices.modal = Some(DeviceModal::DeleteConfirm { id, display_name });
+            }
+            KeyCode::Enter if app.devices.delete_focus == 0 => {}
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                match poller.send_device_remove(id.clone()).await {
-                    Ok(_) => {
-                        // Modal closes; force a re-poll so the row
-                        // disappears from the table immediately.
-                        app.clear_status();
-                        poll_active_leaf(app, poller).await;
-                    }
-                    Err(e) => {
-                        app.status_err(format!("delete failed: {e}"));
-                        // Re-open the confirm so the operator can
-                        // retry or cancel after seeing the error.
-                        app.devices.modal = Some(DeviceModal::DeleteConfirm { id, display_name });
-                    }
-                }
+                action_handlers::device_remove(app, id, display_name, poller).await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 // Cancelled — drop the modal.
@@ -9085,66 +9008,7 @@ fn toggle_focused_catalog_row(modal: &mut app::CatalogPickerModal) {
 /// `enabled = false`, keeping the operator's tags, interval and display
 /// name. Deletion lives in the Lists edit modal behind its typed-id gate.
 async fn submit_catalog_picker(app: &mut App, poller: &IpcPoller, config_path: &Path) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-
-    let Some(mut modal) = app.lists.catalog_picker.take() else {
-        return;
-    };
-
-    let dirty: Vec<app::CatalogPickerRow> = modal.dirty_rows().cloned().collect();
-    if dirty.is_empty() {
-        app.lists.catalog_picker = None;
-        app.status_ok("no pending changes — nothing written".to_string());
-        return;
-    }
-
-    modal.submitting = true;
-    modal.error_message = None;
-    modal.status_message = Some(format!("saving {} change(s)…", dirty.len()));
-    app.lists.catalog_picker = Some(modal);
-
-    macro_rules! fail {
-        ($msg:expr) => {{
-            if let Some(m) = app.lists.catalog_picker.as_mut() {
-                m.submitting = false;
-                m.status_message = None;
-                m.error_message = Some($msg);
-            }
-            return;
-        }};
-    }
-
-    let (added, updated) = match apply_catalog_picker_changes(config_path, &dirty) {
-        Ok(counts) => counts,
-        Err(error) => fail!(error),
-    };
-
-    for row in &dirty {
-        tracing::info!(
-            target: "audit",
-            action = if row.original.is_subscribed() { "blocklist.tui_catalog_set_enabled" } else { "blocklist.tui_catalog_add" },
-            source = %row.canonical_id,
-            url = %row.url,
-            enabled = row.staged_enabled,
-            surface = "tui",
-            "TUI mutation"
-        );
-    }
-
-    let reload = attempt_reload(poller.socket_path()).await;
-    app.lists.catalog_picker = None;
-    app.loaded_config = load_v1_config(config_path);
-
-    let summary = match (added, updated) {
-        (0, u) => format!("{u} list(s) updated"),
-        (a, 0) => format!("{a} list(s) subscribed"),
-        (a, u) => format!("{a} subscribed, {u} updated"),
-    };
-    match reload {
-        ReloadOutcome::Reloaded => app.status_ok(format!("{summary} — daemon reloaded")),
-        _ => app.status_ok(format!("{summary} — config written, daemon not reachable")),
-    }
-    poll_active_leaf(app, poller).await;
+    action_handlers::catalog(app, poller, config_path).await;
 }
 
 /// The catalog picker's authoritative disk phase.  It is synchronous so the
@@ -9162,7 +9026,7 @@ fn apply_catalog_picker_changes(
 
     let guard = crate::config::write_lock::acquire_for_write(config_path)
         .map_err(|error| format!("{error:#}"))?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
+    let loaded = load_current_config_locked(&guard, config_path)?;
     // New subscriptions share the conventional creation target. Existing
     // rows instead locate their owning document below.
     let creation_target = dirty
@@ -9438,6 +9302,13 @@ async fn handle_edit_mode_key(
         return;
     }
 
+    let key = if key.code == KeyCode::Delete && !matches!(modal.mode, app::EditModalMode::Add) {
+        modal.focus = EditField::DeleteButton;
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    } else {
+        key
+    };
+
     match key.code {
         KeyCode::Esc => {
             // Drop the modal — discard buffers.
@@ -9571,24 +9442,11 @@ async fn handle_edit_mode_key(
                         // nothing to validator-check; the source string
                         // removal is a one-line legacy mutation.
                         let source = source.clone();
-                        match remove_source_from_master(config_path, &source) {
-                            Ok(()) => {
-                                app.lists.edit_modal = None;
-                                app.loaded_config = load_v1_config(config_path);
-                                let outcome = crate::cli::commands::ipc_reload::attempt_reload(
-                                    poller.socket_path(),
-                                )
-                                .await;
-                                let _ = outcome;
-                                poll_active_leaf(app, poller).await;
-                                app.status_ok(format!("removed orphan source: {source}"));
-                                return;
-                            }
-                            Err(e) => {
-                                modal.error_message = Some(format!("could not remove source: {e}"));
-                            }
-                        }
+                        app.lists.edit_modal = Some(modal.clone());
+                        action_handlers::orphan_remove(app, source, poller, config_path).await;
+                        return;
                     }
+
                     _ => {
                         modal.mode = app::EditModalMode::ConfirmDelete {
                             typed: String::new(),
@@ -10046,8 +9904,6 @@ async fn submit_edit_modal(
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::blocklists::{format_list_edit_ok, LIST_EDIT_DAEMON_UNREACHABLE};
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
     use crate::config::schema::Id;
 
     // Promote- and Add-mode pre-flight: id is operator-typed so it has
@@ -10067,37 +9923,6 @@ async fn submit_edit_modal(
             return;
         }
         modal.blocklist_id = trimmed;
-    }
-
-    // Add-list pre-flight
-    // gates 2 (dedup by URL) + 3 (HEAD reachability probe). Gate 1
-    // (URL parses to http/https) lives inside `build_blocklist_value`
-    // below; surfacing it here AS WELL would double the error surface
-    // for no benefit. Promote mode also runs these gates so the orphan
-    // doesn't promote into a dead URL.
-    if matches!(
-        &modal.mode,
-        app::EditModalMode::Add | app::EditModalMode::Promote { .. }
-    ) {
-        let candidate_url = modal.url.trim().to_string();
-        if !modal.skip_head_check
-            && modal.head_probe_passed_for.as_deref() != Some(candidate_url.as_str())
-            && (candidate_url.starts_with("http://") || candidate_url.starts_with("https://"))
-        {
-            if let Err(e) =
-                crate::cli::commands::blocklists::probe_url_for_tui(&candidate_url).await
-            {
-                modal.error_message = Some(e.to_string());
-                modal.submitting = false;
-                app.lists.edit_modal = Some(modal);
-                return;
-            }
-            // A consent confirmation resumes this same submit. Keep the
-            // successful preflight keyed to the URL, so it cannot cause a
-            // second network probe without turning the persistent skip flag
-            // into an implicit user choice.
-            modal.head_probe_passed_for = Some(candidate_url);
-        }
     }
 
     // The one remaining door to `base = allow`. Reached on every save
@@ -10136,89 +9961,17 @@ async fn submit_edit_modal(
     }
 
     if let Err(msg) = build_blocklist_value(&modal) {
+        if matches!(modal.interval, app::IntervalChoice::Custom) {
+            modal.advanced_expanded = true;
+            modal.focus = app::EditField::Interval;
+        }
         modal.error_message = Some(msg);
         modal.submitting = false;
         app.lists.edit_modal = Some(modal);
         return;
     }
 
-    modal.submitting = true;
-    modal.error_message = None;
-    modal.status_message = None;
-    let blocklist_id = modal.blocklist_id.clone();
-    // Captured here because `modal` is moved into `app.lists.edit_modal`
-    // below, and the success arm needs to know whether this save was the
-    // one that granted the consent — `LIST_EDIT_OK` says nothing about a
-    // standing exposure the operator just accepted.
-    let consent_granted_now = modal.consent_declared;
-    let promote_source: Option<String> = match &modal.mode {
-        app::EditModalMode::Promote { source } => Some(source.clone()),
-        _ => None,
-    };
-    let creates_new_entry = matches!(
-        &modal.mode,
-        app::EditModalMode::Promote { .. } | app::EditModalMode::Add
-    );
-    app.lists.edit_modal = Some(modal.clone());
-
-    let promote_warning = match apply_list_edit(
-        config_path,
-        &modal,
-        &blocklist_id,
-        creates_new_entry,
-        promote_source.as_deref(),
-    ) {
-        Ok(warning) => warning,
-        Err(error) => {
-            if let Some(m) = app.lists.edit_modal.as_mut() {
-                m.submitting = false;
-                m.error_message = Some(error);
-            }
-            return;
-        }
-    };
-
-    tracing::info!(
-        target: "audit",
-        action = "blocklist.tui_edit",
-        source = %blocklist_id,
-        surface = "tui",
-        "TUI mutation"
-    );
-
-    // The synchronous core has dropped its tree guard here.  Reload/cache
-    // work below may await the daemon without inverting the IPC lock order.
-    app.loaded_config = load_v1_config(config_path);
-    let outcome = attempt_reload(poller.socket_path()).await;
-    match outcome {
-        ReloadOutcome::Reloaded => {
-            app.status_ok(reloaded_status_text(
-                promote_warning.clone(),
-                if consent_granted_now {
-                    tabs::lists::format_list_allow_consent_saved(&blocklist_id)
-                } else {
-                    format_list_edit_ok(&blocklist_id)
-                },
-            ));
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::DaemonUnreachable => {
-            app.status_err(LIST_EDIT_DAEMON_UNREACHABLE.to_string());
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::NoToken { .. } => {
-            app.status_err(
-                "list saved on disk but no admin token is available to request a reload"
-                    .to_string(),
-            );
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::ReloadFailed(msg) => {
-            app.status_err(format!("list saved but daemon rejected reload: {msg}"));
-            app.lists.edit_modal = None;
-        }
-    }
-    poll_active_leaf(app, poller).await;
+    action_handlers::list_edit(app, modal, poller, config_path).await;
 }
 
 /// The list modal's guarded commit, including Promote's deliberately
@@ -10239,7 +9992,7 @@ fn apply_list_edit(
 
     let guard = crate::config::write_lock::acquire_for_write(config_path)
         .map_err(|error| format!("{error:#}"))?;
-    let loaded = load_v1_config_locked(&guard, config_path)?;
+    let loaded = load_current_config_locked(&guard, config_path)?;
     if creates_new_entry
         && loaded
             .config
@@ -10468,85 +10221,11 @@ fn cascade_summary(n: usize) -> String {
 
 async fn submit_delete_modal(
     app: &mut App,
-    mut modal: app::EditListModal,
+    modal: app::EditListModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::blocklists::{
-        format_list_delete_ok, run_remove_silent, LIST_EDIT_DAEMON_UNREACHABLE,
-    };
-    use crate::cli::commands::ipc_reload::ReloadOutcome;
-
-    modal.submitting = true;
-    modal.error_message = None;
-    modal.status_message = None;
-    let blocklist_id = modal.blocklist_id.clone();
-    app.lists.edit_modal = Some(modal.clone());
-
-    let result = run_remove_silent(
-        config_path,
-        poller.socket_path(),
-        &blocklist_id,
-        None,
-        // `cascade` reaches the callee's AUDIT ROW only — its removal of
-        // dangling overrides is unconditional (see `run_remove_silent`).
-        // `true` is still the honest value to pass from here: the typed-id
-        // confirm plus the affected-profile list in the prompt are the
-        // safety gates, and the operator has explicitly opted into the
-        // destructive path. A `false` here would understate that in the
-        // audit trail without changing what happens on disk.
-        true,
-    )
-    .await;
-
-    let outcome = match result {
-        Ok(o) => o,
-        Err(e) => {
-            if let Some(m) = app.lists.edit_modal.as_mut() {
-                m.submitting = false;
-                m.error_message = Some(format!("delete failed: {e}"));
-                m.mode = app::EditModalMode::Edit;
-            }
-            return;
-        }
-    };
-
-    tracing::info!(
-        target: "audit",
-        action = "blocklist.tui_delete",
-        source = %blocklist_id,
-        surface = "tui",
-        cascade_count = outcome.cascade_log.len(),
-        "TUI mutation"
-    );
-
-    app.loaded_config = load_v1_config(config_path);
-    let cascade_summary = cascade_summary(outcome.cascade_log.len());
-    match outcome.reload_outcome {
-        ReloadOutcome::Reloaded => {
-            app.status_ok(format!(
-                "{}{cascade_summary}",
-                format_list_delete_ok(&blocklist_id)
-            ));
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::DaemonUnreachable => {
-            app.status_err(LIST_EDIT_DAEMON_UNREACHABLE.to_string());
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::NoToken { .. } => {
-            app.status_err(
-                "list deleted on disk but no admin token is available to request a reload"
-                    .to_string(),
-            );
-            app.lists.edit_modal = None;
-        }
-        ReloadOutcome::ReloadFailed(msg) => {
-            app.status_err(format!("list deleted but daemon rejected reload: {msg}"));
-            app.lists.edit_modal = None;
-        }
-    }
-    poll_active_leaf(app, poller).await;
+    action_handlers::list_delete(app, modal, poller, config_path).await;
 }
 
 // ── Lists edit modal key handler ends here ────────────────────────────
@@ -10584,36 +10263,35 @@ fn build_query_log_rule_modal(app: &App) -> Option<query_log_rule_modal::QueryLo
         .clone()
         .unwrap_or_else(|| entry.client_ip.clone());
 
-    query_log_rule_modal::QueryLogRuleModal::open_for_query_row(
+    let mut modal = query_log_rule_modal::QueryLogRuleModal::open_for_query_row(
         entry,
         display_client,
         custom_list_rows(app),
-    )
+    )?;
+    if app.operator_catalog.is_none() {
+        modal.error = Some(app.operator_catalog_error.clone().unwrap_or_else(|| {
+            "Custom List catalog is loading. Close and reopen after it becomes available.".into()
+        }));
+    }
+    Some(modal)
 }
 
-/// Every declared custom list, in config order, with the profiles that
-/// mount it.
-///
-/// The mount state is a snapshot: the picker states it on the row the
-/// operator is about to write into, so a list nobody mounts announces
-/// itself at the moment it would silently swallow a rule.
+/// The captured daemon catalog supplies both list identity and mount state.
 fn custom_list_rows(app: &App) -> Vec<query_log_rule_modal::ListRow> {
-    let Some(loaded) = app.loaded_config.as_ref() else {
+    let Some(catalog) = app.operator_catalog.as_ref() else {
         return Vec::new();
     };
-    loaded
-        .config
-        .custom_lists
+    catalog
+        .lists
         .iter()
-        .map(|c| {
-            let id = c.id.as_str().to_string();
-            let display = if c.display_name.is_empty() {
-                id.clone()
+        .map(|list| {
+            let display = if list.display_name.is_empty() {
+                list.id.clone()
             } else {
-                format!("{} ({id})", c.display_name)
+                format!("{} ({})", list.display_name, list.id)
             };
-            let mounted = profiles_mounting(app, &id);
-            query_log_rule_modal::ListRow::new(id, display, mounted)
+            query_log_rule_modal::ListRow::new(list.id.clone(), display, list.profiles.clone())
+                .with_description(list.description.clone())
         })
         .collect()
 }
@@ -10662,22 +10340,57 @@ async fn handle_query_log_rule_modal_key(
     use query_log_rule_modal::Stage;
 
     match &modal.stage {
-        // Report state — any keypress closes the modal.
-        Stage::Done(_) => {}
+        Stage::Done(_) => match key.code {
+            KeyCode::Esc | KeyCode::Enter => {}
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
+                match key.code {
+                    KeyCode::Up => modal.scroll_report(-1),
+                    KeyCode::Down => modal.scroll_report(1),
+                    KeyCode::PageUp => modal.scroll_report(-8),
+                    KeyCode::PageDown => modal.scroll_report(8),
+                    KeyCode::Home => modal.report_home(),
+                    KeyCode::End => modal.report_end(),
+                    _ => unreachable!(),
+                }
+                app.query_log_rule_modal = Some(modal);
+            }
+            _ => app.query_log_rule_modal = Some(modal),
+        },
         Stage::NewList(_) => {
             handle_query_log_new_list_key(app, modal, key, poller, config_path).await;
         }
         Stage::Picking => match key.code {
             KeyCode::Esc => {}
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Tab => {
+                modal.focus_next();
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::BackTab => {
+                modal.focus_prev();
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Down | KeyCode::Char('j') if modal.focus == 0 && !modal.rows.is_empty() => {
                 modal.move_cursor(1);
                 app.query_log_rule_modal = Some(modal);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') if modal.focus == 0 && !modal.rows.is_empty() => {
                 modal.move_cursor(-1);
                 app.query_log_rule_modal = Some(modal);
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Home if modal.focus == 0 => {
+                modal.cursor = 0;
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::End if modal.focus == 0 => {
+                modal.cursor = modal.rows.len().saturating_sub(1);
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Char(' ') if modal.focus == 0 => {
                 modal.toggle();
                 app.query_log_rule_modal = Some(modal);
             }
@@ -10685,6 +10398,15 @@ async fn handle_query_log_rule_modal_key(
             // ecosystem: an operator with CapsLock must not press a key
             // that does nothing and says nothing.
             KeyCode::Char('n') | KeyCode::Char('N') => {
+                modal.begin_new_list(packs_dir_display(app));
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Enter if modal.focus == 1 => {}
+            KeyCode::Enter if modal.focus == 2 => {
+                modal.begin_new_list(packs_dir_display(app));
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Enter if modal.focus == 0 && modal.rows.is_empty() => {
                 modal.begin_new_list(packs_dir_display(app));
                 app.query_log_rule_modal = Some(modal);
             }
@@ -10726,6 +10448,11 @@ async fn handle_query_log_new_list_key(
         app.query_log_rule_modal = Some(modal);
         return;
     };
+
+    if is_save_key(key) {
+        submit_query_log_new_list(app, modal, poller, config_path).await;
+        return;
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -10800,12 +10527,6 @@ fn new_list_form_mut(
 
 /// Create the list the form describes, then return to the picker with it
 /// marked.
-///
-/// `create_custom_list` writes the pack file **before** the declaration —
-/// a `[[custom_lists]]` entry naming a file that does not exist fails the
-/// whole config on the next load, taking every other list with it. The
-/// reload is this surface's own: nothing watches the config files, and a
-/// list the daemon never sees is a list that filters nothing.
 async fn submit_query_log_new_list(
     app: &mut App,
     mut modal: query_log_rule_modal::QueryLogRuleModal,
@@ -10830,186 +10551,19 @@ async fn submit_query_log_new_list(
         }
     };
 
-    match create_custom_list(config_path, &resolved) {
-        Err(msg) => {
-            if let Some(form) = new_list_form_mut(&mut modal) {
-                form.error_message = Some(msg.clone());
-            }
-            app.status_err(format!("custom list: {msg}"));
-            app.query_log_rule_modal = Some(modal);
-        }
-        Ok(msg) => {
-            app.status_ok(msg);
-            report_reload_to_status(app, poller, "custom list").await;
-            app.loaded_config = load_v1_config(config_path);
-            modal.adopt_lists(custom_list_rows(app), Some(resolved.id.as_str()));
-            app.query_log_rule_modal = Some(modal);
-        }
-    }
+    app.query_log_rule_modal = Some(modal);
+    action_handlers::query_new_list(app, resolved, poller, config_path).await;
 }
 
-/// Write the rule into every marked pack, then reload once.
-///
-/// **One lock, N appends, one reload.** Each append is a read-modify-write,
-/// and taking the guard per list would let another surface interleave between
-/// two of them. The lexical guarded scope ends before audit/reload/poll
-/// awaits.
-///
-/// Failure is reported **per list**. Three writes out of five do not
-/// collapse into one toast: the modal stays open and names which list
-/// took the rule and which did not.
+/// Submit one versioned operator batch for all marked lists. The policy dialog
+/// owns planning, receipt display and exact-request recovery.
 async fn submit_query_log_rule_modal(
     app: &mut App,
-    mut modal: query_log_rule_modal::QueryLogRuleModal,
+    modal: query_log_rule_modal::QueryLogRuleModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::rules::Action;
-    use crate::config::custom_list::AddOutcome;
-    use crate::config::schema::Id;
-    use crate::tui::tabs::custom_lists;
-    use query_log_rule_modal::{RuleOutcome, RuleReport};
-
-    let allow = matches!(modal.action, Action::Allow);
-    let domain = modal.domain.clone();
-    let ids = modal.selected_ids();
-
-    let reports: Vec<RuleReport> = {
-        let guard = match custom_lists::claim_tree(config_path) {
-            Ok(l) => l,
-            Err(e) => {
-                app.status_err(format!("rule: {e}"));
-                app.query_log_rule_modal = Some(modal);
-                return;
-            }
-        };
-        let loaded = match load_v1_config_locked(&guard, config_path) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                app.status_err(error);
-                app.query_log_rule_modal = Some(modal);
-                return;
-            }
-        };
-        ids.iter()
-            .map(|id| {
-                let outcome = match Id::new(id.as_str()) {
-                    Err(e) => RuleOutcome::Failed(format!("id: {e}")),
-                    // A list dropped between open and confirm would
-                    // otherwise take a pack write with no declaration
-                    // behind it — an orphan file that filters nothing.
-                    Ok(pid) if !loaded.config.custom_lists.iter().any(|c| c.id == pid) => {
-                        RuleOutcome::Failed("no longer declared".into())
-                    }
-                    Ok(pid) => match custom_lists::append_rule_locked(
-                        &guard, &loaded, &pid, &domain, allow,
-                    ) {
-                        Ok(AddOutcome::Added) => RuleOutcome::Added,
-                        Ok(AddOutcome::AlreadyPresent) => RuleOutcome::AlreadyPresent,
-                        Err(e) => RuleOutcome::Failed(e.to_string()),
-                    },
-                };
-                RuleReport {
-                    id: id.clone(),
-                    outcome,
-                }
-            })
-            .collect()
-    };
-
-    let added = reports
-        .iter()
-        .filter(|r| r.outcome == RuleOutcome::Added)
-        .count();
-    let failed = reports
-        .iter()
-        .filter(|r| matches!(r.outcome, RuleOutcome::Failed(_)))
-        .count();
-
-    for report in &reports {
-        if let RuleOutcome::Failed(msg) = &report.outcome {
-            tracing::warn!(
-                target: "audit",
-                action = "custom_list.rule.add",
-                surface = "tui",
-                list = %report.id,
-                rule_action = modal.action.slug(),
-                domain = %domain,
-                error = %msg,
-                "TUI mutation refused"
-            );
-        } else {
-            tracing::info!(
-                target: "audit",
-                action = "custom_list.rule.add",
-                surface = "tui",
-                list = %report.id,
-                rule_action = modal.action.slug(),
-                domain = %domain,
-                already_present = report.outcome == RuleOutcome::AlreadyPresent,
-                "TUI mutation"
-            );
-        }
-    }
-
-    // The footer carries the headline while the modal carries the detail:
-    // the renderer draws both on the same frame, so the operator sees the
-    // status without dismissing the report first.
-    if failed > 0 {
-        app.status_err(format!(
-            "{failed} of {} lists did not accept it",
-            reports.len()
-        ));
-    } else {
-        app.status_ok(format!(
-            "{}: {domain} written to {} list(s)",
-            modal.action.slug(),
-            reports.len()
-        ));
-    }
-    modal.finish(reports);
-    app.query_log_rule_modal = Some(modal);
-
-    // Nothing changed on disk when every list already carried the rule,
-    // so there is nothing for the daemon to reload.
-    if added > 0 {
-        report_reload_to_status(app, poller, "rule").await;
-        // Refresh cached config so subsequent renders pick up the
-        // mutation without waiting for the next 30s poll.
-        app.loaded_config = load_v1_config(config_path);
-        poll_active_leaf(app, poller).await;
-    }
-}
-
-/// Ask the daemon to reload and route the outcome to the footer.
-///
-/// The alt-screen swallows `report_reload_outcome`'s stdout, so every
-/// arm has to reach the operator through `app`. `Reloaded` is the one
-/// arm that stays silent and therefore keeps whatever status the caller
-/// already set.
-///
-/// `noun` names what was written, because the two callers here write
-/// different things: a fixed "rule" would tell an operator who created a
-/// list against a stopped daemon that a rule was saved.
-async fn report_reload_to_status(app: &mut App, poller: &IpcPoller, noun: &str) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-
-    match attempt_reload(poller.socket_path()).await {
-        ReloadOutcome::Reloaded => {}
-        ReloadOutcome::DaemonUnreachable => {
-            app.status_err(format!(
-                "{noun} saved on disk — daemon not running, will activate on next start"
-            ));
-        }
-        ReloadOutcome::NoToken { .. } => {
-            app.status_err(format!(
-                "{noun} saved on disk but no admin token is available to request a reload"
-            ));
-        }
-        ReloadOutcome::ReloadFailed(msg) => {
-            app.status_err(format!("{noun} saved but daemon rejected reload: {msg}"));
-        }
-    }
+    action_handlers::query_rules(app, modal, poller, config_path).await;
 }
 
 // ── s44-tui-modals — Local DNS modal openers + key handler + submit ──
@@ -11037,7 +10591,7 @@ fn snapshot_profile_ids(app: &App) -> Vec<String> {
 /// for Edit / Remove modals. `None` when no record is focused.
 ///
 /// One lookup through the unified row vector, resolved from the
-/// stable `(scope, domain)` anchor rather than from a visual index — an
+/// stable `(scope, domain, type)` anchor rather than from a visual index — an
 /// index is not an identity once a reload or a delete reshuffles the
 /// list.
 fn focused_local_dns_row(
@@ -11046,14 +10600,13 @@ fn focused_local_dns_row(
     crate::cli::commands::local_dns::LocalRecordScope,
     crate::config::settings::LocalDnsRecord,
 )> {
-    let loaded = app.loaded_config.as_ref()?;
-    let rows = tabs::local_dns::build_rows(loaded);
-    let idx = tabs::local_dns::index_of_key(&rows, app.local_dns.selected_id.as_ref())?;
+    let rows = tabs::local_dns::build_display_rows(app);
+    let idx = tabs::local_dns::index_of_display_key(&rows, app.local_dns.selected_id.as_ref())?;
     match rows.get(idx)? {
-        tabs::local_dns::LocalDnsRow::Record { scope, record } => {
+        tabs::local_dns::LocalDnsDisplayRow::Record { scope, record } => {
             Some((scope.clone(), (*record).clone()))
         }
-        tabs::local_dns::LocalDnsRow::Header(_) => None,
+        tabs::local_dns::LocalDnsDisplayRow::Header(_) => None,
     }
 }
 
@@ -11285,27 +10838,39 @@ async fn handle_local_dns_modal_key(
             app.local_dns.modal = Some(modal);
         }
         Stage::ConfirmingRemove(rc) => {
-            match (rc.tier, key.code) {
+            let typed = rc.tier == ConfirmTier::TypedPhrase;
+            let slots = if typed { 3 } else { 2 };
+            let cancel = usize::from(typed);
+            let remove = cancel + 1;
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    rc.focus = (rc.focus + 1) % slots;
+                    app.local_dns.modal = Some(modal);
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    rc.focus = (rc.focus + slots - 1) % slots;
+                    app.local_dns.modal = Some(modal);
+                }
                 // Single-keypress tier: y submits, n/Esc cancels.
-                (ConfirmTier::SingleKeypress, KeyCode::Char('y') | KeyCode::Char('Y')) => {
+                KeyCode::Char('y') | KeyCode::Char('Y') if !typed => {
                     submit_local_dns_modal(app, modal, poller, config_path).await;
                 }
-                (ConfirmTier::SingleKeypress, KeyCode::Char('n') | KeyCode::Char('N'))
-                | (_, KeyCode::Esc) => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     // Drop the modal — handler returned without
                     // re-stashing closes it.
                 }
+                KeyCode::Enter if rc.focus == cancel => {}
                 // Typed-phrase tier: collect chars; Enter submits when
                 // the buffer matches the domain.
-                (ConfirmTier::TypedPhrase, KeyCode::Char(c)) => {
+                KeyCode::Char(c) if typed && rc.focus == 0 => {
                     rc.push_char(c);
                     app.local_dns.modal = Some(modal);
                 }
-                (ConfirmTier::TypedPhrase, KeyCode::Backspace) => {
+                KeyCode::Backspace if typed && rc.focus == 0 => {
                     rc.backspace();
                     app.local_dns.modal = Some(modal);
                 }
-                (ConfirmTier::TypedPhrase, KeyCode::Enter) => {
+                KeyCode::Enter if rc.focus == 0 || rc.focus == remove => {
                     // `confirm_or_refuse` records why it said no, so the
                     // modal that goes back into `app` carries a refusal on
                     // the notice's error line. It used to be re-stashed
@@ -11314,6 +10879,7 @@ async fn handle_local_dns_modal_key(
                         submit_local_dns_modal(app, modal, poller, config_path).await;
                         return;
                     }
+                    rc.focus = 0;
                     app.local_dns.modal = Some(modal);
                 }
                 _ => {
@@ -11383,23 +10949,46 @@ fn submit_local_dns_add_result(
 
 /// Edit a Local DNS row under one guard. This is serialized and compensating,
 /// not crash-atomic: a process crash after the removal can still lose the row.
-fn submit_local_dns_edit(
+struct LocalDnsWriteOutcome {
+    outcome: local_dns_modal::SubmitOutcome,
+    changed: bool,
+}
+
+fn local_dns_add_write_result(
+    scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+    result: anyhow::Result<crate::cli::commands::local_dns::AddOutcome>,
+) -> LocalDnsWriteOutcome {
+    let changed = matches!(
+        &result,
+        Ok(crate::cli::commands::local_dns::AddOutcome::Applied { .. })
+    );
+    LocalDnsWriteOutcome {
+        outcome: submit_local_dns_add_result(scope, spec, result),
+        changed,
+    }
+}
+
+fn submit_local_dns_edit_write(
     config_path: &Path,
     old_scope: &crate::cli::commands::local_dns::LocalRecordScope,
     old_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
     new_scope: &crate::cli::commands::local_dns::LocalRecordScope,
     new_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
-) -> local_dns_modal::SubmitOutcome {
+) -> LocalDnsWriteOutcome {
     use crate::cli::commands::local_dns::{
         add_inner_locked, remove_inner_locked, AddOutcome, RemoveOutcome,
     };
     use local_dns_modal::SubmitOutcome;
-
+    let unchanged = |msg| LocalDnsWriteOutcome {
+        outcome: SubmitOutcome::Failed(msg),
+        changed: false,
+    };
     let guard = match crate::config::write_lock::acquire_for_write(config_path) {
         Ok(guard) => guard,
-        Err(error) => return SubmitOutcome::Failed(format!("edit failed during remove: {error}")),
+        Err(error) => return unchanged(format!("edit failed during remove: {error}")),
     };
-    let outcome = match remove_inner_locked(
+    match remove_inner_locked(
         &guard,
         config_path,
         old_scope,
@@ -11407,35 +10996,60 @@ fn submit_local_dns_edit(
         Some(old_spec.record_type),
         None,
     ) {
-        Err(error) => SubmitOutcome::Failed(format!("edit failed during remove: {error}")),
-        Ok(RemoveOutcome::NotFound) => submit_local_dns_add_result(
+        Err(error) => unchanged(format!("edit failed during remove: {error}")),
+        Ok(RemoveOutcome::NotFound) => local_dns_add_write_result(
             new_scope,
             new_spec,
             add_inner_locked(&guard, config_path, new_scope, new_spec, None),
         ),
         Ok(RemoveOutcome::Removed { .. }) => {
             match add_inner_locked(&guard, config_path, new_scope, new_spec, None) {
-                Ok(AddOutcome::Applied { .. }) | Ok(AddOutcome::NoOp) => {
-                    SubmitOutcome::Ok(format!(
+                Ok(AddOutcome::Applied { .. }) | Ok(AddOutcome::NoOp) => LocalDnsWriteOutcome {
+                    outcome: SubmitOutcome::Ok(format!(
                         "edited local DNS record '{}' (removed old, added new)",
                         new_spec.domain
-                    ))
-                }
-                Err(error) => {
-                    let restored =
-                        add_inner_locked(&guard, config_path, old_scope, old_spec, None).is_ok();
-                    let restore_note = if restored {
-                        "; restored the original record"
-                    } else {
-                        "; FAILED to restore original — config may be missing the row"
-                    };
-                    SubmitOutcome::Failed(format!("edit failed during add: {error}{restore_note}"))
-                }
+                    )),
+                    changed: true,
+                },
+                Err(error) => local_dns_failed_replacement(
+                    error,
+                    add_inner_locked(&guard, config_path, old_scope, old_spec, None),
+                ),
             }
         }
+    }
+}
+
+/// Classify compensation separately from the requested write: failed restore
+/// leaves a durable removal that still requires a cache refresh and reload.
+fn local_dns_failed_replacement(
+    error: anyhow::Error,
+    restore: anyhow::Result<crate::cli::commands::local_dns::AddOutcome>,
+) -> LocalDnsWriteOutcome {
+    let changed = restore.is_err();
+    let note = match restore {
+        Ok(_) => "; restored the original record".to_owned(),
+        Err(error) => {
+            format!("; FAILED to restore original — config may be missing the row: {error}")
+        }
     };
-    drop(guard);
-    outcome
+    LocalDnsWriteOutcome {
+        outcome: local_dns_modal::SubmitOutcome::Failed(format!(
+            "edit failed during add: {error}{note}"
+        )),
+        changed,
+    }
+}
+
+#[cfg(test)]
+fn submit_local_dns_edit(
+    config_path: &Path,
+    old_scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    old_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+    new_scope: &crate::cli::commands::local_dns::LocalRecordScope,
+    new_spec: &crate::cli::commands::local_dns::LocalRecordSpec,
+) -> local_dns_modal::SubmitOutcome {
+    submit_local_dns_edit_write(config_path, old_scope, old_spec, new_scope, new_spec).outcome
 }
 
 /// Submit path for all three Local DNS modals. Branches on the stage:
@@ -11451,132 +11065,11 @@ fn submit_local_dns_edit(
 /// the cached config so the next render reflects the mutation.
 async fn submit_local_dns_modal(
     app: &mut App,
-    mut modal: local_dns_modal::LocalDnsModal,
+    modal: local_dns_modal::LocalDnsModal,
     poller: &IpcPoller,
     config_path: &Path,
 ) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
-    use crate::cli::commands::local_dns::{
-        add_inner, format_local_records_removed, remove_inner, LocalRecordScope, RemoveOutcome,
-    };
-    use local_dns_modal::{Stage, SubmitOutcome};
-
-    let outcome: SubmitOutcome = match &modal.stage {
-        Stage::EditingForm(form) => match form.try_resolve() {
-            Err(msg) => SubmitOutcome::Failed(msg),
-            Ok((scope, spec)) => match form.mode {
-                local_dns_modal::FormMode::Add => submit_add(config_path, &scope, &spec),
-                local_dns_modal::FormMode::Edit => match form.original.as_ref() {
-                    Some(original) => submit_local_dns_edit(
-                        config_path,
-                        &original.scope,
-                        &original.spec,
-                        &scope,
-                        &spec,
-                    ),
-                    // The Add/Edit constructors keep `mode == Edit` and
-                    // `original.is_some()` in lock-step; degrade a broken
-                    // invariant to a footer error instead of a panic that
-                    // would unwind out of the dashboard's main task.
-                    None => SubmitOutcome::Failed(
-                        "internal error: edit modal lost its original snapshot".into(),
-                    ),
-                },
-            },
-        },
-        Stage::ConfirmingRemove(rc) => {
-            match remove_inner(
-                config_path,
-                &rc.scope,
-                &rc.spec.domain,
-                Some(rc.spec.record_type),
-                None,
-            ) {
-                Ok(RemoveOutcome::Removed { .. }) => {
-                    let scope_label = match &rc.scope {
-                        LocalRecordScope::Global => "global".to_string(),
-                        LocalRecordScope::Profile(id) => format!("profile '{id}'"),
-                    };
-                    SubmitOutcome::Ok(format_local_records_removed(&rc.spec.domain, &scope_label))
-                }
-                Ok(RemoveOutcome::NotFound) => SubmitOutcome::Failed(format!(
-                    "record '{}' not found in scope — already removed?",
-                    rc.spec.domain
-                )),
-                Err(e) => SubmitOutcome::Failed(e.to_string()),
-            }
-        }
-        Stage::Submitted(_) => return,
-    };
-
-    // A form (Add/Edit) failure — pre-flight validation (empty field,
-    // bad TTL) or an apply/validator rejection — keeps the modal open
-    // with the message on the grid's inline validation line instead of
-    // dropping to the terminal "failed" screen. The operator fixes the
-    // offending field and re-submits without retyping the rest. Remove
-    // failures still finish (their confirm screen has no form to keep).
-    if let SubmitOutcome::Failed(msg) = &outcome {
-        if let Stage::EditingForm(form) = &mut modal.stage {
-            app.status_err(format!("local DNS modal: {msg}"));
-            form.error_message = Some(msg.clone());
-            app.local_dns.modal = Some(modal);
-            return;
-        }
-    }
-
-    let was_ok = matches!(outcome, SubmitOutcome::Ok(_));
-    match &outcome {
-        SubmitOutcome::Ok(msg) => app.status_ok(msg.clone()),
-        SubmitOutcome::Failed(msg) => {
-            app.status_err(format!("local DNS modal: {msg}"));
-        }
-    }
-    modal.finish(outcome);
-    app.local_dns.modal = Some(modal);
-
-    // Reload + cache invalidation only on a real Apply. Same shape
-    // as `submit_query_log_rule_modal`. Errors land on `last_error` so the
-    // operator sees them in the footer alongside the modal.
-    if was_ok {
-        let outcome = attempt_reload(poller.socket_path()).await;
-        match outcome {
-            ReloadOutcome::Reloaded => {}
-            ReloadOutcome::DaemonUnreachable => {
-                app.status_err(
-                    "local DNS record saved — daemon not running, will activate on next start"
-                        .into(),
-                );
-            }
-            ReloadOutcome::NoToken { .. } => {
-                app.status_err(
-                    "local DNS record saved on disk but no admin token is available to request a reload"
-                        .into(),
-                );
-            }
-            ReloadOutcome::ReloadFailed(msg) => {
-                app.status_err(format!(
-                    "local DNS record saved but daemon rejected reload: {msg}"
-                ));
-            }
-        }
-        // Refresh cached config so the table reflects the mutation
-        // without waiting for the next refresh.
-        app.loaded_config = load_v1_config(config_path);
-        poll_active_leaf(app, poller).await;
-    }
-
-    // Local helpers — kept inside the submit fn so they share the
-    // `add_inner`/`remove_inner` import scope. They return a
-    // SubmitOutcome the caller threads into `modal.finish`.
-    use local_dns_modal::SubmitOutcome as So;
-
-    fn submit_add(
-        config_path: &std::path::Path,
-        scope: &LocalRecordScope,
-        spec: &crate::cli::commands::local_dns::LocalRecordSpec,
-    ) -> So {
-        submit_local_dns_add_result(scope, spec, add_inner(config_path, scope, spec, None))
-    }
+    action_handlers::local_dns(app, modal, poller, config_path).await;
 }
 
 /// Apply a form submit by dispatching the right IPC mutation for the
@@ -11584,82 +11077,8 @@ async fn submit_local_dns_modal(
 /// is re-polled so the table reflects the new state immediately. On
 /// validation or IPC failure the modal stays open with the error
 /// message in `form.error_message`, and `submitting` is reset.
-async fn submit_form(app: &mut App, mut form: DeviceFormState, poller: &IpcPoller) {
-    // Parse the per-field user input into typed values up front so
-    // syntax errors (bad IP, bad tag charset) surface as friendly
-    // in-modal messages, not as a daemon error 5 seconds later.
-    let parsed = match parse_form(&form) {
-        Ok(p) => p,
-        Err(msg) => {
-            form.error_message = Some(msg);
-            app.devices.modal = Some(DeviceModal::Form(form));
-            return;
-        }
-    };
-
-    form.submitting = true;
-    form.error_message = None;
-
-    let result = match form.mode {
-        DeviceFormMode::Add => {
-            let client = ClientConfig {
-                name: parsed.name.clone(),
-                ip: parsed.ip,
-                mac: parsed.mac.clone(),
-                mac_aliases: parsed.mac_aliases.clone(),
-                profile: parsed.profile.clone(),
-                // Singular by wire shape, not by choice — see the
-                // len() > 1 refusal in `parse_form`. `first()` is safe
-                // only because that gate ran.
-                group: parsed.groups.first().cloned(),
-                owner: parsed.owner.clone(),
-                device_type: parsed.device_type.clone(),
-                department: parsed.department.clone(),
-                notes: parsed.notes.clone(),
-            };
-            poller.send_device_add(client).await
-        }
-        DeviceFormMode::Promote => {
-            poller
-                .send_device_promote(crate::tui::ipc_poller::PromoteFields {
-                    ip: parsed.ip,
-                    name: parsed.name.clone(),
-                    profile: parsed.profile.clone(),
-                    owner: parsed.owner.clone(),
-                    device_type: parsed.device_type.clone(),
-                    department: parsed.department.clone(),
-                })
-                .await
-        }
-        DeviceFormMode::Edit => {
-            let patch = edit_patch_from(&parsed);
-            // The IPC key for Update is the device's STABLE v1 id
-            // CAPTURED AT MODAL-OPEN (`form.original_id`), NOT a
-            // re-resolution from the live cursor. A 5s poll can reshuffle
-            // the row set under the open modal, so re-deriving the target
-            // here could patch a different device than the one the form
-            // was opened on. Fall back to slug(parsed.name) only for a
-            // form with no captured id (Add-converted-to-Edit edge; the
-            // id-less case is already handled at capture time).
-            let original_id = form.original_id.clone().unwrap_or_else(|| {
-                crate::cli::commands::target::slug_id(&parsed.name).unwrap_or(parsed.name.clone())
-            });
-            poller.send_device_update(original_id, patch).await
-        }
-    };
-
-    match result {
-        Ok(_) => {
-            app.clear_status();
-            // Modal closes (form is owned, drops here), poll fresh.
-            poll_active_leaf(app, poller).await;
-        }
-        Err(e) => {
-            form.submitting = false;
-            form.error_message = Some(e.to_string());
-            app.devices.modal = Some(DeviceModal::Form(form));
-        }
-    }
+async fn submit_form(app: &mut App, form: DeviceFormState, poller: &IpcPoller) {
+    action_handlers::device(app, form, poller).await;
 }
 
 /// Build the `Edit` mode patch from a parsed form.
@@ -11772,6 +11191,14 @@ fn csv_items(buf: &str) -> Vec<String> {
 }
 
 fn parse_form(form: &DeviceFormState) -> Result<ParsedForm, String> {
+    if form.mode == DeviceFormMode::Promote {
+        if !form.notes.trim().is_empty() {
+            return Err("notes are set after promotion; promote it, then edit it".into());
+        }
+        if !form.mac_aliases.trim().is_empty() {
+            return Err("MAC aliases are set after promotion; promote it, then edit it".into());
+        }
+    }
     let name = form.name.trim();
     if name.is_empty() {
         return Err("name is required".into());
@@ -11911,15 +11338,7 @@ fn is_macish(s: &str) -> bool {
 /// `focused_mapped_name`) share this single selection pipeline.
 #[cfg(test)]
 fn selected_device_row(app: &App) -> Option<tabs::devices::DeviceRow> {
-    let view = app.device_view.as_ref()?;
-    // Same reason as `handle_devices_key`: the selection must resolve
-    // against the VISIBLE rows, not the full list.
-    let rows = tabs::devices::build_filtered_rows(
-        view,
-        app.devices.group_by,
-        app.devices.filter_subnet.as_deref(),
-    )
-    .0;
+    let rows = tabs::devices::build_display_rows(app);
     // Resolve by the operator's stable key first so the focused
     // row tracks the device across poll reshuffles; fall back to the
     // positional cursor before the key is seeded.
@@ -12057,7 +11476,7 @@ fn is_select_only_field(form: &DeviceFormState, field: DeviceFormField) -> bool 
 /// False for select-only fields (Profile / Group) and for a Promote form's
 /// ARP-locked IP.
 fn field_accepts_typing(form: &DeviceFormState, field: DeviceFormField) -> bool {
-    !(is_select_only_field(form, field) || (form.ip_locked && field == DeviceFormField::Ip))
+    !(is_select_only_field(form, field) || form.is_locked(field))
 }
 
 /// Open the popup picker for the focused select-only field, seeding the
@@ -12151,6 +11570,7 @@ fn open_field_picker(form: &mut DeviceFormState) {
         return;
     }
     let cursor = options.iter().position(|o| *o == current).unwrap_or(0);
+    form.picker_focus = query_log_controls::FilterFocus::Value;
     form.picker = Some(FieldPicker {
         target,
         options,
@@ -12176,14 +11596,22 @@ fn handle_form_picker_key(form: &mut DeviceFormState, code: KeyCode) {
         return;
     };
     let n = picker.options.len();
+    use query_log_controls::FilterFocus;
     match code {
+        KeyCode::Tab => form.picker_focus = form.picker_focus.next(),
+        KeyCode::BackTab => form.picker_focus = form.picker_focus.prev(),
+        KeyCode::Enter if form.picker_focus == FilterFocus::Discard => {
+            form.picker = None;
+        }
         KeyCode::Down if n > 0 => {
+            form.picker_focus = FilterFocus::Value;
             picker.cursor = (picker.cursor + 1) % n;
         }
         KeyCode::Up if n > 0 => {
+            form.picker_focus = FilterFocus::Value;
             picker.cursor = (picker.cursor + n - 1) % n;
         }
-        KeyCode::Char(' ') if picker.multi => {
+        KeyCode::Char(' ') if picker.multi && form.picker_focus == FilterFocus::Value => {
             let Some(opt) = picker.options.get(picker.cursor).cloned() else {
                 return;
             };
@@ -12388,6 +11816,17 @@ mod mini_patch_devices_groupby_tests;
 #[cfg(test)]
 #[path = "tests/s47_t2_tests.rs"]
 mod s47_t2_tests;
+
+// Query Log rework: full-frame geometry plus overlay/key/paging regressions.
+// Kept separate from the rule-action tests above because these exercise the
+// interactive filter surface and renderer contract, not Enter's rule picker.
+#[cfg(test)]
+#[path = "tests/query_log_rework_tests.rs"]
+mod query_log_rework_tests;
+
+#[cfg(test)]
+#[path = "tests/query_log_compliance_tests.rs"]
+mod query_log_compliance_tests;
 
 // ── List edit modal save / delete pipeline tests ──────────────────
 
@@ -12644,3 +12083,23 @@ mod logs_tab_key_tests;
 #[cfg(test)]
 #[path = "tests/file_editor_reload_tests.rs"]
 mod file_editor_reload_tests;
+
+#[cfg(test)]
+#[path = "tests/audit_correctness_tests.rs"]
+mod audit_correctness_tests;
+
+#[cfg(test)]
+#[path = "tests/audit_promote_tests.rs"]
+mod audit_promote_tests;
+
+#[cfg(test)]
+#[path = "tests/background_runtime_tests.rs"]
+mod background_runtime_tests;
+
+#[cfg(all(test, feature = "cluster"))]
+#[path = "tests/nodes_interaction_tests.rs"]
+mod nodes_interaction_tests;
+
+#[cfg(test)]
+#[path = "tests/profile_creation_tests.rs"]
+mod profile_creation_tests;

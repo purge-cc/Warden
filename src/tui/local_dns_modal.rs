@@ -141,6 +141,8 @@ pub struct RemoveConfirm {
     /// edit to `buffer`: a rejection describes one buffer, and a stale
     /// one contradicting what is now on screen is worse than silence.
     pub error: Option<String>,
+    /// Typed input (when required), Cancel and Remove share one focus ring.
+    pub focus: usize,
 }
 
 /// Tiered confirm shape (SN2 from S43). The lower the blast radius, the
@@ -177,12 +179,12 @@ impl ConfirmTier {
 
 impl FormField {
     pub const ALL: [FormField; 8] = [
-        FormField::Domain,
+        FormField::Profile,
         FormField::RecordType,
+        FormField::Domain,
         FormField::Value,
         FormField::MatchSubdomains,
         FormField::Ttl,
-        FormField::Profile,
         FormField::Submit,
         FormField::Cancel,
     ];
@@ -376,6 +378,7 @@ impl LocalDnsModal {
                 tier,
                 buffer: String::new(),
                 error: None,
+                focus: 0,
             }),
         }
     }
@@ -504,23 +507,20 @@ impl RemoveConfirm {
 
 // ── Render helpers (called from tabs/local_dns.rs) ────────────────────
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::tui::modal_form::{self, Action, ActionKind, ProseRow, ValueKind};
+use crate::tui::theme::{self, CardRole};
 
 /// Outer width of every stage of this modal — the same 64 the Lists
 /// reference uses, so the two read as one system side by side.
 const MODAL_W: u16 = 64;
 
-/// Nav-key legend. The migration to `modal_form` changed chrome, layout
-/// and colour and **not** the keying: `mod.rs` still maps Tab/↑↓ to
-/// move, ←/→ and Space to change, Enter to save and Esc to cancel.
-///
-/// The action row bakes its own key into each button's label
-/// (`[Esc] Discard` / `[Enter] Save`), so a blanket "Enter save · Esc
-/// cancel" here would be a second, redundant source of the same fact.
-const FORM_KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} change";
+/// Compact editing reminder above the actions. Detailed movement and
+/// selector guidance remains in each focused field's hint.
+const FORM_KEYS: &str = "Type to Edit \u{b7} Ctrl+U Clear";
 
 /// Draw the modal over the tab content rect. Branches on the stage so the
 /// operator sees the form, the confirm prompt, or the outcome at the right
@@ -561,6 +561,50 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &LocalDnsModal) {
     }
 }
 
+/// Render an add/edit form in the wide Local DNS detail card. Captured form
+/// state remains authoritative for scope, original-record identity and
+/// validation; only the centered presentation changes.
+pub fn render_inline_editor(f: &mut Frame, area: Rect, modal: &LocalDnsModal) -> bool {
+    let Stage::EditingForm(form) = &modal.stage else {
+        return false;
+    };
+    let (title, desc) = match form.mode {
+        FormMode::Add => ("Add local DNS", "Scope, Record Type & Resolution"),
+        FormMode::Edit => ("Edit local DNS", "Scope, Record Type & Resolution"),
+    };
+    let body_area = theme::filled_card(f.buffer_mut(), area, title, desc, CardRole::History);
+    let (mut body, mut cursor) = form_body(form, body_area.width);
+    body.head = vec![Line::default()];
+    if body.scrollable
+        && modal_form::will_scroll(
+            body_area.height as usize,
+            body.head.len(),
+            body.fields.len(),
+            body.tail.len(),
+        )
+    {
+        (body, cursor) = form_body(form, body_area.width.saturating_sub(1));
+        body.head = vec![Line::default()];
+    }
+    let view = modal_form::render_scroll_body(f, body_area, &body);
+    if let Some((row, caret)) = cursor {
+        if row >= view.offset && row < view.offset + view.view_h {
+            let position = Position {
+                x: body_area
+                    .x
+                    .saturating_add(modal_form::VALUE_COL as u16 + caret),
+                y: body_area
+                    .y
+                    .saturating_add((view.head_h + row - view.offset) as u16),
+            };
+            if position.x < body_area.right() && position.y < body_area.bottom() {
+                f.set_cursor_position(position);
+            }
+        }
+    }
+    true
+}
+
 /// Build the Archetype-F body — pinned head, scrolling field region,
 /// pinned tail — plus the real-cursor target (index **within the field
 /// region** + value char length) for the focused text field, if any.
@@ -571,23 +615,37 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &LocalDnsModal) {
 fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
     let focus = form.focused;
     let (title, desc) = match form.mode {
-        FormMode::Add => (
-            "Add local DNS record",
-            "answered by the daemon instead of forwarded upstream",
-        ),
-        FormMode::Edit => (
-            "Edit local DNS record",
-            "the old record is dropped and the edited one re-added",
-        ),
+        FormMode::Add => ("Add local DNS", "Scope, Record Type & Resolution"),
+        FormMode::Edit => ("Edit local DNS", "Scope, Record Type & Resolution"),
     };
     let mut rows = modal_form::FormRows::new(title, desc, width);
 
-    // RECORD — what is being answered, and with what.
-    rows.section("Record");
+    rows.line(modal_form::section_rule(
+        "Scope & Record",
+        width,
+        CardRole::Summary,
+    ));
+    let profile_focus = focus == FormField::Profile;
+    rows.field(
+        modal_form::selector_row("Scope", &form.profile_option_label(), profile_focus, width),
+        profile_focus,
+        field_hint(FormField::Profile),
+    );
+    let type_focus = focus == FormField::RecordType;
+    rows.field(
+        modal_form::selector_row(
+            "Type",
+            record_type_display(form.record_type),
+            type_focus,
+            width,
+        ),
+        type_focus,
+        field_hint(FormField::RecordType),
+    );
     let domain_focus = focus == FormField::Domain;
     rows.text_field(
         modal_form::value_row(
-            "domain",
+            "Domain",
             &form.domain,
             domain_focus,
             ValueKind::Identity,
@@ -598,21 +656,10 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         field_hint(FormField::Domain),
         form.domain.chars().count() as u16,
     );
-    let type_focus = focus == FormField::RecordType;
-    rows.field(
-        modal_form::selector_row(
-            "type",
-            record_type_display(form.record_type),
-            type_focus,
-            width,
-        ),
-        type_focus,
-        field_hint(FormField::RecordType),
-    );
     let value_focus = focus == FormField::Value;
     rows.text_field(
         modal_form::value_row(
-            "value",
+            "Value",
             &form.value,
             value_focus,
             ValueKind::Identity,
@@ -625,8 +672,11 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     );
     rows.spacer();
 
-    // MATCHING — how widely the answer applies.
-    rows.section("Matching");
+    rows.line(modal_form::section_rule(
+        "Matching & Cache",
+        width,
+        CardRole::Analytics,
+    ));
     let subs_focus = focus == FormField::MatchSubdomains;
     // A radio, not a `yes`/`no` selector: the two sides mean different
     // things, and the colour rule can say so. Wildcarding is `Caution`
@@ -635,7 +685,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     // toggle it, exactly as they did against the old selector.
     rows.field(
         modal_form::radio_row(
-            "match subdomains",
+            "Subdomains",
             ("Yes", ValueKind::Caution),
             ("No", ValueKind::Healthy),
             form.match_subdomains,
@@ -648,7 +698,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     let ttl_focus = focus == FormField::Ttl;
     rows.text_field(
         modal_form::value_row(
-            "ttl (secs)",
+            "TTL Seconds",
             &form.ttl_input,
             ttl_focus,
             ValueKind::Editable,
@@ -659,22 +709,6 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         field_hint(FormField::Ttl),
         form.ttl_input.chars().count() as u16,
     );
-    rows.spacer();
-
-    // SCOPE — who gets the answer.
-    rows.section("Scope");
-    let profile_focus = focus == FormField::Profile;
-    rows.field(
-        modal_form::selector_row(
-            "profile",
-            &form.profile_option_label(),
-            profile_focus,
-            width,
-        ),
-        profile_focus,
-        field_hint(FormField::Profile),
-    );
-
     // Discard left, Save right — the one `Primary` fill sits right-most
     // on every Archetype-F form. The focus ring still reaches `Submit`
     // before `Cancel`, unchanged — same precedent as `profile_modal.rs`'s
@@ -688,17 +722,19 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     // actually destroys something.
     let actions = [
         Action::new(
-            "  [Esc] Discard  ",
+            "Discard",
             focus == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
-            "  [Enter] Save  ",
+            "Save",
             focus == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -828,9 +864,8 @@ fn remove_notice(rc: &RemoveConfirm, width: u16) -> modal_form::NoticeSpec {
         )),
     ];
 
-    // The button copy carries the key, because this stage has no focus
-    // ring: Tab does nothing here, and a row of buttons that looks
-    // Tab-able would say otherwise.
+    // The button copy keeps the direct shortcuts visible while the focus
+    // ring also makes the actions reachable with Tab/arrows and Enter.
     let (keys, cancel, confirm) = match rc.tier {
         ConfirmTier::SingleKeypress => (
             "[y] remove \u{b7} [n]/Esc cancel",
@@ -839,7 +874,7 @@ fn remove_notice(rc: &RemoveConfirm, width: u16) -> modal_form::NoticeSpec {
         ),
         ConfirmTier::TypedPhrase => {
             prose.push(ProseRow::plain("type the domain to confirm:"));
-            let avail = (width as usize).saturating_sub(2);
+            let avail = width as usize;
             prose.push(ProseRow::emphasis(
                 tail_fit(&format!("{}_", rc.buffer), avail),
                 ValueKind::Blocking,
@@ -871,8 +906,28 @@ fn remove_notice(rc: &RemoveConfirm, width: u16) -> modal_form::NoticeSpec {
         // destructive confirm the safe path is the recommended one. Remove
         // is `Destructive`: coloured, never filled.
         actions: vec![
-            Action::new(cancel, false, ActionKind::Primary, ""),
-            Action::new(confirm, false, ActionKind::Destructive, ""),
+            Action::new(
+                cancel,
+                rc.focus == usize::from(rc.tier == ConfirmTier::TypedPhrase),
+                ActionKind::Primary,
+                "",
+            )
+            .on_key(crossterm::event::KeyCode::Esc),
+            Action::new(
+                confirm,
+                rc.focus
+                    == if rc.tier == ConfirmTier::TypedPhrase {
+                        2
+                    } else {
+                        1
+                    },
+                ActionKind::Destructive,
+                "",
+            )
+            .on_key(match rc.tier {
+                ConfirmTier::SingleKeypress => crossterm::event::KeyCode::Char('y'),
+                ConfirmTier::TypedPhrase => crossterm::event::KeyCode::Enter,
+            }),
         ],
     }
 }
@@ -909,7 +964,8 @@ fn submitted_notice(outcome: &SubmitOutcome) -> modal_form::NoticeSpec {
         error,
         hint: String::new(),
         keys: "[any key] close".into(),
-        actions: vec![Action::new("  Close  ", true, ActionKind::Primary, "")],
+        actions: vec![Action::new("  Close  ", true, ActionKind::Primary, "")
+            .on_key(crossterm::event::KeyCode::Esc)],
     }
 }
 

@@ -28,15 +28,13 @@ use super::validation::validate_query;
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult, AuditWriter};
 use crate::config::cidr::{any_contains, Cidr};
 use crate::config::settings::SecurityConfig;
-use crate::filter::cname::{walk_response, BlockSource, NamePolicy, Verdict};
-use crate::filter::engine::{domain_matches_set, FilterResult};
+use crate::filter::cname::{
+    evaluate_synthetic_cname_hop, walk_response_with_grant, BlockSource, Verdict,
+};
 use crate::filter::ip_filter::IpFilter;
 use crate::filter::FilterEngine;
 use crate::lists::readiness::ReadinessGate;
-use crate::profiles::profile::ResolvedProfile;
-use crate::profiles::{
-    apply_overlay, AttribSource, DeviceOverlay, LayerHits, OverlayDecision, ProfileResolver,
-};
+use crate::profiles::ProfileResolver;
 use crate::security::anti_bypass::AntiBypass;
 use crate::security::query_validator;
 use crate::security::rate_limiter::RateLimiter;
@@ -44,6 +42,13 @@ use crate::security::rrl::{Rrl, RrlAction};
 use crate::security::tunneling::{is_reverse_zone, TunnelingDetector, TunnelingVerdict};
 use crate::tracking::{LocalRecordsHits, LocalRecordsScopeKey, StatsEngine};
 use crate::upstream::Upstream;
+
+#[cfg(test)]
+use crate::filter::engine::{domain_matches_set, FilterResult};
+#[cfg(test)]
+use crate::profiles::profile::ResolvedProfile;
+#[cfg(test)]
+use crate::profiles::{apply_overlay, DeviceOverlay, LayerHits, OverlayDecision};
 
 #[cfg(feature = "dnssec")]
 use super::dnssec_validator::{DnssecDecision, DnssecValidator};
@@ -391,10 +396,8 @@ pub struct ForwardHandler {
     /// operator needs to see this at all). Every one after: `debug!`
     /// (they've seen it).
     gate_refusal_logged: std::sync::atomic::AtomicBool,
-    /// DNSSEC response-path validator. `Some` only when
-    /// `dnssec.mode != Off` (and only on the `dnssec` build); `None`
-    /// disables all DNSSEC processing with zero hot-path cost. Built once
-    /// at boot by `cli::commands::start` over a DO-enabled upstream.
+    /// Fixed DNSSEC response-path validator used by focused handlers and tests.
+    /// Daemon responses carry the validator owned by their upstream generation.
     #[cfg(feature = "dnssec")]
     dnssec_validator: Option<Arc<DnssecValidator>>,
 }
@@ -540,9 +543,9 @@ impl ForwardHandler {
     /// The single DNSSEC hook on the response path. Wraps the free
     /// [`send_cached`] (the convergence point of the cache-hit / fresh-upstream
     /// / stale paths) so a validated answer can get the AD bit, a bogus one a
-    /// SERVFAIL, behind `dnssec.mode`. With no validator (default build, or
-    /// `mode = Off`) it is a zero-cost passthrough to `send_cached` and the
-    /// response bytes are byte-identical to baseline.
+    /// SERVFAIL, behind `dnssec.mode`. The default build compiles the lookup
+    /// out. A DNSSEC build in `mode = Off` leaves the response bytes
+    /// byte-identical to baseline.
     ///
     /// `rewrote` is `true` when a rewrite fired on this query; it
     /// both suppresses the DNSSEC verdict (see below) and tells `send_cached` to
@@ -556,42 +559,50 @@ impl ForwardHandler {
         response_handle: &mut impl ResponseHandler,
     ) -> ResponseInfo {
         #[cfg(feature = "dnssec")]
-        if let Some(validator) = &self.dnssec_validator {
-            match validator
-                .decide(request, entry.is_negative(), rewrote)
-                .await
+        {
+            let runtime_validator = entry.upstream_dnssec_validator();
+            if let Some(validator) = runtime_validator
+                .as_deref()
+                .or(self.dnssec_validator.as_deref())
             {
-                // A rewritten answer carries records for a name the client
-                // never asked for, fronted by a CNAME *we* synthesized — and a
-                // synthesized CNAME is unsigned by construction. So neither
-                // wire verdict is honest here and both are suppressed:
-                //
-                // - never AD: we cannot claim authenticated data for an answer
-                //   whose first record nothing signed. `send_cached` re-asserts
-                //   this at the `set_authentic_data` site.
-                // - never SERVFAIL: a rewrite is operator policy, not a
-                //   validation failure. Failing closed would turn one Bogus
-                //   verdict into a network-wide outage of `safe_search = true`.
-                //
-                // Validation does not *run* on this path — `decide` takes
-                // `rewrote` and short-circuits to `Serve` before the fetch,
-                // because the walk it would otherwise perform is of the
-                // pre-rewrite qname and its verdict would be discarded here
-                // anyway. See the reasoning on `DnssecValidator::decide`.
-                //
-                // This arm is therefore unreachable-by-construction and is kept
-                // as a second gate, deliberately. It costs nothing, and the
-                // failure it guards against is severe and asymmetric: a stray
-                // SERVFAIL on a rewritten answer is a household-wide outage of
-                // `safe_search`. `send_cached` keeps the matching belt on the
-                // AD side (`authentic && !rewrote`), and that redundancy is an
-                // established idiom here rather than an oversight.
-                _ if rewrote => {}
-                DnssecDecision::Servfail => return send_servfail(request, response_handle).await,
-                DnssecDecision::SetAd => {
-                    return send_cached(request, entry, true, rewrote, response_handle).await
+                match validator
+                    .decide(request, entry.is_negative(), rewrote)
+                    .await
+                {
+                    // A rewritten answer carries records for a name the client
+                    // never asked for, fronted by a CNAME *we* synthesized — and a
+                    // synthesized CNAME is unsigned by construction. So neither
+                    // wire verdict is honest here and both are suppressed:
+                    //
+                    // - never AD: we cannot claim authenticated data for an answer
+                    //   whose first record nothing signed. `send_cached` re-asserts
+                    //   this at the `set_authentic_data` site.
+                    // - never SERVFAIL: a rewrite is operator policy, not a
+                    //   validation failure. Failing closed would turn one Bogus
+                    //   verdict into a network-wide outage of `safe_search = true`.
+                    //
+                    // Validation does not *run* on this path — `decide` takes
+                    // `rewrote` and short-circuits to `Serve` before the fetch,
+                    // because the walk it would otherwise perform is of the
+                    // pre-rewrite qname and its verdict would be discarded here
+                    // anyway. See the reasoning on `DnssecValidator::decide`.
+                    //
+                    // This arm is therefore unreachable-by-construction and is kept
+                    // as a second gate, deliberately. It costs nothing, and the
+                    // failure it guards against is severe and asymmetric: a stray
+                    // SERVFAIL on a rewritten answer is a household-wide outage of
+                    // `safe_search`. `send_cached` keeps the matching belt on the
+                    // AD side (`authentic && !rewrote`), and that redundancy is an
+                    // established idiom here rather than an oversight.
+                    _ if rewrote => {}
+                    DnssecDecision::Servfail => {
+                        return send_servfail(request, response_handle).await
+                    }
+                    DnssecDecision::SetAd => {
+                        return send_cached(request, entry, true, rewrote, response_handle).await
+                    }
+                    DnssecDecision::Serve => {}
                 }
-                DnssecDecision::Serve => {}
             }
         }
         send_cached(request, entry, false, rewrote, response_handle).await
@@ -1477,20 +1488,16 @@ impl ForwardHandler {
         // local records could be probed; the already-resolved value is
         // reused here instead of resolving twice.
         //
-        // `device_overlay` rides out of this match alongside the block
-        // verdict. It is the *only* place the resolved device's overlay
-        // is in scope, and the response-path filters below need it to
-        // resolve the queried name's policy once — see the
-        // `NamePolicy::resolve` call after the rewrite hook. Moving the
-        // field out (rather than cloning the Arc) keeps the hot path
-        // refcount-neutral.
+        // The compiled request grant rides out of this match alongside the
+        // verdict. It was issued for the original QNAME and is the only
+        // response authority handed to CNAME and response-IP checks.
         let (
             blocked,
             block_source,
             client_name,
             client_block_response,
             client_blocked_ttl,
-            device_overlay,
+            runtime_grant,
         ) = match (profiles, resolution_opt) {
             (Some(_resolver), Some(resolution)) => {
                 let Some(profile) = resolution.profile.clone() else {
@@ -1524,29 +1531,29 @@ impl ForwardHandler {
                     });
                     return Ok(send_refused(request, response_handle).await);
                 };
-                // Per-device overlay applies between resolution and the
-                // profile evaluator. When the resolved client has no
-                // overlay (empty rule sets, or anonymous source),
-                // `evaluate_with_overlay` is byte-identical to the plain
-                // `filter.evaluate` path.
-                //
-                // Also returns the attributing `BlockSource` so a per-list
-                // bit can be pinned on the BLOCKED stats record.
-                let (is_blocked, block_source) =
-                    evaluate_with_overlay(domain, &profile, resolution.overlay.as_ref(), filter);
+                // Compiled V5 rules consume typed external matches here and
+                // return the original-QNAME grant plus block attribution.
+                let decision = filter.evaluate_active_operator_policy(
+                    domain,
+                    resolved_profile
+                        .as_deref()
+                        .expect("resolved profile retained for request lifetime"),
+                );
+                let is_blocked = decision.blocked;
+                let block_source = decision.source;
+                let grant = decision.grant;
                 // Move `device_name` out of the owned `resolution` (rather
                 // than `.clone()`), and avoid materialising an owned
                 // profile-name String per query — `client_profile` borrows
                 // from `resolved_profile` below, which holds the same Arc
                 // for the whole request. Zero-alloc hot path.
                 let device_name = resolution.device_name;
-                let overlay = resolution.overlay;
                 // The profile carries `block_response` / `blocked_ttl_secs`
                 // with the server-globals fallback already applied at build
                 // time, so the hot path just reads them.
                 let br = profile.block_response;
                 let ttl = profile.blocked_ttl_secs;
-                (is_blocked, block_source, device_name, br, ttl, overlay)
+                (is_blocked, block_source, device_name, br, ttl, grant)
             }
             (None, _) | (Some(_), None) => {
                 // Fail-closed REFUSED rather than an `unreachable!` keyed
@@ -1675,42 +1682,52 @@ impl ForwardHandler {
         }
         let domain = domain_buf.as_str();
 
-        // Resolve the operator's policy for the queried name ONCE, here,
-        // and hand it to every site below that inspects the *answer*: the
-        // three `walk_response` call sites (cache-hit re-check,
-        // post-upstream, stale fallback) and the three
-        // `IpFilter::check_response` ones next to them.
+        // `runtime_grant` is the authority captured before rewrite and
+        // forwarded unchanged to every response check.  It is never inferred
+        // from a response record owner.
         //
-        // Before this, each of those sites re-derived "is this allowed?"
-        // from whatever policy it happened to hold — the walker saw only
-        // `profile.allow_domains`, the IP filter saw nothing at all — so an
-        // allow the operator had attached to a *device* was honoured
-        // pre-upstream and then silently discarded on the response path.
-        // That is the whole defect class, not two instances of it.
-        //
-        // **Placement is load-bearing, twice over:**
-        //
-        // 1. AFTER the rewrite hook above. That hook `mem::replace`s
-        //    `domain_buf`, so `domain` here can differ from the name
-        //    evaluated pre-upstream — with SafeSearch on, several rewrites
-        //    are populated and it routinely does. Every consumer below
-        //    filters the post-rewrite name, so the policy must be keyed on
-        //    the post-rewrite name too. Resolving it earlier reopens the
-        //    same defect class on any deployment with a rewrite rule;
-        //    pinned by `tests/integration_name_policy_once.rs`.
-        // 2. From the ALLOW SETS, never from `blocked == false`. Reaching
-        //    this line only means the name was not blocked, which is the
-        //    state nearly all traffic is in and which must stay fully
-        //    filterable on the response path. `NamePolicy::resolve` probes
-        //    `profile.allow_domains` and `overlay.allow` and nothing else.
-        //
-        // `resolved_profile` is `Some` at this point by construction (the
-        // two REFUSED arms above return early); the `map` is defensive and
-        // falls back to `Neutral`, i.e. to filtering.
-        let name_policy = resolved_profile
-            .as_ref()
-            .map(|p| NamePolicy::resolve(domain, p.as_ref(), device_overlay.as_deref()))
-            .unwrap_or_default();
+        // The rewrite bridge served to the client is a synthetic
+        // `original CNAME target` edge. Evaluate its target with that same
+        // original-QNAME grant before consulting a cache or upstream so a
+        // plain A/AAAA target response cannot bypass the response CNAME walk.
+        // This branch owns `domain_buf` only after a rewrite; the common path
+        // does no additional policy work or allocation.
+        if rewrote_from.is_some() {
+            if let Some(profile_arc) = resolved_profile.as_ref() {
+                if let Verdict::Block { offending, source } = evaluate_synthetic_cname_hop(
+                    domain,
+                    filter,
+                    profile_arc.as_ref(),
+                    runtime_grant.as_ref(),
+                ) {
+                    let qname = Name::from(name.clone());
+                    return Ok(self
+                        .dispatch_cname_block(
+                            BlockDispatchCtx {
+                                cache,
+                                domain,
+                                record_type,
+                                dns_class,
+                                ecs_cache_prefix,
+                                client_ip,
+                                client_name: client_name.as_deref(),
+                                client_profile,
+                                rewrote_from: rewrote_from.as_deref(),
+                                start,
+                                request,
+                                qname: &qname,
+                                client_blocked_ttl,
+                                client_block_response,
+                            },
+                            offending.as_str(),
+                            &source,
+                            response_handle,
+                            "rewrite synthetic CNAME",
+                        )
+                        .await);
+                }
+            }
+        }
 
         // (The RRL check formerly here moved up next to the pre-query
         // security gate so blocked / local / unmapped-REFUSED responses
@@ -1752,11 +1769,12 @@ impl ForwardHandler {
             // reach this site with `resolved_profile = Some(profile)`;
             // the `if let` is defensive.
             if let Some(profile_arc) = resolved_profile.as_ref() {
-                if let Verdict::Block { offending, source } = walk_response(
+                if let Verdict::Block { offending, source } = walk_response_with_grant(
                     entry.records(),
+                    domain,
                     filter,
                     profile_arc.as_ref(),
-                    name_policy,
+                    runtime_grant.as_ref(),
                     cname_max_depth,
                 ) {
                     let qname = Name::from(name.clone());
@@ -1787,7 +1805,14 @@ impl ForwardHandler {
                 }
             }
             if let Some(ipf) = ip_filter {
-                if let Some(blocked_ip) = ipf.check_response(entry.records(), name_policy) {
+                if let Some(blocked_ip) = ipf.check_response_for_profile_with_grant(
+                    entry.records(),
+                    resolved_profile
+                        .as_ref()
+                        .and_then(|profile| profile.operator_rules.as_ref())
+                        .map(|binding| binding.profile()),
+                    runtime_grant.as_ref(),
+                ) {
                     let qname = Name::from(name.clone());
                     return Ok(self
                         .dispatch_ip_block(
@@ -1891,22 +1916,18 @@ impl ForwardHandler {
                                     // cache-hit / post-upstream / stale
                                     // guards.
                                     //
-                                    // Uses `NamePolicy::Neutral`, not the
-                                    // query's `name_policy`. This refresh
-                                    // populates the SHARED (None-bucket)
-                                    // cache slot, which other clients read
-                                    // under their own policy, so the entry
-                                    // it stores must be one every client
-                                    // may see. Fail-closed cost is
-                                    // hit-rate only: a name the operator
-                                    // allowed whose answer is otherwise
-                                    // blocked simply is not prefetched —
-                                    // the serve paths above still allow it,
-                                    // they just pay the upstream round trip.
+                                    // Uses no grant, so this is only a
+                                    // conservative profile-independent
+                                    // admission check for the shared cache.
+                                    // Per-profile policy and grants remain
+                                    // authoritative when an entry is served.
+                                    // A response allowed only by a grant is
+                                    // not prefetched and pays the upstream
+                                    // round trip instead.
                                     let has_blocked_ip = ip_filter
                                         .as_deref()
                                         .and_then(|f| {
-                                            f.check_response(&resp.records, NamePolicy::Neutral)
+                                            f.check_response_with_grant(&resp.records, None)
                                         })
                                         .is_some();
                                     if has_blocked_cname || has_blocked_ip {
@@ -1924,7 +1945,7 @@ impl ForwardHandler {
                                         // inside this spawned task, so no
                                         // clone is needed.
                                         cache
-                                            .insert(
+                                            .insert_with_upstream_generation(
                                                 &domain_owned,
                                                 record_type,
                                                 dns_class,
@@ -1932,6 +1953,7 @@ impl ForwardHandler {
                                                 ResponseCode::NoError,
                                                 None,
                                                 ecs_prefix_for_prefetch,
+                                                resp.generation,
                                             )
                                             .await;
                                         tracing::debug!(
@@ -2113,7 +2135,12 @@ impl ForwardHandler {
                         ) {
                             Err(DnsError::Uncacheable(resp.response_code))
                         } else {
-                            Ok((resp.records, resp.response_code, resp.soa_minimum_ttl))
+                            Ok((
+                                resp.records,
+                                resp.response_code,
+                                resp.soa_minimum_ttl,
+                                resp.generation,
+                            ))
                         }
                     }
                     Err(e) => Err(e),
@@ -2152,64 +2179,21 @@ impl ForwardHandler {
                 // pick it up without duplicating the construction.
                 let qname = Name::from(name.clone());
                 // Post-fetch filter checks on the freshly-cached entry.
-                // Mirrors the filter-on-cache-hit guard at the CACHE HIT
-                // branch above — running both means we block on the FIRST
-                // request when the rule pre-existed (this site) AND on
-                // subsequent requests when the cache populated before the
-                // rule was added (cache-hit site). Negative responses
-                // (empty records) skip — nothing to filter.
-                //
-                // KNOWN ASYMMETRY, deliberately left in place — do not
-                // "tidy" it in either direction without reading this.
-                //
-                // The `response_code() == NoError` conjunct is NOT justified by
-                // the comment above it, which argues only for the emptiness
-                // test. It additionally skips a **non-empty** answer:
-                //
-                //   RFC 2308 §2.1 — a CNAME chain terminating in NXDOMAIN
-                //   carries its CNAMEs in the ANSWER section with
-                //   `RCODE = NXDOMAIN`, and `parse_response_bytes`
-                //   (`upstream/mod.rs`) keeps `msg.answers` regardless of
-                //   rcode. So on the raw / DoH / DoT / DoQ transports such an
-                //   entry reaches here with records present and a non-NoError
-                //   rcode, and skips both the chain walk and the IP check.
-                //   (The hickory-`Resolver` plain path discards them, so the
-                //   case is transport-dependent.)
-                //
-                // The two sibling sites — the cache-hit `CacheLookup::Fresh`
-                // branch and the stale fallback — carry NO rcode predicate, so
-                // the same entry IS walked on the next query for that name.
-                // First query serves NXDOMAIN and logs it as such; second
-                // serves the canned block response and logs BLOCKED.
-                //
-                // So: can a BLOCKED response escape via the cache or stale
-                // branch? **No** — a guard is a *skip*, so the two
-                // unguarded sites check strictly more. What can escape is
-                // the *guarded* site, which is the opposite of adding this
-                // same guard to the other two — that would widen the skip
-                // to the only places these entries are inspected at all.
-                //
-                // Narrowing it to `!is_empty()` is the right fix, and is NOT
-                // applied here because it is a **wire-visible** change — the
-                // first query would start returning the canned block response
-                // instead of NXDOMAIN — and the site sits inside the
-                // post-upstream-fetch branch, unreachable from any current test
-                // harness (`CacheEntry::for_test` is
-                // `cfg(all(test, feature = "dnssec"))` and only reaches
-                // `send_cached`). Shipping an untested wire change to satisfy a
-                // minor style nit is the wrong trade. Whoever takes it needs a
-                // handler harness that can drive a post-fetch entry.
-                if !entry.records().is_empty() && entry.response_code() == ResponseCode::NoError {
+                // A negative response may carry CNAME answers, so a non-empty
+                // answer section is inspected regardless of its RCODE. Empty
+                // negative responses have no targets or addresses to filter.
+                if !entry.records().is_empty() {
                     // Post-upstream chain inspection, mirror of the
                     // cache-hit re-check above. Same defensive
                     // `if let Some(profile)` for parity (the REFUSED
                     // early-return above guarantees `Some` at this site).
                     if let Some(profile_arc) = resolved_profile.as_ref() {
-                        if let Verdict::Block { offending, source } = walk_response(
+                        if let Verdict::Block { offending, source } = walk_response_with_grant(
                             entry.records(),
+                            domain,
                             filter,
                             profile_arc.as_ref(),
-                            name_policy,
+                            runtime_grant.as_ref(),
                             cname_max_depth,
                         ) {
                             return Ok(self
@@ -2240,7 +2224,14 @@ impl ForwardHandler {
                     }
 
                     if let Some(ipf) = ip_filter {
-                        if let Some(blocked_ip) = ipf.check_response(entry.records(), name_policy) {
+                        if let Some(blocked_ip) = ipf.check_response_for_profile_with_grant(
+                            entry.records(),
+                            resolved_profile
+                                .as_ref()
+                                .and_then(|profile| profile.operator_rules.as_ref())
+                                .map(|binding| binding.profile()),
+                            runtime_grant.as_ref(),
+                        ) {
                             return Ok(self
                                 .dispatch_ip_block(
                                     BlockDispatchCtx {
@@ -2309,11 +2300,12 @@ impl ForwardHandler {
                         // across both guards; no clone.
                         let qname = Name::from(name.clone());
                         if let Some(profile_arc) = resolved_profile.as_ref() {
-                            if let Verdict::Block { offending, source } = walk_response(
+                            if let Verdict::Block { offending, source } = walk_response_with_grant(
                                 entry.records(),
+                                domain,
                                 filter,
                                 profile_arc.as_ref(),
-                                name_policy,
+                                runtime_grant.as_ref(),
                                 cname_max_depth,
                             ) {
                                 return Ok(self
@@ -2343,9 +2335,14 @@ impl ForwardHandler {
                             }
                         }
                         if let Some(ipf) = ip_filter {
-                            if let Some(blocked_ip) =
-                                ipf.check_response(entry.records(), name_policy)
-                            {
+                            if let Some(blocked_ip) = ipf.check_response_for_profile_with_grant(
+                                entry.records(),
+                                resolved_profile
+                                    .as_ref()
+                                    .and_then(|profile| profile.operator_rules.as_ref())
+                                    .map(|binding| binding.profile()),
+                                runtime_grant.as_ref(),
+                            ) {
                                 return Ok(self
                                     .dispatch_ip_block(
                                         BlockDispatchCtx {
@@ -2908,37 +2905,9 @@ fn source_allowed(client_ip: IpAddr, allow_from: Option<&[Cidr]>) -> bool {
     }
 }
 
-/// Combined per-device overlay + profile evaluator.
-///
-/// When the resolved client carries a non-empty
-/// [`crate::profiles::DeviceOverlay`], two `HashSet::contains` probes
-/// feed [`apply_overlay`] for a 9-row allow/deny/fall-through decision;
-/// on `OverlayDecision::FallThrough` the existing profile evaluator runs
-/// unchanged.
-///
-/// `overlay = None` (the common case for devices that haven't pinned
-/// any per-device exception, plus anonymous sources at the lower
-/// resolution levels) short-circuits to `filter.evaluate(domain,
-/// profile)` — byte-identical to the no-overlay behaviour.
-///
-/// **Attribution side-effect:** this is the natural seat for
-/// [`crate::tracking::RuleSource`] computation. The attribution is
-/// logged at `tracing::debug!`; wiring it into the query log +
-/// per-device stats is future work for whoever extends the wire
-/// format. Computing it here keeps the layer mapping in one place.
-///
-/// **Invariant:** the `DeviceOverlay` allow / deny sets key on domain
-/// only — qtype is not consulted at this layer. The hot path therefore
-/// returns the same Block/Forward verdict for `A` and `AAAA` of the
-/// same name; the overlay is qtype-agnostic by construction.
-///
-/// Return is `(bool, Option<BlockSource>)` rather than a bare `bool` so
-/// the BLOCKED-outcome stats path can pin a per-list bit when the block
-/// is attributable to a single Tier 1 blocklist hit. The overlay-Block
-/// branch returns `Some(BlockSource::AdminBlock)` because per-device
-/// deny is admin-grade. The fall-through profile path defers to
-/// `evaluate_attributed`, which already names the source authoritatively.
-#[inline]
+/// Historical overlay evaluator retained for its isolated regression tests.
+/// The production handler uses the compiled policy evaluator on `FilterEngine`.
+#[cfg(test)]
 fn evaluate_with_overlay(
     domain: &str,
     profile: &Arc<ResolvedProfile>,
@@ -2952,48 +2921,15 @@ fn evaluate_with_overlay(
             device_deny_hit: domain_matches_set(domain, &ov.deny),
         };
         match apply_overlay(hits, ov.override_profile_deny) {
-            OverlayDecision::Allow {
-                source,
-                override_used,
-            } => {
-                tracing::debug!(
-                    domain,
-                    profile = %profile.name,
-                    device = %ov.device_id.as_str(),
-                    source = source_label(source),
-                    override_used,
-                    "overlay decision: ALLOW",
-                );
-                return (false, None);
-            }
-            OverlayDecision::Block { source } => {
-                tracing::debug!(
-                    domain,
-                    profile = %profile.name,
-                    device = %ov.device_id.as_str(),
-                    source = source_label(source),
-                    "overlay decision: BLOCK",
-                );
-                return (true, Some(BlockSource::AdminBlock));
-            }
-            OverlayDecision::FallThrough => {
-                // No device-side rule fired; fall through to the
-                // profile evaluator below — bitmask + advanced rules.
-            }
+            OverlayDecision::Allow { .. } => return (false, None),
+            OverlayDecision::Block { .. } => return (true, Some(BlockSource::AdminBlock)),
+            OverlayDecision::FallThrough => {}
         }
     }
     let (verdict, source) = filter.evaluate_attributed(domain, profile);
     match verdict {
         FilterResult::Block => (true, source),
         FilterResult::Forward => (false, None),
-    }
-}
-
-#[inline]
-fn source_label(source: AttribSource) -> &'static str {
-    match source {
-        AttribSource::Profile => "profile",
-        AttribSource::Device => "device",
     }
 }
 
@@ -3028,7 +2964,7 @@ pub(crate) fn cname_chain_blocked(
             continue;
         };
         let mut target = CompactString::default();
-        let _ = write!(target, "{}", &**cname);
+        let _ = write!(target, "{}", **cname);
         if target.ends_with('.') {
             target.pop();
         }

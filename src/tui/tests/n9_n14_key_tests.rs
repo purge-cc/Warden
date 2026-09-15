@@ -19,7 +19,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n\
+        "schema_version = 5\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
@@ -30,8 +30,8 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn app_on(master: &Path, leaf: Leaf) -> App {
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(master);
     app.active_leaf = leaf;
     assert!(app.loaded_config.is_some(), "fixture must parse");
     app

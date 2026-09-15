@@ -19,14 +19,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use purge_warden::auth::token::hash_token;
-use purge_warden::config::loader::load_config;
+use purge_warden::config::loader::load_current_config;
 use purge_warden::dns::cache::DnsCache;
 use purge_warden::filter::FilterEngine;
 use purge_warden::ipc::protocol::{IpcCommand, IpcResponse, TrackingPatch};
 use purge_warden::ipc::socket_client;
 use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 
-const MASTER: &str = r#"schema_version = 4
+const MASTER: &str = r#"schema_version = 5
 includes = ["blocklists.d/*.toml"]
 
 [server]
@@ -89,6 +89,7 @@ async fn spawn_fixture() -> Fixture {
         upstream_mode: "plain".into(),
         upstream_count: 0,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -96,6 +97,7 @@ async fn spawn_fixture() -> Fixture {
         api_token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(Some(token_hash))),
         config_path: Some(master.clone()),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         list_statuses: None,
         list_state: None,
         local_records_hits: None,
@@ -111,6 +113,8 @@ async fn spawn_fixture() -> Fixture {
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
 
     let handle = spawn_ipc_server(socket_path.clone(), Arc::new(state))
@@ -171,7 +175,7 @@ async fn tracking_update_preserves_include_layout() {
     // 3. The merged tree still loads and carries the patched value
     //    (Ok above already proves overlay validation passed pre-rename).
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(&fx.master, now).expect("merged config still loads");
+    let loaded = load_current_config(&fx.master, now).expect("merged config still loads");
     assert_eq!(
         loaded.config.tracking.retention_days, 30,
         "the patched retention_days must apply",

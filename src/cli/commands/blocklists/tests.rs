@@ -6,6 +6,8 @@ use crate::config::atomic_write::{
     hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
     AtomicWriteAtOpts, AtomicWriteTestFailure,
 };
+use crate::config::loader::load_current_config;
+use crate::config::schema::TARGET_SCHEMA_VERSION_V5;
 use std::{
     io::{Read, Write},
     os::{
@@ -21,7 +23,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -162,7 +164,7 @@ async fn add_blocklist_valid_url() {
     )
     .await
     .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 1);
 }
 
@@ -210,7 +212,7 @@ async fn add_refuses_a_taken_id_and_leaves_the_row_intact() {
         "expected the id refusal, got: {err}",
     );
 
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 1);
     let b = &loaded.config.blocklists[0];
     // The second call passed none of these. Had the write gone
@@ -232,7 +234,7 @@ async fn import_local_refuses_a_taken_id_and_leaves_the_row_intact() {
     run_import_local(&master, &sock, &src, "mycompany", "deny", None, None)
         .await
         .expect("the first import creates the row");
-    let before = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let before = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let before = before.config.blocklists[0].clone();
 
     let other = dir.path().join("other.txt");
@@ -245,7 +247,7 @@ async fn import_local_refuses_a_taken_id_and_leaves_the_row_intact() {
         "expected the id refusal, got: {err}",
     );
 
-    let after = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let after = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(after.config.blocklists.len(), 1);
     let after = &after.config.blocklists[0];
     assert_eq!(after.url, before.url);
@@ -296,7 +298,7 @@ async fn tmc_add_refuses_a_canonically_duplicate_url() {
             err.to_string().contains("privacy-ads"),
             "the refusal must name the list that already owns the URL, got: {err}",
         );
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(
             loaded.config.blocklists.len(),
             1,
@@ -338,7 +340,7 @@ async fn tmc_add_still_accepts_a_genuinely_different_url() {
         "https://lists.purge.cc/tracking.txt",
     )
     .await;
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 2);
 }
 
@@ -438,33 +440,39 @@ async fn add_rechecks_duplicates_after_the_network_probe() {
     let first_master = master.clone();
     let first_sock = sock.clone();
     let first_url = url.clone();
-    let first = tokio::spawn(async move {
-        run_add(
-            &first_master,
-            &first_sock,
-            "first",
-            None,
-            &first_url,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-        )
-        .await
-    });
+    let first = tokio::spawn(
+        PROBE_TIMEOUT_OVERRIDE.scope(Duration::from_secs(30), async move {
+            run_add(
+                &first_master,
+                &first_sock,
+                "first",
+                None,
+                &first_url,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                false,
+                None,
+            )
+            .await
+        }),
+    );
 
-    tokio::time::timeout(std::time::Duration::from_secs(3), request_seen_rx)
+    // The probe is deliberately held open while the duplicate is inserted.
+    // The scoped test seam gives that first request enough time to observe
+    // the second write without changing the operator-facing probe timeout.
+    const HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
+    tokio::time::timeout(HARNESS_TIMEOUT, request_seen_rx)
         .await
         .expect("the first add must reach its network probe")
         .unwrap();
     add_list(&master, &sock, "second", &url).await;
     release_tx.send(()).unwrap();
 
-    let err = tokio::time::timeout(std::time::Duration::from_secs(3), first)
+    let err = tokio::time::timeout(HARNESS_TIMEOUT, first)
         .await
         .expect("the first add must finish after the probe")
         .unwrap()
@@ -473,7 +481,7 @@ async fn add_rechecks_duplicates_after_the_network_probe() {
     assert!(err.contains("already added as \"second\""), "{err}");
     server.await.unwrap();
 
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 1);
     assert_eq!(loaded.config.blocklists[0].id.as_str(), "second");
 }
@@ -683,7 +691,8 @@ async fn remove_blocklist_without_refs_succeeds_without_cascade() {
         .await
         .unwrap();
     let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap();
     assert!(loaded.config.blocklists.is_empty());
 }
 
@@ -723,7 +732,7 @@ async fn set_enabled_field() {
     run_set(&master, &sock, "privacy-ads", "enabled", "false", None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert!(!loaded.config.blocklists[0].enabled);
 }
 
@@ -752,7 +761,7 @@ async fn set_format_roundtrips() {
     run_set(&master, &sock, "privacy-ads", "format", "adguard", None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].format, BlocklistFormat::Adguard);
 }
 
@@ -1178,7 +1187,7 @@ fn c53_append_master(master: &Path, suffix: &str) {
 
 fn c53_insert_top_level_include(master: &Path, pattern: &str) {
     let mut contents = std::fs::read_to_string(master).unwrap();
-    let marker = "schema_version = 4\n";
+    let marker = "schema_version = 5\n";
     let position = contents.find(marker).unwrap() + marker.len();
     contents.insert_str(position, &format!("includes = [\"{pattern}\"]\n"));
     std::fs::write(master, contents).unwrap();
@@ -1206,7 +1215,7 @@ fn c53_import_transaction_publishes_snapshot_content_format_and_count() {
     assert_eq!(std::fs::read_to_string(&imported.body_path).unwrap(), body);
     let written = std::fs::read_to_string(&master).unwrap();
     assert!(written.contains("format = \"adguard\""), "{written}");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 1);
 }
 
@@ -1230,7 +1239,7 @@ fn c53_import_enforces_loaded_body_cap_at_exact_boundary_and_plus_one() {
         assert_eq!(result.is_ok(), succeeds);
         let body = master.parent().unwrap().join("lists/cap-test.txt");
         assert_eq!(body.exists(), succeeds);
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.blocklists.len(), if succeeds { 1 } else { 0 });
     }
 }
@@ -1256,11 +1265,13 @@ fn c53_import_refuses_existing_body_without_touching_sentinel_or_config() {
     .unwrap_err();
     assert!(error.to_string().contains("already exists"), "{error:#}");
     assert_eq!(std::fs::read_to_string(&body).unwrap(), "leave me alone\n");
-    assert!(load_config(&master, time::OffsetDateTime::now_utc())
-        .unwrap()
-        .config
-        .blocklists
-        .is_empty());
+    assert!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1371,7 +1382,7 @@ fn c53_include_matcher_filters_hidden_prefix_suffix_and_nested_declarations_lexi
     let loaded = load_config_for_schema_under_guard(
         &guard,
         &master,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     )
     .unwrap();
@@ -1414,7 +1425,7 @@ fn c53_include_matcher_refuses_a_loaded_toml_alias_to_the_body_member() {
     let loaded = load_config_for_schema_under_guard(
         &guard,
         &master,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     )
     .unwrap();
@@ -1625,12 +1636,14 @@ fn c53_import_allows_an_absent_into_slice_selected_by_wildcard() {
     )
     .unwrap();
     assert!(imported.config_target.ends_with("blocklists.d/local.toml"));
-    assert!(load_config(&master, time::OffsetDateTime::now_utc())
-        .unwrap()
-        .config
-        .blocklists
-        .iter()
-        .any(|row| row.id.as_str() == "into-wildcard"));
+    assert!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .iter()
+            .any(|row| row.id.as_str() == "into-wildcard")
+    );
 }
 
 #[test]
@@ -1651,11 +1664,13 @@ fn c53_import_body_post_rename_failure_retains_retry_body() {
     .unwrap_err();
     assert!(error.to_string().contains("retained any body"), "{error:#}");
     assert!(dir.path().join("lists/body-rename.txt").exists());
-    assert!(load_config(&master, time::OffsetDateTime::now_utc())
-        .unwrap()
-        .config
-        .blocklists
-        .is_empty());
+    assert!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .is_empty()
+    );
 
     c53_import_with_fault(
         &master,
@@ -1666,12 +1681,14 @@ fn c53_import_body_post_rename_failure_retains_retry_body() {
         C53ImportFault::None,
     )
     .unwrap();
-    assert!(load_config(&master, time::OffsetDateTime::now_utc())
-        .unwrap()
-        .config
-        .blocklists
-        .iter()
-        .any(|row| row.id.as_str() == "body-rename"));
+    assert!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .iter()
+            .any(|row| row.id.as_str() == "body-rename")
+    );
 }
 
 #[test]
@@ -1794,11 +1811,13 @@ fn c53_import_body_cleanup_never_unlinks_a_replacement_by_pathname() {
         std::fs::read_to_string(body).unwrap(),
         "replacement sentinel\n"
     );
-    assert!(load_config(&master, time::OffsetDateTime::now_utc())
-        .unwrap()
-        .config
-        .blocklists
-        .is_empty());
+    assert!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2145,7 +2164,7 @@ async fn cli_surface_set_trust_remote_on_an_allow_list_without_ack_is_refused() 
         "pre-flight, not a post-write revert:\n{msg}"
     );
     // And the list is untouched — still local, still loading.
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].trust, BlocklistTrust::Local);
 }
 
@@ -2160,7 +2179,7 @@ async fn cli_surface_set_trust_remote_on_an_allow_list_with_ack_persists() {
     run_set_trust(&master, &sock, "svc-b", "remote-unsigned", true, None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let b = &loaded.config.blocklists[0];
     assert_eq!(b.trust, BlocklistTrust::RemoteUnsigned);
     assert_eq!(b.base, BlocklistBase::Allow);
@@ -2198,7 +2217,7 @@ async fn cli_surface_set_kind_allow_with_ack_persists_the_consent() {
     run_set_kind_with_ack(&master, &sock, "svc-b", "allow", true, None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let b = &loaded.config.blocklists[0];
     assert_eq!(b.base, BlocklistBase::Allow);
     assert!(
@@ -2222,7 +2241,7 @@ async fn cli_surface_set_kind_flips_back_to_deny() {
     run_set_kind(&master, &sock, "svc-b", "deny", None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Deny);
 }
 
@@ -2323,7 +2342,7 @@ async fn s50_t3_set_kind_to_allow_with_remote_unsigned_is_rejected_and_reverts()
     assert!(err.to_string().to_ascii_lowercase().contains("trust"));
     // Loader must read back the original kind=block — the file
     // was reverted by validate_or_revert.
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Deny);
 }
 
@@ -2366,7 +2385,7 @@ async fn s50_t3_set_trust_local_then_set_kind_allow_succeeds() {
     run_set_kind(&master, &sock, "trusted", "allow", None)
         .await
         .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].trust, BlocklistTrust::Local);
     assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Allow);
 }
@@ -2386,7 +2405,7 @@ async fn tmc_set_kind_allow_is_allowed_when_the_list_carries_a_tag() {
     run_set_kind(&master, &sock, "x", "allow", None)
         .await
         .expect("a tagged list may become an allow-list");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Allow);
 }
 
@@ -2432,7 +2451,7 @@ async fn s50_t3_import_local_copies_file_and_registers_blocklist() {
         .unwrap();
     let dest = master.parent().unwrap().join("lists").join("mycompany.txt");
     assert!(dest.exists());
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let imported = loaded
         .config
         .blocklists
@@ -2522,7 +2541,7 @@ async fn tmc_import_local_still_accepts_an_untagged_deny_list() {
     run_import_local(&master, &sock, &src, "ads", "deny", None, None)
         .await
         .expect("a deny-list needs no consent and no tag");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let imported = loaded
         .config
         .blocklists
@@ -2556,7 +2575,7 @@ async fn tmc_set_kind_allow_accepts_an_untagged_list_now() {
     run_set_kind(&master, &sock, "x", "allow", None)
         .await
         .expect("trust = local needs no consent, and the tag gate is retired");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let b = loaded
         .config
         .blocklists
@@ -2628,7 +2647,7 @@ fn master_with_a_refused_allow_list(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -2661,7 +2680,7 @@ async fn tmc_set_kind_deny_repairs_a_config_that_no_longer_loads() {
     // test could pass against a fixture that quietly stopped being
     // refused, and would then prove nothing about the deadlock.
     assert!(
-        load_config(&master, time::OffsetDateTime::now_utc()).is_err(),
+        load_current_config(&master, time::OffsetDateTime::now_utc()).is_err(),
         "the fixture must be in the refused state"
     );
 
@@ -2669,7 +2688,7 @@ async fn tmc_set_kind_deny_repairs_a_config_that_no_longer_loads() {
         .await
         .expect("the narrowing direction must work on a config that does not load");
 
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc())
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc())
         .expect("the repair must leave a loadable config");
     assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Deny);
 }
@@ -2808,7 +2827,7 @@ async fn cli_surface_add_allow_from_url_without_ack_is_refused_before_write() {
         before,
         "config must be untouched"
     );
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert!(loaded.config.blocklists.is_empty(), "nothing was created");
 }
 
@@ -2842,7 +2861,7 @@ async fn cli_surface_add_allow_from_url_with_ack_writes_and_reloads_clean() {
     )
     .await
     .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let b = loaded
         .config
         .blocklists
@@ -2968,7 +2987,7 @@ async fn cli_surface_deny_and_allow_lists_coexist_from_urls_alone() {
     )
     .await
     .unwrap();
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let by = |id: &str| {
         loaded
             .config
@@ -3010,7 +3029,7 @@ async fn cli_surface_add_allow_without_tags_is_now_accepted() {
     )
     .await
     .expect("the tag gate is retired — an untagged allow-list is a legal declaration now");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let b = loaded
         .config
         .blocklists
@@ -3144,7 +3163,8 @@ fn load_master(toml: &str) -> (tempfile::TempDir, crate::config::schema::ConfigV
     let master = dir.path().join("config.toml");
     std::fs::write(&master, toml).unwrap();
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(&master, now).unwrap_or_else(|e| panic!("fixture must load: {e:?}"));
+    let loaded =
+        load_current_config(&master, now).unwrap_or_else(|e| panic!("fixture must load: {e:?}"));
     (dir, loaded.config)
 }
 
@@ -3175,7 +3195,7 @@ fn report(config: &crate::config::schema::ConfigV1, id: &str) -> (Enforcement, S
 /// `plp-s3`: the inert arm used to be "carries a tag nothing else in the
 /// config has". Tags reach nothing now, so inertness has exactly one
 /// cause left and the fixture states it.
-const TWO_LISTS: &str = r#"schema_version = 4
+const TWO_LISTS: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3256,7 +3276,7 @@ fn only_the_inert_list_reaches_the_closing_note() {
 #[test]
 fn a_disabled_list_is_not_enforced_even_when_its_tags_match() {
     let (_dir, config) = load_master(
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3309,7 +3329,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn an_untagged_allow_list_is_enforced_everywhere_not_inert() {
     let (_dir, config) = load_master(
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3386,7 +3406,7 @@ fn the_closing_note_agrees_with_itself_in_the_singular() {
 #[test]
 fn a_list_no_profile_ignores_is_enforced_by_every_profile() {
     let (_dir, config) = load_master(
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3429,7 +3449,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn a_list_every_profile_ignores_is_reported_inert() {
     let (_dir, config) = load_master(
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3474,7 +3494,7 @@ servers = ["192.0.2.1:53"]
 #[test]
 fn a_partially_ignored_list_names_the_profiles_that_keep_it() {
     let (_dir, config) = load_master(
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -3499,4 +3519,112 @@ servers = ["192.0.2.1:53"]
     assert_eq!(e.profiles, vec!["default".to_string()]);
     assert!(!row.contains(NOT_ENFORCED), "{row}");
     assert!(row.contains("enforced by 1 profile"), "{row}");
+}
+
+// Direct TOML fixtures need no runtime, token discovery or sockets.
+fn master_for_set_kind_core(dir: &tempfile::TempDir) -> PathBuf {
+    let master = mk_master(dir);
+    let mut source = std::fs::read_to_string(&master).unwrap();
+    source.push_str("\n[[blocklists]]\nid = \"worker-list\"\ndisplay_name = \"Worker list\"\nurl = \"https://example.com/worker.txt\"\nformat = \"domains\"\nbase = \"deny\"\ntrust = \"remote-unsigned\"\n");
+    std::fs::write(&master, source).unwrap();
+    load_current_config(&master, time::OffsetDateTime::now_utc()).expect("valid deny-list fixture");
+    master
+}
+
+#[test]
+fn set_kind_without_reload_requires_and_persists_consent_and_success_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_for_set_kind_core(&dir);
+    let before = std::fs::read(&master).unwrap();
+    let error = set_kind_without_reload(&master, "worker-list", "allow", false, None).unwrap_err();
+    assert!(error.to_string().contains("accept_unsigned_allow"));
+    assert_eq!(std::fs::read(&master).unwrap(), before);
+
+    assert_eq!(
+        set_kind_without_reload(&master, "worker-list", "allow", true, None).unwrap(),
+        format_blocklist_set_kind_ok("worker-list", "allow")
+    );
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Allow);
+    assert!(loaded.config.blocklists[0].accept_unsigned_allow);
+    let rows =
+        crate::config::audit::tail(&super::super::audit::audit_log_path_for(&master), 10).unwrap();
+    let records: Vec<_> = rows
+        .iter()
+        .filter_map(|(_, record)| record.as_ref().ok())
+        .filter(|record| record.action.as_deref() == Some("blocklist.set_kind"))
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].result, AuditResult::Ok);
+    assert_eq!(records[0].target_id.as_deref(), Some("worker-list"));
+    assert_eq!(records[0].fields_before.as_deref(), Some("deny"));
+    assert_eq!(records[0].fields_after.as_deref(), Some("allow"));
+
+    set_kind_without_reload(&master, "worker-list", "deny", false, None).unwrap();
+    set_kind_without_reload(&master, "worker-list", "allow", false, None)
+        .expect("consent persisted in the file is sufficient");
+    let _guard = crate::config::write_lock::acquire_for_write(&master)
+        .expect("core must release its writer guard");
+}
+
+#[test]
+fn set_kind_without_reload_preserves_repair_and_rejection_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with_a_refused_allow_list(&dir);
+    let before = std::fs::read(&master).unwrap();
+    assert!(set_kind_without_reload(&master, "guest", "allow", true, None).is_err());
+    assert_eq!(std::fs::read(&master).unwrap(), before);
+    assert_eq!(
+        set_kind_without_reload(&master, "guest", "deny", false, None).unwrap(),
+        format_blocklist_set_kind_ok("guest", "deny")
+    );
+    assert_eq!(
+        load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config
+            .blocklists[0]
+            .base,
+        BlocklistBase::Deny
+    );
+}
+
+#[test]
+fn set_kind_without_reload_rejects_invalid_merged_config_before_promoting_and_audits() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_with_a_refused_allow_list(&dir);
+    let before = std::fs::read_to_string(&master).unwrap().replace(
+        "default_profile = \"default\"",
+        "default_profile = \"missing\"",
+    );
+    std::fs::write(&master, &before).unwrap();
+    assert!(set_kind_without_reload(&master, "guest", "deny", false, None).is_err());
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), before);
+    let rows =
+        crate::config::audit::tail(&super::super::audit::audit_log_path_for(&master), 10).unwrap();
+    let record = rows
+        .iter()
+        .filter_map(|(_, record)| record.as_ref().ok())
+        .find(|record| record.action.as_deref() == Some("blocklist.set_kind"))
+        .expect("validation refusal must retain its audit record");
+    assert_eq!(record.result, AuditResult::Rejected);
+    assert_eq!(record.fields_before.as_deref(), Some("allow"));
+    assert_eq!(record.fields_after.as_deref(), Some("deny"));
+    assert!(!record.errors.is_empty());
+}
+
+#[test]
+fn set_kind_without_reload_keeps_success_when_audit_storage_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = master_for_set_kind_core(&dir);
+    let log = super::super::audit::audit_log_path_for(&master);
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // A directory at the log filename refuses append even when tests run as root.
+    std::fs::create_dir(&log).unwrap();
+    assert_eq!(
+        set_kind_without_reload(&master, "worker-list", "allow", true, None).unwrap(),
+        format_blocklist_set_kind_ok("worker-list", "allow")
+    );
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(loaded.config.blocklists[0].base, BlocklistBase::Allow);
+    assert!(loaded.config.blocklists[0].accept_unsigned_allow);
 }

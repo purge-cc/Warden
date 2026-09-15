@@ -164,6 +164,7 @@ pub struct OriginalSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct RemoveConfirm {
+    pub primary: bool,
     pub kind: LabelKind,
     pub id: String,
     pub display_name: String,
@@ -296,6 +297,7 @@ impl LabelModal {
     pub fn open_remove(label: &Label, usage: usize) -> Self {
         Self {
             stage: Stage::ConfirmingRemove(RemoveConfirm {
+                primary: false,
                 kind: label.kind,
                 id: label.id.as_str().to_string(),
                 display_name: label.display_name.clone(),
@@ -316,8 +318,7 @@ impl LabelModal {
         matches!(self.stage, Stage::Submitted(_))
     }
 
-    /// Convenience: borrow the form when the stage is editing. Test-only.
-    #[cfg(test)]
+    /// Borrow the active editor.
     pub fn form(&self) -> Option<&AddForm> {
         match &self.stage {
             Stage::EditingForm(f) => Some(f),
@@ -363,6 +364,33 @@ use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, Val
 // so a blanket "Enter save · Esc cancel" here would be a second,
 // redundant source of the same fact.
 const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move";
+
+pub fn render_inline_editor(f: &mut Frame, area: Rect, modal: &LabelModal) -> bool {
+    let Stage::EditingForm(form) = &modal.stage else {
+        return false;
+    };
+    let (title, subtitle) = band_text(form);
+    let body_area = crate::tui::theme::filled_card(
+        f.buffer_mut(),
+        area,
+        &title,
+        &subtitle,
+        crate::tui::theme::CardRole::History,
+    );
+    let (mut body, cursor) = form_body(form, body_area.width.saturating_sub(1));
+    body.head = vec![ratatui::text::Line::default()];
+    let view = modal_form::render_scroll_body(f, body_area, &body);
+    if let Some((row, caret)) = cursor {
+        if row >= view.offset && row < view.offset + view.view_h {
+            let x = body_area.x + modal_form::VALUE_COL as u16 + caret;
+            let y = body_area.y + (view.head_h + row - view.offset) as u16;
+            if x < body_area.right() && y < body_area.bottom() {
+                f.set_cursor_position((x, y));
+            }
+        }
+    }
+    true
+}
 
 /// Draw the modal as an overlay anchored on the tab content rect.
 ///
@@ -539,13 +567,15 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
             focus == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             "  [Enter] Save  ",
             focus == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -624,10 +654,12 @@ fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
         choices: Vec::new(),
         error: None,
         hint,
-        keys: "[y] confirm   [n / Esc] cancel".to_string(),
+        keys: "Tab choose · Enter confirm · Esc cancel".to_string(),
         actions: vec![
-            Action::new("  [n] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Remove  ", false, ActionKind::Destructive, ""),
+            Action::new("  Cancel  ", !rc.primary, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  Remove  ", rc.primary, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
 }
@@ -681,7 +713,8 @@ fn outcome_notice(outcome: &SubmitOutcome) -> NoticeSpec {
         error,
         hint: String::new(),
         keys: "[any key] close".to_string(),
-        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")],
+        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")
+            .on_key(crossterm::event::KeyCode::Esc)],
     }
 }
 
@@ -733,7 +766,7 @@ mod tests {
         ] {
             let dump = render_overlay_in(&LabelModal::open_add(kind), 80, 14);
             assert!(
-                dump.contains(&format!("Add {}", kind.as_str())),
+                dump.contains(&format!("ADD {}", kind.as_str().to_uppercase())),
                 "the Add title must name {kind}; got:\n{dump}"
             );
         }
@@ -745,7 +778,7 @@ mod tests {
         let l = label("apple-tv", LabelKind::DeviceType, "Apple TV", None);
         let dump = render_overlay_in(&LabelModal::open_edit(&l), 80, 14);
         assert!(
-            dump.contains("Edit device-type") && dump.contains("apple-tv"),
+            dump.contains("EDIT DEVICE-TYPE") && dump.contains("apple-tv"),
             "got:\n{dump}"
         );
     }
@@ -899,7 +932,7 @@ mod tests {
     fn the_remove_confirm_says_device_values_survive() {
         let l = label("dweller", LabelKind::Owner, "Dweller", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
-        assert!(dump.contains("Remove owner"), "got:\n{dump}");
+        assert!(dump.contains("REMOVE OWNER"), "got:\n{dump}");
         assert!(dump.contains("untouched"), "got:\n{dump}");
         assert!(dump.contains("no device carries"), "got:\n{dump}");
 
@@ -921,7 +954,10 @@ mod tests {
         let l = label("dweller", LabelKind::Owner, "Dweller", None);
         let dump = render_overlay_in(&LabelModal::open_remove(&l, 0), 80, 14);
         assert!(
-            dump.contains("[y] confirm") && dump.contains("[n / Esc] cancel"),
+            dump.contains("Enter confirm")
+                && dump.contains("Esc cancel")
+                && dump.contains("Remove")
+                && dump.contains("Cancel"),
             "got:\n{dump}"
         );
         assert!(

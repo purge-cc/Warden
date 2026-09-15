@@ -437,7 +437,7 @@ impl std::fmt::Display for UpstreamMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct UpstreamConfig {
     /// Resolution mode: "plain", "doh", "dot", or "doq".
     #[serde(default)]
@@ -500,12 +500,10 @@ impl UpstreamConfig {
     /// fallback is configured) every fallback server tagged with the
     /// fallback's mode.
     ///
-    /// The daemon precomputes this at boot and stores the stringified form
-    /// on `DaemonState` so `IpcResponse::Status` can surface the literal
-    /// resolver addresses. Order is primary-then-fallback so the System
-    /// card leads with the primary resolvers. A differing fallback mode is
-    /// the only source of a mixed-kind list — the primary `servers` all
-    /// share `self.mode`.
+    /// Each reloadable upstream generation stores this description so IPC
+    /// status surfaces the resolver addresses that generation actually uses.
+    /// Order is primary-then-fallback. A differing fallback mode is the only
+    /// source of a mixed-kind list — primary servers all share `self.mode`.
     pub fn server_list(&self) -> Vec<(String, UpstreamMode)> {
         let mut out: Vec<(String, UpstreamMode)> = self
             .servers
@@ -623,7 +621,7 @@ pub enum EcsMode {
 /// fallback, and per-zone in `[[forwarding]]`. Kept as a nested table
 /// (`[upstream.dot]`) so the TOML stays flat at the top level and only
 /// users who want non-default pool sizing touch it.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DotUpstreamConfig {
     /// Number of persistent TLS connections per DoT server. Default 4
     /// — two orders of magnitude below an RPi's fd budget and enough
@@ -651,7 +649,7 @@ fn default_dot_pool_size() -> usize {
 /// mode = "plain"
 /// servers = ["192.0.2.1:53", "192.0.2.2:53"]
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FallbackConfig {
     pub mode: UpstreamMode,
     pub servers: Vec<String>,
@@ -1619,7 +1617,7 @@ impl Default for AntiBypassConfig {
 /// mode = "dot"
 /// servers = ["vpn-dns.example.com:853"]
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ForwardingZoneConfig {
     /// Domain suffix to match (e.g. "local", "corp.example.com").
     /// Queries ending in this suffix are forwarded to the zone's upstream.
@@ -1782,8 +1780,9 @@ pub struct RewriteRule {
 // Opt-in, OFF by default. The `[dnssec]` section is parsed *unconditionally*
 // (these types are not behind the `dnssec` cargo feature) so that an
 // operator's `mode = "validate"` deserialises on any build; the validation
-// machinery itself lives in the feature-gated `crate::dnssec` module. This
-// scaffold currently ships inert — nothing reads `mode` or the DoS caps yet.
+// machinery itself lives in the feature-gated `crate::dnssec` module. Builds
+// without that feature reject enabled modes; feature builds consume the mode
+// and DoS caps when constructing each upstream generation.
 
 /// DNSSEC validation mode. Default [`DnssecMode::Off`] — DNSSEC is
 /// opt-in.
@@ -1811,8 +1810,7 @@ impl std::fmt::Display for DnssecMode {
     }
 }
 
-/// `[dnssec]` configuration section. Parsed and stored but not yet
-/// consumed — validation and cap enforcement are not wired up.
+/// `[dnssec]` validation mode and work caps.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DnssecConfig {

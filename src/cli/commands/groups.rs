@@ -1,4 +1,4 @@
-//! `warden group` — v1-native CRUD for `[[groups]]` entries.
+//! `warden group` — current-schema CRUD for `[[groups]]` entries.
 //!
 //! Mirrors the device command surface: list / add / set / remove /
 //! show, with `--into <file>` target selection and validate-or-revert
@@ -19,14 +19,16 @@ use super::target::{
     resolve_target_file_locked, upsert_id_keyed, write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::{load_config, load_config_for_schema_under_guard};
+#[cfg(test)]
+use crate::config::loader::load_current_config as load_config;
+use crate::config::loader::{load_config_for_schema_under_guard, load_current_config};
 use crate::config::schema::ScheduleTargetType;
-use crate::config::schema::{Group, Id, SCHEMA_VERSION_V1};
+use crate::config::schema::{Group, Id, TARGET_SCHEMA_VERSION_V5};
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     if loaded.config.groups.is_empty() {
         println!("no groups configured");
         println!(
@@ -56,7 +58,7 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 
 pub fn run_show(config_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let g = loaded
         .config
         .groups
@@ -206,8 +208,9 @@ pub(crate) fn add_inner_locked(
 ) -> anyhow::Result<AddReport> {
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     validate_group_refs(&loaded, id, profile, devices)?;
 
     let mut tbl = toml::map::Map::new();
@@ -354,8 +357,9 @@ pub(crate) fn remove_inner_locked(
     into: Option<&Path>,
 ) -> anyhow::Result<Option<RemoveReport>> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let refs: Vec<&str> = loaded
         .config
         .devices
@@ -550,7 +554,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -794,7 +798,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"

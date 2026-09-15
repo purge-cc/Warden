@@ -1,4 +1,4 @@
-//! Target-file selection + TOML surgery for v1 entity mutations.
+//! Target-file selection + TOML surgery for current entity mutations.
 //!
 //! The `warden device` / `group` / `subnet` / `blocklist` subcommands must
 //! edit the right `*.d/*.toml` slice when the operator runs a multi-file
@@ -28,7 +28,7 @@
 //!
 //! Mutations route through [`write_value_validated_locked`] (single file) or
 //! [`write_values_validated_locked`] (compound multi-file). Both run the full
-//! [`crate::config::loader::load_config`] against the STAGED bytes — via a
+//! [`crate::config::loader::load_current_config`] against the STAGED bytes — via a
 //! [`crate::config::loader::LoaderOverlay`] that substitutes the would-be-
 //! written content for each touched path — BEFORE the rename. A tree the
 //! validator would reject is never promoted to disk, so the on-disk config is
@@ -45,23 +45,27 @@ use toml::Value;
 
 use crate::config::atomic_write::{hardened_atomic_write_at, AtomicWriteAtOpts, AtomicWriteError};
 use crate::config::cidr::Cidr;
+#[cfg(test)]
+use crate::config::loader::load_current_config as load_config;
 use crate::config::loader::{
-    canonicalize_path, load_config, load_config_for_schema_under_guard,
-    load_config_with_overlay_for_schema_under_guard, LoaderOverlay, MAX_INCLUDE_FILES,
+    canonicalize_path, load_config_for_schema_under_guard,
+    load_config_v5_executable_with_overlay_under_guard,
+    load_config_with_overlay_for_schema_under_guard, load_current_config, LoaderOverlay,
+    MAX_INCLUDE_FILES,
 };
 use crate::config::schema::device::Device;
 use crate::config::schema::id::Id;
 use crate::config::schema::subnet::Subnet;
 use crate::config::schema::{
     ClusterConfig, ClusterRole, ConfigV1, REPLICATED_BUT_ALLOWED_IN_A_SECONDARY_MASTER,
-    REPLICATED_SECTIONS, SCHEMA_VERSION_V1,
+    REPLICATED_SECTIONS, TARGET_SCHEMA_VERSION_V5,
 };
 use crate::config::tree_io::{
     for_each_dir_name, CappedRead, MemberKey, PinnedTarget, TargetPlan, TreeIo,
 };
 use crate::config::write_lock::ConfigWriteLock;
 
-/// The entity collections the CLI can mutate. Maps to the v1 schema
+/// The entity collections the CLI can mutate. Maps to current schema
 /// top-level keys + the `<name>.d/` subdirectory convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityClass {
@@ -517,7 +521,7 @@ pub fn owner_candidate_files(master: &Path, convention_classes: &[EntityClass]) 
     convention.sort();
     convention.dedup();
 
-    let graph = match load_config(master, time::OffsetDateTime::now_utc()) {
+    let graph = match load_current_config(master, time::OffsetDateTime::now_utc()) {
         Ok(loaded) => loaded.files_loaded,
         Err(_) => Vec::new(),
     };
@@ -561,7 +565,7 @@ pub(crate) fn owner_candidate_files_locked(
     let graph = match load_config_for_schema_under_guard(
         guard,
         master,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     ) {
         Ok(loaded) => loaded.files_loaded,
@@ -617,7 +621,7 @@ pub(crate) fn owner_candidate_files_locked(
 /// | Profiles    | named-map        | `[profiles.<id>]` sub-table keys     |
 ///
 /// `Profiles` is the only v1 named-map today — if another class ever
-/// flips shape, the writer ([`upsert_id_keyed`] vs [`upsert_profile`])
+/// flips shape, the writer ([`upsert_id_keyed`] vs [`replace_profile`])
 /// and the corresponding match arm here must move together.
 ///
 /// Candidates come from [`owner_candidate_files`], i.e. the include
@@ -943,8 +947,12 @@ pub fn remove_id_keyed(doc: &mut Value, key: &str, find_value: &str) -> anyhow::
     Ok(arr.len() < before)
 }
 
-/// Set or replace a `[profiles.<id>]` entry in the named-map.
-pub fn upsert_profile(doc: &mut Value, profile_id: &str, entry: Value) -> anyhow::Result<bool> {
+/// Replace a complete `[profiles.<id>]` entry in the named-map.
+///
+/// This is destructive for an existing profile: `entry` becomes the entire
+/// table. Field updates must use [`update_profile_custom_lists`] or another
+/// field-specific read-modify-write helper.
+pub fn replace_profile(doc: &mut Value, profile_id: &str, entry: Value) -> anyhow::Result<bool> {
     let table = match doc {
         Value::Table(t) => t,
         _ => bail!("config root is not a TOML table"),
@@ -959,6 +967,94 @@ pub fn upsert_profile(doc: &mut Value, profile_id: &str, entry: Value) -> anyhow
     let created = !profiles.contains_key(profile_id);
     profiles.insert(profile_id.to_string(), entry);
     Ok(created)
+}
+
+/// Create a complete `[profiles.<id>]` entry in the named-map.
+///
+/// This is deliberately create-only. Updating an existing profile must use a
+/// field-specific read-modify-write helper so a partial value cannot erase its
+/// sibling settings.
+pub fn create_profile(doc: &mut Value, profile_id: &str, entry: Value) -> anyhow::Result<()> {
+    let table = match doc {
+        Value::Table(t) => t,
+        _ => bail!("config root is not a TOML table"),
+    };
+    let profiles_value = table
+        .entry("profiles".to_string())
+        .or_insert_with(|| Value::Table(Default::default()));
+    let profiles = match profiles_value {
+        Value::Table(t) => t,
+        _ => bail!("`profiles` must be a table"),
+    };
+    if profiles.contains_key(profile_id) {
+        bail!("profile `{profile_id}` already exists");
+    }
+    profiles.insert(profile_id.to_string(), entry);
+    Ok(())
+}
+
+/// Apply a custom-list mount delta to one existing profile table.
+///
+/// This is pure TOML surgery: it performs no I/O and changes no sibling
+/// profile key. Callers render the resulting document through the existing
+/// format-preserving validated writer.
+pub fn update_profile_custom_lists(
+    doc: &mut Value,
+    profile_id: &str,
+    mount: &[String],
+    unmount: &[String],
+) -> anyhow::Result<bool> {
+    let table = match doc {
+        Value::Table(t) => t,
+        _ => bail!("config root is not a TOML table"),
+    };
+    let profiles = table
+        .get_mut("profiles")
+        .and_then(Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("`profiles` must be a table"))?;
+    let profile = profiles
+        .get_mut(profile_id)
+        .and_then(Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("profile `{profile_id}` not found or is not a table"))?;
+
+    if mount.iter().any(|id| unmount.contains(id)) {
+        bail!("a custom-list id cannot be mounted and unmounted in the same update");
+    }
+    let had_custom_lists = profile.contains_key("custom_lists");
+    let mut current = match profile.get("custom_lists") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("`custom_lists` must contain only strings"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        Some(_) => bail!("`custom_lists` must be an array"),
+    };
+    let before = current.clone();
+    for id in mount {
+        if !current.iter().any(|mounted| mounted == id) {
+            current.push(id.clone());
+        }
+    }
+    current.retain(|id| !unmount.contains(id));
+    if current.is_empty() {
+        if had_custom_lists {
+            profile.remove("custom_lists");
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if current == before {
+        return Ok(false);
+    }
+    profile.insert(
+        "custom_lists".to_string(),
+        Value::Array(current.into_iter().map(Value::String).collect()),
+    );
+    Ok(true)
 }
 
 /// Remove a `[profiles.<id>]` entry. Returns whether anything was removed.
@@ -1248,6 +1344,82 @@ pub(crate) fn write_value_validated_locked(
     write_value_validated_locked_inner(guard, master, final_path, value, || {})
 }
 
+/// Validate the narrow legacy membership transition before promoting its config.
+pub(crate) fn write_legacy_membership_validated_locked(
+    guard: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    value: &Value,
+) -> anyhow::Result<()> {
+    guard.verify_master(master)?;
+    let plan = guard.tree_io().plan_master_target()?;
+    let before_image = plan.read_original()?;
+    let before: Value = before_image.as_deref().unwrap_or_default().parse()?;
+    let before_cluster = before
+        .get("cluster")
+        .cloned()
+        .map(Value::try_into::<ClusterConfig>)
+        .transpose()?
+        .unwrap_or_default();
+    let after_cluster = value
+        .get("cluster")
+        .cloned()
+        .map(Value::try_into::<ClusterConfig>)
+        .transpose()?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        before_cluster.membership_version.is_none() && after_cluster.membership_version.is_none(),
+        "modern membership requires the Nodes lifecycle service"
+    );
+    let leaving = before_cluster.enabled
+        && before_cluster.role == ClusterRole::Secondary
+        && !after_cluster.enabled;
+    let joining = after_cluster.enabled && after_cluster.role == ClusterRole::Secondary;
+    anyhow::ensure!(
+        leaving || joining,
+        "legacy operation must join or leave a secondary"
+    );
+    let content =
+        super::toml_write::render_preserving(before_image.as_deref().unwrap_or_default(), value)?;
+    let changed = changed_top_level_keys(before_image.as_deref(), &content);
+    anyhow::ensure!(
+        changed
+            .iter()
+            .all(|key| matches!(key.as_str(), "cluster" | "includes")
+                || (leaving && key == "upstream")),
+        "legacy membership cannot replace policy"
+    );
+    let includes = |value: &Value| -> anyhow::Result<Vec<String>> {
+        value
+            .get("includes")
+            .cloned()
+            .map(Value::try_into::<Vec<String>>)
+            .transpose()
+            .map(|v| v.unwrap_or_default())
+            .map_err(Into::into)
+    };
+    let old_includes = includes(&before)?;
+    let new_includes = includes(value)?;
+    anyhow::ensure!(
+        old_includes == new_includes
+            || (joining && {
+                const LEGACY_POLICY_INCLUDE: &str = "cluster.d/*.toml"; // include-dir-ok: fixed protocol-zero enrollment destination, never an entity-owner lookup
+                let mut expected = old_includes;
+                if !expected.iter().any(|item| item == LEGACY_POLICY_INCLUDE) {
+                    expected.push(LEGACY_POLICY_INCLUDE.into());
+                }
+                expected == new_includes
+            }),
+        "legacy membership cannot alter unrelated includes"
+    );
+    let prepared = vec![PreparedWrite {
+        plan,
+        before_image,
+        content,
+    }];
+    validate_prepared_locked_inner(guard, master, &prepared, true)?;
+    promote_prepared_after_validation_with_ops(guard, prepared, write_slice_raw, revert_raw)
+}
+
 #[cfg(test)]
 fn write_value_validated_locked_after_prepare(
     guard: &crate::config::write_lock::ConfigWriteLock,
@@ -1527,9 +1699,33 @@ fn validate_prepared_locked(
     master: &Path,
     prepared: &[PreparedWrite<'_>],
 ) -> anyhow::Result<()> {
+    validate_prepared_locked_inner(lock, master, prepared, false)
+}
+
+fn validate_prepared_locked_inner(
+    lock: &crate::config::write_lock::ConfigWriteLock,
+    master: &Path,
+    prepared: &[PreparedWrite<'_>],
+    legacy_membership: bool,
+) -> anyhow::Result<()> {
     lock.verify_master(master)?;
     let tree = lock.tree_io();
-    refuse_policy_write_on_a_cluster_secondary(tree, prepared)?;
+    #[cfg(feature = "cluster")]
+    if !crate::cluster::lifecycle::policy_edit_allowed_under_guard(lock)? {
+        let changes_policy = prepared.iter().any(|write| {
+            changed_top_level_keys(write.before_image.as_deref(), &write.content)
+                .iter()
+                .any(|key| is_replicated_policy_section(key) || key == "includes")
+                || !changed_server_policy_fields(write).is_empty()
+        });
+        anyhow::ensure!(
+            !changes_policy,
+            "node transition pending; policy editing is temporarily locked"
+        );
+    }
+    if !legacy_membership {
+        refuse_policy_write_on_a_cluster_secondary(tree, prepared)?;
+    }
     #[cfg(test)]
     crate::config::write_lock::test_event(crate::config::write_lock::TestEvent::BeforeOverlay);
     let mut overlay = LoaderOverlay::default();
@@ -1539,13 +1735,9 @@ fn validate_prepared_locked(
 
     // 2. Validate the would-be-merged tree once, before promoting anything.
     let now = time::OffsetDateTime::now_utc();
-    if let Err(errs) = load_config_with_overlay_for_schema_under_guard(
-        lock,
-        master,
-        crate::config::schema::SCHEMA_VERSION_V1,
-        now,
-        Some(&overlay),
-    ) {
+    if let Err(errs) =
+        load_config_v5_executable_with_overlay_under_guard(lock, master, now, Some(&overlay))
+    {
         // Errors first, boilerplate last. The TUI renders this string in a
         // fixed 2-row band (~105 usable cells after its own prefixes) and
         // ellipsises the rest, so any preamble is paid for in operator
@@ -1682,17 +1874,8 @@ pub const CLUSTER_PEER_UNSET: &str = "`cluster.peer` unset";
 ///   fire on every such write, including the node-local ones, and would refuse
 ///   `cluster leave` on a policy-carrying master: the exact verb an operator
 ///   reaches for to rescue a stuck node.
-/// - **`schema_version` and `server` are carved out**, matching the
-///   loader's `REPLICATED_BUT_ALLOWED_IN_A_SECONDARY_MASTER` carve-out and
-///   for the same reasons — every master carries `schema_version`, and the
-///   master keeps node-local `server.listen` while the bundle supplies
-///   `server`'s policy fields.
-///   *Known residual:* the carve-out is section-granular, so a future verb
-///   writing `server.<policy-field>` would pass this guard. Cover is partial
-///   — the loader's sub-key `DuplicateId` fires only when the bundle sets the
-///   same field. No verb writes `[server]` through this path today (the
-///   only `get_mut("server")` in the CLI is `migrate.rs`), so the hole is
-///   known and currently unreachable rather than unnoticed.
+/// - The schema marker and node-local server listen/log/timeout fields stay
+///   editable. Replicated server fields and include topology are protected.
 fn refuse_policy_write_on_a_cluster_secondary(
     tree: TreeIo<'_>,
     prepared: &[PreparedWrite<'_>],
@@ -1713,8 +1896,11 @@ fn refuse_policy_write_on_a_cluster_secondary(
         sections.extend(
             changed_top_level_keys(write.before_image.as_deref(), &write.content)
                 .into_iter()
-                .filter(|k| is_replicated_policy_section(k)),
+                .filter(|k| is_replicated_policy_section(k) || k == "includes"),
         );
+    }
+    for write in prepared {
+        sections.extend(changed_server_policy_fields(write));
     }
     if sections.is_empty() {
         return Ok(());
@@ -1733,27 +1919,55 @@ fn refuse_policy_write_on_a_cluster_secondary(
         ));
 }
 
-/// The `[cluster]` section this write would leave in force.
-///
-/// Read from the master's STAGED bytes when the master is itself one of the
-/// staged writes (the `.d`-less fallback layout restages it wholesale), and
-/// from disk otherwise. `None` when the master is unreadable, unparseable, or
-/// declares no `[cluster]` — in the first two cases the load in
-/// [`promote_validated_locked`] reports the real syntax error a paragraph later, and
-/// a refusal here would name the wrong cause.
-///
-/// *Known residual:* a `[cluster]` declared in an INCLUDE rather than the
-/// master is invisible here. Every real path puts it in the master —
-/// `cluster join` / `leave` write `config_path` — and the tree still fails
-/// closed if one did not, because the loader's load-time check has the
-/// merged config and refuses a policy-carrying secondary regardless.
-/// Resolving it properly
-/// would mean re-implementing the loader's include walk, and two
-/// implementations of one rule drift.
+fn changed_server_policy_fields(write: &PreparedWrite<'_>) -> Vec<String> {
+    let mut sections = Vec::new();
+    let before = write
+        .before_image
+        .as_deref()
+        .and_then(|raw| raw.parse::<Value>().ok());
+    let after = write.content.parse::<Value>().ok();
+    let before_server = before
+        .as_ref()
+        .and_then(|value| value.get("server"))
+        .and_then(Value::as_table);
+    let after_server = after
+        .as_ref()
+        .and_then(|value| value.get("server"))
+        .and_then(Value::as_table);
+    let keys = before_server
+        .into_iter()
+        .flat_map(|table| table.keys())
+        .chain(after_server.into_iter().flat_map(|table| table.keys()));
+    for key in keys {
+        if !matches!(key.as_str(), "listen" | "log_level" | "tcp_timeout_secs")
+            && before_server.and_then(|table| table.get(key))
+                != after_server.and_then(|table| table.get(key))
+        {
+            sections.push(format!("server.{key}"));
+        }
+    }
+    sections
+}
+
+/// Preserve the saved secondary guard even if a write also clears the role.
+/// Otherwise use the staged master, then the saved master. The validating loader
+/// independently rejects replicated policy declared in a secondary include.
 fn cluster_section_in_effect(
     tree: TreeIo<'_>,
     prepared: &[PreparedWrite<'_>],
 ) -> Option<ClusterConfig> {
+    if let Some(raw) = tree.plan_master_target().ok()?.read_original().ok()? {
+        if let Some(cluster) = raw.parse::<Value>().ok().and_then(|value| {
+            value
+                .get("cluster")
+                .cloned()
+                .and_then(|value| value.try_into::<ClusterConfig>().ok())
+        }) {
+            if cluster.enabled && cluster.role == ClusterRole::Secondary {
+                return Some(cluster);
+            }
+        }
+    }
     let staged_master = prepared
         .iter()
         .find(|write| write.plan.key() == &tree.master_key())
@@ -1844,6 +2058,7 @@ fn write_slice_raw_with_opts(
             mode: write_opts.mode,
             owner: write_opts.owner,
             fsync_parent: write_opts.fsync_parent,
+            staging: Default::default(),
             #[cfg(test)]
             test_failure: write_opts.test_failure,
         },
@@ -1872,6 +2087,7 @@ fn write_slice_syntax_checked_with_opts(
             mode: write_opts.mode,
             owner: write_opts.owner,
             fsync_parent: write_opts.fsync_parent,
+            staging: Default::default(),
             #[cfg(test)]
             test_failure: write_opts.test_failure,
         },
@@ -1939,7 +2155,7 @@ pub fn effective_profile_for_device(cfg: &ConfigV1, device: &Device) -> Option<I
 /// number — never blocks the mutation it annotates).
 pub fn count_devices_on_profile(config_path: &Path, profile_id: &str) -> usize {
     let now = time::OffsetDateTime::now_utc();
-    let Ok(loaded) = load_config(config_path, now) else {
+    let Ok(loaded) = load_current_config(config_path, now) else {
         return 0;
     };
     let cfg = loaded.config;
@@ -1951,3 +2167,161 @@ pub fn count_devices_on_profile(config_path: &Path, profile_id: &str) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod profile_custom_lists_rmw_tests {
+    use super::*;
+
+    #[test]
+    fn custom_list_mount_rmw_preserves_a_full_profile_and_comments() {
+        let source = r#"# top-level comment
+[profiles.kids] # profile comment
+display_name = "Kids" # display comment
+block_response = "nxdomain"
+blocked_ttl_secs = 300
+block_all = true # block-all comment
+safe_search = true
+lists = { privacy = "deny" } # list override comment
+
+[[profiles.kids.local_records]]
+name = "router.example.test"
+value = "192.0.2.10"
+
+[[profiles.kids.rewrite_rules]]
+from = "old.example.test"
+to = "new.example.test"
+
+[profiles.kids.ecs]
+mode = "subnet"
+source_prefix_v4 = 24
+source_prefix_v6 = 56
+"#;
+        let mut doc: Value = source.parse().unwrap();
+        let original = doc.clone();
+
+        assert!(
+            update_profile_custom_lists(&mut doc, "kids", &["family-rules".into()], &[]).unwrap()
+        );
+
+        let profile = doc["profiles"]["kids"].as_table().unwrap();
+        assert_eq!(
+            profile["custom_lists"].as_array().unwrap(),
+            &[Value::String("family-rules".into())]
+        );
+        for key in [
+            "display_name",
+            "block_response",
+            "blocked_ttl_secs",
+            "block_all",
+            "safe_search",
+            "lists",
+            "local_records",
+            "rewrite_rules",
+            "ecs",
+        ] {
+            assert_eq!(
+                profile.get(key),
+                original["profiles"]["kids"].get(key),
+                "mount changed sibling `{key}`"
+            );
+        }
+        let mounted = super::super::toml_write::render_preserving(source, &doc).unwrap();
+        assert!(mounted.contains("# profile comment"));
+        assert!(mounted.contains("# display comment"));
+        assert!(mounted.contains("# block-all comment"));
+        assert!(mounted.contains("# list override comment"));
+
+        assert!(
+            update_profile_custom_lists(&mut doc, "kids", &[], &["family-rules".into()]).unwrap()
+        );
+        assert!(doc["profiles"]["kids"].get("custom_lists").is_none());
+        assert_eq!(doc, original, "unmount changed more than the mount key");
+    }
+
+    #[test]
+    fn custom_list_rmw_requires_an_existing_profile_table() {
+        let mut doc: Value = "[profiles]\n".parse().unwrap();
+        let error =
+            update_profile_custom_lists(&mut doc, "missing", &["rules".into()], &[]).unwrap_err();
+        assert!(error.to_string().contains("profile `missing` not found"));
+    }
+
+    #[test]
+    fn custom_list_rmw_no_op_leaves_the_document_unchanged() {
+        let mut doc: Value = r#"[profiles.kids]
+custom_lists = ["family-rules"]
+display_name = "Kids"
+"#
+        .parse()
+        .unwrap();
+        let original = doc.clone();
+
+        assert!(!update_profile_custom_lists(
+            &mut doc,
+            "kids",
+            &["family-rules".into(), "family-rules".into()],
+            &[]
+        )
+        .unwrap());
+        assert_eq!(doc, original);
+    }
+
+    #[test]
+    fn custom_list_rmw_keeps_an_included_owner_document_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        let owner = dir.path().join("profiles.d/kids.toml");
+        std::fs::create_dir_all(owner.parent().unwrap()).unwrap();
+        std::fs::write(&master, "includes = [\"profiles.d/kids.toml\"]\n").unwrap();
+        let owner_source = "# owner comment\n[profiles.kids]\ndisplay_name = \"Kids\"\n";
+        std::fs::write(&owner, owner_source).unwrap();
+
+        let (mut owner_doc, original) = read_or_empty(&owner).unwrap();
+        assert!(
+            update_profile_custom_lists(&mut owner_doc, "kids", &["family-rules".into()], &[])
+                .unwrap()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&master).unwrap(),
+            "includes = [\"profiles.d/kids.toml\"]\n"
+        );
+        assert_eq!(std::fs::read_to_string(&owner).unwrap(), owner_source);
+        assert_eq!(original.as_deref(), Some(owner_source));
+        let rendered =
+            super::super::toml_write::render_preserving(owner_source, &owner_doc).unwrap();
+        assert!(rendered.contains("# owner comment"));
+        assert!(rendered.contains("custom_lists = [\"family-rules\"]"));
+    }
+
+    #[test]
+    fn custom_list_rmw_rejects_malformed_or_conflicting_input_without_mutation() {
+        let mut malformed: Value = r#"[profiles.kids]
+custom_lists = ["family-rules", 7]
+display_name = "Kids"
+"#
+        .parse()
+        .unwrap();
+        let malformed_before = malformed.clone();
+        let error = update_profile_custom_lists(&mut malformed, "kids", &["new-rules".into()], &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("only strings"));
+        assert_eq!(malformed, malformed_before);
+
+        let mut conflicting: Value = r#"[profiles.kids]
+custom_lists = ["family-rules"]
+"#
+        .parse()
+        .unwrap();
+        let conflicting_before = conflicting.clone();
+        let error = update_profile_custom_lists(
+            &mut conflicting,
+            "kids",
+            &["new-rules".into()],
+            &["new-rules".into()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mounted and unmounted"));
+        assert_eq!(conflicting, conflicting_before);
+    }
+}

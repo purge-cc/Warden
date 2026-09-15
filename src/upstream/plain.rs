@@ -178,6 +178,7 @@ impl Upstream for PlainUpstream {
                     Ok(lookup) => Ok(UpstreamResponse {
                         records: lookup.answers().to_vec(),
                         response_code: ResponseCode::NoError,
+                        generation: None,
                         soa_minimum_ttl: None,
                         // Resolver path is never the validator's upstream
                         // (dnssec_ok forces the Raw path), so no authority is
@@ -190,6 +191,7 @@ impl Upstream for PlainUpstream {
                         Ok(UpstreamResponse {
                             records: vec![],
                             response_code: response_code.unwrap_or(ResponseCode::NXDomain),
+                            generation: None,
                             soa_minimum_ttl,
                             #[cfg(feature = "dnssec")]
                             authority: vec![],

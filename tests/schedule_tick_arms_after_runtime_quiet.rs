@@ -21,7 +21,7 @@
 //! reload" is CT-smoke-proven on the isolated `:15353` daemon (see DONE.md).
 
 use purge_warden::cli::commands::schedules::prune_expired_schedules;
-use purge_warden::config::loader::{load_config, LoadedConfig};
+use purge_warden::config::loader::{load_current_config, LoadedConfig};
 
 fn now() -> time::OffsetDateTime {
     time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_600)
@@ -30,7 +30,7 @@ fn now() -> time::OffsetDateTime {
 /// Minimal v2 config with the entities a `warden device quiet` schedule
 /// references (a `blocked` profile + a target device), mirroring what
 /// `run_quiet` materialises before appending the one-shot row.
-const BASE: &str = r#"schema_version = 4
+const BASE: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -59,7 +59,7 @@ fn write_config(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
 }
 
 fn load_ok(path: &std::path::Path) -> LoadedConfig {
-    match load_config(path, now()) {
+    match load_current_config(path, now()) {
         Ok(loaded) => loaded,
         Err(errs) => panic!("expected clean load, got: {errs:?}"),
     }

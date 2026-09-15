@@ -27,8 +27,8 @@ use super::target::{
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
 use crate::config::cidr::Cidr;
-use crate::config::loader::{load_config, load_config_for_schema_under_guard};
-use crate::config::schema::{Id, Subnet, SCHEMA_VERSION_V1};
+use crate::config::loader::{load_config_for_schema_under_guard, load_current_config};
+use crate::config::schema::{Id, Subnet, TARGET_SCHEMA_VERSION_V5};
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 // ── Reports & outcomes ─────────────────────────────────────────────────
@@ -82,7 +82,7 @@ pub(crate) enum RemoveOutcome {
 
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     if loaded.config.subnets.is_empty() {
         println!("no subnets configured");
         println!("add one with: warden subnet add <id> --cidrs 10.0.0.0/8 --profile <profile>");
@@ -104,7 +104,7 @@ pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
 
 pub fn run_show(config_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let s = loaded
         .config
         .subnets
@@ -196,8 +196,9 @@ pub(crate) fn add_inner_locked(
     let stored_cidrs = canonicalise_cidrs(cidrs)?;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if loaded.config.subnets.iter().any(|s| s.id.as_str() == id) {
         bail!("subnet \"{id}\" already exists");
     }
@@ -581,7 +582,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -627,7 +628,7 @@ servers = ["192.0.2.1:53"]
         .expect("add");
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = load_config(&master, now).expect("reload");
+        let loaded = load_current_config(&master, now).expect("reload");
         let s = loaded
             .config
             .subnets
@@ -672,7 +673,7 @@ servers = ["192.0.2.1:53"]
         )
         .await
         .unwrap();
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.subnets.len(), 1);
         assert_eq!(loaded.config.subnets[0].id.as_str(), "lan-guest");
         assert_eq!(loaded.config.subnets[0].priority, 10);
@@ -745,7 +746,7 @@ servers = ["192.0.2.1:53"]
         )
         .await
         .unwrap();
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.subnets[0].cidrs.len(), 2);
     }
 
@@ -790,7 +791,7 @@ servers = ["192.0.2.1:53"]
         .await
         .unwrap();
         run_remove(&master, &sock, "lan", None).await.unwrap();
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert!(loaded.config.subnets.is_empty());
     }
 
@@ -822,7 +823,7 @@ servers = ["192.0.2.1:53"]
         assert_eq!(report.id, "lan");
         assert_eq!(report.target_path, master);
         // Single-file layout: the entry landed in the master.
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.subnets.len(), 1);
         assert_eq!(loaded.config.subnets[0].priority, 5);
     }
@@ -966,7 +967,7 @@ servers = ["192.0.2.1:53"]
         .unwrap();
         assert_eq!(report.fields, vec!["display_name", "priority"]);
 
-        let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         let s = &loaded.config.subnets[0];
         assert_eq!(s.display_name, "Renamed");
         assert_eq!(s.priority, 7);

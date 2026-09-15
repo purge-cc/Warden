@@ -1,4 +1,4 @@
-//! `warden device` — v1-native CRUD for `[[devices]]` entries.
+//! `warden device` — current-schema CRUD for `[[devices]]` entries.
 //!
 //! Every mutation locates the right `devices.d/*.toml` file (or the
 //! master on a single-file layout) via [`crate::cli::commands::target`]
@@ -16,13 +16,14 @@ use super::audit_emit::{current_uid, persist_cli_mutation_audit};
 use super::format_config_errors;
 use super::ipc_reload;
 use super::target::{
-    read_or_empty_locked, remove_id_keyed, resolve_existing_target_file_locked,
-    resolve_target_file_locked, upsert_id_keyed, upsert_profile, write_value_validated_locked,
-    EntityClass,
+    create_profile, read_or_empty_locked, remove_id_keyed, resolve_existing_target_file_locked,
+    resolve_target_file_locked, upsert_id_keyed, write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::{load_config, load_config_for_schema_under_guard};
-use crate::config::schema::{Device, Id, ScheduleTargetType, SCHEMA_VERSION_V1};
+#[cfg(test)]
+use crate::config::loader::load_current_config as load_config;
+use crate::config::loader::{load_config_for_schema_under_guard, load_current_config};
+use crate::config::schema::{Device, Id, ScheduleTargetType, TARGET_SCHEMA_VERSION_V5};
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
 /// List configured devices against the on-disk config.
@@ -31,7 +32,7 @@ use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 /// summary (IP / MAC), direct profile (if any), and group memberships.
 pub fn run_list(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let devices = &loaded.config.devices;
     if devices.is_empty() {
         println!("no devices configured");
@@ -212,7 +213,7 @@ fn render_device_view(view: &crate::ipc::protocol::DeviceViewDto) -> String {
 /// Render a single device in a detail view (one field per line).
 pub fn run_show(config_path: &Path, id: &str) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let dev = loaded
         .config
         .devices
@@ -278,31 +279,6 @@ fn render_device_detail(dev: &Device) -> String {
         let _ = writeln!(out, "notes:        {notes}");
     }
 
-    // ── state that changes what the resolver does ─────────────────────
-    //
-    // Printed unconditionally, unlike the optional metadata above. These
-    // four decide how the device's queries are filtered, and a field that
-    // shows up only when set teaches the operator that absence means
-    // `false` — which is indistinguishable from a build that cannot show
-    // the field at all.
-    let _ = writeln!(
-        out,
-        "allow_rules:  {}",
-        join_rule_ids(&dev.allow_rules).as_str()
-    );
-    let _ = writeln!(
-        out,
-        "deny_rules:   {}",
-        join_rule_ids(&dev.deny_rules).as_str()
-    );
-    if dev.override_profile_deny {
-        let _ = writeln!(
-            out,
-            "override_profile_deny: true  (allow_rules beat profile-level denies)"
-        );
-    } else {
-        let _ = writeln!(out, "override_profile_deny: false");
-    }
     if dev.unfiltered {
         let _ = writeln!(out, "unfiltered:   true  (filtering skipped entirely)");
     } else {
@@ -310,18 +286,6 @@ fn render_device_detail(dev: &Device) -> String {
     }
 
     out
-}
-
-/// Render a rule-overlay id list, or `(none)` when empty. Empty is the
-/// common case and it is an answer, not a reason to print nothing.
-fn join_rule_ids(ids: &[Id]) -> String {
-    if ids.is_empty() {
-        return "(none)".to_string();
-    }
-    ids.iter()
-        .map(|i| i.as_str())
-        .collect::<Vec<&str>>()
-        .join(", ")
 }
 
 /// Add or replace a device. See
@@ -361,8 +325,9 @@ pub async fn run_add(
     // message earlier.
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!(
             "device \"{id}\" already exists. Use `warden device set {id} <field> <value>` to edit, \
@@ -444,7 +409,7 @@ pub async fn run_add(
 /// Set a single field on an existing device. Supported fields: `ip`,
 /// `mac`, `profile`, `display_name`, `owner`, `device_type` (the legacy
 /// `device` spelling is also accepted and rewritten to `device_type`),
-/// `department`, `notes`. Lists (`tags`, `groups`) are comma-separated.
+/// `department`, `notes`. Group lists are comma-separated.
 /// `mac_aliases` is config-file-only — there is no `set` arm for it; edit
 /// the device's TOML entry directly to add aliases.
 pub async fn run_set(
@@ -523,8 +488,9 @@ pub async fn run_remove(
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let referenced_by: Vec<&str> = loaded
         .config
         .groups
@@ -613,8 +579,9 @@ pub async fn run_block(
     // neither does.
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if !loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!(
             "device \"{id}\" not found. Run `warden device list` to see configured devices, \
@@ -645,7 +612,7 @@ block_all = true
 "#,
         )
         .context("building blocked profile")?;
-        upsert_profile(&mut master_doc, "blocked", profile_entry)?;
+        create_profile(&mut master_doc, "blocked", profile_entry)?;
         write_value_validated_locked(&guard, config_path, config_path, &master_doc)?;
     }
 
@@ -867,9 +834,7 @@ fn apply_device_field(entry: &mut Value, field: &str, value: &str) -> anyhow::Re
 
 // ── set-unfiltered verb — frozen strings + handler ─────────────────────
 //
-// Setting `unfiltered = true` also clears the `tags` array — mutual
-// exclusion enforced at write time so the operator can't
-// tell-then-bail-on-validate.
+// The current device shape stores the filtering bypass directly.
 
 pub const DEVICE_SET_UNFILTERED_OK: &str = "Device '{id}' unfiltered={value}.";
 
@@ -897,10 +862,9 @@ pub fn format_device_set_unfiltered_warn(id: &str) -> String {
     DEVICE_SET_UNFILTERED_WARN.replace("{id}", id)
 }
 
-/// `warden devices set-unfiltered <id> <true|false>`. Idempotent. When
-/// `value = true`, also clears the `tags` array in the same write to
-/// preserve the unfiltered/tags mutual exclusion. Emits [`DEVICE_SET_UNFILTERED_WARN`]
-/// in addition to the OK message when the new value is `true`.
+/// `warden devices set-unfiltered <id> <true|false>`. Idempotent. Emits
+/// [`DEVICE_SET_UNFILTERED_WARN`] in addition to the OK message when the new
+/// value is `true`.
 pub async fn run_set_unfiltered(
     config_path: &Path,
     socket_path: &Path,
@@ -910,8 +874,9 @@ pub async fn run_set_unfiltered(
 ) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     let dev = loaded
         .config
         .devices
@@ -935,10 +900,6 @@ pub async fn run_set_unfiltered(
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("device entry is not a TOML table"))?;
     tbl.insert("unfiltered".into(), Value::Boolean(value));
-    if value {
-        // Clear tags atomically so the post-write state is consistent.
-        tbl.insert("tags".into(), Value::Array(toml::value::Array::new()));
-    }
     write_value_validated_locked(&guard, config_path, &target_path, &doc)?;
     drop(guard);
 
@@ -1018,7 +979,7 @@ fn too_far_in_the_future(s: &str) -> anyhow::Error {
 
 /// Parse the helper for `warden device quiet --for 15m` / `--until <rfc3339>`.
 /// Kept here (rather than in `clients.rs` where it originated) so the
-/// full v1 device flow lives in one file; the semantics are unchanged.
+/// the full device flow lives in one file.
 pub fn parse_quiet_duration(
     for_str: Option<&str>,
     until_str: Option<&str>,
@@ -1067,7 +1028,7 @@ pub fn parse_quiet_duration(
 
 /// Add a one-shot `[[schedules]]` entry that blocks the named device
 /// until `now + duration` (or `--until <rfc3339>`). Mirrors the legacy
-/// `warden client quiet` semantics on the v1 schedule shape.
+/// `warden client quiet` semantics on the current schedule shape.
 ///
 /// Compound mutation (blocked profile + schedule append) emits ONE
 /// reload at the end.
@@ -1084,8 +1045,9 @@ pub async fn run_quiet(
     // Device existence check up front.
     let now = time::OffsetDateTime::now_utc();
     let guard = acquire_for_write(config_path)?;
-    let loaded = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .map_err(format_config_errors)?;
+    let loaded =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .map_err(format_config_errors)?;
     if !loaded.config.devices.iter().any(|d| d.id.as_str() == id) {
         bail!("no device named \"{id}\". Run `warden device list` to see configured devices.");
     }
@@ -1125,7 +1087,7 @@ block_all = true
 "#,
         )
         .context("building blocked profile")?;
-        upsert_profile(&mut master_doc, "blocked", blocked_tbl)?;
+        create_profile(&mut master_doc, "blocked", blocked_tbl)?;
         write_value_validated_locked(&guard, config_path, config_path, &master_doc)?;
     }
 
@@ -1210,7 +1172,7 @@ mod tests {
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1257,7 +1219,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 includes = ["profiles.d/*.toml"]
 
 [server]
@@ -1335,6 +1297,7 @@ servers = ["192.0.2.1:53"]
                 network_name_wildcard: false,
                 id: Some("kitchen-pi".into()),
                 hourly_queries: vec![],
+                hourly_blocked: None,
                 unfiltered: false,
             }],
             unmapped: vec![UnmappedDeviceDto {
@@ -1348,6 +1311,7 @@ servers = ["192.0.2.1:53"]
                 online: true,
                 vendor: Some("Acme Corp".into()),
                 hourly_queries: vec![],
+                hourly_blocked: None,
             }],
         };
 
@@ -1399,6 +1363,7 @@ servers = ["192.0.2.1:53"]
                 network_name_wildcard: false,
                 id: Some("nomac".into()),
                 hourly_queries: vec![],
+                hourly_blocked: None,
                 unfiltered: false,
             }],
             unmapped: vec![],
@@ -1692,7 +1657,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1934,9 +1899,9 @@ servers = ["192.0.2.1:53"]
             device_type,
             department,
             notes,
-            allow_rules,
-            deny_rules,
-            override_profile_deny,
+            allow_rules: _,
+            deny_rules: _,
+            override_profile_deny: _,
             unfiltered,
             network_name,
             network_name_wildcard,
@@ -1955,13 +1920,9 @@ servers = ["192.0.2.1:53"]
         assert_eq!(notes.as_deref(), Some("a note"));
 
         // Deliberately NOT written by `add`, and each for its own reason:
-        // extra MACs and the per-device rule overlays are delta primitives
-        // owned by their own verbs, and the two network-name fields plus the
+        // Extra MACs are owned by their own verb. The network-name fields and
         // filtering opt-out are opt-ins a fresh device must not carry.
         assert!(mac_aliases.is_empty());
-        assert!(allow_rules.is_empty());
-        assert!(deny_rules.is_empty());
-        assert!(!*override_profile_deny);
         assert!(!*unfiltered);
         assert_eq!(network_name.as_deref(), None);
         assert!(!*network_name_wildcard);
@@ -2061,7 +2022,7 @@ servers = ["192.0.2.1:53"]
         let master = dir.path().join("config.toml");
         std::fs::write(
             &master,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -2320,15 +2281,8 @@ servers = ["192.0.2.1:53"]
 
     // ── `device show` prints the state that changes filtering ────────────
     //
-    // `unfiltered`, `allow_rules`, `deny_rules` and `override_profile_deny`
-    // all change what the resolver does to a device's queries, so all
-    // must appear in the detail view — otherwise, after
-    // `warden device set-unfiltered iot-fridge true`, no command in the
-    // product would tell you the fridge had stopped being filtered.
-    //
-    // The first three are printed UNCONDITIONALLY. A field that appears
-    // only when true teaches the operator that absence means false, which
-    // is indistinguishable from "this build does not show that field".
+    // `unfiltered` is rendered in both states so absence is never mistaken
+    // for `false`. Retired schema-4 overlay fields remain absent.
 
     fn device_from_toml(src: &str) -> Device {
         toml::from_str(src).expect("fixture device must deserialise")
@@ -2359,53 +2313,17 @@ servers = ["192.0.2.1:53"]
     }
 
     #[test]
-    fn h10_device_show_prints_rule_overlays() {
+    fn device_show_omits_retired_schema_four_overlays() {
         let dev = device_from_toml(
             "id = \"laptop\"\ndisplay_name = \"Laptop\"\n\
              allow_rules = [\"allow-work\"]\ndeny_rules = [\"deny-social\"]\n",
         );
         let out = render_device_detail(&dev);
-        assert!(
-            out.contains("allow_rules:  allow-work"),
-            "the per-device allow overlay is checked BEFORE the profile's \
-             tables — it must be visible. got:\n{out}"
-        );
-        assert!(
-            out.contains("deny_rules:   deny-social"),
-            "the per-device deny overlay must be visible. got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn h10_device_show_prints_empty_rule_overlays_as_none() {
-        let dev = device_from_toml("id = \"laptop\"\ndisplay_name = \"Laptop\"\n");
-        let out = render_device_detail(&dev);
-        assert!(
-            out.contains("allow_rules:  (none)") && out.contains("deny_rules:   (none)"),
-            "\"this device has no overlays\" is an answer the operator needs \
-             when asking why a domain resolved. got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn h10_device_show_prints_override_profile_deny_both_ways() {
-        let off = device_from_toml("id = \"laptop\"\ndisplay_name = \"Laptop\"\n");
-        assert!(
-            render_device_detail(&off).contains("override_profile_deny: false"),
-            "got:\n{}",
-            render_device_detail(&off)
-        );
-
-        let on = device_from_toml(
-            "id = \"laptop\"\ndisplay_name = \"Laptop\"\n\
-             allow_rules = [\"allow-work\"]\noverride_profile_deny = true\n",
-        );
-        let out = render_device_detail(&on);
-        assert!(
-            out.contains("override_profile_deny: true"),
-            "this flag lets a device's allow beat a profile-level deny — it \
-             has no CLI writer, so `show` is the ONLY way to discover a \
-             hand-edited `true`. got:\n{out}"
-        );
+        for retired in ["allow_rules", "deny_rules", "override_profile_deny"] {
+            assert!(
+                !out.contains(retired),
+                "retired schema-4 field {retired} must not be rendered: {out}"
+            );
+        }
     }
 }

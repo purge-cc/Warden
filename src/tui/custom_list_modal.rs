@@ -39,12 +39,38 @@ pub struct MountPicker {
     /// One row per declared profile, in config order.
     pub rows: Vec<MountRow>,
     pub cursor: usize,
+    pub focus: MountFocus,
     pub error: Option<String>,
     /// Set once the save has run; the picker renders the outcome and
     /// closes on the next keypress.
     pub outcome: Option<String>,
     /// Whether [`Self::outcome`] is a failure.
     pub failed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountFocus {
+    Profiles,
+    Discard,
+    Apply,
+}
+
+impl MountFocus {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Profiles => Self::Discard,
+            Self::Discard => Self::Apply,
+            Self::Apply => Self::Profiles,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Profiles => Self::Apply,
+            Self::Discard => Self::Profiles,
+            Self::Apply => Self::Discard,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +111,7 @@ impl MountPicker {
             },
             rows,
             cursor,
+            focus: MountFocus::Profiles,
             error: None,
             outcome: None,
             failed: false,
@@ -248,14 +275,16 @@ impl RemoveConfirm {
 pub enum RuleField {
     Domain,
     Direction,
+    Raw,
     Submit,
     Cancel,
 }
 
 impl RuleField {
-    pub const ALL: [RuleField; 4] = [
+    pub const ALL: [RuleField; 5] = [
         RuleField::Domain,
         RuleField::Direction,
+        RuleField::Raw,
         RuleField::Submit,
         RuleField::Cancel,
     ];
@@ -276,18 +305,29 @@ impl RuleField {
 pub enum RuleFormMode {
     /// Append a line at the end of the file.
     Add,
-    /// Replace the rule on one file line with what the form holds.
-    ///
-    /// **The rule as it was rendered is carried, not only its line
-    /// number.** The pane's numbers come from the last read, so a write it
-    /// did not see makes line N a different rule; the writer takes these
-    /// as the expectation and refuses on a mismatch rather than editing
-    /// whatever now sits there.
+    /// Replace one backend-snapshot row with what the form holds.
     Edit {
-        line: usize,
+        target: BackendRuleRef,
         was_domain: String,
         was_allow: bool,
     },
+    /// Replace a backend AST this TUI cannot safely reduce to a bare domain
+    /// and allow/deny direction. The raw source is intentionally unparsed
+    /// here; the daemon validates the replacement under its own grammar.
+    EditRaw {
+        target: BackendRuleRef,
+        original_raw: String,
+    },
+}
+
+/// Stable identity of a row returned by `operator_rules::RuleRow`. `line`
+/// and `raw` are presentation only; mutations address `row_ref`, so an
+/// external edit cannot retarget a pending form merely by moving a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRuleRef {
+    pub row_ref: String,
+    pub line: usize,
+    pub raw: String,
 }
 
 /// One rule, added or edited.
@@ -302,6 +342,9 @@ pub struct RuleForm {
     pub domain: String,
     /// `true` writes `@@||domain^`, `false` writes `||domain^`.
     pub allow: bool,
+    /// Exact backend rule source for [`RuleFormMode::EditRaw`]. It is not
+    /// normalised or passed through the legacy pack parser.
+    pub raw_rule: String,
     pub focused: RuleField,
     pub error_message: Option<String>,
     pub mode: RuleFormMode,
@@ -316,6 +359,7 @@ impl RuleForm {
             list_id,
             domain: String::new(),
             allow: false,
+            raw_rule: String::new(),
             focused: RuleField::Domain,
             error_message: None,
             mode: RuleFormMode::Add,
@@ -329,17 +373,41 @@ impl RuleForm {
     /// the expectation back out of the editable fields would make it
     /// agree with any change they typed, which is the whole thing the
     /// writer checks.
-    pub fn edit(list_id: String, line: usize, domain: String, allow: bool) -> Self {
+    pub fn edit_with_ref(
+        list_id: String,
+        target: BackendRuleRef,
+        domain: String,
+        allow: bool,
+    ) -> Self {
         Self {
             list_id,
             domain: domain.clone(),
             allow,
+            raw_rule: String::new(),
             focused: RuleField::Domain,
             error_message: None,
             mode: RuleFormMode::Edit {
-                line,
+                target,
                 was_domain: domain,
                 was_allow: allow,
+            },
+        }
+    }
+
+    /// Opens a raw replacement form for a non-simple or malformed backend
+    /// row. `target.raw` is captured verbatim for both the field seed and the
+    /// stable row reference carried to `ReplaceRule`.
+    pub fn edit_raw(list_id: String, target: BackendRuleRef) -> Self {
+        Self {
+            list_id,
+            domain: String::new(),
+            allow: false,
+            raw_rule: target.raw.clone(),
+            focused: RuleField::Raw,
+            error_message: None,
+            mode: RuleFormMode::EditRaw {
+                original_raw: target.raw.clone(),
+                target,
             },
         }
     }
@@ -349,11 +417,36 @@ impl RuleForm {
         match &self.mode {
             RuleFormMode::Add => None,
             RuleFormMode::Edit {
-                line,
+                target,
                 was_domain,
                 was_allow,
-            } => Some((*line, was_domain.as_str(), *was_allow)),
+            } => Some((target.line, was_domain.as_str(), *was_allow)),
+            RuleFormMode::EditRaw { target, .. } => Some((target.line, "", false)),
         }
+    }
+
+    pub fn row_ref(&self) -> Option<&str> {
+        match &self.mode {
+            RuleFormMode::Add => None,
+            RuleFormMode::Edit { target, .. } | RuleFormMode::EditRaw { target, .. } => {
+                Some(&target.row_ref)
+            }
+        }
+    }
+
+    pub fn is_raw_edit(&self) -> bool {
+        matches!(&self.mode, RuleFormMode::EditRaw { .. })
+    }
+
+    /// The exact value to hand to `Operation::ReplaceRule` for an edit.
+    /// Raw edits deliberately do no local grammar conversion: modifiers and
+    /// malformed text are daemon-owned syntax, not domain-form input.
+    pub fn replacement_rule(&self) -> Result<String, String> {
+        if self.is_raw_edit() {
+            return Ok(self.raw_rule.clone());
+        }
+        crate::config::custom_list::compose_line(self.domain.trim(), self.allow)
+            .map_err(|error| error.to_string())
     }
 
     /// Whether the form still holds exactly the rule it opened on.
@@ -364,6 +457,9 @@ impl RuleForm {
     /// reports — or cost a daemon reload. A domain the grammar refuses is
     /// never "unchanged": the operator has to see the refusal.
     pub fn is_unchanged(&self) -> bool {
+        if let RuleFormMode::EditRaw { original_raw, .. } = &self.mode {
+            return self.raw_rule == *original_raw;
+        }
         let Some((_, was_domain, was_allow)) = self.replacing() else {
             return false;
         };
@@ -404,14 +500,14 @@ impl RuleForm {
 pub struct RuleRemoveConfirm {
     pub list_id: String,
     pub domain: String,
-    /// Every file line that names this domain, in file order.
+    /// Every backend row that names this domain, in snapshot order.
     ///
     /// **`remove_rule` matches on the domain alone and takes BOTH
     /// directions**, so a domain present as an allow and as a deny loses
     /// two lines to one keystroke. The row under the cursor shows one of
     /// them and nothing on it hints at the other, so the confirm counts
     /// them and says so.
-    pub affected: Vec<(usize, String)>,
+    pub affected: Vec<BackendRuleRef>,
 }
 
 impl RuleRemoveConfirm {
@@ -530,16 +626,27 @@ impl CustomListModal {
         }
     }
 
-    pub fn open_edit_rule(list_id: String, line: usize, domain: String, allow: bool) -> Self {
+    pub fn open_edit_rule_ref(
+        list_id: String,
+        target: BackendRuleRef,
+        domain: String,
+        allow: bool,
+    ) -> Self {
         Self {
-            stage: Stage::AddingRule(RuleForm::edit(list_id, line, domain, allow)),
+            stage: Stage::AddingRule(RuleForm::edit_with_ref(list_id, target, domain, allow)),
+        }
+    }
+
+    pub fn open_edit_raw_rule(list_id: String, target: BackendRuleRef) -> Self {
+        Self {
+            stage: Stage::AddingRule(RuleForm::edit_raw(list_id, target)),
         }
     }
 
     pub fn open_remove_rule(
         list_id: String,
         domain: String,
-        affected: Vec<(usize, String)>,
+        affected: Vec<BackendRuleRef>,
     ) -> Self {
         Self {
             stage: Stage::ConfirmingRuleRemove(RuleRemoveConfirm {
@@ -616,12 +723,10 @@ fn mount_spec(picker: &MountPicker) -> NoticeSpec {
             error: None,
             hint: String::new(),
             keys: "[Esc] close".to_string(),
-            actions: vec![Action::new(
-                "  [Esc] Close  ",
-                false,
-                ActionKind::Neutral,
-                "",
-            )],
+            actions: vec![
+                Action::new("  [Esc] Close  ", false, ActionKind::Neutral, "")
+                    .on_key(crossterm::event::KeyCode::Esc),
+            ],
         };
     }
 
@@ -652,7 +757,7 @@ fn mount_spec(picker: &MountPicker) -> NoticeSpec {
                 } else {
                     ValueKind::Identity
                 },
-                focused: i == picker.cursor,
+                focused: picker.focus == MountFocus::Profiles && i == picker.cursor,
                 note: None,
             }
         })
@@ -670,14 +775,26 @@ fn mount_spec(picker: &MountPicker) -> NoticeSpec {
         choices,
         error: picker.error.clone(),
         hint: if staged == 0 {
-            "nothing staged — Enter writes nothing".to_string()
+            "nothing staged — Tab reaches Discard / Apply".to_string()
         } else {
-            format!("{staged} profile(s) will be rewritten on Enter")
+            format!("{staged} profile(s) will be rewritten by Apply")
         },
-        keys: "[Space] toggle   [Enter] save   [Esc] discard".to_string(),
+        keys: "[Tab] rows / Discard / Apply   [Space / Enter] toggle".to_string(),
         actions: vec![
-            Action::new("  [Esc] Discard  ", false, ActionKind::Neutral, ""),
-            Action::new("  [Enter] Save  ", false, ActionKind::Primary, ""),
+            Action::new(
+                "  [Esc] Discard  ",
+                picker.focus == MountFocus::Discard,
+                ActionKind::Neutral,
+                "",
+            )
+            .on_key(crossterm::event::KeyCode::Esc),
+            Action::new(
+                "  [Enter] Apply  ",
+                picker.focus == MountFocus::Apply,
+                ActionKind::Primary,
+                "",
+            )
+            .on_save(),
         ],
     }
 }
@@ -693,7 +810,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
     const W: u16 = 64;
     match &modal.stage {
         Stage::EditingForm(form) => {
-            let render = modal_form::render_modal(f, anchor, W, |w| form_body(form, w));
+            let render = modal_form::render_modal(f, anchor, 68, |w| form_body(form, w));
             if let Some((row, caret)) = render.cursor {
                 render.place_cursor(f, row, modal_form::VALUE_COL as u16 + caret);
             }
@@ -707,7 +824,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
             let render =
                 modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
             if !rc.is_refused() {
-                render.place_cursor(f, idx, 2 + rc.typed.chars().count() as u16);
+                render.place_cursor(f, idx, rc.typed.chars().count() as u16);
             }
         }
         Stage::AddingRule(form) => {
@@ -728,6 +845,9 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
 }
 
 fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
+    if form.is_raw_edit() {
+        return raw_rule_body(form, width);
+    }
     let focus = form.focused;
     let replacing = form.replacing();
     let verb = if replacing.is_some() { "Edit" } else { "Add" };
@@ -749,16 +869,21 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
         rule_hint(RuleField::Domain, replacing.is_some()),
         form.domain.chars().count() as u16,
     );
-    rows.line(modal_form::value_row(
-        "direction",
-        form.direction_label(),
-        focus == RuleField::Direction,
-        // Not `Editable`: this is a two-value toggle, not a text field, and
-        // the hint names the keys that change it.
-        ValueKind::Identity,
-        Some("Left/Right toggles"),
-        width,
-    ));
+    let direction = focus == RuleField::Direction;
+    rows.field(
+        modal_form::value_row(
+            "direction",
+            form.direction_label(),
+            direction,
+            // Not `Editable`: this is a two-value toggle, not a text field,
+            // and the hint names the keys that change it.
+            ValueKind::Identity,
+            Some("Left/Right toggles"),
+            width,
+        ),
+        direction,
+        rule_hint(RuleField::Direction, replacing.is_some()),
+    );
     rows.spacer();
 
     // **The exact line, before it is written.** The grammar admits two
@@ -786,7 +911,8 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
             focus == RuleField::Cancel,
             ActionKind::Neutral,
             rule_hint(RuleField::Cancel, edit),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             if edit {
                 "  [Enter] Save  "
@@ -796,12 +922,71 @@ fn rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(us
             focus == RuleField::Submit,
             ActionKind::Primary,
             rule_hint(RuleField::Submit, edit),
-        ),
+        )
+        .on_save(),
     ];
     let tail = modal_form::form_tail(
         &rows,
         form.error_message.as_deref(),
         rule_hint(focus, edit),
+        KEYS,
+        &actions,
+    );
+    rows.finish(tail)
+}
+
+fn raw_rule_body(form: &RuleForm, width: u16) -> (modal_form::ScrollBody, Option<(usize, u16)>) {
+    let focus = form.focused;
+    let line = form
+        .replacing()
+        .map(|(line, _, _)| line)
+        .unwrap_or_default();
+    let title = format!("Edit raw rule · {}", form.list_id);
+    let mut rows = modal_form::FormRows::new(&title, "verbatim operator-rule source", width);
+    rows.section("Rule source");
+    let raw = focus == RuleField::Raw;
+    rows.text_field(
+        modal_form::value_row(
+            "rule",
+            &form.raw_rule,
+            raw,
+            ValueKind::Editable,
+            Some("backend grammar; retained verbatim"),
+            width,
+        ),
+        raw,
+        rule_hint(RuleField::Raw, true),
+        form.raw_rule.chars().count() as u16,
+    );
+    rows.spacer();
+    rows.section(&format!("Replaces line {line}"));
+    rows.line(modal_form::state_row(
+        "row reference",
+        form.row_ref().unwrap_or_default(),
+        ValueKind::Identity,
+        "",
+        width,
+    ));
+    let actions = [
+        Action::new(
+            "  [Esc] Discard  ",
+            focus == RuleField::Cancel,
+            ActionKind::Neutral,
+            rule_hint(RuleField::Cancel, true),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
+        Action::new(
+            "  [Enter] Save  ",
+            focus == RuleField::Submit,
+            ActionKind::Primary,
+            rule_hint(RuleField::Submit, true),
+        )
+        .on_save(),
+    ];
+    let tail = modal_form::form_tail(
+        &rows,
+        form.error_message.as_deref(),
+        rule_hint(focus, true),
         KEYS,
         &actions,
     );
@@ -816,6 +1001,7 @@ fn rule_hint(f: RuleField, edit: bool) -> &'static str {
     match f {
         RuleField::Domain => "a bare domain — no wildcard, no regex, no path",
         RuleField::Direction => "deny blocks it; allow exempts it from every list",
+        RuleField::Raw => "verbatim backend rule source; the daemon validates it",
         RuleField::Submit if edit => "Enter replaces that line and nothing else",
         RuleField::Submit => "Enter appends the line to the end of the file",
         RuleField::Cancel => "discard and close (also Esc)",
@@ -836,8 +1022,12 @@ pub fn rule_remove_notice(rc: &RuleRemoveConfirm) -> NoticeSpec {
             "{} lines name this domain, in BOTH directions:",
             rc.affected.len()
         )));
-        for (n, raw) in &rc.affected {
-            prose.push(ProseRow::plain(format!("  line {n}: {}", raw.trim())));
+        for target in &rc.affected {
+            prose.push(ProseRow::plain(format!(
+                "  line {}: {}",
+                target.line,
+                target.raw.trim()
+            )));
         }
         prose.push(ProseRow::plain(
             "all of them go — removal matches the domain, not the direction.".to_string(),
@@ -860,14 +1050,16 @@ pub fn rule_remove_notice(rc: &RuleRemoveConfirm) -> NoticeSpec {
         hint: "the rest of the file keeps its order and its comments".to_string(),
         keys: "[y] confirm   [n / Esc] cancel".to_string(),
         actions: vec![
-            Action::new("  [n] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Remove  ", false, ActionKind::Destructive, ""),
+            Action::new("  [n] Cancel  ", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  [y] Remove  ", false, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
 }
 
 fn band_text(form: &Form) -> (String, String) {
-    let desc = "a rule file you write yourself — allow and deny together".to_string();
+    let desc = "Identity & Description".to_string();
     match form.mode {
         FormMode::Add => ("Add custom list".to_string(), desc),
         FormMode::Edit => (format!("Edit custom list \u{b7} {}", form.id), desc),
@@ -880,7 +1072,6 @@ fn form_body(form: &Form, width: u16) -> (modal_form::ScrollBody, Option<(usize,
     let (title, desc) = band_text(form);
     let mut rows = modal_form::FormRows::new(&title, &desc, width);
 
-    rows.section("Identity");
     if form.mode == FormMode::Add {
         let f = focus == FormField::Id;
         rows.text_field(
@@ -923,22 +1114,6 @@ fn form_body(form: &Form, width: u16) -> (modal_form::ScrollBody, Option<(usize,
         field_hint(FormField::DisplayName),
         chars(&form.display_name),
     );
-    rows.spacer();
-
-    rows.section("File");
-    // Stated and unreachable. Derived from the id and never configured,
-    // which is what makes a traversal, a symlink and two lists sharing one
-    // file unrepresentable instead of merely refused.
-    rows.line(modal_form::state_row(
-        "path",
-        &form.pack_path_preview(),
-        ValueKind::Identity,
-        "",
-        width,
-    ));
-    rows.spacer();
-
-    rows.section("Note");
     let de = focus == FormField::Description;
     rows.text_field(
         modal_form::value_row(
@@ -954,26 +1129,38 @@ fn form_body(form: &Form, width: u16) -> (modal_form::ScrollBody, Option<(usize,
         chars(&form.description),
     );
 
+    rows.spacer();
+    rows.line(modal_form::prose_row(
+        &ProseRow::plain(format!("Path          {}", form.pack_path_preview())),
+        width,
+    ));
+
     let actions = [
         Action::new(
             "  [Esc] Discard  ",
             focus == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             "  [Enter] Save  ",
             focus == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
 
-    let tail = modal_form::form_tail(
+    let tail = modal_form::form_tail_with_note(
         &rows,
+        modal_form::TailNote {
+            rows: 2,
+            banded: false,
+        },
         form.error_message.as_deref(),
         field_hint(focus),
-        KEYS,
+        "",
         &actions,
     );
     rows.finish(tail)
@@ -1013,12 +1200,10 @@ pub fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
             error: None,
             hint: "removing a mounted list would change what those profiles filter".to_string(),
             keys: "[Esc] close".to_string(),
-            actions: vec![Action::new(
-                "  [Esc] Close  ",
-                false,
-                ActionKind::Neutral,
-                "",
-            )],
+            actions: vec![
+                Action::new("  [Esc] Close  ", false, ActionKind::Neutral, "")
+                    .on_key(crossterm::event::KeyCode::Esc),
+            ],
         };
     }
     NoticeSpec {
@@ -1038,11 +1223,13 @@ pub fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
         ],
         choices: Vec::new(),
         error: None,
-        hint: "the pack file stays on disk; only the declaration goes".to_string(),
+        hint: "the declaration and pack file, including all its rules, will be deleted".to_string(),
         keys: "[Enter] confirm   [Esc] cancel".to_string(),
         actions: vec![
-            Action::new("  [Esc] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [Enter] Remove  ", false, ActionKind::Destructive, ""),
+            Action::new("  [Esc] Cancel  ", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  [Enter] Remove  ", false, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Enter),
         ],
     }
 }
@@ -1211,11 +1398,9 @@ mod tests {
         assert!(rc.confirmed());
     }
 
-    /// The unmounted gate says the file survives, because it does — and an
-    /// operator who expects the rules gone would otherwise be surprised
-    /// the next time they create a list with the same id.
+    /// The unmounted gate names both objects removed by confirmation.
     #[test]
-    fn the_removal_gate_says_the_pack_file_stays() {
+    fn the_removal_gate_says_the_pack_file_is_deleted() {
         let rc = RemoveConfirm {
             id: "tv".to_string(),
             display_name: String::new(),
@@ -1225,7 +1410,7 @@ mod tests {
         };
         let spec = remove_notice(&rc);
         assert!(
-            spec.hint.contains("stays on disk"),
+            spec.hint.contains("pack file") && spec.hint.contains("will be deleted"),
             "got hint: {}",
             spec.hint
         );
@@ -1282,7 +1467,17 @@ mod tests {
     }
 
     fn edit_form(domain: &str, allow: bool) -> RuleForm {
-        RuleForm::edit("videogames".to_string(), 7, domain.to_string(), allow)
+        RuleForm::edit_with_ref(
+            "videogames".to_string(),
+            BackendRuleRef {
+                row_ref: "rule-7".to_string(),
+                line: 7,
+                raw: crate::config::custom_list::compose_line(domain, allow)
+                    .expect("fixture rule must compose"),
+            },
+            domain.to_string(),
+            allow,
+        )
     }
 
     /// The form opens on the rule under the cursor, and keeps what it was
@@ -1293,12 +1488,38 @@ mod tests {
         assert_eq!(f.domain, "tracking.example.com");
         assert!(!f.allow);
         assert_eq!(f.replacing(), Some((7, "tracking.example.com", false)));
+        assert_eq!(f.row_ref(), Some("rule-7"));
 
         // Editing the fields must not move the expectation: it is what the
         // writer checks the file against.
         f.domain = "other.example.com".to_string();
         f.allow = true;
         assert_eq!(f.replacing(), Some((7, "tracking.example.com", false)));
+    }
+
+    #[test]
+    fn raw_edit_preserves_backend_syntax_and_mutates_by_stable_ref() {
+        let target = BackendRuleRef {
+            row_ref: "videogames:r1:9:hash".to_string(),
+            line: 9,
+            raw: "@@||tracking.example.com^$important".to_string(),
+        };
+        let mut form = RuleForm::edit_raw("videogames".to_string(), target);
+        assert!(form.is_raw_edit());
+        assert_eq!(form.focused, RuleField::Raw);
+        assert_eq!(form.row_ref(), Some("videogames:r1:9:hash"));
+        assert_eq!(
+            form.replacement_rule().as_deref(),
+            Ok("@@||tracking.example.com^$important")
+        );
+        assert!(form.is_unchanged());
+
+        form.raw_rule = "||tracking.example.com^$important".to_string();
+        assert!(!form.is_unchanged());
+        assert_eq!(
+            form.replacement_rule().as_deref(),
+            Ok("||tracking.example.com^$important")
+        );
     }
 
     #[test]
@@ -1345,20 +1566,24 @@ mod tests {
     /// every handler test.
     #[test]
     fn the_edit_body_shows_the_seeded_rule_and_the_line_it_replaces() {
-        let modal = CustomListModal::open_edit_rule(
+        let modal = CustomListModal::open_edit_rule_ref(
             "videogames".to_string(),
-            7,
+            BackendRuleRef {
+                row_ref: "rule-7".to_string(),
+                line: 7,
+                raw: "@@||d.example.com^".to_string(),
+            },
             "d.example.com".into(),
             true,
         );
         let out = render(&modal, 80, 30);
 
-        assert!(out.contains("Edit rule"), "title must say edit:\n{out}");
+        assert!(out.contains("EDIT RULE"), "title must say edit:\n{out}");
         assert!(
-            !out.contains("Add rule"),
+            !out.contains("ADD RULE"),
             "the add title must be gone:\n{out}"
         );
-        assert!(out.contains("videogames"), "the list must be named:\n{out}");
+        assert!(out.contains("VIDEOGAMES"), "the list must be named:\n{out}");
         assert!(
             out.contains("d.example.com"),
             "the domain must be seeded:\n{out}"
@@ -1378,14 +1603,28 @@ mod tests {
             out.contains("REPLACES LINE 7"),
             "the file line being replaced must be stated:\n{out}"
         );
-        assert!(
-            out.contains("[Enter] Save"),
-            "the action must not read Add:\n{out}"
-        );
+        assert!(out.contains("Save"), "the action must not read Add:\n{out}");
         assert!(
             !out.contains("APPENDS"),
             "an edit must not promise an append:\n{out}"
         );
+    }
+
+    #[test]
+    fn raw_edit_body_labels_verbatim_source_and_the_stable_target() {
+        let modal = CustomListModal::open_edit_raw_rule(
+            "videogames".to_string(),
+            BackendRuleRef {
+                row_ref: "videogames:r1:9:hash".to_string(),
+                line: 9,
+                raw: "@@||tracking.example.com^$important".to_string(),
+            },
+        );
+        let out = render(&modal, 80, 30);
+        assert!(out.contains("EDIT RAW RULE"), "{out}");
+        assert!(out.contains("tracking.example.com^$important"), "{out}");
+        assert!(out.contains("row reference"), "{out}");
+        assert!(out.contains("REPLACES LINE 9"), "{out}");
     }
 
     /// The add body is the same form, and must keep saying what IT does.
@@ -1393,9 +1632,9 @@ mod tests {
     fn the_add_body_still_promises_an_append() {
         let modal = CustomListModal::open_add_rule("videogames".to_string());
         let out = render(&modal, 80, 30);
-        assert!(out.contains("Add rule"), "{out}");
+        assert!(out.contains("ADD RULE"), "{out}");
         assert!(out.contains("APPENDS"), "{out}");
-        assert!(out.contains("[Enter] Add"), "{out}");
+        assert!(out.contains("Add"), "{out}");
         assert!(!out.contains("REPLACES LINE"), "{out}");
     }
 }

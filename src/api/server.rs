@@ -1,7 +1,7 @@
 //! REST API HTTP/HTTPS server.
 //!
 //! Spawns an axum server on the configured listen address.
-//! Uses plain HTTP for loopback, TLS (via axum-server + rustls) for non-loopback.
+//! Uses the configured TLS pair, including on loopback; plain HTTP is loopback-only.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub async fn spawn_api_server(
     let router = build_router(state, config.metrics_enabled);
 
     if let (Some(cert), Some(key)) = (config.tls_cert.as_ref(), config.tls_key.as_ref()) {
-        // TLS mode
+        crate::upstream::install_ring_crypto_provider_once();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| anyhow::anyhow!("failed to load TLS config: {e}"))?;
@@ -119,7 +119,6 @@ mod tests {
     /// logged "REST API listening" with no listener behind it.
     #[tokio::test]
     async fn tls_bind_failure_reaches_the_caller() {
-        crate::upstream::install_ring_crypto_provider_once();
         let (_holder, addr) = occupied_addr();
         let (cert, key) = self_signed_pair("tls-inuse");
 

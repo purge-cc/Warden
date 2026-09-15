@@ -18,7 +18,7 @@
 //! ## Fence note (see REPORT.md)
 //!
 //! The async submit path here calls `super::poll_active_leaf` and
-//! `super::load_v1_config` — private free functions defined at the
+//! `super::load_current_config` — private free functions defined at the
 //! `crate::tui` module root. Rust's privacy rules make module-private
 //! items visible to descendant modules, and `rule_add_modal` is a
 //! descendant of `tui`, so this is a legal, ordinary same-crate call —
@@ -54,11 +54,6 @@ pub const ADD_RULE_HINT_1: &str =
 /// Placeholder shown in the Domain field before the operator types
 /// anything.
 pub const DOMAIN_PLACEHOLDER: &str = "(type a domain, e.g. ads.example.com)";
-/// Rules-tab empty-state lead hint (DoD: "leads with `[a] add rule`").
-/// Rendered ahead of the Query Log / CLI secondary hints in
-/// `tabs::rules::render_empty_state`.
-pub const RULES_EMPTY_ADD_HINT: &str = "  [a] add rule — create one directly from this tab.";
-
 // ── modal state ───────────────────────────────────────────────────────
 
 /// Tab-cycle focus targets in [`RuleAddModal`]. Mirrors
@@ -261,84 +256,68 @@ pub async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config
 /// active leaf so the new row shows up in the table on the very next
 /// frame, then requests the daemon reload (HR2 single shared reload).
 async fn submit(app: &mut App, mut modal: RuleAddModal, poller: &IpcPoller, config_path: &Path) {
-    use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
     use crate::cli::commands::rules::{
         add_inner, Action as CliAction, ChangeOutcome, NoOpReason, Scope,
     };
-
     let (domain, rule_action, scope_choice) = match build_submit_payload(&modal) {
         Ok(payload) => payload,
-        Err(e) => {
-            modal.error_message = Some(e);
+        Err(error) => {
+            modal.error_message = Some(error);
             app.rules.add_modal = Some(modal);
             return;
         }
     };
-    let cli_action = match rule_action {
-        RuleAction::Allow => CliAction::Allow,
-        RuleAction::Block => CliAction::Deny,
-    };
-    let scope_id: String = match &scope_choice {
-        ScopeChoice::Default => String::new(),
-        ScopeChoice::Profile(id) | ScopeChoice::Device(id) => id.clone(),
-    };
-    let scope = match &scope_choice {
-        ScopeChoice::Default => Scope::Default,
-        ScopeChoice::Profile(_) => Scope::Profile(scope_id.as_str()),
-        ScopeChoice::Device(_) => Scope::Device(scope_id.as_str()),
-    };
-
-    // `add_inner` is synchronous and there is no yield point before it, so a
-    // progress flag set here could never be drawn — the event loop cannot
-    // deliver a key or paint a frame during a bare synchronous call.
-    // Kept inline deliberately: this is a config-sized write plus a
-    // validator pass, not the seconds a tar.gz of the config tree costs —
-    // the two surfaces that DID need the blocking pool are the
-    // backup/restore flows.
-    let outcome = add_inner(config_path, scope, cli_action, &domain, None, None);
-
-    match outcome {
-        Ok(ChangeOutcome::Applied(report)) => {
-            app.rules.add_modal = None;
-            app.status_ok(format!(
-                "{}: rule '{}' added",
-                cli_action.slug(),
-                report.rule_id
-            ));
-            app.loaded_config = super::load_v1_config(config_path);
-            super::poll_active_leaf(app, poller).await;
-            let reload_outcome = attempt_reload(poller.socket_path()).await;
-            match reload_outcome {
-                ReloadOutcome::Reloaded => {}
-                ReloadOutcome::DaemonUnreachable => {
-                    app.status_err(
-                        "rule saved on disk — daemon not running, will activate on next start"
-                            .into(),
-                    );
-                }
-                ReloadOutcome::NoToken { .. } => {
-                    app.status_err(
-                        "rule saved on disk but no admin token is available to request a reload"
-                            .into(),
-                    );
-                }
-                ReloadOutcome::ReloadFailed(msg) => {
-                    app.status_err(format!("rule saved but daemon rejected reload: {msg}"));
+    app.rules.add_modal = Some(modal);
+    super::actions::start_disk(
+        app,
+        super::actions::Surface::RuleAdd,
+        "Saving rule",
+        config_path,
+        poller,
+        move |path| {
+            let action = match rule_action {
+                RuleAction::Allow => CliAction::Allow,
+                RuleAction::Block => CliAction::Deny,
+            };
+            let scope = match &scope_choice {
+                ScopeChoice::Default => Scope::Default,
+                ScopeChoice::Profile(id) => Scope::Profile(id),
+                ScopeChoice::Device(id) => Scope::Device(id),
+            };
+            match add_inner(path, scope, action, &domain, None, None) {
+                Ok(ChangeOutcome::Applied(report)) => (
+                    Ok(format!(
+                        "{}: rule '{}' added",
+                        action.slug(),
+                        report.rule_id
+                    )),
+                    true,
+                ),
+                Ok(ChangeOutcome::NoOp(NoOpReason::AlreadyPresent { rule_id })) => (
+                    Ok(format!(
+                        "{} rule already present (id: {rule_id}) — no-op",
+                        action.slug()
+                    )),
+                    false,
+                ),
+                Err(e) => (Err(format!("add failed: {e}")), false),
+            }
+        },
+        |app, attached, result| {
+            if attached {
+                match &result.result {
+                    Ok(_) => app.rules.add_modal = None,
+                    Err(error) => {
+                        if let Some(modal) = app.rules.add_modal.as_mut() {
+                            modal.error_message = Some(error.clone());
+                        }
+                    }
                 }
             }
-        }
-        Ok(ChangeOutcome::NoOp(NoOpReason::AlreadyPresent { rule_id })) => {
-            app.rules.add_modal = None;
-            app.status_ok(format!(
-                "{} rule already present (id: {rule_id}) — no-op",
-                cli_action.slug()
-            ));
-        }
-        Err(e) => {
-            modal.error_message = Some(format!("add failed: {e}"));
-            app.rules.add_modal = Some(modal);
-        }
-    }
+            super::actions::report(app, result, "rule");
+        },
+    )
+    .await;
 }
 
 // ── render (Archetype F) ────────────────────────────────────────────────
@@ -488,8 +467,9 @@ fn form_body(modal: &RuleAddModal, width: u16) -> (modal_form::ScrollBody, Optio
     // way to close this modal would appear nowhere on screen. Pinned by
     // `esc_and_enter_are_discoverable_without_focus`.
     let actions = [
-        Action::new("  [Esc] Discard  ", false, ActionKind::Neutral, ""),
-        Action::new("  [Enter] Save  ", false, ActionKind::Primary, ""),
+        Action::new("  [Esc] Discard  ", false, ActionKind::Neutral, "")
+            .on_key(crossterm::event::KeyCode::Esc),
+        Action::new("  [Enter] Save  ", false, ActionKind::Primary, "").on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -763,7 +743,7 @@ mod tests {
         m.domain = "ads.example.com".into();
         let content = render_overlay_in(&m, 80, 24);
 
-        assert!(content.contains("Add rule"), "title missing");
+        assert!(content.contains("ADD RULE"), "title missing");
         assert!(content.contains(LABEL_DOMAIN), "domain label missing");
         assert!(content.contains(LABEL_ACTION), "action label missing");
         assert!(content.contains(LABEL_SCOPE), "scope label missing");
@@ -808,10 +788,7 @@ mod tests {
             dump.contains("\u{2039} default \u{203a}"),
             "the focused scope row is off-screen:\n{dump}"
         );
-        assert!(
-            dump.contains('\u{25c0}'),
-            "the focus marker must be on screen with the action row:\n{dump}"
-        );
+        assert!(!dump.contains('\u{25c0}') && !dump.contains('\u{258c}'));
         assert!(
             !dump.contains(LABEL_DOMAIN),
             "a 3-row viewport cannot be showing both ends of the form:\n{dump}"
@@ -927,6 +904,13 @@ mod tests {
             "cursor must sit just past the typed value, got column {} on {row:?}",
             pos.x
         );
+        let value_x = pos.x - "ads.example.com".len() as u16;
+        assert_eq!(
+            term.backend().buffer()[(value_x, pos.y)].bg,
+            crate::tui::theme::T.info,
+            "the editable value under the cursor carries the focus highlight"
+        );
+        assert!(!row.contains('\u{25c0}') && !row.contains('\u{258c}'));
         assert!(
             !dump.contains("ads.example.com_"),
             "the `_` caret is the cursor's job"
@@ -981,25 +965,17 @@ mod tests {
     }
 
     #[test]
-    fn esc_and_enter_are_discoverable_without_focus() {
-        // The pre-migration form carried two hint lines; Archetype F's
-        // tail carries one, and the one it carries (`ADD_RULE_HINT_1`)
-        // does not mention Esc or Enter. Neither action is a Tab target,
-        // so neither can advertise its key by being focused. If the
-        // labels lose their keys, the only way to save or close this
-        // modal appears nowhere on screen — which is precisely the
-        // class of silent operator-facing loss this test exists to
-        // prevent.
-        //
-        // Was `esc_and_ctrl_s_are_discoverable_without_focus`: the
-        // advertised save key moved from Ctrl+s to Enter (still on the
-        // button, since focus still never reaches it) and Ctrl+s itself
-        // dropped off this surface — it still works, but is kept to one
-        // mention on the modal, and the global footer owns that
-        // mention now, not this overlay.
+    fn compact_actions_and_navigation_legend_remain_visible() {
         let dump = render_overlay_in(&blank_modal(), 80, 24);
-        assert!(dump.contains("Esc"), "no way to discard is shown:\n{dump}");
-        assert!(dump.contains("Enter"), "no way to save is shown:\n{dump}");
+        assert!(
+            dump.contains("Discard"),
+            "discard action is hidden:\n{dump}"
+        );
+        assert!(dump.contains("Save"), "save action is hidden:\n{dump}");
+        assert!(
+            dump.contains("Tab/↑↓ move"),
+            "navigation legend is hidden:\n{dump}"
+        );
     }
 
     // `submitting`/`status_message` and

@@ -1,7 +1,7 @@
 //! Frozen strings for the Log Messages tab (`Leaf::Logs`).
 //!
-//! Pins the N13 filter-card prompts and — the ones that matter — the two
-//! empty states. "Nothing was captured" and "nothing matched your filter"
+//! Pins the shared filter labels and the distinct empty states.
+//! "Nothing was captured" and "nothing matched your filter"
 //! are different facts about the daemon, and an operator who reads the
 //! wrong one concludes the tab is broken when it is merely filtered. A
 //! reword that collapses them into one sentence is the regression this
@@ -13,11 +13,11 @@
 //! module's visibility to suit a test is a worse trade than reading the
 //! source.
 
-const SEARCH_PROMPT: &str = "Search [/]: ";
-const LEVEL_PROMPT: &str = "   Level [f]: ";
-const CLEAR_HINT: &str = "   [R] clear";
+const SEARCH_LABEL: &str = "Search";
+const LEVEL_LABEL: &str = "Level";
+const CLEAR_LABEL: &str = "Clear";
 const NO_MESSAGES: &str = "  (no messages captured yet)";
-const NO_MATCHES: &str = "  (no messages match the current filter — [R] clears)";
+const NO_MATCHES: &str = "  (no messages match the current filters — use Clear)";
 const WAITING: &str = "  (waiting for the daemon…)";
 const UNREADABLE: &str = "  (could not read the daemon's log buffer — see the footer)";
 
@@ -35,10 +35,34 @@ fn pinned(name: &str, value: &str) {
 }
 
 #[test]
-fn filter_card_prompts_are_frozen() {
-    pinned("SEARCH_PROMPT", SEARCH_PROMPT);
-    pinned("LEVEL_PROMPT", LEVEL_PROMPT);
-    pinned("CLEAR_HINT", CLEAR_HINT);
+fn filter_chip_labels_and_shortcuts_are_frozen() {
+    let chips = include_str!("../src/tui/filter_chips.rs")
+        .split_once("Leaf::Logs => vec![")
+        .expect("Logs must use the shared filter chip model")
+        .1
+        .split_once("],")
+        .expect("Logs chip model must be a complete list")
+        .0;
+    for label in [SEARCH_LABEL, LEVEL_LABEL, CLEAR_LABEL] {
+        assert!(chips.contains(&format!("\"{label}\"")));
+    }
+    assert!(logs_src().contains("crate::tui::filter_chips::render_card("));
+
+    let help = include_str!("../src/tui/help.rs")
+        .split_once("Leaf::Logs => vec![")
+        .expect("Logs must have contextual filter help")
+        .1
+        .split_once("],")
+        .expect("Logs help must be a complete list")
+        .0;
+    assert!(help.contains("key: \"f\""));
+    assert!(help.contains("Focus filters; Tab/arrows move, Enter opens, Delete clears"));
+    for retired in ["key: \"/\"", "key: \"R\""] {
+        assert!(
+            !help.contains(retired),
+            "Logs help must not restore the retired shortcut {retired}"
+        );
+    }
 }
 
 #[test]
@@ -60,8 +84,8 @@ fn the_four_empty_states_are_frozen_and_mutually_distinct() {
         }
     }
     assert!(
-        NO_MATCHES.contains("[R]"),
-        "the filtered empty state must name the key that clears the filter"
+        NO_MATCHES.contains("use Clear"),
+        "the filtered empty state must name the visible action that clears the filters"
     );
     assert!(
         !WAITING.contains("no messages") && !UNREADABLE.contains("no messages"),

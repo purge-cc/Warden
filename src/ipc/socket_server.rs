@@ -22,7 +22,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::dns::cache::DnsCache;
-use crate::filter::engine::FilterResult;
 use crate::filter::FilterEngine;
 use crate::lists::status::{BlocklistStatusDto, ListStatusRegistry};
 use crate::profiles::ProfileResolver;
@@ -33,14 +32,15 @@ use crate::{
     },
     config::{
         loader::load_config_for_schema_under_guard,
-        schema::SCHEMA_VERSION_V1,
+        schema::TARGET_SCHEMA_VERSION_V5,
         write_lock::{acquire_for_write, ConfigWriteLock},
     },
 };
 
 use super::errors::{ipc_error, IpcError};
 use super::protocol::{
-    CommandTier, IpcCommand, IpcNotification, IpcResponse, LocalRecordsHitEntry,
+    CommandTier, CustomListsReadRequest, CustomListsReadResponse, IpcCommand, IpcNotification,
+    IpcResponse, LocalRecordsHitEntry, OPERATOR_RULES_MAX_BYTES,
 };
 use crate::auth::token::verify_token;
 
@@ -92,11 +92,12 @@ pub struct DaemonState {
     pub upstream_mode: String,
     pub upstream_count: usize,
     /// Per-server upstream list (primary then fallback),
-    /// precomputed at boot from `config.upstream.server_list()`. Surfaced
-    /// verbatim on `IpcResponse::Status` so the TUI / `warden status`
-    /// render the real resolver addresses. Set-once at construction,
-    /// matching the no-reload semantics of `upstream_mode`/`upstream_count`.
+    /// Precomputed boot metadata from `config.upstream.server_list()`. Used
+    /// by `IpcResponse::Status` when no live runtime handle is available.
     pub upstream_servers: Vec<crate::ipc::protocol::UpstreamServerInfo>,
+    /// Live upstream resolver state used by status responses when available.
+    /// `None` is retained for compatibility with lightweight test fixtures.
+    pub upstream_runtime: Option<Arc<crate::upstream::ReloadableUpstream>>,
     pub list_count: usize,
     pub started_at: Instant,
     /// Sender to trigger shutdown from IPC. Payload carries the invoker
@@ -217,6 +218,9 @@ pub struct DaemonState {
     /// the snapshot as `None` — IPC just reports
     /// `resource_budget: None` in that case.
     pub resource_budget_store: crate::resource_budget::ResourceBudgetStore,
+    /// Process-wide operator-rule job client shared with the REST adapter.
+    /// Transport limits are selected by each adapter at the call site.
+    pub operator_rule_jobs: Option<crate::api::operator_rule_jobs::OperatorRuleJobClient>,
     /// Shared cluster observability handle. `handle_cluster_status`
     /// reads role / generations / hashes, the secondary's poll telemetry, and
     /// the primary's peer roster from here. `Some` only on an enabled cluster
@@ -225,6 +229,9 @@ pub struct DaemonState {
     /// Behind the `cluster` feature so the default `DaemonState` is unchanged.
     #[cfg(feature = "cluster")]
     pub cluster_observe: Option<Arc<crate::cluster::ClusterObserve>>,
+    /// Durable local node operations, present even before membership exists.
+    #[cfg(feature = "cluster")]
+    pub node_controller: Option<Arc<crate::cluster::node_control::NodeController>>,
 }
 
 /// Bind the IPC socket and start the accept loop. Returns the JoinHandle.
@@ -569,6 +576,87 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 /// so memory is bounded before allocation, not checked after.
 const MAX_COMMAND_SIZE: u64 = 65_536;
 
+fn validate_operator_rules_wire(line: &str) -> Option<Result<(), &'static str>> {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str(line) else {
+        return None;
+    };
+    let kind = object.get("type").and_then(serde_json::Value::as_str)?;
+    let allowed: &[&str] = match kind {
+        "operator_rules_capabilities" | "custom_lists_metadata" => &["type"],
+        "custom_lists_read" | "custom_list_export_chunk" => &["type", "request", "token"],
+        "operator_rules_plan" => &["type", "request", "plan_ref", "cursor", "limit", "token"],
+        "operator_rules_apply" => &["type", "plan_ref", "plan_hash", "request_id", "token"],
+        "operator_rules_replay" => &["type", "request", "token"],
+        "operator_rules_operation" => &["type", "operation_id", "token"],
+        _ => return None,
+    };
+    fn contains_authority(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.contains_key("actor")
+                    || object.contains_key("limits")
+                    || object.values().any(contains_authority)
+            }
+            serde_json::Value::Array(values) => values.iter().any(contains_authority),
+            _ => false,
+        }
+    }
+
+    if contains_authority(&serde_json::Value::Object(object.clone())) {
+        return Some(Err(
+            "actor identity and transport limits are server-controlled",
+        ));
+    }
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Some(Err("unknown field in operator-rules request"));
+    }
+    Some(Ok(()))
+}
+
+enum DecodeIpcError {
+    OperatorRules(&'static str),
+    InvalidCommand,
+}
+
+impl DecodeIpcError {
+    fn into_response(self) -> (IpcResponse, bool) {
+        match self {
+            Self::OperatorRules(message) => (
+                operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+                    crate::operator_rules::ErrorCode::InvalidRequest,
+                    message,
+                )),
+                true,
+            ),
+            Self::InvalidCommand => (ipc_error(IpcError::InvalidCommand), false),
+        }
+    }
+}
+
+fn decode_ipc_command(line: &str) -> Result<IpcCommand, DecodeIpcError> {
+    let validation = validate_operator_rules_wire(line);
+    if let Some(Err(message)) = validation {
+        return Err(DecodeIpcError::OperatorRules(message));
+    }
+    match serde_json::from_str::<IpcCommand>(line) {
+        Ok(command) => Ok(command),
+        Err(error) => {
+            tracing::warn!(
+                target: "ipc.error",
+                error = %error,
+                "invalid IPC command — JSON decode failed"
+            );
+            if validation.is_some() {
+                Err(DecodeIpcError::OperatorRules(
+                    "invalid operator-rules request",
+                ))
+            } else {
+                Err(DecodeIpcError::InvalidCommand)
+            }
+        }
+    }
+}
+
 /// Per-side I/O budget on every IPC connection. Mirrors the
 /// 5-second read timeout (`tokio::time::timeout` around `read_line`)
 /// onto the write + shutdown halves. A slow-loris peer that accepts
@@ -639,23 +727,42 @@ async fn handle_connection(
         return Ok(()); // Client disconnected without sending
     }
 
-    let response = if line.len() as u64 > MAX_COMMAND_SIZE {
-        ipc_error(IpcError::CommandTooLarge)
+    let (response, is_operator_rules) = if line.len() as u64 > MAX_COMMAND_SIZE {
+        (ipc_error(IpcError::CommandTooLarge), false)
     } else {
-        match serde_json::from_str::<IpcCommand>(line.trim()) {
-            Ok(cmd) => dispatch_command(cmd, peer_uid, state).await,
-            Err(e) => {
-                tracing::warn!(
-                    target: "ipc.error",
-                    error = %e,
-                    "invalid IPC command — JSON decode failed"
-                );
-                ipc_error(IpcError::InvalidCommand)
+        let wire = line.trim_end_matches(['\r', '\n']);
+        let is_operator_rules = validate_operator_rules_wire(wire).is_some();
+        if is_operator_rules && wire.len() > OPERATOR_RULES_MAX_BYTES {
+            (
+                operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+                    crate::operator_rules::ErrorCode::TransportLimitExceeded,
+                    "operator-rules request exceeds the 60 KiB IPC limit; use REST",
+                )),
+                true,
+            )
+        } else {
+            match decode_ipc_command(wire) {
+                Ok(cmd) => {
+                    let is_operator_rules = cmd.is_operator_rules();
+                    (
+                        dispatch_command(cmd, peer_uid, state).await,
+                        is_operator_rules,
+                    )
+                }
+                Err(error) => error.into_response(),
             }
         }
     };
 
     let mut resp_json = serde_json::to_string(&response)?;
+    if is_operator_rules && resp_json.len() > OPERATOR_RULES_MAX_BYTES {
+        resp_json = serde_json::to_string(&operator_rules_error(
+            crate::operator_rules::OperatorRulesError::new(
+                crate::operator_rules::ErrorCode::TransportLimitExceeded,
+                "operator-rules response exceeds the 60 KiB IPC limit; use REST",
+            ),
+        ))?;
+    }
     resp_json.push('\n');
     // Bound write_all + shutdown by IPC_WRITE_TIMEOUT so a
     // slow-loris peer cannot pin the handler task. On timeout we drop
@@ -686,14 +793,90 @@ async fn dispatch_command(
     peer_uid: Option<u32>,
     state: &DaemonState,
 ) -> IpcResponse {
-    // Authorization gate.
-    if cmd.tier() != CommandTier::ReadOnly {
+    // Lifecycle bootstrap uses the authenticated local socket owner; it must
+    // work before an API administration credential has been provisioned.
+    #[cfg(feature = "cluster")]
+    let local_node_owner = matches!(
+        cmd,
+        IpcCommand::NodesPreview { .. }
+            | IpcCommand::NodesApply { .. }
+            | IpcCommand::NodesCancel { .. }
+            | IpcCommand::NodeControl { .. }
+    ) && peer_uid == Some(state.daemon_uid);
+    #[cfg(not(feature = "cluster"))]
+    let local_node_owner = false;
+    if cmd.tier() != CommandTier::ReadOnly && !local_node_owner {
         if let Some(err_resp) = auth_error_for(&cmd, peer_uid, state) {
+            if cmd.is_operator_rules() {
+                let message = match err_resp {
+                    IpcResponse::Error { message } => message,
+                    _ => "operator-rules authorization failed".into(),
+                };
+                return operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+                    crate::operator_rules::ErrorCode::AdmissionRejected,
+                    message,
+                ));
+            }
             return err_resp;
         }
     }
 
+    #[cfg(feature = "cluster")]
+    if state
+        .cluster_observe
+        .as_ref()
+        .is_some_and(|observe| observe.role == crate::config::schema::ClusterRole::Secondary)
+        && matches!(
+            cmd,
+            IpcCommand::DeviceAdd { .. }
+                | IpcCommand::DeviceUpdate { .. }
+                | IpcCommand::DeviceRemove { .. }
+                | IpcCommand::DevicePromote { .. }
+                | IpcCommand::ProfileCreate { .. }
+                | IpcCommand::ProfileUpdate { .. }
+                | IpcCommand::ProfileDelete { .. }
+                | IpcCommand::ForgetList { .. }
+                | IpcCommand::OperatorRulesPlan { .. }
+                | IpcCommand::OperatorRulesApply { .. }
+        )
+    {
+        let message = IpcError::PolicyOwnedByPrimary.operator_message();
+        if cmd.is_operator_rules() {
+            return operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+                crate::operator_rules::ErrorCode::PolicyOwnedByPrimary,
+                message,
+            ));
+        }
+        return ipc_error(IpcError::PolicyOwnedByPrimary);
+    }
+
     match cmd {
+        IpcCommand::OperatorRulesCapabilities => handle_operator_rules_capabilities(state),
+        IpcCommand::CustomListsMetadata => handle_custom_lists_metadata(state).await,
+        IpcCommand::CustomListsRead { request, .. } => {
+            handle_custom_lists_read(state, request).await
+        }
+        IpcCommand::CustomListExportChunk { request, .. } => {
+            handle_custom_list_export(state, request).await
+        }
+        IpcCommand::OperatorRulesPlan {
+            request,
+            plan_ref,
+            page,
+            ..
+        } => handle_operator_rules_plan(state, peer_uid, request, plan_ref, page).await,
+        IpcCommand::OperatorRulesApply {
+            plan_ref,
+            plan_hash,
+            request_id,
+            ..
+        } => handle_operator_rules_apply(state, peer_uid, plan_ref, plan_hash, request_id).await,
+        IpcCommand::OperatorRulesReplay { request, .. } => {
+            handle_operator_rules_replay(state, peer_uid, request).await
+        }
+        IpcCommand::OperatorRulesOperation { operation_id, .. } => {
+            handle_operator_rules_operation(state, peer_uid, operation_id).await
+        }
         IpcCommand::Status => handle_status(state).await,
         IpcCommand::Query { domain } => handle_query(&domain, state),
         IpcCommand::CacheFlush { domain, .. } => {
@@ -710,6 +893,7 @@ async fn dispatch_command(
         IpcCommand::QueryLogs {
             limit,
             client,
+            client_ips,
             blocked_only,
             domain,
             since_secs,
@@ -722,6 +906,7 @@ async fn dispatch_command(
                 crate::ipc::protocol::QueryLogRequest {
                     limit,
                     client,
+                    client_ips,
                     blocked_only,
                     domain,
                     since_secs,
@@ -777,6 +962,456 @@ async fn dispatch_command(
         IpcCommand::ProfileDelete { id, .. } => handle_profile_delete(state, id, peer_uid).await,
         #[cfg(feature = "cluster")]
         IpcCommand::ClusterStatus => handle_cluster_status(state),
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodesStatus => handle_nodes_status(state).await,
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodeControl { request, .. } => {
+            let Some(controller) = state.node_controller.as_ref() else {
+                return ipc_error(IpcError::NodeStatusUnavailable);
+            };
+            match controller.handle(request).await {
+                Ok(mut reply) => {
+                    enrich_nodes_runtime(&mut reply.status.membership, state);
+                    IpcResponse::NodeControl {
+                        reply: Box::new(reply),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "ipc.error", code = ?error.code, ?error, "node control request failed");
+                    ipc_error(IpcError::NodeControl(error.code))
+                }
+            }
+        }
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodesPreview { request, .. } => {
+            let Some(path) = state.config_path.as_deref() else {
+                return ipc_error(IpcError::NoConfigPath);
+            };
+            let expected = match node_lifecycle_active_pair(
+                state,
+                matches!(request, crate::cluster::lifecycle::LifecycleRequest::Leave),
+            ) {
+                Ok(expected) => expected,
+                Err(kind) => return ipc_error(kind),
+            };
+            match crate::cluster::lifecycle::preview_with_active_pair(path, request, expected).await
+            {
+                Ok(preview) => IpcResponse::NodesPreview {
+                    preview: Box::new(preview),
+                },
+                Err(error) => nodes_request_error(IpcError::NodePreviewFailed, &error),
+            }
+        }
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodesCancel { preview_id, .. } => {
+            let Some(path) = state.config_path.as_deref() else {
+                return ipc_error(IpcError::NoConfigPath);
+            };
+            let _sequence = state.config_write_lock.lock().await;
+            match crate::cluster::lifecycle::cancel(path, &preview_id).await {
+                Ok(mut result) => {
+                    enrich_nodes_runtime(&mut result.status, state);
+                    IpcResponse::NodesResult {
+                        result: Box::new(result),
+                    }
+                }
+                Err(error) => nodes_request_error(IpcError::NodeCancelFailed, &error),
+            }
+        }
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodesApply { preview_id, .. } => {
+            let Some(path) = state.config_path.as_deref() else {
+                return ipc_error(IpcError::NoConfigPath);
+            };
+            let _sequence = state.config_write_lock.lock().await;
+            let master = path.to_owned();
+            let id = preview_id.clone();
+            let leaving = match tokio::task::spawn_blocking(move || {
+                crate::cluster::lifecycle::preview_operation(&master, &id)
+            })
+            .await
+            {
+                Ok(Ok(operation)) => {
+                    operation == crate::cluster::lifecycle::LifecycleOperation::Leave
+                }
+                Ok(Err(error)) => {
+                    return nodes_request_error(IpcError::NodeApplyFailed, &error);
+                }
+                Err(error) => {
+                    return nodes_request_error(IpcError::NodeApplyFailed, &error);
+                }
+            };
+            let expected = match node_lifecycle_active_pair(state, leaving) {
+                Ok(expected) => expected,
+                Err(kind) => return ipc_error(kind),
+            };
+            match crate::cluster::lifecycle::apply_with_active_pair(path, &preview_id, expected)
+                .await
+            {
+                Ok(mut result) => {
+                    enrich_nodes_runtime(&mut result.status, state);
+                    IpcResponse::NodesResult {
+                        result: Box::new(result),
+                    }
+                }
+                Err(error) => nodes_request_error(IpcError::NodeApplyFailed, &error),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn nodes_request_error(kind: IpcError, error: &impl std::fmt::Debug) -> IpcResponse {
+    tracing::warn!(target: "ipc.error", ?kind, ?error, "node request failed");
+    ipc_error(kind)
+}
+
+#[cfg(feature = "cluster")]
+fn node_lifecycle_active_pair(
+    state: &DaemonState,
+    leaving: bool,
+) -> Result<Option<(crate::cluster::dto::ArtifactIdentity, String)>, IpcError> {
+    let Some(observe) = state
+        .cluster_observe
+        .as_ref()
+        .filter(|observe| leaving && observe.role == crate::config::schema::ClusterRole::Secondary)
+    else {
+        return Ok(None);
+    };
+    let mut status = crate::cluster::lifecycle::LifecycleStatus::default();
+    observe.enrich_nodes_status(&mut status);
+    status
+        .active_policy
+        .zip(status.active_corpus)
+        .map(Some)
+        .ok_or(IpcError::NodeDepartureUnconfirmed)
+}
+
+#[cfg(feature = "cluster")]
+async fn handle_nodes_status(state: &DaemonState) -> IpcResponse {
+    let Some(path) = state.config_path.clone() else {
+        return ipc_error(IpcError::NoConfigPath);
+    };
+    let observe = state.cluster_observe.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut status = crate::cluster::lifecycle::status(&path)?;
+        if let Some(observe) = observe {
+            if let Err(error) = observe.refresh_primary_membership() {
+                status.last_error = Some(format!("membership observation is stale: {error}"));
+            }
+        }
+        Ok::<_, anyhow::Error>(status)
+    })
+    .await
+    {
+        Ok(Ok(mut status)) => {
+            enrich_nodes_runtime(&mut status, state);
+            IpcResponse::NodesStatus {
+                status: Box::new(status),
+            }
+        }
+        Ok(Err(error)) => nodes_request_error(IpcError::NodeStatusUnavailable, &error),
+        Err(error) => nodes_request_error(IpcError::NodeStatusUnavailable, &error),
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn enrich_nodes_runtime(
+    status: &mut crate::cluster::lifecycle::LifecycleStatus,
+    state: &DaemonState,
+) {
+    use crate::cluster::lifecycle::NodeRole;
+    use crate::config::schema::ClusterRole;
+    let active_role = match state.cluster_observe.as_ref().map(|observe| observe.role) {
+        Some(ClusterRole::Primary) => NodeRole::Primary,
+        Some(ClusterRole::Secondary) => NodeRole::Secondary,
+        None => NodeRole::Standalone,
+    };
+    status.active_role = Some(active_role);
+    status.restart_required |= active_role != status.saved_role;
+    status.can_edit_policy &=
+        active_role != NodeRole::Secondary && !status.pending_join && !status.restart_required;
+    if let Some(observe) = &state.cluster_observe {
+        observe.enrich_nodes_status(status);
+    }
+    if let Some(error) = status.last_error.take() {
+        tracing::warn!(target: "ipc.error", %error, "node observation failed");
+        status.last_error = Some(IpcError::NodeStatusUnavailable.operator_message());
+    }
+}
+
+fn operator_rules_error(error: crate::operator_rules::OperatorRulesError) -> IpcResponse {
+    IpcResponse::OperatorRulesError { error }
+}
+
+fn operator_rules_actor(peer_uid: Option<u32>) -> crate::operator_rules::Actor {
+    crate::operator_rules::Actor {
+        identity: format!("uid:{}", peer_uid.unwrap_or(u32::MAX)),
+        origin: "ipc".into(),
+    }
+}
+
+struct OperatorRulesUnavailable;
+
+impl OperatorRulesUnavailable {
+    fn into_response(self) -> IpcResponse {
+        operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+            crate::operator_rules::ErrorCode::StorageUnavailable,
+            "operator-rules service is unavailable",
+        ))
+    }
+}
+
+fn operator_rule_jobs(
+    state: &DaemonState,
+) -> Result<crate::api::operator_rule_jobs::OperatorRuleJobClient, OperatorRulesUnavailable> {
+    state
+        .operator_rule_jobs
+        .clone()
+        .ok_or(OperatorRulesUnavailable)
+}
+
+fn handle_operator_rules_capabilities(state: &DaemonState) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    IpcResponse::OperatorRulesCapabilities {
+        capabilities: jobs.capabilities(crate::operator_rules::TransportLimits::IPC),
+    }
+}
+
+async fn handle_custom_lists_metadata(state: &DaemonState) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    match jobs.metadata().await {
+        Ok(metadata) => IpcResponse::CustomListsMetadata { metadata },
+        Err(error) => {
+            tracing::warn!(
+                target: "ipc.error",
+                error = %error,
+                "redacted Custom Lists metadata read failed"
+            );
+            operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+                crate::operator_rules::ErrorCode::StorageUnavailable,
+                "custom-list metadata is unavailable",
+            ))
+        }
+    }
+}
+
+async fn handle_custom_lists_read(
+    state: &DaemonState,
+    request: CustomListsReadRequest,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    let result = match request {
+        CustomListsReadRequest::List { page } => jobs
+            .lists(page, crate::operator_rules::TransportLimits::IPC)
+            .await
+            .map(CustomListsReadResponse::List),
+        CustomListsReadRequest::Show { id } => {
+            jobs.list(id).await.map(CustomListsReadResponse::Show)
+        }
+        CustomListsReadRequest::Rules { id, page } => jobs
+            .rules(id, page, crate::operator_rules::TransportLimits::IPC)
+            .await
+            .map(CustomListsReadResponse::Rules),
+    };
+    match result {
+        Ok(response) => IpcResponse::CustomListsRead { response },
+        Err(error) => operator_rules_error(error),
+    }
+}
+
+async fn handle_custom_list_export(
+    state: &DaemonState,
+    request: crate::operator_rules::ExportRequest,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    match jobs
+        .export(request, crate::operator_rules::TransportLimits::IPC)
+        .await
+    {
+        Ok(chunk) => IpcResponse::CustomListExportChunk { chunk },
+        Err(error) => operator_rules_error(error),
+    }
+}
+
+async fn handle_operator_rules_plan(
+    state: &DaemonState,
+    peer_uid: Option<u32>,
+    request: Option<crate::operator_rules::BatchRequest>,
+    plan_ref: Option<String>,
+    page: crate::operator_rules::PageRequest,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    let actor = operator_rules_actor(peer_uid);
+    match (request, plan_ref) {
+        (Some(request), None) => match jobs
+            .plan(
+                actor,
+                request,
+                page,
+                crate::operator_rules::TransportLimits::IPC,
+            )
+            .await
+        {
+            Ok(prepared) => IpcResponse::OperatorRulesPlan {
+                plan_ref: prepared.plan_id,
+                summary: prepared.summary,
+                impact: prepared.first_impacts,
+            },
+            Err(error) => operator_rules_error(error),
+        },
+        (None, Some(plan_ref)) => {
+            let summary = match jobs.stored_plan_summary(&actor, &plan_ref) {
+                Ok(summary) => summary,
+                Err(error) => return operator_rules_error(error),
+            };
+            match jobs.plan_impacts(&actor, &plan_ref, page) {
+                Ok(impact) => IpcResponse::OperatorRulesPlan {
+                    plan_ref,
+                    summary,
+                    impact,
+                },
+                Err(error) => operator_rules_error(error),
+            }
+        }
+        _ => operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+            crate::operator_rules::ErrorCode::InvalidRequest,
+            "provide exactly one of request or plan_ref",
+        )),
+    }
+}
+
+async fn handle_operator_rules_apply(
+    state: &DaemonState,
+    peer_uid: Option<u32>,
+    plan_ref: String,
+    plan_hash: String,
+    request_id: String,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    let actor = operator_rules_actor(peer_uid);
+    match submit_operator_plan_and_wait(&jobs, actor, plan_ref, plan_hash, request_id).await {
+        Ok(receipt) => IpcResponse::OperatorRulesApply { receipt },
+        Err(error) => operator_rules_error(error),
+    }
+}
+
+async fn submit_operator_plan_and_wait(
+    jobs: &crate::api::operator_rule_jobs::OperatorRuleJobClient,
+    actor: crate::operator_rules::Actor,
+    plan_ref: String,
+    plan_hash: String,
+    request_id: String,
+) -> Result<crate::operator_rules::Receipt, crate::operator_rules::OperatorRulesError> {
+    match jobs
+        .submit(actor.clone(), plan_ref, plan_hash, request_id)
+        .await?
+    {
+        crate::api::operator_rule_jobs::SubmitOutcome::Accepted { operation_id, .. } => {
+            jobs.wait_terminal(&actor, &operation_id).await
+        }
+        crate::api::operator_rule_jobs::SubmitOutcome::Replay {
+            operation_id,
+            receipt,
+            ..
+        } if receipt.persistence == crate::operator_rules::PersistenceState::Prepared => {
+            jobs.wait_terminal(&actor, &operation_id).await
+        }
+        crate::api::operator_rule_jobs::SubmitOutcome::Replay { receipt, .. } => Ok(receipt),
+    }
+}
+
+async fn handle_operator_rules_replay(
+    state: &DaemonState,
+    peer_uid: Option<u32>,
+    request: crate::operator_rules::BatchRequest,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    match jobs
+        .replay_request(
+            operator_rules_actor(peer_uid),
+            request,
+            crate::operator_rules::TransportLimits::IPC,
+        )
+        .await
+    {
+        Ok(Some(receipt)) => IpcResponse::OperatorRulesApply { receipt },
+        Ok(None) => operator_rules_error(crate::operator_rules::OperatorRulesError::new(
+            crate::operator_rules::ErrorCode::NotFound,
+            "no durable operator-rule receipt matches this request",
+        )),
+        Err(error) => operator_rules_error(error),
+    }
+}
+
+fn legacy_profile_mount_response(
+    profile_id: &str,
+    receipt: &crate::operator_rules::Receipt,
+) -> IpcResponse {
+    match receipt.persistence {
+        crate::operator_rules::PersistenceState::Committed if receipt.changed => IpcResponse::Ok {
+            message: format!(
+                "persisted custom-list mounts for profile \"{profile_id}\"; activation pending (operation_id={})",
+                receipt.operation_id
+            ),
+        },
+        crate::operator_rules::PersistenceState::Committed => IpcResponse::Ok {
+            message: format!(
+                "custom-list mounts unchanged for profile \"{profile_id}\" (operation_id={})",
+                receipt.operation_id
+            ),
+        },
+        persistence => {
+            let persistence = match persistence {
+                crate::operator_rules::PersistenceState::Prepared => "prepared",
+                crate::operator_rules::PersistenceState::Aborted => "aborted",
+                crate::operator_rules::PersistenceState::DurabilityUncertain => {
+                    "durability_uncertain"
+                }
+                crate::operator_rules::PersistenceState::Committed => unreachable!(),
+            };
+            ipc_error(IpcError::CustomListMountNotCommitted {
+                operation_id: receipt.operation_id.clone(),
+                persistence: persistence.into(),
+            })
+        }
+    }
+}
+
+async fn handle_operator_rules_operation(
+    state: &DaemonState,
+    peer_uid: Option<u32>,
+    operation_id: String,
+) -> IpcResponse {
+    let jobs = match operator_rule_jobs(state) {
+        Ok(jobs) => jobs,
+        Err(error) => return error.into_response(),
+    };
+    let actor = operator_rules_actor(peer_uid);
+    match jobs.operation(&actor, &operation_id).await {
+        Ok(receipt) => IpcResponse::OperatorRulesOperation { receipt },
+        Err(error) => operator_rules_error(error),
     }
 }
 
@@ -928,11 +1563,36 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
     // IPC call), so the await costs nothing that matters. See
     // `DnsCache::flushed_usage`.
     let cache_usage = state.cache.flushed_usage().await;
+    let (upstream_mode, upstream_count, upstream_servers) = state
+        .upstream_runtime
+        .as_ref()
+        .map(|runtime| {
+            let snapshot = runtime.status();
+            (
+                snapshot.mode.to_string(),
+                snapshot.primary_count,
+                snapshot
+                    .servers
+                    .into_iter()
+                    .map(|(address, mode)| crate::ipc::protocol::UpstreamServerInfo {
+                        address,
+                        kind: mode.to_string(),
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                state.upstream_mode.clone(),
+                state.upstream_count,
+                state.upstream_servers.clone(),
+            )
+        });
     IpcResponse::Status {
         pid: std::process::id(),
         listen: state.listen_addr.clone(),
-        upstream_mode: state.upstream_mode.clone(),
-        upstream_count: state.upstream_count,
+        upstream_mode,
+        upstream_count,
         domain_count,
         cache_entries: cache_usage.entries,
         list_count: state.list_count,
@@ -951,7 +1611,18 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
         lists_total,
         lc2_list_diagnostics,
         resource_budget,
-        upstream_servers: state.upstream_servers.clone(),
+        lists_memory_bytes: Some(state.filter.installed_memory_bytes()),
+        query_log_client_ips_supported: true,
+        top_lists_24h_supported: true,
+        // Startup creates StatsEngine exactly when config.tracking.enabled;
+        // its immutable config carries the active setting, without reading disk.
+        tracking_enabled: Some(
+            state
+                .stats
+                .as_ref()
+                .is_some_and(|stats| stats.config.enabled),
+        ),
+        upstream_servers,
     }
 }
 
@@ -962,10 +1633,18 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
 /// secondary → poll telemetry (last-sync age, ok/err, converged).
 #[cfg(feature = "cluster")]
 fn handle_cluster_status(state: &DaemonState) -> IpcResponse {
+    cluster_status_response(state.cluster_observe.as_deref(), std::time::Instant::now())
+}
+
+#[cfg(feature = "cluster")]
+fn cluster_status_response(
+    observe: Option<&crate::cluster::ClusterObserve>,
+    now: std::time::Instant,
+) -> IpcResponse {
     use crate::config::schema::ClusterRole;
     use crate::ipc::protocol::{ClusterStatusDto, RosterEntryDto};
 
-    let Some(obs) = state.cluster_observe.as_ref() else {
+    let Some(obs) = observe else {
         return IpcResponse::ClusterStatus {
             status: ClusterStatusDto {
                 enabled: false,
@@ -989,23 +1668,31 @@ fn handle_cluster_status(state: &DaemonState) -> IpcResponse {
 
     // Primary serve-state: generation + current content hash (None on a
     // secondary, which has no serve-state — it tracks the last-applied hash).
-    let (config_generation, primary_config_hash) = obs.generations().unwrap_or((0, String::new()));
+    let (config_generation, primary_config_hash, primary_converged) = obs
+        .primary_summary(now)
+        .unwrap_or((0, String::new(), false));
 
-    // Secondary poll telemetry.
-    let sync = obs.load_sync();
-    let last_sync_secs = sync.last_sync.map(|t| t.elapsed().as_secs());
-    let converged = sync.synced_at_least_once && sync.last_poll_ok;
+    let sync = obs.sync_view(now);
+    let last_sync_secs = sync.as_ref().and_then(|view| view.confirmed_secs_ago);
+    let converged = if obs.role == ClusterRole::Primary {
+        primary_converged
+    } else {
+        sync.as_ref()
+            .is_some_and(|view| view.health == crate::cluster::observe::SyncHealth::Current)
+    };
     // On a secondary the "current" hash IS the last-applied one; on a primary
     // it is the serve-state's live hash.
     let config_hash = if obs.role == ClusterRole::Secondary {
-        sync.last_config_hash.clone().unwrap_or_default()
+        sync.as_ref()
+            .and_then(|view| view.applied_hash.clone())
+            .unwrap_or_default()
     } else {
         primary_config_hash
     };
 
     // Primary roster (self-row + peers); empty on a secondary.
     let roster = obs
-        .roster_snapshot(std::time::Instant::now())
+        .roster_snapshot(now)
         .into_iter()
         .map(|r| RosterEntryDto {
             name: r.name,
@@ -1028,8 +1715,8 @@ fn handle_cluster_status(state: &DaemonState) -> IpcResponse {
             config_generation,
             config_hash,
             last_sync_secs,
-            last_poll_ok: sync.last_poll_ok,
-            last_error: sync.last_error.clone(),
+            last_poll_ok: sync.as_ref().is_some_and(|view| view.last_poll_ok),
+            last_error: sync.and_then(|view| view.last_error),
             converged,
             roster,
         },
@@ -1059,21 +1746,16 @@ fn handle_query(domain: &str, state: &DaemonState) -> IpcResponse {
     };
     let normalized = normalized.as_str();
 
-    // Surface the block attribution the engine already
-    // computes (`evaluate_attributed`), not just the boolean. Off the
-    // hot path: this is the on-demand operator probe, not the per-query
-    // DNS path. `source` is `Some` only alongside a Block verdict, so
-    // `.map(..)` yields `None` for allowed domains automatically. The
-    // no-profile fallbacks have no `ResolvedProfile` to attribute
-    // against, so `blocked_by` stays `None` there (behaviour otherwise
-    // unchanged).
+    // This is an on-demand operator probe rather than the DNS hot path.
     let (blocked, blocked_by) = match &state.profiles {
         Some(resolver) => match resolver.default_profile() {
             Some(profile) => {
-                let (verdict, source) = state.filter.evaluate_attributed(normalized, &profile);
+                let decision = state
+                    .filter
+                    .evaluate_active_operator_policy(normalized, &profile);
                 (
-                    verdict == FilterResult::Block,
-                    source.map(|s| s.describe(&state.list_labels)),
+                    decision.blocked,
+                    decision.source.map(|s| s.describe(&state.list_labels)),
                 )
             }
             // When `default_profile` is unset, every
@@ -1082,7 +1764,7 @@ fn handle_query(domain: &str, state: &DaemonState) -> IpcResponse {
             // be blocked" for the `warden query` CLI output.
             None => (true, None),
         },
-        None => (state.filter.is_blocked(normalized), None),
+        None => (true, None),
     };
 
     IpcResponse::QueryResult {
@@ -1635,9 +2317,11 @@ fn handle_tracking_stats(state: &DaemonState) -> IpcResponse {
         })
         .collect();
 
-    let hourly: Vec<super::protocol::TimeBucketDto> = engine
-        .time_series
-        .hourly_snapshot()
+    let now = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+    let hourly_snapshot = engine.time_series.hourly_snapshot();
+    let (qtype_distribution_24h, qtype_blocked_distribution_24h) =
+        crate::tracking::time_series::per_type_24h_from_buckets(&hourly_snapshot, now);
+    let hourly: Vec<super::protocol::TimeBucketDto> = hourly_snapshot
         .into_iter()
         .map(|b| super::protocol::TimeBucketDto {
             timestamp: b.timestamp,
@@ -1649,7 +2333,7 @@ fn handle_tracking_stats(state: &DaemonState) -> IpcResponse {
 
     let daily: Vec<super::protocol::TimeBucketDto> = engine
         .time_series
-        .daily_snapshot()
+        .daily_snapshot_at(now)
         .into_iter()
         .map(|b| super::protocol::TimeBucketDto {
             timestamp: b.timestamp,
@@ -1660,14 +2344,7 @@ fn handle_tracking_stats(state: &DaemonState) -> IpcResponse {
         .collect();
 
     let (cache_hit_rate_24h, blocked_pct_24h, cache_hit_rate_delta_1h, blocked_pct_delta_1h) =
-        compute_24h_stats(&hourly);
-
-    // Per-`TypeBucket` 24h rolling sums computed daemon-side
-    // from the internal hourly ring (the wire `TimeBucketDto` stays
-    // 4-field; per-type breakdowns never cross the socket). Drives the
-    // Dashboard QTYPE chart card.
-    let (qtype_distribution_24h, qtype_blocked_distribution_24h) =
-        engine.time_series.per_type_24h_snapshot();
+        compute_24h_stats(&hourly, now);
 
     // Surface the prefetch hit-tracker counters.
     // `pool_size` is a live derived value; the cumulative totals come
@@ -1737,74 +2414,55 @@ fn handle_tracking_stats(state: &DaemonState) -> IpcResponse {
     }
 }
 
-/// Compute the rolling 24h averages + 1h deltas from the hourly
-/// time-series buckets. Returns `(cache_hit_rate_24h, blocked_pct_24h,
-/// cache_hit_delta_1h, blocked_pct_delta_1h)` — all in percent
-/// (0–100) units matching the cumulative counters.
-///
-/// The 24h averages are computed as `sum(X) / sum(queries)`, weighting
-/// each bucket by its own query volume. The 1h deltas compare the most
-/// recent bucket's ratio against the bucket before it. Buckets with
-/// zero queries contribute nothing to the average and are treated as
-/// `0.0` when computing the delta (no history = no trend to show).
-// Stats display path: query counts that exceed `2^53` lose f64 precision,
-// but at that point the operator has bigger problems. Ratios are bounded
-// to 0..=100 so the rounding stays well within display tolerance.
+/// Rates over the current UTC hour and preceding 23 hours, with deltas only
+/// when both current and immediately preceding hour are present. Duplicate
+/// fragments are summed before ratios; gaps are never treated as adjacent hours.
 #[allow(clippy::cast_precision_loss)]
-fn compute_24h_stats(hourly: &[super::protocol::TimeBucketDto]) -> (f64, f64, f64, f64) {
-    if hourly.is_empty() {
-        return (0.0, 0.0, 0.0, 0.0);
+fn compute_24h_stats(hourly: &[super::protocol::TimeBucketDto], now: u64) -> (f64, f64, f64, f64) {
+    let mut hours = std::collections::BTreeMap::<u64, (u128, u128, u128)>::new();
+    for b in hourly
+        .iter()
+        .filter(|b| crate::tracking::time_series::hour_in_24h_window(b.timestamp, now))
+    {
+        let counts = hours.entry(b.timestamp / 3600 * 3600).or_default();
+        counts.0 = counts.0.saturating_add(u128::from(b.queries));
+        counts.1 = counts.1.saturating_add(u128::from(b.blocked));
+        counts.2 = counts.2.saturating_add(u128::from(b.cache_hits));
     }
-
-    // 24h weighted averages.
-    let window: Vec<&super::protocol::TimeBucketDto> = hourly.iter().rev().take(24).collect();
-    let sum_q: u64 = window.iter().map(|b| b.queries).sum();
-    let sum_b: u64 = window.iter().map(|b| b.blocked).sum();
-    let sum_h: u64 = window.iter().map(|b| b.cache_hits).sum();
-    // Same correction as handle_tracking_stats above —
-    // blocked_24h stays on sum_q (all queries), cache_24h moves to the
-    // cacheable population (sum_q - sum_b), matching the live figure's
-    // basis so the two never disagree with each other.
-    let sum_cacheable = sum_q.saturating_sub(sum_b);
-    let (cache_24h, blocked_24h) = (
-        if sum_cacheable > 0 {
-            (sum_h as f64 / sum_cacheable as f64) * 100.0
-        } else {
-            0.0
-        },
-        if sum_q > 0 {
-            (sum_b as f64 / sum_q as f64) * 100.0
-        } else {
-            0.0
-        },
-    );
-
-    // 1h delta: last bucket's ratio minus previous bucket's ratio.
-    let bucket_ratios = |b: &super::protocol::TimeBucketDto| -> (f64, f64) {
-        let cacheable = b.queries.saturating_sub(b.blocked);
-        let cache = if cacheable == 0 {
-            0.0
-        } else {
-            (b.cache_hits as f64 / cacheable as f64) * 100.0
-        };
-        let blocked = if b.queries == 0 {
-            0.0
-        } else {
-            (b.blocked as f64 / b.queries as f64) * 100.0
-        };
-        (cache, blocked)
+    let ratios = |(q, b, h): (u128, u128, u128)| {
+        let cacheable = q.saturating_sub(b);
+        (
+            if cacheable == 0 {
+                0.0
+            } else {
+                100.0 * h as f64 / cacheable as f64
+            },
+            if q == 0 {
+                0.0
+            } else {
+                100.0 * b as f64 / q as f64
+            },
+        )
     };
-    let (cache_delta, blocked_delta) = if hourly.len() >= 2 {
-        let last = &hourly[hourly.len() - 1];
-        let prev = &hourly[hourly.len() - 2];
-        let (lc, lb) = bucket_ratios(last);
-        let (pc, pb) = bucket_ratios(prev);
-        (lc - pc, lb - pb)
-    } else {
-        (0.0, 0.0)
-    };
-
-    (cache_24h, blocked_24h, cache_delta, blocked_delta)
+    let sum = hours.values().fold((0u128, 0u128, 0u128), |a, b| {
+        (
+            a.0.saturating_add(b.0),
+            a.1.saturating_add(b.1),
+            a.2.saturating_add(b.2),
+        )
+    });
+    let (cache, blocked) = ratios(sum);
+    let current = now - now % 3600;
+    let deltas = current
+        .checked_sub(3600)
+        .and_then(|prev| hours.get(&current).zip(hours.get(&prev)))
+        .map(|(last, prev)| {
+            let (lc, lb) = ratios(*last);
+            let (pc, pb) = ratios(*prev);
+            (lc - pc, lb - pb)
+        })
+        .unwrap_or_default();
+    (cache, blocked, deltas.0, deltas.1)
 }
 
 #[cfg(test)]
@@ -1845,9 +2503,6 @@ fn handle_device_stats(state: &DaemonState) -> IpcResponse {
 }
 
 async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
-    use super::protocol::{DeviceViewDto, MappedDeviceDto, UnmappedDeviceDto};
-    use std::collections::HashSet;
-    use std::net::IpAddr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let Some(profiles) = state.profiles.as_ref() else {
@@ -1906,6 +2561,26 @@ async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
         .map(|s| s.list_observed_ips())
         .unwrap_or_default();
 
+    build_device_view(
+        mapped_snapshots,
+        arp,
+        &observed,
+        state.oui_table.as_deref(),
+        now_secs,
+    )
+}
+
+fn build_device_view(
+    mapped_snapshots: Vec<crate::profiles::resolver::MappedDeviceSnapshot>,
+    arp: std::collections::HashMap<std::net::IpAddr, String>,
+    observed: &[crate::tracking::engine::ObservedDevice],
+    oui: Option<&crate::oui::OuiTable>,
+    now_secs: u64,
+) -> IpcResponse {
+    use super::protocol::{DeviceViewDto, MappedDeviceDto, UnmappedDeviceDto};
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
     // Index observed stats by IP so each mapped device can look up its
     // live counters in O(1). Keeps the join linear in total devices
     // instead of quadratic.
@@ -1920,8 +2595,6 @@ async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
         .iter()
         .flat_map(|s| s.ips.iter().copied())
         .collect();
-
-    let oui = state.oui_table.as_deref();
 
     let mapped: Vec<MappedDeviceDto> = mapped_snapshots
         .into_iter()
@@ -1939,6 +2612,7 @@ async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
             // a device with a single IP allocates the 24-elem Vec
             // exactly once.
             let mut hourly: Vec<u64> = Vec::new();
+            let mut hourly_blocked: Option<Vec<u64>> = None;
             for ip in &snap.ips {
                 if let Some(s) = stats_by_ip.get(ip) {
                     dto.queries += s.queries;
@@ -1955,10 +2629,20 @@ async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
                             *slot += v;
                         }
                     }
+                    if let Some(values) = &mut hourly_blocked {
+                        if values.len() == s.hourly_blocked.len() {
+                            for (slot, value) in values.iter_mut().zip(&s.hourly_blocked) {
+                                *slot += value;
+                            }
+                        }
+                    } else {
+                        hourly_blocked = Some(s.hourly_blocked.clone());
+                    }
                 }
             }
             dto.vendor = lookup_vendor(oui, dto.mac.as_deref());
             dto.hourly_queries = hourly;
+            dto.hourly_blocked = hourly_blocked;
             dto
         })
         .collect();
@@ -1980,6 +2664,7 @@ async fn handle_get_all_devices(state: &DaemonState) -> IpcResponse {
                 online: c.is_online(now_secs),
                 vendor,
                 hourly_queries: c.hourly_queries.clone(),
+                hourly_blocked: Some(c.hourly_blocked.clone()),
             }
         })
         .collect();
@@ -1998,6 +2683,10 @@ fn lookup_vendor(table: Option<&crate::oui::OuiTable>, mac: Option<&str>) -> Opt
         return Some("(randomized)".to_string());
     }
     table?.lookup(mac).map(|s| s.to_string())
+}
+
+fn query_log_cutoff_epoch(now: i64, since_secs: u64) -> i64 {
+    (i128::from(now) - i128::from(since_secs)).max(i128::from(i64::MIN)) as i64
 }
 
 /// Read the query log and return it over IPC.
@@ -2025,6 +2714,7 @@ async fn handle_query_logs(
     let crate::ipc::protocol::QueryLogRequest {
         limit,
         client,
+        client_ips,
         blocked_only,
         domain,
         since_secs,
@@ -2051,14 +2741,10 @@ async fn handle_query_logs(
             None => engine.config.query_log_path.clone(),
         },
     };
-    // since_secs is a relative duration in seconds; compute
-    // an absolute epoch cutoff once here so the reader never re-asks
-    // for `now`. Treat a clock reading failure (pre-epoch system clock,
-    // not plausible in practice) as "no cutoff" — conservative.
-    let cutoff_epoch: Option<i64> = since_secs.and_then(|s| {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        i64::try_from(s).ok().map(|s_i64| now - s_i64)
-    });
+    // Compute the absolute cutoff once. Oversized durations saturate toward
+    // the past rather than overflowing or silently dropping the predicate.
+    let cutoff_epoch = since_secs
+        .map(|s| query_log_cutoff_epoch(time::OffsetDateTime::now_utc().unix_timestamp(), s));
     // Read everything off `engine` that the response needs BEFORE the
     // await — `state` is a borrow and cannot cross into the closure.
     let retention_days = engine.config.retention_days;
@@ -2079,8 +2765,17 @@ async fn handle_query_logs(
     // cost is a match. `compile` is also where an empty form collapses to
     // "no predicate", which keeps a blank advanced filter from costing
     // anything on the read path.
-    if let Some(adv) = advanced.filter(|a| !a.is_empty()) {
-        filters = filters.with_advanced(adv.compile());
+    let mut adv = advanced.map(|a| a.compile()).unwrap_or_default();
+    if !client_ips.is_empty() {
+        let ips: Result<std::collections::HashSet<std::net::IpAddr>, _> =
+            client_ips.iter().map(|ip| ip.parse()).collect();
+        let Ok(ips) = ips else {
+            return ipc_error(IpcError::InvalidCommand);
+        };
+        adv = adv.with_client_ip_set(ips, crate::tracking::query_log::Polarity::Include);
+    }
+    if !adv.is_empty() {
+        filters = filters.with_advanced(adv);
     }
 
     let read = tokio::task::spawn_blocking(move || {
@@ -2130,6 +2825,7 @@ async fn handle_query_logs(
 
     IpcResponse::QueryLogs {
         entries: dto_entries,
+        client_ips_applied: !client_ips.is_empty(),
         logging_enabled,
         file_state,
         next_cursor,
@@ -2140,7 +2836,7 @@ async fn handle_query_logs(
 /// Add a configured client. Server-side counterpart of the CLI
 /// `warden device add` and the TUI device form modal.
 ///
-/// Loads via the v1 loader so duplicate-detection sees the merged
+/// Loads via the current loader so duplicate-detection sees the merged
 /// master+includes view, writes the new entity into
 /// `devices.d/<id>.toml` (or falls through to the master when no class
 /// directory exists), then validates the complete staged tree before
@@ -2177,7 +2873,7 @@ async fn handle_device_add(
         }
     };
 
-    // Load via the v1 loader so duplicate-detection sees the merged
+    // Load via the current loader so duplicate-detection sees the merged
     // master+includes view (a device defined in `devices.d/foo.toml`
     // would otherwise be invisible to a single-file parse).
     let config_guard = match acquire_for_write(config_path) {
@@ -2197,7 +2893,7 @@ async fn handle_device_add(
     let loaded = match load_config_for_schema_under_guard(
         &config_guard,
         config_path,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         now,
     ) {
         Ok(l) => l,
@@ -3216,13 +3912,13 @@ async fn handle_profile_create(
     );
 
     if let Err(e) =
-        crate::cli::commands::target::upsert_profile(&mut doc, &id, toml::Value::Table(entry))
+        crate::cli::commands::target::create_profile(&mut doc, &id, toml::Value::Table(entry))
     {
         tracing::warn!(
             target: "ipc.error",
             id = %id,
             error = %e,
-            "profile_create: upsert_profile failed",
+            "profile_create: create_profile failed",
         );
         return ipc_error(IpcError::StageFailed);
     }
@@ -3332,9 +4028,112 @@ async fn handle_profile_update(
     patch: super::protocol::ProfileUpdatePatch,
     peer_uid: Option<u32>,
 ) -> IpcResponse {
+    // `admin_rules` is a retired loose-rule transport. `Some` is intent even
+    // when both delta arrays are empty: an old client can submit its complete
+    // form unchanged, and accepting that request would falsely acknowledge a
+    // policy operation. Reject before config discovery or any write lock.
+    if patch.admin_rules.is_some() {
+        tracing::warn!(
+            target: "ipc.error",
+            id = %id,
+            "profile_update: legacy admin_rules patch rejected"
+        );
+        return ipc_error(IpcError::LegacyProfileRulesRetired);
+    }
+
     let Some(config_path) = state.config_path.as_ref() else {
         return ipc_error(IpcError::NoConfigPath);
     };
+
+    if let Some(mounts) = patch.custom_lists.clone() {
+        let mixed = patch.display_name.is_some()
+            || patch.block_response.is_some()
+            || patch.blocked_ttl_secs.is_some()
+            || patch.block_all.is_some()
+            || patch.ecs.is_some()
+            || patch.retired_tags.is_some()
+            || patch.lists.is_some();
+        if mixed {
+            return ipc_error(IpcError::CustomListsMixedProfilePatch);
+        }
+
+        let jobs = match operator_rule_jobs(state) {
+            Ok(jobs) => jobs,
+            Err(_) => {
+                return ipc_error(IpcError::OperatorRulesUnavailable);
+            }
+        };
+        let actor = operator_rules_actor(peer_uid);
+        let profile_id = id.clone();
+        let mut operations = Vec::with_capacity(mounts.mount.len() + mounts.unmount.len());
+        operations.extend(mounts.mount.into_iter().map(|list_id| {
+            crate::operator_rules::Operation::Mount {
+                id: list_id,
+                profile_id: profile_id.clone(),
+            }
+        }));
+        operations.extend(mounts.unmount.into_iter().map(|list_id| {
+            crate::operator_rules::Operation::Unmount {
+                id: list_id,
+                profile_id: profile_id.clone(),
+            }
+        }));
+        if operations.is_empty() {
+            return IpcResponse::Ok {
+                message: format!("custom-list mounts unchanged for profile \"{id}\""),
+            };
+        }
+        use rand_core::{OsRng, RngCore};
+        let mut request_id_bytes = [0_u8; 16];
+        OsRng.fill_bytes(&mut request_id_bytes);
+        let request_id = hex::encode(request_id_bytes);
+        let result = async {
+            let revision = jobs
+                .lists(
+                    crate::operator_rules::PageRequest {
+                        cursor: None,
+                        limit: Some(1),
+                    },
+                    crate::operator_rules::TransportLimits::IPC,
+                )
+                .await?
+                .config_revision;
+            let prepared = jobs
+                .plan(
+                    actor.clone(),
+                    crate::operator_rules::BatchRequest {
+                        contract_version: crate::operator_rules::CONTRACT_VERSION,
+                        request_id: request_id.clone(),
+                        expected_config_revision: revision,
+                        operations,
+                        expected_plan_hash: None,
+                    },
+                    crate::operator_rules::PageRequest::default(),
+                    crate::operator_rules::TransportLimits::IPC,
+                )
+                .await?;
+            submit_operator_plan_and_wait(
+                &jobs,
+                actor,
+                prepared.plan_id,
+                prepared.summary.plan_hash,
+                request_id,
+            )
+            .await
+        }
+        .await;
+        return match result {
+            Ok(receipt) => legacy_profile_mount_response(&id, &receipt),
+            Err(error) => {
+                tracing::warn!(
+                    target: "ipc.error",
+                    error = %error,
+                    "redacted legacy profile custom-list update failed"
+                );
+                ipc_error(IpcError::CustomListMountUpdateFailed)
+            }
+        };
+    }
 
     let _ipc_guard = state.config_write_lock.lock().await;
 
@@ -3429,27 +4228,6 @@ async fn handle_profile_update(
     }
     if let Some(b) = patch.block_all {
         entry.insert("block_all".into(), toml::Value::Boolean(b));
-    }
-    if let Some(admin) = patch.admin_rules {
-        let mut current: Vec<String> = entry
-            .get("admin_rules")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for add in &admin.add {
-            if !current.iter().any(|x| x == add) {
-                current.push(add.clone());
-            }
-        }
-        current.retain(|x| !admin.remove.contains(x));
-        entry.insert(
-            "admin_rules".into(),
-            toml::Value::Array(current.into_iter().map(toml::Value::String).collect()),
-        );
     }
     // A profile `tags` delta is refused, for the same reason as the
     // device path above — see `cli::commands::entity_tags::TAGS_RETIRED`.
@@ -3604,67 +4382,6 @@ async fn handle_profile_update(
             entry.remove("lists");
         } else {
             entry.insert("lists".into(), toml::Value::Table(current));
-        }
-    }
-
-    // The custom-list mount delta.
-    //
-    // One writer, for the same reason the override map above has one: both
-    // operator surfaces reach `[profiles.<id>]` through this command.
-    //
-    // **It carries no gate of its own, and that is a decision rather than
-    // an omission.** `allow_direction_gates` prices the standing exposure
-    // of an allow-direction list whose body is re-fetched from a URL
-    // somebody else controls; a custom list is a local file the operator
-    // wrote, re-read from their own disk. Nor is there an existence
-    // pre-check: the validator below refuses a profile that mounts an
-    // undeclared list, and it judges the whole staged tree, which a check
-    // reading one row cannot.
-    if let Some(mounts) = patch.custom_lists {
-        // Validated before anything is staged, like the two deltas above:
-        // the post-write validator rejects the WHOLE file, so one
-        // malformed id would take the other fields of this patch down
-        // with it.
-        for raw in mounts.mount.iter().chain(mounts.unmount.iter()) {
-            if crate::config::schema::Id::new(raw.as_str()).is_err() {
-                tracing::warn!(
-                    target: "ipc.error",
-                    id = %id,
-                    list = %raw,
-                    "profile_update: invalid custom-list id in mount patch",
-                );
-                return ipc_error(IpcError::ValidatorRejected);
-            }
-        }
-
-        let mut current: Vec<String> = entry
-            .get("custom_lists")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `mount` BEFORE `unmount`, frozen: an id in both ends unmounted.
-        for add in &mounts.mount {
-            if !current.iter().any(|x| x == add) {
-                current.push(add.clone());
-            }
-        }
-        current.retain(|x| !mounts.unmount.contains(x));
-        // An empty vector is REMOVED, never written as `custom_lists = []`
-        // — `Profile::custom_lists` carries `skip_serializing_if =
-        // Vec::is_empty` precisely so a profile that mounts nothing does
-        // not grow the key, and a handler that inserted one would put back
-        // what that attribute exists to keep out.
-        if current.is_empty() {
-            entry.remove("custom_lists");
-        } else {
-            entry.insert(
-                "custom_lists".into(),
-                toml::Value::Array(current.into_iter().map(toml::Value::String).collect()),
-            );
         }
     }
 
@@ -3872,3 +4589,89 @@ fn notify_reload(state: &DaemonState, peer_uid: Option<u32>, op: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests;
+
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_freshness_tests {
+    use super::{cluster_status_response, IpcResponse};
+    use crate::cluster::{ClusterObserve, SyncStatus};
+    use crate::ipc::protocol::ClusterStatusDto;
+    use std::time::{Duration, Instant};
+
+    fn wire_status(observe: &ClusterObserve, now: Instant) -> ClusterStatusDto {
+        let response = cluster_status_response(Some(observe), now);
+        let bytes = serde_json::to_vec(&response).unwrap();
+        match serde_json::from_slice(&bytes).unwrap() {
+            IpcResponse::ClusterStatus { status } => status,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_expired_success_preserves_last_observation_without_claiming_convergence() {
+        let observe = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let confirmed = Instant::now();
+        observe.store_sync(SyncStatus {
+            last_config_hash: Some("a".repeat(64)),
+            last_sync: Some(confirmed),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        });
+        let current = wire_status(&observe, confirmed + Duration::from_secs(45));
+        assert!(current.converged);
+        assert!(current.last_poll_ok);
+
+        let expired = wire_status(&observe, confirmed + Duration::from_secs(46));
+        assert!(expired.enabled);
+        assert_eq!(expired.role, "secondary");
+        assert!(!expired.converged);
+        assert!(!expired.last_poll_ok);
+        assert_eq!(expired.last_sync_secs, Some(46));
+        assert_eq!(expired.config_hash, current.config_hash);
+        assert!(expired.last_error.is_none());
+    }
+
+    #[test]
+    fn ipc_failure_is_immediately_stale_and_recovery_requires_a_new_confirmation() {
+        let observe = ClusterObserve::new_secondary(None, "https://192.0.2.10:8080".into(), 45);
+        let confirmed = Instant::now();
+        let never = wire_status(&observe, confirmed);
+        assert!(!never.converged);
+        assert!(never.last_sync_secs.is_none());
+        let success = SyncStatus {
+            last_config_hash: Some("a".repeat(64)),
+            last_sync: Some(confirmed),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        };
+        observe.store_sync(success.clone());
+        assert!(wire_status(&observe, confirmed).converged);
+        observe.store_sync(SyncStatus {
+            last_poll_ok: false,
+            last_error: Some("primary unreachable".into()),
+            ..success
+        });
+        let failed = wire_status(&observe, confirmed + Duration::from_secs(1));
+        assert!(!failed.converged);
+        assert!(!failed.last_poll_ok);
+        assert_eq!(failed.last_sync_secs, Some(1));
+        assert_eq!(failed.config_hash, "a".repeat(64));
+        assert_eq!(failed.last_error.as_deref(), Some("primary unreachable"));
+
+        let recovered_at = confirmed + Duration::from_secs(60);
+        observe.store_sync(SyncStatus {
+            last_config_hash: Some("b".repeat(64)),
+            last_sync: Some(recovered_at),
+            last_poll_ok: true,
+            last_error: None,
+            synced_at_least_once: true,
+        });
+        let recovered = wire_status(&observe, recovered_at);
+        assert!(recovered.converged);
+        assert!(recovered.last_poll_ok);
+        assert_eq!(recovered.last_sync_secs, Some(0));
+        assert_eq!(recovered.config_hash, "b".repeat(64));
+        assert!(recovered.last_error.is_none());
+    }
+}

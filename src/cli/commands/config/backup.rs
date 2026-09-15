@@ -52,9 +52,8 @@ use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::config::atomic_write::{hardened_atomic_write, AtomicWriteOpts};
-use crate::config::loader::load_config_for_schema_under_read_guard;
+use crate::config::loader::{self, GuardedLoadFailure};
 use crate::config::migration_journal;
-use crate::config::schema::SCHEMA_VERSION_V1;
 use crate::config::tree_io::{
     for_each_dir_name, inspect_at, plan_external_directory_from, rename_noreplace_at, same_inode,
     unlink_at, ExternalDirectoryPlan, PinnedDirectory, TreeIo,
@@ -266,6 +265,7 @@ fn required_members_from_canonical(
     Ok(members)
 }
 
+#[cfg(test)]
 pub(crate) fn include_roots(root: &Path, files_loaded: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let canonical = root
         .canonicalize()
@@ -812,11 +812,14 @@ fn admit_backup_for(
     let root = master.parent().context("canonical master has no parent")?;
     // Fence admission is fatal; schema diagnostics below remain best effort.
     migration_journal::refuse_normal_access(guard.tree_io())?;
-    match load_config_for_schema_under_read_guard(
+    crate::config::custom_list::validate_flat_pack_tree_under_tree(guard.tree_io())
+        .context("backup refuses an unsupported packs/ tree")?;
+    match loader::load_config_v5_with_policy_overlays_under_service_read_guard(
         guard,
         master,
-        SCHEMA_VERSION_V1,
         time::OffsetDateTime::now_utc(),
+        None,
+        None,
     ) {
         Ok(loaded) => {
             let include_roots = include_roots_from_canonical(root, &loaded.files_loaded)?;
@@ -829,7 +832,7 @@ fn admit_backup_for(
                 auto_interval_error: None,
             })
         }
-        Err(errs) => {
+        Err(GuardedLoadFailure::Diagnostics(errs)) => {
             let auto_interval_error = only_auto_interval_validation_error(&errs);
             #[cfg(test)]
             backup_test_event(BackupTestEvent::AfterGuardedLoadFailure);
@@ -866,6 +869,13 @@ fn admit_backup_for(
                 auto_interval_error,
             })
         }
+        Err(
+            GuardedLoadFailure::UnsafePath(error)
+            | GuardedLoadFailure::BudgetExceeded(error)
+            | GuardedLoadFailure::TreeChanged(error)
+            | GuardedLoadFailure::RecoveryRequired(error)
+            | GuardedLoadFailure::Storage(error),
+        ) => Err(error),
     }
 }
 
@@ -1217,7 +1227,7 @@ pub fn list_backups(dir: &Path) -> Vec<BackupEntry> {
 /// still be backed up / listed from the default location.
 pub fn resolved_backup_dir(config_path: &Path) -> PathBuf {
     use crate::config::schema::BackupConfig;
-    crate::config::loader::load_config(config_path, time::OffsetDateTime::now_utc())
+    crate::config::loader::load_config_v5(config_path, time::OffsetDateTime::now_utc())
         .map(|loaded| loaded.config.backup.resolve_dir(&loaded.master_path))
         .unwrap_or_else(|_| {
             let canonical = crate::config::write_lock::ConfigTreeIdentity::resolve(config_path)
@@ -2042,7 +2052,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            b"schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         (dir, path)
@@ -2164,7 +2174,7 @@ mod tests {
         std::fs::create_dir(real.join("profiles.d")).unwrap();
         let master = real.join("config.toml");
         let include = real.join("profiles.d/default.toml");
-        std::fs::write(&master, "schema_version = 4\n").unwrap();
+        std::fs::write(&master, "schema_version = 5\n").unwrap();
         std::fs::write(&include, "# profile\n").unwrap();
         let alias = parent.path().join("staging-alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
@@ -2187,7 +2197,11 @@ mod tests {
         let listing = archive_listing(&archive);
         assert!(listing.lines().any(|name| name == "config.toml"));
         assert!(!listing.lines().any(|name| name == "active.toml"));
-        std::fs::write(&config, "garbage = true\n").unwrap();
+        std::fs::write(
+            &config,
+            "schema_version = 5\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+        )
+        .unwrap();
         assert!(matches!(
             crate::cli::commands::config::restore_archive(&config, &archive).unwrap(),
             crate::cli::commands::config::RestoreOutcome::Restored { .. }
@@ -2204,7 +2218,7 @@ mod tests {
         std::fs::create_dir(&front).unwrap();
         write_config(
             &real,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let alias = front.join("active.toml");
         std::os::unix::fs::symlink("../real/config.toml", &alias).unwrap();
@@ -2259,7 +2273,7 @@ mod tests {
                 std::fs::write(
                     &config,
                     format!(
-                        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[backup]\ndir = {:?}\n",
+                        "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[backup]\ndir = {:?}\n",
                         alias.to_string_lossy()
                     ),
                 )
@@ -2283,7 +2297,7 @@ mod tests {
         std::fs::write(backups.join("settings.toml"), "# included\n").unwrap();
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"backups/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\"backups/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         let aliases = tempfile::tempdir().unwrap();
@@ -2300,7 +2314,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            b"schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            b"schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         let dev_dir = dir.path().join("devices.d");
@@ -2333,7 +2347,7 @@ mod tests {
         let replacement = dir.path().join("replacement.toml");
         std::fs::write(
             &replacement,
-            "schema_version = 4\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
         )
         .unwrap();
         let output_parent = tempfile::tempdir().unwrap();
@@ -2360,7 +2374,7 @@ mod tests {
         let config = root.join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         std::fs::write(root.join("generation"), "held").unwrap();
@@ -2375,7 +2389,7 @@ mod tests {
                     std::fs::create_dir(&replacement).unwrap();
                     std::fs::write(
                         replacement.join("config.toml"),
-                        "schema_version = 4\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+                        "schema_version = 5\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
                     )
                     .unwrap();
                     std::fs::write(replacement.join("generation"), "replacement").unwrap();
@@ -2405,7 +2419,7 @@ mod tests {
         let include = dir.path().join("slice.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"slice.toml\"]\n# master-old\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\"slice.toml\"]\n# master-old\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         std::fs::write(&include, "# include-old\n").unwrap();
@@ -2438,12 +2452,12 @@ mod tests {
                         || {
                             let guard = write_lock::acquire_for_write_with_timeout(
                                 &master,
-                                Duration::from_secs(10),
+                                TEST_COMPLETION_TIMEOUT,
                             )
                             .unwrap();
                             std::fs::write(
                                 &master,
-                                "schema_version = 4\nincludes = [\"slice.toml\"]\n# master-new\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+                                "schema_version = 5\nincludes = [\"slice.toml\"]\n# master-new\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
                             )
                             .unwrap();
                             std::fs::write(&include, "# include-new\n").unwrap();
@@ -2455,7 +2469,7 @@ mod tests {
                 receiver_for_hook
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(TEST_COMPLETION_TIMEOUT)
                     .expect("writer must block behind the backup reader");
             },
             || create_backup(&config, Some(output.path())).unwrap().archive,
@@ -2604,7 +2618,7 @@ mod tests {
             let config = dir.path().join("config.toml");
             std::fs::write(
                 &config,
-                "schema_version = 4\n\n[server]\ndefault_profile = \"missing\"\n",
+                "schema_version = 5\n\n[server]\ndefault_profile = \"missing\"\n",
             )
             .unwrap();
             let output = tempfile::tempdir().unwrap();
@@ -2710,7 +2724,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "done");
         assert_no_archive_or_private(output.path());
         assert!(!output.path().join(LOCK_FILE).exists());
-        let writer = write_lock::acquire_for_write_with_timeout(&config, Duration::from_secs(10))
+        let writer = write_lock::acquire_for_write_with_timeout(&config, TEST_COMPLETION_TIMEOUT)
             .expect("reader must be released after tar failure");
         drop(writer);
     }
@@ -2742,7 +2756,7 @@ mod tests {
         std::fs::create_dir(&config_root).unwrap();
         let config = write_config(
             &config_root,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let descriptor_parent = workspace.path().join("descriptor-parent");
         let working_dir = descriptor_parent.join("working");
@@ -2841,7 +2855,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\".private/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\".private/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         std::fs::create_dir(dir.path().join(".private")).unwrap();
@@ -2875,7 +2889,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"custom/.policy.incoming-123-1\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\"custom/.policy.incoming-123-1\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         std::fs::create_dir(dir.path().join("custom")).unwrap();
@@ -2911,7 +2925,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"nested/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\nincludes = [\"nested/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
         let nested = dir.path().join("nested");
@@ -2967,15 +2981,19 @@ mod tests {
         let config = dir.path().join("config.toml");
         let include = dir.path().join(".hidden/nested/line\nbreak.toml");
         std::fs::create_dir_all(include.parent().unwrap()).unwrap();
-        let master_bytes = b"schema_version = 4\nincludes = [\".hidden/nested/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+        let master_bytes = b"schema_version = 5\nincludes = [\".hidden/nested/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
         let include_bytes = b"# unusual declared member\n";
         std::fs::write(&config, master_bytes).unwrap();
         std::fs::write(&include, include_bytes).unwrap();
         let output = tempfile::tempdir().unwrap();
         let archive = create_backup(&config, Some(output.path())).unwrap().archive;
 
-        std::fs::write(&config, "corrupted").unwrap();
-        std::fs::write(&include, "changed").unwrap();
+        std::fs::write(
+            &config,
+            "schema_version = 5\nincludes = [\".hidden/nested/*.toml\"]\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+        )
+        .unwrap();
+        std::fs::write(&include, "# changed unusual declared member\n").unwrap();
         assert!(matches!(
             crate::cli::commands::config::restore_archive(&config, &archive).unwrap(),
             crate::cli::commands::config::RestoreOutcome::Restored { .. }
@@ -3659,7 +3677,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         let now = datetime!(2026-05-28 12:00:00 UTC);
@@ -3680,7 +3698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"24h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"24h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3713,7 +3731,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3744,7 +3762,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3772,7 +3790,7 @@ mod tests {
         // No [backup] section ⇒ auto_interval is None.
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         let now = datetime!(2026-05-28 12:00:00 UTC);
@@ -3786,7 +3804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"0h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"0h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let output = dir.path().join("missing-output");
         let mut notices = Vec::new();
@@ -3834,7 +3852,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"0h\"\n\n[server]\ndefault_profile = \"missing\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"0h\"\n\n[server]\ndefault_profile = \"missing\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let output = dir.path().join("backups");
         let worker_config = config.clone();
@@ -3864,7 +3882,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let cfg = write_config(
                 dir.path(),
-                "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
             );
             let output = dir.path().join("elsewhere");
             let requested = explicit.then_some(output.as_path());
@@ -3888,7 +3906,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let cfg = write_config(
                 dir.path(),
-                "schema_version = 4\n[backup]\nauto_interval = \"24h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                "schema_version = 5\n[backup]\nauto_interval = \"24h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
             );
             let output = dir.path().join("backups");
             std::fs::create_dir(&output).unwrap();
@@ -3937,7 +3955,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3965,7 +3983,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -3985,7 +4003,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nretention_count = 2\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nretention_count = 2\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
@@ -4019,13 +4037,13 @@ mod tests {
                 move |event| {
                     if event == BackupTestEvent::OutputOwned {
                         owned_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
                     }
                 },
                 || create_backup(&worker_config, Some(&worker_output)),
             )
         });
-        owned_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        owned_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
         assert_eq!(
             run_backup_managed(
                 &config,
@@ -4095,7 +4113,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let output = dir.path().join("backups");
         let injected = AutoState {
@@ -4164,7 +4182,7 @@ mod tests {
                 move |event| {
                     if event == BackupTestEvent::SourceGuardDropped {
                         paused_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
                     }
                 },
                 || {
@@ -4177,7 +4195,7 @@ mod tests {
                 },
             )
         });
-        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        paused_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
         let before_reset = std::fs::read(output.join(STATE_FILE)).unwrap();
         let error =
             run_reset_auto_failure_at(&config, datetime!(2026-05-28 12:00:00 UTC)).unwrap_err();
@@ -4207,13 +4225,13 @@ mod tests {
                 move |event| {
                     if event == BackupTestEvent::ResetStateLoaded {
                         paused_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
                     }
                 },
                 || run_reset_auto_failure_at(&reset_config, datetime!(2026-05-28 12:01:00 UTC)),
             )
         });
-        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        paused_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
         assert_eq!(
             run_backup_managed(
                 &config,
@@ -4246,18 +4264,20 @@ mod tests {
                 move |event| {
                     if event == BackupTestEvent::SourceGuardDropped {
                         paused_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        release_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
                     }
                 },
                 || create_backup(&worker_config, Some(&worker_output)),
             )
         });
-        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        paused_rx
+            .recv_timeout(TEST_COMPLETION_TIMEOUT)
+            .expect("backup worker did not reach the post-snapshot pause");
         let writer = write_lock::acquire_for_write_with_timeout(&config, Duration::from_secs(2))
             .expect("source reader must be gone before publication");
         std::fs::write(
             &config,
-            "schema_version = 4\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"198.51.100.1:53\"]\n",
         )
         .unwrap();
         drop(writer);
@@ -4275,7 +4295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nretention_count = 2\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n[backup]\nretention_count = 2\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let output = dir.path().join("backups");
         std::fs::create_dir_all(&output).unwrap();
@@ -4422,7 +4442,7 @@ mod tests {
             let config = write_config(
                 dir.path(),
                 &format!(
-                    "schema_version = 4\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                    "schema_version = 5\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
                     configured
                 ),
             );
@@ -4471,7 +4491,7 @@ mod tests {
         let config = write_config(
             dir.path(),
             &format!(
-                "schema_version = 4\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                "schema_version = 5\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
                 configured
             ),
         );
@@ -4504,7 +4524,7 @@ mod tests {
         let config = write_config(
             dir.path(),
             &format!(
-                "schema_version = 4\n[backup]\ndir = {:?}\nauto_interval = \"0h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                "schema_version = 5\n[backup]\ndir = {:?}\nauto_interval = \"0h\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
                 configured
             ),
         );
@@ -4557,7 +4577,7 @@ mod tests {
         let canonical = write_config(
             &real,
             &format!(
-                "schema_version = 4\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+                "schema_version = 5\n[backup]\ndir = {:?}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
                 configured
             ),
         );
@@ -4657,7 +4677,7 @@ mod tests {
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg = write_config(
             &cfg_dir,
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\
              disable_after_failures = 1\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         std::fs::write(
@@ -4692,7 +4712,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n\
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
@@ -4728,7 +4748,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"1h\"\n\n\
+            "schema_version = 5\n[backup]\nauto_interval = \"1h\"\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
@@ -4752,7 +4772,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n[backup]\nauto_interval = \"24h\"\n\n\
+            "schema_version = 5\n[backup]\nauto_interval = \"24h\"\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
@@ -4790,7 +4810,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
 
@@ -4852,7 +4872,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_config(
             dir.path(),
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         );
         let backup_dir = dir.path().join("backups");
 
@@ -5064,7 +5084,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
+                "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
                  [backup]\ndir = \"{}\"\n",
                 elsewhere.path().display()
             ),

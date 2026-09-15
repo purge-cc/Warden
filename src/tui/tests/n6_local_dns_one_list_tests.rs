@@ -18,7 +18,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -59,7 +59,7 @@ fn empty_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n\
+        "schema_version = 5\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
@@ -70,8 +70,8 @@ fn empty_master(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn app_on(master: &Path) -> App {
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(master);
     app.active_leaf = Leaf::LocalDns;
     assert!(app.loaded_config.is_some(), "fixture must parse");
     app
@@ -81,7 +81,7 @@ async fn press(app: &mut App, code: KeyCode, master: &Path) {
     handle_key(app, key(code), &poller(master.parent().unwrap()), master).await;
 }
 
-fn anchor(app: &App) -> (String, String) {
+fn anchor(app: &App) -> (String, String, String) {
     app.local_dns
         .selected_id
         .clone()
@@ -100,23 +100,26 @@ async fn n6_down_walks_every_scope_in_one_pass() {
 
     // First keystroke seeds on the first record.
     press(&mut app, KeyCode::Down, &master).await;
-    assert_eq!(anchor(&app), ("global".into(), "printer.home".into()));
+    assert_eq!(
+        anchor(&app),
+        ("global".into(), "printer.home".into(), "A".into())
+    );
     press(&mut app, KeyCode::Down, &master).await;
     assert_eq!(
         anchor(&app),
-        ("profile:kids".into(), "youtube.local".into()),
+        ("profile:kids".into(), "youtube.local".into(), "A".into()),
         "crosses into the profile group over its header"
     );
     press(&mut app, KeyCode::Down, &master).await;
     assert_eq!(
         anchor(&app),
-        ("profile:work".into(), "vpn.work".into()),
+        ("profile:work".into(), "vpn.work".into(), "A".into()),
         "and on into the next profile group"
     );
     press(&mut app, KeyCode::Down, &master).await;
     assert_eq!(
         anchor(&app),
-        ("profile:work".into(), "vpn.work".into()),
+        ("profile:work".into(), "vpn.work".into(), "A".into()),
         "N4: the last record clamps"
     );
 }
@@ -128,13 +131,19 @@ async fn n6_up_clamps_on_the_first_record_not_onto_its_header() {
     let mut app = app_on(&master);
 
     press(&mut app, KeyCode::End, &master).await;
-    assert_eq!(anchor(&app), ("profile:work".into(), "vpn.work".into()));
+    assert_eq!(
+        anchor(&app),
+        ("profile:work".into(), "vpn.work".into(), "A".into())
+    );
     press(&mut app, KeyCode::Home, &master).await;
-    assert_eq!(anchor(&app), ("global".into(), "nas.home".into()));
+    assert_eq!(
+        anchor(&app),
+        ("global".into(), "nas.home".into(), "A".into())
+    );
     press(&mut app, KeyCode::Up, &master).await;
     assert_eq!(
         anchor(&app),
-        ("global".into(), "nas.home".into()),
+        ("global".into(), "nas.home".into(), "A".into()),
         "Up on the first record stays put — and never selects the \
              `Global` header above it"
     );
@@ -168,46 +177,57 @@ async fn n6_tab_still_cycles_the_leaf() {
     assert_ne!(app.active_leaf, Leaf::LocalDns);
 }
 
-// ── the side-card ───────────────────────────────────────────────
+// ── record details ──────────────────────────────────────────────
 
-/// Enter opens the audit side-card on the focused record; Esc closes
-/// it. Unchanged by N6, which is exactly why it is pinned here.
+/// `i` opens record details and its audit history on the focused record;
+/// Esc closes it without changing the selection.
 #[tokio::test]
-async fn n6_enter_opens_the_audit_card_on_the_focused_record_and_esc_closes_it() {
+async fn n6_i_opens_details_on_the_focused_record_and_esc_closes_it() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master);
 
     press(&mut app, KeyCode::Down, &master).await; // printer.home
-    press(&mut app, KeyCode::Enter, &master).await;
+    press(&mut app, KeyCode::Char('i'), &master).await;
     let view = app
         .local_dns
         .audit_view
         .as_ref()
-        .expect("Enter opens the side-card");
+        .expect("i opens record details");
+    assert!(app.local_dns.inspect_open);
     assert_eq!(view.scope_tag, "global");
     assert_eq!(view.domain, "printer.home", "on the FOCUSED record");
 
     press(&mut app, KeyCode::Esc, &master).await;
     assert!(app.local_dns.audit_view.is_none(), "Esc closes it");
+    assert!(!app.local_dns.inspect_open);
 }
 
-/// And it follows the cursor across a scope boundary — the card
-/// showing a Global record while a profile record is highlighted is
-/// the desync the follow-block exists to prevent.
+/// Detail scrolling owns navigation until the overlay closes. Reopening
+/// after moving the table resolves audit history from the new stable key.
 #[tokio::test]
-async fn n6_the_side_card_follows_the_cursor_across_scopes() {
+async fn n6_details_keep_selection_stable_and_reopen_on_the_new_scope() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master);
 
-    press(&mut app, KeyCode::Enter, &master).await;
+    press(&mut app, KeyCode::Char('i'), &master).await;
     assert_eq!(
         app.local_dns.audit_view.as_ref().unwrap().domain,
         "nas.home"
     );
 
+    let selected = app.local_dns.selected_id.clone();
     press(&mut app, KeyCode::End, &master).await;
+    assert_eq!(app.local_dns.selected_id, selected);
+    assert_eq!(
+        app.local_dns.audit_view.as_ref().unwrap().domain,
+        "nas.home"
+    );
+
+    press(&mut app, KeyCode::Esc, &master).await;
+    press(&mut app, KeyCode::End, &master).await;
+    press(&mut app, KeyCode::Char('i'), &master).await;
     let view = app.local_dns.audit_view.as_ref().unwrap();
     assert_eq!(view.scope_tag, "profile");
     assert_eq!(view.target_id, "work");
@@ -278,7 +298,7 @@ async fn n6_add_as_the_first_keystroke_still_resolves_a_real_row() {
 
     assert_eq!(
         anchor(&app),
-        ("global".into(), "nas.home".into()),
+        ("global".into(), "nas.home".into(), "A".into()),
         "the anchor is seeded before `a` runs, matching what the \
              renderer already highlights"
     );

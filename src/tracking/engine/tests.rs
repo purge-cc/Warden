@@ -736,6 +736,7 @@ fn observed_device_is_online_within_window() {
         cache_hits: 0,
         last_seen: now - 30, // 30s ago: within 60s window
         hourly_queries: Vec::new(),
+        hourly_blocked: Vec::new(),
     };
     assert!(device.is_online(now));
 
@@ -1655,6 +1656,40 @@ fn device_hourly_blocked_independent_of_queries() {
     let queries_sum: u64 = stats.hourly_queries_last_24h(now).iter().sum();
     assert_eq!(queries_sum, 5);
     assert_eq!(stats.hourly_blocked_last_24h_sum(now), 2);
+}
+
+#[test]
+fn device_hourly_blocked_series_is_oldest_first_and_rolls_over() {
+    let stats = DeviceStats::new("test".into(), "default".into());
+    let hour = 100u64;
+
+    for _ in 0..4 {
+        stats.record_hourly_query((hour - 2) * 3600);
+    }
+    for _ in 0..3 {
+        stats.record_hourly_query((hour - 1) * 3600);
+    }
+    stats.record_hourly_query(hour * 3600 + 17);
+
+    for _ in 0..2 {
+        stats.record_hourly_blocked((hour - 2) * 3600);
+    }
+    for _ in 0..3 {
+        stats.record_hourly_blocked((hour - 1) * 3600);
+    }
+    stats.record_hourly_blocked(hour * 3600 + 17);
+
+    let series = stats.hourly_blocked_last_24h(hour * 3600 + 17);
+    let query_series = stats.hourly_queries_last_24h(hour * 3600 + 17);
+    assert_eq!(series.len(), DEVICE_HOURLY_SLOTS);
+    assert_eq!(&query_series[21..], &[4, 3, 1]);
+    assert_eq!(&series[21..], &[2, 3, 1]);
+    assert_eq!(query_series.iter().sum::<u64>(), 8);
+    assert_eq!(series.iter().sum::<u64>(), 6);
+
+    let after_rollover = stats.hourly_blocked_last_24h((hour + 24) * 3600);
+    assert_eq!(after_rollover.len(), DEVICE_HOURLY_SLOTS);
+    assert!(after_rollover.iter().all(|count| *count == 0));
 }
 
 /// `record_query` end-to-end on the hot path bumps both the

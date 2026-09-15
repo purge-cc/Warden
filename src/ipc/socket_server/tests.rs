@@ -1,5 +1,112 @@
 use super::*;
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn node_control_bootstrap_requires_local_ownership_without_admin_token() {
+    use crate::cluster::node_control::NodeControlCommand;
+    let state = test_state();
+    let unavailable = IpcError::NodeStatusUnavailable.operator_message();
+    let command = IpcCommand::NodeControl {
+        request: NodeControlCommand::TokenPrepare { listen: None },
+        token: None,
+    };
+    for uid in [None, Some(state.daemon_uid.wrapping_add(1))] {
+        let reply = dispatch_command(command.clone(), uid, &state).await;
+        assert!(matches!(reply, IpcResponse::Error { message } if message != unavailable));
+    }
+    let reply = dispatch_command(command, Some(state.daemon_uid), &state).await;
+    assert!(matches!(reply, IpcResponse::Error { message } if message == unavailable));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn node_bootstrap_auth_requires_the_socket_owner_and_is_lifecycle_only() {
+    let mut state = test_state();
+    state.config_path = None;
+    state.api_token_hash.store(Arc::new(None));
+    let command = IpcCommand::NodesCancel {
+        preview_id: "invalid".into(),
+        token: None,
+    };
+    let unavailable = IpcError::NoConfigPath.operator_message();
+    for uid in [None, Some(state.daemon_uid.wrapping_add(1))] {
+        let reply = dispatch_command(command.clone(), uid, &state).await;
+        assert!(matches!(reply, IpcResponse::Error { message } if message != unavailable));
+    }
+    let reply = dispatch_command(command, Some(state.daemon_uid), &state).await;
+    assert!(matches!(reply, IpcResponse::Error { message } if message == unavailable));
+    let reply = dispatch_command(
+        IpcCommand::Reload { token: None },
+        Some(state.daemon_uid),
+        &state,
+    )
+    .await;
+    assert!(matches!(reply, IpcResponse::Error { .. }));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn node_failures_keep_backend_details_off_the_wire() {
+    let mut state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("private-node-master.toml");
+    crate::config::atomic_write::hardened_atomic_write(
+        &master,
+        b"invalid TOML [",
+        Default::default(),
+    )
+    .unwrap();
+    state.config_path = Some(master.clone());
+    state.api_token_hash.store(Arc::new(None));
+    let id = "01909766-9674-4f34-a930-164caad0db86".to_string();
+    for (command, expected) in [
+        (IpcCommand::NodesStatus, IpcError::NodeStatusUnavailable),
+        (
+            IpcCommand::NodesPreview {
+                request: crate::cluster::lifecycle::LifecycleRequest::Rename {
+                    name: "Local name".into(),
+                },
+                token: None,
+            },
+            IpcError::NodePreviewFailed,
+        ),
+        (
+            IpcCommand::NodesApply {
+                preview_id: id.clone(),
+                token: None,
+            },
+            IpcError::NodeApplyFailed,
+        ),
+        (
+            IpcCommand::NodesCancel {
+                preview_id: id,
+                token: None,
+            },
+            IpcError::NodeCancelFailed,
+        ),
+    ] {
+        let response = dispatch_command(command, Some(state.daemon_uid), &state).await;
+        match response {
+            IpcResponse::Error { message } => {
+                assert_eq!(message, expected.operator_message());
+                assert!(!message.contains("private-node-master"));
+                assert!(!message.contains(root.path().to_str().unwrap()));
+            }
+            other => panic!("unexpected node response: {other:?}"),
+        }
+    }
+    assert_eq!(std::fs::read_to_string(master).unwrap(), "invalid TOML [");
+    let mut status = crate::cluster::lifecycle::LifecycleStatus {
+        last_error: Some("cannot read /var/private-node/corpus.json".into()),
+        ..Default::default()
+    };
+    enrich_nodes_runtime(&mut status, &state);
+    assert_eq!(
+        status.last_error,
+        Some(IpcError::NodeStatusUnavailable.operator_message())
+    );
+}
+
 #[tokio::test]
 async fn server_handles_status_command() {
     let state = Arc::new(test_state());
@@ -68,8 +175,11 @@ async fn server_handles_query_command() {
             blocked_by,
         } => {
             assert_eq!(domain, "test.com");
-            assert!(!blocked);
-            assert!(blocked_by.is_none(), "allowed domain carries no source");
+            assert!(blocked, "a missing resolver must fail closed");
+            assert!(
+                blocked_by.is_none(),
+                "no resolver has no policy attribution"
+            );
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -77,17 +187,17 @@ async fn server_handles_query_command() {
     server_handle.abort();
 }
 
-/// §4.2 G1a — a blocked domain carries its attribution. A default
-/// profile with `block_all` blocks via the admin layer, so
-/// `evaluate_attributed` reports `BlockSource::AdminBlock` →
-/// `blocked_by = "admin_block"`.
+/// A compiled default-deny profile reports admin attribution.
 #[test]
 fn handle_query_attributes_admin_block() {
     use crate::config::schema::{ConfigV1, Id, Profile};
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, ProfileMounts, RuleCompileLimits,
+    };
     use crate::profiles::ProfileResolver;
 
     let mut config = ConfigV1::test_scaffold();
-    config.schema_version = 4;
+    config.schema_version = crate::config::schema::TARGET_SCHEMA_VERSION_V5;
     config.profiles.insert(
         "strict".into(),
         Profile {
@@ -96,13 +206,25 @@ fn handle_query_attributes_admin_block() {
         },
     );
     config.server.default_profile = Some(Id::new("strict").unwrap());
-    let bit_map = crate::lists::source_key::SourceBitMap::default();
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let compiled = Arc::new(
+        CompiledOperatorRules::compile(
+            &[],
+            &[ProfileMounts {
+                profile_id: "strict",
+                custom_lists: &[],
+                block_all: true,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
 
     let mut state = test_state();
-    state.profiles = Some(Arc::new(ProfileResolver::build(
-        &config,
-        &bit_map,
-        &crate::config::custom_list::CustomListStore::new(),
+    state.profiles = Some(Arc::new(ProfileResolver::build_with_operator_rules(
+        &config, compiled,
     )));
 
     match handle_query("anything.example", &state) {
@@ -792,6 +914,7 @@ fn test_state() -> DaemonState {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -812,8 +935,11 @@ fn test_state() -> DaemonState {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     }
 }
 
@@ -832,6 +958,7 @@ fn test_state_with_token(token_plaintext: &str) -> DaemonState {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -854,8 +981,11 @@ fn test_state_with_token(token_plaintext: &str) -> DaemonState {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     }
 }
 
@@ -1209,6 +1339,7 @@ fn test_state_with_query_log(
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -1229,8 +1360,11 @@ fn test_state_with_query_log(
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     }
 }
 
@@ -1336,6 +1470,7 @@ async fn query_logs_read_does_not_park_the_runtime_worker() {
         async move {
             let resp = dispatch_command(
                 IpcCommand::QueryLogs {
+                    client_ips: Vec::new(),
                     limit: 1000,
                     client: None,
                     blocked_only: false,
@@ -1853,6 +1988,7 @@ async fn admin_accepted_when_token_correct() {
     let state = Arc::new(test_state_with_token("ps_correctvalue"));
     let resp = dispatch_command(
         IpcCommand::QueryLogs {
+            client_ips: Vec::new(),
             limit: 10,
             client: None,
             blocked_only: false,
@@ -1934,6 +2070,7 @@ async fn get_all_clients_empty_view_on_zero_clients() {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -1954,8 +2091,11 @@ async fn get_all_clients_empty_view_on_zero_clients() {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     let resp = dispatch_command(IpcCommand::GetAllDevices, None, &state).await;
@@ -2060,6 +2200,7 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -2080,8 +2221,11 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     let resp = dispatch_command(IpcCommand::GetAllDevices, None, &state).await;
@@ -2102,6 +2246,160 @@ async fn get_all_clients_splits_mapped_and_unmapped() {
             let u = &view.unmapped[0];
             assert_eq!(u.ip, "10.0.0.99");
             assert_eq!(u.queries, 1);
+            assert!(u.online);
+        }
+        other => panic!("expected DeviceView, got {other:?}"),
+    }
+}
+
+/// The GetAllDevices projection must split mapped/unmapped devices and
+/// aggregate both hourly rings across every IP belonging to one mapped
+/// device. This exercises the live resolver snapshot and stats engine, not
+/// a hand-built DTO.
+#[test]
+fn get_all_clients_projects_hourly_series_across_mapped_ips_and_unmapped() {
+    use crate::config::schema::{ConfigV1, Device, Id, Profile};
+    use crate::config::settings::TrackingConfig;
+    use crate::profiles::ProfileResolver;
+    use crate::tracking::StatsEngine;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut config = ConfigV1::test_scaffold();
+    config.schema_version = 4;
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            display_name: "Default".into(),
+            ..Default::default()
+        },
+    );
+    config.devices.push(Device {
+        id: Id::new("edo-laptop").unwrap(),
+        display_name: "edo-laptop".into(),
+        ip: Some("192.168.1.42".parse().unwrap()),
+        mac: Some("AA:BB:CC:DD:EE:FF".into()),
+        mac_aliases: vec![],
+        profile: Some(Id::new("default").unwrap()),
+        groups: vec![],
+        owner: Some("Dweller".into()),
+        device_type: Some("ThinkPad T14".into()),
+        department: Some("home".into()),
+        notes: None,
+        allow_rules: vec![],
+        deny_rules: vec![],
+        override_profile_deny: false,
+        unfiltered: false,
+        network_name: None,
+        network_name_wildcard: false,
+    });
+
+    let bit_map = crate::lists::source_key::SourceBitMap::default();
+    let profiles = Arc::new(ProfileResolver::build(
+        &config,
+        &bit_map,
+        &crate::config::custom_list::CustomListStore::new(),
+    ));
+
+    let stats = Arc::new(StatsEngine::new(&TrackingConfig::default()));
+    let mapped_ip: IpAddr = Ipv4Addr::new(192, 168, 1, 42).into();
+    let mapped_secondary_ip: IpAddr = Ipv4Addr::new(192, 168, 1, 43).into();
+    let unmapped_ip: IpAddr = Ipv4Addr::new(10, 0, 0, 99).into();
+    profiles.test_only_set_arp_snapshot(&[(mapped_secondary_ip, "AA:BB:CC:DD:EE:FF")]);
+    stats.record_query(
+        mapped_ip,
+        "good.com",
+        Some("edo-laptop"),
+        Some("default"),
+        hickory_proto::rr::RecordType::A,
+        false,
+        false,
+        None,
+    );
+    stats.record_query(
+        mapped_secondary_ip,
+        "second.example",
+        None,
+        None,
+        hickory_proto::rr::RecordType::A,
+        true,
+        false,
+        None,
+    );
+    stats.record_query(
+        mapped_secondary_ip,
+        "second-allowed.example",
+        None,
+        None,
+        hickory_proto::rr::RecordType::A,
+        false,
+        false,
+        None,
+    );
+    stats.record_query(
+        mapped_ip,
+        "ads.example",
+        None,
+        None,
+        hickory_proto::rr::RecordType::A,
+        true,
+        false,
+        None,
+    );
+    stats.record_query(
+        unmapped_ip,
+        "random.example",
+        None,
+        None,
+        hickory_proto::rr::RecordType::A,
+        false,
+        false,
+        None,
+    );
+    stats.record_query(
+        unmapped_ip,
+        "random-blocked.example",
+        None,
+        None,
+        hickory_proto::rr::RecordType::A,
+        true,
+        false,
+        None,
+    );
+
+    let (mapped_snapshots, arp) = profiles.snapshot_for_ipc();
+    let observed = stats.list_observed_ips();
+    let resp = super::build_device_view(
+        mapped_snapshots,
+        arp,
+        &observed,
+        None,
+        observed
+            .iter()
+            .map(|device| device.last_seen)
+            .max()
+            .unwrap_or(0),
+    );
+    match resp {
+        IpcResponse::DeviceView(view) => {
+            assert_eq!(view.mapped.len(), 1);
+            let m = &view.mapped[0];
+            assert_eq!(m.name, "edo-laptop");
+            assert_eq!(m.ip, "192.168.1.42");
+            assert_eq!(m.owner.as_deref(), Some("Dweller"));
+            assert_eq!(m.device_type.as_deref(), Some("ThinkPad T14"));
+            assert_eq!(m.department.as_deref(), Some("home"));
+            assert_eq!(m.queries, 4);
+            assert_eq!(m.blocked, 2);
+            assert_eq!(m.hourly_queries.as_slice().iter().sum::<u64>(), 4);
+            assert_eq!(m.hourly_blocked.as_deref().unwrap().iter().sum::<u64>(), 2);
+            assert!(m.online);
+
+            assert_eq!(view.unmapped.len(), 1);
+            let u = &view.unmapped[0];
+            assert_eq!(u.ip, "10.0.0.99");
+            assert_eq!(u.queries, 2);
+            assert_eq!(u.hourly_queries.as_slice().iter().sum::<u64>(), 2);
+            assert_eq!(u.hourly_blocked.as_deref().unwrap().iter().sum::<u64>(), 1);
             assert!(u.online);
         }
         other => panic!("expected DeviceView, got {other:?}"),
@@ -2131,6 +2429,7 @@ fn test_state_with_config_path(
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -2153,8 +2452,11 @@ fn test_state_with_config_path(
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
     (state, reload_rx)
 }
@@ -2171,13 +2473,10 @@ fn client_mutation_temp_config(content: &str, suffix: &str) -> (tempfile::TempDi
     (dir, path)
 }
 
-/// §4.27-A: load the v1 config and return its devices for
-/// post-mutation assertions. Replaces the pre-migration
-/// `Settings::from_file(&path).clients` verification — the IPC
-/// device handlers are now v1-native and write `[[devices]]`.
+/// Read current-schema devices back through the loader after mutation.
 fn load_devices(path: &std::path::Path) -> Vec<crate::config::schema::Device> {
-    crate::config::loader::load_config(path, time::OffsetDateTime::now_utc())
-        .expect("v1 config must load")
+    crate::config::loader::load_current_config(path, time::OffsetDateTime::now_utc())
+        .expect("current config must load")
         .config
         .devices
 }
@@ -2185,7 +2484,7 @@ fn load_devices(path: &std::path::Path) -> Vec<crate::config::schema::Device> {
 #[tokio::test]
 async fn client_add_happy_path_writes_and_reloads() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2235,7 +2534,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_rejects_duplicate_name_with_named_error() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2289,7 +2588,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_rejects_duplicate_ip_with_named_error() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2339,7 +2638,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_add_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-auth", path.clone());
@@ -2383,7 +2682,7 @@ async fn client_add_requires_admin_token() {
 #[tokio::test]
 async fn client_add_validator_catches_unknown_profile() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "validator",
     );
     let (state, _rx) = test_state_with_config_path("tok-val", path.clone());
@@ -2423,7 +2722,7 @@ async fn client_add_concurrent_calls_serialize_through_write_lock() {
     // must end up on disk — without the write lock the second
     // would overwrite the first's append.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "concurrent",
     );
     let (state, _rx) = test_state_with_config_path("tok-conc", path.clone());
@@ -2492,7 +2791,7 @@ async fn client_add_concurrent_calls_serialize_through_write_lock() {
 #[tokio::test]
 async fn client_update_partial_patch_only_touches_provided_fields() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2557,7 +2856,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_sets_network_name() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2597,7 +2896,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_clears_network_name_on_some_none() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2656,7 +2955,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn a_pre_s5_payload_still_carrying_tags_applies_its_other_fields() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2736,7 +3035,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_leaves_network_name_alone_when_patch_field_is_none() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2788,7 +3087,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn device_update_clear_name_with_wildcard_still_set_is_validator_refused() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2884,12 +3183,13 @@ fn two_group_dto() -> super::super::protocol::MappedDeviceDto {
         network_name_wildcard: false,
         id: Some("edo-laptop".into()),
         hourly_queries: Vec::new(),
+        hourly_blocked: None,
         unfiltered: false,
     }
 }
 
 const TWO_GROUP_CONFIG: &str = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -2974,7 +3274,7 @@ async fn client_update_some_none_clears_nullable_field() {
     // "leave alone" (which would be outer `None`). This is the
     // load-bearing reason DevicePatch uses Option<Option<T>>.
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -3017,7 +3317,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_update_unknown_name_returns_friendly_error() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "update-unknown",
     );
     let (state, _rx) = test_state_with_config_path("tok-unk", path.clone());
@@ -3060,7 +3360,7 @@ async fn client_update_to_duplicate_ip_caught_by_validator() {
     // Duplicate-IP is the v1-relevant validate-or-revert case in
     // its place.)
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -3114,7 +3414,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_update_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "update-auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-uauth", path.clone());
@@ -3134,7 +3434,7 @@ async fn client_update_requires_admin_token() {
 #[tokio::test]
 async fn client_remove_happy_path_drops_client_and_reloads() {
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -3179,7 +3479,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_remove_unknown_name_returns_friendly_error() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "remove-unknown",
     );
     let (state, _rx) = test_state_with_config_path("tok-rmx", path.clone());
@@ -3213,7 +3513,7 @@ async fn client_remove_dangling_schedule_blocked_by_validator() {
     // and the touched file is rolled back. A sibling "laptop"
     // device is kept so the removal is an ordinary 2→1 case.
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -3285,7 +3585,7 @@ servers = ["192.0.2.1:53"]
 #[tokio::test]
 async fn client_remove_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "remove-auth",
     );
     let (state, _rx) = test_state_with_config_path("tok-rmauth", path.clone());
@@ -3316,7 +3616,7 @@ fn test_state_with_resolver(
     use crate::dns::cache::DnsCache;
     use crate::profiles::ProfileResolver;
 
-    let loaded = loader::load_config(&config_path, time::OffsetDateTime::now_utc())
+    let loaded = loader::load_current_config(&config_path, time::OffsetDateTime::now_utc())
         .unwrap_or_else(|errs| panic!("test fixture config must load: {errs:?}"));
     let bit_map = crate::lists::source_key::SourceBitMap::default();
     let resolver = Arc::new(ProfileResolver::build(
@@ -3337,6 +3637,7 @@ fn test_state_with_resolver(
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -3359,8 +3660,11 @@ fn test_state_with_resolver(
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
     (state, reload_rx)
 }
@@ -3376,7 +3680,7 @@ async fn client_promote_happy_path_pins_arp_mac() {
     // fires. The previous test that asserted Sprint-35-style
     // refusal is inverted here.
     let initial = r#"
-schema_version = 4
+schema_version = 5
 
 [profiles.default]
 display_name = "Default"
@@ -3415,8 +3719,8 @@ servers = ["192.0.2.1:53"]
     // block. The entry lands in the master because no devices.d/
     // directory was created for this fixture.
     let now = time::OffsetDateTime::now_utc();
-    let loaded = crate::config::loader::load_config(&path, now)
-        .expect("master must reload as v1 after promote");
+    let loaded = crate::config::loader::load_current_config(&path, now)
+        .expect("master must reload as current schema after promote");
     let devices = &loaded.config.devices;
     assert_eq!(devices.len(), 1, "exactly one device after promote");
     assert_eq!(devices[0].id.as_str(), "phone");
@@ -3442,7 +3746,7 @@ async fn client_promote_rejects_when_arp_has_no_entry() {
     // requirement and reintroduce the IP-only-identification
     // foot-gun documented in CLAUDE.md.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-no-arp",
     );
     let target_ip: std::net::IpAddr = "10.0.0.50".parse().unwrap();
@@ -3491,7 +3795,7 @@ async fn client_promote_validator_runs_via_delegated_add_path() {
     // test pins the unknown-profile case to confirm delegation
     // didn't bypass validation.
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-validator",
     );
     let unmapped: std::net::IpAddr = "10.0.0.42".parse().unwrap();
@@ -3520,7 +3824,7 @@ async fn client_promote_validator_runs_via_delegated_add_path() {
 #[tokio::test]
 async fn client_promote_requires_admin_token() {
     let (_dir, path) = client_mutation_temp_config(
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         "promote-auth",
     );
     let target_ip: std::net::IpAddr = "10.0.0.42".parse().unwrap();
@@ -3545,7 +3849,7 @@ async fn client_promote_requires_admin_token() {
 
 fn tracking_v1_master() -> String {
     r#"
-schema_version = 4
+schema_version = 5
 
 [server]
 listen = "127.0.0.1:15353"
@@ -3633,8 +3937,9 @@ async fn handle_tracking_config_update_happy_path() {
     }
 
     // Re-read and assert the mutation landed.
-    let reloaded = crate::config::loader::load_config(&path, time::OffsetDateTime::now_utc())
-        .expect("reload after patch");
+    let reloaded =
+        crate::config::loader::load_current_config(&path, time::OffsetDateTime::now_utc())
+            .expect("reload after patch");
     assert!(!reloaded.config.tracking.query_log_enabled);
     assert_eq!(reloaded.config.tracking.retention_days, 14);
 }
@@ -3667,8 +3972,9 @@ async fn handle_tracking_config_update_refuses_invalid_retention() {
     }
 
     // Master unchanged on disk.
-    let reloaded = crate::config::loader::load_config(&path, time::OffsetDateTime::now_utc())
-        .expect("reload after reject");
+    let reloaded =
+        crate::config::loader::load_current_config(&path, time::OffsetDateTime::now_utc())
+            .expect("reload after reject");
     assert_eq!(reloaded.config.tracking.retention_days, 7);
 }
 
@@ -3741,6 +4047,7 @@ fn test_state_with_list_statuses() -> DaemonState {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 2,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -3761,8 +4068,11 @@ fn test_state_with_list_statuses() -> DaemonState {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     }
 }
 
@@ -4303,6 +4613,7 @@ fn test_state_with_local_records_hits() -> DaemonState {
         upstream_mode: "plain".into(),
         upstream_count: 2,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -4323,8 +4634,11 @@ fn test_state_with_local_records_hits() -> DaemonState {
         )),
         daemon_uid: current_euid(),
         resource_budget_store: crate::resource_budget::types::new_store(),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     }
 }
 
@@ -4410,9 +4724,17 @@ fn local_records_hits_with_token_is_identity() {
 /// every assertion below fail for a reason that has nothing to do with
 /// mounting.
 fn mount_fixture(suffix: &str, mounted: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    mount_fixture_for_schema(suffix, mounted, 5)
+}
+
+fn mount_fixture_for_schema(
+    suffix: &str,
+    mounted: &str,
+    schema_version: u32,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let initial = format!(
         r#"
-schema_version = 4
+schema_version = {schema_version}
 
 [profiles.default]
 display_name = "Default"
@@ -4439,10 +4761,35 @@ servers = ["192.0.2.1:53"]
     (dir, path)
 }
 
+async fn test_state_with_operator_rules_path(
+    token_plaintext: &str,
+    config_path: PathBuf,
+) -> (
+    DaemonState,
+    tokio::sync::mpsc::Receiver<Option<u32>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (mut state, reload_rx) = test_state_with_config_path(token_plaintext, config_path.clone());
+    let (supervisor, jobs) = crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+        Arc::new(crate::operator_rules::OperatorRulesService::new(
+            config_path,
+        )),
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+    state.operator_rule_jobs = Some(jobs);
+    (state, reload_rx, shutdown_tx, supervisor_task)
+}
+
 /// The mounts a profile carries after a mutation, read back off disk.
 fn load_profile_mounts(path: &std::path::Path, id: &str) -> Vec<String> {
-    crate::config::loader::load_config(path, time::OffsetDateTime::now_utc())
-        .expect("v1 config must load")
+    crate::config::loader::load_current_config(path, time::OffsetDateTime::now_utc())
+        .expect("current config must load")
         .config
         .profiles
         .get(id)
@@ -4470,7 +4817,8 @@ fn raw_profile_table(path: &std::path::Path, id: &str) -> toml::value::Table {
 #[tokio::test]
 async fn profile_update_mounts_a_custom_list() {
     let (_dir, path) = mount_fixture("mount", "");
-    let (state, mut reload_rx) = test_state_with_config_path("tok-mount", path.clone());
+    let (state, mut reload_rx, shutdown_tx, supervisor_task) =
+        test_state_with_operator_rules_path("tok-mount", path.clone()).await;
     let state = Arc::new(state);
 
     let resp = dispatch_command(
@@ -4494,7 +4842,60 @@ async fn profile_update_mounts_a_custom_list() {
         "expected Ok, got {resp:?}"
     );
     assert_eq!(load_profile_mounts(&path, "default"), ["home-exceptions"]);
-    assert!(reload_rx.try_recv().is_ok(), "reload signal must be sent");
+    // Custom-list mounts complete through the supervised operator-rules job.
+    // The durable receipt reports activation pending; no legacy synchronous
+    // reload signal is emitted by this adapter.
+    let IpcResponse::Ok { message } = &resp else {
+        unreachable!("response was checked above");
+    };
+    assert!(
+        message.contains("activation pending"),
+        "committed mount must report pending activation: {message}"
+    );
+    assert!(
+        message.contains("operation_id="),
+        "pending activation must expose the durable operation id: {message}"
+    );
+    assert!(
+        reload_rx.try_recv().is_err(),
+        "supervised operator-rule mount must not use legacy reload channel"
+    );
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_update_rejects_even_an_empty_legacy_admin_rules_patch_without_writing() {
+    let (_dir, path) = mount_fixture_for_schema("retired-admin-rules", "", 4);
+    let before = std::fs::read(&path).unwrap();
+    let (state, _rx) = test_state_with_config_path("tok-retired-rules", path.clone());
+    let state = Arc::new(state);
+
+    let resp = dispatch_command(
+        IpcCommand::ProfileUpdate {
+            id: "default".into(),
+            patch: crate::ipc::protocol::ProfileUpdatePatch {
+                admin_rules: Some(crate::ipc::protocol::AdminRulesPatch {
+                    add: vec![],
+                    remove: vec![],
+                }),
+                ..Default::default()
+            },
+            token: Some("tok-retired-rules".into()),
+        },
+        None,
+        &state,
+    )
+    .await;
+
+    let IpcResponse::Error { message } = resp else {
+        panic!("legacy admin_rules patch must be rejected");
+    };
+    assert_eq!(
+        message,
+        IpcError::LegacyProfileRulesRetired.operator_message()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 /// Unmounting the last one REMOVES the key rather than leaving
@@ -4504,7 +4905,8 @@ async fn profile_update_mounts_a_custom_list() {
 #[tokio::test]
 async fn profile_update_unmount_removes_the_key_rather_than_emptying_it() {
     let (_dir, path) = mount_fixture("unmount", "custom_lists = [\"home-exceptions\"]");
-    let (state, _rx) = test_state_with_config_path("tok-unmount", path.clone());
+    let (state, _reload_rx, shutdown_tx, supervisor_task) =
+        test_state_with_operator_rules_path("tok-unmount", path.clone()).await;
     let state = Arc::new(state);
 
     let resp = dispatch_command(
@@ -4532,6 +4934,8 @@ async fn profile_update_unmount_removes_the_key_rather_than_emptying_it() {
         !raw_profile_table(&path, "default").contains_key("custom_lists"),
         "an empty mount list is removed, never written as []",
     );
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
 }
 
 /// `mount` is applied BEFORE `unmount`, frozen: an id named by both
@@ -4541,7 +4945,8 @@ async fn profile_update_unmount_removes_the_key_rather_than_emptying_it() {
 #[tokio::test]
 async fn an_id_in_both_halves_of_the_mount_patch_ends_unmounted() {
     let (_dir, path) = mount_fixture("both", "custom_lists = [\"handheld\"]");
-    let (state, _rx) = test_state_with_config_path("tok-both", path.clone());
+    let (state, _reload_rx, shutdown_tx, supervisor_task) =
+        test_state_with_operator_rules_path("tok-both", path.clone()).await;
     let state = Arc::new(state);
 
     let resp = dispatch_command(
@@ -4569,6 +4974,8 @@ async fn an_id_in_both_halves_of_the_mount_patch_ends_unmounted() {
         ["handheld"],
         "the untouched mount survives and the contested one does not land",
     );
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
 }
 
 /// Mounting an id no `[[custom_lists]]` declares is refused — by the
@@ -4654,7 +5061,7 @@ const C55_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn c55_master() -> &'static str {
     r#"
-schema_version = 4
+schema_version = 5
 
 [server]
 default_profile = "default"
@@ -5074,7 +5481,7 @@ async fn cross_directory_master_alias_keeps_all_seven_mutations_in_the_canonical
     std::fs::write(
         &master,
         r#"
-schema_version = 4
+schema_version = 5
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -5178,8 +5585,9 @@ profile = "default"
         assert!(matches!(response, IpcResponse::Ok { .. }), "{response:?}");
     }
 
-    let loaded = crate::config::loader::load_config(&alias, time::OffsetDateTime::now_utc())
-        .expect("the canonical tree must remain loadable through its alias");
+    let loaded =
+        crate::config::loader::load_current_config(&alias, time::OffsetDateTime::now_utc())
+            .expect("the canonical tree must remain loadable through its alias");
     let added = loaded
         .config
         .devices
@@ -5366,7 +5774,8 @@ fn os_guard_is_released_before_reload_while_the_ipc_mutex_remains_held() {
 async fn migration_fence_maps_all_seven_acquisition_failures_without_writing_or_reloading() {
     use std::os::unix::fs::PermissionsExt;
 
-    let (_dir, path) = client_mutation_temp_config(c55_master(), "migration-fence");
+    let legacy_master = c55_master().replacen("schema_version = 5", "schema_version = 4", 1);
+    let (_dir, path) = client_mutation_temp_config(&legacy_master, "migration-fence");
     let migration_guard = crate::config::write_lock::acquire_for_migration(&path).unwrap();
     crate::config::migration_journal::create_fence(&migration_guard).unwrap();
     let journal = path
@@ -5494,14 +5903,15 @@ async fn closed_reload_channel_preserves_the_existing_post_write_split() {
     )
     .await;
     assert_eq!(response, ipc_error(IpcError::ConfigSavedReloadClosed));
-    assert!(
-        crate::config::loader::load_config(&device_path, time::OffsetDateTime::now_utc())
-            .unwrap()
-            .config
-            .devices
-            .iter()
-            .any(|device| device.id.as_str() == "added")
-    );
+    assert!(crate::config::loader::load_current_config(
+        &device_path,
+        time::OffsetDateTime::now_utc()
+    )
+    .unwrap()
+    .config
+    .devices
+    .iter()
+    .any(|device| device.id.as_str() == "added"));
 
     let (_profile_dir, profile_path) =
         client_mutation_temp_config(c55_master(), "closed-reload-profile");
@@ -5524,13 +5934,14 @@ async fn closed_reload_channel_preserves_the_existing_post_write_split() {
             message: "created profile \"created\"".into()
         }
     );
-    assert!(
-        crate::config::loader::load_config(&profile_path, time::OffsetDateTime::now_utc())
-            .unwrap()
-            .config
-            .profiles
-            .contains_key("created")
-    );
+    assert!(crate::config::loader::load_current_config(
+        &profile_path,
+        time::OffsetDateTime::now_utc()
+    )
+    .unwrap()
+    .config
+    .profiles
+    .contains_key("created"));
 }
 
 #[test]
@@ -5622,5 +6033,655 @@ fn mutation_handlers_keep_the_acquire_read_write_drop_reload_fence() {
             !body[acquire..drop_guard].contains(".await"),
             "{name} awaits while holding the OS guard"
         );
+    }
+}
+
+#[tokio::test]
+async fn exact_client_selection_is_validated_anded_and_applied_before_pagination() {
+    use crate::ipc::protocol::{AdvancedClientFilterDto, QueryLogRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("query.log");
+    let timestamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let rows = [
+        ("10.0.0.1", "selected", "target.test", "BLOCKED"),
+        ("2001:db8::1", "selected", "target.test", "BLOCKED"),
+        ("10.0.0.10", "selected", "target.test", "BLOCKED"),
+        ("10.0.0.1", "selected", "target.test", "ALLOWED"),
+        ("2001:db8::1", "selected", "other.test", "BLOCKED"),
+        ("10.0.0.1", "excluded", "target.test", "BLOCKED"),
+    ];
+    let mut body = String::new();
+    for (ip, name, domain, result) in rows {
+        let entry = crate::tracking::query_log::QueryLogEntry {
+            timestamp: timestamp.clone(),
+            client_ip: ip.parse().unwrap(),
+            client_name: Some(name.into()),
+            domain: domain.into(),
+            query_type: "A".into(),
+            result: result.into(),
+            response_time_us: 100,
+            cname_chain_via: None,
+            rewrote_from: None,
+        };
+        body.push_str(&serde_json::to_string(&entry).unwrap());
+        body.push('\n');
+    }
+    std::fs::write(&log, body).unwrap();
+    let state = test_state_with_query_log(&log, dir.path(), true);
+    let req = QueryLogRequest {
+        limit: 1,
+        // Expanded IPv6 text must match the parsed IP, not its string spelling.
+        client_ips: vec![
+            "10.0.0.1".into(),
+            "2001:0db8:0:0:0:0:0:1".into(),
+            "10.0.0.1".into(),
+        ],
+        blocked_only: true,
+        domain: Some("target".into()),
+        since_secs: Some(3600),
+        advanced: Some(AdvancedClientFilterDto {
+            name: Some("selected".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    state
+        .api_token_hash
+        .store(Arc::new(Some(crate::auth::token::hash_token(
+            "exact-client-test",
+        ))));
+    let mut wire = serde_json::to_value(&req).unwrap();
+    wire["type"] = serde_json::json!("query_logs");
+    let cmd = serde_json::from_value::<IpcCommand>(wire)
+        .unwrap()
+        .with_token(Some("exact-client-test".into()));
+    let IpcResponse::QueryLogs {
+        entries,
+        next_cursor,
+        client_ips_applied,
+        ..
+    } = dispatch_command(cmd, Some(state.daemon_uid), &state).await
+    else {
+        panic!("expected query logs");
+    };
+    assert!(
+        client_ips_applied,
+        "exact-client response must acknowledge its predicate"
+    );
+    assert_eq!(
+        entries.len(),
+        1,
+        "nonmatching newer rows must not consume the page limit"
+    );
+    assert_eq!(entries[0].client_ip, "2001:db8::1");
+    let cursor = next_cursor.expect("older matching IPv4 row remains");
+    let IpcResponse::QueryLogs { entries, .. } = handle_query_logs(
+        &state,
+        QueryLogRequest {
+            cursor: Some(cursor),
+            ..req.clone()
+        },
+    )
+    .await
+    else {
+        panic!("expected next query log page");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].client_ip, "10.0.0.1");
+    let invalid = QueryLogRequest {
+        client_ips: vec!["10.0.0.1".into(), "10.0.0.*".into()],
+        ..req
+    };
+    assert_eq!(
+        handle_query_logs(&state, invalid).await,
+        ipc_error(IpcError::InvalidCommand)
+    );
+}
+
+#[tokio::test]
+async fn status_advertises_exact_client_support_and_installed_corpus_estimate() {
+    let state = test_state();
+    let expected = state.filter.installed_memory_bytes();
+    let IpcResponse::Status {
+        lists_memory_bytes,
+        query_log_client_ips_supported,
+        ..
+    } = handle_status(&state).await
+    else {
+        panic!("expected status");
+    };
+    assert_eq!(lists_memory_bytes, Some(expected));
+    assert!(query_log_client_ips_supported);
+}
+
+#[tokio::test]
+async fn status_reads_the_current_upstream_generation() {
+    let mut state = test_state();
+    let first = crate::config::settings::UpstreamConfig {
+        servers: vec!["127.0.0.1:5301".into()],
+        ..Default::default()
+    };
+    let client = reqwest::Client::new();
+    let dnssec = crate::config::settings::DnssecConfig::default();
+    let runtime = Arc::new(
+        crate::upstream::ReloadableUpstream::from_config(&first, &[], &client, &dnssec).unwrap(),
+    );
+    state.upstream_mode = "stale-mode".into();
+    state.upstream_count = 99;
+    state.upstream_servers = Vec::new();
+    state.upstream_runtime = Some(Arc::clone(&runtime));
+
+    let mut second = first.clone();
+    second.servers.push("127.0.0.1:5302".into());
+    runtime.install(
+        runtime
+            .prepare(&second, &[], &client, &dnssec)
+            .unwrap()
+            .unwrap(),
+    );
+
+    let IpcResponse::Status {
+        upstream_mode,
+        upstream_count,
+        upstream_servers,
+        ..
+    } = handle_status(&state).await
+    else {
+        panic!("expected Status")
+    };
+    assert_eq!(upstream_mode, "plain");
+    assert_eq!(upstream_count, 2);
+    assert_eq!(upstream_servers.len(), 2);
+    assert_eq!(upstream_servers[0].address, "127.0.0.1:5301");
+    assert_eq!(upstream_servers[1].address, "127.0.0.1:5302");
+}
+
+#[tokio::test]
+async fn status_reports_tracking_configuration_without_needing_a_tracking_read() {
+    let mut state = test_state();
+    let IpcResponse::Status {
+        tracking_enabled,
+        top_lists_24h_supported,
+        ..
+    } = handle_status(&state).await
+    else {
+        panic!("expected Status")
+    };
+    assert_eq!(tracking_enabled, Some(false));
+    assert!(
+        top_lists_24h_supported,
+        "capability is independent of whether tracking is enabled"
+    );
+    for enabled in [true, false] {
+        let config = crate::config::settings::TrackingConfig {
+            enabled,
+            ..Default::default()
+        };
+        state.stats = Some(Arc::new(StatsEngine::new(&config)));
+        let IpcResponse::Status {
+            tracking_enabled,
+            top_lists_24h_supported,
+            ..
+        } = handle_status(&state).await
+        else {
+            panic!("expected Status")
+        };
+        assert_eq!(tracking_enabled, Some(enabled));
+        assert!(top_lists_24h_supported);
+    }
+}
+
+#[tokio::test]
+async fn readonly_custom_list_metadata_redacts_private_pack_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("private-config.toml");
+    std::fs::write(
+        &config_path,
+        r#"schema_version = 5
+[upstream]
+servers = ["192.0.2.1:53"]
+[server]
+default_profile = "private-profile"
+[profiles.private-profile]
+custom_lists = ["private-family-rules"]
+lists = {}
+[[custom_lists]]
+id = "private-family-rules"
+display_name = "Private family policy"
+description = "Sensitive description"
+"#,
+    )
+    .unwrap();
+    let mut state = test_state();
+    state.config_path = Some(config_path.clone());
+    let (_supervisor, jobs) = crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+        Arc::new(crate::operator_rules::OperatorRulesService::new(
+            config_path.clone(),
+        )),
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    state.operator_rule_jobs = Some(jobs);
+
+    let response = handle_custom_lists_metadata(&state).await;
+    let encoded = serde_json::to_string(&response).unwrap();
+    let IpcResponse::OperatorRulesError { error } = response else {
+        panic!("missing pack must return a structured redacted error: {encoded}");
+    };
+    assert_eq!(
+        error.code,
+        crate::operator_rules::ErrorCode::StorageUnavailable
+    );
+    assert_eq!(error.message, "custom-list metadata is unavailable");
+    for private in [
+        "private-family-rules",
+        "private-profile",
+        "Private family policy",
+        "Sensitive description",
+        config_path.to_str().unwrap(),
+    ] {
+        assert!(
+            !encoded.contains(private),
+            "metadata error leaked {private}"
+        );
+    }
+}
+
+#[test]
+fn operator_rules_decode_rejects_unknown_fields_without_tightening_legacy_commands() {
+    let top_level = serde_json::json!({
+        "type": "operator_rules_operation",
+        "operation_id": "operation",
+        "token": "secret",
+        "unexpected": true,
+    })
+    .to_string();
+    let Err(failure) = decode_ipc_command(&top_level) else {
+        panic!("unknown UOR envelope field must return a structured error");
+    };
+    let (IpcResponse::OperatorRulesError { error }, true) = failure.into_response() else {
+        panic!("unknown UOR envelope field must return a structured error");
+    };
+    assert_eq!(error.code, crate::operator_rules::ErrorCode::InvalidRequest);
+
+    let nested = serde_json::json!({
+        "type": "custom_lists_read",
+        "request": {
+            "read": "show",
+            "id": "private-list",
+            "unexpected": "private-fragment",
+        },
+        "token": "secret",
+    })
+    .to_string();
+    let Err(failure) = decode_ipc_command(&nested) else {
+        panic!("unknown nested UOR field must return a structured error");
+    };
+    let (IpcResponse::OperatorRulesError { error }, true) = failure.into_response() else {
+        panic!("unknown nested UOR field must return a structured error");
+    };
+    assert_eq!(error.code, crate::operator_rules::ErrorCode::InvalidRequest);
+    assert_eq!(error.message, "invalid operator-rules request");
+    assert!(!error.message.contains("private"));
+
+    let legacy = r#"{"type":"status","legacy_extension":true}"#;
+    assert!(matches!(decode_ipc_command(legacy), Ok(IpcCommand::Status)));
+}
+
+#[tokio::test]
+async fn operator_rules_apply_waits_for_the_shared_job_terminal_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"schema_version = 5
+[upstream]
+servers = ["192.0.2.1:53"]
+[server]
+default_profile = "household"
+[profiles.household]
+display_name = "Whole household"
+lists = {}
+"#,
+    )
+    .unwrap();
+    let (supervisor, jobs) = crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+        Arc::new(crate::operator_rules::OperatorRulesService::new(
+            config_path.clone(),
+        )),
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+
+    let revision = jobs
+        .lists(
+            crate::operator_rules::PageRequest::default(),
+            crate::operator_rules::TransportLimits::IPC,
+        )
+        .await
+        .unwrap()
+        .config_revision;
+    let request_id = "ipc-terminal-receipt".to_string();
+    let mut state = test_state_with_token("secret");
+    state.config_path = Some(config_path);
+    state.operator_rule_jobs = Some(jobs);
+    let uid = state.daemon_uid;
+    let plan = dispatch_command(
+        IpcCommand::OperatorRulesPlan {
+            request: Some(crate::operator_rules::BatchRequest {
+                contract_version: crate::operator_rules::CONTRACT_VERSION,
+                request_id: request_id.clone(),
+                expected_config_revision: revision,
+                operations: vec![crate::operator_rules::Operation::CreateList {
+                    id: "local".into(),
+                    display_name: "Local".into(),
+                    description: String::new(),
+                    into: None,
+                }],
+                expected_plan_hash: None,
+            }),
+            plan_ref: None,
+            page: crate::operator_rules::PageRequest::default(),
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &state,
+    )
+    .await;
+    let IpcResponse::OperatorRulesPlan {
+        plan_ref, summary, ..
+    } = plan
+    else {
+        panic!("expected plan response: {plan:?}");
+    };
+    let applied = dispatch_command(
+        IpcCommand::OperatorRulesApply {
+            plan_ref,
+            plan_hash: summary.plan_hash,
+            request_id,
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &state,
+    )
+    .await;
+    let IpcResponse::OperatorRulesApply { receipt } = applied else {
+        panic!("expected apply response: {applied:?}");
+    };
+    assert_eq!(
+        receipt.persistence,
+        crate::operator_rules::PersistenceState::Committed
+    );
+    assert!(receipt.changed);
+
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn operator_rules_apply_replays_after_supervisor_restart_without_a_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"schema_version = 5
+[upstream]
+servers = ["192.0.2.1:53"]
+[server]
+default_profile = "household"
+[profiles.household]
+display_name = "Whole household"
+lists = {}
+"#,
+    )
+    .unwrap();
+    let (supervisor, jobs) = crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+        Arc::new(crate::operator_rules::OperatorRulesService::new(
+            config_path.clone(),
+        )),
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+
+    let revision = jobs
+        .lists(
+            crate::operator_rules::PageRequest::default(),
+            crate::operator_rules::TransportLimits::IPC,
+        )
+        .await
+        .unwrap()
+        .config_revision;
+    let request_id = "ipc-restart-replay".to_string();
+    let direct_request = crate::operator_rules::BatchRequest {
+        contract_version: crate::operator_rules::CONTRACT_VERSION,
+        request_id: request_id.clone(),
+        expected_config_revision: revision,
+        operations: vec![
+            crate::operator_rules::Operation::CreateList {
+                id: "local".into(),
+                display_name: "Local".into(),
+                description: String::new(),
+                into: None,
+            },
+            crate::operator_rules::Operation::AddDomainRule {
+                id: "local".into(),
+                domain: "Ads.Example".into(),
+                action: crate::operator_rules::RuleAction::Deny,
+            },
+            crate::operator_rules::Operation::AddRawRule {
+                id: "local".into(),
+                rule: "  ||TRACKER.Example^  ".into(),
+            },
+        ],
+        expected_plan_hash: None,
+    };
+    let mut state = test_state_with_token("secret");
+    state.config_path = Some(config_path.clone());
+    state.operator_rule_jobs = Some(jobs);
+    let uid = state.daemon_uid;
+    let planned = dispatch_command(
+        IpcCommand::OperatorRulesPlan {
+            request: Some(direct_request.clone()),
+            plan_ref: None,
+            page: crate::operator_rules::PageRequest::default(),
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &state,
+    )
+    .await;
+    let IpcResponse::OperatorRulesPlan {
+        plan_ref, summary, ..
+    } = planned
+    else {
+        panic!("expected plan response: {planned:?}");
+    };
+    let plan_hash = summary.plan_hash;
+    let applied = dispatch_command(
+        IpcCommand::OperatorRulesApply {
+            plan_ref: plan_ref.clone(),
+            plan_hash: plan_hash.clone(),
+            request_id: request_id.clone(),
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &state,
+    )
+    .await;
+    let IpcResponse::OperatorRulesApply { receipt: first } = applied else {
+        panic!("expected apply response: {applied:?}");
+    };
+    assert_eq!(
+        first.persistence,
+        crate::operator_rules::PersistenceState::Committed
+    );
+
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
+    drop(state);
+
+    let (supervisor, jobs) = crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
+        Arc::new(crate::operator_rules::OperatorRulesService::new(
+            config_path.clone(),
+        )),
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+    let mut restarted = test_state_with_token("secret");
+    restarted.config_path = Some(config_path);
+    restarted.operator_rule_jobs = Some(jobs);
+
+    let direct_replayed = dispatch_command(
+        IpcCommand::OperatorRulesReplay {
+            request: direct_request.clone(),
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &restarted,
+    )
+    .await;
+    let IpcResponse::OperatorRulesApply {
+        receipt: direct_receipt,
+    } = direct_replayed
+    else {
+        panic!("expected direct replay response: {direct_replayed:?}");
+    };
+    assert_eq!(direct_receipt.operation_id, first.operation_id);
+    assert_eq!(
+        direct_receipt.persistence,
+        crate::operator_rules::PersistenceState::Committed
+    );
+
+    let mut different_request = direct_request;
+    different_request
+        .operations
+        .push(crate::operator_rules::Operation::Unmount {
+            id: "local".into(),
+            profile_id: "household".into(),
+        });
+    let direct_conflict = dispatch_command(
+        IpcCommand::OperatorRulesReplay {
+            request: different_request,
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &restarted,
+    )
+    .await;
+    let IpcResponse::OperatorRulesError { error } = direct_conflict else {
+        panic!("expected direct replay conflict: {direct_conflict:?}");
+    };
+    assert_eq!(
+        error.code,
+        crate::operator_rules::ErrorCode::IdempotencyConflict
+    );
+
+    let replayed = dispatch_command(
+        IpcCommand::OperatorRulesApply {
+            plan_ref: plan_ref.clone(),
+            plan_hash: plan_hash.clone(),
+            request_id: request_id.clone(),
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &restarted,
+    )
+    .await;
+    let IpcResponse::OperatorRulesApply { receipt: replay } = replayed else {
+        panic!("expected replay response: {replayed:?}");
+    };
+    assert_eq!(replay.operation_id, first.operation_id);
+    assert_eq!(
+        replay.persistence,
+        crate::operator_rules::PersistenceState::Committed
+    );
+
+    let conflicting = dispatch_command(
+        IpcCommand::OperatorRulesApply {
+            plan_ref,
+            plan_hash: "0".repeat(64),
+            request_id,
+            token: Some("secret".into()),
+        },
+        Some(uid),
+        &restarted,
+    )
+    .await;
+    let IpcResponse::OperatorRulesError { error } = conflicting else {
+        panic!("expected idempotency conflict: {conflicting:?}");
+    };
+    assert_eq!(
+        error.code,
+        crate::operator_rules::ErrorCode::IdempotencyConflict
+    );
+
+    let _ = shutdown_tx.send(());
+    supervisor_task.await.unwrap();
+}
+
+#[test]
+fn legacy_profile_mount_only_reports_committed_receipts_as_success() {
+    let mut receipt = crate::operator_rules::Receipt {
+        contract_version: crate::operator_rules::CONTRACT_VERSION,
+        operation_id: "operation-123".into(),
+        request_id: "request-123".into(),
+        changed: true,
+        persistence: crate::operator_rules::PersistenceState::Committed,
+        config_revision: "revision".into(),
+        operator_policy_hash: None,
+        activation: crate::operator_rules::Activation {
+            state: "pending".into(),
+            correlation_id: None,
+            reload_outcome: None,
+            active_config_revision: None,
+            active_policy_hash: None,
+            daemon_instance_id: None,
+            superseded_by: None,
+        },
+        replication: "unavailable".into(),
+        audit: "intent_recorded".into(),
+        diagnostics: Vec::new(),
+    };
+    let IpcResponse::Ok { message } = legacy_profile_mount_response("household", &receipt) else {
+        panic!("committed receipt must be successful");
+    };
+    assert!(message.contains("persisted"));
+    assert!(message.contains("activation pending"));
+    assert!(!message.contains(" active"));
+
+    for (persistence, label) in [
+        (
+            crate::operator_rules::PersistenceState::Prepared,
+            "prepared",
+        ),
+        (crate::operator_rules::PersistenceState::Aborted, "aborted"),
+        (
+            crate::operator_rules::PersistenceState::DurabilityUncertain,
+            "durability_uncertain",
+        ),
+    ] {
+        receipt.persistence = persistence;
+        let IpcResponse::Error { message } = legacy_profile_mount_response("household", &receipt)
+        else {
+            panic!("{label} receipt must not be successful");
+        };
+        assert!(message.contains("operation_id=operation-123"));
+        assert!(message.contains(&format!("persistence={label}")));
+        assert!(message.len() < 512);
     }
 }

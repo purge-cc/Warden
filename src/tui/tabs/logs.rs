@@ -1,42 +1,12 @@
-//! Log Messages tab (`Leaf::Logs`) — the daemon's own recent `tracing`
-//! events, read over `IpcCommand::DaemonLogs`.
+//! The daemon's recent tracing events, read over IPC and distinct from DNS
+//! query history. Search and severity travel in the request, so filters reach
+//! the entire bounded ring rather than only the currently displayed page.
 //!
-//! Answers "what has the daemon been saying"; `Leaf::QueryLog` answers
-//! "what did clients ask for". Two different questions, which is why the
-//! leaf is labelled **Log Messages** rather than "Logs" sitting one
-//! section away from "Query Log".
-//!
-//! Shape is deliberately borrowed rather than invented:
-//!
-//! - the **scroll convention is `tabs::file`'s** — `↑`/`↓` by one,
-//!   `PgUp`/`PgDn` by [`NAV_PAGE`], `Home`/`End`, clamped against
-//!   `len - 1` through a saturating `u16` conversion. A second scroll
-//!   idiom in the same product is a bug an operator has to learn.
-//! - the **filter card is shared** — `theme::render_filter_card`, `/`
-//!   search, an `f`-cycled chip row, `[R] clear`, exactly as
-//!   `tabs::lists` and `tabs::rules` render it.
-//!
-//! Neither filter is applied here. Both travel in the IPC request and are
-//! applied during the daemon's walk of the ring, so filtering to `errors`
-//! reaches the bottom of the buffer instead of searching only the newest
-//! page and presenting that as "the errors".
-//!
-//! ```text
-//! ┌ Search [/]: ______   Level [f]:  all  errors  warnings  info   [R] clear ┐
-//! └──────────────────────────────────────────────────────────────────────────┘
-//! ┌ Log Messages (47 of ≤1000) ──────────────────────────────────────────────┐
-//! │ 14:03:05  ERROR  lists::manager   refresh failed source=oisd attempt=3   │
-//! │ 14:02:58  INFO   cli::start       listening on 0.0.0.0:53                │
-//! └──────────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Not here
-//! - Keys:  `mod.rs::handle_logs_key` (the borrowed scroll convention above)
-//! - Form:  none — read-only, no modal
-//! - State: `app::LogsState` (`entries`, `scroll_offset`, `level_filter`, `filter_text`)
-//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
+//! Shared filter chips provide search and severity selection; the central
+//! event handler owns keyboard and mouse dispatch. Rows remain one line each
+//! so scrolling counts messages consistently across terminal widths.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -44,26 +14,15 @@ use ratatui::Frame;
 
 use crate::ipc::protocol::DaemonLogDto;
 use crate::tracking::log_ring::LogLevel;
-use crate::tui::app::{self, App, LogsFetch, LogsLevelFilter};
+use crate::tui::app::{App, LogsFetch, LogsLevelFilter};
 use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
-// `NAV_PAGE` is private to `crate::tui`; reachable here because `tabs` is
-// a descendant module, so the page step stays written once.
-use crate::tui::NAV_PAGE;
-
-/// Frozen strings for the filter card and the two empty states. Pinned by
-/// `tests/frozen_strings_tui_logs.rs` — the empty states in particular,
-/// because "nothing captured" and "nothing matched" are the two readings
-/// an operator will draw the wrong conclusion from if they collapse into
-/// one blank pane.
-pub const SEARCH_PROMPT: &str = "Search [/]: ";
-pub const LEVEL_PROMPT: &str = "   Level [f]: ";
-pub const CLEAR_HINT: &str = "   [R] clear";
+/// Frozen strings for the two empty states. Filter controls are rendered by
+/// the shared filter-chip surface.
 /// Shown when a poll succeeded and the daemon has captured nothing.
 pub const NO_MESSAGES: &str = "  (no messages captured yet)";
 /// Shown when the ring holds messages but none pass the current filters —
-/// a different fact, and the one that tells the operator to press `R`.
-pub const NO_MATCHES: &str = "  (no messages match the current filter — [R] clears)";
+/// a different fact, and the one that points the operator to Clear.
+pub const NO_MATCHES: &str = "  (no messages match the current filters — use Clear)";
 /// Shown before the first response lands. Says nothing about the daemon,
 /// because nothing is known about it yet.
 pub const WAITING: &str = "  (waiting for the daemon…)";
@@ -73,111 +32,148 @@ pub const WAITING: &str = "  (waiting for the daemon…)";
 /// the wrong fault. The footer carries the underlying error.
 pub const UNREADABLE: &str = "  (could not read the daemon's log buffer — see the footer)";
 
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
-    render_filters(f, chunks[0], app);
-    render_body(f, chunks[1], app);
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
+    let table = crate::tui::filter_chips::render_card(f, area, app);
+    render_body(f, table, app);
 }
 
-/// Shared filter card: `/` text search plus the `f`-cycled severity
-/// chip. Mirrors `tabs::lists::render_filters` field for field.
-fn render_filters(f: &mut Frame, area: Rect, app: &App) {
-    let content_area = theme::render_filter_card(f, area);
+pub fn selected_index(app: &App) -> Option<usize> {
+    app.logs
+        .selected
+        .as_ref()
+        .and_then(|selected| {
+            app.logs
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, row)| *row == selected)
+                .nth(app.logs.selected_occurrence)
+                .map(|(index, _)| index)
+        })
+        .or_else(|| (!app.logs.entries.is_empty()).then_some(0))
+}
 
-    let (search_val, search_style) = match &app.input_mode {
-        app::InputMode::FilterLogs(s) => (format!("{s}_"), Style::default().fg(T.info)),
-        _ => (
-            app.logs.filter_text.clone().unwrap_or_default(),
-            Style::default().fg(T.text_secondary),
+pub fn select(app: &mut App, index: usize) {
+    app.logs.selected_occurrence = app.logs.entries.get(index).map_or(0, |selected| {
+        app.logs.entries[index + 1..]
+            .iter()
+            .filter(|row| *row == selected)
+            .count()
+    });
+    app.logs.selected = app.logs.entries.get(index).cloned();
+}
+
+pub fn information(app: &App) -> Option<crate::tui::detail_panel::Information> {
+    let row = app.logs.entries.get(selected_index(app)?)?;
+    Some(crate::tui::detail_panel::Information::new(
+        "Log Message",
+        "Service Event & Full Message",
+        vec![
+            crate::tui::modal_form::section_rule("Event Context", 74, theme::CardRole::Summary),
+            detail_value("Timestamp", &row.timestamp),
+            detail_value("Level", level_label(row.level)),
+            detail_value("Target", &row.target),
+            Line::default(),
+            crate::tui::modal_form::section_rule("Message", 74, theme::CardRole::History),
+            Line::styled(row.message.clone(), Style::default().fg(T.text_primary)),
+        ],
+    ))
+}
+
+fn detail_value(label: &str, value: impl Into<String>) -> Line<'static> {
+    let value = value.into();
+    Line::from(vec![
+        Span::styled(format!("{label:<14} "), Style::default().fg(T.text_muted)),
+        Span::styled(
+            if value.is_empty() {
+                "—".into()
+            } else {
+                value
+            },
+            Style::default().fg(T.text_primary),
         ),
-    };
-
-    let chip = |label: &str, selected: bool| {
-        let style = if selected {
-            Style::default()
-                .fg(T.text_inverse)
-                .bg(T.brand_red)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(T.text_secondary)
-        };
-        Span::styled(format!(" {label} "), style)
-    };
-
-    let level = app.logs.level_filter;
-    // Width budget: fixed spans first, the search value gets what is
-    // left, tail-kept so the `_` edit cursor stays visible and the chips
-    // never scroll off. Same arithmetic as tabs::lists.
-    let lead = Span::styled(SEARCH_PROMPT, Style::default().fg(T.text_muted));
-    let mut trailing = vec![Span::styled(
-        LEVEL_PROMPT,
-        Style::default().fg(T.text_muted),
-    )];
-    for chip_level in [
-        LogsLevelFilter::All,
-        LogsLevelFilter::Error,
-        LogsLevelFilter::Warn,
-        LogsLevelFilter::Info,
-    ] {
-        trailing.push(chip(chip_level.label(), level == chip_level));
-        trailing.push(Span::raw(" "));
-    }
-    trailing.push(Span::styled(CLEAR_HINT, Style::default().fg(T.text_muted)));
-
-    let fixed: usize = lead.width() + trailing.iter().map(Span::width).sum::<usize>();
-    let budget = (content_area.width as usize).saturating_sub(fixed).max(11);
-    let shown = if search_val.is_empty() {
-        "___________".to_string()
-    } else {
-        crate::tui::tabs::query_log::truncate_tail(&search_val, budget)
-    };
-    let mut spans = Vec::with_capacity(trailing.len() + 2);
-    spans.push(lead);
-    spans.push(Span::styled(shown, search_style));
-    spans.extend(trailing);
-    f.render_widget(Paragraph::new(Line::from(spans)), content_area);
+    ])
 }
 
-/// The scrolling event list, under a chrome title that carries the
-/// counts.
-fn render_body(f: &mut Frame, area: Rect, app: &App) {
-    let content = render_section_chrome(f, area, &body_title(app), T.text_secondary);
-
+fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
+    let subtitle = body_title(app);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "Logs",
+        &subtitle,
+        theme::CardRole::Analytics,
+    );
     if app.logs.entries.is_empty() {
         let filtered =
             app.logs.level_filter != LogsLevelFilter::All || app.logs.filter_text.is_some();
-        // FOUR readings of one empty list. Three are claims about the
-        // daemon, one is a claim about the connection — and only one of
-        // them is the operator's own filter. Collapsing them is how an
-        // operator concludes the tab is broken when it is merely
-        // filtered, or that the daemon is silent when the read failed.
-        let msg = match app.logs.fetch {
+        let message = match app.logs.fetch {
             LogsFetch::Never => WAITING,
             LogsFetch::Failed => UNREADABLE,
             LogsFetch::Ok if filtered => NO_MATCHES,
             LogsFetch::Ok => NO_MESSAGES,
         };
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(T.text_muted))),
+            Paragraph::new(message).style(Style::default().fg(T.text_muted)),
             content,
         );
         return;
     }
-
-    // Clamp before skipping: a poll that returns a SHORTER page (the
-    // operator just narrowed the filter) leaves `scroll_offset` past the
-    // end, and `.skip()` then consumes every row → a blank pane that
-    // reads as "no messages". Same failure `tabs::file` documents.
-    let offset = (app.logs.scroll_offset as usize).min(app.logs.entries.len().saturating_sub(1));
-    let lines: Vec<Line> = app
+    let Some(selected) = selected_index(app) else {
+        return;
+    };
+    select(app, selected);
+    let visible = content.height.saturating_sub(1) as usize;
+    let mut offset =
+        (app.logs.scroll_offset as usize).min(app.logs.entries.len().saturating_sub(visible));
+    if selected < offset {
+        offset = selected;
+    }
+    if selected >= offset.saturating_add(visible) {
+        offset = selected.saturating_add(1).saturating_sub(visible);
+    }
+    app.logs.scroll_offset = offset.min(u16::MAX as usize) as u16;
+    if content.height > 0 {
+        f.render_widget(
+            Paragraph::new(format!(
+                "TIME      LEVEL  {:<width$}  MESSAGE",
+                "TARGET",
+                width = if content.width >= 100 { 22 } else { 14 }
+            ))
+            .style(Style::default().fg(T.text_secondary)),
+            Rect::new(content.x, content.y, content.width, 1),
+        );
+    }
+    for (i, entry) in app
         .logs
         .entries
         .iter()
+        .enumerate()
         .skip(offset)
-        .map(|e| entry_line(e, content.width))
-        .collect();
-
-    f.render_widget(Paragraph::new(lines), content);
+        .take(visible)
+    {
+        let rect = Rect::new(
+            content.x,
+            content.y + 1 + (i - offset) as u16,
+            content.width,
+            1,
+        );
+        let style = if i == selected {
+            theme::highlight_style()
+        } else {
+            Style::default()
+        };
+        f.render_widget(
+            Paragraph::new(entry_line(entry, rect.width)).style(style),
+            rect,
+        );
+        crate::tui::mouse::register(
+            app,
+            rect,
+            crate::tui::mouse::MouseAction::Row(crate::tui::app::Leaf::Logs, i),
+        );
+    }
 }
 
 /// `Log Messages (47 of ≤1000 · 3 dropped)`.
@@ -208,7 +204,7 @@ fn body_title(app: &App) -> String {
 /// One rendered row: `HH:MM:SS  LEVEL  target  message`.
 ///
 /// The message is truncated to whatever width the fixed columns leave,
-/// never wrapped: `scroll_offset`, [`last_row`] and [`page_step`] all
+/// never wrapped: the selection and viewport offset both
 /// count *entries*, and a wrapped message would make `PgDn`/`End` skip
 /// whole screens or land mid-message instead of moving one pane.
 fn entry_line(entry: &DaemonLogDto, width: u16) -> Line<'static> {
@@ -294,18 +290,6 @@ fn level_color(level: LogLevel) -> Color {
     }
 }
 
-/// Last scrollable row index, saturating. A bare `as` on a page longer
-/// than 65 535 rows would wrap the clamp to a small number and pin
-/// scrolling near the top — the hazard `tabs::file` already names.
-pub fn last_row(app: &App) -> u16 {
-    u16::try_from(app.logs.entries.len().saturating_sub(1)).unwrap_or(u16::MAX)
-}
-
-/// `PgUp`/`PgDn`/`Home`/`End` step, shared with the key handler.
-pub fn page_step() -> u16 {
-    u16::try_from(NAV_PAGE).unwrap_or(u16::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +332,10 @@ mod tests {
 
     fn draw(app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, Rect::new(0, 0, w, h), app))
+        let mut state = App::new();
+        state.active_leaf = crate::tui::app::Leaf::Logs;
+        state.logs = app.logs.clone();
+        term.draw(|f| render(f, Rect::new(0, 0, w, h), &mut state))
             .unwrap();
         term
     }
@@ -430,15 +417,12 @@ mod tests {
     #[test]
     fn the_filter_card_shows_the_selected_severity_chip() {
         let mut app = App::new();
+        app.active_leaf = crate::tui::app::Leaf::Logs;
         app.logs.level_filter = LogsLevelFilter::Warn;
         let term = draw(&app, 120, 10);
         let buf = term.backend().buffer();
-        assert!(
-            buffer_contains(buf, "Level [f]:"),
-            "the chip row must render"
-        );
-        assert!(buffer_contains(buf, "warnings"));
-        assert!(buffer_contains(buf, "[R] clear"));
+        assert!(buffer_contains(buf, "Level:"), "the chip row must render");
+        assert!(buffer_contains(buf, "WARN"));
     }
 
     #[test]
@@ -491,11 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn the_search_buffer_renders_its_edit_cursor_while_typing() {
+    fn the_filter_chips_render_search_value() {
         let mut app = App::new();
-        app.input_mode = app::InputMode::FilterLogs("refre".into());
+        app.active_leaf = crate::tui::app::Leaf::Logs;
+        app.logs.filter_text = Some("refre".into());
         let term = draw(&app, 120, 10);
-        assert!(buffer_contains(term.backend().buffer(), "refre_"));
+        assert!(buffer_contains(term.backend().buffer(), "Search: refre"));
     }
 
     #[test]
@@ -533,12 +518,13 @@ mod tests {
         // so a reworded description still passes and a DELETED row does
         // not.
         let rows = crate::tui::help::per_leaf_rows(crate::tui::app::Leaf::Logs);
-        for key in ["Up/Down", "PgUp/PgDn", "Home/End", "/", "f", "R"] {
+        for key in ["Up/Down", "PgUp/PgDn", "Home/End", "Enter", "i", "f"] {
             assert!(
                 rows.iter().any(|r| r.key == key),
                 "`{key}` is handled by handle_logs_key but has no help row"
             );
         }
+        assert!(rows.iter().all(|row| !matches!(row.key, "/" | "R")));
     }
 
     #[test]

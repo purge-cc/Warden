@@ -16,7 +16,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -33,9 +33,9 @@ display_name = "Default"
 }
 
 fn mk_app(master: &Path) -> App {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     // Same loader the live `r` refresh + startup path use.
-    app.loaded_config = load_v1_config(master);
+    app.loaded_config = load_current_config(master);
     app
 }
 
@@ -58,7 +58,13 @@ async fn settings_03_s_submits_form_not_global_resolver() {
     // path; the ghost socket fails the IPC, but a `submit_message`
     // is set either way — proving `s` hit the form, not the global
     // resolver hotkey.
-    handle_key(&mut app, key(KeyCode::Char('s')), &poller, &master).await;
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        &poller,
+        &master,
+    )
+    .await;
     assert!(
         app.resolver_modal.is_none(),
         "`s` must not open the global resolver modal while the Tracking form is open"
@@ -140,7 +146,7 @@ fn ldns_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -197,7 +203,11 @@ async fn ldns_04_panel_switch_is_gone_and_down_crosses_the_scope_boundary() {
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
     assert_eq!(
         app.local_dns.selected_id,
-        Some(("profile:kids".to_string(), "youtube.local".to_string())),
+        Some((
+            "profile:kids".to_string(),
+            "youtube.local".to_string(),
+            "A".to_string(),
+        )),
         "Down must cross from Global into the profile group, stepping \
              over the header — no `o`, no `n`, no second key"
     );
@@ -205,6 +215,86 @@ async fn ldns_04_panel_switch_is_gone_and_down_crosses_the_scope_boundary() {
 
 /// `n` / `N` retired with the panels. They cycled the focused
 /// profile; there is no focused profile.
+#[tokio::test]
+async fn local_dns_dual_stack_identity_opens_the_selected_type_after_sorting() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    std::fs::write(
+        &master,
+        r#"schema_version = 5
+
+[upstream]
+servers = ["192.0.2.1:53"]
+
+[server]
+default_profile = "default"
+
+[profiles.default]
+display_name = "Default"
+
+[[local_dns.records]]
+domain = "dual.home"
+type = "A"
+value = "192.0.2.20"
+
+[[local_dns.records]]
+domain = "dual.home"
+type = "AAAA"
+value = "2001:db8::20"
+"#,
+    )
+    .unwrap();
+    let poller = dummy_poller(dir.path());
+    let mut app = ldns_app(&master);
+
+    handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    assert_eq!(
+        app.local_dns.selected_id,
+        Some((
+            "global".to_string(),
+            "dual.home".to_string(),
+            "AAAA".to_string(),
+        ))
+    );
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
+    let Some(local_dns_modal::LocalDnsModal {
+        stage: local_dns_modal::Stage::EditingForm(form),
+    }) = app.local_dns.modal.as_ref()
+    else {
+        panic!("Enter must edit the selected AAAA record");
+    };
+    assert_eq!(
+        form.record_type,
+        crate::config::settings::LocalDnsRecordType::AAAA
+    );
+    assert_eq!(form.value, "2001:db8::20");
+
+    handle_key(&mut app, key(KeyCode::Esc), &poller, &master).await;
+    app.mouse.toggle_sort(Leaf::LocalDns, 1);
+    app.mouse.toggle_sort(Leaf::LocalDns, 1);
+    let rows = tabs::local_dns::build_display_rows(&app);
+    let index =
+        tabs::local_dns::index_of_display_key(&rows, app.local_dns.selected_id.as_ref()).unwrap();
+    assert!(matches!(
+        &rows[index],
+        tabs::local_dns::LocalDnsDisplayRow::Record { record, .. }
+            if record.record_type == crate::config::settings::LocalDnsRecordType::AAAA
+    ));
+
+    handle_key(&mut app, key(KeyCode::Char('d')), &poller, &master).await;
+    let Some(local_dns_modal::LocalDnsModal {
+        stage: local_dns_modal::Stage::ConfirmingRemove(confirm),
+    }) = app.local_dns.modal.as_ref()
+    else {
+        panic!("remove must target the selected AAAA record");
+    };
+    assert_eq!(
+        confirm.spec.record_type,
+        crate::config::settings::LocalDnsRecordType::AAAA
+    );
+    assert_eq!(confirm.spec.value, "2001:db8::20");
+}
+
 #[tokio::test]
 async fn n6_n_and_capital_n_are_unbound_on_local_dns() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,7 +343,7 @@ fn mk_labels_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -339,24 +429,15 @@ async fn ux8_right_focuses_the_entries_and_left_focuses_the_menu() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
-    handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
-    assert_eq!(app.labels.focus, LabelsFocus::Entries, "Right → entries");
-    // Idempotent: Right again stays put rather than bouncing back.
-    handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
-    assert_eq!(
-        app.labels.focus,
-        LabelsFocus::Entries,
-        "Right is absolute — a second press is not a toggle"
-    );
-
     handle_key(&mut app, key(KeyCode::Left), &poller, &master).await;
-    assert_eq!(app.labels.focus, LabelsFocus::KindMenu, "Left → menu");
-    handle_key(&mut app, key(KeyCode::Left), &poller, &master).await;
-    assert_eq!(
-        app.labels.focus,
-        LabelsFocus::KindMenu,
-        "Left is absolute too"
-    );
+    assert_eq!(app.labels.focus, LabelsFocus::Categories);
+    handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
+    assert_eq!(app.labels.selected_id.as_deref(), Some("laptop"));
+    handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
+    assert_eq!(app.labels.focus, LabelsFocus::Entries);
+    assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
+    assert!(app.labels.modal.is_none());
 }
 
 /// N3 (2026-08-24): `h` / `l` were silent aliases of `\u{2190}` / `\u{2192}` here and
@@ -373,7 +454,7 @@ async fn ux8_h_and_l_are_no_longer_bound_on_labels() {
     handle_key(&mut app, key(KeyCode::Char('l')), &poller, &master).await;
     assert_eq!(
         app.labels.focus,
-        LabelsFocus::KindMenu,
+        LabelsFocus::Entries,
         "`l` is unbound \u{2014} focus stays on the menu it started on"
     );
     handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
@@ -398,7 +479,10 @@ async fn ux8_down_walks_the_kind_menu_while_the_menu_has_focus() {
     let mut app = labels_app(&master);
     assert_eq!(app.labels.selected_kind, LabelKind::Owner);
 
+    handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert_eq!(
         app.labels.selected_kind,
         LabelKind::DeviceType,
@@ -416,7 +500,10 @@ async fn ux8_up_and_down_move_opposite_ways_in_the_menu() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
+    handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Up), &poller, &master).await;
+    assert_eq!(app.labels.selected_kind, LabelKind::Department);
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert_eq!(
         app.labels.selected_kind,
         LabelKind::Department,
@@ -509,7 +596,10 @@ async fn ux8_changing_kind_reseeds_the_anchor_rather_than_clearing_it() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
+    handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
     assert_eq!(
         app.labels.selected_id.as_deref(),
@@ -520,43 +610,144 @@ async fn ux8_changing_kind_reseeds_the_anchor_rather_than_clearing_it() {
     );
 }
 
-/// §4.68 UX8: at the D18 floor the focus must NOT be `KindMenu` —
-/// there is no kind menu on screen to own it.
-///
-/// The default focus is `KindMenu`, so at 80 columns an unclamped
-/// build leaves the cursor on a pane that is never painted and `↑`/
-/// `↓` swap the whole table's contents instead of moving a row.
 #[test]
-fn ux8_the_floor_width_forces_focus_off_the_unpainted_menu() {
+fn labels_resize_keeps_categories_and_clamps_hidden_details() {
     let mut app = App::new();
     app.active_leaf = Leaf::Labels;
-    assert_eq!(
-        app.labels.focus,
-        LabelsFocus::KindMenu,
-        "the default is the pane that the floor does not paint"
-    );
-
+    app.labels.focus = LabelsFocus::Categories;
     clamp_labels_focus_to_layout(&mut app, 80);
-    assert_eq!(
-        app.labels.focus,
-        LabelsFocus::Entries,
-        "at 80x24 the split collapses, so the menu cannot hold focus"
-    );
+    assert_eq!(app.labels.focus, LabelsFocus::Categories);
+    app.labels.focus = LabelsFocus::Details;
+    clamp_labels_focus_to_layout(&mut app, 164);
+    assert_eq!(app.labels.focus, LabelsFocus::Details);
+    clamp_labels_focus_to_layout(&mut app, 80);
+    assert_eq!(app.labels.focus, LabelsFocus::Entries);
 }
 
-/// The differential: a terminal wide enough to paint the menu must
-/// leave the operator's choice alone. Without this, a clamp that
-/// simply always wrote `Entries` would pass the test above.
-#[test]
-fn ux8_a_wide_terminal_leaves_the_focus_alone() {
-    let mut app = App::new();
-    app.active_leaf = Leaf::Labels;
-    clamp_labels_focus_to_layout(&mut app, 100);
-    assert_eq!(
-        app.labels.focus,
-        LabelsFocus::KindMenu,
-        "100 columns paints both panes — nothing to clamp"
-    );
+#[tokio::test]
+async fn labels_resize_cannot_scroll_or_refocus_hidden_details() {
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_labels_master(&dir);
+    let poller = dummy_poller(dir.path());
+    let mut app = labels_app(&master);
+    let mut terminal = Terminal::new(TestBackend::new(164, 46)).unwrap();
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
+    assert!(detail_panel::focused(&app, Leaf::Labels));
+    terminal.backend_mut().resize(80, 24);
+    terminal.resize(Rect::new(0, 0, 80, 24)).unwrap();
+    clamp_labels_focus_to_layout(&mut app, 80);
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    assert!(!detail_panel::focused(&app, Leaf::Labels));
+    handle_key(&mut app, key(KeyCode::Right), &poller, &master).await;
+    assert!(!detail_panel::focused(&app, Leaf::Labels));
+    handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    assert_eq!(app.labels.selected_id.as_deref(), Some("dweller2"));
+}
+
+#[tokio::test]
+async fn labels_sort_actions_return_focus_to_the_label_list() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_labels_master(&dir);
+    let poller = dummy_poller(dir.path());
+    for use_mouse in [false, true] {
+        let mut app = labels_app(&master);
+        let mut terminal = Terminal::new(TestBackend::new(164, 46)).unwrap();
+        app.labels.focus = LabelsFocus::Categories;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        if use_mouse {
+            let event = |x, y| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let (x, y) = (0..46)
+                .flat_map(|y| (0..164).map(move |x| (x, y)))
+                .find(|(x, y)| {
+                    mouse::action(&app, event(*x, *y))
+                        == Some(mouse::MouseAction::Sort(Leaf::Labels, 1))
+                })
+                .unwrap();
+            handle_mouse(&mut app, event(x, y), &poller, &master).await;
+        } else {
+            handle_key(&mut app, key(KeyCode::Char('s')), &poller, &master).await;
+            handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
+        }
+        assert_eq!(app.labels.focus, LabelsFocus::Entries);
+        handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+        assert_eq!(app.labels.selected_kind, LabelKind::Owner);
+        assert_eq!(app.labels.selected_id.as_deref(), Some("dweller2"));
+    }
+}
+
+#[tokio::test]
+async fn labels_mouse_selects_categories_and_wheel_follows_painted_column() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_labels_master(&dir);
+    let poller = dummy_poller(dir.path());
+    for width in [80, 164] {
+        let mut app = labels_app(&master);
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let area = ui::content_area_for_test(ratatui::layout::Rect::new(0, 0, width, 24), &app);
+        let (rail, list, _) = tabs::labels::columns(area);
+        let event = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let target = (rail.y..rail.bottom())
+            .flat_map(|y| (rail.x..rail.right()).map(move |x| (x, y)))
+            .find(|(x, y)| {
+                mouse::action(&app, event(MouseEventKind::Down(MouseButton::Left), *x, *y))
+                    == Some(mouse::MouseAction::LabelKind(1))
+            })
+            .unwrap();
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), target.0, target.1),
+            &poller,
+            &master,
+        )
+        .await;
+        assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
+        assert_eq!(app.labels.selected_id.as_deref(), Some("laptop"));
+        assert_eq!(app.labels.focus, LabelsFocus::Categories);
+        assert!(!mouse::overlay_open(&app));
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::ScrollUp, rail.x + 2, rail.y + 4),
+            &poller,
+            &master,
+        )
+        .await;
+        assert_eq!(app.labels.selected_kind, LabelKind::Owner);
+        assert_eq!(app.labels.selected_id.as_deref(), Some("dweller"));
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        handle_mouse(
+            &mut app,
+            event(MouseEventKind::ScrollDown, list.x + 2, list.y + 5),
+            &poller,
+            &master,
+        )
+        .await;
+        assert_eq!(app.labels.selected_kind, LabelKind::Owner);
+        assert_eq!(app.labels.selected_id.as_deref(), Some("dweller2"));
+        assert_eq!(app.labels.focus, LabelsFocus::Entries);
+        handle_key(&mut app, key(KeyCode::Char('e')), &poller, &master).await;
+        assert_eq!(
+            app.labels.modal.as_ref().unwrap().form().unwrap().id,
+            "dweller2"
+        );
+    }
 }
 
 /// The clamp is scoped to its own leaf. It runs on every dirty
@@ -569,7 +760,7 @@ fn ux8_the_clamp_does_not_fire_on_another_leaf() {
     clamp_labels_focus_to_layout(&mut app, 80);
     assert_eq!(
         app.labels.focus,
-        LabelsFocus::KindMenu,
+        LabelsFocus::Entries,
         "not the active leaf — leave its state untouched"
     );
 }
@@ -622,7 +813,10 @@ async fn ux8_an_empty_kind_anchors_nothing() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
+    handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Up), &poller, &master).await;
+    assert_eq!(app.labels.selected_kind, LabelKind::Department);
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert_eq!(app.labels.selected_kind, LabelKind::Department);
     assert_eq!(
         app.labels.selected_id, None,
@@ -646,7 +840,7 @@ fn mk_empty_labels_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -663,7 +857,7 @@ display_name = "Default"
 }
 
 fn labels_of(master: &Path) -> Vec<crate::config::schema::Label> {
-    crate::config::loader::load_config(master, time::OffsetDateTime::now_utc())
+    crate::config::loader::load_current_config(master, time::OffsetDateTime::now_utc())
         .expect("fixture must load")
         .config
         .labels
@@ -753,8 +947,9 @@ async fn l7_the_add_modal_binds_the_focused_kind_not_the_default() {
     let poller = dummy_poller(dir.path());
     let mut app = labels_app(&master);
 
-    // Walk the kind menu to Device types, then Add.
+    handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
     handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert_eq!(app.labels.selected_kind, LabelKind::DeviceType);
 
     handle_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
@@ -801,18 +996,20 @@ async fn l7_edit_acts_on_the_row_the_table_highlights() {
     app.labels.focus = app::LabelsFocus::Entries;
     app.labels.selected_id = None;
 
-    // 80 columns: below `NARROW_THRESHOLD`, so the kind menu is not
-    // painted and the only `▸ ` in the buffer is the table's own
-    // highlight symbol.
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| tabs::labels::render(f, f.area(), &mut app))
         .unwrap();
-    let dump = term.backend().to_string();
-    let highlighted = dump
-        .lines()
-        .find(|l| l.contains("\u{25b8} "))
-        .expect("the table highlights a row")
-        .to_string();
+    let buffer = term.backend().buffer();
+    let (_, list, _) = tabs::labels::columns(buffer.area);
+    let highlighted = (0..buffer.area.height)
+        .find_map(|y| {
+            let line = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            (line.contains("dweller") && buffer[(list.x + 2, y)].bg == theme::T.bg_highlight)
+                .then_some(line)
+        })
+        .expect("the selected label has the row highlight");
 
     handle_key(&mut app, key(KeyCode::Char('e')), &poller, &master).await;
     let form = app
@@ -880,9 +1077,11 @@ async fn l7_the_same_id_under_two_kinds_makes_two_rows() {
     let mut app = labels_app(&master);
 
     for kind_steps in [0usize, 1] {
+        handle_key(&mut app, key(KeyCode::Char('f')), &poller, &master).await;
         for _ in 0..kind_steps {
             handle_key(&mut app, key(KeyCode::Down), &poller, &master).await;
         }
+        handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
         handle_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
         for c in "shared".chars() {
             handle_key(&mut app, key(KeyCode::Char(c)), &poller, &master).await;
@@ -1143,14 +1342,18 @@ async fn l7b_the_kind_is_reachable_at_the_eighty_column_floor() {
         }};
     }
 
-    press!(KeyCode::Right);
+    press!(KeyCode::Char('f'));
+    press!(KeyCode::Down);
+    press!(KeyCode::Enter);
     assert_eq!(
         app.labels.selected_kind,
         LabelKind::DeviceType,
         "at the floor the horizontal keys must carry the kind — there is \
              no second pane for them to move focus to"
     );
-    press!(KeyCode::Left);
+    press!(KeyCode::Char('f'));
+    press!(KeyCode::Up);
+    press!(KeyCode::Enter);
     assert_eq!(
         app.labels.selected_kind,
         LabelKind::Owner,
@@ -1158,7 +1361,9 @@ async fn l7b_the_kind_is_reachable_at_the_eighty_column_floor() {
     );
 
     // And the whole point: Add follows it.
-    press!(KeyCode::Right);
+    press!(KeyCode::Char('f'));
+    press!(KeyCode::Down);
+    press!(KeyCode::Enter);
     press!(KeyCode::Char('a'));
     assert_eq!(
         app.labels.modal.as_ref().unwrap().form().unwrap().kind,
@@ -1435,9 +1640,10 @@ async fn profile_modal_down_up_move_focus_same_as_tab_backtab() {
     );
 
     handle_profile_modal_key(&mut app, key(KeyCode::Down), &poller, &master).await;
-    assert_eq!(focused(&app), profile_modal::FormField::Submit);
+    assert_eq!(focused(&app), profile_modal::FormField::BlockResponse);
 
     handle_profile_modal_key(&mut app, key(KeyCode::Up), &poller, &master).await;
+    assert_eq!(focused(&app), profile_modal::FormField::DisplayName);
     assert_eq!(
         focused(&app),
         profile_modal::FormField::DisplayName,

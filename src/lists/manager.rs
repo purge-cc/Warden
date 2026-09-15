@@ -385,6 +385,21 @@ impl Default for ListCache {
     }
 }
 
+#[cfg(feature = "cluster")]
+enum NodeCorpusProvider {
+    Primary {
+        store: Arc<crate::cluster::corpus::CorpusStore>,
+        artifact: crate::cluster::dto::ArtifactIdentity,
+        auxiliary: Vec<crate::cluster::corpus::CorpusAuxSource>,
+        generation: Option<String>,
+    },
+    Secondary {
+        store: Arc<crate::cluster::corpus::CorpusStore>,
+        manifest: crate::cluster::corpus::CorpusManifest,
+        _workspace: tempfile::TempDir,
+    },
+}
+
 /// Manages list downloads, parsing, and periodic refresh into the FilterEngine.
 ///
 /// Owns a shared `reqwest::Client` (connection pooling), a per-URL cache,
@@ -400,6 +415,21 @@ pub struct ListManager {
     /// Present only for plan-backed managers so command aliases use the same
     /// generation that owns fetch and cache identity.
     source_plan: Option<ResolvedSourcePlan>,
+    #[cfg(feature = "cluster")]
+    node_corpus: Option<NodeCorpusProvider>,
+    #[cfg(feature = "cluster")]
+    node_candidate_cache: Option<tempfile::TempDir>,
+    #[cfg(feature = "cluster")]
+    node_cache_lease: Option<std::fs::File>,
+    #[cfg(feature = "cluster")]
+    node_cache_unpublished: bool,
+    #[cfg(feature = "cluster")]
+    node_auxiliary_refresh: Option<crate::cluster::corpus::AuxiliaryRefresh>,
+    #[cfg(feature = "cluster")]
+    node_active_pair_hook:
+        Option<Arc<dyn Fn(crate::cluster::dto::ArtifactIdentity, String) + Send + Sync>>,
+    #[cfg(feature = "cluster")]
+    node_pair_unconfirmed_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     refresh_interval: Duration,
     /// Canonical cadence is plan-owned; compatibility managers retain the
     /// global interval and therefore keep their historical all-source work.
@@ -1074,6 +1104,265 @@ fn run_streamed_cache_body_after_persist_hook_for_test(path: &Path) {
     }
 }
 
+#[cfg(feature = "cluster")]
+impl ListManager {
+    /// Copy only verified selected bodies into a private cache transaction namespace.
+    /// The temporary directory is retained durably only after successful publication.
+    pub(crate) fn isolate_candidate_cache(
+        &mut self,
+        store: &crate::cluster::corpus::CorpusStore,
+    ) -> anyhow::Result<()> {
+        let previous_owner = store.lease_primary_cache()?;
+        let previous = previous_owner
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .or_else(|| self.cache_dir.clone());
+        let (workspace, lease) = store.parser_workspace()?;
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                !rollback_journal_path(&previous).try_exists()?,
+                "CorpusCacheRecoveryRequired"
+            );
+            for source in &self.sources {
+                let stem = source_to_cache_stem(source);
+                let meta_path = previous.join(format!("{stem}.meta"));
+                let meta = load_meta_file(&meta_path);
+                let Some(url) = self.fetch_urls.get(source) else {
+                    continue;
+                };
+                if !cache_identity_matches(source, url, &meta) {
+                    continue;
+                }
+                let Some(manifest) = manifest_from_meta(&stem, &meta) else {
+                    continue;
+                };
+                let Some(bytes) = meta.size else {
+                    continue;
+                };
+                let object = crate::cluster::manifest::ObjectRef {
+                    sha256: manifest.sha256.to_owned(),
+                    bytes: bytes as u64,
+                };
+                let Ok(mut file) = std::fs::File::open(previous.join(manifest.body)) else {
+                    continue;
+                };
+                if crate::cluster::corpus::verify_file(&mut file, &object).is_err() {
+                    continue;
+                }
+                std::fs::hard_link(
+                    previous.join(manifest.body),
+                    workspace.path().join(manifest.body),
+                )?;
+                let raw = read_small_cache_file(&meta_path)?;
+                anyhow::ensure!(
+                    write_cache_manifest(&workspace.path().join(format!("{stem}.meta")), &raw)?
+                        == ManifestCommit::Durable,
+                    "CorpusCacheCopyNotDurable"
+                );
+            }
+        }
+        self.cache_dir = Some(workspace.path().to_owned());
+        self.cache.clear();
+        self.node_candidate_cache = Some(workspace);
+        self.node_cache_lease = Some(lease);
+        self.node_cache_unpublished = true;
+        Ok(())
+    }
+
+    pub(crate) fn set_node_pair_unconfirmed_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.node_pair_unconfirmed_hook = Some(hook);
+    }
+
+    pub(crate) fn set_node_active_pair_hook(
+        &mut self,
+        hook: Arc<dyn Fn(crate::cluster::dto::ArtifactIdentity, String) + Send + Sync>,
+    ) {
+        self.node_active_pair_hook = Some(hook);
+    }
+
+    pub(crate) fn set_node_auxiliary_refresh(
+        &mut self,
+        refresh: crate::cluster::corpus::AuxiliaryRefresh,
+    ) {
+        self.node_auxiliary_refresh = Some(refresh);
+    }
+
+    pub(crate) fn set_node_corpus_secondary(
+        &mut self,
+        store: Arc<crate::cluster::corpus::CorpusStore>,
+        manifest: crate::cluster::corpus::CorpusManifest,
+    ) -> anyhow::Result<()> {
+        let plan = self
+            .source_plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CorpusSourcePlanRequired"))?;
+        manifest.verify_plan(plan)?;
+        anyhow::ensure!(
+            manifest
+                .sources
+                .iter()
+                .all(|source| source.body.bytes <= self.max_body_bytes as u64),
+            "CorpusReceiverBodyQuotaExceeded"
+        );
+        store.verify_manifest_objects(&manifest)?;
+        let (workspace, lease) = store.parser_workspace()?;
+        self.cache_dir = Some(workspace.path().to_owned());
+        self.cache.clear();
+        self.node_cache_lease = Some(lease);
+        self.node_corpus = Some(NodeCorpusProvider::Secondary {
+            store,
+            manifest,
+            _workspace: workspace,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn set_node_corpus_primary(
+        &mut self,
+        store: Arc<crate::cluster::corpus::CorpusStore>,
+        artifact: crate::cluster::dto::ArtifactIdentity,
+        auxiliary: Vec<crate::cluster::corpus::CorpusAuxSource>,
+    ) -> anyhow::Result<()> {
+        artifact.validate()?;
+        anyhow::ensure!(self.source_plan.is_some(), "CorpusSourcePlanRequired");
+        if self.node_candidate_cache.is_none() && self.installed_corpus_digest.is_none() {
+            if let Some((path, lease)) = store.lease_primary_cache()? {
+                self.cache_dir = Some(path);
+                self.node_cache_lease = Some(lease);
+            }
+        }
+        self.node_corpus = Some(NodeCorpusProvider::Primary {
+            store,
+            artifact,
+            auxiliary,
+            generation: None,
+        });
+        if self.installed_corpus_digest.is_some() {
+            self.publish_node_corpus()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_node_secondary(&self) -> bool {
+        matches!(self.node_corpus, Some(NodeCorpusProvider::Secondary { .. }))
+    }
+
+    pub(crate) fn node_corpus_generation(&self) -> Option<&str> {
+        match self.node_corpus.as_ref()? {
+            NodeCorpusProvider::Secondary { manifest, .. } => Some(&manifest.generation),
+            NodeCorpusProvider::Primary { generation, .. } => generation.as_deref(),
+        }
+    }
+
+    pub(crate) fn verify_node_corpus(&self) -> anyhow::Result<()> {
+        let cycle = self.status_registry.cycle();
+        anyhow::ensure!(
+            self.installed_corpus_digest.is_some()
+                && !cycle.generation_degraded
+                && !cycle.source_coverage_incomplete
+                && matches!(
+                    cycle.served_state,
+                    ServedState::Complete | ServedState::IntentionalEmpty
+                ),
+            "CorpusPreparationFailed: parser, quota or complete inventory admission refused"
+        );
+        if let Some(NodeCorpusProvider::Secondary {
+            store, manifest, ..
+        }) = &self.node_corpus
+        {
+            store.verify_manifest_objects(manifest)?;
+        }
+        Ok(())
+    }
+
+    /// Rebind only after the coordinator installs the verified detached shards.
+    pub(crate) fn install_prepared_status_registry(&mut self, live: Arc<ListStatusRegistry>) {
+        live.install_prepared(&self.status_registry);
+        self.status_registry = live;
+    }
+
+    pub(crate) fn install_prepared_filter(&mut self, live: Arc<FilterEngine>) {
+        self.filter = live;
+    }
+
+    fn publish_node_corpus(&mut self) -> anyhow::Result<()> {
+        use crate::cluster::corpus::{source_inventory, CorpusManifest, CorpusSource};
+        let Some(NodeCorpusProvider::Primary {
+            store,
+            artifact,
+            auxiliary,
+            ..
+        }) = &self.node_corpus
+        else {
+            return Ok(());
+        };
+        let cache_dir = self
+            .cache_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("CorpusDurableCacheRequired"))?;
+        anyhow::ensure!(
+            !rollback_journal_path(cache_dir).try_exists()?,
+            "CorpusCacheRecoveryRequired"
+        );
+        let plan = self
+            .source_plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CorpusSourcePlanRequired"))?;
+        let mut sources = Vec::new();
+        for source in source_inventory(plan) {
+            let stem = source_to_cache_stem(&source.representative);
+            let meta = load_meta_file(&cache_dir.join(format!("{stem}.meta")));
+            anyhow::ensure!(
+                cache_identity_matches(&source.representative, &source.fetch_url, &meta),
+                "CorpusCacheIdentityMismatch"
+            );
+            let generation = manifest_from_meta(&stem, &meta)
+                .ok_or_else(|| anyhow::anyhow!("CorpusVerifiedCacheRequired"))?;
+            let body = crate::cluster::manifest::ObjectRef {
+                sha256: generation.sha256.to_owned(),
+                bytes: meta
+                    .size
+                    .ok_or_else(|| anyhow::anyhow!("CorpusBodySizeRequired"))?
+                    as u64,
+            };
+            let fetched_at = meta
+                .fetched_at
+                .ok_or_else(|| anyhow::anyhow!("CorpusFreshnessRequired"))?
+                .unix_timestamp();
+            let mut file = std::fs::File::open(cache_dir.join(generation.body))?;
+            crate::cluster::corpus::verify_file(&mut file, &body)?;
+            store.import_file(&body, &mut file)?;
+            sources.push(CorpusSource {
+                source,
+                body,
+                fetched_at,
+            });
+        }
+        let manifest = CorpusManifest::new(artifact.clone(), sources, auxiliary.clone())?;
+        store.install_manifest(&manifest)?;
+        store.mark_active(&manifest.generation, &manifest.artifact)?;
+        if let Some(workspace) = self.node_candidate_cache.take() {
+            let retained = workspace.keep();
+            self.cache_dir = Some(retained);
+        }
+        if self.node_cache_unpublished {
+            store.set_primary_cache_dir(
+                self.cache_dir
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("CorpusCacheMissing"))?,
+            )?;
+            self.node_cache_unpublished = false;
+        }
+        if let Some(NodeCorpusProvider::Primary { generation, .. }) = &mut self.node_corpus {
+            *generation = Some(manifest.generation.clone());
+        }
+        if let Some(hook) = &self.node_active_pair_hook {
+            hook(manifest.artifact, manifest.generation);
+        }
+        Ok(())
+    }
+}
+
 impl ListManager {
     /// Create a new list manager.
     ///
@@ -1235,6 +1524,20 @@ impl ListManager {
             sources,
             fetch_urls,
             source_plan,
+            #[cfg(feature = "cluster")]
+            node_corpus: None,
+            #[cfg(feature = "cluster")]
+            node_candidate_cache: None,
+            #[cfg(feature = "cluster")]
+            node_cache_lease: None,
+            #[cfg(feature = "cluster")]
+            node_cache_unpublished: false,
+            #[cfg(feature = "cluster")]
+            node_auxiliary_refresh: None,
+            #[cfg(feature = "cluster")]
+            node_active_pair_hook: None,
+            #[cfg(feature = "cluster")]
+            node_pair_unconfirmed_hook: None,
             refresh_interval,
             source_schedules,
             schedule_state: ListScheduleState::default(),
@@ -2186,7 +2489,20 @@ impl ListManager {
             //
             // With no installed generation, admit a bounded entry-count
             // exception so startup does not leave filtering unavailable.
-            if serving == 0 && u128::from(unique) <= cold_start_hard_cap(ceiling) {
+            let allow_cold_exception = {
+                #[cfg(feature = "cluster")]
+                {
+                    !self.is_node_secondary() && self.node_candidate_cache.is_none()
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    true
+                }
+            };
+            if allow_cold_exception
+                && serving == 0
+                && u128::from(unique) <= cold_start_hard_cap(ceiling)
+            {
                 return Ok(CorpusVerdict::InstallOverCeiling {
                     unique,
                     ceiling,
@@ -2311,7 +2627,57 @@ impl ListManager {
         now: OffsetDateTime,
         mode: RefreshMode,
     ) -> Result<RefreshCompletion, Cancelled> {
+        #[cfg(feature = "cluster")]
+        let mode = if self.is_node_secondary() {
+            RefreshMode::CacheOnly
+        } else {
+            mode
+        };
         cancellation::checkpoint("start")?;
+        #[cfg(feature = "cluster")]
+        if matches!(self.node_corpus, Some(NodeCorpusProvider::Primary { .. })) {
+            if let Some(hook) = &self.node_pair_unconfirmed_hook {
+                hook();
+            }
+        }
+        #[cfg(feature = "cluster")]
+        let prepared_auxiliary = if !matches!(mode, RefreshMode::CacheOnly) {
+            match (&self.node_corpus, self.node_auxiliary_refresh.clone()) {
+                (Some(NodeCorpusProvider::Primary { store, .. }), Some(refresh)) => {
+                    match cancellation::wait(
+                        refresh(Arc::clone(store), self.client.clone()),
+                        "node_auxiliary",
+                    )
+                    .await?
+                    {
+                        Ok(prepared) => Some(prepared),
+                        Err(error) => {
+                            if let Err(cleanup) = store.release_unpublished_pins() {
+                                tracing::warn!(%cleanup, "cannot release refused auxiliary acquisition");
+                            }
+                            tracing::warn!(%error, "primary auxiliary list preparation failed; keeping complete active corpus");
+                            cancellation::begin_commit()?;
+                            let snapshot = self
+                                .status_registry
+                                .record_cycle_with_qualifiers_and_served_state(
+                                    CycleOutcome::SpillRollbackFailed,
+                                    true,
+                                    true,
+                                    self.filter.domain_count(),
+                                    None,
+                                );
+                            return Ok(RefreshCompletion {
+                                domain_count: self.filter.domain_count(),
+                                snapshot,
+                            });
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         if !matches!(mode, RefreshMode::CacheOnly) {
             self.seed_schedule_state(now);
         }
@@ -3436,8 +3802,17 @@ impl ListManager {
         // An incomplete first load installs whichever sources were usable:
         // retaining zero domains would make the node more unfiltered. Once a
         // corpus is live, preserve it whole instead of publishing a subset.
-        let keep_live_for_incomplete_coverage =
-            source_coverage_incomplete && self.filter.domain_count() > 0;
+        let keep_live_for_incomplete_coverage = source_coverage_incomplete
+            && (self.filter.domain_count() > 0 || {
+                #[cfg(feature = "cluster")]
+                {
+                    self.is_node_secondary()
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    false
+                }
+            });
         if source_coverage_incomplete {
             digest_valid = false;
         }
@@ -3745,17 +4120,12 @@ impl ListManager {
                 // leaves some of the previous generation serving, so the
                 // corpus is still frozen and the streak must survive it.
                 self.status_registry.note_installed_cycle();
-                // Must track `SortedShard`'s entry type, not the old
-                // `DomainMasks` pair: 24 B + 8 B = 32 B, against 24 + 16 = 40.
-                // Left stale, this over-reports by 25 % on the one
-                // operator-facing memory number this workstream exists to
-                // move, and nothing fails to say so.
-                let est_bytes = total * std::mem::size_of::<(CompactString, u64)>();
+                let est_bytes = self.filter.installed_memory_bytes();
                 tracing::info!(
                     total,
-                    est_mb = est_bytes / (1024 * 1024),
+                    est_mib = est_bytes / (1024 * 1024),
                     spill = if spill.is_disk() { "disk" } else { "memory" },
-                    "domain map updated (estimated map payload)"
+                    "domain map updated (estimated installed corpus allocations)"
                 );
             }
         }
@@ -3854,6 +4224,8 @@ impl ListManager {
             .map(|admission| admission.source.clone())
             .collect();
         let mut cache_admission_committed = HashSet::new();
+        #[cfg(feature = "cluster")]
+        let mut node_cache_durable = true;
         if !spill_poisoned && ((installed && !source_coverage_incomplete) || unchanged) {
             let transaction = match self.cache_dir.as_deref() {
                 Some(dir)
@@ -3865,6 +4237,10 @@ impl ListManager {
                 }
                 _ => CorpusManifestCommit::Durable,
             };
+            #[cfg(feature = "cluster")]
+            {
+                node_cache_durable = transaction == CorpusManifestCommit::Durable;
+            }
             let committed_body_gc: Vec<(String, String)> =
                 if transaction == CorpusManifestCommit::Durable {
                     pending_cache_admissions
@@ -4121,6 +4497,30 @@ impl ListManager {
                 Some(served_state),
             );
 
+        #[cfg(feature = "cluster")]
+        if node_cache_durable
+            && (installed || unchanged)
+            && !source_coverage_incomplete
+            && !generation_degraded
+        {
+            if let Some(prepared) = prepared_auxiliary {
+                if let Some(NodeCorpusProvider::Primary { auxiliary, .. }) = &mut self.node_corpus {
+                    (prepared.activate)();
+                    *auxiliary = prepared.sources;
+                }
+            }
+            if let Err(error) = self.publish_node_corpus() {
+                tracing::warn!(%error, "installed list corpus cannot be published; retaining previous node corpus");
+            }
+        }
+
+        #[cfg(feature = "cluster")]
+        if let Some(NodeCorpusProvider::Primary { store, .. }) = &self.node_corpus {
+            if let Err(error) = store.release_unpublished_pins() {
+                tracing::warn!(%error, "cannot collect unadvertised primary corpus inputs");
+            }
+        }
+
         // Never resumed, so never left behind.
         drop(spill);
         drop(spill_cleanup);
@@ -4158,6 +4558,23 @@ impl ListManager {
     /// be the candidate that this very cycle rejected for trust, body size,
     /// or a retention guard.
     fn resolve_retained_body_reader(&self, url: &str, source: &str) -> Option<BodyReader> {
+        #[cfg(feature = "cluster")]
+        if let Some(NodeCorpusProvider::Secondary {
+            store, manifest, ..
+        }) = &self.node_corpus
+        {
+            let item = manifest.sources.iter().find(|item| {
+                item.source.representative == source && item.source.fetch_url == url
+            })?;
+            let file = store.verified_object(&item.body).ok()?;
+            let mut digest = [0u8; 32];
+            hex::decode_to_slice(&item.body.sha256, &mut digest).ok()?;
+            return Some(BodyReader::RetainedCache {
+                reader: std::io::BufReader::with_capacity(SPILL_WRITE_BUF, file),
+                path: store.object_path(&item.body.sha256).ok()?,
+                expected_sha256: Some(digest),
+            });
+        }
         // Fast path: body still in memory (only when cache_dir is None).
         //
         // `mem2608-s7`: "fast" is relative — this `clone()` copies the whole
@@ -4306,6 +4723,13 @@ impl ListManager {
         url: &str,
         request_mode: RequestMode,
     ) -> Result<FetchResult, ListError> {
+        #[cfg(feature = "cluster")]
+        if self.is_node_secondary() {
+            return Err(ListError::Download {
+                url: url.to_owned(),
+                reason: "secondary parser inputs are available only from its primary corpus".into(),
+            });
+        }
         // S50 T5.5 loader-bridge: intercept synthetic `imported.local`
         // URLs BEFORE the HTTPS-only URL guard would refuse them. The
         // bridge reads from `<config_dir>/lists/<id>.<ext>` on disk for
@@ -4514,6 +4938,10 @@ impl ListManager {
     /// streams bodies from disk on demand, avoiding a whole-body startup
     /// residency spike.
     pub fn load_disk_cache(&mut self) {
+        #[cfg(feature = "cluster")]
+        if self.is_node_secondary() {
+            return;
+        }
         let cache_dir = match &self.cache_dir {
             Some(dir) => dir.clone(),
             None => {
@@ -4610,6 +5038,10 @@ impl ListManager {
     /// Remove legacy files and exact generation bodies for removed sources;
     /// also reclaim active-stem generation orphans selected by no valid manifest.
     pub fn cleanup_stale_caches(&self) {
+        #[cfg(feature = "cluster")]
+        if self.is_node_secondary() {
+            return;
+        }
         let cache_dir = match &self.cache_dir {
             Some(dir) => dir,
             None => return,
@@ -9017,3 +9449,7 @@ impl BufRead for BodyReader {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "cluster"))]
+#[path = "manager_node_tests.rs"]
+mod node_tests;

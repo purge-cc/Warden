@@ -6,7 +6,7 @@
 //! - State: `app::QueryLogState` (`selected_key`, the filter fields, paging cursors)
 //! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
@@ -95,17 +95,15 @@ pub fn pick_empty_state_message(
 }
 
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    // Query Log uses the shared filter-card frame. An earlier version
-    // dropped the frame to hand ~3 rows to the table on the theory that
-    // a frame needs 3 rows minimum and this leaf couldn't spare them;
-    // spending exactly those 3 rows is deliberate so all four
-    // filterable leaves read as one family. No interior title either
-    // way — the per-control labels ("Domain [/]", "Time [t]", …) are
-    // self-describing.
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).split(area);
-
-    render_filters(f, chunks[0], app);
-    render_table(f, chunks[1], app);
+    let table_area = crate::tui::filter_chips::render_card(f, area, app);
+    let body = super::super::ui::render_card(
+        f,
+        table_area,
+        "Query Log",
+        &table_subtitle(app),
+        theme::CardRole::Analytics,
+    );
+    render_table(f, body, app);
 
     // The advanced-search form is a LEAF-local modal, so it renders from
     // the leaf — the same choice `tabs::lists` makes for its own modals,
@@ -114,6 +112,104 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     // it lands over both the card and the table.
     if let Some(modal) = app.query_log.advanced_modal.as_ref() {
         crate::tui::query_log_filter_modal::render_overlay(f, area, modal);
+    }
+    let picker_reads = crate::tui::query_log_client_picker::PickerReadState {
+        devices_loading: app
+            .read_jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.is_loading(crate::tui::jobs::ReadResource::Devices)),
+        devices_error: app
+            .read_jobs
+            .as_ref()
+            .and_then(|jobs| jobs.error(crate::tui::jobs::ReadResource::Devices)),
+        status_loading: app
+            .read_jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.is_loading(crate::tui::jobs::ReadResource::Status)),
+        status_error: app
+            .read_jobs
+            .as_ref()
+            .and_then(|jobs| jobs.error(crate::tui::jobs::ReadResource::Status)),
+        exact_client_ips_supported: app
+            .daemon_status
+            .as_ref()
+            .map(|status| status.query_log_client_ips_supported),
+    };
+    let domain_anchor = crate::tui::filter_chips::chip_area(area, app, 0);
+    let client_anchor = crate::tui::filter_chips::chip_area(area, app, 1);
+    let period_anchor = crate::tui::filter_chips::chip_area(area, app, 2);
+    if let Some(picker) = app.query_log.client_picker.as_mut() {
+        crate::tui::query_log_client_picker::render(
+            f,
+            area,
+            client_anchor,
+            picker,
+            app.device_view.as_ref(),
+            picker_reads,
+        );
+    }
+    if let Some(detail) = app.query_log.detail.as_mut() {
+        crate::tui::query_log_detail::render(f, area, detail);
+    }
+    if let InputMode::FilterDomain(draft) = &app.input_mode {
+        crate::tui::query_log_controls::render_domain(
+            f,
+            area,
+            domain_anchor,
+            draft,
+            app.query_log.domain_focus,
+        );
+    }
+    if app.query_log.period_menu {
+        crate::tui::query_log_controls::render_period(
+            f,
+            area,
+            period_anchor,
+            app.query_log.period_draft,
+            app.query_log.period_focus,
+        );
+    }
+}
+
+fn table_subtitle(app: &App) -> String {
+    let total = app.query_log.entries.len();
+    let blocked = app
+        .query_log
+        .entries
+        .iter()
+        .filter(|entry| entry.result == "BLOCKED" || entry.cname_chain_via.is_some())
+        .count();
+    format!("{total} of {total} Requests · {blocked} Blocked · Newest First · UTC")
+}
+
+/// Small UI integration seam: overlays rendered by this leaf are not in the
+/// global modal stack, so the shell can suppress a toast/footer that would
+/// cover their focused control.
+pub(crate) fn overlay_open(app: &App) -> bool {
+    matches!(app.input_mode, InputMode::FilterDomain(_))
+        || app.query_log.client_picker.is_some()
+        || app.query_log.detail.is_some()
+        || app.query_log.period_menu
+        || app.query_log.advanced_modal.is_some()
+}
+
+/// Contextual compact legend for the root footer. The shell owns the actual
+/// spans/width elision; this leaf owns which keys are meaningful right now.
+pub(crate) fn footer_hint(app: &App) -> &'static str {
+    if matches!(app.input_mode, InputMode::FilterDomain(_)) {
+        "Tab focus · Enter apply · Esc discard · Ctrl+U clear"
+    } else if let Some(picker) = app.query_log.client_picker.as_ref() {
+        picker.footer_hint()
+    } else if app.query_log.detail.is_some() {
+        "Up/Down scroll · Esc close"
+    } else if app.query_log.period_menu {
+        "Up/Down choose · Enter apply · Esc cancel"
+    } else if app.query_log.advanced_modal.is_some() {
+        "Tab focus · Enter apply · Esc cancel"
+    } else if app.filter_focus.is_some() {
+        "Tab/Shift+Tab chip · Enter edit · Del clear · Esc table"
+    } else {
+        "f filters · Enter allow/deny · i details · ↑/↓ select"
     }
 }
 
@@ -128,117 +224,6 @@ pub(crate) fn advanced_predicate_count(app: &App) -> usize {
         .count()
 }
 
-fn render_filters(f: &mut Frame, area: Rect, app: &App) {
-    let content_area = theme::render_filter_card(f, area);
-
-    let domain_val = match &app.input_mode {
-        InputMode::FilterDomain(s) => format!("{s}_"),
-        _ => app.query_log.filter_domain.clone().unwrap_or_default(),
-    };
-
-    let client_val = match &app.input_mode {
-        InputMode::FilterClient(s) => format!("{s}_"),
-        _ => app.query_log.filter_client.clone().unwrap_or_default(),
-    };
-
-    let blocked_marker = if app.query_log.blocked_only {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let since_label = app.query_log.since.label();
-
-    const LABEL_DOMAIN: &str = "Domain [/]: ";
-    const LABEL_CLIENT: &str = "  Client [c]: ";
-    const LABEL_TIME: &str = "  Time [t]: [";
-    // `Adv` chip. Shows the COUNT, not a checkbox: the operator needs to
-    // know an advanced filter is narrowing what they are reading, and
-    // "2" says more than "[x]" for the same cells.
-    let adv_n = advanced_predicate_count(app);
-    let adv_chip = if adv_n > 0 {
-        format!("  Adv [f]: {adv_n}")
-    } else {
-        "  Adv [f]: \u{00b7}".to_string()
-    };
-    let tail = format!("]  Blocked only [b]: {blocked_marker}");
-
-    // Width budget: the Time/Blocked chips must never scroll off the
-    // right edge, so cap each search value to a share of the leftover
-    // width — tail-kept so the trailing `_` edit cursor stays visible on
-    // a long filter. The `{:<12}` below still min-pads short values,
-    // so the normal-width look is unchanged; only a pathologically long
-    // value truncates. (qlog-02 template shared with tabs::lists / rules.)
-    let base_fixed =
-        LABEL_DOMAIN.len() + LABEL_CLIENT.len() + LABEL_TIME.len() + since_label.len() + tail.len();
-    // The chip costs cells this row does not comfortably have at 80
-    // columns, so it yields — but ONLY while nothing is applied. An
-    // ACTIVE advanced filter is never dropped for width: a filter that is
-    // narrowing the log while being invisible is strictly worse than a
-    // row that runs long. `adv_n > 0` is the whole condition.
-    const MIN_FIELD: usize = 11;
-    let chip_cells = adv_chip.chars().count();
-    let room_for_chip = (content_area.width as usize) >= base_fixed + chip_cells + 2 * MIN_FIELD;
-    let adv_shown = if adv_n > 0 || room_for_chip {
-        adv_chip.as_str()
-    } else {
-        ""
-    };
-    let fixed = base_fixed + adv_shown.chars().count();
-    let per_field = ((content_area.width as usize).saturating_sub(fixed) / 2).max(MIN_FIELD);
-    let domain_capped = truncate_tail(&domain_val, per_field);
-    let client_capped = truncate_tail(&client_val, per_field);
-
-    let domain_shown = format!(
-        "{:<12}",
-        if domain_capped.is_empty() {
-            "___________"
-        } else {
-            domain_capped.as_str()
-        }
-    );
-    let client_shown = format!(
-        "{:<12}",
-        if client_capped.is_empty() {
-            "___________"
-        } else {
-            client_capped.as_str()
-        }
-    );
-
-    // Only the value actually being edited turns `T.info` with a
-    // trailing `_` cursor — matches Lists/Rules. Query Log used to tint
-    // the whole strip on any edit; that stops here.
-    let domain_style = match &app.input_mode {
-        InputMode::FilterDomain(_) => Style::default().fg(T.info),
-        _ => Style::default().fg(T.text_secondary),
-    };
-    let client_style = match &app.input_mode {
-        InputMode::FilterClient(_) => Style::default().fg(T.info),
-        _ => Style::default().fg(T.text_secondary),
-    };
-    let muted = Style::default().fg(T.text_muted);
-
-    let line = Line::from(vec![
-        Span::styled(LABEL_DOMAIN, muted),
-        Span::styled(domain_shown, domain_style),
-        Span::styled(LABEL_CLIENT, muted),
-        Span::styled(client_shown, client_style),
-        Span::styled(format!("{LABEL_TIME}{since_label}{tail}"), muted),
-        // Applied advanced filters take `T.info`, the same tint the card
-        // gives a field being edited — it is the one chip whose control
-        // lives off-screen, so it has to carry its own "this is on".
-        Span::styled(
-            adv_shown.to_string(),
-            if adv_n > 0 {
-                Style::default().fg(T.info)
-            } else {
-                muted
-            },
-        ),
-    ]);
-    f.render_widget(Paragraph::new(line), content_area);
-}
-
 /// Char-count truncation keeping the **tail**, with a leading ellipsis.
 /// The Filters search fields append-edit at the end (the `_` cursor is the
 /// last char), so when a long query exceeds its width budget we keep the
@@ -247,25 +232,22 @@ fn render_filters(f: &mut Frame, area: Rect, app: &App) {
 /// for id/rule labels. UTF-8-correct (counts chars, never byte-slices).
 /// Shared by `tabs::lists` and `tabs::rules` filter cards (qlog-02 root).
 pub(crate) fn truncate_tail(s: &str, max_chars: usize) -> String {
-    let n = s.chars().count();
-    if n <= max_chars {
-        s.to_string()
-    } else if max_chars == 0 {
-        String::new()
-    } else {
-        // Keep the last `max_chars - 1` chars; the ellipsis takes one cell.
-        let mut out = String::with_capacity(max_chars);
-        out.push('\u{2026}');
-        out.extend(s.chars().skip(n - (max_chars - 1)));
-        out
-    }
+    crate::tui::text::fit_tail(s, max_chars)
 }
 
-/// qlog-06: the stable selection key for a log entry — `(timestamp,
-/// domain, client_ip)`. Used to re-anchor the cursor to the same row
-/// after a 3s poll slides the tail window underneath it.
-pub fn entry_key(e: &crate::ipc::protocol::QueryLogDto) -> (String, String, String) {
-    (e.timestamp.clone(), e.domain.clone(), e.client_ip.clone())
+/// Re-anchor to the same complete record when polling shifts the page.
+/// Timestamp/domain/IP alone collide for semantically different requests.
+pub fn entry_key(e: &crate::ipc::protocol::QueryLogDto) -> crate::tui::app::QueryLogEntryKey {
+    crate::tui::app::QueryLogEntryKey(
+        e.timestamp.clone(),
+        e.domain.clone(),
+        e.client_ip.clone(),
+        e.client_name.clone(),
+        e.query_type.clone(),
+        e.result.clone(),
+        e.response_time_us,
+        e.cname_chain_via.clone(),
+    )
 }
 
 /// Query Log table column headers: the standalone DATE
@@ -275,38 +257,43 @@ pub fn entry_key(e: &crate::ipc::protocol::QueryLogDto) -> (String, String, Stri
 /// buffer scan that the 80×24 column squeeze would truncate.
 pub(crate) const QLOG_HEADERS: [&str; 6] = ["TIME", "CLIENT", "DOMAIN", "TYPE", "RESULT", "RTT"];
 
-fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
-    let block = theme::framed_block_colored(T.text_primary);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let padded_x = inner.x.saturating_add(1);
-    let padded_w = inner.width.saturating_sub(2);
-
-    let title_area = Rect {
-        x: padded_x,
-        y: inner.y,
-        width: padded_w,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "Query Log",
-            Style::default()
-                .fg(T.brand_red)
-                .add_modifier(Modifier::BOLD),
-        )),
-        title_area,
-    );
-
-    let content_area = Rect {
-        x: padded_x,
-        y: inner.y.saturating_add(1),
-        width: padded_w,
-        height: inner.height.saturating_sub(1),
-    };
-
+fn render_table(f: &mut Frame, content_area: Rect, app: &mut App) {
     if app.query_log.entries.is_empty() {
+        if app.query_log.read_failed {
+            f.render_widget(
+                Paragraph::new("Query log read failed. Check daemon connection and try r.")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(T.error)),
+                content_area,
+            );
+            return;
+        }
+        if !app.query_log.has_loaded {
+            f.render_widget(
+                Paragraph::new("Loading Query Log…")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(T.text_secondary)),
+                content_area,
+            );
+            return;
+        }
+        if app.query_log.logging_enabled
+            && matches!(app.query_log.file_state, QueryLogFileState::Ok)
+            && app.query_log.has_active_filters()
+        {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from("No requests match the filters."),
+                    Line::from(
+                        "Press f, choose a chip, and use Delete to clear it; Reset All clears every filter.",
+                    ),
+                ])
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(T.text_secondary)),
+                content_area,
+            );
+            return;
+        }
         let (line1, line2) =
             pick_empty_state_message(app.query_log.logging_enabled, &app.query_log.file_state);
         let is_error = matches!(app.query_log.file_state, QueryLogFileState::Unreadable);
@@ -320,22 +307,22 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             line1_style = line1_style.add_modifier(Modifier::BOLD);
         }
 
-        let paragraph = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(line1, line1_style)),
-            Line::from(""),
-            Line::from(Span::styled(line2, Style::default().fg(T.text_secondary))),
-        ])
-        .alignment(Alignment::Center);
+        let mut lines: Vec<Line> = crate::tui::text::wrap(line1, content_area.width as usize)
+            .into_iter()
+            .map(|line| Line::styled(line, line1_style))
+            .collect();
+        lines.push(Line::from(""));
+        lines.extend(
+            crate::tui::text::wrap(line2, content_area.width as usize)
+                .into_iter()
+                .map(|line| Line::styled(line, Style::default().fg(T.text_secondary))),
+        );
+        let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
         f.render_widget(paragraph, content_area);
         return;
     }
 
-    let header = Row::new(QLOG_HEADERS.map(Cell::from)).style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(QLOG_HEADERS.map(Cell::from)).style(theme::table_heading_style(false));
 
     // Today's UTC date, captured once per render, so each
     // row's TIME cell can show a bare clock for same-day rows and fold
@@ -350,6 +337,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             .unwrap_or_default()
     };
 
+    let (constraints, spacing, widths) = table_columns(content_area.width);
     let rows: Vec<Row> = app
         .query_log
         .entries
@@ -385,47 +373,25 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             };
 
             Row::new(vec![
-                Cell::from(time_str),
-                Cell::from(
-                    entry
-                        .client_name
-                        .as_deref()
-                        .unwrap_or(&entry.client_ip)
-                        .to_string(),
-                ),
-                Cell::from(domain_cell),
-                Cell::from(entry.query_type.clone()),
-                Cell::from(Span::styled(badge_text, badge_style)),
-                Cell::from(rtt_str),
+                Cell::from(crate::tui::text::fit(&time_str, widths[0] as usize)),
+                Cell::from(crate::tui::text::fit(
+                    entry.client_name.as_deref().unwrap_or(&entry.client_ip),
+                    widths[1] as usize,
+                )),
+                Cell::from(crate::tui::text::fit(&domain_cell, widths[2] as usize)),
+                Cell::from(crate::tui::text::fit(&entry.query_type, widths[3] as usize)),
+                Cell::from(Span::styled(
+                    crate::tui::text::fit(badge_text, widths[4] as usize),
+                    badge_style,
+                )),
+                Cell::from(crate::tui::text::fit(&rtt_str, widths[5] as usize)),
             ])
         })
         .collect();
 
-    // Column constraints — `domain` is the sole flexible (Min) column
-    // and absorbs leftover width. The same array feeds both the Table
-    // and the separator helper so the two layouts cannot diverge.
-    // DATE(10)+CLOCK(8) merged into a single TIME(11) column
-    // (fits `MM-DD HH:MM`); the reclaimed width goes to CLIENT (16→20)
-    // and, via the flex column, to DOMAIN.
-    const TIME_W: u16 = 11;
-    const CLIENT_W: u16 = 20;
-    const TYPE_W: u16 = 6;
-    const RESULT_W: u16 = 8;
-    const RTT_W: u16 = 8;
-    const COLUMN_SPACING: u16 = 3;
-
-    let constraints = [
-        Constraint::Length(TIME_W),
-        Constraint::Length(CLIENT_W),
-        Constraint::Min(20), // domain (flexible)
-        Constraint::Length(TYPE_W),
-        Constraint::Length(RESULT_W),
-        Constraint::Length(RTT_W),
-    ];
-
     let table = Table::new(rows, constraints)
         .header(header)
-        .column_spacing(COLUMN_SPACING)
+        .column_spacing(spacing)
         .row_highlight_style(theme::highlight_style());
 
     // qlog-06: resolve the operator's stable entry key to the current
@@ -456,7 +422,56 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // documented 80x24 minimum (a 76-cell content rect) the hand-drawn
     // separators diverged from the real column edges and painted through
     // the TYPE/RESULT/RTT text.
-    crate::tui::ui::draw_table_column_separators(f, content_area, &constraints, COLUMN_SPACING);
+    crate::tui::ui::draw_table_column_separators(f, content_area, &constraints, spacing);
+    app.query_log.visible_rows = usize::from(content_area.height.saturating_sub(1)).max(1);
+    let offset = app.query_log.table_state.offset();
+    for row in 0..content_area.height.saturating_sub(1) {
+        let index = offset + row as usize;
+        if index >= app.query_log.entries.len() {
+            break;
+        }
+        super::super::mouse::register(
+            app,
+            Rect::new(
+                content_area.x,
+                content_area.y + 1 + row,
+                content_area.width,
+                1,
+            ),
+            super::super::mouse::MouseAction::Row(super::super::app::Leaf::QueryLog, index),
+        );
+    }
+}
+
+/// Six columns never disappear. Compact widths total 70 cells including five
+/// one-cell gaps, leaving the domain at least 20 cells at the 80×24 floor.
+fn table_columns(width: u16) -> ([Constraint; 6], u16, [u16; 6]) {
+    let compact = width < 100;
+    let wide = width >= 140;
+    let spacing = if compact { 1 } else { 2 };
+    let client = if compact {
+        12
+    } else if wide {
+        32
+    } else {
+        20
+    };
+    let fixed = 11 + client + 6 + 8 + 8 + 5 * spacing;
+    let domain = width
+        .saturating_sub(fixed)
+        .max(if compact { 20 } else { 24 });
+    (
+        [
+            Constraint::Length(11),
+            Constraint::Length(client),
+            Constraint::Length(domain),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+        spacing,
+        [11, client, domain, 6, 8, 8],
+    )
 }
 
 /// Compact per-row timestamp for the merged TIME column (the
@@ -540,6 +555,64 @@ fn format_response_time(us: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn responsive_six_columns_keep_compact_contract_at_80_floor() {
+        let (_constraints, spacing, widths) = table_columns(76);
+        assert_eq!(spacing, 1);
+        assert_eq!(widths, [11, 12, 26, 6, 8, 8]);
+        assert_eq!(widths.iter().sum::<u16>() + 5 * spacing, 76);
+
+        let (_constraints, spacing, widths) = table_columns(140);
+        assert_eq!(spacing, 2);
+        assert_eq!(widths[0], 11);
+        assert_eq!(widths[1], 32);
+        assert_eq!(widths[3..], [6, 8, 8]);
+    }
+
+    #[test]
+    fn tail_truncation_uses_display_cells_and_keeps_graphemes() {
+        let clipped = truncate_tail("cafe\u{301}-端末.example", 8);
+        assert!(crate::tui::text::width(&clipped) <= 8);
+        assert!(!clipped.contains('\u{fffd}'));
+        assert!(clipped.starts_with('…'));
+    }
+
+    #[test]
+    fn active_filter_empty_state_is_distinct_from_first_collection() {
+        let mut state = crate::tui::app::QueryLogState::default();
+        assert!(!state.has_active_filters());
+        state.client_ips.push("192.0.2.1".into());
+        assert!(state.has_active_filters());
+        state.client_ips.clear();
+        state.since = crate::tui::app::SincePreset::LastHour;
+        assert!(state.has_active_filters());
+    }
+
+    #[test]
+    fn table_subtitle_reports_loaded_and_blocked_counts_in_utc() {
+        let mut app = App::new();
+        let entry =
+            |result: &str, cname_chain_via: Option<&str>| crate::ipc::protocol::QueryLogDto {
+                timestamp: "2026-09-13T12:00:00Z".into(),
+                client_ip: "192.0.2.1".into(),
+                client_name: Some("client".into()),
+                domain: "example.test".into(),
+                query_type: "A".into(),
+                result: result.into(),
+                response_time_us: 10,
+                cname_chain_via: cname_chain_via.map(str::to_owned),
+            };
+        app.query_log.entries = vec![
+            entry("BLOCKED", None),
+            entry("ALLOWED", None),
+            entry("ALLOWED", Some("blocked-hop.example")),
+        ];
+        assert_eq!(
+            table_subtitle(&app),
+            "3 of 3 Requests · 2 Blocked · Newest First · UTC"
+        );
+    }
+
     // qlog-05 — separators are painted by re-running ratatui's Table
     // column solver on the same zero-origin rect the Table uses, so they
     // land in the inter-column gaps even at the documented 80x24 minimum
@@ -552,7 +625,7 @@ mod tests {
     fn separators_only_paint_into_column_gaps_at_80x24() {
         use crate::ipc::protocol::QueryLogDto;
         use ratatui::backend::TestBackend;
-        use ratatui::layout::{Constraint, Rect};
+        use ratatui::layout::Rect;
         use ratatui::widgets::{Cell, Row, Table};
         use ratatui::Terminal;
 
@@ -579,27 +652,20 @@ mod tests {
         // table, with every column cell filled so a misplaced separator
         // would land on a non-space glyph. content_area in render_table
         // is (x=2, y=2, …): frame border + "Query Log" title row.
-        let constraints = [
-            Constraint::Length(11),
-            Constraint::Length(20),
-            Constraint::Min(20),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Length(8),
-        ];
+        let (constraints, spacing, _) = table_columns(80);
         let filled = ["WWWWWWWWWWWWWWWWWWWWWW"; 6];
         let bare = Table::new(vec![Row::new(filled.map(Cell::from)); 6], constraints)
             .header(Row::new(filled.map(Cell::from)))
-            .column_spacing(3);
+            .column_spacing(spacing);
         let mut term2 = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term2
-            .draw(|f| f.render_widget(bare, Rect::new(2, 2, 76, 8)))
+            .draw(|f| f.render_widget(bare, Rect::new(0, 0, 80, 8)))
             .unwrap();
         let bare_buf = term2.backend().buffer().clone();
 
         let mut sep_count = 0;
-        for y in 2..9u16 {
-            for x in 2..78u16 {
+        for y in 0..7u16 {
+            for x in 0..80u16 {
                 if with[(x, y)].symbol() == "\u{2502}" {
                     sep_count += 1;
                     assert_eq!(
@@ -669,10 +735,11 @@ mod tests {
     // `footer_hints_for_query_log_tab_carries_all_five_keys` there.
 
     #[test]
-    fn since_preset_cycle_wraps_through_four_states() {
+    fn since_preset_cycle_wraps_through_all_five_states() {
         use crate::tui::app::SincePreset;
         assert_eq!(SincePreset::Off.next(), SincePreset::LastHour);
-        assert_eq!(SincePreset::LastHour.next(), SincePreset::Last6Hours);
+        assert_eq!(SincePreset::LastHour.next(), SincePreset::Last3Hours);
+        assert_eq!(SincePreset::Last3Hours.next(), SincePreset::Last6Hours);
         assert_eq!(SincePreset::Last6Hours.next(), SincePreset::Last24Hours);
         assert_eq!(SincePreset::Last24Hours.next(), SincePreset::Off);
     }
@@ -682,6 +749,7 @@ mod tests {
         use crate::tui::app::SincePreset;
         assert_eq!(SincePreset::Off.as_secs(), None);
         assert_eq!(SincePreset::LastHour.as_secs(), Some(3_600));
+        assert_eq!(SincePreset::Last3Hours.as_secs(), Some(10_800));
         assert_eq!(SincePreset::Last6Hours.as_secs(), Some(21_600));
         assert_eq!(SincePreset::Last24Hours.as_secs(), Some(86_400));
     }

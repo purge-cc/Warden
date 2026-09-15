@@ -13,7 +13,6 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use time::macros::datetime;
 
-use crate::filter::engine::FilterResult;
 use crate::tracking::query_log;
 
 use super::deprecation::deprecation_headers;
@@ -83,11 +82,6 @@ struct ListsResponse {
 }
 
 #[derive(Serialize)]
-struct WhitelistResponse {
-    entries: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -95,6 +89,19 @@ struct ErrorResponse {
 #[derive(Serialize)]
 struct OkResponse {
     message: String,
+}
+
+const LEGACY_WHITELIST_RETIRED: &str =
+    "The whitelist API is retired. Create a Custom List and mount it on the target profile instead.";
+
+fn retired_whitelist_response() -> axum::response::Response {
+    (
+        StatusCode::GONE,
+        Json(ErrorResponse {
+            error: LEGACY_WHITELIST_RETIRED.into(),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -115,12 +122,6 @@ struct LogEntry {
 pub struct ListBody {
     #[serde(deserialize_with = "deserialize_id_256")]
     pub id: String,
-}
-
-#[derive(Deserialize)]
-pub struct WhitelistBody {
-    #[serde(deserialize_with = "deserialize_domain_253")]
-    pub domain: String,
 }
 
 #[derive(Deserialize)]
@@ -249,19 +250,19 @@ where
     Option::<Wrap>::deserialize(d).map(|o| o.map(|Wrap(s)| s))
 }
 
-/// Load the v1 [`ConfigV1`](crate::config::schema::ConfigV1) off the async runtime. Reads the
-/// v1 schema via the loader (which merges master + includes) rather
+/// Load the current config projection off the async runtime. Reads the
+/// schema-5 tree via the loader (which merges master + includes) rather
 /// than a single-file parse.
 ///
 /// `spawn_blocking` runs the synchronous multi-file read on tokio's
 /// dedicated blocking pool, never a runtime worker — so even when this
 /// future is awaited inside the `config_write_lock` window, no async
 /// worker is starved.
-async fn read_config_v1(
+async fn read_current_config(
     path: std::path::PathBuf,
 ) -> anyhow::Result<crate::config::schema::ConfigV1> {
     let loaded = tokio::task::spawn_blocking(move || {
-        crate::config::loader::load_config(&path, time::OffsetDateTime::now_utc())
+        crate::config::loader::load_current_config(&path, time::OffsetDateTime::now_utc())
     })
     .await
     .map_err(|e| anyhow::anyhow!("config read task panicked: {e}"))?
@@ -419,7 +420,7 @@ where
     .map_err(|e| ListEditError::Io(anyhow::anyhow!("config edit task panicked: {e}")))?
 }
 
-/// Same `spawn_blocking` rationale as `read_config_v1`, applied to
+/// Same `spawn_blocking` rationale as `read_current_config`, applied to
 /// the rotated-log walker. `read_log_entries_with_state`
 /// can walk up to `retention_days` sibling files synchronously; in
 /// production with `retention_days = 30` and ~10 MB-per-day logs,
@@ -575,11 +576,20 @@ pub async fn get_status(State(state): State<Arc<ApiState>>) -> impl IntoResponse
         |snapshot| snapshot.domain_count,
     );
 
+    let upstream_status = state.upstream.as_ref().map(|upstream| upstream.status());
+    let upstream_mode = upstream_status.as_ref().map_or_else(
+        || state.upstream_mode.clone(),
+        |status| status.mode.to_string(),
+    );
+    let upstream_count = upstream_status
+        .as_ref()
+        .map_or(state.upstream_count, |status| status.primary_count);
+
     Json(StatusResponse {
         pid: std::process::id(),
         listen: state.listen_addr.clone(),
-        upstream_mode: state.upstream_mode.clone(),
-        upstream_count: state.upstream_count,
+        upstream_mode,
+        upstream_count,
         domain_count,
         cache_entries,
         list_count: state.list_count,
@@ -830,8 +840,8 @@ pub async fn get_blocklist_stats(
 
 /// GET /api/lists — current list subscriptions.
 pub async fn get_lists(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    // See `read_config_v1` for the spawn_blocking rationale.
-    match read_config_v1(state.config_path.clone()).await {
+    // See `read_current_config` for the spawn_blocking rationale.
+    match read_current_config(state.config_path.clone()).await {
         Ok(config) => Json(ListsResponse {
             sources: config.lists.sources,
         })
@@ -855,8 +865,8 @@ pub async fn add_list(
     // catalogue slug (`privacy/ads`) as well as a URL, so only strings
     // that look like a URL go through the fetch-side guard — but one that
     // the fetcher will reject is a subscription that silently filters
-    // nothing, and 200 OK is the wrong answer for it. Validated before
-    // the lock is taken, as `add_whitelist` does.
+    // nothing, and 200 OK is the wrong answer for it. Validate before
+    // taking the write lock.
     if body.id.contains("://") {
         if let Err(e) = crate::lists::http_client::validate_list_url(&body.id) {
             return (
@@ -983,217 +993,19 @@ pub async fn trigger_update(State(state): State<Arc<ApiState>>) -> impl IntoResp
     }
 }
 
-/// GET /api/whitelist — default profile allow rules.
-pub async fn get_whitelist(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    // v1 expresses a profile's allow list as `[[admin_rules]]` rows
-    // referenced by `profiles.<id>.admin_rules`. Reconstruct the
-    // pre-migration `WhitelistResponse` shape — the `@@||domain^` rule
-    // strings — by resolving the "default" profile's allow-type refs.
-    // See `read_config_v1` for the spawn_blocking rationale.
-    match read_config_v1(state.config_path.clone()).await {
-        Ok(config) => {
-            let entries = config
-                .profiles
-                .get("default")
-                .map(|p| {
-                    p.admin_rules
-                        .iter()
-                        .filter_map(|rid| {
-                            config
-                                .admin_rules
-                                .iter()
-                                .find(|ar| ar.id.as_str() == rid.as_str())
-                        })
-                        .filter(|ar| ar.rule.starts_with("@@"))
-                        .map(|ar| ar.rule.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            Json(WhitelistResponse { entries }).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to read config: {e}"),
-            }),
-        )
-            .into_response(),
-    }
+/// GET /api/whitelist — retired compatibility endpoint; never reads policy.
+pub async fn get_whitelist(State(_state): State<Arc<ApiState>>) -> impl IntoResponse {
+    retired_whitelist_response()
 }
 
-/// POST /api/whitelist/add — add an allow rule to the default profile.
-pub async fn add_whitelist(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<WhitelistBody>,
-) -> impl IntoResponse {
-    // Validate BEFORE acquiring the lock or touching disk. Strip any
-    // operator-typed `@@||...^` wrapper first so we validate
-    // the bare domain shape, then re-wrap below from the canonical
-    // (lowercased) form returned by the validator.
-    let bare = body.domain.trim_start_matches("@@||").trim_end_matches('^');
-    let canonical = match validate_api_domain(bare, "domain") {
-        Ok(d) => d,
-        Err(resp) => return resp,
-    };
-
-    // Route through the shared v1 admin-rule seat
-    // (`cli::commands::rules::add_inner`). It synthesises the
-    // `[[admin_rules]]` row, references it from
-    // `profiles.default.admin_rules`, and runs validate-or-revert as
-    // one compound write. `Scope::Profile("default")` keeps the
-    // pre-migration semantic — the endpoint edits the profile literally
-    // named "default". `add_inner` is sync, so it runs under
-    // `spawn_blocking` (see `read_config_v1` for the rationale), inside
-    // the `mutate_config` window that holds the write lock.
-    let config_path = state.config_path.clone();
-    let canon = canonical.clone();
-    let outcome = state
-        .mutate_config(|| {
-            tokio::task::spawn_blocking(move || {
-                crate::cli::commands::rules::add_inner(
-                    &config_path,
-                    crate::cli::commands::rules::Scope::Profile("default"),
-                    crate::cli::commands::rules::Action::Allow,
-                    &canon,
-                    None,
-                    None,
-                )
-            })
-        })
-        .await;
-    match outcome {
-        Ok(Ok(crate::cli::commands::rules::ChangeOutcome::Applied(_))) => {}
-        Ok(Ok(crate::cli::commands::rules::ChangeOutcome::NoOp(_))) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("already whitelisted: {canonical}"),
-                }),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to whitelist: {e}"),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("whitelist task panicked: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    // Audit the rule that reached disk, not the string that was typed:
-    // `canonical` is lowercased and `@@||`/`^` affix-stripped, so the two
-    // differ. The raw input stays under its own key so an operator's typo
-    // is still traceable to the request that made it.
-    tracing::info!(
-        target: "audit",
-        action = "whitelist.add",
-        domain = %canonical,
-        submitted = %body.domain,
-        "API mutation"
-    );
-    if let Err(e) = state.reload_tx.send(None).await {
-        return reload_failed_response(&canonical, "whitelist.add", &e);
-    }
-
-    Json(OkResponse {
-        message: format!("whitelisted: {canonical}"),
-    })
-    .into_response()
+/// POST /api/whitelist/add — retired compatibility endpoint; never writes.
+pub async fn add_whitelist(State(_state): State<Arc<ApiState>>) -> impl IntoResponse {
+    retired_whitelist_response()
 }
 
-/// DELETE /api/whitelist/remove — remove an allow rule from the default profile.
-pub async fn remove_whitelist(
-    State(state): State<Arc<ApiState>>,
-    Json(body): Json<WhitelistBody>,
-) -> impl IntoResponse {
-    // Validate BEFORE acquiring the lock or touching disk.
-    let bare = body.domain.trim_start_matches("@@||").trim_end_matches('^');
-    let canonical = match validate_api_domain(bare, "domain") {
-        Ok(d) => d,
-        Err(resp) => return resp,
-    };
-
-    // Route through the shared v1 admin-rule seat
-    // (`cli::commands::rules::remove_inner`). It drops the reference
-    // from `profiles.default.admin_rules`, cascades the
-    // `[[admin_rules]]` row when no other entity still references it,
-    // and runs validate-or-revert. `Scope::Profile("default")` keeps
-    // the pre-migration semantic. Sync — runs under `spawn_blocking`,
-    // inside the `mutate_config` window that holds the write lock.
-    let config_path = state.config_path.clone();
-    let canon = canonical.clone();
-    let outcome = state
-        .mutate_config(|| {
-            tokio::task::spawn_blocking(move || {
-                crate::cli::commands::rules::remove_inner(
-                    &config_path,
-                    crate::cli::commands::rules::Scope::Profile("default"),
-                    crate::cli::commands::rules::Action::Allow,
-                    &canon,
-                    None,
-                )
-            })
-        })
-        .await;
-    match outcome {
-        Ok(Ok(crate::cli::commands::rules::RemoveOutcome::Removed(_))) => {}
-        Ok(Ok(crate::cli::commands::rules::RemoveOutcome::NotFound)) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("not whitelisted: {canonical}"),
-                }),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to remove whitelist: {e}"),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("whitelist task panicked: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    // Audit the rule that reached disk — see `add_whitelist`.
-    tracing::info!(
-        target: "audit",
-        action = "whitelist.remove",
-        domain = %canonical,
-        submitted = %body.domain,
-        "API mutation"
-    );
-    if let Err(e) = state.reload_tx.send(None).await {
-        return reload_failed_response(&canonical, "whitelist.remove", &e);
-    }
-
-    Json(OkResponse {
-        message: format!("removed: {canonical}"),
-    })
-    .into_response()
+/// DELETE /api/whitelist/remove — retired compatibility endpoint; never writes.
+pub async fn remove_whitelist(State(_state): State<Arc<ApiState>>) -> impl IntoResponse {
+    retired_whitelist_response()
 }
 
 /// GET /api/query/:domain — test if a domain would be blocked.
@@ -1214,18 +1026,16 @@ pub async fn query_domain(
         Err(resp) => return resp,
     };
 
-    // Surface the already-computed block attribution via
-    // `evaluate_attributed` (off hot path; this is the on-demand probe).
-    // `source` is `Some` only with a Block verdict, so allowed domains
-    // map to `None`. The no-profile fallbacks lack a `ResolvedProfile`
-    // to attribute against, so `blocked_by` stays `None` there.
+    // This is an on-demand operator probe rather than the DNS hot path.
     let (blocked, blocked_by) = match &state.profiles {
         Some(resolver) => match resolver.default_profile() {
             Some(profile) => {
-                let (verdict, source) = state.filter.evaluate_attributed(&canonical, &profile);
+                let decision = state
+                    .filter
+                    .evaluate_active_operator_policy(&canonical, &profile);
                 (
-                    verdict == FilterResult::Block,
-                    source.map(|s| s.describe(&state.list_labels)),
+                    decision.blocked,
+                    decision.source.map(|s| s.describe(&state.list_labels)),
                 )
             }
             // When the operator has explicitly unset `default_profile`,
@@ -1233,7 +1043,7 @@ pub async fn query_domain(
             // REFUSED. Report as blocked for the API consumer.
             None => (true, None),
         },
-        None => (state.filter.is_blocked(&canonical), None),
+        None => (true, None),
     };
 
     Json(QueryResult {
@@ -1524,9 +1334,9 @@ pub async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
 
 /// GET /api/config — read-only config view (secrets redacted).
 pub async fn get_config(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    // See `read_config_v1` for the spawn_blocking rationale. The
-    // response body is the v1 `ConfigV1` shape.
-    match read_config_v1(state.config_path.clone()).await {
+    // See `read_current_config` for the spawn_blocking rationale. The
+    // response body is the stable projected config shape.
+    match read_current_config(state.config_path.clone()).await {
         // Structural redaction — every credential-bearing field is
         // starred in ONE place (`ConfigV1::redacted`, guarded by the
         // deny-by-default leak test beside it), not name-matched here.

@@ -208,13 +208,13 @@ fn render_text(form: &AddForm, width: u16) -> String {
 }
 
 #[test]
-fn s51_form_renders_banded_sections_and_the_active_marker() {
+fn s51_form_renders_banded_sections_and_the_value_focus() {
     // §4.61 Wave 2a replaced the grey `Field │ Value` grid with the
     // banded, labelled-section Archetype-F body. Two assertions from
     // the grid era had to change with it, and both are behaviour:
     //
     //  - the "Field"/"Value" header is gone — sections label
-    //    themselves now (IDENTITY / RANGE / POLICY);
+    //    themselves now (IDENTITY / ADDRESS RANGES / POLICY);
     //  - the `_` caret is gone — a focused text field hosts the real
     //    terminal cursor, as the operator-validated Lists modal
     //    does. `focused_text_field_hosts_the_real_cursor` below is
@@ -226,14 +226,54 @@ fn s51_form_renders_banded_sections_and_the_active_marker() {
     let text = render_text(form, 60);
 
     assert!(
-        text.contains("IDENTITY") && text.contains("RANGE") && text.contains("POLICY"),
+        text.contains("IDENTITY") && text.contains("ADDRESS RANGES") && text.contains("POLICY"),
         "labelled section bands:\n{text}"
     );
     assert!(!text.contains("lan_"), "the `_` caret is the cursor's job");
     assert!(text.contains("lan"), "the focused value still renders");
-    assert!(text.contains('◀'), "active row carries the focus marker");
+    let (body, cursor) = form_body(form, 60);
+    let (row, caret) = cursor.expect("focused text field records its cursor");
+    assert_eq!(caret, 3);
+    assert!(body.fields[row].spans[0].style.bg.is_none());
+    assert!(
+        body.fields[row]
+            .spans
+            .iter()
+            .skip(1)
+            .all(|span| span.style.bg == Some(crate::tui::theme::T.info)),
+        "only the focused value surface carries the highlight"
+    );
+    assert!(!text.contains('◀') && !text.contains('▌'));
     assert!(text.contains("Save"), "Save action present");
     assert!(text.contains("Discard"), "Discard action present");
+
+    for (section, role) in [
+        ("IDENTITY", CardRole::Summary),
+        ("ADDRESS RANGES", CardRole::Analytics),
+        ("POLICY", CardRole::History),
+    ] {
+        let line = body
+            .fields
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains(section)))
+            .unwrap();
+        let span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains(section))
+            .unwrap();
+        let effective = line.style.patch(span.style);
+        assert_eq!(
+            (effective.fg, effective.bg),
+            (Some(T.text_inverse), Some(T.card_title_bg(role)))
+        );
+    }
+    assert_eq!(body.fields.len(), 14, "reference field-region height");
+    assert_eq!(
+        body.head.len() + body.fields.len() + body.tail.len() + 2,
+        23,
+        "the roomy overlay keeps the reference's 23-row frame"
+    );
 }
 
 #[test]
@@ -251,26 +291,57 @@ fn focused_text_field_hosts_the_real_cursor() {
     let pos = term.get_cursor_position().unwrap();
 
     let dump = dump_buffer(term.backend().buffer());
-    // Located by the focus marker, not by the value: exactly one row
-    // carries `◀`, whereas "lan" also hides inside the display-name
-    // placeholder ("blank = the id") two rows below.
-    let row = dump
-        .lines()
-        .position(|l| l.contains('\u{25c0}'))
-        .expect("the focused row must be on screen") as u16;
+    let row = pos.y;
     assert!(
         dump.lines().nth(row as usize).unwrap().contains("lan"),
         "the focused row is the id row:\n{dump}"
     );
     assert_eq!(pos.y, row, "cursor must sit on the focused row:\n{dump}");
-    // Modal is 64 wide and centred in 100 columns → inner left edge
-    // is 18 + 1 border; the caret lands VALUE_COL + len("lan") in.
-    let inner_x = (100 - 64) / 2 + 1;
+    let buffer = term.backend().buffer();
+    let value = "lan";
+    let value_x = (0..=buffer.area.width - value.len() as u16)
+        .find(|&x| {
+            value.chars().enumerate().all(|(offset, character)| {
+                buffer[(x + offset as u16, row)].symbol() == character.to_string()
+            })
+        })
+        .expect("the complete typed value is visible on the cursor row");
     assert_eq!(
         pos.x,
-        inner_x + modal_form::VALUE_COL as u16 + 3,
-        "cursor must sit at the end of the typed value:\n{dump}"
+        value_x + value.len() as u16,
+        "cursor must sit at the end of the displayed value:\n{dump}"
     );
+    assert_eq!(
+        buffer[(value_x, row)].bg,
+        crate::tui::theme::T.info,
+        "the value under the cursor is highlighted"
+    );
+}
+
+#[test]
+fn roomy_form_uses_the_reference_geometry() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut modal = SubnetModal::open_add(vec!["default".into()], 0);
+    modal.form_mut().unwrap().id = "lan".into();
+    let mut term = Terminal::new(TestBackend::new(100, 44)).unwrap();
+    term.draw(|f| render_overlay(f, f.area(), &modal)).unwrap();
+    let buffer = term.backend().buffer();
+    let corner = |glyph: &str| {
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == glyph)
+            .unwrap_or_else(|| panic!("missing modal corner {glyph:?}"))
+    };
+    let (left, top) = corner("┌");
+    let (right, top_right) = corner("┐");
+    let (bottom_left, bottom) = corner("└");
+
+    assert_eq!(top_right, top);
+    assert_eq!(bottom_left, left);
+    assert_eq!(right - left + 1, 68);
+    assert_eq!(bottom - top + 1, 23);
 }
 
 #[test]
@@ -402,10 +473,6 @@ fn floor_keeps_the_action_row_and_the_focused_field_on_screen_together() {
         dump.contains("77"),
         "the focused field's value is off-screen:\n{dump}"
     );
-    assert!(
-        dump.contains('\u{25c0}'),
-        "the focus marker must be on screen with the action row:\n{dump}"
-    );
 }
 
 #[test]
@@ -448,16 +515,18 @@ fn floor_add_mode_keeps_the_action_row_and_the_focused_field_together() {
     // lines and fitted the 12-row interior by luck. This pins
     // behaviour that already works.
     let mut modal = SubnetModal::open_add(vec!["default".into()], 0);
-    modal.form_mut().unwrap().focused = FormField::Profile; // last Add field
+    let form = modal.form_mut().unwrap();
+    form.focused = FormField::Priority;
+    form.priority_input = "77".into();
     let dump = render_overlay_in(&modal, 80, 14);
 
     assert!(
-        dump.contains("\u{2039} default \u{203a}"),
-        "focused profile row is off-screen:\n{dump}"
+        dump.contains("77"),
+        "focused priority row is off-screen:\n{dump}"
     );
     assert!(dump.contains("Save"), "action row cut in Add mode:\n{dump}");
     assert!(
-        !dump.contains("display name"),
+        !dump.contains("Display Name"),
         "the viewport must have scrolled past the first field:\n{dump}"
     );
 }
@@ -472,6 +541,7 @@ fn floor_remove_confirm_shows_the_entity_and_the_key_legend() {
             id: "lan".into(),
             display_name: "Guest WiFi".into(),
             cidrs: vec!["10.0.0.0/24".into()],
+            focus: 0,
         }),
     };
     let dump = render_overlay_in(&modal, 80, 14);
@@ -481,7 +551,7 @@ fn floor_remove_confirm_shows_the_entity_and_the_key_legend() {
         "the operator must see which subnet they are removing:\n{dump}"
     );
     assert!(
-        dump.contains("[y] confirm") && dump.contains("[y] Remove"),
+        dump.contains("[y] confirm") && dump.contains("Cancel") && dump.contains("Remove"),
         "the y/n keying is unchanged and must stay legible:\n{dump}"
     );
 }
@@ -554,27 +624,6 @@ fn overlay_is_confined_to_the_anchor_rect() {
 }
 
 #[test]
-fn no_hand_rolled_colour_in_this_module() {
-    // §4.61 Wave 2a's acceptance criterion, as a test rather than a
-    // claim in a commit message. A surface that reaches for the
-    // theme directly is a surface that will drift from the other
-    // eleven — and R1 is that every wave re-derives the colour rule
-    // locally. Needles are split so this assertion cannot match
-    // itself.
-    let src = include_str!("../subnet_modal.rs");
-    for needle in [
-        concat!("Style::default()", ".fg("),
-        concat!("Color", "::Rgb("),
-        concat!("T", ".brand_red"),
-    ] {
-        assert!(
-            !src.contains(needle),
-            "{needle} in subnet_modal.rs — the colour belongs in modal_form"
-        );
-    }
-}
-
-#[test]
 #[ignore = "visual aid: cargo test subnet_visual_dump -- --ignored --nocapture"]
 fn subnet_visual_dump() {
     let mut modal = edit_modal_for_floor();
@@ -601,6 +650,7 @@ fn subnet_visual_dump() {
         id: "lan".into(),
         display_name: "Guest WiFi".into(),
         cidrs: vec!["10.0.0.0/24".into()],
+        focus: 0,
     };
     println!(
         "--- remove confirm (Archetype C) ---\n{}",

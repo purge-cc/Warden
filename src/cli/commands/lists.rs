@@ -10,9 +10,9 @@ use super::target::{
     resolve_existing_target_file_locked, write_value_validated_locked, EntityClass,
 };
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-use crate::config::loader::{load_config, load_config_for_schema_under_guard};
+use crate::config::loader::{load_config_for_schema_under_guard, load_current_config};
 use crate::config::schema::Blocklist;
-use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::schema::TARGET_SCHEMA_VERSION_V5;
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client;
 use crate::lists::catalog::{Catalog, CatalogEntry};
@@ -272,7 +272,7 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
     let now = time::OffsetDateTime::now_utc();
     let loaded = {
         let guard = crate::config::write_lock::acquire_for_write(config_path)?;
-        load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now).ok()
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now).ok()
     };
     if let Some(loaded) = &loaded {
         let canonical = canonical_url_key(&url);
@@ -344,7 +344,7 @@ pub async fn run_add(config_path: &Path, socket_path: &Path, source: &str) -> an
         let guard = crate::config::write_lock::acquire_for_write(config_path)?;
         let now = time::OffsetDateTime::now_utc();
         if let Ok(loaded) =
-            load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
+            load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
         {
             let canonical = canonical_url_key(&url);
             if let Some(existing) = loaded
@@ -465,20 +465,21 @@ pub async fn run_remove(
     // Which entry does this argument name? Matched by id, by the id the
     // argument would derive to, or by URL.
     let now = time::OffsetDateTime::now_utc();
-    let entity_id = load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-        .ok()
-        .and_then(|loaded| {
-            loaded
-                .config
-                .blocklists
-                .iter()
-                .find(|b| {
-                    b.id.as_str() == source
-                        || derived_id.as_deref() == Some(b.id.as_str())
-                        || canonical_url_key(&b.url) == canonical
-                })
-                .map(|b| b.id.as_str().to_string())
-        });
+    let entity_id =
+        load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
+            .ok()
+            .and_then(|loaded| {
+                loaded
+                    .config
+                    .blocklists
+                    .iter()
+                    .find(|b| {
+                        b.id.as_str() == source
+                            || derived_id.as_deref() == Some(b.id.as_str())
+                            || canonical_url_key(&b.url) == canonical
+                    })
+                    .map(|b| b.id.as_str().to_string())
+            });
 
     // Where the entry lives. On a single-file config this is the master
     // itself, which is the case worth being careful about: the same
@@ -604,7 +605,7 @@ pub async fn run_list(config_path: &Path, socket_path: &Path) -> anyhow::Result<
     super::lists_knobs::warn_if_frozen(socket_path).await;
 
     let now = time::OffsetDateTime::now_utc();
-    let loaded = load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = load_current_config(config_path, now).map_err(format_config_errors)?;
     let lists = &loaded.config.lists;
     let blocklists = &loaded.config.blocklists;
 
@@ -717,7 +718,7 @@ pub async fn run_catalog(
     // absent or not yet a valid v1 master, so every load error collapses
     // to "nothing configured" rather than aborting.
     let now = time::OffsetDateTime::now_utc();
-    let active = load_config(config_path, now)
+    let active = load_current_config(config_path, now)
         .map(|loaded| {
             ActiveSources::collect(&loaded.config.lists.sources, &loaded.config.blocklists)
         })
@@ -1145,7 +1146,7 @@ mod tests {
     /// `validate_or_revert` (the full v1 loader), and `run_list` reads
     /// via `load_config`, so every config-touching test fixture must
     /// carry `schema_version` + a resolvable `default_profile`.
-    const MINIMAL_V1: &str = r#"schema_version = 4
+    const MINIMAL_V1: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1226,7 +1227,7 @@ servers = ["192.0.2.1:53"]
         let path = temp_config(MINIMAL_V1);
         run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(
             loaded.config.blocklists.len(),
             1,
@@ -1273,7 +1274,7 @@ servers = ["192.0.2.1:53"]
         // a tag, so the tag was inert here too — and the shape now under
         // test is the one an operator is actually handed.
         let path = temp_config(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1287,7 +1288,7 @@ servers = ["192.0.2.1:53"]
         );
         run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let profile = loaded.config.profiles.get("default").unwrap();
         let reached = resolve_profile_blocklist_ids(profile, &loaded.config.blocklists);
         let reached: Vec<&str> = reached.iter().map(|id| id.as_str()).collect();
@@ -1318,7 +1319,7 @@ servers = ["192.0.2.1:53"]
         );
 
         let path = temp_config(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1332,7 +1333,7 @@ servers = ["192.0.2.1:53"]
         );
         run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let profile = loaded.config.profiles.get("default").unwrap();
         let reached = resolve_profile_blocklist_ids(profile, &loaded.config.blocklists);
         assert!(
@@ -1350,7 +1351,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let b = &loaded.config.blocklists[0];
         assert_eq!(b.id.as_str(), "lists-example-org-ads");
         assert_eq!(b.url, "https://lists.example.org/ads.txt");
@@ -1366,7 +1367,7 @@ servers = ["192.0.2.1:53"]
         run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
         run_add(&path, &no_socket(), "privacy/ads").await.unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.blocklists.len(), 1);
         std::fs::remove_file(&path).ok();
     }
@@ -1384,7 +1385,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.blocklists.len(), 1);
         std::fs::remove_file(&path).ok();
     }
@@ -1403,7 +1404,7 @@ servers = ["192.0.2.1:53"]
             "the refusal must say how to find a real list, got: {err}"
         );
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert!(loaded.config.blocklists.is_empty());
         assert!(loaded.config.lists.sources.is_empty());
         std::fs::remove_file(&path).ok();
@@ -1422,7 +1423,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let ids: Vec<&str> = loaded
             .config
             .blocklists
@@ -1445,7 +1446,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.lists.sources, vec!["security/malicious"]);
         std::fs::remove_file(&path).ok();
     }
@@ -1475,7 +1476,7 @@ servers = ["192.0.2.1:53"]
             );
         std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
 
-        let before = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let before = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(before.config.blocklists.len(), 1, "fixture: entry present");
         assert_eq!(before.config.lists.sources.len(), 1, "fixture: legacy too");
 
@@ -1483,7 +1484,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let after = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let after = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert!(
             after.config.blocklists.is_empty(),
             "the entry must be gone: {:?}",
@@ -1524,7 +1525,7 @@ servers = ["192.0.2.1:53"]
             .await
             .unwrap();
 
-        let after = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let after = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert!(after.config.blocklists.is_empty());
         assert!(after.config.lists.sources.is_empty());
         std::fs::remove_file(&alias).ok();
@@ -1554,7 +1555,7 @@ servers = ["192.0.2.1:53"]
             "the refusal must say how to name it: {err}"
         );
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.blocklists.len(), 1);
         std::fs::remove_file(&path).ok();
     }
@@ -1573,7 +1574,7 @@ servers = ["192.0.2.1:53"]
     #[tokio::test]
     async fn add_leaves_every_other_section_untouched() {
         let path = temp_config(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1598,7 +1599,7 @@ display_name = "Default"
             .await
             .unwrap();
 
-        let loaded = load_config(&path, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = load_current_config(&path, time::OffsetDateTime::now_utc()).unwrap();
         let cfg = &loaded.config;
         assert_eq!(cfg.server.listen, "0.0.0.0:53".parse().unwrap());
         assert_eq!(cfg.server.log_level, "debug");

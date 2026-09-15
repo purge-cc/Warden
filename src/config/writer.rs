@@ -1,13 +1,8 @@
-//! Atomic v1 config file writer.
+//! Test-only atomic schema-4 config writer.
 //!
-//! The daemon and every CLI verb operate exclusively on [`ConfigV1`]; the
-//! single writer here is [`write_config_v1_locked`], retained for guarded
-//! in-crate whole-file writer coverage.
-//! Per-section mutations (the schedule-tick prune, the IPC
-//! tracking-config handler, every entity editor) do NOT go through here
-//! — they use per-file `toml::Value` surgery via
-//! `cli::commands::target::write_value_validated_locked` so multi-file include
-//! layouts aren't flattened onto the master.
+//! The current runtime writes schema 5 through the target transaction path.
+//! This module is compiled only for unit tests and retains coverage of the
+//! guarded whole-file mechanics used by historical schema-4 recovery code.
 
 use std::path::Path;
 
@@ -21,10 +16,6 @@ use super::write_lock::ConfigWriteLock;
 /// Uses `toml::to_string_pretty`, so the output round-trips semantically
 /// but **does not preserve comment layout or field ordering** of a
 /// hand-edited source. Sufficient for:
-///
-/// - `warden init` scaffolding (writing a fresh file).
-/// - `warden config restore` (staged replacement, operator already accepted
-///   the backup being canonical).
 ///
 /// Not suitable for round-tripping a hand-edited file without churn.
 pub(crate) fn write_config_v1_locked(

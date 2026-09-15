@@ -125,6 +125,7 @@ use arc_swap::ArcSwap;
 use compact_str::CompactString;
 
 use super::cname::BlockSource;
+use super::operator_rules::{ExternalMatches, RequestGrant, Verdict as OperatorRuleVerdict};
 use super::rules::{RuleAction, RulePattern};
 use crate::profiles::profile::ResolvedProfile;
 
@@ -567,6 +568,8 @@ pub struct SortedShard {
     /// that contains it, direction-agnostic. [`Self::split_base`] recovers the
     /// per-direction masks.
     entries: Box<[(CompactString, u64)]>,
+    /// Entry arrays plus separately allocated domain capacities, measured at build.
+    entries_memory_bytes: u64,
     /// The direction map that interprets [`Self::entries`], materialised
     /// against the **same** generation's bit assignment. Shared across the 16
     /// shards of a generation, so this costs one pointer per shard and one
@@ -637,6 +640,7 @@ impl SortedShard {
     pub fn empty() -> Self {
         Self {
             entries: Box::new([]),
+            entries_memory_bytes: 0,
             policy: ListPolicy::inert(),
         }
     }
@@ -735,9 +739,20 @@ impl SortedShard {
             return Err(err);
         }
         Ok(Self {
+            entries_memory_bytes: Self::estimate_entries_memory(&entries),
             entries: entries.into_boxed_slice(),
             policy,
         })
+    }
+
+    fn estimate_entries_memory(entries: &[(CompactString, u64)]) -> u64 {
+        entries
+            .iter()
+            .filter(|(domain, _)| domain.is_heap_allocated())
+            .fold(
+                std::mem::size_of_val(entries) as u64,
+                |bytes, (domain, _)| bytes.saturating_add(domain.capacity() as u64),
+            )
     }
 
     /// Iterate `(domain, source_bits)` in sorted order.
@@ -923,6 +938,7 @@ impl SortedShard {
         entries.shrink_to_fit();
 
         Self {
+            entries_memory_bytes: Self::estimate_entries_memory(&entries),
             entries: entries.into_boxed_slice(),
             policy: ListPolicy::uniform(allow_bits, gen_id),
         }
@@ -945,6 +961,14 @@ pub enum FilterResult {
     Forward,
     /// Block the query (return canned response).
     Block,
+}
+
+/// Result of the active compiled policy evaluation for an original QNAME.
+#[derive(Debug)]
+pub(crate) struct ActivePolicyDecision<'a> {
+    pub blocked: bool,
+    pub source: Option<BlockSource>,
+    pub grant: Option<RequestGrant<'a>>,
 }
 
 /// Per-domain Tier 1 list-membership masks split by direction.
@@ -1228,6 +1252,51 @@ impl FilterEngine {
     #[must_use]
     pub fn new() -> Self {
         Self::from_shard_maps(std::array::from_fn(|_| SortedShard::empty()))
+    }
+
+    /// Install already validated shards without rebuilding their domain arrays.
+    /// The caller serializes writers and retains the prepared engine until all
+    /// corresponding runtime consumers have been installed.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_prepared_shards(&self, prepared: &Self) {
+        for (destination, source) in self.shards.iter().zip(&prepared.shards) {
+            destination.0.store(source.0.load_full());
+        }
+    }
+
+    /// Estimate the installed deduplicated corpus, independent of its RSS.
+    ///
+    /// Includes exact shard arrays, heap domain capacities, shard headers and
+    /// cells, Arc reference counters, and each distinct policy header once.
+    /// Policy map backing storage, allocator overhead, temporary build buffers,
+    /// and old generations retained only by readers are excluded. Domain payload
+    /// is measured during construction; polling uses stack storage and reads only
+    /// the fixed shard set. Policies are deduplicated with at most 120 pointer
+    /// comparisons for the 16 shards, without scanning their profile maps.
+    #[must_use]
+    pub fn installed_memory_bytes(&self) -> u64 {
+        let mut policies: [Option<Arc<ListPolicy>>; DOMAIN_SHARDS] = std::array::from_fn(|_| None);
+        let mut bytes = std::mem::size_of_val(&self.shards) as u64;
+        for (i, cell) in self.shards.iter().enumerate() {
+            // Pin at most one domain shard at a time. Retaining only the small
+            // policies avoids pointer reuse while deduplicating their headers.
+            let shard = cell.0.load();
+            bytes = bytes
+                .saturating_add(shard.entries_memory_bytes)
+                .saturating_add(std::mem::size_of::<SortedShard>() as u64)
+                .saturating_add((2 * std::mem::size_of::<usize>()) as u64);
+            if !policies[..i]
+                .iter()
+                .flatten()
+                .any(|p| Arc::ptr_eq(p, &shard.policy))
+            {
+                policies[i] = Some(Arc::clone(&shard.policy));
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<ListPolicy>() as u64)
+                    .saturating_add((2 * std::mem::size_of::<usize>()) as u64);
+            }
+        }
+        bytes
     }
 
     /// Return allocation-relevant installed-shard shapes for deterministic
@@ -1595,6 +1664,51 @@ impl FilterEngine {
         self.evaluate_inner::<true>(domain, profile)
     }
 
+    /// Evaluate the active compiled policy for an original query name.
+    ///
+    /// The returned grant is carried to response validation by the DNS path;
+    /// control-plane probes use the verdict and attribution only.
+    #[inline]
+    pub(crate) fn evaluate_active_operator_policy<'a>(
+        &self,
+        domain: &str,
+        profile: &'a ResolvedProfile,
+    ) -> ActivePolicyDecision<'a> {
+        let Some(compiled) = profile.operator_rules.as_ref() else {
+            return ActivePolicyDecision {
+                blocked: true,
+                source: Some(BlockSource::AdminBlock),
+                grant: None,
+            };
+        };
+
+        let (external, external_source) = self.external_matches_attributed(domain, profile);
+        let decision = compiled.profile().evaluate_attributed(domain, external);
+        let grant = decision.grant();
+        if decision.verdict() == OperatorRuleVerdict::Forward {
+            return ActivePolicyDecision {
+                blocked: false,
+                source: None,
+                grant,
+            };
+        }
+
+        let source = decision
+            .winning_rule()
+            .map(|hit| BlockSource::CustomList(hit.origin().list_id().clone()))
+            .or_else(|| {
+                (external == ExternalMatches::Deny)
+                    .then_some(external_source)
+                    .flatten()
+            })
+            .unwrap_or(BlockSource::AdminBlock);
+        ActivePolicyDecision {
+            blocked: true,
+            source: Some(source),
+            grant,
+        }
+    }
+
     /// Shared evaluation kernel for [`Self::evaluate`] and
     /// [`Self::evaluate_attributed`].
     ///
@@ -1946,6 +2060,39 @@ impl FilterEngine {
         self.walk_membership(domain, |eng, key| eng.probe_shard(key, profile))
     }
 
+    /// Typed result of the downloaded-list layer for a resolved profile.
+    /// Operator Custom Lists are deliberately absent: their compiled rules
+    /// are evaluated by `CompiledProfile`; this method preserves only the
+    /// existing subscription/direction projection for external lists.
+    #[inline(always)]
+    pub fn external_matches(&self, domain: &str, profile: &ResolvedProfile) -> ExternalMatches {
+        self.external_matches_attributed(domain, profile).0
+    }
+
+    /// Same typed external result plus the historical downloaded-list block
+    /// attribution.  Custom List attribution is emitted by the compiled-rule
+    /// evaluator, never here.
+    #[inline(always)]
+    pub fn external_matches_attributed(
+        &self,
+        domain: &str,
+        profile: &ResolvedProfile,
+    ) -> (ExternalMatches, Option<BlockSource>) {
+        if profile.unfiltered {
+            return (ExternalMatches::Disabled, None);
+        }
+        let masks = self.list_membership_for(domain, profile.name.as_str());
+        let external = match (masks.allow_mask != 0, masks.block_mask != 0) {
+            (false, false) => ExternalMatches::None,
+            (true, false) => ExternalMatches::Allow,
+            (false, true) => ExternalMatches::Deny,
+            (true, true) => ExternalMatches::AllowAndDeny,
+        };
+        let source = (masks.block_mask != 0)
+            .then_some(BlockSource::List(masks.block_mask.trailing_zeros() as u8));
+        (external, source)
+    }
+
     /// Exact match plus the subdomain walk, OR-accumulating whatever `probe`
     /// returns.
     ///
@@ -2027,8 +2174,10 @@ impl FilterEngine {
                     block: base.block & bits,
                 },
             );
+            let entries = cur.entries.clone();
             shard.0.store(Arc::new(SortedShard {
-                entries: cur.entries.clone(),
+                entries_memory_bytes: SortedShard::estimate_entries_memory(&entries),
+                entries,
                 policy: Arc::new(ListPolicy {
                     per_profile,
                     base,
@@ -2133,3 +2282,125 @@ pub fn parse_blocklist(content: &str) -> HashSet<CompactString, RandomState> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod installed_memory_tests {
+    use super::*;
+
+    #[test]
+    fn shared_policy_metadata_is_counted_once_for_all_installed_shards() {
+        let policy = ListPolicy::publish_uniform(0);
+        let engine = FilterEngine::from_shard_maps(std::array::from_fn(|_| {
+            SortedShard::from_sorted_entries(vec![], policy.clone()).unwrap()
+        }));
+        let arc_counters = 2 * std::mem::size_of::<usize>();
+        let expected = std::mem::size_of_val(&engine.shards)
+            + DOMAIN_SHARDS * (std::mem::size_of::<SortedShard>() + arc_counters)
+            + std::mem::size_of::<ListPolicy>()
+            + arc_counters;
+        assert_eq!(engine.installed_memory_bytes(), expected as u64);
+        // A partial publish introduces one additional distinct policy header.
+        engine.swap_shard_sorted(
+            0,
+            SortedShard::from_sorted_entries(vec![], ListPolicy::publish_uniform(0)).unwrap(),
+        );
+        assert_eq!(
+            engine.installed_memory_bytes(),
+            (expected + std::mem::size_of::<ListPolicy>() + arc_counters) as u64
+        );
+    }
+
+    #[test]
+    fn estimate_counts_domain_heap_capacity_and_exact_array_after_deduplication() {
+        let long =
+            CompactString::from("a-very-long-domain-name-that-cannot-be-inlined.example.com");
+        assert!(long.is_heap_allocated());
+        let shard = SortedShard::from_pairs(
+            vec![
+                (
+                    long.clone(),
+                    DomainMasks {
+                        allow_mask: 0,
+                        block_mask: 1,
+                    },
+                ),
+                (
+                    long,
+                    DomainMasks {
+                        allow_mask: 0,
+                        block_mask: 2,
+                    },
+                ),
+                (
+                    CompactString::from("short.test"),
+                    DomainMasks {
+                        allow_mask: 0,
+                        block_mask: 1,
+                    },
+                ),
+            ],
+            1,
+        );
+        assert_eq!(shard.len(), 2);
+        let heap: usize = shard
+            .entries
+            .iter()
+            .filter(|(s, _)| s.is_heap_allocated())
+            .map(|(s, _)| s.capacity())
+            .sum();
+        assert_eq!(
+            shard.entries_memory_bytes,
+            (2 * std::mem::size_of::<(CompactString, u64)>() + heap) as u64
+        );
+        assert_eq!(shard.entries[0].1, 3);
+    }
+
+    #[test]
+    fn estimate_tracks_partial_publication_and_excludes_retained_old_shards() {
+        let policy = ListPolicy::publish_uniform(0);
+        let engine = FilterEngine::from_shard_maps(std::array::from_fn(|_| {
+            SortedShard::from_sorted_entries(vec![], policy.clone()).unwrap()
+        }));
+        let empty = engine.installed_memory_bytes();
+        let first = SortedShard::from_sorted_entries(
+            vec![(CompactString::from("first.example"), 1)],
+            policy.clone(),
+        )
+        .unwrap();
+        let first_bytes = first.entries_memory_bytes;
+        engine.swap_shard_sorted(0, first);
+        let retained = engine.shards[0].0.load_full();
+        let second = SortedShard::from_sorted_entries(
+            vec![(
+                CompactString::from("a-long-domain-that-needs-separate-allocation.example.com"),
+                1,
+            )],
+            policy.clone(),
+        )
+        .unwrap();
+        let second_bytes = second.entries_memory_bytes;
+        engine.swap_shard_sorted(1, second);
+        assert_eq!(
+            engine.installed_memory_bytes(),
+            empty + first_bytes + second_bytes
+        );
+        engine.swap_shard_sorted(0, SortedShard::from_sorted_entries(vec![], policy).unwrap());
+        assert_eq!(engine.installed_memory_bytes(), empty + second_bytes);
+        assert_eq!(retained.len(), 1);
+    }
+
+    #[test]
+    fn rejected_shard_does_not_change_installed_estimate() {
+        let engine = FilterEngine::new();
+        let before = engine.installed_memory_bytes();
+        assert!(SortedShard::from_sorted_entries(
+            vec![
+                (CompactString::from("duplicate.example"), 1),
+                (CompactString::from("duplicate.example"), 2),
+            ],
+            ListPolicy::publish_uniform(0)
+        )
+        .is_err());
+        assert_eq!(engine.installed_memory_bytes(), before);
+    }
+}

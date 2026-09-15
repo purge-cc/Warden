@@ -14,17 +14,16 @@
 //! colour switches on `ok` exactly like the restore outcome.
 //!
 //! ## Chrome
-//! Both flows are **Archetype C**: [`NoticeSpec`] →
-//! `modal_form::notice_body` → `modal_form::render_modal`, anchored on the
-//! tab content rect. Seven stages across the two — four
-//! restore, three backup — and every one of them is a `NoticeSpec`.
+//! Both flows use the shared modal frame and body rows. Every stage declares
+//! a [`NoticeSpec`] for its actions and outcome semantics; the archive picker
+//! and confirmations compose the configuration-specific table and sections.
 //!
 //! ## State machine
 //! ```text
 //! Picking { entries, selected } ──Enter──▶ Confirming { point }
 //!                               ──Esc──▶ closed
 //! Confirming { point }          ──[y]──▶ Restoring { point }
-//!                               ──[n / Esc]──▶ closed
+//!                               ──[n / Esc]──▶ Picking
 //! Restoring { point }           ──job──▶ Submitted(Ok | Failed)
 //!                               ──any key──▶ (swallowed)
 //! Submitted(..)                 ──any key──▶ closed
@@ -45,14 +44,17 @@
 //! shift the row under the operator — confirm always restores the captured
 //! path.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use crate::tui::modal_form::{
-    self, Action, ActionKind, ChoiceRow, NoticeSpec, ProseRow, ValueKind,
+    self, Action, ActionKind, ChoiceRow, FormRows, NoticeSpec, ProseRow, ValueKind,
 };
+use crate::tui::theme::{self, CardRole, T};
 
 /// Settings-tab backup confirm + result modal. Opened by `b`; closed by
 /// dropping the `Option` (n / Esc on Confirm, any key on Submitted).
@@ -193,9 +195,12 @@ pub(crate) fn format_age(now: time::OffsetDateTime, ts: time::OffsetDateTime) ->
     }
 }
 
-/// Ecosystem modal width (Archetype C). 64 is the house figure every
-/// migrated overlay uses — interior 62, or 61 once the body scrolls.
-const MODAL_W: u16 = 64;
+/// Settings overlays compare paths and archive names, so they use the wider
+/// configuration-dialog measure while still clamping at the terminal floor.
+const MODAL_W: u16 = 82;
+const STANDARD_H: u16 = 17;
+const RESTORE_PICKER_H: u16 = 24;
+const RESTORE_CONFIRM_H: u16 = 20;
 
 /// Key legend for a terminal stage. Verbatim from `scope_modal`, which is
 /// Archetype C's reference implementation.
@@ -207,7 +212,7 @@ const KEYS_DONE: &str = "[any key] close";
 /// list, where a prose row would scroll out of the viewport the moment
 /// the operator walked past the eighth entry.
 const DOT_D_NOTE: &str =
-    "Master saved as .pre-restore-<ts>. Files under *.d/ not in the archive are DELETED.";
+    "Current master is saved as .pre-restore-<ts>. Files under *.d/ not in the archive are DELETED.";
 
 /// Archetype-C overlay for the restore flow's four stages
 /// (`Picking` → `Confirming` → `Restoring` → `Submitted`).
@@ -217,22 +222,238 @@ const DOT_D_NOTE: &str =
 /// nothing transient may cover either permanent surface.
 /// That anchor has to land in the same commit as the
 /// `ScrollBody` migration: on its own it would cut the budget and clip.
-pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &RestoreModal) {
-    modal_form::render_modal(f, anchor, MODAL_W, |w| {
-        (modal_form::notice_body(&restore_notice(modal), w), ())
-    });
+pub fn render_overlay(
+    f: &mut Frame,
+    anchor: Rect,
+    modal: &RestoreModal,
+    primary: bool,
+    report_scroll: usize,
+    report_max_scroll: &Cell<usize>,
+) {
+    let mut spec = restore_notice(modal);
+    focus_confirmation(&mut spec, primary);
+    match &modal.stage {
+        RestoreStage::Picking { entries, selected } => {
+            report_max_scroll.set(0);
+            render_fixed_height(f, anchor, RESTORE_PICKER_H, |w, _| {
+                restore_picker_body(&spec, entries, *selected, w)
+            });
+        }
+        RestoreStage::Confirming { point } => {
+            report_max_scroll.set(0);
+            render_fixed_height(f, anchor, RESTORE_CONFIRM_H, |w, _| {
+                restore_confirm_body(&spec, point, w)
+            });
+        }
+        RestoreStage::Restoring { .. } => {
+            report_max_scroll.set(0);
+            render_fixed_height(f, anchor, STANDARD_H, |w, _| {
+                modal_form::notice_body(&spec, w)
+            });
+        }
+        RestoreStage::Submitted(outcome) => {
+            let (message, ok) = match outcome {
+                SubmitOutcome::Ok(message) => (message.as_str(), true),
+                SubmitOutcome::Failed(message) => (message.as_str(), false),
+            };
+            render_fixed_height(f, anchor, STANDARD_H, |w, h| {
+                report_body(&spec, message, ok, report_scroll, report_max_scroll, w, h)
+            });
+        }
+    }
 }
 
-/// A body's **row count** must depend only
-/// on the spec, never on the width — `render_modal` builds twice, at
-/// `width - 2` and again at `width - 3` when the body scrolls, and a count
-/// that differed between the two passes would mis-size the frame. None of
-/// these stages takes a width at all, which makes that structurally
-/// impossible rather than merely true today.
+fn render_fixed_height(
+    f: &mut Frame,
+    anchor: Rect,
+    height: u16,
+    build: impl Fn(u16, u16) -> modal_form::ScrollBody,
+) {
+    let nominal_w = MODAL_W.min(anchor.width).saturating_sub(4);
+    let expected_inner_h = height.min(anchor.height).saturating_sub(2);
+    let body = build(nominal_w, expected_inner_h);
+    let surface =
+        modal_form::render_chrome_in(f, anchor, MODAL_W, height, "", T.text_primary, true);
+    let inner = modal_form::content_rect(surface);
+    let scrolls = body.scrollable
+        && modal_form::will_scroll(
+            inner.height as usize,
+            body.head.len(),
+            body.fields.len(),
+            body.tail.len(),
+        );
+    let target_w = if scrolls {
+        inner.width.saturating_sub(1)
+    } else {
+        inner.width
+    };
+    let body = if target_w == nominal_w {
+        body
+    } else {
+        build(target_w, inner.height)
+    };
+    modal_form::render_scroll_body(f, inner, &body);
+}
+
+fn report_body(
+    spec: &NoticeSpec,
+    message: &str,
+    ok: bool,
+    report_scroll: usize,
+    report_max_scroll: &Cell<usize>,
+    width: u16,
+    height: u16,
+) -> modal_form::ScrollBody {
+    let mut rows = FormRows::new(&spec.title, &spec.desc, width);
+    let lines = crate::tui::text::wrap(message, usize::from(width).max(1));
+
+    // Title, description, and action regions stay pinned while the report
+    // consumes the remaining rows.
+    const REPORT_HEAD_ROWS: usize = 3;
+    const REPORT_TAIL_ROWS: usize = 4;
+    let field_budget = usize::from(height)
+        .saturating_sub(REPORT_HEAD_ROWS + REPORT_TAIL_ROWS)
+        .max(1);
+    let max_scroll = lines.len().saturating_sub(field_budget);
+    report_max_scroll.set(max_scroll);
+    let offset = report_scroll.min(max_scroll);
+    let first = if lines.is_empty() { 0 } else { offset + 1 };
+    let last = (offset + field_budget).min(lines.len());
+    let status = format!(
+        "Lines {first}–{last} of {} · ↑/↓ scroll · PgUp/PgDn page · Home/End jump",
+        lines.len()
+    );
+    let tail = modal_form::form_tail(&rows, None, &status, "", &spec.actions);
+    let color = if ok {
+        ValueKind::Healthy.color()
+    } else {
+        ValueKind::Blocking.color()
+    };
+    for line in lines.iter().skip(offset).take(field_budget) {
+        rows.line(Line::from(Span::styled(
+            line.clone(),
+            theme::highlight_style().bg(T.bg_elevated).fg(color),
+        )));
+    }
+    let (mut body, _) = rows.finish(tail);
+    body.fields.resize_with(field_budget, Line::default);
+    body.scrollable = false;
+    body
+}
+
+fn archive_name(point: &RestorePoint) -> String {
+    point
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| point.path.display().to_string())
+}
+
+fn archive_columns(date: &str, size: &str, archive: &str, width: u16) -> String {
+    const DATE_W: usize = 18;
+    const SIZE_W: usize = 10;
+    let archive_w = usize::from(width).saturating_sub(DATE_W + SIZE_W + 2);
+    format!(
+        "{} {} {}",
+        crate::tui::text::pad(date, DATE_W),
+        crate::tui::text::pad(size, SIZE_W),
+        crate::tui::text::fit(archive, archive_w)
+    )
+}
+
+fn archive_table_line(
+    date: &str,
+    size: &str,
+    archive: &str,
+    width: u16,
+    selected: bool,
+) -> Line<'static> {
+    let text = crate::tui::text::pad(
+        &archive_columns(date, size, archive, width),
+        usize::from(width),
+    );
+    let style = if selected {
+        theme::highlight_style()
+    } else {
+        theme::highlight_style().bg(T.bg_elevated)
+    };
+    Line::styled(text, style)
+}
+
+fn restore_picker_body(
+    spec: &NoticeSpec,
+    entries: &[RestorePoint],
+    selected: usize,
+    width: u16,
+) -> modal_form::ScrollBody {
+    let mut rows = FormRows::new(&spec.title, &spec.desc, width);
+    for (index, point) in entries.iter().enumerate() {
+        rows.choice_field(
+            archive_table_line(
+                &point.date,
+                &point.size,
+                &archive_name(point),
+                width,
+                index == selected,
+            ),
+            index == selected,
+            &spec.hint,
+        );
+    }
+    let tail = modal_form::form_tail(&rows, None, &spec.hint, "", &spec.actions);
+    let (mut body, _) = rows.finish(tail);
+    body.head.push(Line::styled(
+        crate::tui::text::pad(
+            &archive_columns("DATE", "SIZE", "ARCHIVE", width),
+            usize::from(width),
+        ),
+        theme::table_heading_style(false),
+    ));
+    body
+}
+
+fn read_only_value(label: &str, value: &str, width: u16) -> Line<'static> {
+    const LABEL_W: usize = 14;
+    let lead = format!("{} ", crate::tui::text::pad(label, LABEL_W));
+    let value = crate::tui::text::fit(value, usize::from(width).saturating_sub(LABEL_W + 1));
+    Line::from(vec![
+        Span::styled(
+            lead,
+            theme::table_heading_style(false)
+                .bg(T.bg_elevated)
+                .remove_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(value, theme::highlight_style().bg(T.bg_elevated)),
+    ])
+}
+
+fn restore_confirm_body(
+    spec: &NoticeSpec,
+    point: &RestorePoint,
+    width: u16,
+) -> modal_form::ScrollBody {
+    let mut rows = FormRows::new(&spec.title, &spec.desc, width);
+    rows.section_with_role("Selected archive", CardRole::History);
+    rows.line(read_only_value("Archive", &archive_name(point), width));
+    rows.line(read_only_value("Created", &point.date, width));
+    rows.line(read_only_value("Size", &point.size, width));
+    rows.spacer();
+    rows.section_with_role("Restore scope", CardRole::History);
+    rows.line("Replaces the complete live configuration tree.");
+    let tail = modal_form::form_tail(&rows, None, &spec.hint, "", &spec.actions);
+    let (mut body, _) = rows.finish(tail);
+    body.fields.resize_with(11, Line::default);
+    body.scrollable = false;
+    body
+}
+
+/// The fixed-height renderer may rebuild one column narrower when a scrollbar
+/// is needed. These specs keep their row counts stable across both widths;
+/// the configuration-specific builders truncate values instead of wrapping.
 fn restore_notice(modal: &RestoreModal) -> NoticeSpec {
     match &modal.stage {
         RestoreStage::Picking { entries, selected } => picking_notice(entries, *selected),
-        RestoreStage::Confirming { point } => restore_confirm_notice(point),
+        RestoreStage::Confirming { .. } => restore_confirm_notice(),
         RestoreStage::Restoring { point } => restoring_notice(point),
         RestoreStage::Submitted(SubmitOutcome::Ok(msg)) => outcome_notice(
             "Restore \u{2014} done",
@@ -266,44 +487,38 @@ fn picking_notice(entries: &[RestorePoint], selected: usize) -> NoticeSpec {
         .collect();
 
     NoticeSpec {
-        title: "Restore config from backup".to_string(),
-        desc: "pick a restore point \u{2014} this replaces the live config".to_string(),
+        title: "Restore points".to_string(),
+        desc: "Select an archive · newest first".to_string(),
         prose: Vec::new(),
         choices,
         error: None,
         hint: DOT_D_NOTE.to_string(),
         hint_rows: None,
-        keys: "[\u{2191}/\u{2193} or j/k] choose".to_string(),
+        keys: String::new(),
         actions: vec![
-            Action::new("  [Esc] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [Enter] Restore  ", false, ActionKind::Destructive, ""),
+            Action::new("Cancel", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("Choose", false, ActionKind::Primary, "")
+                .on_key(crossterm::event::KeyCode::Enter),
         ],
     }
 }
 
-/// D7′: the input contract is unchanged — this stage still answers to a
-/// single `y` / `n`, and the action labels spell those keys rather than
-/// implying `Enter`.
-fn restore_confirm_notice(point: &RestorePoint) -> NoticeSpec {
+fn restore_confirm_notice() -> NoticeSpec {
     NoticeSpec {
         title: "Confirm restore".to_string(),
-        desc: "this replaces the live config and reloads the daemon".to_string(),
-        prose: vec![
-            ProseRow::emphasis(
-                format!("Restore from {} ({})?", point.date, point.size),
-                ValueKind::Blocking,
-            ),
-            ProseRow::plain(String::new()),
-            ProseRow::plain("Files under *.d/ not in the archive are DELETED."),
-        ],
+        desc: "Replace the live full configuration tree".to_string(),
+        prose: Vec::new(),
         choices: Vec::new(),
         error: None,
-        hint: "Your current master is saved as .pre-restore-<ts>.".to_string(),
+        hint: DOT_D_NOTE.to_string(),
         hint_rows: None,
         keys: String::new(),
         actions: vec![
-            Action::new("  [n / Esc] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Restore  ", false, ActionKind::Destructive, ""),
+            Action::new("Cancel", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("Restore", false, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
 }
@@ -369,7 +584,8 @@ fn outcome_notice(title: &str, ok_desc: &str, msg: &str, ok: bool) -> NoticeSpec
         hint: String::new(),
         hint_rows: None,
         keys: KEYS_DONE.to_string(),
-        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")],
+        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")
+            .on_key(crossterm::event::KeyCode::Esc)],
     }
 }
 
@@ -377,15 +593,43 @@ fn outcome_notice(title: &str, ok_desc: &str, msg: &str, ok: bool) -> NoticeSpec
 /// (`Confirm` → `Running` → `Submitted`). Same anchor contract as
 /// [`render_overlay`]; shares [`outcome_notice`] so both flows report
 /// their result in one shape.
-pub fn render_backup_overlay(f: &mut Frame, anchor: Rect, modal: &BackupModal) {
-    modal_form::render_modal(f, anchor, MODAL_W, |w| {
-        (modal_form::notice_body(&backup_notice(modal), w), ())
+pub fn render_backup_overlay(
+    f: &mut Frame,
+    anchor: Rect,
+    modal: &BackupModal,
+    primary: bool,
+    report_scroll: usize,
+    report_max_scroll: &Cell<usize>,
+) {
+    let mut spec = backup_notice(modal);
+    focus_confirmation(&mut spec, primary);
+    render_fixed_height(f, anchor, STANDARD_H, |w, h| match modal {
+        BackupModal::Confirm { dir } => {
+            report_max_scroll.set(0);
+            backup_confirm_body(&spec, dir, w)
+        }
+        BackupModal::Running { .. } => {
+            report_max_scroll.set(0);
+            modal_form::notice_body(&spec, w)
+        }
+        BackupModal::Submitted { msg, ok } => {
+            report_body(&spec, msg, *ok, report_scroll, report_max_scroll, w, h)
+        }
     });
+}
+
+fn focus_confirmation(spec: &mut NoticeSpec, primary: bool) {
+    if spec.choices.is_empty() && spec.actions.len() == 2 {
+        spec.actions[0].focused = !primary;
+        spec.actions[1].focused = primary;
+    } else if spec.actions.len() == 1 {
+        spec.actions[0].focused = true;
+    }
 }
 
 fn backup_notice(modal: &BackupModal) -> NoticeSpec {
     match modal {
-        BackupModal::Confirm { dir } => backup_confirm_notice(dir),
+        BackupModal::Confirm { .. } => backup_confirm_notice(),
         BackupModal::Running { dir } => backup_running_notice(dir),
         BackupModal::Submitted { msg, ok } => outcome_notice(
             if *ok {
@@ -400,30 +644,40 @@ fn backup_notice(modal: &BackupModal) -> NoticeSpec {
     }
 }
 
-/// The context line surfaces the resolved backup dir so the operator sees
-/// where the archive will land before pressing `y`.
-fn backup_confirm_notice(dir: &Path) -> NoticeSpec {
+fn backup_confirm_notice() -> NoticeSpec {
     NoticeSpec {
-        title: "Confirm backup".to_string(),
-        desc: "archives the whole config tree \u{2014} nothing is overwritten".to_string(),
-        prose: vec![
-            ProseRow::plain("Back up the config tree now?"),
-            ProseRow::plain(String::new()),
-            ProseRow::emphasis(
-                format!("Archive written to {}", dir.display()),
-                ValueKind::Identity,
-            ),
-        ],
+        title: "Create backup".to_string(),
+        desc: "Full config tree · compressed archive on disk".to_string(),
+        prose: Vec::new(),
         choices: Vec::new(),
         error: None,
-        hint: String::new(),
+        hint: "Writes a durable archive on disk; live config files are not changed.".to_string(),
         hint_rows: None,
         keys: String::new(),
         actions: vec![
-            Action::new("  [n / Esc] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Back up  ", false, ActionKind::Primary, ""),
+            Action::new("Cancel", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("Create", false, ActionKind::Primary, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
+}
+
+fn backup_confirm_body(spec: &NoticeSpec, dir: &Path, width: u16) -> modal_form::ScrollBody {
+    let mut rows = FormRows::new(&spec.title, &spec.desc, width);
+    rows.section_with_role("Archive", CardRole::History);
+    rows.line(read_only_value(
+        "Directory",
+        &dir.display().to_string(),
+        width,
+    ));
+    rows.spacer();
+    rows.line("Create an archive of the complete configuration tree?");
+    let tail = modal_form::form_tail(&rows, None, &spec.hint, "", &spec.actions);
+    let (mut body, _) = rows.finish(tail);
+    body.fields.resize_with(8, Line::default);
+    body.scrollable = false;
+    body
 }
 
 /// In-flight card (tui-14), the mirror of [`restoring_notice`].
@@ -480,22 +734,86 @@ mod tests {
         out
     }
 
-    fn restore_dump(stage: RestoreStage) -> String {
+    fn restore_buffer_at_scroll(
+        stage: RestoreStage,
+        width: u16,
+        height: u16,
+        scroll: usize,
+    ) -> (ratatui::buffer::Buffer, usize) {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let modal = RestoreModal { stage };
-        let mut term = Terminal::new(TestBackend::new(FLOOR_W, FLOOR_H)).unwrap();
-        term.draw(|f| render_overlay(f, f.area(), &modal)).unwrap();
-        dump_buffer(term.backend().buffer())
+        let max_scroll = Cell::new(0);
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| render_overlay(f, f.area(), &modal, false, scroll, &max_scroll))
+            .unwrap();
+        (term.backend().buffer().clone(), max_scroll.get())
+    }
+
+    fn restore_buffer_at(stage: RestoreStage, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        restore_buffer_at_scroll(stage, width, height, 0).0
+    }
+
+    fn restore_buffer(stage: RestoreStage) -> ratatui::buffer::Buffer {
+        restore_buffer_at(stage, FLOOR_W, FLOOR_H)
+    }
+
+    fn restore_dump(stage: RestoreStage) -> String {
+        dump_buffer(&restore_buffer(stage))
+    }
+
+    fn assert_selected(buffer: &ratatui::buffer::Buffer, needle: &str) {
+        let y = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .expect("selected archive stays visible");
+        assert!(
+            (0..buffer.area.width).any(|x| buffer[(x, y)].bg == crate::tui::theme::T.bg_highlight)
+        );
+    }
+
+    fn backup_buffer_at_scroll(
+        modal: BackupModal,
+        width: u16,
+        height: u16,
+        scroll: usize,
+    ) -> (ratatui::buffer::Buffer, usize) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let max_scroll = Cell::new(0);
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| render_backup_overlay(f, f.area(), &modal, false, scroll, &max_scroll))
+            .unwrap();
+        (term.backend().buffer().clone(), max_scroll.get())
+    }
+
+    fn backup_buffer_at(modal: BackupModal, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        backup_buffer_at_scroll(modal, width, height, 0).0
     }
 
     fn backup_dump(modal: BackupModal) -> String {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        let mut term = Terminal::new(TestBackend::new(FLOOR_W, FLOOR_H)).unwrap();
-        term.draw(|f| render_backup_overlay(f, f.area(), &modal))
-            .unwrap();
-        dump_buffer(term.backend().buffer())
+        dump_buffer(&backup_buffer_at(modal, FLOOR_W, FLOOR_H))
+    }
+
+    fn modal_rect(buffer: &ratatui::buffer::Buffer) -> Rect {
+        let (left, top) = (0..buffer.area.height)
+            .find_map(|y| {
+                (0..buffer.area.width)
+                    .find(|x| buffer[(*x, y)].symbol() == "┌")
+                    .map(|x| (x, y))
+            })
+            .expect("modal top-left border");
+        let right = (left..buffer.area.width)
+            .find(|x| buffer[(*x, top)].symbol() == "┐")
+            .expect("modal top-right border");
+        let bottom = (top..buffer.area.height)
+            .find(|y| buffer[(left, *y)].symbol() == "└")
+            .expect("modal bottom-left border");
+        Rect::new(left, top, right - left + 1, bottom - top + 1)
     }
 
     /// Distinct restore points. The date doubles as each entry's **unique
@@ -523,11 +841,6 @@ mod tests {
     }
 
     const BACKUP_DIR: &str = "/var/lib/purge-warden/backups";
-
-    /// The focus bar `modal_form` paints in front of the focused row.
-    /// Asserting on `FOCUS + label` is what makes a needle discriminating:
-    /// the bare label also appears on every unfocused row.
-    const FOCUS: &str = "\u{258c} ";
 
     #[test]
     fn age_buckets() {
@@ -560,6 +873,38 @@ mod tests {
 
     // ---- stage 1/7 — restore · Picking ---------------------------------
 
+    #[test]
+    fn roomy_settings_modals_use_reference_geometry() {
+        let picker = restore_buffer_at(
+            RestoreStage::Picking {
+                entries: mk_points(30),
+                selected: 15,
+            },
+            164,
+            46,
+        );
+        assert_eq!(modal_rect(&picker), Rect::new(41, 11, 82, 24));
+
+        let confirm = restore_buffer_at(RestoreStage::Confirming { point: a_point() }, 164, 46);
+        assert_eq!(modal_rect(&confirm), Rect::new(41, 13, 82, 20));
+
+        let backup = backup_buffer_at(
+            BackupModal::Confirm {
+                dir: PathBuf::from(BACKUP_DIR),
+            },
+            164,
+            46,
+        );
+        assert_eq!(modal_rect(&backup), Rect::new(41, 14, 82, 17));
+
+        let result = restore_buffer_at(
+            RestoreStage::Submitted(SubmitOutcome::Ok("restored".to_string())),
+            164,
+            46,
+        );
+        assert_eq!(modal_rect(&result), Rect::new(41, 14, 82, 17));
+    }
+
     /// The two things a clip silently takes away: the operator's own
     /// cursor and the action row. Asserted on the rendered buffer, never
     /// on the line vector — the vector was correct in every past instance
@@ -570,21 +915,36 @@ mod tests {
     /// state after a month, so the scrolling path is the normal one.
     #[test]
     fn floor_picker_keeps_the_selected_entry_and_the_action_row_together() {
+        assert_selected(
+            &restore_buffer(RestoreStage::Picking {
+                entries: mk_points(30),
+                selected: 15,
+            }),
+            "2026-06-10 00:15",
+        );
         let dump = restore_dump(RestoreStage::Picking {
             entries: mk_points(30),
             selected: 15,
         });
         assert!(
-            dump.contains(&format!("{FOCUS}2026-06-10 00:15")),
+            dump.contains("2026-06-10 00:15"),
             "the selected entry must be on screen wearing the focus bar:\n{dump}"
         );
         assert!(
-            dump.contains("[Enter] Restore"),
+            dump.contains("Choose"),
             "action row cut at the floor:\n{dump}"
         );
         assert!(
-            dump.contains("[Esc] Cancel"),
+            dump.contains("Cancel"),
             "the cancel action must survive too:\n{dump}"
+        );
+        assert!(
+            dump.contains("DATE") && dump.contains("SIZE") && dump.contains("ARCHIVE"),
+            "restore points must use the reference archive table:\n{dump}"
+        );
+        assert!(
+            dump.contains("15.tar.gz"),
+            "the selected row must expose the real archive filename:\n{dump}"
         );
     }
 
@@ -610,12 +970,19 @@ mod tests {
     /// would have.
     #[test]
     fn picker_note_survives_scrolling_to_the_last_entry() {
+        assert_selected(
+            &restore_buffer(RestoreStage::Picking {
+                entries: mk_points(30),
+                selected: 29,
+            }),
+            "2026-06-10 00:29",
+        );
         let dump = restore_dump(RestoreStage::Picking {
             entries: mk_points(30),
             selected: 29,
         });
         assert!(
-            dump.contains(&format!("{FOCUS}2026-06-10 00:29")),
+            dump.contains("2026-06-10 00:29"),
             "the last entry must be reachable:\n{dump}"
         );
         assert!(
@@ -630,8 +997,11 @@ mod tests {
     fn floor_restore_confirm_states_the_blast_radius_and_keeps_its_actions() {
         let dump = restore_dump(RestoreStage::Confirming { point: a_point() });
         assert!(
-            dump.contains("Restore from 2026-07-12 12:00 (1.0 KiB)?"),
-            "the confirm must name the point it would restore:\n{dump}"
+            dump.contains("SELECTED ARCHIVE")
+                && dump.contains("x.tar.gz")
+                && dump.contains("2026-07-12 12:00")
+                && dump.contains("1.0 KiB"),
+            "the confirm must identify the selected archive:\n{dump}"
         );
         assert!(
             dump.contains("*.d/") && dump.contains("DELETED"),
@@ -645,10 +1015,9 @@ mod tests {
             !dump.contains("current config is saved"),
             "the stale full-tree reassurance must be gone:\n{dump}"
         );
-        // D7': the input contract is still a single `y` / `n`.
         assert!(
-            dump.contains("[y] Restore") && dump.contains("[n / Esc] Cancel"),
-            "action row cut, or it stopped spelling the y/n contract:\n{dump}"
+            dump.contains("Restore") && dump.contains("Cancel"),
+            "confirmation actions missing:\n{dump}"
         );
     }
 
@@ -702,6 +1071,45 @@ mod tests {
         assert!(bad.contains("Close"), "action row cut:\n{bad}");
     }
 
+    #[test]
+    fn submitted_failure_report_keeps_every_line_reachable_with_close_pinned() {
+        let message = (0..24)
+            .map(|index| format!("failure line {index:02} sentinel"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (first, max_scroll) = restore_buffer_at_scroll(
+            RestoreStage::Submitted(SubmitOutcome::Failed(message.clone())),
+            80,
+            24,
+            0,
+        );
+        let first = dump_buffer(&first);
+        assert!(max_scroll > 0, "long failure must expose a scroll range");
+        assert!(first.contains("failure line 00 sentinel"));
+        assert!(!first.contains("failure line 23 sentinel"));
+        assert!(
+            first.contains("Close"),
+            "close action must stay pinned:\n{first}"
+        );
+
+        let (last, observed_max) = restore_buffer_at_scroll(
+            RestoreStage::Submitted(SubmitOutcome::Failed(message)),
+            80,
+            24,
+            max_scroll,
+        );
+        let last = dump_buffer(&last);
+        assert_eq!(observed_max, max_scroll);
+        assert!(
+            last.contains("failure line 23 sentinel"),
+            "last failure line must be reachable:\n{last}"
+        );
+        assert!(
+            last.contains("Close"),
+            "close action must stay pinned:\n{last}"
+        );
+    }
+
     /// The outcome still switches colour on `ok`; it is now the ecosystem
     /// pair (`ValueKind::Healthy` prose vs the `error` slot) rather than
     /// the bespoke `T.success` / `T.error`, matching
@@ -734,7 +1142,7 @@ mod tests {
             dir: PathBuf::from(BACKUP_DIR),
         });
         assert!(
-            dump.contains("Back up the config tree now?"),
+            dump.contains("Create an archive of the complete configuration tree?"),
             "confirm card must surface the prompt:\n{dump}"
         );
         assert!(
@@ -742,8 +1150,12 @@ mod tests {
             "confirm card must surface the resolved backup dir:\n{dump}"
         );
         assert!(
-            dump.contains("[y] Back up") && dump.contains("[n / Esc] Cancel"),
-            "action row cut, or it stopped spelling the y/n contract:\n{dump}"
+            dump.contains("ARCHIVE") && dump.contains("Directory"),
+            "confirm card must use the archive section:\n{dump}"
+        );
+        assert!(
+            dump.contains("Create") && dump.contains("Cancel"),
+            "confirmation actions missing:\n{dump}"
         );
     }
 
@@ -798,6 +1210,42 @@ mod tests {
             "the failure message must be on screen:\n{bad}"
         );
         assert!(bad.contains("Close"), "action row cut:\n{bad}");
+    }
+
+    #[test]
+    fn submitted_success_report_preserves_multiline_output() {
+        let message = (0..18)
+            .map(|index| format!("success line {index:02} sentinel"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, max_scroll) = backup_buffer_at_scroll(
+            BackupModal::Submitted {
+                msg: message.clone(),
+                ok: true,
+            },
+            80,
+            24,
+            0,
+        );
+        assert!(max_scroll > 0, "long success must expose a scroll range");
+        let (last, _) = backup_buffer_at_scroll(
+            BackupModal::Submitted {
+                msg: message,
+                ok: true,
+            },
+            80,
+            24,
+            max_scroll,
+        );
+        let last = dump_buffer(&last);
+        assert!(
+            last.contains("success line 17 sentinel"),
+            "last success line must be reachable:\n{last}"
+        );
+        assert!(
+            last.contains("Close"),
+            "close action must stay pinned:\n{last}"
+        );
     }
 
     // ---- No red borders anywhere in this file ---------------------------
@@ -859,8 +1307,9 @@ mod tests {
         }
     }
 
-    /// The chrome now comes from `modal_form::render_modal`, which owns
-    /// the border, its colour and the elevated surface. No red
+    /// The chrome comes from `modal_form::render_chrome_in` and
+    /// `modal_form::render_scroll_body`, which own the border, its colour,
+    /// scrolling, and the elevated surface. No red
     /// border, no wrapping body, and "zero hand-rolled colour"
     /// as a test rather than a claim in a commit message.
     ///
@@ -886,13 +1335,6 @@ mod tests {
 
     // ---- The permanent orientation surfaces ------------------------------
     //
-    // At the 80×24 floor `ui::layout_chunks` splits the frame into
-    // header 4 (rows 0..=3) · menu card 3 (rows 4..=6, Settings is a
-    // singleton section) · content 16 (rows 7..=22) · footer 1 (row 23).
-    // Everything outside 7..=22 is a permanent affordance that nothing
-    // transient may repaint.
-    const CONTENT_ROWS: std::ops::RangeInclusive<usize> = 7..=22;
-
     fn full_frame_dump(app: &mut App, w: u16, h: u16) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -902,15 +1344,20 @@ mod tests {
     }
 
     /// The observable form of the anchor rule: opening the overlay must
-    /// change the content region and **nothing else**. Comparing the two
+    /// change the content region while preserving the header and the shared
+    /// contextual footer. Comparing the two
     /// frames row-by-row rather than grepping for a legend needle is
     /// deliberate — a needle that also occurs inside the modal gives a
     /// false green.
-    fn assert_only_the_content_region_changed(before: &str, after: &str, what: &str) {
+    fn assert_only_the_content_region_changed(before: &str, after: &str, what: &str, app: &App) {
         let (b, a): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
         assert_eq!(b.len(), a.len(), "frame height changed");
+        let content = crate::tui::ui::content_area_for_test(
+            ratatui::layout::Rect::new(0, 0, crate::tui::text::width(b[0]) as u16, b.len() as u16),
+            &settings_app(),
+        );
         for (y, (bl, al)) in b.iter().zip(a.iter()).enumerate() {
-            if !CONTENT_ROWS.contains(&y) {
+            if y + 1 < b.len() && !(content.y as usize..content.bottom() as usize).contains(&y) {
                 assert_eq!(
                     bl, al,
                     "{what} repainted row {y}, which is header / menu card / footer \
@@ -920,6 +1367,22 @@ mod tests {
                 );
             }
         }
+        // The footer changes grammar with the overlay, but remains entirely
+        // owned by the shared footer renderer and retains the version.
+        let mut footer = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            crate::tui::text::width(b[0]) as u16,
+            1,
+        ))
+        .unwrap();
+        footer
+            .draw(|f| crate::tui::ui::render_footer_for_test(f, f.area(), app))
+            .unwrap();
+        let expected = dump_buffer(footer.backend().buffer());
+        assert_eq!(a.last().unwrap(), &expected.lines().next().unwrap());
+        assert!(a
+            .last()
+            .unwrap()
+            .contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         // Control arm: if the overlay did not draw at all the loop above
         // passes vacuously. Prove the frames really do differ somewhere.
         assert_ne!(
@@ -946,7 +1409,7 @@ mod tests {
             },
         });
         let after = full_frame_dump(&mut app, 80, 24);
-        assert_only_the_content_region_changed(&before, &after, "the restore picker");
+        assert_only_the_content_region_changed(&before, &after, "the restore picker", &app);
     }
 
     #[test]
@@ -957,6 +1420,6 @@ mod tests {
             dir: PathBuf::from(BACKUP_DIR),
         });
         let after = full_frame_dump(&mut app, 80, 24);
-        assert_only_the_content_region_changed(&before, &after, "the backup confirm");
+        assert_only_the_content_region_changed(&before, &after, "the backup confirm", &app);
     }
 }

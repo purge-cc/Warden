@@ -134,8 +134,7 @@ pub fn prefill_from_active_leaf(app: &App) -> Option<(String, &'static str)> {
             }
         }
         Leaf::Devices => {
-            let view = app.device_view.as_ref()?;
-            let rows = crate::tui::tabs::devices::build_rows(view, app.devices.group_by);
+            let rows = crate::tui::tabs::devices::build_display_rows(app);
             let idx =
                 crate::tui::tabs::devices::current_selection(&app.devices.table_state, &rows)?;
             match rows.get(idx)? {
@@ -184,7 +183,7 @@ const QUERY_LABEL: &str = "Source IP   ";
 
 /// Where the caret sits when the buffer is empty: `prose_row`'s 2-cell
 /// indent plus the label. ASCII, so bytes and columns agree.
-const QUERY_COL: usize = 2 + QUERY_LABEL.len();
+const QUERY_COL: usize = QUERY_LABEL.len();
 
 /// Nav-key legend — the same three keys the pre-migration footer
 /// advertised, in the same order. The migration to `modal_form` changes
@@ -216,6 +215,13 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ResolverModal) {
     let spec = notice(modal);
     let render =
         modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+    // The query row is the sole editable resolver target. `notice_body`
+    // intentionally treats this read-only result surface as prose, so
+    // register its exact first field row explicitly for pointer focus.
+    crate::tui::mouse::register_overlay_action(
+        Rect::new(render.inner.x, render.inner.y + 2, render.inner.width, 1),
+        crate::tui::mouse::MouseAction::OverlayField(0),
+    );
 
     // The query row is field-region row 0 and nothing else can take
     // focus, so the caret target is unconditional; `place_cursor` no-ops
@@ -243,8 +249,10 @@ fn notice(modal: &ResolverModal) -> NoticeSpec {
         // remove-confirm labels its `[y]` / `[n]`. `Resolve` is the one
         // filled action; `Close` is colour-only.
         actions: vec![
-            Action::new("  [Esc] Close  ", false, ActionKind::Neutral, ""),
-            Action::new("  [Enter] Resolve  ", false, ActionKind::Primary, ""),
+            Action::new("  [Esc] Close  ", false, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  [Enter] Resolve  ", false, ActionKind::Primary, "")
+                .on_key(crossterm::event::KeyCode::Enter),
         ],
     }
 }
@@ -811,9 +819,12 @@ mod tests {
             "the live query row is off screen at the 80x24 floor:\n{dump}"
         );
         assert!(
-            dump.contains("[Enter] Resolve"),
-            "the action row is off screen at the 80x24 floor — nothing tells the \
-             operator how to commit:\n{dump}"
+            dump.contains("Resolve"),
+            "the action row is off screen:\n{dump}"
+        );
+        assert!(
+            dump.contains("Enter resolve"),
+            "the resolve key legend is off screen:\n{dump}"
         );
     }
 

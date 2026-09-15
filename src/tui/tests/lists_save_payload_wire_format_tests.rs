@@ -85,7 +85,7 @@ fn save_pipeline_lands_an_edit_on_a_minimal_config() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -103,7 +103,6 @@ max_entries = 5000000
 enabled = true
 base = "deny"
 trust = "remote-unsigned"
-tags = ["uncategorized"]
 "#,
     )
     .unwrap();

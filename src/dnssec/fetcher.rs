@@ -121,6 +121,7 @@ mod tests {
             Ok(UpstreamResponse {
                 records: self.records.clone(),
                 response_code: self.response_code,
+                generation: None,
                 soa_minimum_ttl: None,
                 authority: self.authority.clone(),
             })

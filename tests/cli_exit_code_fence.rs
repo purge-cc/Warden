@@ -114,9 +114,8 @@ const EXCLUDED: &[(&str, &str)] = &[
 ///
 /// Every entry below was checked by hand against the broken-config state:
 ///
-/// - the three `remove` verbs, `security tunneling unexempt` and
-///   `cluster leave` report "not found / not a member / not exempt —
-///   nothing to do". Idempotent removal is a deliberate contract, and a
+/// - the three `remove` verbs and `security tunneling unexempt` report
+///   "not found / not exempt — nothing to do". Idempotent removal is a deliberate contract, and a
 ///   no-op is a success. (`security tunneling exempt` is NOT here: adding
 ///   proceeds to `write_value_validated`, which refuses on a broken
 ///   config, so it exits non-zero as it should.)
@@ -145,7 +144,6 @@ const EXCLUDED: &[(&str, &str)] = &[
 ///   than changed — the leniency is explicit and predates this sprint.
 const KNOWN_ZERO: &[&str] = &[
     "audit tail",
-    "cluster leave",
     "config backup",
     "config render-default",
     "firewall-rules",
@@ -200,6 +198,9 @@ fn placeholder_for(value_name: &str) -> &'static str {
     if has("BOOL") {
         return "true";
     }
+    if has("ROLE") {
+        return "primary";
+    }
     if has("URL") {
         return "https://example.invalid/list.txt";
     }
@@ -225,6 +226,7 @@ fn placeholder_for(value_name: &str) -> &'static str {
 /// verbs, the walker retries with optional positionals filled in.
 fn level_args(cmd: &clap::Command, include_optional_positionals: bool) -> Vec<String> {
     let mut args = vec![cmd.get_name().to_string()];
+    let mut emitted = BTreeSet::new();
     for arg in cmd.get_arguments() {
         let positional = arg.is_positional();
         let wanted = arg.is_required_set() || (include_optional_positionals && positional);
@@ -244,6 +246,45 @@ fn level_args(cmd: &clap::Command, include_optional_positionals: bool) -> Vec<St
         ) {
             args.push(placeholder_for(&value_name).to_string());
         }
+        emitted.insert(arg.get_id().to_string());
+    }
+
+    // Required clap groups do not mark any one member as required. Pick one
+    // representative so the parse oracle reaches the command handler.
+    for group in cmd.get_groups().filter(|group| group.is_required_set()) {
+        if group.get_args().any(|id| emitted.contains(id.as_str())) {
+            continue;
+        }
+        let Some(id) = group.get_args().next() else {
+            continue;
+        };
+        let Some(arg) = cmd.get_arguments().find(|arg| arg.get_id() == id) else {
+            continue;
+        };
+        if let Some(long) = arg.get_long() {
+            args.push(format!("--{long}"));
+        }
+        if !matches!(
+            arg.get_action(),
+            clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+        ) {
+            let value_name = arg
+                .get_value_names()
+                .and_then(|names| names.first().map(|name| name.to_string()))
+                .unwrap_or_else(|| arg.get_id().to_string());
+            args.push(placeholder_for(&value_name).to_string());
+        }
+        emitted.insert(id.to_string());
+    }
+
+    // A pair of conditionally-required direction flags is not represented as
+    // an ArgGroup. Selecting one keeps the generic tree walk exhaustive.
+    if cmd.get_arguments().any(|arg| arg.get_id() == "allow")
+        && cmd.get_arguments().any(|arg| arg.get_id() == "deny")
+        && !emitted.contains("allow")
+        && !emitted.contains("deny")
+    {
+        args.push("--allow".to_string());
     }
     args
 }
@@ -493,7 +534,7 @@ fn write_valid_config(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("valid.toml");
     std::fs::write(
         &path,
-        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+        "schema_version = 5\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
          default_profile = \"default\"\n\n[socket]\npath = \"/nonexistent/fence.sock\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -621,7 +662,7 @@ fn status_json_down_is_json() {
     let config = dir.path().join("valid.toml");
     std::fs::write(
         &config,
-        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
+        "schema_version = 5\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\
          default_profile = \"default\"\n\n[socket]\npath = \"/nonexistent/fence.sock\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
@@ -675,7 +716,7 @@ fn a_negative_answer_is_not_a_failure() {
     let config = dir.path().join("refuse.toml");
     std::fs::write(
         &config,
-        "schema_version = 4\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\n\
+        "schema_version = 5\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\n\
          [profiles.default]\ndisplay_name = \"Default\"\ntags = [\"uncategorized\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();

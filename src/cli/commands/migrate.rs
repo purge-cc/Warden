@@ -66,6 +66,7 @@ use crate::config::settings::{ClientConfig, ScheduleConfig};
 use crate::config::write_lock::{self, ConfigWriteLock};
 
 pub mod v3_to_v4;
+pub mod v4_to_v5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V3ToV4Mode {

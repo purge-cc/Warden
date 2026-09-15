@@ -59,25 +59,12 @@
 //!   because overflow is cut with no affordance saying so.
 //!
 //!
-//! ## Colour rule (frozen — do not re-derive per surface)
+//! ## Color roles
 //!
-//! Chrome stays neutral grey. `warden_teal` marks static info: section
-//! headers, read-only values, the description. `emerald_ping` marks the
-//! single live focus and nothing else. Category colour
-//! (`scope_privacy` / `scope_security` / `scope_content`) appears **only**
-//! on tag chips — on data, never on chrome. `brand_red` is the title-band
-//! tick and destructive copy, and **never a border**. Exactly one
-//! filled action per modal: the [`ActionKind::Primary`] one, `warden_teal`
-//! fill with a `text_inverse` label.
-//!
-//! On the focus bar (`bg_highlight`) every semantic hue drops to
-//! `text_primary`: `bg_highlight` is the lightest surface the theme paints
-//! and it sinks every hue below WCAG's 3:1 large-text floor. The meaning
-//! returns the moment focus leaves. See
-//! `theme::tests::focus_bar_admits_only_high_contrast_foregrounds`.
-//!
-//! New colour pairs are measured against **`bg_elevated` #262626**,
-//! not against a nominal dark background — the modal never paints one.
+//! Modal titles reuse the red navigation bands. Section rules use their
+//! semantic card colors. Editable values have a neutral resting surface and
+//! a blue focus surface with inverse text. Buttons use compact neutral fills;
+//! the focused button uses its action color. Labels stay outside the focus fill.
 //!
 //! ## Input contract
 //!
@@ -112,6 +99,9 @@
 //! `dead_code` — clippy builds the lib target separately, without
 //! `cfg(test)`, and that is the target that fails.
 
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -119,22 +109,18 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::overlay::centered_rect;
-use crate::tui::theme::T;
+use crate::tui::theme::{self, T};
 
 /// Fixed width (chars) of the left "Field" label column in the grid.
 pub const GRID_LABEL_W: usize = 18;
 
-/// Clear a `w`×`h` rect centred on `anchor`, draw the rounded modal frame
+/// Clear a `w`×`h` rect centred on `anchor`, draw the square modal frame
 /// on the elevated surface, and return the inner rect for the body.
 ///
-/// This is the only chrome entry point: the full-frame variant it used to
-/// extend is retired — the tab content rect is always
-/// the anchor, never `f.area()`.
-///
-/// `anchor` is the rect to centre within. Pass a sub-rect when the modal
-/// must deliberately not cover the whole frame — the Devices client form
-/// anchors over the list column so the detail card on the right stays
-/// readable while the operator fills the form in.
+/// `anchor` bounds the modal and supplies its horizontal center. Vertically
+/// the modal centers on the terminal, clamped inside the content anchor so
+/// narrow terminals retain navigation and footer access. Devices supplies the
+/// list column as its anchor to keep the detail card visible.
 ///
 /// `title_in_band` suppresses the border title: the caller renders
 /// [`title_band`] as the first body line instead.
@@ -147,11 +133,14 @@ pub fn render_chrome_in(
     accent: Color,
     title_in_band: bool,
 ) -> Rect {
-    let area = centered_rect(anchor, w, h);
+    crate::tui::mouse::begin_overlay();
+    let mut area = centered_rect(anchor, w, h);
+    let centered_y = f.area().y + f.area().height.saturating_sub(area.height) / 2;
+    area.y = centered_y.clamp(anchor.y, anchor.bottom().saturating_sub(area.height));
     f.render_widget(Clear, area);
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(accent))
         // Raised surface so the modal reads as floating above the tab.
         .style(Style::default().bg(T.bg_elevated));
@@ -164,6 +153,67 @@ pub fn render_chrome_in(
     let inner = block.inner(area);
     f.render_widget(block, area);
     inner
+}
+
+/// Content shares one cell of horizontal breathing room inside the frame.
+pub fn content_rect(surface: Rect) -> Rect {
+    Rect::new(
+        surface.x.saturating_add(surface.width.min(1)),
+        surface.y,
+        surface.width.saturating_sub(2),
+        surface.height,
+    )
+}
+
+/// Paint full surface heading bands and return the padded body below them.
+pub fn render_header(f: &mut Frame, surface: Rect, title: &str, description: &str) -> Rect {
+    let inner = content_rect(surface);
+    for (row, (text, subtitle)) in [(title, false), (description, true)]
+        .into_iter()
+        .enumerate()
+    {
+        if row >= surface.height as usize {
+            break;
+        }
+        let band = Rect::new(surface.x, surface.y + row as u16, surface.width, 1);
+        let text_area = Rect::new(inner.x, band.y, inner.width, 1);
+        f.render_widget(
+            Block::default().style(T.modal_heading_style(subtitle)),
+            band,
+        );
+        f.render_widget(
+            Paragraph::new(heading_line(text, inner.width, subtitle)),
+            text_area,
+        );
+    }
+    Rect::new(
+        inner.x,
+        inner.y.saturating_add(3.min(inner.height)),
+        inner.width,
+        inner.height.saturating_sub(3),
+    )
+}
+
+/// Reserve an actionable Close control beneath a read-only modal body.
+pub fn close_footer(f: &mut Frame, content: Rect) -> Rect {
+    if content.is_empty() {
+        return content;
+    }
+    let actions = [Action::new("Close", true, ActionKind::Neutral, "").on_key(KeyCode::Esc)];
+    let footer = Rect::new(content.x, content.bottom() - 1, content.width, 1);
+    f.render_widget(Paragraph::new(action_row(&actions, content.width)), footer);
+    for hit in action_hits(&actions, content.width) {
+        crate::tui::mouse::register_overlay(
+            Rect::new(footer.x + hit.x, footer.y, hit.width, 1),
+            hit.key,
+        );
+    }
+    Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(2),
+    )
 }
 
 /// Render a body whose rows are already laid out to exactly fill the
@@ -202,6 +252,9 @@ pub fn render_body_fixed(f: &mut Frame, inner: Rect, lines: Vec<Line<'static>>) 
 /// editing, and how do I commit or escape — are pinned, and only the field
 /// region scrolls.
 pub struct ScrollBody {
+    /// Explicit keyboard actions and the exact button cells that activate them.
+    pub action_hits: Vec<ActionHit>,
+    pub field_hits: Vec<FieldHit>,
     /// Pinned to the top: title band, description, spacer.
     pub head: Vec<Line<'static>>,
     /// The scrolling region: one entry per field row.
@@ -326,8 +379,46 @@ pub fn render_scroll_body(f: &mut Frame, inner: Rect, body: &ScrollBody) -> Scro
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(avail);
     lines.extend(body.head.iter().take(head_h).cloned());
     lines.extend(body.fields.iter().skip(offset).take(view_h).cloned());
+    let gap = avail.saturating_sub(head_h + view_h + tail_h);
+    lines.extend(std::iter::repeat_with(Line::default).take(gap));
     lines.extend(body.tail.iter().skip(tail_skip).cloned());
+    for (row, line) in lines.iter().enumerate() {
+        if line.style.bg == T.modal_heading_style(false).bg
+            || line.style.bg == T.modal_heading_style(true).bg
+        {
+            let band = Rect::new(
+                inner.x.saturating_sub(1),
+                inner.y + row as u16,
+                inner.width.saturating_add(2),
+                1,
+            )
+            .intersection(f.area());
+            f.render_widget(Block::default().style(line.style), band);
+        }
+    }
     render_body_fixed(f, inner, lines);
+
+    for hit in &body.field_hits {
+        if hit.row >= offset && hit.row < offset + view_h {
+            let area = Rect::new(
+                inner.x.saturating_add(hit.x),
+                inner.y + (head_h + hit.row - offset) as u16,
+                hit.width,
+                1,
+            )
+            .intersection(inner);
+            crate::tui::mouse::register_overlay_action(area, hit.action);
+        }
+    }
+
+    if tail_h > 0 {
+        let y = inner.y + (avail - 1) as u16;
+        for hit in &body.action_hits {
+            let area =
+                Rect::new(inner.x.saturating_add(hit.x), y, hit.width, 1).intersection(inner);
+            crate::tui::mouse::register_overlay(area, hit.key);
+        }
+    }
 
     if scrolled {
         render_scrollbar(f, inner, head_h as u16, view_h, offset, total);
@@ -386,24 +477,68 @@ fn render_scrollbar(
     }
 }
 
-/// Truncate to `max` *characters*, appending `…` when it had to cut.
-///
-/// Characters, not display cells: a wide grapheme (CJK, emoji) counts once
-/// here but occupies two cells, so such a string can still overflow. That
-/// matches the rest of this module (`grid_row`, `button_row` measure the
-/// same way); moving to display width means moving all of them together.
+/// Fit complete graphemes into a display-cell budget, marking omitted text.
 pub fn fit(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    // `max == 0` leaves no room even for the ellipsis — returning "…" there
-    // would overflow the caller's budget rather than fit it.
-    if max == 0 {
-        return String::new();
-    }
-    let mut s: String = text.chars().take(max - 1).collect();
-    s.push('\u{2026}');
-    s
+    crate::tui::text::fit(text, max)
+}
+
+#[derive(Clone, Copy)]
+pub enum TextTone {
+    Primary,
+    Secondary,
+    Muted,
+    Success,
+    Warning,
+    Error,
+}
+
+pub fn text_style(tone: TextTone) -> Style {
+    Style::default().fg(match tone {
+        TextTone::Primary => T.text_primary,
+        TextTone::Secondary => T.text_secondary,
+        TextTone::Muted => T.text_muted,
+        TextTone::Success => T.success,
+        TextTone::Warning => T.warning,
+        TextTone::Error => T.error,
+    })
+}
+
+fn padded_line(text: &str, width: u16, style: Style) -> Line<'static> {
+    let shown = fit(text, width as usize);
+    let padding = (width as usize).saturating_sub(crate::tui::text::width(&shown));
+    Line::styled(format!("{shown}{}", " ".repeat(padding)), style)
+}
+
+pub fn heading_band(text: &str, width: u16, subtitle: bool) -> Line<'static> {
+    padded_line(&format!(" {text}"), width, T.modal_heading_style(subtitle))
+}
+
+pub fn filled_section_band(label: &str, width: u16, role: theme::CardRole) -> Line<'static> {
+    padded_line(
+        label,
+        width,
+        Style::default()
+            .bg(T.card_title_bg(role))
+            .fg(T.text_inverse)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+pub fn list_choice_row(label: &str, width: u16, focused: bool, selected: bool) -> Line<'static> {
+    let style = if focused {
+        Style::default()
+            .bg(T.warden_teal)
+            .fg(T.text_inverse)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .bg(T.bg_highlight)
+            .fg(T.warden_teal)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(T.bg_surface).fg(T.text_secondary)
+    };
+    padded_line(label, width, style)
 }
 
 /// [`fit`]'s mirror: keep the **tail**, mark the cut on the left.
@@ -417,183 +552,29 @@ pub fn fit(text: &str, max: usize) -> String {
 /// The ellipsis leads for the same reason it trails in [`fit`] — it marks
 /// which side was cut, and here that side is the left.
 fn fit_tail(text: &str, max: usize) -> String {
-    let n = text.chars().count();
-    if n <= max {
-        return text.to_string();
-    }
-    // Same guard as `fit`: at `max == 0` even the ellipsis would overflow
-    // the caller's budget rather than fit inside it.
-    if max == 0 {
-        return String::new();
-    }
-    let mut s = String::from('\u{2026}');
-    s.extend(text.chars().skip(n - (max - 1)));
-    s
+    crate::tui::text::fit_tail(text, max)
 }
 
-/// Full-width title row: red `▌` tick, bold title, padded to `width` on
-/// `bg_highlight`. `width` is the inner rect's width, NOT the modal's
-/// outer width. No right-hand badge — the id lives in the body.
-///
-/// The row is composed so it can never exceed `width`, however small:
-/// the tick claims one cell and the title is fitted into what remains.
+/// Full-width paired heading bands shared with the main navigation.
+/// The form retains a single blank row after its subtitle.
 pub fn title_band(title: &str, width: u16) -> Line<'static> {
-    let w = width as usize;
-    if w == 0 {
-        return Line::from(String::new());
-    }
-    let rest = w - 1; // the tick claims the first cell
-    let body = fit(&format!(" {title}"), rest);
-    let pad = rest - body.chars().count();
-    Line::from(vec![
-        Span::styled(
-            "\u{258c}",
-            Style::default().fg(T.brand_red).bg(T.bg_highlight),
-        ),
-        Span::styled(
-            body,
-            Style::default()
-                .fg(T.text_primary)
-                .bg(T.bg_highlight)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ".repeat(pad), Style::default().bg(T.bg_highlight)),
-    ])
+    heading_line(&title.to_uppercase(), width, false)
 }
 
-/// Full-width description row under the title: 2-cell indent, italic
-/// `warden_teal` on the modal surface, padded to `width`. Single line —
-/// long text is truncated, never wrapped, so the modal's row count stays
-/// deterministic. Like [`title_band`], it can never exceed `width`.
-///
-/// Teal, not grey: the description is *static info*, which the ecosystem
-/// colour rule paints teal. This is the Lists pilot's `edit_desc_band`
-/// promoted; the grey-on-`bg_surface` variant it replaced was never
-/// measured against `bg_elevated`, whereas teal was.
-///
-/// ## No background here — and the reason is narrower than it used to be
-///
-/// This doc used to refuse a background outright: *"the title band directly
-/// above already carries a `bg_highlight` strip — a second band under it
-/// reads as two selections stacked"*. **That argument stands, and it is
-/// still why this function paints none.** What it does not cover is the
-/// case [`desc_band2`] answers, so the two are not in conflict:
-///
-/// - a **second, different** strip (the rejected `bg_surface` variant)
-///   under the title does read as two stacked selections — refused, then
-///   and now;
-/// - **a strip of its own, in a different tone**, is a heading with two
-///   registers rather than two selections. The description then reads as
-///   part of the heading rather than as the first line of the body, which
-///   is what the operator asked for after living with per-section blurbs.
-///
-/// So this single-line, surface-coloured variant **stays**, and stays the
-/// default: [`notice_body`] builds every Archetype-C head from it, where
-/// there is no form body for a description to be mistaken for. Only the
-/// three Archetype-F surfaces that carry a two-row description moved to
-/// [`desc_band2`].
-///
-/// Note what the two-row variant did **not** do: it does not reuse
-/// [`title_band`]'s `bg_highlight`. That was tried first and measured out —
-/// teal on it is 3.37:1 against the 4.5:1 bar prose is held to, and no
-/// contrast gate covers the pair. It uses `bg_main` at 5.12:1 instead. The
-/// full reasoning, and the warning against re-aligning it, is on
-/// [`desc_band2`].
+fn heading_line(text: &str, width: u16, subtitle: bool) -> Line<'static> {
+    let body = fit(text, width as usize);
+    let pad = (width as usize).saturating_sub(crate::tui::text::width(&body));
+    Line::from(format!("{body}{}", " ".repeat(pad))).style(T.modal_heading_style(subtitle))
+}
+
+/// A coordinated darker subtitle band; long copy is fitted to the viewport.
 pub fn desc_band(text: &str, width: u16) -> Line<'static> {
-    let w = width as usize;
-    let body = fit(&format!("  {text}"), w);
-    let pad = w - body.chars().count();
-    Line::from(vec![
-        Span::styled(
-            body,
-            Style::default()
-                .fg(T.warden_teal)
-                .add_modifier(Modifier::ITALIC),
-        ),
-        Span::styled(" ".repeat(pad), Style::default()),
-    ])
+    heading_line(text, width, true)
 }
 
-/// Two-row variant of [`desc_band`], laid on a full-width `bg_main` strip
-/// directly under [`title_band`] so the description reads as part of the
-/// heading rather than as the first line of the form.
-///
-/// Same 2-cell indent, same italic `warden_teal`, same `fit` truncation per
-/// row. The row count is **always 2**, from the type: the copy is authored
-/// as two lines, so no width ever changes how tall this is — the invariant
-/// `choice_rows_row_count_never_varies_with_width` applies to every band in
-/// this module, not only to choices. A caller with one sentence passes an
-/// empty second line and pays the row anyway; a caller with three wants a
-/// prose row, not a band.
-///
-/// Both rows pad out to `width` **with the background on the padding**. A
-/// `Span`'s background paints only its own characters, so styling just the
-/// text span would band the row as wide as the sentence and leave a ragged
-/// right edge — the same defect [`band_line`] exists to avoid, and the
-/// reason the twin tests compare a whole column run rather than sampling a
-/// cell under the text.
-///
-/// ## Why `bg_main` and NOT `bg_highlight` — do not "fix" this
-///
-/// The obvious edit here is to reuse [`title_band`]'s `bg_highlight`, so
-/// the heading is one unbroken strip. It was written that way first, and
-/// it was **measured and rejected**:
-///
-/// | pair | ratio | verdict |
-/// |---|---|---|
-/// | `warden_teal` on `bg_highlight` | **3.37:1** | clears WCAG AA's 3:1 large/bold provision, fails the **4.5:1 prose bar** |
-/// | `warden_teal` on `bg_main` | **5.12:1** | clears both |
-///
-/// These two rows are **prose** — full sentences the operator reads, not a
-/// glanceable state word — so 4.5:1 is the applicable bar, and 3.37 misses
-/// it. `bg_main` keeps the teal, and therefore keeps the separation from
-/// the title that was the whole point of the request, while clearing the
-/// bar by 0.62.
-///
-/// **The part that makes this worth writing down: no gate would have
-/// stopped the `bg_highlight` version.**
-/// `theme::contrast_gate_holds_for_every_text_pair` enumerates the
-/// backgrounds `bg_main` / `bg_surface` / `bg_elevated` and deliberately
-/// **not** `bg_highlight` (the focus bar is asserted separately, under a
-/// stricter rule); `theme::focus_bar_admits_only_high_contrast_foregrounds`
-/// is a *positive* list of the two foregrounds that ARE legal on the bar
-/// and never enumerates teal to forbid it. So the pair fell in the gap
-/// between two tests and both stayed green. It was caught by reading
-/// `modal_form`'s own colour rule (*"on the focus bar every semantic hue
-/// drops to `text_primary`"*) and measuring, not by the build.
-///
-/// `bg_main` is inside the gate's coverage, which is the second reason to
-/// prefer it: the pair is now one a future theme edit cannot silently
-/// break.
-///
-/// A future session that re-aligns this to `bg_highlight` for aesthetics
-/// will therefore get a green build and a 3.37:1 regression. That is
-/// exactly the outcome this paragraph exists to prevent. If the unbroken
-/// strip is ever genuinely wanted, the foreground has to move to
-/// `text_primary` (10.03:1 on the bar) and the teal "static info" signal is
-/// what pays for it.
-///
-/// Not `bg_surface` under a `bg_highlight` title either — see [`desc_band`]
-/// for why that one was refused on separate, non-contrast grounds.
+/// A fixed two-row subtitle for forms whose description needs two lines.
 pub fn desc_band2(desc: [&str; 2], width: u16) -> [Line<'static>; 2] {
-    let w = width as usize;
-    let style = Style::default()
-        .fg(T.warden_teal)
-        // NOT `bg_highlight`, however much it would tidy the heading up —
-        // teal on it is 3.37:1 against a 4.5:1 prose bar, and no gate
-        // catches that. See this function's doc.
-        .bg(T.bg_main)
-        .add_modifier(Modifier::ITALIC);
-    desc.map(|text| {
-        let body = fit(&format!("  {text}"), w);
-        let pad = w - body.chars().count();
-        Line::from(vec![
-            Span::styled(body, style),
-            // The band is the padding as much as the text: without a `bg`
-            // here the strip stops where the sentence does.
-            Span::styled(" ".repeat(pad), Style::default().bg(T.bg_main)),
-        ])
-    })
+    desc.map(|text| desc_band(text, width))
 }
 
 /// Buffer assertions shared by the four surfaces that carry a
@@ -614,9 +595,9 @@ pub(crate) mod desc_band2_assert {
     /// it. See [`super::desc_band2`]'s doc. Asserting the literal here is
     /// what makes a re-alignment to the title's background fail the build
     /// instead of shipping green.
-    const BAND_BG: Color = Color::Rgb(15, 15, 15);
-    const TITLE_BG: Color = Color::Rgb(51, 51, 51);
-    const COPY_FG: Color = Color::Rgb(13, 148, 136);
+    const BAND_BG: Color = Color::Rgb(75, 36, 36);
+    const TITLE_BG: Color = Color::Rgb(185, 28, 28);
+    const COPY_FG: Color = Color::Rgb(229, 229, 229);
 
     /// Cell-accurate substring search — returns the **column** of the
     /// match, not a byte offset.
@@ -702,13 +683,6 @@ pub(crate) mod desc_band2_assert {
                  the modal's full interior — a band that stops at the end of \
                  its text is the defect `band_line` documents\n{dump}"
             );
-            assert!(
-                run_of(buf, y, TITLE_BG).is_empty(),
-                "description row {i} is painted on the TITLE's bg_highlight. \
-                 That is teal at 3.37:1 against a 4.5:1 prose bar, and no \
-                 contrast gate covers the pair — see desc_band2's doc before \
-                 changing this\n{dump}"
-            );
             // Every cell of the copy, not just its first: a style applied to
             // one span and not its neighbours passes a single-cell sample.
             //
@@ -716,11 +690,11 @@ pub(crate) mod desc_band2_assert {
             // span carries the background but deliberately NO foreground, so
             // widening this to the whole row would fail on correct output —
             // if you are here because it did, that is the reason.
-            for dx in 0..desc[i].chars().count() as u16 {
+            for dx in 0..crate::tui::text::width(desc[i]) as u16 {
                 assert_eq!(
                     buf[(x0 + dx, y)].fg,
                     COPY_FG,
-                    "description row {i} is not teal at column {}\n{dump}",
+                    "description row {i} is not red at column {}\n{dump}",
                     x0 + dx
                 );
             }
@@ -749,7 +723,7 @@ pub(crate) mod desc_band2_assert {
 // title tick and destructive copy, never a border.
 
 /// Value column (chars from the modal's inner-left edge) for the banded
-/// ecosystem rows: 2-cell lead + [`GRID_LABEL_W`] label + a 2-cell gap.
+/// ecosystem rows: [`GRID_LABEL_W`] label + a 2-cell gap.
 /// Every value span and the real terminal cursor share it, so the column
 /// is dead straight and [`ModalRender::place_cursor`] can be told a plain
 /// character offset.
@@ -757,7 +731,7 @@ pub(crate) mod desc_band2_assert {
 /// Distinct from `GRID_RULE_COL`, which belonged to the older `│`-ruled
 /// grid (`section_lines`): the ecosystem rows carry no vertical rule,
 /// so their gap is two cells of whitespace, not `│ `.
-pub const VALUE_COL: usize = 2 + GRID_LABEL_W + 2;
+pub const VALUE_COL: usize = GRID_LABEL_W + 2;
 
 /// What a row's value *is* — the sole input to its colour, per the palette
 /// spec. No caller passes a `Color`, so a value's meaning can never be
@@ -798,47 +772,67 @@ impl ValueKind {
     }
 }
 
-/// A teal, bold section header + a hairline rule beneath it — the
-/// Archetype-F replacement for the grey `section_lines` grid header.
-///
-/// The header sits on a recessed `bg_surface` strip (deliberately NOT
-/// `bg_highlight`, which is the focus bar) so "a different part starts
-/// here" is unmistakable without reading as a selection.
-pub fn section_band(label: &str, width: u16) -> [Line<'static>; 2] {
-    let w = width as usize;
-    let text = format!("  {}", label.to_uppercase());
-    let pad = w.saturating_sub(text.chars().count());
-    let band = Style::default().bg(T.bg_surface);
-    let header = Line::from(vec![
-        Span::styled(text, band.fg(T.warden_teal).add_modifier(Modifier::BOLD)),
-        Span::styled(" ".repeat(pad), band),
-    ]);
-    let rule_w = w.saturating_sub(4);
-    let rule = Line::from(Span::styled(
-        format!("  {}", "\u{2500}".repeat(rule_w)),
-        Style::default().fg(T.border_subtle),
-    ));
-    [header, rule]
+/// A coloured section label followed by a trailing hairline rule. The text
+/// has no background: section identity is conveyed by foreground and rule,
+/// never by a second selection-like band.
+pub fn section_rule(label: &str, width: u16, role: theme::CardRole) -> Line<'static> {
+    let label = fit(&label.to_uppercase(), width as usize);
+    let remaining = (width as usize).saturating_sub(crate::tui::text::width(&label));
+    let rule = if remaining > 0 {
+        format!(" {}", "─".repeat(remaining - 1))
+    } else {
+        String::new()
+    };
+    let color = T.card_title_bg(role);
+    Line::from(vec![
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(rule, Style::default().fg(color)),
+    ])
 }
 
-/// One `label  value` row aligned to [`VALUE_COL`].
-///
-/// At rest the value takes its colour from `kind` alone. Focused, the row
-/// becomes a full-width `bg_highlight` bar led by an emerald `▌` rule and
-/// closed by a `◀` marker, and the value drops to `text_primary`. That is
-/// three "you are here" signals — rule, bar, marker — of which only one is
-/// colour, so focus stays locatable with colour vision disabled.
-///
-/// `placeholder` shows when a text value is empty and unfocused.
-///
-/// The value is **fitted** to what the row can hold. It used to be pushed
-/// raw and clipped by the widget at the modal edge with no marker at all,
-/// which is strictly worse than an ellipsis: the operator reads a
-/// truncated string as a complete one and transcribes it. Every other row
-/// vocabulary in this module announces its own cut ([`fit`], [`desc_band`],
-/// [`hint_or_error_rows`], [`choice_rows`]), and this is that answer — not
-/// [`ProseRow::verbatim`]'s, because a value row is not a transcription
-/// target. A surface that needs one asks for a verbatim prose row.
+pub fn section_band(label: &str, width: u16) -> [Line<'static>; 2] {
+    section_band_with_role(label, width, theme::CardRole::Summary)
+}
+
+pub fn section_band_with_role(
+    label: &str,
+    width: u16,
+    role: theme::CardRole,
+) -> [Line<'static>; 2] {
+    [section_rule(label, width, role), Line::default()]
+}
+
+/// Label width and neutral spacing before the value surface.
+#[derive(Clone, Copy)]
+pub struct ValueLayout {
+    pub label_width: usize,
+    pub gap: usize,
+}
+
+impl Default for ValueLayout {
+    fn default() -> Self {
+        Self {
+            label_width: GRID_LABEL_W,
+            gap: 1,
+        }
+    }
+}
+
+impl ValueLayout {
+    /// Text starts after the value surface's leading padding cell.
+    pub fn value_column(self) -> usize {
+        self.label_width + self.gap + 1
+    }
+
+    fn budget(self, width: u16) -> usize {
+        (width as usize).saturating_sub(self.value_column() + 1)
+    }
+}
+
+/// Editable value surface with a stable label and cursor column.
 pub fn value_row(
     label: &str,
     value: &str,
@@ -847,85 +841,80 @@ pub fn value_row(
     placeholder: Option<&str>,
     width: u16,
 ) -> Line<'static> {
-    let bar = |s: Style| if focused { s.bg(T.bg_highlight) } else { s };
-    let label_style = bar(if focused {
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD)
+    value_row_with_layout(
+        label,
+        value,
+        focused,
+        kind,
+        placeholder,
+        width,
+        ValueLayout::default(),
+    )
+}
+
+/// Editable row with explicit label geometry, shared by its cursor budget.
+pub fn value_row_with_layout(
+    label: &str,
+    value: &str,
+    focused: bool,
+    kind: ValueKind,
+    placeholder: Option<&str>,
+    width: u16,
+    layout: ValueLayout,
+) -> Line<'static> {
+    let label_style = Style::default().fg(if focused {
+        T.text_primary
     } else {
-        Style::default().fg(T.text_secondary)
+        T.text_secondary
     });
-
-    let (shown, value_style) = if value.is_empty() && !focused {
+    let surface = if focused { T.info } else { T.bg_highlight };
+    let (value, color) = if value.is_empty() && !focused {
+        (placeholder.unwrap_or(""), T.text_muted)
+    } else {
         (
-            placeholder.unwrap_or("").to_string(),
-            // Guidance, not data: italic and dim, but held at the
-            // glanceable 3:1 floor rather than `text_disabled`, which is
-            // reserved for content that is genuinely inactive.
-            Style::default()
-                .fg(T.text_muted)
-                .add_modifier(Modifier::ITALIC),
+            value,
+            if focused {
+                T.text_inverse
+            } else {
+                kind.color()
+            },
         )
-    } else if focused {
-        // Semantic colour steps aside on the focus bar — see `ValueKind`.
-        (value.to_string(), bar(Style::default().fg(T.text_primary)))
-    } else {
-        (value.to_string(), Style::default().fg(kind.color()))
     };
-
-    // The focus rule REPLACES the 2-cell lead indent instead of adding to
-    // it, so the label column never shifts and `VALUE_COL` stays true for
-    // the hardware cursor.
-    //
-    // Focused rows window from the TAIL. `focused` is the whole predicate
-    // and it is exact rather than approximate: the placeholder arm above
-    // is guarded by `!focused`, so a focused row always carries the
-    // operator's own text, and every focused row in this product is one
-    // being typed into — `caret` is documented on [`FormRows::text_field`]
-    // as "the visible length of the value being typed", and all 52 call
-    // sites pass the value's character count. There is no mid-string
-    // editing to window around.
-    //
-    // [`selector_row`] is the one focused caller that is cycled rather
-    // than typed; it pre-fits its value, so this is a no-op there.
+    let budget = layout.budget(width);
     let shown = if focused {
-        fit_tail(&shown, value_budget(width, focused))
+        fit_tail(value, budget)
     } else {
-        fit(&shown, value_budget(width, focused))
+        fit(value, budget)
     };
-
-    let mut spans = Vec::with_capacity(5);
-    push_row_lead(&mut spans, focused, label, label_style);
-    spans.push(Span::styled(shown.clone(), value_style));
+    let mut value_style = Style::default().fg(color).bg(surface);
     if focused {
-        let used = VALUE_COL + shown.chars().count() + 2;
-        let pad = (width as usize).saturating_sub(used);
-        if pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(T.bg_highlight),
-            ));
-        }
-        spans.push(Span::styled(
-            " \u{25c0}",
-            Style::default().fg(T.emerald_ping).bg(T.bg_highlight),
-        ));
+        value_style = value_style.add_modifier(Modifier::BOLD);
+    }
+    let lead = format!(
+        "{}{}",
+        crate::tui::text::pad(&fit(label, layout.label_width), layout.label_width),
+        " ".repeat(layout.gap)
+    );
+    let lead = fit(&lead, width as usize);
+    let mut spans = vec![Span::styled(lead, label_style)];
+    if width as usize >= layout.value_column() {
+        spans.push(Span::styled(" ", value_style));
+        let padding = (width as usize)
+            .saturating_sub(layout.value_column() + crate::tui::text::width(&shown));
+        spans.push(Span::styled(shown, value_style));
+        spans.push(Span::styled(" ".repeat(padding), value_style));
     }
     Line::from(spans)
 }
 
-/// Cells a [`value_row`] can put right of [`VALUE_COL`]. A focused row
-/// pays 2 more for its trailing ` ◀` marker, so the value does not reflow
-/// as the operator tabs onto it.
-pub fn value_budget(width: u16, focused: bool) -> usize {
-    (width as usize)
-        .saturating_sub(VALUE_COL)
-        .saturating_sub(if focused { 2 } else { 0 })
+/// Reserve one trailing cell for the cursor at the end of a full input.
+pub fn value_budget(width: u16, _focused: bool) -> usize {
+    (width as usize).saturating_sub(VALUE_COL + 1)
 }
 
 /// A cyclable value row (format, refresh interval). Focused wraps the value
 /// in `‹ … ›` to signal that a key cycles it.
-pub fn selector_row(label: &str, value: &str, focused: bool, width: u16) -> Line<'static> {
+pub fn selector_row(label: &str, value: &str, focused: bool, width: u16) -> FormLine {
     let shown = if focused {
         // Fit the value FIRST so [`value_row`]'s own fit is a no-op here.
         // Ellipsising the composed string would eat the closing `›` — the
@@ -936,7 +925,59 @@ pub fn selector_row(label: &str, value: &str, focused: bool, width: u16) -> Line
     } else {
         value.to_string()
     };
-    value_row(label, &shown, focused, ValueKind::Editable, None, width)
+    let mut line = FormLine::from(value_row(
+        label,
+        &shown,
+        focused,
+        ValueKind::Editable,
+        None,
+        width,
+    ));
+    if focused && value_budget(width, true) >= 4 {
+        line.keys.push((VALUE_COL as u16, 1, KeyCode::Left));
+        line.keys.push((
+            (VALUE_COL + crate::tui::text::width(&shown) - 1) as u16,
+            1,
+            KeyCode::Right,
+        ));
+    }
+    line
+}
+
+/// A rendered field and its explicitly declared keyboard controls.
+/// Geometry follows the same fitted value as the glyphs, including Unicode.
+pub struct FormLine {
+    line: Line<'static>,
+    keys: Vec<(u16, u16, KeyCode)>,
+}
+
+impl From<Line<'static>> for FormLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            keys: Vec::new(),
+        }
+    }
+}
+
+impl From<FormLine> for Line<'static> {
+    fn from(line: FormLine) -> Self {
+        line.line
+    }
+}
+
+impl std::ops::Deref for FormLine {
+    type Target = Line<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.line
+    }
+}
+
+pub struct FieldHit {
+    row: usize,
+    x: u16,
+    width: u16,
+    action: crate::tui::mouse::MouseAction,
 }
 
 /// A two-option radio row (Block/Allow, Yes/No). Each side declares what it
@@ -955,13 +996,15 @@ pub fn radio_row(
     focused: bool,
     width: u16,
 ) -> Line<'static> {
-    let bar = |s: Style| if focused { s.bg(T.bg_highlight) } else { s };
+    let bar = |s: Style| {
+        if focused {
+            s.bg(T.info).fg(T.text_inverse)
+        } else {
+            s.bg(T.bg_highlight)
+        }
+    };
     let (left_label, left_kind) = left;
     let (right_label, right_kind) = right;
-    // On the focus bar the selected word steps back to `text_primary` —
-    // no semantic hue clears WCAG's 3:1 floor against `bg_highlight`. The
-    // `●` stays emerald there so the choice is still legible as *the*
-    // live control.
     let selected_text = |kind: ValueKind| {
         if focused {
             T.text_primary
@@ -984,12 +1027,10 @@ pub fn radio_row(
     } else {
         ("\u{25cf}", dot_sel, selected_text(right_kind))
     };
-    let label_style = bar(if focused {
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD)
+    let label_style = Style::default().fg(if focused {
+        T.text_primary
     } else {
-        Style::default().fg(T.text_secondary)
+        T.text_secondary
     });
     let mut spans = Vec::with_capacity(6);
     push_row_lead(&mut spans, focused, label, label_style);
@@ -1003,13 +1044,14 @@ pub fn radio_row(
         Span::styled(format!(" {right_label}"), bar(Style::default().fg(rtext))),
     ]);
     if focused {
-        let used = VALUE_COL + 2 + left_label.chars().count() + 5 + right_label.chars().count();
+        let used = VALUE_COL
+            + 2
+            + crate::tui::text::width(left_label)
+            + 5
+            + crate::tui::text::width(right_label);
         let pad = (width as usize).saturating_sub(used);
         if pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(T.bg_highlight),
-            ));
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(T.info)));
         }
     }
     Line::from(spans)
@@ -1036,16 +1078,6 @@ pub fn collapse_row(
         T.warden_teal
     };
     let mut spans = vec![
-        // Same rule-replaces-indent trick as `value_row`, so the arrow
-        // never shifts when focus arrives.
-        Span::styled(
-            if focused { "\u{258c} " } else { "  " }.to_string(),
-            if focused {
-                Style::default().fg(T.emerald_ping).bg(T.bg_highlight)
-            } else {
-                Style::default()
-            },
-        ),
         Span::styled(format!("{arrow} "), bar(Style::default().fg(arrow_col))),
         Span::styled(
             label.to_string(),
@@ -1058,13 +1090,13 @@ pub fn collapse_row(
             }),
         ),
     ];
-    let mut used = 2 + 2 + label.chars().count();
+    let mut used = 2 + crate::tui::text::width(label);
     if !expanded {
         spans.push(Span::styled(
             preview.to_string(),
             bar(Style::default().fg(T.text_muted)),
         ));
-        used += preview.chars().count();
+        used += crate::tui::text::width(preview);
     }
     if focused {
         let pad = (width as usize).saturating_sub(used);
@@ -1100,13 +1132,13 @@ pub fn state_row(
     let value = format!("\u{25c6} {state}");
     let mut spans = vec![
         Span::styled(
-            format!("  {:<w$}  ", label, w = GRID_LABEL_W),
+            format!("{}  ", crate::tui::text::pad(label, GRID_LABEL_W)),
             Style::default().fg(T.text_secondary),
         ),
         Span::styled(value.clone(), Style::default().fg(kind.color())),
     ];
     if !note.is_empty() {
-        let used = VALUE_COL + value.chars().count() + note.chars().count();
+        let used = VALUE_COL + crate::tui::text::width(&value) + crate::tui::text::width(note);
         if used <= width as usize {
             spans.push(Span::styled(
                 note.to_string(),
@@ -1125,7 +1157,7 @@ pub fn state_row(
 /// surface, which is exactly what D7′ makes wrong.
 pub fn nav_keys_line(keys: &str) -> Line<'static> {
     Line::from(Span::styled(
-        format!("  {keys}"),
+        keys.to_string(),
         Style::default().fg(T.text_secondary),
     ))
 }
@@ -1152,6 +1184,8 @@ pub struct Action {
     /// rather than leaving the tail builder to look it up — see
     /// [`form_tail`].
     pub hint: String,
+    /// Activation is declared by the caller; labels never determine behavior.
+    pub key: Option<KeyEvent>,
 }
 
 impl Action {
@@ -1166,32 +1200,87 @@ impl Action {
             focused,
             kind,
             hint: hint.into(),
+            key: None,
         }
+    }
+
+    pub fn on_key(mut self, code: KeyCode) -> Self {
+        self.key = Some(KeyEvent::new(code, KeyModifiers::NONE));
+        self
+    }
+
+    pub fn on_save(mut self) -> Self {
+        self.key = Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        self
     }
 }
 
-/// Right-aligned action row for the ecosystem modals.
-///
-/// Diverges from `button_row` — still used by the older grid forms — on
-/// the rule: **exactly one filled button per modal**. The
-/// [`ActionKind::Primary`] action takes the solid `warden_teal` fill with
-/// an inverse label (4.79:1, the only fill in the modal that clears AA);
-/// destructive and neutral actions are colour-only. A filled red sitting
-/// next to a filled primary is how an operator deletes a list they meant
-/// to save.
-///
-/// Because focus can no longer be a fill, it is the same emerald `▌` the
-/// focused field row uses, plus bold. The marker sits outside the fill so
-/// it stays legible against teal, and it occupies one cell whether or not
-/// the action is focused, so the row never reflows.
-pub fn action_row(actions: &[Action], width: u16) -> Line<'static> {
-    // group = Σ (marker + label) + 2-col gaps between + 2-col right margin.
-    let labels_w: usize = actions
+#[derive(Clone, Debug)]
+pub struct ActionHit {
+    x: u16,
+    width: u16,
+    key: KeyEvent,
+}
+
+fn action_leading_pad(actions: &[Action], width: u16) -> usize {
+    let labels: usize = actions
         .iter()
-        .map(|a| 1 + a.label.chars().count())
-        .sum::<usize>();
-    let gaps = actions.len().saturating_sub(1) * 2;
-    let pad = (width as usize).saturating_sub(labels_w + gaps + 2).max(1);
+        .map(|a| crate::tui::text::width(action_label(a)) + 2)
+        .sum();
+    (width as usize).saturating_sub(labels + actions.len().saturating_sub(1) * 2)
+}
+
+fn action_label(action: &Action) -> &str {
+    let label = action.label.trim();
+    label
+        .strip_prefix('[')
+        .and_then(|s| s.split_once("] "))
+        .map_or(label, |(_, name)| name.trim_start())
+}
+
+pub(crate) fn action_hits(actions: &[Action], width: u16) -> Vec<ActionHit> {
+    let mut x = action_leading_pad(actions, width);
+    let mut hits = Vec::new();
+    for action in actions {
+        let cells = crate::tui::text::width(action_label(action)) + 2;
+        if let Some(key) = action.key {
+            if x < width as usize {
+                hits.push(ActionHit {
+                    x: x as u16,
+                    width: cells.min(width as usize - x) as u16,
+                    key,
+                });
+            }
+        }
+        x += cells + 2;
+    }
+    hits
+}
+
+/// The same clipped button cells used by the painter, in frame coordinates.
+pub fn action_regions(actions: &[Action], row: Rect) -> Vec<(Rect, KeyEvent)> {
+    action_hits(actions, row.width)
+        .into_iter()
+        .map(|hit| {
+            (
+                Rect::new(
+                    row.x.saturating_add(hit.x),
+                    row.y,
+                    hit.width,
+                    row.height.min(1),
+                )
+                .intersection(row),
+                hit.key,
+            )
+        })
+        .collect()
+}
+
+/// Compact right-aligned buttons. Focus fills the selected button with its
+/// action color; resting buttons retain a neutral surface.
+pub fn action_row(actions: &[Action], width: u16) -> Line<'static> {
+    // The content rectangle already reserves the right gutter.
+    let pad = action_leading_pad(actions, width);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(actions.len() * 3 + 2);
     spans.push(Span::raw(" ".repeat(pad)));
@@ -1199,25 +1288,21 @@ pub fn action_row(actions: &[Action], width: u16) -> Line<'static> {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            if a.focused { "\u{258c}" } else { " " }.to_string(),
-            if a.focused {
-                Style::default().fg(T.emerald_ping)
-            } else {
-                Style::default()
-            },
-        ));
-        let mut style = match a.kind {
-            ActionKind::Primary => Style::default().fg(T.text_inverse).bg(T.warden_teal),
-            ActionKind::Destructive => Style::default().fg(T.red_glow),
-            ActionKind::Neutral => Style::default().fg(T.text_secondary),
+        let color = match a.kind {
+            ActionKind::Primary => T.warden_teal,
+            ActionKind::Destructive => T.red_glow,
+            ActionKind::Neutral => T.text_secondary,
         };
-        if a.focused {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(a.label.to_string(), style));
+        let style = if a.focused {
+            Style::default()
+                .bg(color)
+                .fg(T.text_inverse)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(T.bg_highlight).fg(color)
+        };
+        spans.push(Span::styled(format!(" {} ", action_label(a)), style));
     }
-    spans.push(Span::raw("  "));
     Line::from(spans)
 }
 
@@ -1243,7 +1328,11 @@ pub const HINT_ROWS: usize = 2;
 /// practice: there is no longer a second `match focus { … }` table to keep
 /// in sync with the field list.
 pub struct FormRows {
+    action_hits: RefCell<Vec<ActionHit>>,
+    field_hits: Vec<FieldHit>,
+    field_count: usize,
     width: u16,
+    value_layout: ValueLayout,
     head: Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
     focus_row: Option<usize>,
@@ -1256,7 +1345,11 @@ impl FormRows {
     /// spacer. `width` is the *inner* width the rows must fill.
     pub fn new(title: &str, desc: &str, width: u16) -> Self {
         Self {
+            action_hits: RefCell::default(),
+            field_hits: Vec::new(),
+            field_count: 0,
             width,
+            value_layout: ValueLayout::default(),
             head: vec![
                 title_band(title, width),
                 desc_band(desc, width),
@@ -1300,13 +1393,23 @@ impl FormRows {
     pub fn new_desc2(title: &str, desc: [&str; 2], width: u16) -> Self {
         let [d1, d2] = desc_band2(desc, width);
         Self {
+            action_hits: RefCell::default(),
+            field_hits: Vec::new(),
+            field_count: 0,
             width,
+            value_layout: ValueLayout::default(),
             head: vec![title_band(title, width), d1, d2, Line::from("")],
             lines: Vec::with_capacity(32),
             focus_row: None,
             hint: None,
             cursor: None,
         }
+    }
+
+    /// Match the caret window to rows using explicit value geometry.
+    pub fn with_value_layout(mut self, layout: ValueLayout) -> Self {
+        self.value_layout = layout;
+        self
     }
 
     /// The inner width rows must be built at — already net of the
@@ -1323,6 +1426,11 @@ impl FormRows {
     /// A labelled section header + its hairline rule.
     pub fn section(&mut self, label: &str) {
         self.lines.extend(section_band(label, self.width));
+    }
+
+    pub fn section_with_role(&mut self, label: &str, role: theme::CardRole) {
+        self.lines
+            .extend(section_band_with_role(label, self.width, role));
     }
 
     // `section_with_blurb` used to live here:
@@ -1349,22 +1457,49 @@ impl FormRows {
     }
 
     /// A row that cannot take focus (a state row, a suggestion row).
-    pub fn line(&mut self, line: Line<'static>) {
-        self.lines.push(line);
+    pub fn line(&mut self, line: impl Into<Line<'static>>) {
+        self.lines.push(line.into());
     }
 
     /// A focusable row. When `focused`, it becomes the viewport's anchor
     /// and `hint` becomes the tail's guidance.
-    pub fn field(&mut self, line: Line<'static>, focused: bool, hint: &str) {
-        self.lines.push(line);
+    pub fn field(&mut self, line: impl Into<FormLine>, focused: bool, hint: &str) {
+        let line = line.into();
+        self.field_hits.push(FieldHit {
+            row: self.lines.len(),
+            x: 0,
+            width: self.width,
+            action: crate::tui::mouse::MouseAction::OverlayField(self.field_count),
+        });
+        self.field_count += 1;
+        if focused {
+            self.field_hits
+                .extend(line.keys.into_iter().map(|(x, width, code)| FieldHit {
+                    row: self.lines.len(),
+                    x,
+                    width,
+                    action: crate::tui::mouse::MouseAction::OverlayKey(KeyEvent::new(
+                        code,
+                        KeyModifiers::NONE,
+                    )),
+                }));
+        }
+        self.lines.push(line.line);
         if focused {
             self.focus_row = Some(self.lines.len() - 1);
             self.hint = Some(hint.to_string());
         }
     }
 
+    pub fn choice_field(&mut self, line: impl Into<FormLine>, focused: bool, hint: &str) {
+        let hit = self.field_hits.len();
+        let index = self.field_count;
+        self.field(line, focused, hint);
+        self.field_hits[hit].action = crate::tui::mouse::MouseAction::OverlayChoice(index);
+    }
+
     /// [`FormRows::field`] for a row that hosts the real terminal cursor.
-    /// `caret` is the caret's offset in characters from [`VALUE_COL`] —
+    /// `caret` is the caret's cell offset from the configured value column —
     /// i.e. the visible length of the value being typed.
     pub fn text_field(&mut self, line: Line<'static>, focused: bool, hint: &str, caret: u16) {
         self.field(line, focused, hint);
@@ -1381,7 +1516,7 @@ impl FormRows {
             // set it (`x < self.inner.right()`), so the cursor VANISHES
             // mid-typing — which is the defect, not the truncation. The
             // ellipsis at least announces itself; a missing caret does not.
-            let budget = u16::try_from(value_budget(self.width, true)).unwrap_or(u16::MAX);
+            let budget = u16::try_from(self.value_layout.budget(self.width)).unwrap_or(u16::MAX);
             self.cursor = Some((self.lines.len() - 1, caret.min(budget)));
         }
     }
@@ -1394,6 +1529,8 @@ impl FormRows {
     pub fn finish(self, tail: Vec<Line<'static>>) -> (ScrollBody, Option<(usize, u16)>) {
         (
             ScrollBody {
+                action_hits: self.action_hits.into_inner(),
+                field_hits: self.field_hits,
                 head: self.head,
                 fields: self.lines,
                 tail,
@@ -1530,6 +1667,7 @@ fn build_form_tail(
     actions: &[Action],
 ) -> Vec<Line<'static>> {
     let width = rows.width();
+    *rows.action_hits.borrow_mut() = action_hits(actions, width);
     let hint = rows
         .hint()
         .or_else(|| {
@@ -1548,7 +1686,9 @@ fn build_form_tail(
         region = region.into_iter().map(|l| band_line(l, width)).collect();
     }
     tail.extend(region);
-    tail.push(nav_keys_line(keys));
+    if !keys.is_empty() {
+        tail.push(nav_keys_line(keys));
+    }
     tail.push(action_row(actions, width));
     tail
 }
@@ -1562,7 +1702,11 @@ fn build_form_tail(
 /// styles.
 fn band_line(line: Line<'static>, width: u16) -> Line<'static> {
     let band = Style::default().bg(T.bg_surface);
-    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|s| crate::tui::text::width(&s.content))
+        .sum();
     let mut spans: Vec<Span<'static>> = line
         .spans
         .into_iter()
@@ -1591,7 +1735,7 @@ fn note_rows(
     match status.filter(|s| !s.is_empty()) {
         Some(s) if error.is_none() && max_rows > 0 => {
             let mut rows = vec![Line::from(Span::styled(
-                fit(&format!("  {s}"), width as usize),
+                fit(s, width as usize),
                 // Its own colour, not the hint's: `info` is the theme's
                 // neutral "something is happening" and it is the one
                 // affordance that told the operator a submit was in
@@ -1617,7 +1761,7 @@ fn note_rows(
 // `resolver_modal`, and the remove-confirm / outcome stages of
 // `subnet_modal`, `local_dns_modal`, `profile_modal` and `tabs/rules`.
 
-/// A paragraph row of an Archetype-C body: 2-cell indent.
+/// A paragraph row aligned to the modal content edge.
 ///
 /// `kind` is `None` for ordinary prose and `Some(_)` for a line that
 /// carries state — the entity being deleted, the count that is about to
@@ -1675,7 +1819,7 @@ impl ProseRow {
     }
 }
 
-/// Cells a verbatim row may put on one line, **before** its 2-cell indent.
+/// Cells a verbatim row may put on one line.
 ///
 /// A fixed column, deliberately not derived from the passed `width`:
 /// [`render_modal`] builds the body at `w` and again at `w - 1` when the
@@ -1685,8 +1829,8 @@ impl ProseRow {
 /// `prose_rows_row_count_never_varies_with_width`.
 ///
 /// 59 is the narrowest interior the ecosystem can hand a [`ProseRow`]: its
-/// consumers are all 64 columns or wider, 64 leaves a 62-cell interior, the
-/// scrollbar pass takes it to 61, and the indent takes 2 more. A notice
+/// consumers are all 64 columns or wider: borders and gutters leave 60
+/// content cells, then the scrollbar takes one. A notice
 /// narrower than 64 would clip — [`render_body_fixed`] does not wrap — so
 /// that is the floor this constant encodes.
 const VERBATIM_WRAP: usize = 59;
@@ -1724,7 +1868,7 @@ pub fn prose_field_row(prose: &[ProseRow], idx: usize) -> usize {
 /// use [`prose_rows`], which is what [`notice_body`] calls.
 pub fn prose_row(row: &ProseRow, width: u16) -> Line<'static> {
     Line::from(Span::styled(
-        fit(&format!("  {}", row.text), width as usize),
+        fit(&row.text, width as usize),
         prose_style(row),
     ))
 }
@@ -1748,12 +1892,7 @@ pub fn prose_rows(row: &ProseRow, width: u16) -> Vec<Line<'static>> {
     // leave the operator guessing whether the space is part of the string.
     chars
         .chunks(VERBATIM_WRAP)
-        .map(|chunk| {
-            Line::from(Span::styled(
-                format!("  {}", chunk.iter().collect::<String>()),
-                style,
-            ))
-        })
+        .map(|chunk| Line::from(Span::styled(chunk.iter().collect::<String>(), style)))
         .collect()
 }
 
@@ -1855,15 +1994,15 @@ impl ChoiceNote {
     }
 }
 
-/// Cells a [`ChoiceNote`] row may put on one line, **after** its 4-cell
+/// Cells a [`ChoiceNote`] row may put on one line, after its 2-cell
 /// indent.
 ///
 /// A fixed column for the same reason [`VERBATIM_WRAP`] is one, and derived
 /// the same way: [`render_modal`] builds the body at `w` and again at
 /// `w - 1` once the scrollbar claims a column, so a width-derived wrap
 /// would change the row count between the two passes and silently mis-size
-/// the modal. 64-column modal → 62-cell interior → 61 on the scrollbar
-/// pass → 57 after the indent.
+/// the modal. A 64-column modal leaves 60 content cells, 59 with a
+/// scrollbar, then 57 after the note indent.
 const NOTE_WRAP: usize = 57;
 
 /// How many lines a [`ChoiceRow`] renders as. A function of the **spec**
@@ -1878,14 +2017,12 @@ fn choice_row_count(row: &ChoiceRow) -> usize {
     1 + row
         .note
         .as_ref()
-        .map(|n| n.text().chars().count().div_ceil(NOTE_WRAP).max(1))
+        .map(|n| crate::tui::text::width(n.text()).div_ceil(NOTE_WRAP).max(1))
         .unwrap_or(0)
 }
 
 /// Render a [`ChoiceRow`] as **one or more** lines, with the same focus
-/// grammar every ecosystem row uses: an emerald `▌` rule replacing the
-/// lead indent, a `bg_highlight` bar, and a `◀` marker. Three "you are
-/// here" signals, only one of them colour.
+/// grammar every ecosystem row uses: inverse text on a blue focus surface.
 ///
 /// The row count is a function of the **spec**, never of `width`: one line
 /// for a bare option, plus however many [`NOTE_WRAP`] chunks its `note`
@@ -1915,7 +2052,7 @@ fn choice_row_count(row: &ChoiceRow) -> usize {
 /// Archetype-C tail budget (see [`notice_body`]).
 pub fn choice_rows(row: &ChoiceRow, width: u16) -> Vec<Line<'static>> {
     let disabled = row.note.as_ref().is_some_and(ChoiceNote::blocks);
-    let bar = |s: Style| if row.focused { s.bg(T.bg_highlight) } else { s };
+    let bar = |s: Style| if row.focused { s.bg(T.info) } else { s };
     // Semantic colour steps aside on the focus bar — see [`ValueKind`].
     // A disabled option recedes to `text_muted`: its kind describes what
     // choosing it would mean, and it cannot be chosen.
@@ -1926,7 +2063,7 @@ pub fn choice_rows(row: &ChoiceRow, width: u16) -> Vec<Line<'static>> {
     // option whose reason references it is exactly that.
     let label_style = bar(if row.focused {
         Style::default()
-            .fg(T.text_primary)
+            .fg(T.text_inverse)
             .add_modifier(Modifier::BOLD)
     } else if disabled {
         Style::default().fg(T.text_muted)
@@ -1935,46 +2072,33 @@ pub fn choice_rows(row: &ChoiceRow, width: u16) -> Vec<Line<'static>> {
     });
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
-    if row.focused {
-        spans.push(Span::styled(
-            "\u{258c}".to_string(),
-            Style::default().fg(T.emerald_ping).bg(T.bg_highlight),
-        ));
-        spans.push(Span::styled(format!(" {}", row.label), label_style));
-    } else {
-        spans.push(Span::styled(format!("  {}", row.label), label_style));
-    }
-    let mut used = 2 + row.label.chars().count();
+    spans.push(Span::styled(row.label.clone(), label_style));
+    let mut used = crate::tui::text::width(&row.label);
 
-    // `+ 2` reserves the trailing marker cells so a focused row's detail
-    // is held to the same budget as an unfocused one — otherwise the
-    // detail would reflow as the operator tabs past it.
+    // Focus must not change the detail budget and reflow adjacent choices.
     let detail_budget = (width as usize).saturating_sub(used + 2 + 2);
     if let Some(detail) = row.detail.as_deref().filter(|d| !d.is_empty()) {
         if detail_budget >= MIN_DETAIL_CELLS {
             let shown = fit(detail, detail_budget);
-            used += 2 + shown.chars().count();
+            used += 2 + crate::tui::text::width(&shown);
             spans.push(Span::styled(
                 format!("  {shown}"),
                 bar(Style::default()
-                    .fg(T.text_muted)
+                    .fg(if row.focused {
+                        T.text_inverse
+                    } else {
+                        T.text_muted
+                    })
                     .add_modifier(Modifier::ITALIC)),
             ));
         }
     }
 
     if row.focused {
-        let pad = (width as usize).saturating_sub(used + 2);
+        let pad = (width as usize).saturating_sub(used);
         if pad > 0 {
-            spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(T.bg_highlight),
-            ));
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(T.info)));
         }
-        spans.push(Span::styled(
-            " \u{25c0}",
-            Style::default().fg(T.emerald_ping).bg(T.bg_highlight),
-        ));
     }
 
     let mut lines = vec![Line::from(spans)];
@@ -1994,7 +2118,7 @@ pub fn choice_rows(row: &ChoiceRow, width: u16) -> Vec<Line<'static>> {
         } else {
             lines.extend(chars.chunks(NOTE_WRAP).map(|chunk| {
                 Line::from(Span::styled(
-                    format!("    {}", chunk.iter().collect::<String>()),
+                    format!("  {}", chunk.iter().collect::<String>()),
                     style,
                 ))
             }));
@@ -2092,6 +2216,7 @@ pub fn notice_body(spec: &NoticeSpec, width: u16) -> ScrollBody {
         .iter()
         .flat_map(|p| prose_rows(p, width))
         .collect();
+    let mut field_hits = Vec::new();
     let focus_row = if spec.choices.is_empty() {
         None
     } else {
@@ -2103,7 +2228,15 @@ pub fn notice_body(spec: &NoticeSpec, width: u16) -> ScrollBody {
         // the two indices diverge and the viewport would follow the wrong
         // row — silently, since nothing panics and the marker still draws.
         let mut focus = None;
-        for choice in &spec.choices {
+        for (index, choice) in spec.choices.iter().enumerate() {
+            if !choice.note.as_ref().is_some_and(ChoiceNote::blocks) {
+                field_hits.push(FieldHit {
+                    row: fields.len(),
+                    x: 0,
+                    width,
+                    action: crate::tui::mouse::MouseAction::OverlayChoice(index),
+                });
+            }
             if choice.focused {
                 focus = Some(fields.len());
             }
@@ -2137,6 +2270,8 @@ pub fn notice_body(spec: &NoticeSpec, width: u16) -> ScrollBody {
     }
 
     ScrollBody {
+        action_hits: action_hits(&spec.actions, width),
+        field_hits,
         head,
         fields,
         tail,
@@ -2151,7 +2286,7 @@ pub fn notice_body(spec: &NoticeSpec, width: u16) -> ScrollBody {
 /// What [`render_modal`] drew, so the caller can finish the job —
 /// place a hardware cursor, or measure what landed on screen in a test.
 pub struct ModalRender<C> {
-    /// The chrome's inner rect.
+    /// The horizontally padded content rect, including heading rows.
     pub inner: Rect,
     /// Where the field viewport ended up.
     pub view: ScrollView,
@@ -2211,11 +2346,12 @@ pub fn render_modal<C>(
     width: u16,
     build: impl Fn(u16) -> (ScrollBody, C),
 ) -> ModalRender<C> {
-    let nominal_w = width.saturating_sub(2);
+    let nominal_w = width.min(anchor.width).saturating_sub(4);
     let (body, payload) = build(nominal_w);
     let total = body.head.len() + body.fields.len() + body.tail.len();
     let h = (total as u16).saturating_add(2);
-    let inner = render_chrome_in(f, anchor, width, h, "", T.text_primary, true);
+    let surface = render_chrome_in(f, anchor, width, h, "", T.text_primary, true);
+    let inner = content_rect(surface);
 
     let scrolls = body.scrollable
         && will_scroll(
@@ -2243,45 +2379,14 @@ pub fn render_modal<C>(
     }
 }
 
-/// Emit an ecosystem row's lead: an emerald `▌` rule then the label when
-/// focused, a plain 2-cell indent then the label otherwise.
-///
-/// The rule stays its own span because its emerald must not be the label's
-/// colour, and it REPLACES the indent rather than adding to it — so
-/// [`VALUE_COL`] holds whether or not the row has focus, and the hardware
-/// cursor does not jog right the moment the operator tabs onto the field.
-fn push_row_lead(spans: &mut Vec<Span<'static>>, focused: bool, label: &str, label_style: Style) {
-    // `{:<w$}` pads a short label out to the grid column; it does NOT cut a
-    // long one. Every label in this module used to be a hand-written
-    // constant of at most a dozen cells, so the missing cut was unreachable
-    // — until `profile_modal`'s per-list override panel made the label
-    // *operator data*: a `[[blocklists]]` id, which `Id::MAX_LEN` allows to
-    // be 64 characters against this column's 18. Unfitted, such a row
-    // shifts `VALUE_COL` 46 cells right, overruns the 70-column modal, and
-    // is clipped by the widget at the frame edge with no ellipsis — the
-    // "operator reads a truncated string as a complete one" failure
-    // [`value_row`]'s doc-comment says this module answers everywhere else.
-    //
-    // Fitted here rather than at the one call site that can overrun,
-    // because the grid invariant belongs to the grid: the next surface to
-    // label a row with operator data gets it for free instead of having to
-    // know.
-    let label = fit(label, GRID_LABEL_W);
-    if focused {
-        spans.push(Span::styled(
-            "\u{258c}".to_string(),
-            Style::default().fg(T.emerald_ping).bg(T.bg_highlight),
-        ));
-        spans.push(Span::styled(
-            format!(" {:<w$}  ", label, w = GRID_LABEL_W),
-            label_style,
-        ));
-    } else {
-        spans.push(Span::styled(
-            format!("  {:<w$}  ", label, w = GRID_LABEL_W),
-            label_style,
-        ));
-    }
+fn push_row_lead(spans: &mut Vec<Span<'static>>, _focused: bool, label: &str, label_style: Style) {
+    spans.push(Span::styled(
+        format!(
+            "{}  ",
+            crate::tui::text::pad(&fit(label, GRID_LABEL_W), GRID_LABEL_W)
+        ),
+        label_style,
+    ));
 }
 
 /// Validation row for a fixed-height body: the pending error (`⚠ …`) if
@@ -2366,8 +2471,7 @@ pub fn hint_or_error_rows(
         ),
     };
 
-    // 2-cell lead indent on every row, matching the grid.
-    let usable = (width as usize).saturating_sub(2).max(1);
+    let usable = (width as usize).max(1);
 
     // `tui-modal-truncates-multiline-refusal`: a fixed row budget and an
     // unbounded refusal can never both be honoured, so cutting is a given.
@@ -2392,27 +2496,10 @@ pub fn hint_or_error_rows(
     // thing arrived as one long run and its structure was lost before the
     // truncation even got to it. Splitting first means an indented command
     // line stays its own row.
-    let mut wrapped: Vec<String> = Vec::new();
-    for line in logical {
-        let mut rest: Vec<char> = line.chars().collect();
-        if rest.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-        while !rest.is_empty() {
-            if rest.len() <= usable {
-                wrapped.push(rest.drain(..).collect());
-            } else {
-                // Break on the last space inside the budget so words survive.
-                let cut = rest[..usable]
-                    .iter()
-                    .rposition(|c| *c == ' ')
-                    .map(|i| i + 1)
-                    .unwrap_or(usable);
-                wrapped.push(rest.drain(..cut).collect::<String>().trim_end().to_string());
-            }
-        }
-    }
+    let wrapped: Vec<String> = logical
+        .into_iter()
+        .flat_map(|line| crate::tui::text::wrap(line, usable))
+        .collect();
 
     let mut rows: Vec<Line<'static>> = Vec::with_capacity(max_rows);
     // Only an ERROR names its residual. A hint is guidance the operator
@@ -2433,7 +2520,7 @@ pub fn hint_or_error_rows(
             // A hint keeps the bare marker it always had: something was
             // cut, and for guidance that is all the operator needs.
             let keep = usable.saturating_sub(1);
-            let head: String = chunk.chars().take(keep).collect();
+            let head = crate::tui::text::fit(chunk, keep);
             format!("{head}\u{2026}")
         } else if last_row && overflows {
             // STATE the residual, do not merely mark it. A bare `…` says
@@ -2447,17 +2534,17 @@ pub fn hint_or_error_rows(
             // the recovery commands needs to know where they are, and the
             // CLI prints this same refusal in full.
             let tail = format!("\u{2026} +{dropped} more \u{2014} run in the CLI to read it all");
-            if tail.chars().count() >= usable {
+            if crate::tui::text::width(&tail) >= usable {
                 tail
             } else {
-                let keep = usable - tail.chars().count();
-                let head: String = chunk.chars().take(keep).collect();
+                let keep = usable - crate::tui::text::width(&tail);
+                let head = crate::tui::text::fit(chunk, keep);
                 format!("{head}{tail}")
             }
         } else {
             chunk.clone()
         };
-        rows.push(Line::from(Span::styled(format!("  {text}"), style)));
+        rows.push(Line::from(Span::styled(text, style)));
     }
 
     // Pad with EMPTY lines, never whitespace-only ones — see
@@ -2466,6 +2553,16 @@ pub fn hint_or_error_rows(
         rows.push(Line::from(String::new()));
     }
     rows
+}
+
+/// Wrap a complete error for a scrollable modal body without truncating it.
+pub fn scrollable_error_rows(error: &str, width: u16) -> Vec<Line<'static>> {
+    let usable = usize::from(width).max(1);
+    error
+        .split('\n')
+        .flat_map(|line| crate::tui::text::wrap(line, usable))
+        .map(|line| Line::styled(line, Style::default().fg(T.error)))
+        .collect()
 }
 
 // ── internals ─────────────────────────────────────────────────────────
@@ -2534,32 +2631,24 @@ mod tests {
     /// its own characters, so a band whose spans sum to fewer than the
     /// inner width leaves its tail on the modal surface instead.
     fn row_cells(line: &Line<'static>) -> usize {
-        line.spans.iter().map(|s| s.content.chars().count()).sum()
+        line.spans
+            .iter()
+            .map(|s| crate::tui::text::width(&s.content))
+            .sum()
     }
 
     #[test]
-    fn title_band_pads_to_full_width_on_highlight() {
-        let line = title_band("EDIT CLIENT", 60);
-        assert_eq!(row_cells(&line), 60, "band must fill 60 cells");
-        assert!(
-            line.spans
-                .iter()
-                .all(|s| s.style.bg == Some(T.bg_highlight)),
-            "every span carries bg_highlight"
+    fn title_band_fills_the_width_with_the_navigation_red_background() {
+        let line = title_band("Edit client", 60);
+        assert_eq!(row_cells(&line), 60);
+        assert_eq!(
+            line.style.bg,
+            Some(T.modal_heading_style(false).bg.unwrap())
         );
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.starts_with('\u{258c}'), "red tick leads the band");
-        assert!(text.contains("EDIT CLIENT"));
-    }
-
-    /// The tick is the single red accent this component owns. Nothing else
-    /// pinned its colour, so a red -> neutral regression would ship green.
-    #[test]
-    fn title_band_tick_is_brand_red() {
-        let line = title_band("EDIT CLIENT", 60);
-        let tick = &line.spans[0];
-        assert_eq!(tick.content.as_ref(), "\u{258c}");
-        assert_eq!(tick.style.fg, Some(T.brand_red));
+        assert_eq!(line.style.fg, Some(T.navigation_active_fg));
+        let text = flatten(std::slice::from_ref(&line));
+        assert!(text.starts_with("EDIT CLIENT"));
+        assert!(!text.contains('▌'));
     }
 
     #[test]
@@ -2598,86 +2687,140 @@ mod tests {
         assert!(text.contains('\u{2026}'), "overlong title gets an ellipsis");
     }
 
-    /// The description is static info, so it is teal — and it carries NO
-    /// background band, because the `bg_highlight` title band sits directly
-    /// above it and two stacked strips read as two selections.
     #[test]
-    fn desc_band_is_teal_on_the_modal_surface_and_fills_the_width() {
+    fn subtitle_band_fills_the_width_in_the_coordinated_red_tone() {
         let line = desc_band("Change the profile and metadata.", 60);
         assert_eq!(row_cells(&line), 60);
-        assert!(line.spans.iter().all(|s| s.style.bg.is_none()));
-        assert_eq!(line.spans[0].style.fg, Some(T.warden_teal));
+        assert_eq!(line.style.bg, Some(T.navigation_submenu_bg));
+        assert_eq!(line.style.fg, Some(T.text_primary));
     }
 
-    // ── desc_band2 — the twins ────────────────────────────────────────
-    //
-    // `desc_band` keeps all three tests above unchanged, including the one
-    // pinning the ABSENCE of a background: it did not change, and the three
-    // Archetype-C / catalog callers still want that variant. These are the
-    // opposite pins for the two-row variant.
-
-    /// The band's whole point: the description gets a strip of its own
-    /// under the title instead of sitting on the body surface.
-    ///
-    /// **Every span, both rows** — a `Span`'s background paints only its own
-    /// characters, so a band whose pad span carries no `bg` stops where the
-    /// sentence stops and still passes any check that samples the copy.
-    ///
-    /// `bg_main`, and the negative assertion below is the load-bearing one:
-    /// `bg_highlight` would make the heading one unbroken strip and put
-    /// teal at 3.37:1 against a 4.5:1 prose bar, which
-    /// `theme::contrast_gate_holds_for_every_text_pair` cannot see because
-    /// it does not enumerate that background. The
-    /// reasoning is on `desc_band2`.
     #[test]
-    fn desc_band2_paints_its_own_bg_main_strip_across_both_full_rows() {
-        let lines = desc_band2(["first line", "second"], 60);
-        for (i, line) in lines.iter().enumerate() {
-            assert_eq!(row_cells(line), 60, "row {i} does not fill the width");
-            assert!(
-                line.spans.iter().all(|s| s.style.bg == Some(T.bg_main)),
-                "row {i} has a span off the band: {:?}",
-                line.spans
-            );
-            assert!(
-                line.spans
-                    .iter()
-                    .all(|s| s.style.bg != Some(T.bg_highlight)),
-                "row {i} is on the title's bg_highlight — 3.37:1 prose, and \
-                 no gate covers the pair: {:?}",
-                line.spans
-            );
+    fn section_rule_uses_coloured_text_without_a_background_band() {
+        let [section, spacer] = section_band("Identity", 40);
+        let text = flatten(std::slice::from_ref(&section));
+        assert!(text.contains("IDENTITY") && text.contains('─'));
+        assert!(section.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(
+            spacer.spans.is_empty(),
+            "the section leaves one compact spacer row"
+        );
+    }
+
+    #[test]
+    fn selected_actions_are_compact_background_buttons_without_arrows() {
+        let line = action_row(
+            &[
+                Action::new("Cancel", false, ActionKind::Neutral, "discard"),
+                Action::new("Save", true, ActionKind::Primary, "write"),
+            ],
+            40,
+        );
+        let text = flatten(std::slice::from_ref(&line));
+        assert!(!text.contains('▌') && !text.contains('◀'));
+        let save = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Save"))
+            .expect("Save action is rendered");
+        assert_eq!(save.style.bg, Some(T.warden_teal));
+    }
+
+    #[test]
+    fn editable_value_focus_uses_blue_without_coloring_the_label() {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+        let area = Rect::new(0, 0, 50, 1);
+        let mut buffer = Buffer::empty(area);
+        value_row("Name", "Device", true, ValueKind::Editable, None, 50).render(area, &mut buffer);
+        assert_eq!(buffer[(2, 0)].bg, ratatui::style::Color::Reset);
+        assert_eq!(buffer[(VALUE_COL as u16, 0)].bg, T.info);
+        assert_eq!(buffer[(VALUE_COL as u16, 0)].fg, T.text_inverse);
+        value_row("Name", "Device", false, ValueKind::Editable, None, 50).render(area, &mut buffer);
+        assert_eq!(buffer[(VALUE_COL as u16, 0)].bg, T.bg_highlight);
+    }
+
+    #[test]
+    fn short_inline_forms_keep_their_actions_at_the_bottom() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut rows = FormRows::new("EDIT", "Details", 50);
+        rows.field(
+            value_row("Name", "Device", true, ValueKind::Editable, None, 50),
+            true,
+            "",
+        );
+        let tail = form_tail(
+            &rows,
+            None,
+            "",
+            "",
+            &[
+                Action::new("[Esc] Discard", false, ActionKind::Neutral, "").on_key(KeyCode::Esc),
+                Action::new("[Enter] Save", false, ActionKind::Primary, "").on_save(),
+            ],
+        );
+        let (body, _) = rows.finish(tail);
+        let mut terminal = Terminal::new(TestBackend::new(50, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_scroll_body(frame, frame.area(), &body);
+            })
+            .unwrap();
+        let last: String = (0..50)
+            .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+            .collect();
+        assert!(last.contains("Discard") && last.contains("Save"), "{last}");
+        assert!(!last.contains("[Esc]") && !last.contains("[Enter]"));
+    }
+
+    #[test]
+    fn both_subtitle_rows_fill_the_same_heading_band() {
+        for line in desc_band2(["First line", "Second"], 60) {
+            assert_eq!(row_cells(&line), 60);
+            assert_eq!(line.style.bg, Some(T.navigation_submenu_bg));
+            assert_eq!(line.style.fg, Some(T.text_primary));
         }
-        assert_eq!(lines[0].spans[0].style.fg, Some(T.warden_teal));
-        assert_eq!(lines[1].spans[0].style.fg, Some(T.warden_teal));
     }
 
-    /// The measurement the colour choice rests on, pinned so it cannot rot
-    /// into folklore. `theme::contrast_ratio` is the same function the
-    /// palette gate uses.
-    ///
-    /// This is the guard the gates do **not** provide: neither
-    /// `contrast_gate_holds_for_every_text_pair` (which does not enumerate
-    /// `bg_highlight`) nor `focus_bar_admits_only_high_contrast_foregrounds`
-    /// (a positive list that never names teal) would fail if this band were
-    /// moved back onto the title's background.
     #[test]
-    fn the_bands_background_clears_the_prose_bar_and_bg_highlight_would_not() {
-        use crate::tui::theme::contrast_ratio;
-        let chosen = contrast_ratio(T.warden_teal, T.bg_main).unwrap();
-        assert!(
-            chosen >= 4.5,
-            "desc_band2 copy is prose and must clear WCAG AA 4.5:1; \
-             bg_main gives {chosen:.2}:1"
-        );
-        // Guard the premise: if teal ever clears 4.5 on the focus bar, the
-        // choice above can be revisited. Until then it cannot.
-        let rejected = contrast_ratio(T.warden_teal, T.bg_highlight).unwrap();
-        assert!(
-            rejected < 4.5,
-            "teal now clears the prose bar on bg_highlight ({rejected:.2}:1) \
-             — revisit desc_band2's background"
-        );
+    fn all_palette_heading_pairs_meet_text_contrast() {
+        use crate::tui::theme::{self, CardRole, ThemePreset};
+        struct RestorePreset(ThemePreset);
+        impl Drop for RestorePreset {
+            fn drop(&mut self) {
+                theme::set_active(self.0);
+            }
+        }
+        let _restore = RestorePreset(theme::active_preset());
+        for preset in ThemePreset::ALL {
+            theme::set_active(preset);
+            for (fg, bg) in [
+                (
+                    T.navigation_active_fg,
+                    T.modal_heading_style(false).bg.unwrap(),
+                ),
+                (T.text_primary, T.navigation_submenu_bg),
+            ] {
+                assert!(
+                    theme::contrast_ratio(fg, bg).unwrap() >= 4.5,
+                    "{} modal heading contrast",
+                    preset.name()
+                );
+            }
+            for role in [CardRole::Summary, CardRole::Analytics, CardRole::History] {
+                assert!(
+                    theme::contrast_ratio(T.text_inverse, T.card_title_bg(role)).unwrap() >= 4.5,
+                    "{} {:?} title contrast",
+                    preset.name(),
+                    role
+                );
+                assert!(
+                    theme::contrast_ratio(T.text_primary, T.card_subtitle_bg(role)).unwrap() >= 4.5,
+                    "{} {:?} subtitle contrast",
+                    preset.name(),
+                    role
+                );
+            }
+        }
     }
 
     /// The row count comes from the spec, never from the width — the same
@@ -2733,16 +2876,9 @@ mod tests {
         );
     }
 
-    /// Every modal centres on the **anchor**, not the frame.
-    /// The anchor is the tab content area, so the header, the menu card and
-    /// the footer legend all stay visible beneath an open modal; centring on
-    /// `f.area()` would occlude them.
-    ///
-    /// *(This is an ecosystem-wide property, not one surface's: the
-    /// Devices form no longer anchors `render_chrome_in` over the list
-    /// column specifically — [`render_modal`] is now its only caller.)*
+    /// A modal over the list column keeps the adjacent detail visible.
     #[test]
-    fn render_chrome_in_centres_on_the_anchor_not_the_frame() {
+    fn modal_horizontal_center_uses_the_anchor_column() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -2758,6 +2894,41 @@ mod tests {
         // have been (100-40)/2 = 30.
         assert_eq!(inner.x, 11, "anchor, not frame, decides the centring");
         assert_eq!(inner.width, 38);
+    }
+
+    #[test]
+    fn modal_centers_vertically_on_the_terminal_within_content_bounds() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(164, 46)).unwrap();
+        terminal
+            .draw(|frame| {
+                let inner = render_chrome_in(
+                    frame,
+                    Rect::new(0, 7, 164, 37),
+                    68,
+                    26,
+                    "",
+                    T.text_primary,
+                    true,
+                );
+                assert_eq!(inner.y, 11);
+            })
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let inner = render_chrome_in(
+                    frame,
+                    Rect::new(0, 4, 80, 18),
+                    68,
+                    26,
+                    "",
+                    T.text_primary,
+                    true,
+                );
+                assert!(inner.y >= 5 && inner.bottom() <= 21);
+            })
+            .unwrap();
     }
 
     /// With `title_in_band` the border must carry no title — the caller
@@ -2816,6 +2987,108 @@ mod tests {
     /// either way. This used to be an instruction in `will_scroll`'s doc
     /// that every caller had to remember.
     #[test]
+    fn modal_padding_aligns_headings_sections_labels_and_pointer_targets() {
+        use crate::tui::mouse::{self, MouseAction};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        for height in [12, 32] {
+            let mut app = crate::tui::app::App::new();
+            app.devices.inspect_open = true;
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            let mut content = Rect::default();
+            let mut field_y = 0;
+            terminal
+                .draw(|f| {
+                    let rendered = render_modal(f, f.area(), 64, |width| {
+                        let mut rows = FormRows::new("TITLE", "Description", width);
+                        rows.section("SECTION");
+                        rows.text_field(
+                            value_row("Name", "typed", true, ValueKind::Editable, None, width),
+                            true,
+                            "",
+                            5,
+                        );
+                        let actions =
+                            [Action::new("Save", true, ActionKind::Primary, "").on_save()];
+                        let tail = form_tail(&rows, None, "", "", &actions);
+                        rows.finish(tail)
+                    });
+                    content = rendered.inner;
+                    if let Some((row, caret)) = rendered.cursor {
+                        field_y =
+                            content.y + (rendered.view.head_h + row - rendered.view.offset) as u16;
+                        rendered.place_cursor(f, row, VALUE_COL as u16 + caret);
+                    }
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(content.x, 10);
+            assert_eq!(content.width, 60);
+            assert_eq!(buffer[(content.x, content.y)].symbol(), "T");
+            assert_eq!(buffer[(content.x - 1, content.y)].symbol(), " ");
+            assert_eq!(
+                buffer[(content.x - 1, content.y)].bg,
+                T.modal_heading_style(false).bg.unwrap()
+            );
+            assert_eq!(
+                buffer[(content.right(), content.y)].bg,
+                T.modal_heading_style(false).bg.unwrap()
+            );
+            assert_eq!(buffer[(content.x, field_y)].symbol(), "N");
+            assert_eq!(buffer[(content.x - 1, field_y)].bg, T.bg_elevated);
+            assert_eq!(buffer[(content.x + VALUE_COL as u16, field_y)].bg, T.info);
+            assert_eq!(
+                terminal.get_cursor_position().unwrap().x,
+                content.x + VALUE_COL as u16 + 5
+            );
+            let click = |x, y| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(
+                mouse::action(&app, click(content.x, field_y)),
+                Some(MouseAction::OverlayField(0))
+            );
+            assert_eq!(mouse::action(&app, click(content.x - 1, field_y)), None);
+        }
+    }
+
+    #[test]
+    fn close_footer_only_activates_its_painted_button() {
+        use crate::tui::mouse::{self, MouseAction};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = crate::tui::app::App::new();
+        app.devices.inspect_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        let mut footer = Rect::default();
+        terminal
+            .draw(|f| {
+                let surface = render_chrome_in(f, f.area(), 32, 12, "", T.text_primary, true);
+                let content = render_header(f, surface, "DETAILS", "Description");
+                footer = Rect::new(content.x, content.bottom() - 1, content.width, 1);
+                close_footer(f, content);
+            })
+            .unwrap();
+        let click = |x| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: footer.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let close = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            mouse::action(&app, click(footer.right() - 2)),
+            Some(MouseAction::OverlayKey(close))
+        );
+        assert_eq!(mouse::action(&app, click(footer.right())), None);
+        assert_eq!(mouse::action(&app, click(footer.x)), None);
+    }
+
+    #[test]
     fn render_modal_rebuilds_narrower_only_when_the_field_region_scrolls() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -2826,6 +3099,8 @@ mod tests {
             widths.borrow_mut().push(w);
             (
                 ScrollBody {
+                    action_hits: Vec::new(),
+                    field_hits: Vec::new(),
                     head: vec![Line::from("HEAD")],
                     fields: (0..20).map(|i| Line::from(format!("F{i}"))).collect(),
                     tail: vec![Line::from("BUTTONS")],
@@ -2842,7 +3117,7 @@ mod tests {
             render_modal(f, f.area(), 64, build);
         })
         .unwrap();
-        assert_eq!(*widths.borrow(), vec![62], "no scroll → one pass");
+        assert_eq!(*widths.borrow(), vec![60], "no scroll → one pass");
 
         // Clamped to a short anchor → scrolls → rebuilt one narrower.
         widths.borrow_mut().clear();
@@ -2853,7 +3128,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             *widths.borrow(),
-            vec![62, 61],
+            vec![60, 59],
             "scroll → second pass reserves the scrollbar column"
         );
     }
@@ -2975,7 +3250,7 @@ mod tests {
         let all = flatten(&[body.head.clone(), body.fields.clone(), body.tail.clone()].concat());
         assert!(!all.contains('\u{2502}'), "no grid separator:\n{all}");
         assert!(!all.contains('\u{252c}') && !all.contains('\u{2534}'));
-        assert!(all.contains("Delete list") && all.contains("privacy-ads"));
+        assert!(all.contains("DELETE LIST") && all.contains("privacy-ads"));
         assert!(all.contains("Cancel"), "action row present");
     }
 
@@ -3018,7 +3293,7 @@ mod tests {
             "prose scrolls when nothing else does"
         );
         assert_eq!(read_only.focus_row, None);
-        assert!(flatten(&read_only.head).contains("Pick one"));
+        assert!(flatten(&read_only.head).contains("PICK ONE"));
     }
 
     #[test]
@@ -3027,21 +3302,15 @@ mod tests {
         let cells: usize = focused
             .spans
             .iter()
-            .map(|s| s.content.chars().count())
+            .map(|s| crate::tui::text::width(&s.content))
             .sum();
         assert_eq!(cells, 60, "a focused row fills the width");
-        assert!(
-            focused
-                .spans
-                .iter()
-                .any(|s| s.content.as_ref() == "\u{258c}" && s.style.fg == Some(T.emerald_ping)),
-            "emerald rule leads a focused option"
-        );
         let text = flatten(std::slice::from_ref(&focused));
-        assert!(
-            text.ends_with(" \u{25c0}"),
-            "marker closes the row: {text:?}"
-        );
+        assert!(!text.contains('▌') && !text.contains('◀'));
+        assert!(focused
+            .spans
+            .iter()
+            .all(|span| span.style.bg == Some(T.info)));
 
         let at_rest = choice_line(&choice("Delete", None, false), 60);
         assert!(
@@ -3064,7 +3333,7 @@ mod tests {
         assert!(text.contains("aaaa"), "detail must survive, cut: {text}");
         assert!(text.ends_with('\u{2026}'), "the cut is announced: {text}");
         assert!(
-            text.chars().count() <= 30,
+            crate::tui::text::width(&text) <= 30,
             "the row still fits its width: {text}"
         );
         assert!(
@@ -3153,7 +3422,7 @@ mod tests {
             "action row must stay pinned:\n{out}"
         );
         assert!(
-            out.contains("Delete list"),
+            out.contains("DELETE LIST"),
             "title must stay pinned:\n{out}"
         );
     }
@@ -3481,7 +3750,11 @@ mod tests {
         let row = ProseRow::verbatim("z".repeat(253), ValueKind::Identity);
         for w in [61u16, 62] {
             for line in prose_rows(&row, w) {
-                let cells: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                let cells: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| crate::tui::text::width(&s.content))
+                    .sum();
                 assert!(
                     cells <= w as usize,
                     "verbatim line is {cells} cells against an interior of {w}"
@@ -3582,13 +3855,13 @@ mod tests {
             !rendered.contains('\u{2026}'),
             "a note must wrap, not ellipsise: {rendered:?}"
         );
-        // Undo the wrap by stripping each note row's 4-cell indent — a
+        // Undo the wrap by stripping each note row's 2-cell indent — a
         // chunk boundary can fall mid-word, so re-splitting on whitespace
         // would not reconstruct the original.
         let joined: String = rendered
             .lines()
             .skip(1)
-            .map(|l| l.strip_prefix("    ").unwrap_or(l))
+            .map(|l| l.strip_prefix("  ").unwrap_or(l))
             .collect();
         assert_eq!(
             joined, text,
@@ -3662,10 +3935,10 @@ mod tests {
                 "value_row clipped without a tell (focused={focused}): {text:?}"
             );
             assert!(
-                text.chars().count() <= 62,
+                crate::tui::text::width(&text) <= 62,
                 "value_row overran the interior (focused={focused}): \
                  {} cells",
-                text.chars().count()
+                crate::tui::text::width(&text)
             );
         }
     }

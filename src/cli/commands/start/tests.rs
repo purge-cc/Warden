@@ -4,6 +4,216 @@ use std::collections::BTreeMap;
 use crate::config::schema::{ConfigV1, Profile};
 use crate::config::settings::DnssecMode;
 
+#[test]
+fn node_rename_is_live_but_identity_change_requires_restart() {
+    let mut config = ConfigV1::test_scaffold();
+    config.node.ensure_identity().unwrap();
+    let baseline = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+    config.node.name = Some("renamed node".into());
+    assert_eq!(
+        baseline,
+        RestartOnlyRuntimeFingerprint::from_config(&config).unwrap()
+    );
+    config.node.id = Some(crate::config::schema::node::generate_node_id().unwrap());
+    assert_eq!(
+        baseline.changed_sections(&RestartOnlyRuntimeFingerprint::from_config(&config).unwrap()),
+        ["node identity"]
+    );
+}
+
+#[test]
+fn node_control_listener_change_requires_restart() {
+    let mut config = ConfigV1::test_scaffold();
+    let baseline = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+    config.node.control_listen = Some("127.0.0.1:8443".parse().unwrap());
+    assert_eq!(
+        baseline.changed_sections(&RestartOnlyRuntimeFingerprint::from_config(&config).unwrap()),
+        ["node control listener"]
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn modern_ip_only_primary_keeps_periodic_manager_and_reloadable_ip_policy() {
+    let mut config = ConfigV1::test_scaffold();
+    config.cluster.enabled = true;
+    config.cluster.membership_version = Some(1);
+    config.cluster.role = crate::config::schema::ClusterRole::Primary;
+    config.ip_blocklists.enabled = true;
+    config.ip_blocklists.sources = vec!["https://list.example.test/ips".into()];
+    assert!(modern_primary_auxiliary(&config));
+    let baseline = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+    config.ip_blocklists.inline.push("192.0.2.1".into());
+    assert_eq!(
+        baseline,
+        RestartOnlyRuntimeFingerprint::from_config(&config).unwrap()
+    );
+    config.cluster.role = crate::config::schema::ClusterRole::Secondary;
+    assert!(!modern_primary_auxiliary(&config));
+}
+
+#[test]
+fn restart_only_fingerprint_tracks_only_boot_built_runtime_sections() {
+    let mut config = ConfigV1::test_scaffold();
+    let baseline = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+
+    config.upstream.timeout_ms += 1;
+    config.server.allow_from.push("127.0.0.0/8".into());
+    config.server.enforce_device_mac = !config.server.enforce_device_mac;
+    config.tracking.query_log_enabled = !config.tracking.query_log_enabled;
+    config.api.token_hash = Some("replacement".into());
+    config.security.rrl.responses_per_second += 1;
+    config.security.rate_limit.burst += 1;
+    config.security.tunneling.window_secs += 1;
+    let hot_reloadable = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+    assert_eq!(baseline, hot_reloadable);
+
+    config.server.tcp_timeout_secs += 1;
+    config.custom_list_limits.max_file_bytes += 1;
+    config.cache.max_entries += 1;
+    config.tracking.top_n_limit += 1;
+    config.socket.path.push("replacement");
+    config.api.metrics_enabled = !config.api.metrics_enabled;
+    config.local_dns.ttl_secs += 1;
+    config.ip_blocklists.enabled = !config.ip_blocklists.enabled;
+    config.anti_bypass.enabled = !config.anti_bypass.enabled;
+    config.security.rrl.enabled = !config.security.rrl.enabled;
+    config.resource_budget.tick_secs += 1;
+    config.cluster.enabled = !config.cluster.enabled;
+    let restart_only = RestartOnlyRuntimeFingerprint::from_config(&config).unwrap();
+    assert_eq!(
+        baseline.changed_sections(&restart_only),
+        [
+            "server startup fields",
+            "custom_list_limits",
+            "cache",
+            "tracking runtime",
+            "socket",
+            "api runtime",
+            "local_dns",
+            "ip_blocklists",
+            "anti_bypass",
+            "security enabled flags",
+            "resource_budget",
+            "cluster",
+        ]
+    );
+}
+
+#[cfg(not(feature = "cluster"))]
+fn test_compile_admission() -> Arc<crate::operator_rules::PolicyCandidateRuntime> {
+    Arc::new(crate::operator_rules::PolicyCandidateRuntime::new(
+        crate::filter::operator_rules::CompileAdmission::new(
+            RuleCompileLimits::HARD_CEILINGS.max_compiled_bytes_total * 2,
+            1,
+        )
+        .unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn failed_dns_bind_does_not_attest_the_runtime_capability() {
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    std::fs::write(&master, runtime_gate_master("[]", 5_000_000, false)).unwrap();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config =
+        crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .config;
+    config.server.listen = occupied.local_addr().unwrap();
+    let pid_file = root.path().join("daemon.pid");
+    let lease = crate::config::runtime_lease::acquire_for_daemon(&master).unwrap();
+
+    let error = run_start(
+        &config,
+        &crate::config::custom_list::CustomListStore::new(),
+        &master,
+        &pid_file,
+        None,
+        lease,
+        RuntimeCapabilityAttestation::AuthoritativeSchema5Tree,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AddrInUse),
+        "{error:#}"
+    );
+    let error = crate::config::runtime_lease::acquire_for_offline_operation(&master).unwrap_err();
+    assert!(error.to_string().contains("LeaseCapabilityMissing"));
+}
+
+#[test]
+fn safe_mode_dns_ready_does_not_attest_the_authoritative_tree() {
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("missing.toml");
+    let lease = crate::config::runtime_lease::acquire_for_daemon(&master).unwrap();
+
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = tcp.local_addr().unwrap();
+    let udp = std::net::UdpSocket::bind(address).unwrap();
+    attest_runtime_capability_after_dns_ready(
+        &lease,
+        RuntimeCapabilityAttestation::Disabled,
+        safe_mode_config().schema_version,
+    )
+    .unwrap();
+    drop((tcp, udp, lease));
+
+    let error = crate::config::runtime_lease::acquire_for_offline_operation(&master).unwrap_err();
+    assert!(error.to_string().contains("LeaseCapabilityMissing"));
+}
+
+#[test]
+fn policy_recovery_runs_before_config_validation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    std::fs::write(&master, b"[broken").unwrap();
+    let fence = root
+        .path()
+        .join(crate::config::migration_journal::TXN_DIR_NAME);
+    std::fs::create_dir(&fence).unwrap();
+    std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = fence.join("format2.setup");
+    std::fs::write(&marker, b"2\n").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(crate::config::loader::load_config(&master, time::OffsetDateTime::UNIX_EPOCH).is_err());
+    recover_policy_transaction_before_load(&master).unwrap();
+
+    assert!(!fence.exists());
+    assert!(crate::config::loader::load_config(&master, time::OffsetDateTime::UNIX_EPOCH).is_err());
+}
+
+#[test]
+fn unresolved_legacy_recovery_refuses_startup_without_loading_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    let original = b"[broken";
+    std::fs::write(&master, original).unwrap();
+    let fence = root
+        .path()
+        .join(crate::config::migration_journal::TXN_DIR_NAME);
+    std::fs::create_dir(&fence).unwrap();
+    std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = recover_policy_transaction_before_load(&master)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("v3-to-v4 migration"), "{error}");
+    assert!(fence.exists());
+    assert_eq!(std::fs::read(&master).unwrap(), original);
+}
+
 // ── shared list-manager wiring ───────────────────────────────────
 
 fn wiring_blocklist(id: &str, url: &str, enabled: bool) -> crate::config::schema::Blocklist {
@@ -633,7 +843,7 @@ fn blocklist_flag_refusal_names_the_flag_and_the_replacement() {
     );
 }
 
-// start-01: a minimal, valid v1 master with a distinguishable `token_hash`
+// Minimal current-schema master with a distinguishable `token_hash`
 // and an empty list set, so a reload either (a) aborts at the secrets gate
 // before the auth-hash store, or (b) reaches the relocated store via the
 // empty-sources success path. Both arms avoid any network fetch.
@@ -642,7 +852,7 @@ fn write_reload_master(dir: &Path) -> PathBuf {
     let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "schema_version = 4\n\n\
+        "schema_version = 5\n\n\
          [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"default\"\n\
          allow_from = [\"10.0.0.0/24\"]\n\n\
          [api]\ntoken_hash = \"NEWHASH\"\n\n\
@@ -685,12 +895,15 @@ async fn reload_rejected_secrets_leaves_token_hash_unchanged() {
     let mut refresh_handle: Option<crate::lists::manager::ListManagerTask> = None;
     let mut current_files: Vec<PathBuf> = Vec::new();
     let mut current_hash: Option<String> = None;
+    let compile_admission = test_compile_admission();
 
     handle_reload(
         &config_path,
         &reqwest::Client::new(),
+        None,
         &filter,
         None,
+        &compile_admission,
         &mut refresh_handle,
         &mut None,
         &audit_writer,
@@ -747,12 +960,15 @@ async fn reload_accepted_rotates_token_hash() {
     let mut refresh_handle: Option<crate::lists::manager::ListManagerTask> = None;
     let mut current_files: Vec<PathBuf> = Vec::new();
     let mut current_hash: Option<String> = None;
+    let compile_admission = test_compile_admission();
 
     handle_reload(
         &config_path,
         &reqwest::Client::new(),
+        None,
         &filter,
         None,
+        &compile_admission,
         &mut refresh_handle,
         &mut None,
         &audit_writer,
@@ -793,10 +1009,12 @@ async fn reload_accepted_rotates_token_hash() {
 #[tokio::test]
 async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
     let dir = tempfile::tempdir().unwrap();
-    let (config_path, _) = load_fixture(
-        dir.path(),
-        &gate_master("[\"https://lists.example.invalid/a.txt\"]", 100_000, false),
-    );
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        runtime_gate_master("[\"https://lists.example.invalid/a.txt\"]", 100_000, false),
+    )
+    .unwrap();
     // The local proxy rejects catalog traffic; the injected worker must panic
     // before any list request, and the test never reaches a public network.
     let (addr, _) = spawn_connection_counter();
@@ -835,7 +1053,9 @@ async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
     let (notifications, _) = tokio::sync::broadcast::channel(8);
     let (_shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
+    let (_activation_tx, mut activation_rx) = mpsc::channel(1);
     reload_tx.send(Some(1234)).await.unwrap();
+    let compile_admission = test_compile_admission();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         PANIC_RELOAD_WORKER.scope(
@@ -843,13 +1063,16 @@ async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
             signal_loop(
                 &config_path,
                 &client,
+                None,
                 &filter,
                 None,
+                &compile_admission,
                 &mut refresh_handle,
                 &mut fingerprint,
                 false,
                 &mut shutdown_rx,
                 &mut reload_rx,
+                &mut activation_rx,
                 &audit_writer,
                 &mut files,
                 &mut hash,
@@ -862,6 +1085,8 @@ async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
                 std::marker::PhantomData,
                 None,
                 &mut None,
+                &mut None,
+                &mut std::marker::PhantomData,
             ),
         ),
     )
@@ -942,6 +1167,25 @@ fn load_fixture(dir: &Path, body: &str) -> (PathBuf, crate::config::schema::Conf
     (config_path, loaded.config)
 }
 
+#[cfg(not(feature = "cluster"))]
+fn load_runtime_fixture(dir: &Path, body: &str) -> (PathBuf, crate::config::schema::ConfigV1) {
+    let config_path = dir.join("config.toml");
+    std::fs::write(&config_path, body).unwrap();
+    let loaded =
+        crate::config::loader::load_current_config(&config_path, time::OffsetDateTime::now_utc())
+            .unwrap_or_else(|errors| {
+                panic!(
+                    "fixture must validate: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
+    (config_path, loaded.config)
+}
+
 /// A master with one list source, one admin allow rule, and one
 /// device referencing it. `extra_allow` appends a second rule id to
 /// the device so a caller can vary ONLY the device's allow set.
@@ -961,6 +1205,16 @@ fn gate_master(sources: &str, max_entries: u64, extra_allow: bool) -> String {
          [[admin_rules]]\nid = \"allow-two\"\nrule = \"@@||example.org^\"\n\n\
          [[devices]]\nid = \"pc-test\"\ndisplay_name = \"Test PC\"\n\
          ip = \"10.0.0.5\"\nallow_rules = {device_allow}\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
+    )
+}
+
+fn runtime_gate_master(sources: &str, max_entries: u64, block_all: bool) -> String {
+    format!(
+        "schema_version = 5\n\n\
+         [server]\nlisten = \"127.0.0.1:15353\"\ndefault_profile = \"default\"\n\n\
+         [lists]\nsources = {sources}\nmax_entries = {max_entries}\n\n\
+         [profiles.default]\ndisplay_name = \"Default\"\nblock_all = {block_all}\n\n\
+         [upstream]\nservers = [\"192.0.2.1:53\"]\n"
     )
 }
 
@@ -1609,7 +1863,7 @@ struct GateOutcome {
 /// which is how a real reload sees an operator's edit.
 #[cfg(not(feature = "cluster"))]
 async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> GateOutcome {
-    let (config_path, seed_cfg) = load_fixture(dir, seed_body);
+    let (config_path, seed_cfg) = load_runtime_fixture(dir, seed_body);
     let seed_fp =
         ListsFingerprint::from_config(&seed_cfg, &crate::config::secrets::Secrets::default(), dir);
     std::fs::write(&config_path, reload_body).unwrap();
@@ -1647,6 +1901,7 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
     let (notification_tx, _rx) = tokio::sync::broadcast::channel(8);
     let mut current_files: Vec<PathBuf> = Vec::new();
     let mut current_hash: Option<String> = None;
+    let compile_admission = test_compile_admission();
 
     // A gate that fails to fire falls through to
     // `fetch_catalog_or_fallback` (lists.purge.cc) and a full
@@ -1657,8 +1912,10 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
         handle_reload(
             &config_path,
             &reqwest::Client::new(),
+            None,
             &filter,
             None,
+            &compile_admission,
             &mut refresh_handle,
             &mut lists_fingerprint,
             &audit_writer,
@@ -1706,7 +1963,7 @@ async fn drive_gate_reload(dir: &Path, seed_body: &str, reload_body: &str) -> Ga
 #[tokio::test]
 async fn reload_with_identical_config_reuses_the_live_manager() {
     let dir = tempfile::tempdir().unwrap();
-    let body = gate_master(
+    let body = runtime_gate_master(
         "[\"https://lists.example.invalid/a.txt\"]",
         5_000_000,
         false,
@@ -1742,25 +1999,22 @@ async fn reload_with_identical_config_reuses_the_live_manager() {
     );
 }
 
-/// DoD #4 — the operator's real case, and the reason the gate is not
-/// built on the config tree hash. Adding an allow rule to a device
-/// moves the tree hash but nothing the list pipeline consumes, so
-/// the 9.9 M-domain rebuild must still be skipped. A hash gate would
-/// have left the incident's bug exactly where it was.
+/// A profile-policy change moves the tree hash but does not alter the external
+/// list pipeline, so the live list manager can be reused.
 #[cfg(not(feature = "cluster"))]
 #[tokio::test]
-async fn reload_after_a_device_allow_rule_change_reuses_the_live_manager() {
+async fn reload_after_a_profile_policy_change_reuses_the_live_manager() {
     let dir = tempfile::tempdir().unwrap();
     let src = "[\"https://lists.example.invalid/a.txt\"]";
-    let before = gate_master(src, 5_000_000, false);
-    let after = gate_master(src, 5_000_000, true);
+    let before = runtime_gate_master(src, 5_000_000, false);
+    let after = runtime_gate_master(src, 5_000_000, true);
     assert_ne!(before, after, "the fixture must actually differ on disk");
 
     let out = drive_gate_reload(dir.path(), &before, &after).await;
 
     assert!(
         out.refresh_alive,
-        "adding a device allow rule must not cost a blocklist rebuild"
+        "changing profile policy must not cost a blocklist rebuild"
     );
     assert!(
         out.cmd_tx_preserved,

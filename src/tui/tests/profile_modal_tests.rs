@@ -80,17 +80,68 @@ fn mk_profile() -> Profile {
 // ── Field navigation ──────────────────────────────────────────────
 
 #[test]
-fn add_form_cycles_four_fields() {
+fn add_form_cycles_the_complete_profile_draft() {
     let mut f = ProfileForm::new_add();
     assert_eq!(f.focused, FormField::Id);
     f.focus_next();
     assert_eq!(f.focused, FormField::DisplayName);
-    f.focus_next();
-    assert_eq!(f.focused, FormField::Submit);
-    f.focus_next();
-    assert_eq!(f.focused, FormField::Cancel, "Discard button is last");
-    f.focus_next();
-    assert_eq!(f.focused, FormField::Id, "Add form wraps after Cancel");
+    let fields = f.visible_fields();
+    assert!(fields.contains(&FormField::BlockResponse));
+    assert!(fields.contains(&FormField::Advanced));
+    assert!(!fields.contains(&FormField::EcsMode));
+    assert_eq!(fields[fields.len() - 2], FormField::Submit);
+    assert_eq!(fields[fields.len() - 1], FormField::Cancel);
+}
+
+#[test]
+fn advanced_toggle_controls_the_ecs_focus_ring_without_losing_drafts() {
+    let mut f = ProfileForm::new_add();
+    f.ecs_mode_idx = 2;
+    f.ecs_v4_input = "24".into();
+    f.focused = FormField::Advanced;
+
+    f.cycle_dropdown(true);
+    assert!(f.advanced_expanded);
+    assert!(f.visible_fields().contains(&FormField::EcsMode));
+    f.focused = FormField::EcsPrefixV4;
+    f.toggle_advanced();
+    assert!(!f.advanced_expanded);
+    assert_eq!(f.focused, FormField::Advanced);
+    assert!(!f.visible_fields().contains(&FormField::EcsPrefixV4));
+    assert_eq!(f.ecs_mode_idx, 2);
+    assert_eq!(f.ecs_v4_input, "24");
+
+    f.toggle_advanced();
+    let text = render_text(&f, 70);
+    assert!(text.contains("ECS") && text.contains("ecs prefix v4"));
+}
+
+#[test]
+fn existing_ecs_configuration_opens_advanced_for_attention() {
+    let f = ProfileForm::new_edit("kids", &mk_profile(), Vec::new(), Vec::new());
+    assert!(f.advanced_expanded);
+    assert!(f.visible_fields().contains(&FormField::EcsClear));
+
+    let profile = Profile {
+        ecs: None,
+        ..mk_profile()
+    };
+    let f = ProfileForm::new_edit("kids", &profile, Vec::new(), Vec::new());
+    assert!(!f.advanced_expanded);
+    assert!(!f.visible_fields().contains(&FormField::EcsMode));
+}
+
+#[test]
+fn collapsing_advanced_does_not_turn_an_unrelated_edit_into_an_ecs_patch() {
+    let mut f = ProfileForm::new_edit("kids", &mk_profile(), Vec::new(), Vec::new());
+    f.focused = FormField::Advanced;
+    f.toggle_advanced();
+    f.display_name = "Updated kids".into();
+
+    let patch = resolve_edit_patch(&f, f.original.as_ref().unwrap()).unwrap();
+    assert_eq!(patch.display_name.as_deref(), Some("Updated kids"));
+    assert!(patch.ecs.is_none());
+    assert_eq!(f.ecs_v4_input, "24");
 }
 
 #[test]
@@ -101,7 +152,7 @@ fn edit_form_cycles_head_then_every_list_then_tail_skipping_id() {
         FormField::BlockResponse,
         FormField::BlockedTtl,
         FormField::BlockAll,
-        FormField::AdminRules,
+        FormField::Advanced,
         FormField::EcsMode,
         FormField::EcsPrefixV4,
         FormField::EcsPrefixV6,
@@ -283,28 +334,13 @@ fn resolve_bad_ttl_returns_err() {
 }
 
 #[test]
-fn resolve_admin_rules_diff_computes_add_and_remove() {
+fn retired_admin_rule_buffer_never_emits_a_schema5_patch() {
     let mut modal = ProfileModal::open_edit("kids", &mk_profile(), vec![], vec![]);
     let form = modal.form_mut().unwrap();
     // snapshot is "rule-a, rule-b" → keep b, drop a, add c.
     form.admin_rules_input = "rule-b, rule-c".into();
     let patch = resolve_edit_patch(form, form.original.as_ref().unwrap()).unwrap();
-    let ar = patch.admin_rules.expect("admin_rules delta present");
-    assert_eq!(ar.add, vec!["rule-c"]);
-    assert_eq!(ar.remove, vec!["rule-a"]);
-}
-
-#[test]
-fn resolve_admin_rules_dedups_typed_duplicates() {
-    let mut modal = ProfileModal::open_edit("kids", &mk_profile(), vec![], vec![]);
-    let form = modal.form_mut().unwrap();
-    // Operator types the same new id twice; the add delta must carry
-    // it exactly once, not emit a duplicate into the patch.
-    form.admin_rules_input = "rule-a, rule-b, rule-c, rule-c".into();
-    let patch = resolve_edit_patch(form, form.original.as_ref().unwrap()).unwrap();
-    let ar = patch.admin_rules.expect("admin_rules delta present");
-    assert_eq!(ar.add, vec!["rule-c"]);
-    assert!(ar.remove.is_empty());
+    assert!(patch.admin_rules.is_none());
 }
 
 // ── plp §4 S4: the per-list override delta ────────────────────────
@@ -942,7 +978,6 @@ fn add_form_renders_section_band_cursor_target_and_actions() {
         !text.contains("Field") && !text.contains("Value"),
         "the legacy grid header is gone:\n{text}"
     );
-    assert!(text.contains('◀'), "active row carries the focus marker");
     assert!(text.contains("Save"), "Save action present");
     assert!(text.contains("Discard"), "Discard action present");
 
@@ -954,6 +989,34 @@ fn add_form_renders_section_band_cursor_target_and_actions() {
          band's header + hairline; §4.65 UX1(c)'s 2 blurb rows that \
          used to sit under them are gone as of 2026-08-07) at the end \
          of `kids`"
+    );
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| render_overlay(f, f.area(), &modal)).unwrap();
+    let cursor = term.get_cursor_position().unwrap();
+    let buf = term.backend().buffer();
+    let screen = dump_buffer(buf);
+    let cursor_row: String = (0..buf.area.width)
+        .map(|x| buf[(x, cursor.y)].symbol())
+        .collect();
+    assert!(
+        cursor_row.contains("id") && cursor_row.contains("kids"),
+        "the hardware cursor must remain on the focused id row:\n{screen}"
+    );
+    assert_eq!(
+        buf[(cursor.x, cursor.y)].bg,
+        crate::tui::theme::T.info,
+        "the cursor cell must retain the focused-row background"
+    );
+    assert!(
+        screen.contains("Save"),
+        "Save action must remain visible:\n{screen}"
+    );
+    assert!(
+        screen.contains("Discard"),
+        "Discard action must remain visible:\n{screen}"
     );
 }
 
@@ -1282,7 +1345,7 @@ fn floor_edit_keeps_the_action_row_and_the_focused_field_on_screen() {
         (FormField::BlockResponse, "block response"),
         (FormField::BlockedTtl, "blocked ttl"),
         (FormField::BlockAll, "block all"),
-        (FormField::AdminRules, "admin rules"),
+        (FormField::Advanced, "advanced"),
         (FormField::EcsMode, "ecs mode"),
         (FormField::EcsPrefixV4, "ecs prefix v4"),
         (FormField::EcsPrefixV6, "ecs prefix v6"),
@@ -1352,63 +1415,44 @@ fn floor_add_keeps_the_action_row_and_the_focused_field_on_screen() {
     }
 }
 
-/// §4.65 UX1(b): the operator asked why Add shows only the name. It now
-/// shows the whole shape of a profile — and every row the Add wire
-/// cannot carry says so instead of taking input it would drop.
-///
-/// `IpcCommand::ProfileCreate` carries `id` + `display_name` and
-/// nothing else, so a widened focus ring would reproduce §4.64 G4's
-/// defect: a field the operator fills and the submit path discards in
-/// silence. Both halves are asserted — the sections are **there**, and
-/// the ring is **not** widened.
 #[test]
-fn add_shows_every_section_and_offers_none_it_cannot_carry() {
-    let modal = ProfileModal::open_add();
+fn add_exposes_and_resolves_the_complete_current_profile_draft() {
+    let mut modal = ProfileModal::open_add_full(mk_lists(), mk_custom_lists());
+    let form = modal.form_mut().unwrap();
+    form.id = "new-profile".into();
+    form.block_all = true;
+    form.focused = FormField::ListOverride(0);
+    form.cycle_list_policy(true);
+    form.focused = FormField::CustomListMount(0);
+    form.toggle_custom_list_mount();
+    let (id, display_name) = form.try_resolve_add().unwrap();
+    let patch = resolve_add_patch(form, &id, &display_name).unwrap();
+    assert_eq!(patch.block_all, Some(true));
+    assert!(patch.lists.is_some());
+    assert!(patch.custom_lists.is_some());
+
     let form = modal.form().unwrap();
     let text = render_text(form, 62);
 
-    for section in ["IDENTITY", "BLOCKING", "POLICY", "ECS"] {
+    for section in ["IDENTITY", "BLOCKING", "ADVANCED", "LISTS", "CUSTOM LISTS"] {
         assert!(
             text.contains(section),
             "Add must show the {section} section:\n{text}"
         );
     }
-    for label in [
-        "block response",
-        "blocked ttl",
-        "block all",
-        "admin rules",
-        "ecs mode",
-        "clear ecs",
-    ] {
+    assert!(
+        !text.contains("ecs mode")
+            && !text.contains("ecs prefix v4")
+            && !text.contains("ecs prefix v6")
+            && !text.contains("clear ecs"),
+        "ECS controls stay collapsed by default:\n{text}"
+    );
+    for label in ["block response", "blocked ttl", "block all"] {
         assert!(text.contains(label), "Add must name {label}:\n{text}");
     }
-    assert_eq!(
-        text.matches("set after creating").count(),
-        8,
-        "every row the Add wire cannot carry, and that a later Edit \
-         CAN, states when it becomes available:\n{text}"
-    );
-    // The two Policy rows Edit cannot set either keep Edit's copy: a
-    // row that will never be editable here must not promise it will.
-    assert_eq!(
-        text.matches("read-only here").count(),
-        2,
-        "local records / rewrite rules are read-only on both forms, \
-         so Add must not say they arrive with the next Edit:\n{text}"
-    );
-
-    // The ring is what decides whether a value can be typed and lost.
-    assert_eq!(
-        FormField::ADD_FIELDS,
-        [
-            FormField::Id,
-            FormField::DisplayName,
-            FormField::Submit,
-            FormField::Cancel,
-        ],
-        "widening the Add focus ring puts a field in reach that \
-         ProfileCreate cannot transport"
+    assert!(
+        !text.contains("admin rules"),
+        "retired schema surface returned:\n{text}"
     );
 }
 
@@ -1469,7 +1513,10 @@ fn the_heading_explains_the_form_and_no_section_repeats_it() {
         ),
     ] {
         let form = modal.form().unwrap();
-        let text = render_text(form, 62);
+        // The modal's narrow rendering pass supplies 67 cells: 70 columns,
+        // two for chrome and one for the scrollbar. Both frozen description
+        // rows fit that pass, including the two-cell band indent.
+        let text = render_text(form, MODAL_W - 3);
         let (_, desc) = band_text(form);
 
         for line in desc {
@@ -1621,7 +1668,7 @@ fn floor_modal_stays_inside_the_content_rect() {
         "row 23 is the footer legend's and must be untouched:\n{dump}"
     );
     assert!(
-        rows[9].contains('\u{256d}') && rows[22].contains('\u{2570}'),
+        rows[9].contains('\u{250c}') && rows[22].contains('\u{2514}'),
         "the frame occupies exactly the anchor's 14 rows:\n{dump}"
     );
 }
@@ -1633,15 +1680,18 @@ fn floor_modal_stays_inside_the_content_rect() {
 /// instead of quietly asserting about `EcsClear`.
 #[test]
 fn viewport_follows_focus_to_the_last_field() {
-    let last_add = *FormField::ADD_FIELDS
+    let mut modal = ProfileModal::open_add_full(mk_lists(), mk_custom_lists());
+    let last_add = *modal
+        .form()
+        .unwrap()
+        .visible_fields()
         .iter()
         .rfind(|f| !matches!(f, FormField::Submit | FormField::Cancel))
         .unwrap();
-    assert_eq!(last_add, FormField::DisplayName);
-    let mut modal = ProfileModal::open_add();
+    assert_eq!(last_add, FormField::CustomListMount(1));
     modal.form_mut().unwrap().focused = last_add;
     let dump = render_at_floor(&modal);
-    assert!(dump.contains("display name"), "Add's last row:\n{dump}");
+    assert!(dump.contains("home-exceptions"), "Add's last row:\n{dump}");
 
     let mut modal = ProfileModal::open_edit("kids", &mk_profile(), mk_lists(), mk_custom_lists());
     let last_edit = *modal
@@ -1846,6 +1896,120 @@ async fn press(app: &mut crate::tui::app::App, code: crossterm::event::KeyCode) 
     crate::tui::handle_profile_modal_key(app, key, &dead_poller(), dead_cfg()).await;
 }
 
+#[tokio::test]
+async fn allow_consent_refusal_is_readable_and_returns_to_the_unsaved_profile() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for back in [KeyCode::Enter, KeyCode::Esc] {
+        let mut app = mount_app(mk_profile());
+        let modal = app.profiles.modal.as_mut().unwrap();
+        let form = modal.form_mut().unwrap();
+        form.display_name = "Edited profile".into();
+        form.focused = FormField::ListOverride(2);
+        form.lists_draft
+            .insert(Id::new("social").unwrap(), ListPolicy::Allow);
+        form.custom_lists_draft.insert(Id::new("handheld").unwrap());
+        let pending = resolve_edit_patch(form, form.original.as_ref().unwrap()).unwrap();
+        let refusal = crate::ipc::errors::IpcError::OverrideAllowNeedsConsent {
+            id: "kids".into(),
+            list: "social".into(),
+        }
+        .operator_message();
+        modal.fail(refusal.clone());
+        let first = render_at_floor(modal);
+        assert!(first.contains("↑/↓ scroll"), "{first}");
+        assert!(first.contains("Back to editor"), "{first}");
+        assert!(!first.contains("run in the CLI to read it all"), "{first}");
+        let Stage::ReviewingError(review) = &modal.stage else {
+            panic!("a long submit error must open its scrollable details");
+        };
+        let steps = review.max_scroll.get();
+        assert!(steps > 0, "the fixture must overflow at 80×24");
+
+        let mut seen = first.clone();
+        for step in 0..steps {
+            press(&mut app, KeyCode::Down).await;
+            let page = render_at_floor(app.profiles.modal.as_ref().unwrap());
+            if step == 0 {
+                assert_ne!(page, first, "the first Down must move the viewport");
+            }
+            assert!(page.contains("Back to editor"), "{page}");
+            seen.push_str(&page);
+        }
+        for word in refusal.split_whitespace() {
+            assert!(
+                seen.contains(word),
+                "missing {word:?} from scrollable refusal"
+            );
+        }
+        assert!(seen.contains("--accept-unsigned-allow"));
+
+        press(&mut app, KeyCode::Home).await;
+        assert_eq!(render_at_floor(app.profiles.modal.as_ref().unwrap()), first);
+        press(&mut app, KeyCode::End).await;
+        let end = render_at_floor(app.profiles.modal.as_ref().unwrap());
+        assert!(end.contains("allows it."), "{end}");
+        press(&mut app, KeyCode::Up).await;
+        assert_ne!(render_at_floor(app.profiles.modal.as_ref().unwrap()), end);
+
+        // The form-wide save chord must not submit while reading the error.
+        crate::tui::handle_profile_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &dead_poller(),
+            dead_cfg(),
+        )
+        .await;
+        assert!(matches!(
+            app.profiles.modal.as_ref().unwrap().stage,
+            Stage::ReviewingError(_)
+        ));
+
+        press(&mut app, back).await;
+        let form = form_of(&app);
+        assert_eq!(form.focused, FormField::ListOverride(2));
+        assert_eq!(
+            resolve_edit_patch(form, form.original.as_ref().unwrap()).unwrap(),
+            pending
+        );
+        assert!(form.error_message.is_none());
+        assert!(!form.lists_snapshot[2].accept_unsigned_allow);
+    }
+}
+
+#[test]
+fn short_profile_validation_errors_stay_inline() {
+    let mut modal = ProfileModal::open_add();
+    modal.form_mut().unwrap().display_name = "Unsaved name".into();
+    modal.fail("id is required".into());
+    let form = modal.form().expect("short errors keep the editor visible");
+    assert_eq!(form.display_name, "Unsaved name");
+    assert_eq!(form.error_message.as_deref(), Some("id is required"));
+}
+
+#[test]
+fn ecs_submit_error_opens_advanced_and_preserves_the_draft() {
+    let mut modal = ProfileModal::open_add();
+    {
+        let form = modal.form_mut().unwrap();
+        form.ecs_v4_input = "invalid".into();
+        form.advanced_expanded = false;
+    }
+    modal.fail("source_prefix_v4 must be an integer".into());
+    let form = modal.form().expect("short errors keep the editor visible");
+    assert!(form.advanced_expanded);
+    assert!(form.visible_fields().contains(&FormField::EcsPrefixV4));
+    assert_eq!(form.ecs_v4_input, "invalid");
+}
+
+#[test]
+fn profile_error_details_account_for_the_inline_warning_prefix() {
+    let mut modal = ProfileModal::open_add();
+    let error = "x".repeat(3 * 65);
+    modal.fail(error);
+    assert!(matches!(modal.stage, Stage::ReviewingError(_)));
+}
+
 fn form_of(app: &crate::tui::app::App) -> &ProfileForm {
     match &app.profiles.modal.as_ref().unwrap().stage {
         Stage::EditingForm(f) => f,
@@ -1990,6 +2154,24 @@ fn an_empty_mount_panel_points_at_the_leaf_that_fills_it() {
     assert!(
         dump.contains(CUSTOM_LIST_PANEL_EMPTY),
         "the pointer survives the row's width budget:\n{dump}"
+    );
+}
+
+#[test]
+fn an_unavailable_catalog_is_not_claimed_to_be_known_empty() {
+    let mut modal = ProfileModal::open_edit("kids", &mk_profile(), mk_lists(), Vec::new());
+    let Stage::EditingForm(form) = &mut modal.stage else {
+        panic!("edit form")
+    };
+    form.custom_lists_available = false;
+    let dump = render_text(form, 80);
+    assert!(
+        dump.contains(CUSTOM_LIST_CATALOG_UNAVAILABLE),
+        "the unavailable state must be explicit:\n{dump}"
+    );
+    assert!(
+        !dump.contains(CUSTOM_LIST_PANEL_EMPTY),
+        "an unread catalogue must not be advertised as empty:\n{dump}"
     );
 }
 

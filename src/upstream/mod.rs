@@ -15,6 +15,7 @@ pub mod dot;
 pub mod forwarding;
 pub mod plain;
 pub mod plain_raw;
+pub mod reloadable;
 pub mod resolver;
 /// Pure, I/O-free shape validation for upstream server strings, shared by the
 /// transport constructors (boot) and `config lint`. See the module doc for
@@ -25,10 +26,13 @@ use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode}
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rand_core::RngCore;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::dns::edns::EdnsClientSubnet;
 use crate::dns::error::DnsError;
 
+pub use reloadable::{PreparedUpstream, ReloadableUpstream, UpstreamStatusSnapshot};
 pub use resolver::UpstreamResolver;
 
 // ── Upstream trait ─────────────────────────────────────────────
@@ -74,6 +78,10 @@ pub trait Upstream: Send + Sync {
 pub struct UpstreamResponse {
     pub records: Vec<Record>,
     pub response_code: ResponseCode,
+    /// Identity of the reloadable upstream generation that produced this
+    /// answer. Direct upstream implementations and test doubles leave it
+    /// `None`; the daemon facade stamps every response.
+    pub generation: Option<UpstreamGenerationStamp>,
     /// SOA-derived negative TTL hint from the authority section, per RFC 2308.
     /// `min(soa_record.ttl(), soa.minimum())` when an SOA is present — the
     /// cache uses this as a floor for negative-cache TTL. `None` for positive
@@ -89,6 +97,62 @@ pub struct UpstreamResponse {
     /// [`ChainFetcher`]: crate::dnssec::ChainFetcher
     #[cfg(feature = "dnssec")]
     pub authority: Vec<Record>,
+}
+
+/// A cacheable proof of which reloadable upstream generation produced an
+/// answer, plus a cheap off-hot-path current-generation check.
+#[derive(Clone)]
+pub struct UpstreamGenerationStamp {
+    id: u64,
+    current: Arc<AtomicU64>,
+    #[cfg(feature = "dnssec")]
+    dnssec_validator: Option<Arc<crate::dns::dnssec_validator::DnssecValidator>>,
+}
+
+impl UpstreamGenerationStamp {
+    pub(crate) fn new(
+        id: u64,
+        current: Arc<AtomicU64>,
+        #[cfg(feature = "dnssec")] dnssec_validator: Option<
+            Arc<crate::dns::dnssec_validator::DnssecValidator>,
+        >,
+    ) -> Self {
+        Self {
+            id,
+            current,
+            #[cfg(feature = "dnssec")]
+            dnssec_validator,
+        }
+    }
+
+    /// True while this stamp still names the facade's active generation.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.current.load(Ordering::Acquire) == self.id
+    }
+
+    /// Validator owned by the generation that produced the answer.
+    ///
+    /// Keeping this lease on the response prevents a concurrent reload from
+    /// validating old-generation data with new-generation policy or skipping
+    /// validation because the old generation is no longer active.
+    #[cfg(feature = "dnssec")]
+    #[must_use]
+    pub(crate) fn dnssec_validator(
+        &self,
+    ) -> Option<Arc<crate::dns::dnssec_validator::DnssecValidator>> {
+        self.dnssec_validator.clone()
+    }
+}
+
+impl std::fmt::Debug for UpstreamGenerationStamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamGenerationStamp")
+            .field("id", &self.id)
+            .field("current", &self.current.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 // ── Wire format helpers ────────────────────────────────────────
@@ -214,6 +278,7 @@ pub fn parse_response_bytes(data: &[u8], expected: &Query) -> Result<UpstreamRes
     Ok(UpstreamResponse {
         records: msg.answers.to_vec(),
         response_code: msg.metadata.response_code,
+        generation: None,
         soa_minimum_ttl: extract_soa_minimum_ttl(&msg.authorities),
         #[cfg(feature = "dnssec")]
         authority: msg.authorities.to_vec(),

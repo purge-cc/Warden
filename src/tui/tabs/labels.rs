@@ -1,116 +1,61 @@
-//! Labels tab — the `[[labels]]` vocabulary.
+//! Declared label vocabulary with category, list and detail columns.
+//! Add and Edit replace the detail card with an inline form; narrow terminals
+//! show that form in the list column. The information view preserves full values.
 //!
-//! Left card: the kinds with their counts. Right card: the entries of
-//! the selected kind, with how many entities actually use each. `Tab` /
-//! `←` / `→` move focus between the two cards; `↑` / `↓` move inside the
-//! focused one.
-//!
-//! The menu lists the three declared kinds — [`menu_kinds`] is
-//! `LabelKind::ALL` with nothing filtered out. A fourth, `tag`, existed
-//! briefly and is gone from the enum itself, not merely hidden from this
-//! view; see "Why a registry existed here for tags" below for what it was
-//! and why removing it made [`LabelKind::device_field`] total again.
-//!
-//! ## Why a registry existed here for tags — and why it no longer does
-//!
-//! The argument this section carried is kept, because it is what a future
-//! session would cite to bring the kind back. It ran: a tag needs no
-//! registry, because `collect_known_tag_slugs` derives the vocabulary the
-//! pickers use — but that derivation inserts **only what is attached**, so
-//! it answers *autocomplete*, never *naming a tag before anything uses
-//! it*, which was the operator's actual request. Hence a declared
-//! vocabulary.
-//!
-//! A second lesson from the same paragraph, and it outlives the feature:
-//! the enumeration of carriers once read "blocklists / devices / profiles /
-//! subnets", missing a `groups` walk. The sentence
-//! was written to *defend* the derivation's completeness while the
-//! derivation was incomplete, and no test disagreed — **prose counting a
-//! set is a claim, not a check.**
-//!
-//! Both the pickers and their derivation are gone. There is no
-//! autocomplete left to feed and nothing that reads a tag, so the whole
-//! argument is now historical: `menu_kinds` had already stopped offering
-//! the Tags bucket, and `usage_count` no longer counts one.
-//!
-//! `owner` / `device-type` / `department` are a different case for a
-//! different reason: they are free text on `[[devices]]`, read by nothing,
-//! and have **no** derived vocabulary anywhere at all.
-//!
-//! ## The USED column counts two different things
-//!
-//! For the three metadata kinds: `Device.owner` is free text
-//! (`"Dweller"`); `Label.id` is an `Id` (`"dweller"`). They can never be
-//! equal, so the count goes through [`Label::matches_value`], which
-//! accepts **id or display_name**.
-//!
-//! `tag` used to be the second thing: `TagSlug`s counted across five
-//! carrier entities, delegated to `cli::commands::tags::collect_tag_usage`
-//! so the TUI and the CLI could not disagree. That is gone — see
-//! [`usage_count`] — and no `Tag` row reaches this tab anyway.
-//!
-//! A count of 0 means "nothing uses this value", not "this label is
-//! broken": a device carrying an undeclared metadata value is legal and
-//! WARNs at load.
-//!
-//! ```text
-//! Labels (3)                       (focus on the kind menu)
-//!   KIND            │   ID          NAME        DESCRIPTION      USED
-//!   ▸ Owners      2 │ · dweller     Dweller     Personal kit        4
-//!     Device types 1│   dweller2    Dweller2    —                   2
-//!     Departments  0│
-//! ```
-//!
-//! `▸` marks the cursor of the **focused** pane, `·` the resting cursor
-//! of the other one. Pressing `→` swaps them.
-//!
-//! ## Not here
-//! - Keys:  `mod.rs::handle_labels_key` (`a`/`e`/`d` open the modal)
-//! - Form:  `tui::label_modal` (fields, validation, submit)
-//! - State: `app::LabelsState` (cursor, focus, selected_kind)
-//! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
+//! Usage matches a device's free-text metadata against either the label ID or
+//! display name through [`Label::matches_value`]. Zero usage is valid because
+//! devices may carry undeclared metadata values.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use std::cmp::Ordering;
+
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, List, ListItem, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::config::schema::{Label, LabelKind};
-use crate::tui::app::{App, LabelsFocus};
+use crate::tui::app::{App, LabelsFocus, Leaf};
+use crate::tui::mouse::{self, MouseAction, SortOrder};
 use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
 
-/// Below this width the split collapses to the entry table alone — the
-/// kind menu is three rows and the table is the part that carries data.
-const NARROW_THRESHOLD: u16 = 90;
+const CATEGORY_RAIL_WIDTH: u16 = 16;
 
-/// Width of the left kind-menu column.
-const MENU_W: u16 = 22;
-
-/// Columns `render_section_chrome` consumes before the leaf sees its
-/// rect: one border cell and one padding cell on each side.
-const CHROME_W: u16 = 4;
-
-/// Does a terminal this wide actually paint the kind menu?
+/// Labels-specific responsive columns.
 ///
-/// **The focus must never rest on a pane the layout does not draw**, and
-/// at the minimum-terminal floor of 80×24 this leaf has only one pane: the rect
-/// reaching [`render`] is 76 columns, below [`NARROW_THRESHOLD`], so the
-/// split collapses to the entry table. A `KindMenu` focus there is
-/// unhonourable — `↑`/`↓` would change the whole table's *contents*
-/// while the operator, seeing only a table, expects its rows to move.
-///
-/// Lowering the threshold was the other candidate fix and was rejected:
-/// it would squeeze a 22-column menu into 76 and overturn a deliberate
-/// decision that carries its own comment. Clamping the focus leaves that
-/// decision intact.
-///
-/// Takes the **viewport** width because the caller in the render loop is
-/// the only place that knows it, and the tab body spans the full width
-/// (`layout_chunks` splits vertically only).
+/// The entry table keeps the shared master/detail helper's 42% width at the
+/// wide breakpoint. The category rail is inserted before it, so the detail
+/// card yields the additional space. Below the breakpoint only details
+/// collapse; category selection remains available beside the entries.
+pub fn columns(area: Rect) -> (Rect, Rect, Option<Rect>) {
+    let category_width = area.width.min(CATEGORY_RAIL_WIDTH);
+    let categories = Rect::new(area.x, area.y, category_width, area.height);
+    let list_x = area.x.saturating_add(category_width.saturating_sub(1));
+
+    if let Some(shared) = crate::tui::detail_panel::columns(area) {
+        let list = Rect::new(list_x, area.y, shared[0].width, area.height);
+        let detail_x = list.x.saturating_add(list.width.saturating_sub(1));
+        let details = Rect::new(
+            detail_x,
+            area.y,
+            area.right().saturating_sub(detail_x),
+            area.height,
+        );
+        (categories, list, Some(details))
+    } else {
+        let list = Rect::new(
+            list_x,
+            area.y,
+            area.right().saturating_sub(list_x),
+            area.height,
+        );
+        (categories, list, None)
+    }
+}
+
+/// Whether the viewport leaves room for the detail card.
 pub fn menu_is_painted(viewport_width: u16) -> bool {
-    viewport_width.saturating_sub(CHROME_W) >= NARROW_THRESHOLD
+    columns(Rect::new(0, 0, viewport_width, 1)).2.is_some()
 }
 
 /// The kinds this leaf offers, and the **only** list any part of it may
@@ -118,11 +63,7 @@ pub fn menu_is_painted(viewport_width: u16) -> bool {
 /// read this one function.
 ///
 /// Every declared kind, in `LabelKind::ALL` order — the same order
-/// `warden label list` groups by, so the menu and the CLI read alike.
-/// Nothing here is filtered: a `tag` kind existed once and is retired
-/// from the enum itself, not merely hidden from this view (see the
-/// module doc's "Why a registry existed here for tags"), so there is no
-/// fourth variant left to exclude.
+/// `warden label list` groups by, so the category rail and CLI read alike.
 pub fn menu_kinds() -> Vec<LabelKind> {
     LabelKind::ALL.to_vec()
 }
@@ -152,138 +93,290 @@ pub fn kind_menu_label(kind: LabelKind) -> &'static str {
 }
 
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some(loaded) = app.loaded_config.as_ref() else {
-        render_no_config(f, area);
+    let (categories, list, details) = columns(area);
+    mouse::register(
+        app,
+        categories,
+        MouseAction::LabelsPanel(LabelsFocus::Categories),
+    );
+    mouse::register(app, list, MouseAction::LabelsPanel(LabelsFocus::Entries));
+    render_categories(f, categories, app);
+    if app.loaded_config.is_none() {
+        let unavailable = Rect::new(
+            list.x,
+            list.y,
+            area.right().saturating_sub(list.x),
+            list.height,
+        );
+        render_no_config(f, unavailable);
         return;
-    };
-
-    let labels = &loaded.config.labels;
-    let title = format!("Labels ({})", labels.len());
-    let outer = render_section_chrome(f, area, &title, T.text_secondary);
-    let kind = app.labels.selected_kind;
-    let focus = app.labels.focus;
-
-    if outer.width < NARROW_THRESHOLD {
+    }
+    let editing = app
+        .labels
+        .modal
+        .as_ref()
+        .is_some_and(|modal| modal.form().is_some());
+    if !editing || details.is_some() {
+        let rows = build_display_rows(app);
         render_entries(
             f,
-            outer,
-            loaded,
-            labels,
-            kind,
-            focus,
+            list,
+            &rows,
+            app.labels.selected_kind,
+            app.mouse.sort(Leaf::Labels),
             (
                 app.labels.selected_id.as_deref(),
                 &mut app.labels.table_state,
             ),
+            app.loaded_config.as_ref().unwrap().config.labels.is_empty(),
         );
-        return;
+        register_label_mouse(app, list, rows.len());
     }
+    if editing {
+        crate::tui::label_modal::render_inline_editor(
+            f,
+            details.unwrap_or(list),
+            app.labels.modal.as_ref().unwrap(),
+        );
+    } else if let Some(details) = details {
+        let info = information_with_width(app, body_width_for(details));
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            details,
+            &info.title,
+            &info.subtitle,
+            theme::CardRole::History,
+        );
+        crate::tui::detail_panel::render(
+            f,
+            Rect::new(body.x, body.y, body.width, body.height.saturating_sub(2)),
+            app,
+            Leaf::Labels,
+            app.labels.selected_id.as_deref().unwrap_or(""),
+            info.lines,
+        );
+        if body.height > 1 && app.labels.selected_id.is_some() {
+            use crate::tui::modal_form::{self, Action, ActionKind};
+            let row = Rect::new(body.x, body.bottom() - 1, body.width, 1);
+            let actions = [
+                Action::new("Edit", false, ActionKind::Primary, "Edit label")
+                    .on_key(crossterm::event::KeyCode::Char('e')),
+            ];
+            f.render_widget(
+                Paragraph::new(modal_form::action_row(&actions, row.width)),
+                row,
+            );
+            for (rect, key) in modal_form::action_regions(&actions, row) {
+                mouse::register(app, rect, MouseAction::Key(key.code));
+            }
+        }
+    }
+}
 
-    let cols = Layout::horizontal([
-        Constraint::Length(MENU_W),
-        Constraint::Length(1),
-        Constraint::Min(30),
-    ])
-    .split(outer);
-
-    render_kind_menu(f, cols[0], app, labels);
-    draw_v_divider(f, cols[1]);
-    render_entries(
-        f,
-        cols[2],
-        loaded,
-        labels,
-        kind,
-        focus,
-        (
-            app.labels.selected_id.as_deref(),
-            &mut app.labels.table_state,
-        ),
+fn render_categories(f: &mut Frame, area: Rect, app: &mut App) {
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "Categories",
+        "Label Type",
+        theme::CardRole::Summary,
     );
-}
-
-// ── Left card: the kinds ─────────────────────────────────────────────
-
-fn render_kind_menu(f: &mut Frame, area: Rect, app: &App, labels: &[Label]) {
-    let selected = app.labels.selected_kind;
-    let pane_focused = app.labels.focus == LabelsFocus::KindMenu;
-    let lines: Vec<Line> = menu_kinds()
+    // A complete card has no list body at four terminal rows or fewer. Keep the
+    // selected category reachable by reusing its visible card surface there.
+    let body = if body.is_empty() {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        )
+    } else {
+        body
+    };
+    let kinds = menu_kinds();
+    let selected = kinds
         .iter()
-        .map(|k| {
-            let n = labels.iter().filter(|l| l.kind == *k).count();
-            let focused = *k == selected;
-            // Two distinct glyphs, not two colours. A `TestBackend`
-            // buffer compared via `to_string()` discards every style, so
-            // a colour-only focus cue is invisible to exactly the test
-            // that is supposed to prove focus is drawn — it would pass on
-            // a build showing no focus at all. Both markers are 2 cells
-            // so the column does not shift when focus moves.
-            let marker = match (focused, pane_focused) {
-                (true, true) => "\u{25b8} ",  // ▸ selected, pane has the cursor
-                (true, false) => "\u{00b7} ", // · selected, cursor is elsewhere
-                (false, _) => "  ",
-            };
-            let style = if focused {
-                Style::default()
-                    .fg(if pane_focused {
-                        T.brand_red
-                    } else {
-                        T.text_secondary
-                    })
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(T.text_secondary)
-            };
-            Line::from(vec![
-                Span::styled(format!("{marker}{:<13}", kind_menu_label(*k)), style),
-                Span::styled(format!("{n:>3}"), Style::default().fg(T.text_muted)),
-            ])
-        })
-        .collect();
+        .position(|kind| *kind == app.labels.selected_kind)
+        .unwrap_or(0);
+    app.labels.category_state.select(Some(selected));
 
-    f.render_widget(Paragraph::new(lines), area);
+    let selected_style = if app.labels.focus == LabelsFocus::Categories {
+        theme::highlight_style().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(T.emerald_ping)
+            .add_modifier(Modifier::BOLD)
+    };
+    let items = kinds
+        .iter()
+        .map(|kind| ListItem::new(category_label(*kind)))
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(items)
+            .style(Style::default().fg(T.text_primary).bg(T.bg_elevated))
+            .highlight_style(selected_style),
+        body,
+        &mut app.labels.category_state,
+    );
+
+    let offset = app.labels.category_state.offset();
+    for visible in 0..body.height as usize {
+        let index = offset + visible;
+        if index >= kinds.len() {
+            break;
+        }
+        mouse::register(
+            app,
+            Rect::new(body.x, body.y + visible as u16, body.width, 1),
+            MouseAction::LabelKind(index),
+        );
+    }
 }
 
-// ── Right card: the entries of the selected kind ──────────────────────
+fn category_label(kind: LabelKind) -> &'static str {
+    match kind {
+        LabelKind::Owner => "Owner",
+        LabelKind::DeviceType => "Device Types",
+        LabelKind::Department => "Department",
+    }
+}
+
+pub fn information(app: &App) -> crate::tui::detail_panel::Information {
+    information_with_width(app, 74)
+}
+
+fn information_with_width(app: &App, width: u16) -> crate::tui::detail_panel::Information {
+    let rows = build_display_rows(app);
+    let row = rows
+        .iter()
+        .find(|row| Some(&row.key) == app.labels.selected_id.as_ref())
+        .or(rows.first());
+    let mut lines = vec![crate::tui::modal_form::section_rule(
+        "Identity",
+        width,
+        theme::CardRole::Summary,
+    )];
+    if let Some(row) = row {
+        lines.extend([
+            detail_value("Kind", app.labels.selected_kind.as_str()),
+            detail_value("ID", &row.id),
+            detail_value("Name", &row.name),
+            detail_value("Description", &row.description),
+            Line::default(),
+            crate::tui::modal_form::section_rule(
+                "Device References",
+                width,
+                theme::CardRole::History,
+            ),
+            detail_value("Used By", format!("{} Devices", row.used)),
+        ]);
+        if let Some(loaded) = app.loaded_config.as_ref() {
+            if let Some(label) =
+                loaded.config.labels.iter().find(|label| {
+                    label.kind == app.labels.selected_kind && label.id.as_str() == row.id
+                })
+            {
+                for (index, device) in loaded.config.devices.iter().enumerate() {
+                    let value = match label.kind {
+                        LabelKind::Owner => device.owner.as_deref(),
+                        LabelKind::DeviceType => device.device_type.as_deref(),
+                        LabelKind::Department => device.department.as_deref(),
+                    };
+                    if value.is_some_and(|value| label.matches_value(value)) {
+                        lines.push(detail_value(
+                            &format!("device{:02}", index + 1),
+                            device.id.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        lines.push(Line::from("No label selected"));
+    }
+    crate::tui::detail_panel::Information::new(
+        "Label Details",
+        format!(
+            "{} · Identity & Device References",
+            detail_kind_label(app.labels.selected_kind)
+        ),
+        lines,
+    )
+}
+
+fn detail_kind_label(kind: LabelKind) -> &'static str {
+    match kind {
+        LabelKind::Owner => "Owners",
+        LabelKind::DeviceType => "Device Types",
+        LabelKind::Department => "Departments",
+    }
+}
+
+fn detail_value(label: &str, value: impl Into<String>) -> Line<'static> {
+    let value = value.into();
+    Line::from(vec![
+        Span::styled(format!("{label:<14} "), Style::default().fg(T.text_muted)),
+        Span::styled(
+            if value.is_empty() {
+                "—".into()
+            } else {
+                value
+            },
+            Style::default().fg(T.text_primary),
+        ),
+    ])
+}
+
+fn body_width_for(area: Rect) -> u16 {
+    area.width.saturating_sub(4)
+}
+
+// ── Centre card: entries of the selected category ────────────────────
 
 fn render_entries(
     f: &mut Frame,
     area: Rect,
-    loaded: &crate::config::loader::LoadedConfig,
-    labels: &[Label],
+    rows_data: &[LabelDisplayRow],
     kind: crate::config::schema::LabelKind,
-    focus: LabelsFocus,
+    sort: Option<SortOrder>,
     cursor: (Option<&str>, &mut TableState),
+    whole_vocab_empty: bool,
 ) {
     let (selected_id, table_state) = cursor;
-    let rows_data = rows_for_kind(labels, kind);
 
     if rows_data.is_empty() {
-        render_empty_for_kind(f, area, kind, labels.is_empty());
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "LABELS",
+            &format!("{} · {} Entries", kind_menu_label(kind), 0),
+            theme::CardRole::Analytics,
+        );
+        render_empty_for_kind(f, body, kind, whole_vocab_empty);
         return;
     }
 
-    let header = Row::new(vec![
-        Cell::from("ID"),
-        Cell::from("NAME"),
-        Cell::from("DESCRIPTION"),
-        Cell::from("USED"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(
+        ["ID", "NAME", "DESCRIPTION", "USED"]
+            .into_iter()
+            .enumerate()
+            .map(|(column, label)| {
+                Cell::from(mouse::sort_label(label, column, sort)).style(
+                    theme::table_heading_style(sort.is_some_and(|order| order.column == column)),
+                )
+            }),
+    )
+    .style(theme::table_heading_style(false));
 
+    let row_count = rows_data.len();
     let rows: Vec<Row> = rows_data
         .iter()
-        .map(|l| {
-            let used = usage_count(loaded, l);
+        .map(|row| {
             Row::new(vec![
-                Cell::from(l.id.as_str().to_string()),
-                Cell::from(l.display_name.clone()),
-                Cell::from(l.description.clone().unwrap_or_else(|| "—".to_string())),
-                Cell::from(used.to_string()),
+                Cell::from(row.id.clone()),
+                Cell::from(row.name.clone()),
+                Cell::from(row.description.clone()),
+                Cell::from(row.used.to_string()),
             ])
         })
         .collect();
@@ -294,32 +387,125 @@ fn render_entries(
     // offset persists regardless (see `tabs::subnets::render_master` for
     // why that is safe across a row-count change).
     let selected =
-        resolve_selected_index(&rows_data, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
+        resolve_selected_index(rows_data, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
 
-    // Mirror of the kind menu's marker, for the same reason: the glyph
-    // carries the focus, not the colour, so a style-blind buffer dump can
-    // still tell the two states apart. Both are 2 cells wide, so the
-    // columns stay put when focus moves.
-    let symbol = if focus == LabelsFocus::Entries {
-        "\u{25b8} "
-    } else {
-        "\u{00b7} "
+    let table = Table::new(rows, label_columns(area.width.saturating_sub(4)))
+        .header(header)
+        .row_highlight_style(theme::highlight_style());
+
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "LABELS",
+        &format!("{} · {} Entries", kind_menu_label(kind), row_count),
+        theme::CardRole::Analytics,
+    );
+    super::render_table(f, body, table, table_state, selected);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelDisplayRow {
+    pub key: String,
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub used: usize,
+}
+
+pub fn build_display_rows(app: &App) -> Vec<LabelDisplayRow> {
+    build_display_rows_for_kind(app, app.labels.selected_kind)
+}
+
+/// Build the exact sorted projection for an explicitly selected kind. Root
+/// selection/edit wiring can use this without temporarily mutating the tab's
+/// visible kind.
+pub fn build_display_rows_for_kind(app: &App, kind: LabelKind) -> Vec<LabelDisplayRow> {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return Vec::new();
     };
+    let mut rows: Vec<LabelDisplayRow> = rows_for_kind(&loaded.config.labels, kind)
+        .into_iter()
+        .map(|label| LabelDisplayRow {
+            key: label.id.as_str().to_string(),
+            id: label.id.as_str().to_string(),
+            name: label.display_name.clone(),
+            description: label.description.clone().unwrap_or_else(|| "—".into()),
+            used: usage_count(loaded, label),
+        })
+        .collect();
+    if let Some(sort) = app.mouse.sort(Leaf::Labels) {
+        rows.sort_by(|a, b| compare_display_rows(a, b, sort));
+    }
+    rows
+}
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(12),
-            Constraint::Min(14),
-            Constraint::Min(16),
-            Constraint::Length(5),
-        ],
+/// Stable identity for root-level edit/delete selection wiring. Sorting and
+/// scrolling must never turn a visual index into a different label.
+pub fn stable_row_key(row: &LabelDisplayRow) -> &str {
+    &row.key
+}
+
+fn compare_display_rows(a: &LabelDisplayRow, b: &LabelDisplayRow, sort: SortOrder) -> Ordering {
+    let primary = match sort.column {
+        0 => a.id.to_lowercase().cmp(&b.id.to_lowercase()),
+        1 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        2 => a
+            .description
+            .to_lowercase()
+            .cmp(&b.description.to_lowercase()),
+        3 => a.used.cmp(&b.used),
+        _ => Ordering::Equal,
+    };
+    let primary = if sort.descending {
+        primary.reverse()
+    } else {
+        primary
+    };
+    primary.then_with(|| a.key.cmp(&b.key))
+}
+
+fn label_columns(width: u16) -> [Constraint; 4] {
+    [
+        Constraint::Length((width / 5).max(8)),
+        Constraint::Length((width / 4).max(10)),
+        Constraint::Min(0),
+        Constraint::Length(4),
+    ]
+}
+
+fn register_label_mouse(app: &App, area: Rect, row_count: usize) {
+    if row_count == 0 {
+        return;
+    }
+    let body = card_body_area(area);
+    let constraints = label_columns(body.width);
+    let columns = crate::tui::ui::table_column_rects(
+        Rect::new(body.x, body.y, body.width, 1),
+        &constraints,
+        1,
+        0,
+    );
+    for (column, column_area) in columns.into_iter().enumerate() {
+        mouse::register(app, column_area, MouseAction::Sort(Leaf::Labels, column));
+    }
+    let visible = body.height.saturating_sub(1) as usize;
+    let offset = app.labels.table_state.offset();
+    for index in 0..visible.min(row_count.saturating_sub(offset)) {
+        mouse::register(
+            app,
+            Rect::new(body.x, body.y + 1 + index as u16, body.width, 1),
+            MouseAction::Row(Leaf::Labels, offset + index),
+        );
+    }
+}
+
+fn card_body_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(3),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(4),
     )
-    .header(header)
-    .highlight_symbol(symbol)
-    .row_highlight_style(theme::highlight_style());
-
-    super::render_table(f, area, table, table_state, selected);
 }
 
 /// How many entities use this label's value.
@@ -365,9 +551,12 @@ pub fn rows_for_kind(labels: &[Label], kind: LabelKind) -> Vec<&Label> {
 
 /// Index of `selected_id` among the currently shown entries, or `None`
 /// when the anchor no longer resolves.
-pub fn resolve_selected_index(rows: &[&Label], selected_id: Option<&str>) -> Option<usize> {
+pub fn resolve_selected_index(
+    rows: &[LabelDisplayRow],
+    selected_id: Option<&str>,
+) -> Option<usize> {
     let want = selected_id?;
-    rows.iter().position(|l| l.id.as_str() == want)
+    rows.iter().position(|row| stable_row_key(row) == want)
 }
 
 // ── Empty / error states ─────────────────────────────────────────────
@@ -422,7 +611,13 @@ fn render_empty_for_kind(f: &mut Frame, area: Rect, kind: LabelKind, whole_vocab
 }
 
 fn render_no_config(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Labels", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "LABELS",
+        "Device Metadata & Vocabulary",
+        theme::CardRole::Summary,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             "  could not load config — fix it and press r to retry",
@@ -430,17 +625,6 @@ fn render_no_config(f: &mut Frame, area: Rect) {
         )),
         content,
     );
-}
-
-/// Paint a 1-cell-wide vertical separator. Mirrors Profiles/Groups.
-fn draw_v_divider(f: &mut Frame, area: Rect) {
-    let style = Style::default().fg(T.text_muted);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        if area.x < buf.area.right() && y < buf.area.bottom() {
-            buf.set_string(area.x, y, "\u{2502}", style);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -562,9 +746,53 @@ mod tests {
     fn selection_resolves_by_id_not_by_index() {
         let a = label("a", LabelKind::Owner, "A");
         let b = label("b", LabelKind::Owner, "B");
-        let rows = vec![&a, &b];
+        let mut app = App::new();
+        app.loaded_config = Some(loaded(vec![a, b], Vec::new()));
+        let rows = build_display_rows(&app);
         assert_eq!(resolve_selected_index(&rows, Some("b")), Some(1));
         assert_eq!(resolve_selected_index(&rows, Some("gone")), None);
+    }
+
+    #[test]
+    fn display_rows_follow_real_column_sort_and_keep_stable_keys() {
+        let mut app = App::new();
+        app.loaded_config = Some(loaded(
+            vec![
+                label("zeta", LabelKind::Owner, "Same"),
+                label("alpha", LabelKind::Owner, "Same"),
+            ],
+            Vec::new(),
+        ));
+        app.mouse.toggle_sort(Leaf::Labels, 1);
+        let rows = build_display_rows(&app);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(stable_row_key(&rows[0]), "alpha");
+
+        app.mouse.toggle_sort(Leaf::Labels, 1);
+        let descending_tie = build_display_rows(&app);
+        assert_eq!(
+            descending_tie
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"],
+            "descending reverses only the selected value, not its immutable-id tie"
+        );
+
+        app.mouse.toggle_sort(Leaf::Labels, 0);
+        let rows = build_display_rows(&app);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(
+            build_display_rows_for_kind(&app, LabelKind::Department).len(),
+            0,
+            "explicit kind projection must not depend on the visible kind"
+        );
     }
 
     /// Rendered-buffer test: a line-vector assertion passes even when the
@@ -656,27 +884,22 @@ mod tests {
         );
     }
 
-    /// The anti-split-brain pin the two lists exist for: what the menu
+    /// The anti-split-brain pin the two lists exist for: what the category rail
     /// **paints** and what the hint **names** must be the same set. A
     /// containment check against a shared const cannot fail; this one
     /// compares the rendered buffer against the rendered string.
     #[test]
     fn menu_and_hint_enumerate_the_same_kinds() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
         let labels = vec![label("dweller", LabelKind::Owner, "Dweller")];
         let mut app = App::new();
         app.loaded_config = Some(loaded(labels.clone(), Vec::new()));
-
-        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        term.draw(|f| render(f, f.area(), &mut app)).unwrap();
+        let term = draw(&mut app, 100, 24);
         let dump = term.backend().to_string();
 
         let hint = empty_hint();
         for k in menu_kinds() {
             assert!(
-                dump.contains(kind_menu_label(k)),
+                dump.contains(category_label(k)),
                 "{k} is in the hint but the menu does not paint it:\n{dump}"
             );
             assert!(hint.contains(k.as_str()), "{k} missing from: {hint}");
@@ -686,17 +909,6 @@ mod tests {
             "the kind menu must not carry a Tags row:\n{dump}"
         );
     }
-
-    // ── The focus marker is drawn where it is claimed ──────────────────
-    //
-    // Geometry, so the coordinates below are derived and not guessed.
-    // `render_section_chrome` returns `x = 2, y = 2` (block border +
-    // one padding column, title row consumed). The two-pane split is
-    // `[Length(MENU_W), Length(1), Min(30)]`, so the kind menu's marker
-    // column is x=2 and the entry table's is x = 2 + 22 + 1 = 25. The
-    // table's first data row is one below its header: y=3.
-    const MENU_MARK_X: u16 = 2;
-    const TABLE_MARK_X: u16 = 25;
 
     fn focus_app(focus: LabelsFocus) -> App {
         let mut app = App::new();
@@ -712,24 +924,6 @@ mod tests {
         app
     }
 
-    /// Read `len` cells starting at `(x, y)` straight out of the buffer.
-    ///
-    /// Deliberately not `to_string()`: that flattens the whole screen and
-    /// a `contains` on it proves only that the glyph exists *somewhere*.
-    /// The claim under test is positional — the marker is on the pane
-    /// that has focus — so the assertion has to be positional too.
-    fn span_at(
-        term: &ratatui::Terminal<ratatui::backend::TestBackend>,
-        x: u16,
-        y: u16,
-        len: u16,
-    ) -> String {
-        let buf = term.backend().buffer();
-        (x..x + len)
-            .map(|i| buf.cell((i, y)).map_or(" ", |c| c.symbol()).to_string())
-            .collect()
-    }
-
     fn draw(app: &mut App, w: u16, h: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -739,69 +933,75 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_marks_the_kind_menu_when_the_kind_menu_has_focus() {
-        let term = draw(&mut focus_app(LabelsFocus::KindMenu), 100, 24);
-        assert_eq!(
-            span_at(&term, MENU_MARK_X, 2, 8),
-            "\u{25b8} Owners",
-            "the focused pane's cursor is the filled marker"
-        );
-        assert_eq!(
-            span_at(&term, TABLE_MARK_X, 3, 2),
-            "\u{00b7} ",
-            "the unfocused table keeps a resting cursor, not the live one"
-        );
+    fn wide_labels_uses_blue_categories_green_list_and_yellow_details() {
+        let term = draw(&mut focus_app(LabelsFocus::Entries), 164, 46);
+        let dump = term.backend().to_string();
+        assert!(dump.contains("Owner"));
+        assert!(dump.contains("Device Types"));
+        assert!(dump.contains("Department"));
+        assert!(!dump.contains("Kind:"));
+        assert!(dump.contains("LABEL DETAILS"));
+        assert!(dump.contains("dweller"));
+        let (categories, list, details) = columns(Rect::new(0, 0, 164, 46));
+        let details = details.unwrap();
+        assert_eq!(categories, Rect::new(0, 0, 16, 46));
+        assert_eq!(list, Rect::new(15, 0, 68, 46));
+        assert_eq!(details, Rect::new(82, 0, 82, 46));
+
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer[(1, 1)].bg, T.card_summary_title_bg);
+        assert_eq!(buffer[(1, 2)].bg, T.card_summary_subtitle_bg);
+        assert_eq!(buffer[(2, 3)].bg, T.bg_elevated);
+        assert_eq!(buffer[(16, 1)].bg, T.card_analytics_title_bg);
+        assert_eq!(buffer[(83, 1)].bg, T.card_history_title_bg);
     }
 
-    /// Differential twin of the test above. Both markers must move
-    /// together: a build that draws `▸` on both panes, or on neither,
-    /// fails exactly one of the pair.
     #[test]
-    fn the_cursor_marks_the_entries_when_the_entries_have_focus() {
-        let term = draw(&mut focus_app(LabelsFocus::Entries), 100, 24);
-        assert_eq!(
-            span_at(&term, TABLE_MARK_X, 3, 10),
-            "\u{25b8} dweller ",
-            "the focused pane's cursor is the filled marker"
-        );
-        assert_eq!(
-            span_at(&term, MENU_MARK_X, 2, 8),
-            "\u{00b7} Owners",
-            "the menu keeps its selected kind visible, but resting"
-        );
+    fn category_mouse_rows_follow_the_painted_card_body() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = focus_app(LabelsFocus::Entries);
+        let term = draw(&mut app, 80, 24);
+        let buffer = term.backend().buffer();
+
+        for (row, kind) in menu_kinds().into_iter().enumerate() {
+            let y = 3 + row as u16;
+            assert_eq!(buffer[(2, y)].bg, T.bg_elevated);
+            assert_eq!(
+                mouse::action(
+                    &app,
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 2,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                ),
+                Some(MouseAction::LabelKind(row)),
+                "{} must be clickable where it is painted",
+                category_label(kind),
+            );
+        }
     }
 
-    /// **The minimum-terminal floor is 80×24, and at 80 columns this leaf has only one
-    /// pane.** `NARROW_THRESHOLD = 90` collapses the split to the entry
-    /// table — a deliberate call with its own comment, since the table is
-    /// the part that carries data. So the two-pane assertions above run
-    /// at 100 wide and this one pins what the floor actually shows.
-    ///
-    /// Worth a test rather than a comment: the focus model must not make
-    /// the narrow layout paint a menu marker for a menu that is not
-    /// there.
     #[test]
-    fn at_the_eighty_column_floor_the_split_collapses_to_the_table() {
-        // `Entries` is what the state actually holds at this width:
-        // `clamp_labels_focus_to_layout` runs before every draw, because
-        // the focus must not rest on a pane the layout omits. Rendering
-        // `KindMenu` here would be staging a state production cannot
-        // reach.
+    fn at_the_eighty_column_floor_categories_and_entries_remain_visible() {
         let term = draw(&mut focus_app(LabelsFocus::Entries), 80, 24);
         let dump = term.backend().to_string();
         assert!(
-            !dump.contains("Device types"),
-            "below NARROW_THRESHOLD the kind menu is not painted:\n{dump}"
+            dump.contains("Device Types"),
+            "category rail missing:\n{dump}"
         );
+        assert!(dump.contains("dweller"), "entry table missing:\n{dump}");
         assert!(
-            dump.contains("dweller"),
-            "the entry table is the pane that survives the collapse:\n{dump}"
+            !dump.contains("LABEL DETAILS"),
+            "detail must collapse:\n{dump}"
         );
-        assert!(
-            dump.contains("\u{25b8} dweller"),
-            "the surviving pane carries the live cursor, not the resting \
-             one — at this width there is nothing else it could be:\n{dump}"
-        );
+
+        let (categories, list, details) = columns(Rect::new(0, 0, 80, 24));
+        assert_eq!(categories, Rect::new(0, 0, 16, 24));
+        assert_eq!(list, Rect::new(15, 0, 65, 24));
+        assert_eq!(details, None);
     }
 
     /// [`menu_is_painted`] is the predicate the clamp keys off, so its
@@ -812,14 +1012,30 @@ mod tests {
     fn the_menu_is_not_painted_at_the_floor_but_is_when_wide() {
         assert!(!menu_is_painted(80), "the floor collapses the split");
         assert!(
-            !menu_is_painted(NARROW_THRESHOLD + CHROME_W - 1),
+            !menu_is_painted(107),
             "one column short of the threshold still collapses"
         );
         assert!(
-            menu_is_painted(NARROW_THRESHOLD + CHROME_W),
+            menu_is_painted(108),
             "the first width whose inner rect reaches the threshold"
         );
-        assert!(menu_is_painted(100), "a comfortable terminal");
+        assert!(menu_is_painted(164), "a comfortable terminal");
+    }
+
+    #[test]
+    fn selected_category_remains_visible_when_the_rail_is_one_row_tall() {
+        let mut app = focus_app(LabelsFocus::Categories);
+        app.labels.selected_kind = LabelKind::Department;
+        let term = draw(&mut app, 80, 3);
+        let dump = term.backend().to_string();
+
+        assert!(
+            dump.contains("Department"),
+            "selected row must scroll into view:\n{dump}"
+        );
+        assert_eq!(app.labels.category_state.selected(), Some(2));
+        assert_eq!(app.labels.category_state.offset(), 2);
+        assert_eq!(term.backend().buffer()[(2, 1)].bg, T.bg_highlight);
     }
 
     // `a_tag_counts_carriers_not_device_metadata` no longer exists.
@@ -975,6 +1191,14 @@ mod tests {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("readable .rs file");
+            // The scanner protects against this tab reaching the label CLI
+            // helpers. Files with no label namespace cannot contain that
+            // edge, and may be independently edited while this test runs;
+            // avoid parsing unrelated cfg/test blocks as if they were part
+            // of this invariant.
+            if !src.contains("labels::") && !src.contains("commands::labels") {
+                continue;
+            }
             scan_source(hits, &path.display().to_string(), &src);
         }
     }

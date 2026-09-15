@@ -424,6 +424,12 @@ impl DeviceStats {
         ring_last_24h_chrono(&self.hourly_queries, now_secs)
     }
 
+    /// Snapshot the last 24 hours of per-device blocked queries in the same
+    /// oldest-first order as [`Self::hourly_queries_last_24h`].
+    pub fn hourly_blocked_last_24h(&self, now_secs: u64) -> Vec<u64> {
+        ring_last_24h_chrono(&self.hourly_blocked, now_secs)
+    }
+
     /// Sum the last 24h of BLOCKED queries for this device. Drives the
     /// Dashboard Top Devices (24h) ranking. Matches
     /// `HourlyRing::sum_last_24h` shape.
@@ -554,6 +560,8 @@ pub struct ObservedDevice {
     /// callers that don't need the time series (kept opt-in to avoid
     /// the 24-element copy on the per-device-stats CLI path).
     pub hourly_queries: Vec<u64>,
+    /// Per-hour blocked-query counts for the last 24 hours, oldest-first.
+    pub hourly_blocked: Vec<u64>,
 }
 
 impl ObservedDevice {
@@ -1094,6 +1102,7 @@ impl StatsEngine {
                 // ring's chronological order so the TUI's sparkline
                 // can iterate left-to-right without re-mapping.
                 hourly_queries: entry.hourly_queries_last_24h(now_secs),
+                hourly_blocked: entry.hourly_blocked_last_24h(now_secs),
             })
             .collect()
     }

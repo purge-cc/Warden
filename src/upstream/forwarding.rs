@@ -212,6 +212,7 @@ mod tests {
             Ok(UpstreamResponse {
                 records: vec![],
                 response_code: ResponseCode::NoError,
+                generation: None,
                 soa_minimum_ttl: None,
                 #[cfg(feature = "dnssec")]
                 authority: vec![],

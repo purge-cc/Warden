@@ -37,6 +37,9 @@ pub const WARDEN_COMPACT: [&str; 3] = [
     "▀▀ ▀▀ ▀ ▀ ▀ ▀ ▀▀  ▀▀▀ ▀ ▀",
 ];
 
+/// Glyph footprint of `PURGE`, the inter-word gap, and `WARDEN`.
+pub const COMPACT_WIDTH: u16 = 47;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +85,7 @@ mod tests {
     fn widths_match_header_layout_constants() {
         assert_eq!(row_widths(&PURGE_COMPACT), [19, 19, 19]);
         assert_eq!(row_widths(&WARDEN_COMPACT), [25, 25, 25]);
+        assert_eq!(COMPACT_WIDTH, 19 + 3 + 25);
     }
 
     /// Only `█ ▀ ▄` + ASCII space are allowed. `▌ ▍ ▐ ▘` and similar

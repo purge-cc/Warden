@@ -2,13 +2,19 @@
 //!
 //! Design tokens derived from the purge.cc website for brand consistency.
 
+use std::cell::Cell;
+use std::ops::Deref;
+
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, BorderType, Borders};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 
 // ── Theme struct ───────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct Theme {
     // Base — backgrounds & surfaces
@@ -17,6 +23,21 @@ pub struct Theme {
     pub bg_elevated: Color,
     pub bg_highlight: Color,
     pub bg_input: Color,
+
+    // Card bands. These are card hierarchy, not status surfaces: the three
+    // role pairs stay coordinated while preserving their own title/subtitle
+    // contrast in every preset.
+    pub card_summary_title_bg: Color,
+    pub card_summary_subtitle_bg: Color,
+    pub card_analytics_title_bg: Color,
+    pub card_analytics_subtitle_bg: Color,
+    pub card_history_title_bg: Color,
+    pub card_history_subtitle_bg: Color,
+
+    // Navigation and modal headings share the accepted paired red bands.
+    pub navigation_active_bg: Color,
+    pub navigation_active_fg: Color,
+    pub navigation_submenu_bg: Color,
 
     // Borders
     pub border_default: Color,
@@ -41,7 +62,7 @@ pub struct Theme {
     // the Delete label). The palette spec asked for these to be two
     // different hexes with `brand_red` renamed onto #B91C1C — refused,
     // because that silently retargets `chart_1`, `gauge_critical`,
-    // `bar_gradient` and `border_focus` across 12 tab files. Splitting
+    // `border_focus` across 12 tab files. Splitting
     // the *role* now costs nothing and makes the later value split a
     // one-line change.
     pub red_glow: Color,
@@ -113,6 +134,81 @@ pub struct Theme {
     pub grid_line: Color,
 }
 
+/// Built-in palettes. The selection belongs to [`crate::tui::app::App`];
+/// [`set_active`] makes that selection available to legacy renderers through
+/// [`T`] for the duration of a frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemePreset {
+    #[default]
+    Warden,
+    TokyoNight,
+    Gruvbox,
+    Everforest,
+    Dracula,
+}
+
+/// Semantic card families. Card renderers choose a role, never a raw colour,
+/// so the blue/green/yellow hierarchy follows every active preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardRole {
+    /// Primary operational summaries use the first (blue) family.
+    Summary,
+    /// Live analysis uses the second (green) family.
+    Analytics,
+    /// History and cautionary data use the third (yellow) family.
+    History,
+}
+
+impl ThemePreset {
+    pub const ALL: [Self; 5] = [
+        Self::Warden,
+        Self::TokyoNight,
+        Self::Gruvbox,
+        Self::Everforest,
+        Self::Dracula,
+    ];
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Warden => Self::TokyoNight,
+            Self::TokyoNight => Self::Gruvbox,
+            Self::Gruvbox => Self::Everforest,
+            Self::Everforest => Self::Dracula,
+            Self::Dracula => Self::Warden,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Warden => "Warden",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Gruvbox => "Gruvbox",
+            Self::Everforest => "Everforest",
+            Self::Dracula => "Dracula",
+        }
+    }
+}
+
+struct BasePalette {
+    bg_main: Color,
+    bg_surface: Color,
+    bg_elevated: Color,
+    bg_highlight: Color,
+    text_primary: Color,
+    text_secondary: Color,
+    text_muted: Color,
+    text_inverse: Color,
+    brand_red: Color,
+    teal: Color,
+    success: Color,
+    warning: Color,
+    info: Color,
+    privacy: Color,
+    security: Color,
+    content: Color,
+    frame: Color,
+}
+
 impl Theme {
     pub const fn dark() -> Self {
         Self {
@@ -122,6 +218,16 @@ impl Theme {
             bg_elevated: Color::Rgb(38, 38, 38),
             bg_highlight: Color::Rgb(51, 51, 51),
             bg_input: Color::Rgb(31, 31, 31),
+            card_summary_title_bg: Color::Rgb(96, 165, 250),
+            card_summary_subtitle_bg: Color::Rgb(52, 69, 91),
+            card_analytics_title_bg: Color::Rgb(52, 211, 153),
+            card_analytics_subtitle_bg: Color::Rgb(42, 81, 67),
+            card_history_title_bg: Color::Rgb(251, 191, 36),
+            card_history_subtitle_bg: Color::Rgb(91, 76, 38),
+
+            navigation_active_bg: Color::Rgb(185, 28, 28),
+            navigation_active_fg: Color::Rgb(229, 229, 229),
+            navigation_submenu_bg: Color::Rgb(75, 36, 36),
 
             // Border
             border_default: Color::Rgb(64, 64, 64),
@@ -209,6 +315,270 @@ impl Theme {
         }
     }
 
+    const fn recolored(palette: BasePalette) -> Self {
+        let BasePalette {
+            bg_main,
+            bg_surface,
+            bg_elevated,
+            bg_highlight,
+            text_primary,
+            text_secondary,
+            text_muted,
+            text_inverse,
+            brand_red,
+            teal,
+            success,
+            warning,
+            info,
+            privacy,
+            security,
+            content,
+            frame,
+        } = palette;
+        let mut theme = Self::dark();
+        theme.bg_main = bg_main;
+        theme.bg_surface = bg_surface;
+        theme.bg_elevated = bg_elevated;
+        theme.bg_highlight = bg_highlight;
+        theme.bg_input = bg_surface;
+        theme.border_default = frame;
+        theme.border_subtle = bg_surface;
+        theme.border_focus = brand_red;
+        theme.text_primary = text_primary;
+        theme.text_secondary = text_secondary;
+        theme.text_muted = text_muted;
+        theme.text_disabled = text_muted;
+        theme.text_inverse = text_inverse;
+        theme.navigation_active_bg = brand_red;
+        theme.navigation_active_fg = text_inverse;
+        theme.brand_red = brand_red;
+        theme.brand_red_dim = brand_red;
+        theme.brand_red_bg = bg_highlight;
+        theme.red_glow = brand_red;
+        theme.warden_teal = teal;
+        theme.emerald_ping = success;
+        theme.scope_privacy = privacy;
+        theme.scope_security = security;
+        theme.scope_content = content;
+        theme.scope_services = privacy;
+        theme.success = success;
+        theme.success_bg = bg_surface;
+        theme.error = brand_red;
+        theme.error_bg = bg_highlight;
+        theme.warning = warning;
+        theme.warning_bg = bg_surface;
+        theme.info = info;
+        theme.info_bg = bg_surface;
+        theme.chart_1 = brand_red;
+        theme.chart_2 = info;
+        theme.chart_3 = success;
+        theme.chart_4 = warning;
+        theme.chart_5 = privacy;
+        theme.chart_6 = content;
+        theme.chart_7 = teal;
+        theme.chart_8 = brand_red;
+        theme.spark_normal = info;
+        theme.spark_rising = success;
+        theme.spark_falling = brand_red;
+        theme.heat_0 = bg_surface;
+        theme.heat_1 = success;
+        theme.heat_2 = warning;
+        theme.heat_3 = content;
+        theme.heat_4 = brand_red;
+        theme.gauge_empty = bg_highlight;
+        theme.gauge_low = success;
+        theme.gauge_mid = warning;
+        theme.gauge_high = brand_red;
+        theme.gauge_critical = brand_red;
+        theme.axis_line = frame;
+        theme.axis_label = text_muted;
+        theme.axis_tick = frame;
+        theme.grid_line = bg_surface;
+        theme
+    }
+
+    const fn with_submenu(mut self, color: Color) -> Self {
+        self.navigation_submenu_bg = color;
+        self
+    }
+
+    const fn with_navigation_text(mut self, color: Color) -> Self {
+        self.navigation_active_fg = color;
+        self
+    }
+
+    pub fn modal_heading_style(&self, subtitle: bool) -> Style {
+        if subtitle {
+            Style::default()
+                .bg(self.navigation_submenu_bg)
+                .fg(self.text_primary)
+        } else {
+            Style::default()
+                .bg(self.navigation_active_bg)
+                .fg(self.navigation_active_fg)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        }
+    }
+
+    const fn with_card_bands(
+        mut self,
+        summary_title: Color,
+        summary_subtitle: Color,
+        analytics_title: Color,
+        analytics_subtitle: Color,
+        history_title: Color,
+        history_subtitle: Color,
+    ) -> Self {
+        self.card_summary_title_bg = summary_title;
+        self.card_summary_subtitle_bg = summary_subtitle;
+        self.card_analytics_title_bg = analytics_title;
+        self.card_analytics_subtitle_bg = analytics_subtitle;
+        self.card_history_title_bg = history_title;
+        self.card_history_subtitle_bg = history_subtitle;
+        self
+    }
+
+    pub const fn card_title_bg(&self, role: CardRole) -> Color {
+        match role {
+            CardRole::Summary => self.card_summary_title_bg,
+            CardRole::Analytics => self.card_analytics_title_bg,
+            CardRole::History => self.card_history_title_bg,
+        }
+    }
+
+    pub const fn card_subtitle_bg(&self, role: CardRole) -> Color {
+        match role {
+            CardRole::Summary => self.card_summary_subtitle_bg,
+            CardRole::Analytics => self.card_analytics_subtitle_bg,
+            CardRole::History => self.card_history_subtitle_bg,
+        }
+    }
+
+    const fn tokyo_night() -> Self {
+        Self::recolored(BasePalette {
+            bg_main: Color::Rgb(26, 27, 38),
+            bg_surface: Color::Rgb(31, 35, 53),
+            bg_elevated: Color::Rgb(36, 40, 59),
+            bg_highlight: Color::Rgb(41, 46, 66),
+            text_primary: Color::Rgb(192, 202, 245),
+            text_secondary: Color::Rgb(169, 177, 214),
+            text_muted: Color::Rgb(115, 122, 162),
+            text_inverse: Color::Rgb(26, 27, 38),
+            brand_red: Color::Rgb(247, 118, 142),
+            teal: Color::Rgb(115, 218, 202),
+            success: Color::Rgb(158, 206, 106),
+            warning: Color::Rgb(224, 175, 104),
+            info: Color::Rgb(122, 162, 247),
+            privacy: Color::Rgb(122, 162, 247),
+            security: Color::Rgb(158, 206, 106),
+            content: Color::Rgb(224, 175, 104),
+            frame: Color::Rgb(169, 177, 214),
+        })
+        .with_card_bands(
+            Color::Rgb(122, 162, 247),
+            Color::Rgb(57, 70, 106),
+            Color::Rgb(158, 206, 106),
+            Color::Rgb(57, 77, 64),
+            Color::Rgb(224, 175, 104),
+            Color::Rgb(83, 74, 70),
+        )
+        .with_submenu(Color::Rgb(89, 60, 80))
+    }
+
+    const fn gruvbox() -> Self {
+        Self::recolored(BasePalette {
+            bg_main: Color::Rgb(40, 40, 40),
+            bg_surface: Color::Rgb(60, 56, 54),
+            bg_elevated: Color::Rgb(80, 73, 69),
+            bg_highlight: Color::Rgb(80, 73, 69),
+            text_primary: Color::Rgb(235, 219, 178),
+            text_secondary: Color::Rgb(213, 196, 161),
+            text_muted: Color::Rgb(168, 153, 132),
+            text_inverse: Color::Rgb(40, 40, 40),
+            brand_red: Color::Rgb(251, 73, 52),
+            teal: Color::Rgb(142, 192, 124),
+            success: Color::Rgb(184, 187, 38),
+            warning: Color::Rgb(250, 189, 47),
+            info: Color::Rgb(131, 165, 152),
+            privacy: Color::Rgb(131, 165, 152),
+            security: Color::Rgb(184, 187, 38),
+            content: Color::Rgb(250, 189, 47),
+            frame: Color::Rgb(189, 174, 147),
+        })
+        .with_card_bands(
+            Color::Rgb(131, 165, 152),
+            Color::Rgb(92, 96, 89),
+            Color::Rgb(184, 187, 38),
+            Color::Rgb(103, 98, 62),
+            Color::Rgb(250, 189, 47),
+            Color::Rgb(111, 94, 65),
+        )
+        .with_submenu(Color::Rgb(123, 73, 65))
+        .with_navigation_text(Color::Rgb(29, 32, 33))
+    }
+
+    const fn everforest() -> Self {
+        Self::recolored(BasePalette {
+            bg_main: Color::Rgb(45, 53, 59),
+            bg_surface: Color::Rgb(52, 63, 68),
+            bg_elevated: Color::Rgb(61, 72, 77),
+            bg_highlight: Color::Rgb(71, 82, 88),
+            text_primary: Color::Rgb(211, 198, 170),
+            text_secondary: Color::Rgb(157, 169, 160),
+            text_muted: Color::Rgb(133, 146, 137),
+            text_inverse: Color::Rgb(45, 53, 59),
+            brand_red: Color::Rgb(230, 126, 128),
+            teal: Color::Rgb(131, 192, 146),
+            success: Color::Rgb(167, 192, 128),
+            warning: Color::Rgb(219, 188, 127),
+            info: Color::Rgb(127, 187, 179),
+            privacy: Color::Rgb(127, 187, 179),
+            security: Color::Rgb(167, 192, 128),
+            content: Color::Rgb(219, 188, 127),
+            frame: Color::Rgb(157, 169, 160),
+        })
+        .with_card_bands(
+            Color::Rgb(127, 187, 179),
+            Color::Rgb(69, 86, 90),
+            Color::Rgb(167, 192, 128),
+            Color::Rgb(74, 86, 83),
+            Color::Rgb(219, 188, 127),
+            Color::Rgb(78, 85, 82),
+        )
+        .with_submenu(Color::Rgb(96, 79, 83))
+    }
+
+    const fn dracula() -> Self {
+        Self::recolored(BasePalette {
+            bg_main: Color::Rgb(40, 42, 54),
+            bg_surface: Color::Rgb(40, 42, 54),
+            bg_elevated: Color::Rgb(68, 71, 90),
+            bg_highlight: Color::Rgb(68, 71, 90),
+            text_primary: Color::Rgb(248, 248, 242),
+            text_secondary: Color::Rgb(248, 248, 242),
+            text_muted: Color::Rgb(98, 114, 164),
+            text_inverse: Color::Rgb(40, 42, 54),
+            brand_red: Color::Rgb(255, 85, 85),
+            teal: Color::Rgb(139, 233, 253),
+            success: Color::Rgb(80, 250, 123),
+            warning: Color::Rgb(241, 250, 140),
+            info: Color::Rgb(139, 233, 253),
+            privacy: Color::Rgb(189, 147, 249),
+            security: Color::Rgb(80, 250, 123),
+            content: Color::Rgb(255, 184, 108),
+            frame: Color::Rgb(189, 147, 249),
+        })
+        .with_card_bands(
+            Color::Rgb(139, 233, 253),
+            Color::Rgb(85, 111, 130),
+            Color::Rgb(80, 250, 123),
+            Color::Rgb(65, 102, 82),
+            Color::Rgb(241, 250, 140),
+            Color::Rgb(111, 116, 102),
+        )
+        .with_submenu(Color::Rgb(115, 74, 89))
+    }
+
     /// Returns chart series colors as a slice for iteration.
     #[allow(dead_code)]
     pub const fn chart_series(&self) -> [Color; 8] {
@@ -255,32 +625,180 @@ impl Theme {
             self.heat_4
         }
     }
+}
 
-    /// Bar-gradient color for a cell at normalized position
-    /// (`cell_index / bar_width`, 0.0–1.0). Use only on "fill = good"
-    /// bars.
-    ///
-    /// First stop is hardcoded to a fixed dark green (`#1D6B4F`) rather
-    /// than derived from `self.heat_2`, so the Block Rate / Cache Hit
-    /// Rate gauges keep their cool-start anchor even if a future
-    /// heatmap palette change retargets `heat_2`'s value.
-    pub const fn bar_gradient(&self, pos: f64) -> Color {
-        if pos <= 0.20 {
-            Color::Rgb(29, 107, 79)
-        } else if pos <= 0.45 {
-            self.success
-        } else if pos <= 0.65 {
-            self.warning
-        } else if pos <= 0.85 {
-            self.chart_6
-        } else {
-            self.brand_red
-        }
+const WARDEN: Theme = Theme::dark();
+const TOKYO_NIGHT: Theme = Theme::tokyo_night();
+const GRUVBOX: Theme = Theme::gruvbox();
+const EVERFOREST: Theme = Theme::everforest();
+const DRACULA: Theme = Theme::dracula();
+
+thread_local! {
+    static ACTIVE_PRESET: Cell<ThemePreset> = const { Cell::new(ThemePreset::Warden) };
+}
+
+/// Select the palette for this rendering thread. The UI calls this once per
+/// frame before drawing; tests and incremental page migrations can continue to
+/// read `T.field` without receiving a process-global mutable palette.
+pub fn set_active(preset: ThemePreset) {
+    ACTIVE_PRESET.with(|active| active.set(preset));
+}
+
+pub fn active_preset() -> ThemePreset {
+    ACTIVE_PRESET.with(Cell::get)
+}
+
+pub fn active_theme() -> &'static Theme {
+    match active_preset() {
+        ThemePreset::Warden => &WARDEN,
+        ThemePreset::TokyoNight => &TOKYO_NIGHT,
+        ThemePreset::Gruvbox => &GRUVBOX,
+        ThemePreset::Everforest => &EVERFOREST,
+        ThemePreset::Dracula => &DRACULA,
     }
 }
 
-/// Global theme instance.
-pub static T: Theme = Theme::dark();
+/// Adjacent card rectangles share their outer page-background column.
+pub fn split_card_columns(area: Rect, right_width: u16) -> [Rect; 2] {
+    let right_width = right_width.min(area.width);
+    let overlap = u16::from(right_width > 0 && area.width > 0);
+    [
+        Rect::new(
+            area.x,
+            area.y,
+            area.width - right_width + overlap,
+            area.height,
+        ),
+        Rect::new(area.right() - right_width, area.y, right_width, area.height),
+    ]
+}
+
+/// Stacked cards share one page-background row without a separator stroke.
+pub fn split_card_rows(area: Rect, top_height: u16) -> [Rect; 2] {
+    let top_height = top_height.min(area.height);
+    let overlap = u16::from(top_height > 0 && area.height > 0);
+    [
+        Rect::new(area.x, area.y, area.width, top_height),
+        Rect::new(
+            area.x,
+            area.y + top_height - overlap,
+            area.width,
+            area.height - top_height + overlap,
+        ),
+    ]
+}
+
+/// Paint a borderless card with a page-background gutter and the semantic
+/// title/subtitle bands, returning the padded neutral body. This buffer-native
+/// primitive is shared by Frame-based pages and Dashboard's canvas renderer.
+pub fn filled_card(
+    buf: &mut Buffer,
+    area: Rect,
+    title: &str,
+    subtitle: &str,
+    role: CardRole,
+) -> Rect {
+    filled_card_with_subtitle(buf, area, title, Line::raw(subtitle), role)
+}
+
+/// The padded subtitle row shared by caption text and inline chart legends.
+pub fn card_subtitle_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(3).min(1),
+    )
+}
+
+/// Reserve the right-hand legend before fitting the descriptive caption.
+pub fn card_subtitle_with_legend(
+    area: Rect,
+    description: &str,
+    legend: Line<'static>,
+) -> Line<'static> {
+    use super::text::{fit, width};
+    use ratatui::text::Span;
+
+    let cells = card_subtitle_area(area).width as usize;
+    let legend_width = legend.width();
+    if cells <= legend_width {
+        return legend;
+    }
+    let description = fit(description, cells.saturating_sub(legend_width + 2));
+    let gap = " ".repeat(cells.saturating_sub(width(&description) + legend_width));
+    let mut spans = vec![Span::raw(description), Span::raw(gap)];
+    spans.extend(legend.spans);
+    Line::from(spans)
+}
+
+pub fn filled_card_with_subtitle(
+    buf: &mut Buffer,
+    area: Rect,
+    title: &str,
+    subtitle: Line<'_>,
+    role: CardRole,
+) -> Rect {
+    Paragraph::new("")
+        .style(Style::default().bg(T.bg_main))
+        .render(area, buf);
+    let surface = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if surface.is_empty() {
+        return surface;
+    }
+    Paragraph::new("")
+        .style(Style::default().bg(T.bg_elevated))
+        .render(surface, buf);
+    Paragraph::new(format!(" {}", title.to_uppercase()))
+        .style(
+            Style::default()
+                .bg(T.card_title_bg(role))
+                .fg(T.text_inverse)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+        .render(Rect::new(surface.x, surface.y, surface.width, 1), buf);
+    let subtitle_area = Rect::new(
+        surface.x,
+        surface.y.saturating_add(1),
+        surface.width,
+        surface.height.saturating_sub(1).min(1),
+    );
+    if !subtitle_area.is_empty() {
+        let style = Style::default()
+            .bg(T.card_subtitle_bg(role))
+            .fg(T.text_primary);
+        Paragraph::new("").style(style).render(subtitle_area, buf);
+        Paragraph::new(subtitle)
+            .style(style)
+            .render(card_subtitle_area(area), buf);
+    }
+    Rect::new(
+        surface.x.saturating_add(1),
+        surface.y.saturating_add(2),
+        surface.width.saturating_sub(2),
+        surface.height.saturating_sub(2),
+    )
+}
+
+/// Compatibility palette handle. Dereferencing resolves to a static palette
+/// selected in the current thread, so existing `T.field` call sites migrate
+/// incrementally without cross-test or cross-session palette races.
+pub struct ActiveTheme;
+
+impl Deref for ActiveTheme {
+    type Target = Theme;
+
+    fn deref(&self) -> &Self::Target {
+        active_theme()
+    }
+}
+
+pub static T: ActiveTheme = ActiveTheme;
 
 // ── Reusable styles ────────────────────────────────────────────────────────
 
@@ -288,9 +806,20 @@ pub fn highlight_style() -> Style {
     Style::default().fg(T.text_primary).bg(T.bg_highlight)
 }
 
+pub fn table_heading_style(sorted: bool) -> Style {
+    Style::default()
+        .bg(T.bg_surface)
+        .fg(if sorted {
+            T.warden_teal
+        } else {
+            T.text_secondary
+        })
+        .add_modifier(ratatui::style::Modifier::BOLD)
+}
+
 // ── Block constructors ─────────────────────────────────────────────────────
 
-/// Standard block with rounded corners, subtle border, and a secondary-text
+/// Standard square block with a subtle border and a secondary-text
 /// title — matches the design's `╭─ Label ─╮` panel chrome. Titles are
 /// intentionally rendered in `text_secondary` (not brand_red) so the red
 /// stays reserved for data and action affordances.
@@ -304,13 +833,13 @@ pub fn highlight_style() -> Style {
 pub fn titled_block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(T.border_default))
         .title_style(Style::default().fg(T.text_secondary))
         .title(title)
 }
 
-/// Frame-only block: rounded corners, subtle border, no title on the
+/// Frame-only block: square corners, subtle border, no title on the
 /// border. Use when the panel renders its title as the first interior
 /// row (codeburn-style "title inside the box, bold, category-coloured")
 /// and the panel does not need a category-coloured border. Pendant of
@@ -319,7 +848,7 @@ pub fn titled_block(title: &str) -> Block<'_> {
 pub fn framed_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(T.border_default))
 }
 
@@ -330,7 +859,7 @@ pub fn framed_block() -> Block<'static> {
 pub fn framed_block_colored(border: Color) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border))
 }
 
@@ -445,7 +974,7 @@ mod tests {
     fn red_glow_is_a_new_role_not_a_renamed_brand_red() {
         // The palette spec asked to rename brand_red onto #B91C1C and
         // introduce red_glow at #DC2626. Renaming in place would have
-        // retargeted chart_1, gauge_critical, bar_gradient's last stop and
+        // retargeted chart_1, gauge_critical and
         // border_focus across 12 tab files. Instead the *role* split, with
         // brand_red's value pinned. If someone later re-values brand_red,
         // this fails and they must confirm the blast radius on purpose.
@@ -462,6 +991,150 @@ mod tests {
         assert_eq!(T.scope_privacy, Color::Rgb(110, 138, 184), "slate");
         assert_eq!(T.scope_security, Color::Rgb(111, 160, 136), "sage");
         assert_eq!(T.scope_content, Color::Rgb(201, 163, 90), "ochre");
+    }
+
+    #[test]
+    fn presets_cycle_in_the_operator_visible_order() {
+        let mut preset = ThemePreset::Warden;
+        let mut names = Vec::new();
+        for _ in ThemePreset::ALL {
+            names.push(preset.name());
+            preset = preset.next();
+        }
+        assert_eq!(
+            names,
+            vec!["Warden", "Tokyo Night", "Gruvbox", "Everforest", "Dracula"]
+        );
+        assert_eq!(preset, ThemePreset::Warden);
+    }
+
+    #[test]
+    fn compatibility_handle_resolves_the_current_threads_static_palette() {
+        let prior = active_preset();
+        set_active(ThemePreset::Dracula);
+        assert_eq!(T.bg_main, Color::Rgb(40, 42, 54));
+        assert_eq!(T.brand_red, Color::Rgb(255, 85, 85));
+        set_active(prior);
+    }
+
+    #[test]
+    fn warden_card_role_pairs_are_the_approved_bands() {
+        assert_eq!(T.card_title_bg(CardRole::Summary), Color::Rgb(96, 165, 250));
+        assert_eq!(
+            T.card_subtitle_bg(CardRole::Summary),
+            Color::Rgb(52, 69, 91)
+        );
+        assert_eq!(
+            T.card_title_bg(CardRole::Analytics),
+            Color::Rgb(52, 211, 153)
+        );
+        assert_eq!(
+            T.card_subtitle_bg(CardRole::Analytics),
+            Color::Rgb(42, 81, 67)
+        );
+        assert_eq!(T.card_title_bg(CardRole::History), Color::Rgb(251, 191, 36));
+        assert_eq!(
+            T.card_subtitle_bg(CardRole::History),
+            Color::Rgb(91, 76, 38)
+        );
+    }
+
+    #[test]
+    fn styled_card_subtitles_preserve_series_colors_and_card_padding() {
+        use ratatui::text::Span;
+
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buffer = Buffer::empty(area);
+        let body = filled_card_with_subtitle(
+            &mut buffer,
+            area,
+            "DNS Traffic",
+            Line::from(vec![
+                Span::raw("Queries  "),
+                Span::styled("Total", Style::default().fg(T.chart_2)),
+                Span::raw("  "),
+                Span::styled("Blocked", Style::default().fg(T.brand_red)),
+            ]),
+            CardRole::Analytics,
+        );
+        assert_eq!(body, Rect::new(2, 3, 26, 4));
+        assert_eq!(card_subtitle_area(area), Rect::new(2, 2, 26, 1));
+        assert_eq!(buffer[(11, 2)].symbol(), "T");
+        assert_eq!(buffer[(11, 2)].fg, T.chart_2);
+        assert_eq!(buffer[(18, 2)].symbol(), "B");
+        assert_eq!(buffer[(18, 2)].fg, T.brand_red);
+        for x in 1..29 {
+            assert_eq!(buffer[(x, 2)].bg, T.card_analytics_subtitle_bg);
+        }
+        for x in [0, 29] {
+            assert_eq!(buffer[(x, 2)].bg, T.bg_main);
+        }
+        assert_eq!(buffer[(1, 2)].symbol(), " ");
+        assert_eq!(buffer[(28, 2)].symbol(), " ");
+        for width in 0..=4 {
+            for height in 0..=3 {
+                assert!(card_subtitle_area(Rect::new(0, 0, width, height)).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn paired_cards_share_exactly_one_background_cell() {
+        let area = Rect::new(3, 2, 125, 24);
+        let columns = split_card_columns(area, 42);
+        assert_eq!(columns[1].width, 42);
+        assert_eq!(columns[0].right() - 1, columns[1].x);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 132, 30));
+        for (column, role) in columns
+            .into_iter()
+            .zip([CardRole::Analytics, CardRole::History])
+        {
+            for row in split_card_rows(column, 12) {
+                filled_card(&mut buffer, row, "Card", "Caption", role);
+            }
+        }
+        for y in area.y..area.bottom() {
+            let cell = &buffer[(columns[1].x, y)];
+            assert_eq!(cell.symbol(), " ");
+            assert_eq!(cell.bg, T.bg_main);
+        }
+        for x in area.x..area.right() {
+            assert_eq!(buffer[(x, area.y + 11)].symbol(), " ");
+            assert_eq!(buffer[(x, area.y + 11)].bg, T.bg_main);
+        }
+        for width in 0..=5 {
+            for height in 0..=5 {
+                let small = Rect::new(3, 2, width, height);
+                for rect in split_card_columns(small, 42)
+                    .into_iter()
+                    .chain(split_card_rows(small, 12))
+                {
+                    assert!(rect.x >= small.x && rect.y >= small.y);
+                    assert!(rect.right() <= small.right() && rect.bottom() <= small.bottom());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_headers_use_foreground_tokens_in_every_palette() {
+        let original = active_preset();
+        for preset in ThemePreset::ALL {
+            set_active(preset);
+            for selected in [false, true] {
+                let style = table_heading_style(selected);
+                assert_eq!(style.bg, Some(T.bg_surface));
+                assert_eq!(
+                    style.fg,
+                    Some(if selected {
+                        T.warden_teal
+                    } else {
+                        T.text_secondary
+                    })
+                );
+            }
+        }
+        set_active(original);
     }
 
     #[test]
@@ -629,9 +1302,18 @@ mod tests {
             bg_elevated,
             bg_highlight,
             bg_input,
+            card_summary_title_bg: _,
+            card_summary_subtitle_bg: _,
+            card_analytics_title_bg: _,
+            card_analytics_subtitle_bg: _,
+            card_history_title_bg: _,
+            card_history_subtitle_bg: _,
             // Everything else: never a background a glyph lands on.
             // Borders and rules are chrome, `*_bg` tokens are fills
             // behind a badge, the rest are foreground marks.
+            navigation_active_bg: _,
+            navigation_active_fg: _,
+            navigation_submenu_bg: _,
             border_default: _,
             border_subtle: _,
             border_focus: _,

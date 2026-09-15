@@ -17,7 +17,7 @@ fn poller(dir: &Path) -> IpcPoller {
 fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     let mut t = String::from(
-        "schema_version = 4\n\n\
+        "schema_version = 5\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
              [server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n\n",
@@ -35,8 +35,8 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn app_on(master: &Path, leaf: Leaf) -> App {
-    let mut app = App::new();
-    app.loaded_config = load_v1_config(master);
+    let mut app = App::known_standalone_for_test();
+    app.loaded_config = load_current_config(master);
     app.active_leaf = leaf;
     assert!(
         app.loaded_config.is_some(),
@@ -160,6 +160,7 @@ async fn n4_the_labels_kind_menu_still_wraps() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master, Leaf::Labels);
+    app.labels.focus = crate::tui::app::LabelsFocus::Categories;
     let first = app.labels.selected_kind;
     let n = crate::tui::tabs::labels::menu_kinds().len();
     assert!(n >= 2, "fixture assumes a multi-kind menu");
@@ -177,16 +178,18 @@ async fn n4_the_labels_kind_menu_still_wraps() {
 /// jump past in a three-item cycler, and aliasing them to `↑`/`↓`
 /// would make the menu the one place where a jump key means a step.
 #[tokio::test]
-async fn n4_home_and_end_are_inert_on_the_labels_kind_menu() {
+async fn labels_category_home_and_end_select_extremes() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master, Leaf::Labels);
+    app.labels.focus = crate::tui::app::LabelsFocus::Categories;
     let kind_before = app.labels.selected_kind;
 
     press(&mut app, KeyCode::End, &master).await;
     assert_eq!(
-        app.labels.selected_kind, kind_before,
-        "End does not walk the kind menu"
+        app.labels.selected_kind,
+        crate::config::schema::LabelKind::Department,
+        "End selects the last category"
     );
     press(&mut app, KeyCode::Home, &master).await;
     assert_eq!(app.labels.selected_kind, kind_before);
@@ -335,9 +338,8 @@ fn a_cursor(file: &str) -> crate::tracking::query_log::QueryLogCursor {
 /// not belong to the filters on screen. Silently wrong data in the
 /// surface an operator uses to decide what to block.
 ///
-/// Every filter mutation must land back on the live tail. All five
-/// arms are checked because the defect is per-arm: covering `R` and
-/// trusting the rest is how four of them would have shipped.
+/// Every filter commit and reset returns to the live tail; cursors from
+/// the previous predicate set cannot be reused.
 #[tokio::test]
 async fn every_filter_mutation_drops_the_cursor_stack() {
     let dir = tempfile::tempdir().unwrap();
@@ -345,21 +347,72 @@ async fn every_filter_mutation_drops_the_cursor_stack() {
 
     // (key sequence, what it changes)
     let cases: Vec<(Vec<KeyCode>, &str)> = vec![
-        (vec![KeyCode::Char('b')], "blocked-only toggle"),
-        (vec![KeyCode::Char('t')], "time preset"),
-        (vec![KeyCode::Char('R')], "reset-all"),
         (
-            vec![KeyCode::Char('/'), KeyCode::Char('x'), KeyCode::Enter],
+            vec![
+                KeyCode::Char('f'),
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Enter,
+            ],
+            "blocked-only toggle",
+        ),
+        (
+            vec![
+                KeyCode::Char('f'),
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
+            "time preset apply",
+        ),
+        (
+            vec![KeyCode::Char('f'), KeyCode::End, KeyCode::Enter],
+            "reset-all",
+        ),
+        (
+            vec![
+                KeyCode::Char('f'),
+                KeyCode::Enter,
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+            ],
             "domain filter commit",
         ),
         (
-            vec![KeyCode::Char('c'), KeyCode::Char('x'), KeyCode::Enter],
+            vec![
+                KeyCode::Char('f'),
+                KeyCode::Tab,
+                KeyCode::Enter,
+                KeyCode::Char(' '),
+                KeyCode::Enter,
+            ],
             "client filter commit",
+        ),
+        (
+            vec![
+                KeyCode::Char('f'),
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::Enter,
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+            ],
+            "advanced filter commit",
         ),
     ];
 
     for (keys, what) in cases {
         let mut app = app_on(&master, Leaf::QueryLog);
+        app.daemon_status = Some(app::DaemonStatus {
+            query_log_client_ips_supported: true,
+            ..Default::default()
+        });
+        app.query_log.client_ips = vec!["192.0.2.1".into(), "192.0.2.2".into()];
         app.query_log.entries = qlog_rows(4);
         // Pretend the operator paged two deep.
         app.query_log.page_cursors = vec![None, Some(a_cursor("/q.log")), Some(a_cursor("/q.log"))];
@@ -423,7 +476,10 @@ async fn pgdn_pages_only_from_the_last_row() {
         Some(a_cursor("/q.log")),
         "the page must be requested with the daemon's resume point"
     );
-    assert_eq!(app.query_log.table_state.selected(), Some(0));
+    assert!(
+        app.query_log.table_state.selected().is_none(),
+        "no selection until the requested page arrives"
+    );
 
     // …and back.
     app.force_poll = false;
@@ -488,13 +544,21 @@ async fn pgdn_at_the_oldest_page_refuses_instead_of_advancing() {
 /// unreachable — and nothing failed. A leaf-handler-only test would
 /// have stayed green through exactly that.
 #[tokio::test]
-async fn f_reaches_the_query_log_leaf_and_opens_the_advanced_form() {
+async fn f_reaches_filter_chips_and_enter_opens_the_advanced_form() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master, Leaf::QueryLog);
     assert!(app.query_log.advanced_modal.is_none());
 
     press(&mut app, KeyCode::Char('f'), &master).await;
+    assert!(
+        app.query_log.advanced_modal.is_none(),
+        "f focuses chips without changing filters"
+    );
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Tab, &master).await;
+    }
+    press(&mut app, KeyCode::Enter, &master).await;
     assert!(
         app.query_log.advanced_modal.is_some(),
         "`f` must reach handle_query_log_key through the real dispatcher"
@@ -504,15 +568,22 @@ async fn f_reaches_the_query_log_leaf_and_opens_the_advanced_form() {
     assert!(app.query_log.advanced_modal.is_none(), "Esc closes it");
 }
 
-/// While the form is open it owns every keystroke. `b`, `t`, `c` and
-/// `R` are Query Log verbs and the form has three text fields — all
-/// four letters have to be typeable.
+/// While the form is open it owns every keystroke. Letters that are used
+/// elsewhere by the Query Log and its shell remain typeable here.
 #[tokio::test]
 async fn the_open_form_swallows_the_query_log_verbs() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = app_on(&master, Leaf::QueryLog);
     press(&mut app, KeyCode::Char('f'), &master).await;
+    assert!(
+        app.query_log.advanced_modal.is_none(),
+        "f focuses chips without changing filters"
+    );
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Tab, &master).await;
+    }
+    press(&mut app, KeyCode::Enter, &master).await;
 
     for c in ['b', 't', 'c'] {
         press(&mut app, KeyCode::Char(c), &master).await;
@@ -551,6 +622,14 @@ async fn a_ctrl_chord_is_not_typed_into_the_form() {
     let master = mk_master(&dir);
     let mut app = app_on(&master, Leaf::QueryLog);
     press(&mut app, KeyCode::Char('f'), &master).await;
+    assert!(
+        app.query_log.advanced_modal.is_none(),
+        "f focuses chips without changing filters"
+    );
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Tab, &master).await;
+    }
+    press(&mut app, KeyCode::Enter, &master).await;
 
     let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
     handle_key(&mut app, ctrl_s, &poller(dir.path()), &master).await;
@@ -576,6 +655,14 @@ async fn applying_the_form_resets_paging_and_requests_a_fetch() {
     app.query_log.next_cursor = Some(a_cursor("/q.log"));
 
     press(&mut app, KeyCode::Char('f'), &master).await;
+    assert!(
+        app.query_log.advanced_modal.is_none(),
+        "f focuses chips without changing filters"
+    );
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Tab, &master).await;
+    }
+    press(&mut app, KeyCode::Enter, &master).await;
     for c in ['i', 'o', 't'] {
         press(&mut app, KeyCode::Char(c), &master).await;
     }
@@ -591,9 +678,8 @@ async fn applying_the_form_resets_paging_and_requests_a_fetch() {
     assert!(app.force_poll);
 }
 
-/// `R` is documented as "reset all filters", so it has to reach the
-/// advanced form too — otherwise it is the one filter the reset key
-/// cannot clear, and the card shows a single chip for it.
+/// Reset All reaches the advanced form too; otherwise the card's aggregate
+/// chip would stay active after the operator selected the explicit reset.
 #[tokio::test]
 async fn reset_all_clears_the_advanced_filter_too() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,10 +688,12 @@ async fn reset_all_clears_the_advanced_filter_too() {
     app.query_log.advanced.name = Some("iot*".into());
     app.query_log.advanced.name_exclude = true;
 
-    press(&mut app, KeyCode::Char('R'), &master).await;
+    press(&mut app, KeyCode::Char('f'), &master).await;
+    press(&mut app, KeyCode::End, &master).await;
+    press(&mut app, KeyCode::Enter, &master).await;
     assert!(
         app.query_log.advanced.is_empty(),
-        "R must clear the advanced form, not just the four card controls"
+        "Reset All must clear the advanced form, not just the first controls"
     );
     assert!(!app.query_log.advanced.name_exclude);
 }
@@ -680,10 +768,10 @@ fn a_stale_cursor_response_resets_to_the_live_tail() {
     assert_eq!(app.status_text(), Some(QUERY_LOG_CURSOR_STALE));
 }
 
-/// An empty page beyond page 0 steps BACK and keeps the rows the
-/// operator was reading, instead of blanking the table.
+/// An empty page beyond page 0 steps back and requests the preceding page.
+/// Until its response arrives, no rows from another cursor remain visible.
 #[test]
-fn an_empty_page_beyond_the_first_steps_back_and_keeps_its_rows() {
+fn an_empty_page_beyond_the_first_steps_back_and_requests_coherent_rows() {
     let mut app = App::new();
     app.query_log.page_cursors = vec![None, Some(a_cursor("/q.log"))];
     app.query_log.page_index = 1;
@@ -691,11 +779,15 @@ fn an_empty_page_beyond_the_first_steps_back_and_keeps_its_rows() {
 
     apply_query_log_page(&mut app, a_page(Vec::new(), None, false));
 
-    assert_eq!(app.query_log.page_index, 0, "step back, do not blank");
-    assert_eq!(
-        app.query_log.entries.len(),
-        4,
-        "the page being read must survive an empty response"
+    assert_eq!(app.query_log.page_index, 0);
+    assert!(
+        app.query_log.entries.is_empty(),
+        "rows from another cursor cannot carry the new page label"
+    );
+    assert!(app.query_log.table_state.selected().is_none());
+    assert!(
+        app.force_poll,
+        "the previous page must be refetched explicitly even while paused"
     );
     assert!(
         app.query_log.next_cursor.is_none(),

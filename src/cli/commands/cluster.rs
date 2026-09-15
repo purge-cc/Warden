@@ -37,7 +37,7 @@ use crate::config::atomic_write::{
     hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts, AtomicWriteError,
 };
 use crate::config::loader;
-use crate::config::schema::{ClusterRole, SCHEMA_VERSION_V1};
+use crate::config::schema::{ClusterRole, TARGET_SCHEMA_VERSION_V5};
 use crate::config::tree_io::PinnedTarget;
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 
@@ -55,9 +55,13 @@ pub fn run_token(config_path: &Path) -> anyhow::Result<()> {
         // schema load. Keep this one guard through the promotion so a peer
         // cannot replace the master between either decision and the write.
         let guard = acquire_for_write(config_path)?;
-        let _loaded =
-            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-                .map_err(format_config_errors)?;
+        let _loaded = loader::load_config_for_schema_under_guard(
+            &guard,
+            config_path,
+            TARGET_SCHEMA_VERSION_V5,
+            now,
+        )
+        .map_err(format_config_errors)?;
 
         let (plaintext, hash) = generate_token();
         write_cluster_fields_to_master(
@@ -527,8 +531,12 @@ fn own_upstream(guard: &ConfigWriteLock, config_path: &Path) -> anyhow::Result<O
     guard.verify_master(config_path)?;
     let now = time::OffsetDateTime::now_utc();
     Ok(
-        match loader::load_config_for_schema_under_guard(guard, config_path, SCHEMA_VERSION_V1, now)
-        {
+        match loader::load_config_for_schema_under_guard(
+            guard,
+            config_path,
+            TARGET_SCHEMA_VERSION_V5,
+            now,
+        ) {
             Ok(loaded) if loaded.config.upstream.servers.is_empty() => OwnUpstream::WouldStrand,
             Ok(_) => OwnUpstream::Present,
             Err(_) => OwnUpstream::Unknown,
@@ -717,7 +725,7 @@ fn bail_if_an_include_holds_membership(
     let Ok(loaded) = loader::load_config_for_schema_under_guard(
         guard,
         config_path,
-        SCHEMA_VERSION_V1,
+        TARGET_SCHEMA_VERSION_V5,
         time::OffsetDateTime::now_utc(),
     ) else {
         return Ok(());
@@ -784,7 +792,7 @@ pub async fn run_status(socket_path: &Path, config_path: &Path) -> anyhow::Resul
 /// always-available fallback, and the only output on a feature-less build.
 fn print_config_status(config_path: &Path) -> anyhow::Result<()> {
     let now = time::OffsetDateTime::now_utc();
-    let loaded = loader::load_config(config_path, now).map_err(format_config_errors)?;
+    let loaded = loader::load_current_config(config_path, now).map_err(format_config_errors)?;
     let c = &loaded.config.cluster;
 
     if !c.enabled {
@@ -986,6 +994,36 @@ fn write_master_sections(
     upstream: Option<&str>,
     add_cluster_include: bool,
 ) -> anyhow::Result<()> {
+    let (raw, _) = read_raw_or_empty_locked(guard, config_path, config_path)?;
+    let saved: toml::Value = raw.as_deref().unwrap_or_default().parse()?;
+    let leaving_secondary = cluster_fields
+        .iter()
+        .any(|(key, value)| *key == "enabled" && value.is_none())
+        && saved
+            .get("cluster")
+            .and_then(|c| c.get("role"))
+            .and_then(toml::Value::as_str)
+            == Some("secondary")
+        && saved
+            .get("cluster")
+            .and_then(|c| c.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            == Some(true);
+    if add_cluster_include || leaving_secondary {
+        let content = render_master_sections(
+            guard,
+            config_path,
+            cluster_fields,
+            api_fields,
+            upstream,
+            add_cluster_include,
+        )?;
+        return super::target::write_legacy_membership_validated_locked(
+            guard,
+            config_path,
+            &content.parse()?,
+        );
+    }
     let prepared = prepare_master_sections(
         guard,
         config_path,
@@ -1008,6 +1046,25 @@ fn prepare_master_sections<'g>(
     upstream: Option<&str>,
     add_cluster_include: bool,
 ) -> anyhow::Result<PreparedValidatedSingleWrite<'g>> {
+    let content = render_master_sections(
+        guard,
+        config_path,
+        cluster_fields,
+        api_fields,
+        upstream,
+        add_cluster_include,
+    )?;
+    prepare_raw_validated_single_locked(guard, config_path, config_path, content)
+}
+
+fn render_master_sections(
+    guard: &ConfigWriteLock,
+    config_path: &Path,
+    cluster_fields: &[(&str, Option<toml::Value>)],
+    api_fields: &[(&str, Option<toml::Value>)],
+    upstream: Option<&str>,
+    add_cluster_include: bool,
+) -> anyhow::Result<String> {
     let (raw, _) = read_raw_or_empty_locked(guard, config_path, config_path)?;
     let raw =
         raw.ok_or_else(|| anyhow::anyhow!("cannot read {}", guard.canonical_master().display()))?;
@@ -1046,7 +1103,7 @@ fn prepare_master_sections<'g>(
         ensure_cluster_include(guard, config_path, &mut doc)?;
     }
 
-    prepare_raw_validated_single_locked(guard, config_path, config_path, doc.to_string())
+    Ok(doc.to_string())
 }
 
 /// `warden cluster enable --role primary` — S4: turn a standalone node into a
@@ -1104,9 +1161,13 @@ pub fn run_enable(
         // Pre-load, unlike `run_join`. A would-be PRIMARY's master is an
         // ordinary standalone config that already loads, and its parsed API
         // defaults are what R3 needs.
-        let loaded =
-            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-                .map_err(format_config_errors)?;
+        let loaded = loader::load_config_for_schema_under_guard(
+            &guard,
+            config_path,
+            TARGET_SCHEMA_VERSION_V5,
+            now,
+        )
+        .map_err(format_config_errors)?;
         let cluster = &loaded.config.cluster;
         let api = &loaded.config.api;
 
@@ -1358,8 +1419,10 @@ fn publish_certificate<'g>(
         r6_crt,
         r6_key,
         AtomicCreateOnlyAtOpts {
+            validator: None,
             mode: Some(mode),
             owner: Some(owner),
+            staging: Default::default(),
             #[cfg(test)]
             test_failure: None,
         },
@@ -1556,6 +1619,172 @@ fn ensure_cluster_include(
     Ok(true)
 }
 
+/// Shared node lifecycle front end. Secrets are accepted only by private file or stdin.
+#[cfg(feature = "cluster")]
+pub async fn run_nodes(
+    config_path: &Path,
+    socket_path: &Path,
+    action: crate::cli::ClusterAction,
+) -> anyhow::Result<()> {
+    use crate::cli::ClusterAction as Action;
+    use crate::cluster::lifecycle::{self, LifecycleRequest as Request};
+    match action {
+        Action::Status => {
+            let command=crate::ipc::protocol::IpcCommand::NodesStatus;
+            if let Ok(crate::ipc::protocol::IpcResponse::NodesStatus { status })=crate::ipc::socket_client::send_command(socket_path,&command).await {
+                println!("{}",serde_json::to_string_pretty(&status)?);
+            } else {
+                let path=config_path.to_path_buf();
+                let status=tokio::task::spawn_blocking(move||lifecycle::status(&path)).await??;
+                println!("{}",serde_json::to_string_pretty(&status)?);
+            }
+        }
+        Action::Apply { preview_id } => { print_nodes_result(nodes_apply(config_path,socket_path,&preview_id).await?)?; }
+        Action::Cancel { preview_id } => { print_nodes_result(lifecycle::cancel(config_path,&preview_id).await?)?; }
+        Action::Token => anyhow::bail!("shared-token setup is retired; use cluster create and cluster invite; existing primaries require create --migrate-legacy"),
+        other => {
+            let (request, immediate)=match other {
+                Action::Create { sans,api_listen,migrate_legacy }=>(Request::Create{san:sans,api_listen,migrate_legacy},false),
+                Action::Enable {role,sans,api_listen,validity_days}=>{
+                    anyhow::ensure!(role==crate::cli::EnableRole::Primary,"use cluster join for a secondary");
+                    anyhow::ensure!(validity_days==3650,"custom validity is unavailable in modern creation");
+                    (Request::Create{san:sans,api_listen,migrate_legacy:false},false)
+                }
+                Action::Join {peer,invitation_file,node_name}=>{
+                    let secret=read_invitation(invitation_file.as_deref())?;
+                    (Request::Join{primary:peer,invitation:crate::cluster::membership::SecretString(secret),node_name},false)
+                }
+                Action::Leave {upstream}=>{ anyhow::ensure!(upstream.is_none(),"leave retains the reviewed current policy; no resolver override is accepted"); (Request::Leave,false) }
+                Action::Rename {name}=>(Request::Rename{name},true),
+                Action::Invite=>(Request::Invite,true),
+                Action::Revoke {node_id}=>(Request::Revoke{node_id},true),
+                Action::ResetIdentity=>(Request::ResetIdentity,false),
+                _=>unreachable!(),
+            };
+            let preview=nodes_preview(config_path,socket_path,request).await?;
+            if immediate { print_nodes_result(nodes_apply(config_path,socket_path,&preview.id).await?)?; }
+            else {
+                println!("{}",serde_json::to_string_pretty(&preview)?);
+                println!("Apply this reviewed candidate with: warden cluster apply --preview-id {}",preview.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cluster"))]
+pub async fn run_nodes(
+    _config_path: &Path,
+    _socket_path: &Path,
+    _action: crate::cli::ClusterAction,
+) -> anyhow::Result<()> {
+    anyhow::bail!("this binary was built without Nodes support")
+}
+
+#[cfg(feature = "cluster")]
+fn read_invitation(path: Option<&Path>) -> anyhow::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut bytes = String::new();
+    if let Some(path) = path {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let meta = file.metadata()?;
+        anyhow::ensure!(
+            meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o077 == 0 && meta.len() <= 4096,
+            "invitation file must be a private regular file, at most 4096 bytes"
+        );
+        file.take(4097).read_to_string(&mut bytes)?;
+    } else {
+        anyhow::ensure!(!std::io::IsTerminal::is_terminal(&std::io::stdin()),"pipe the invitation on stdin or use --invitation-file; interactive terminal echo would expose it");
+        std::io::stdin().take(4097).read_to_string(&mut bytes)?;
+    }
+    anyhow::ensure!(
+        bytes.len() <= 4096 && !bytes.trim().is_empty(),
+        "invitation is empty or oversized"
+    );
+    Ok(bytes.trim().into())
+}
+
+#[cfg(feature = "cluster")]
+async fn nodes_preview(
+    master: &Path,
+    socket: &Path,
+    request: crate::cluster::lifecycle::LifecycleRequest,
+) -> anyhow::Result<crate::cluster::lifecycle::LifecyclePreview> {
+    use crate::ipc::protocol::{IpcCommand, IpcResponse};
+    let command = IpcCommand::NodesPreview {
+        request: request.clone(),
+        token: crate::ipc::auth_token::load_token().ok().flatten(),
+    };
+    match crate::ipc::socket_client::send_command(socket, &command).await {
+        Ok(IpcResponse::NodesPreview { preview }) => Ok(*preview),
+        Ok(other) => anyhow::bail!("node preview refused: {other:?}"),
+        Err(error) if nodes_connection_absent(&error) => {
+            crate::cluster::lifecycle::preview(master, request).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn nodes_apply(
+    master: &Path,
+    socket: &Path,
+    id: &str,
+) -> anyhow::Result<crate::cluster::lifecycle::LifecycleResult> {
+    use crate::ipc::protocol::{IpcCommand, IpcResponse};
+    let command = IpcCommand::NodesApply {
+        preview_id: id.into(),
+        token: crate::ipc::auth_token::load_token().ok().flatten(),
+    };
+    match crate::ipc::socket_client::send_command(socket, &command).await {
+        Ok(IpcResponse::NodesResult { result }) => Ok(*result),
+        Ok(other) => anyhow::bail!("node apply refused: {other:?}"),
+        Err(error) if nodes_connection_absent(&error) => {
+            let mut result = crate::cluster::lifecycle::apply(master, id).await?;
+            if result.operation == crate::cluster::lifecycle::LifecycleOperation::Rename {
+                use crate::cli::commands::ipc_reload::{attempt_reload, ReloadOutcome};
+                result.message = match attempt_reload(socket).await {
+                    ReloadOutcome::Reloaded => "Name saved and reload requested.".into(),
+                    ReloadOutcome::DaemonUnreachable => "Name saved; daemon unreachable.".into(),
+                    ReloadOutcome::NoToken { .. } => "Name saved; reload has no API token.".into(),
+                    ReloadOutcome::ReloadFailed(reason) => {
+                        format!("Name saved; reload failed: {reason}")
+                    }
+                };
+            }
+            Ok(result)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn print_nodes_result(
+    mut result: crate::cluster::lifecycle::LifecycleResult,
+) -> anyhow::Result<()> {
+    if let Some(invitation) = result.invitation.take() {
+        println!("{}", invitation.0);
+        eprintln!("Invitation expires in 15 minutes. Keep it private.");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
+fn nodes_connection_absent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,7 +1819,7 @@ mod tests {
         }
     }
 
-    const MASTER: &str = r#"schema_version = 4
+    const MASTER: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -1623,7 +1852,7 @@ servers = ["192.0.2.1:53"]
     /// only a node that is actually syncing earns the missing-`[upstream]`
     /// exemption. An unvalidated `std::fs::write` followed by a validating
     /// cluster write is exactly the sequence a real join performs.
-    const SECONDARY_MASTER: &str = r#"schema_version = 4
+    const SECONDARY_MASTER: &str = r#"schema_version = 5
 
 [server]
 default_blocked_ttl_secs = 60
@@ -1664,7 +1893,10 @@ token_hash = ""
 
     fn reload(path: &Path) -> crate::config::schema::ClusterConfig {
         let now = time::OffsetDateTime::now_utc();
-        loader::load_config(path, now).unwrap().config.cluster
+        loader::load_current_config(path, now)
+            .unwrap()
+            .config
+            .cluster
     }
 
     fn block_until_contended(receiver: &std::sync::mpsc::Receiver<()>, operation: &str) {
@@ -1836,7 +2068,7 @@ token_hash = ""
         run_leave(&master, Some("192.0.2.53:53")).expect("leave completes with an upstream");
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).expect("post-leave config loads");
+        let loaded = loader::load_current_config(&master, now).expect("post-leave config loads");
         assert!(!loaded.config.cluster.enabled);
         assert_eq!(loaded.config.cluster.role, ClusterRole::Primary);
         assert!(loaded.config.cluster.peer.is_none());
@@ -2160,10 +2392,10 @@ token_hash = ""
         std::fs::write(&master, raw).unwrap();
         run_token(&master).unwrap();
         let now = time::OffsetDateTime::now_utc();
-        let cfg = loader::load_config(&master, now).unwrap().config;
+        let cfg = loader::load_current_config(&master, now).unwrap().config;
         // the [api] and [profiles.default] sections are untouched.
         assert!(cfg.profiles.contains_key("default"));
-        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(cfg.schema_version, TARGET_SCHEMA_VERSION_V5);
         assert!(std::fs::read_to_string(&master)
             .unwrap()
             .contains("# keep internal array comment"));
@@ -2188,7 +2420,7 @@ token_hash = ""
         )
         .is_err());
 
-        let mut doc: toml_edit::DocumentMut = "schema_version = 4\n".parse().unwrap();
+        let mut doc: toml_edit::DocumentMut = "schema_version = 5\n".parse().unwrap();
         let original = doc.to_string();
         assert!(ensure_cluster_include(&guard, &wrong, &mut doc).is_err());
         assert_eq!(
@@ -2338,7 +2570,7 @@ token_hash = ""
 
         // (a) the sync drop-in glob was added to the master's includes.
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap();
+        let loaded = loader::load_current_config(&master, now).unwrap();
         assert!(
             loaded
                 .config
@@ -2548,7 +2780,7 @@ token_hash = ""
 
         let now = time::OffsetDateTime::now_utc();
         assert!(
-            loader::load_config(&path, now).is_err(),
+            loader::load_current_config(&path, now).is_err(),
             "fixture must be the stuck, unloadable state or this test proves nothing"
         );
 
@@ -2577,7 +2809,7 @@ token_hash = ""
         .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        assert!(loader::load_config(&path, now).is_err());
+        assert!(loader::load_current_config(&path, now).is_err());
 
         run_leave(&path, None).unwrap();
         assert_eq!(reload(&path).role, ClusterRole::Primary);
@@ -2639,7 +2871,7 @@ token_hash = ""
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 4\nincludes = [\"cluster.d/*.toml\"]\n\n\
+            "schema_version = 5\nincludes = [\"cluster.d/*.toml\"]\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"D\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
@@ -2701,9 +2933,9 @@ token_hash = ""
         run_leave(&master, None).unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let cfg = loader::load_config(&master, now).unwrap().config;
+        let cfg = loader::load_current_config(&master, now).unwrap().config;
         assert!(cfg.profiles.contains_key("default"));
-        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(cfg.schema_version, TARGET_SCHEMA_VERSION_V5);
         assert_eq!(
             cfg.cluster.token_hash.as_deref(),
             Some(hash_token("ps_tok").as_str())
@@ -2720,7 +2952,7 @@ token_hash = ""
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "schema_version = 4\n\n[server]\ndefault_profile = \"ghost\"\n\n\
+            "schema_version = 5\n\n[server]\ndefault_profile = \"ghost\"\n\n\
              [profiles.default]\ndisplay_name = \"D\"\n\n[cluster]\nenabled = true\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -2883,7 +3115,7 @@ token_hash = ""
         run_join(&master, "http://127.0.0.1:18080", Some("ps_b"), None).unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap();
+        let loaded = loader::load_current_config(&master, now).unwrap();
         let n = loaded
             .config
             .includes
@@ -2927,7 +3159,7 @@ token_hash = ""
     #[cfg(feature = "cluster")]
     fn write_primary_master(dir: &tempfile::TempDir, f: &PrimaryFixture) -> std::path::PathBuf {
         let mut s = String::from(
-            "schema_version = 4\n\n\
+            "schema_version = 5\n\n\
              [server]\ndefault_profile = \"default\"\n\n\
              [profiles.default]\ndisplay_name = \"Default\"\n\n\
              [upstream]\nservers = [\"192.0.2.1:53\"]\n\n\
@@ -3090,7 +3322,7 @@ token_hash = ""
             drop(held);
             worker.join().unwrap().unwrap();
         });
-        let loaded = loader::load_config(&enable_master, time::OffsetDateTime::now_utc())
+        let loaded = loader::load_current_config(&enable_master, time::OffsetDateTime::now_utc())
             .unwrap()
             .config;
         assert!(loaded.cluster.enabled);
@@ -3156,8 +3388,10 @@ token_hash = ""
             &root.join("api.crt"),
             &root.join("api.key"),
             AtomicCreateOnlyAtOpts {
+                validator: None,
                 mode: Some(if name == "api.key" { 0o600 } else { 0o644 }),
                 owner: Some(owner),
+                staging: Default::default(),
                 test_failure: failure,
             },
         )
@@ -3561,8 +3795,8 @@ token_hash = ""
         std::fs::write(
             &master,
             raw.replacen(
-                "schema_version = 4\n",
-                "schema_version = 4\nincludes = [\"api.*\"]\n",
+                "schema_version = 5\n",
+                "schema_version = 5\nincludes = [\"api.*\"]\n",
                 1,
             ),
         )
@@ -3646,7 +3880,7 @@ token_hash = ""
         .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap_or_else(|e| {
+        let loaded = loader::load_current_config(&master, now).unwrap_or_else(|e| {
             panic!(
                 "the post state must load: {}",
                 crate::cli::commands::token::format_errs_flat(e)
@@ -3693,7 +3927,7 @@ token_hash = ""
                 && !alias_dir.path().join("api.key").exists(),
             "TLS material must never be created beside an external alias"
         );
-        let loaded = loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let loaded = loader::load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
         assert_eq!(loaded.config.api.tls_cert.as_deref(), Some(crt.as_path()));
         assert_eq!(loaded.config.api.tls_key.as_deref(), Some(key.as_path()));
     }
@@ -3763,7 +3997,7 @@ token_hash = ""
             "the mirror path must mint nothing"
         );
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap_or_else(|e| {
+        let loaded = loader::load_current_config(&master, now).unwrap_or_else(|e| {
             panic!(
                 "the post state must load: {}",
                 crate::cli::commands::token::format_errs_flat(e)
@@ -3803,7 +4037,7 @@ token_hash = ""
         .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap();
+        let loaded = loader::load_current_config(&master, now).unwrap();
         assert_eq!(
             loaded.config.api.listen,
             "192.0.2.11:9053".parse::<std::net::SocketAddr>().unwrap()

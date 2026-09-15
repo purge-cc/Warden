@@ -21,12 +21,23 @@ use super::migration_journal;
 
 const WRITE_LOCK_FILE: &str = ".warden-config.lock";
 pub(crate) const WRITE_STAGE_PREFIX: &str = ".warden-write-";
+pub(crate) const POLICY_TRANSACTION_STORE_DIR: &str = ".warden-policy-transactions";
+pub(crate) const POLICY_RECEIPT_STORE_DIR: &str = ".warden-policy-receipts";
 const LOCK_DEADLINE: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) fn reserved_component(name: &OsStr) -> bool {
     name == WRITE_LOCK_FILE
         || name.as_bytes().starts_with(WRITE_STAGE_PREFIX.as_bytes())
+        || name == OsStr::new(POLICY_TRANSACTION_STORE_DIR)
+        || name == OsStr::new(POLICY_RECEIPT_STORE_DIR)
+        || name == OsStr::new(".warden-cluster-publications")
+        || name == OsStr::new(".warden-cluster-ownership")
+        || name == OsStr::new(".warden-cluster-peers")
+        || name == OsStr::new(".warden-node-membership")
+        || name == OsStr::new(".warden-node-lifecycle")
+        || name == OsStr::new(".warden-node-corpus")
+        || name == OsStr::new(".warden-node-control")
         || name == migration_journal::TXN_DIR_NAME
         || name
             .as_bytes()
@@ -462,6 +473,20 @@ impl MigrationWriteLock {
     }
     pub(crate) fn canonical_master(&self) -> &Path {
         self.0.canonical_master()
+    }
+
+    /// Refuse mutations when the canonical root no longer names the locked directory.
+    pub(crate) fn verify_root_linked(&self) -> anyhow::Result<()> {
+        let linked = self
+            .identity()
+            .open_root(false)
+            .context("locked config root is no longer linked at its canonical path")?;
+        ensure!(
+            inode(&linked.metadata()?) == inode(&self.0._root.metadata()?),
+            "locked config root was replaced: {}",
+            self.identity().root.display()
+        );
+        Ok(())
     }
 }
 

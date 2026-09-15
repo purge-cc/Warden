@@ -1,9 +1,9 @@
-//! `warden config diff <other>` — structured diff between two v1 configs.
+//! `warden config diff <other>` — structured diff between two schema-5 configs.
 //!
 //! S31 implements the offline variant recommended in
 //! `_docs/features/config_architecture.md` §16.3 follow-up #2 option (b):
 //! the CLI re-reads both files from disk, merges via
-//! [`crate::config::loader::load_config`], and renders a per-entity
+//! [`crate::config::loader::load_config_v5`], and renders a per-entity
 //! delta. An online variant (an IPC endpoint that streams the live
 //! daemon's `LoadedConfig` snapshot) is a future extension once
 //! operators ask for "on-disk vs live" comparison.
@@ -37,20 +37,20 @@ use std::path::Path;
 use crate::cli::exit_codes::{CONFIG, NEGATIVE, SUCCESS};
 use crate::config::loader;
 use crate::config::schema::{
-    AdminRule, Blocklist, ConfigV1, CustomList, Device, Group, Label, Profile, Schedule, Subnet,
+    Blocklist, ConfigV5, CustomList, DeviceV5, Group, Label, ProfileV5, Schedule, Subnet,
 };
 
 /// Run the diff. Returns the intended process exit code.
 pub fn run_diff(current: &Path, other: &Path) -> anyhow::Result<i32> {
     let now = time::OffsetDateTime::now_utc();
-    let left = match loader::load_config(current, now) {
+    let left = match loader::load_config_v5(current, now) {
         Ok(l) => l,
         Err(errs) => {
             print_load_errors(current, &errs);
             return Ok(CONFIG);
         }
     };
-    let right = match loader::load_config(other, now) {
+    let right = match loader::load_config_v5(other, now) {
         Ok(l) => l,
         Err(errs) => {
             print_load_errors(other, &errs);
@@ -124,16 +124,16 @@ impl DiffReport {
 
 /// Diff two merged configs section by section.
 ///
-/// Takes `&ConfigV1` rather than `&LoadedConfig` so the coverage fence can
+/// Takes `&ConfigV5` rather than `&LoadedConfigV5` so the coverage fence can
 /// drive it on in-memory configs — no temp file, no validator in the loop.
 /// That is what makes a per-field differential possible for fields the
 /// validator would refuse to load (`schema_version`).
-fn diff_configs(a: &ConfigV1, b: &ConfigV1) -> DiffReport {
+fn diff_configs(a: &ConfigV5, b: &ConfigV5) -> DiffReport {
     let mut r = DiffReport::default();
 
     // Structural, then the entity model, then the daemon-wide settings in
-    // `ConfigV1` declaration order. Every top-level field appears exactly
-    // once — enforced by `h10_diff_covers_every_config_v1_field`.
+    // `ConfigV5` declaration order. Every top-level field appears exactly
+    // once — enforced by `diff_covers_every_config_v5_field`.
     r.sections.push(diff_settings_section(
         "schema_version",
         &a.schema_version,
@@ -164,13 +164,6 @@ fn diff_configs(a: &ConfigV1, b: &ConfigV1) -> DiffReport {
         &a.blocklists,
         &b.blocklists,
         blocklist_key,
-        toml_eq,
-    ));
-    r.sections.push(diff_entity_vec(
-        "admin_rules",
-        &a.admin_rules,
-        &b.admin_rules,
-        admin_rule_key,
         toml_eq,
     ));
     r.sections.push(diff_entity_vec(
@@ -248,6 +241,8 @@ fn diff_configs(a: &ConfigV1, b: &ConfigV1) -> DiffReport {
         .push(diff_settings_section("backup", &a.backup, &b.backup));
     r.sections
         .push(diff_settings_section("cluster", &a.cluster, &b.cluster));
+    r.sections
+        .push(diff_settings_section("node", &a.node, &b.node));
 
     r
 }
@@ -301,7 +296,7 @@ where
     sd
 }
 
-fn diff_profiles(a: &BTreeMap<String, Profile>, b: &BTreeMap<String, Profile>) -> SectionDiff {
+fn diff_profiles(a: &BTreeMap<String, ProfileV5>, b: &BTreeMap<String, ProfileV5>) -> SectionDiff {
     let mut sd = SectionDiff {
         name: "profiles",
         added: Vec::new(),
@@ -324,7 +319,7 @@ fn diff_profiles(a: &BTreeMap<String, Profile>, b: &BTreeMap<String, Profile>) -
 }
 
 // Key extractors: every entity class carries an `Id` — use its string form.
-fn device_key(d: &Device) -> String {
+fn device_key(d: &DeviceV5) -> String {
     d.id.as_str().to_string()
 }
 fn group_key(g: &Group) -> String {
@@ -338,9 +333,6 @@ fn schedule_key(s: &Schedule) -> String {
 }
 fn blocklist_key(b: &Blocklist) -> String {
     b.id.as_str().to_string()
-}
-fn admin_rule_key(r: &AdminRule) -> String {
-    r.id.as_str().to_string()
 }
 /// The one exception to the comment above: a label's identity is the
 /// `(kind, id)` PAIR, so an id-only key would collapse the legal
@@ -385,7 +377,6 @@ fn value_eq<T: serde::Serialize>(a: &T, b: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::writer::write_config_v1_locked;
 
     fn load(src: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -394,7 +385,7 @@ mod tests {
         (dir, path)
     }
 
-    const BASE: &str = r#"schema_version = 4
+    const BASE: &str = r#"schema_version = 5
 
 [server]
 listen = "127.0.0.1:15353"
@@ -492,17 +483,15 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
     }
 
     #[test]
-    fn diff_roundtrips_via_guarded_v1_writer() {
-        // Loading, writing via v1 writer, then reloading should produce
+    fn diff_roundtrips_via_schema5_serialization() {
+        // Loading, serialising, then reloading should produce
         // a config that diffs clean against itself.
         let (_d1, p1) = load(BASE);
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&p1, now).unwrap();
+        let loaded = loader::load_config_v5(&p1, now).unwrap();
         let d2 = tempfile::tempdir().unwrap();
         let p2 = d2.path().join("config.toml");
-        let guard = crate::config::write_lock::acquire_for_write(&p2).unwrap();
-        write_config_v1_locked(&guard, &p2, &loaded.config).unwrap();
-        drop(guard);
+        std::fs::write(&p2, toml::to_string_pretty(&loaded.config).unwrap()).unwrap();
         let rc = run_diff(&p1, &p2).unwrap();
         assert_eq!(rc, SUCCESS, "writer roundtrip must diff clean");
     }
@@ -549,8 +538,8 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
     //
     // Two halves, because either alone is a fence with a hole:
     //
-    // 1. [`h10_diff_covers_every_config_v1_field`] — set equality between
-    //    the section names the diff emits and `ConfigV1`'s field names,
+    // 1. [`diff_covers_every_config_v5_field`] — set equality between
+    //    the section names the diff emits and `ConfigV5`'s field names,
     //    the latter DERIVED from a serialised value. A hand-written list
     //    of 26 names would be the bug wearing a test's clothes: it rots
     //    the moment field 27 lands, and it rots silently.
@@ -568,24 +557,24 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
     // field of a struct including `Option::None` (as `null`). It would NOT
     // see a future field carrying `#[serde(skip_serializing_if = …)]` or
     // `#[serde(skip)]`, because such a field is absent from the serialised
-    // value when its predicate holds. `ConfigV1` has zero such attributes
+    // value when its predicate holds. `ConfigV5` has zero such attributes
     // today (and `deny_unknown_fields`, so nothing enters off-schema); a
     // commit that adds one moves that field outside this fence and must
     // extend the diff by hand.
 
     use std::collections::BTreeSet;
 
-    /// Every top-level `ConfigV1` field name, derived from a serialised
+    /// Every top-level `ConfigV5` field name, derived from a serialised
     /// value rather than typed out here.
     ///
     /// `serde_json` and not `toml`: the TOML serialiser drops a `None`
     /// field entirely, so an `Option` field 27 would slip through a
     /// TOML-derived key set. JSON renders it as `null` — present.
-    fn config_v1_field_keys() -> BTreeSet<String> {
-        let v = serde_json::to_value(ConfigV1::test_scaffold())
-            .expect("ConfigV1 must serialise to JSON for the fence to derive its key set");
+    fn config_v5_field_keys() -> BTreeSet<String> {
+        let v = serde_json::to_value(ConfigV5::default())
+            .expect("ConfigV5 must serialise to JSON for the fence to derive its key set");
         v.as_object()
-            .expect("ConfigV1 must serialise to a JSON object")
+            .expect("ConfigV5 must serialise to a JSON object")
             .keys()
             .cloned()
             .collect()
@@ -593,7 +582,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
 
     /// Section names the diff actually emits, derived by running it.
     fn diff_section_names() -> BTreeSet<String> {
-        let c = ConfigV1::test_scaffold();
+        let c = ConfigV5::default();
         diff_configs(&c, &c)
             .sections
             .iter()
@@ -603,7 +592,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
 
     /// Sections that report a change for this pair — the same emptiness
     /// predicate the printer uses, via [`SectionDiff::is_empty`].
-    fn changed_sections(a: &ConfigV1, b: &ConfigV1) -> BTreeSet<String> {
+    fn changed_sections(a: &ConfigV5, b: &ConfigV5) -> BTreeSet<String> {
         diff_configs(a, b)
             .sections
             .iter()
@@ -613,8 +602,8 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
     }
 
     #[test]
-    fn h10_diff_covers_every_config_v1_field() {
-        let fields = config_v1_field_keys();
+    fn diff_covers_every_config_v5_field() {
+        let fields = config_v5_field_keys();
         let sections = diff_section_names();
 
         // A floor on the DERIVATION, not on the coverage claim. Both
@@ -626,7 +615,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         // correct response to adding a field; deleting it is not.
         assert!(
             fields.len() >= 26,
-            "the ConfigV1 key derivation returned only {} field(s) — it must \
+            "the ConfigV5 key derivation returned only {} field(s) — it must \
              enumerate the struct. Both coverage assertions below are \
              meaningless until this holds. Derived: {:?}",
             fields.len(),
@@ -636,7 +625,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         let uncompared: Vec<&str> = fields.difference(&sections).map(|s| s.as_str()).collect();
         assert!(
             uncompared.is_empty(),
-            "config diff does not compare {} ConfigV1 field(s): {:?}\n\
+            "config diff does not compare {} ConfigV5 field(s): {:?}\n\
              Every one of these can differ between two configs while the verb \
              prints `(no differences)` and exits 0. Add a section for each in \
              diff_configs(), and a mutation in MUTATIONS.",
@@ -647,7 +636,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         let phantom: Vec<&str> = sections.difference(&fields).map(|s| s.as_str()).collect();
         assert!(
             phantom.is_empty(),
-            "config diff emits section(s) that are not ConfigV1 fields: {phantom:?}\n\
+            "config diff emits section(s) that are not ConfigV5 fields: {phantom:?}\n\
              Either the field was renamed and the section was not, or the \
              section name is a typo — a section nobody can map back to a \
              field is a section nobody can act on."
@@ -661,14 +650,14 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         toml::from_str(src).expect("fence fixture entity must deserialise")
     }
 
-    /// One mutation per `ConfigV1` field. Each must change the
+    /// One mutation per `ConfigV5` field. Each must change the
     /// serialisation of its own field and nothing else.
     ///
     /// This table is hand-written, but it cannot rot silently: the test
     /// below asserts its key set equals the DERIVED key set, so field 27
     /// fails here by name too.
     #[allow(clippy::type_complexity)]
-    const MUTATIONS: &[(&str, fn(&mut ConfigV1))] = &[
+    const MUTATIONS: &[(&str, fn(&mut ConfigV5))] = &[
         ("schema_version", |c| c.schema_version += 1),
         ("includes", |c| c.includes.push("conf.d/*.toml".to_string())),
         ("server", |c| c.server.tcp_timeout_secs += 1),
@@ -686,7 +675,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         }),
         ("profiles", |c| {
             c.profiles
-                .insert("h10-profile".to_string(), Profile::default());
+                .insert("h10-profile".to_string(), ProfileV5::default());
         }),
         ("devices", |c| {
             c.devices
@@ -709,10 +698,6 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
                  target_type = \"group\"\ntarget_id = \"h10-group\"\n\
                  profile = \"default\"\ndays = [\"all\"]\nhours = \"21:00-07:00\"\n",
             ))
-        }),
-        ("admin_rules", |c| {
-            c.admin_rules
-                .push(entity("id = \"h10-rule\"\nrule = \"||h10.example^\"\n"))
         }),
         ("labels", |c| {
             c.labels.push(entity(
@@ -755,10 +740,11 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
             c.backup.dir = Some(std::path::PathBuf::from("/var/lib/purge-warden/h10"))
         }),
         ("cluster", |c| c.cluster.enabled = !c.cluster.enabled),
+        ("node", |c| c.node.name = Some("Renamed node".into())),
     ];
 
     #[test]
-    fn h10_mutation_table_covers_every_config_v1_field() {
+    fn mutation_table_covers_every_config_v5_field() {
         let table: BTreeSet<String> = MUTATIONS.iter().map(|(k, _)| k.to_string()).collect();
         assert_eq!(
             table.len(),
@@ -768,8 +754,8 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         );
         assert_eq!(
             table,
-            config_v1_field_keys(),
-            "MUTATIONS must probe every ConfigV1 field, no more and no less"
+            config_v5_field_keys(),
+            "MUTATIONS must probe every ConfigV5 field, no more and no less"
         );
     }
 
@@ -779,7 +765,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
         // satisfied by a diff that reports every section as changed
         // always — and `(no differences)` + exit 0 is also exactly what
         // the "comparison never ran" bug prints.
-        let c = ConfigV1::test_scaffold();
+        let c = ConfigV5::default();
         assert_eq!(
             changed_sections(&c, &c),
             BTreeSet::new(),
@@ -789,7 +775,7 @@ url = "https://lists.purge.cc/privacy/tracking.txt"
 
     #[test]
     fn h10_each_field_mutation_fires_exactly_its_own_section() {
-        let base = ConfigV1::test_scaffold();
+        let base = ConfigV5::default();
         for (field, mutate) in MUTATIONS {
             let mut variant = base.clone();
             mutate(&mut variant);

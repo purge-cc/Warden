@@ -1,0 +1,82 @@
+schema_version = 5
+includes = []
+
+[server]
+default_profile = "streaming"
+
+[upstream]
+servers = ["192.0.2.53:53"]
+
+[custom_list_limits]
+max_lists = 256
+max_file_bytes = 1048576
+max_total_bytes = 33554432
+max_rules_per_list = 25000
+max_indexed_rules_per_profile = 100000
+max_indexed_rules_total = 500000
+max_advanced_rules_per_profile = 256
+max_advanced_rules_total = 2048
+max_regex_rules_per_profile = 32
+max_regex_rules_total = 128
+max_store_indexed_rules = 500000
+max_store_advanced_rules = 2048
+max_store_regex_rules = 128
+max_rule_bytes = 4096
+max_regex_program_bytes = 1048576
+max_store_compiled_bytes = 33554432
+max_compiled_bytes_per_profile = 8388608
+max_compiled_bytes_total = 33554432
+
+[[custom_lists]]
+id = "streaming"
+display_name = "Streaming"
+description = "Rules chosen for household media devices"
+
+[[custom_lists]]
+id = "archive"
+display_name = "Archive"
+description = "Declared for later use and intentionally unmounted"
+
+[profiles.streaming]
+display_name = "Streaming"
+block_response = "zero"
+blocked_ttl_secs = 60
+block_all = true
+local_records = []
+rewrite_rules = []
+safe_search = false
+custom_lists = ["streaming"]
+
+[profiles.streaming.ecs]
+mode = "off"
+
+[[devices]]
+id = "apple-tv"
+display_name = "Apple TV"
+ip = "192.0.2.10"
+mac = "02:00:00:00:00:10"
+mac_aliases = []
+profile = "streaming"
+groups = []
+owner = "Household"
+device_type = "Media player"
+department = "Living room"
+notes = "Neutral schema fixture"
+unfiltered = false
+network_name = "apple-tv.example"
+network_name_wildcard = false
+
+[[devices]]
+id = "nvidia-shield"
+display_name = "NVIDIA SHIELD"
+ip = "192.0.2.11"
+mac_aliases = ["02:00:00:00:00:11"]
+profile = "streaming"
+groups = []
+owner = "Household"
+device_type = "Media player"
+department = "Living room"
+notes = "Neutral schema fixture"
+unfiltered = false
+network_name = "shield.example"
+network_name_wildcard = true

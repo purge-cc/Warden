@@ -29,20 +29,24 @@
 //! 7. The offending CompactString carries the expected case-normalised
 //!    bytes for the audit log + Query Log enrichment.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use ahash::HashSet;
-use compact_str::CompactString;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{A, CNAME};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
+use purge_warden::config::schema::{ConfigV1, Id, Profile, TARGET_SCHEMA_VERSION_V5};
 use purge_warden::config::settings::CacheConfig;
 use purge_warden::dns::cache::{CacheLookup, DnsCache};
-use purge_warden::filter::cname::{walk_response, BlockSource, NamePolicy, Verdict};
+use purge_warden::filter::cname::{walk_response_with_grant, BlockSource, Verdict};
+use purge_warden::filter::operator_rules::{
+    CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+};
 use purge_warden::filter::FilterEngine;
 use purge_warden::profiles::profile::ResolvedProfile;
+use purge_warden::profiles::resolver::ProfileResolver;
 
 fn cache_config() -> CacheConfig {
     CacheConfig {
@@ -82,58 +86,69 @@ fn a_record(domain: &str, octets: [u8; 4], ttl: u32) -> Record {
     )
 }
 
-fn filter_with_blocked(domains: &[&str]) -> FilterEngine {
-    let set: HashSet<CompactString> = domains.iter().map(|d| CompactString::from(*d)).collect();
-    FilterEngine::with_domains(set)
-}
-
-/// Build a `ResolvedProfile` whose `deny_domains` set carries the given
-/// domains. `walk_response`'s chain trips fire through
-/// `engine.evaluate(target, profile)` which scans the profile's
-/// `deny_domains` (priority 0) — `permissive_default()` alone has no
-/// admin-layer denies, so a flat `FilterEngine::with_domains(...)` is
-/// not enough to make the walker block. This helper is the integration
-/// equivalent of "operator added a deny rule for X" in the live wire
-/// path.
-fn profile_denying(domains: &[&str]) -> ResolvedProfile {
-    let mut profile = ResolvedProfile::permissive_default();
-    profile.deny_domains = domains
-        .iter()
-        .map(|d| CompactString::from(*d))
-        .collect::<std::collections::HashSet<_, _>>()
-        .into();
-    profile
+fn compiled_profile(content: &str) -> Arc<ResolvedProfile> {
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content,
+            }],
+            &[ProfileMounts {
+                profile_id: "default",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    let mut config = ConfigV1 {
+        schema_version: TARGET_SCHEMA_VERSION_V5,
+        ..ConfigV1::default()
+    };
+    config.server.default_profile = Some(Id::new("default").unwrap());
+    config.profiles.insert(
+        "default".to_string(),
+        Profile {
+            custom_lists: vec![Id::new("rules").unwrap()],
+            ..Profile::default()
+        },
+    );
+    ProfileResolver::build_with_operator_rules(&config, rules)
+        .resolve(&IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .profile
+        .expect("default profile must resolve")
 }
 
 #[test]
 fn clean_chain_forwards_through_walker() {
-    let filter = filter_with_blocked(&["tracker.evil.example"]);
-    let profile = ResolvedProfile::permissive_default();
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("");
     let records = vec![
         cname_record("apex.example.com.", "cdn.cloudflare.example.", 300),
         a_record("cdn.cloudflare.example.", [1, 2, 3, 4], 300),
     ];
-    let verdict = walk_response(&records, &filter, &profile, NamePolicy::Neutral, 16);
+    let verdict =
+        walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16);
     assert_eq!(verdict, Verdict::Allow);
 }
 
 #[test]
 fn tail_blocked_chain_trips_with_admin_block_source() {
-    // The tail hop is admin-denied in the resolved profile.
-    // Sprint 1's attribution heuristic priorities
-    // (`Rule` > `deny_domains` > `List(bit)` > `AdminBlock`) — with
-    // only deny_domains populated, the heuristic returns `AdminBlock`.
-    let filter = filter_with_blocked(&[]);
-    let profile = profile_denying(&["tracker.evil.example"]);
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.example");
     let records = vec![
         cname_record("apex.example.com.", "tracker.evil.example.", 300),
         a_record("tracker.evil.example.", [1, 2, 3, 4], 300),
     ];
-    match walk_response(&records, &filter, &profile, NamePolicy::Neutral, 16) {
+    match walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16) {
         Verdict::Block { offending, source } => {
             assert_eq!(offending.as_str(), "tracker.evil.example");
-            assert_eq!(source, BlockSource::AdminBlock);
-            assert_eq!(source.label(), "admin_block");
+            assert_eq!(source, BlockSource::CustomList(Id::new("rules").unwrap()));
+            assert_eq!(source.label(), "custom_list");
         }
         Verdict::Allow => panic!("tail-blocked chain must produce Verdict::Block"),
     }
@@ -145,13 +160,13 @@ fn cname_loop_chain_trips_with_cname_loop_source() {
     // slot 0 holds the queried apex (alias of the first CNAME record),
     // so cycle detection catches the second hop's target=A. Without
     // that slot, the cycle is invisible to a target-only walker.
-    let filter = filter_with_blocked(&[]);
-    let profile = ResolvedProfile::permissive_default();
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("");
     let records = vec![
         cname_record("apex.example.com.", "alias.example.com.", 300),
         cname_record("alias.example.com.", "apex.example.com.", 300),
     ];
-    match walk_response(&records, &filter, &profile, NamePolicy::Neutral, 16) {
+    match walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16) {
         Verdict::Block { source, .. } => {
             assert_eq!(source, BlockSource::CnameLoop);
             assert_eq!(source.label(), "cname_loop");
@@ -163,8 +178,8 @@ fn cname_loop_chain_trips_with_cname_loop_source() {
 #[test]
 fn depth_exceeded_chain_trips_with_depth_exceeded_source() {
     // 5 hops, max_depth=2 → walker stops at hop 2 with depth_exceeded.
-    let filter = filter_with_blocked(&[]);
-    let profile = ResolvedProfile::permissive_default();
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("");
     let records = vec![
         cname_record("apex.example.com.", "h1.example.com.", 300),
         cname_record("h1.example.com.", "h2.example.com.", 300),
@@ -172,7 +187,7 @@ fn depth_exceeded_chain_trips_with_depth_exceeded_source() {
         cname_record("h3.example.com.", "h4.example.com.", 300),
         cname_record("h4.example.com.", "h5.example.com.", 300),
     ];
-    match walk_response(&records, &filter, &profile, NamePolicy::Neutral, 2) {
+    match walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 2) {
         Verdict::Block { source, .. } => {
             assert_eq!(source, BlockSource::CnameDepthExceeded);
             assert_eq!(source.label(), "cname_depth_exceeded");
@@ -182,28 +197,19 @@ fn depth_exceeded_chain_trips_with_depth_exceeded_source() {
 }
 
 #[test]
-fn admin_allow_on_hop_overrides_tail_block() {
-    // The chain hits a tail that the resolved profile WOULD deny via
-    // `deny_domains`, but the same name is also in the profile's
-    // `allow_domains`. The walker's admin-allow short-circuit
-    // (`domain_matches_set(target, &profile.allow_domains)`) returns
-    // `Verdict::Allow` BEFORE the engine.evaluate probe — admin trust
-    // wins. Pinning this confirms Sprint 1 §X decision #5 stays live
-    // through the wire-in.
-    let filter = filter_with_blocked(&[]);
-    let mut profile = profile_denying(&["tracker.evil.example"]);
-    profile.allow_domains = std::iter::once(CompactString::from("tracker.evil.example"))
-        .collect::<std::collections::HashSet<_, _>>()
-        .into();
+fn allow_rule_on_hop_overrides_tail_block() {
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.example\n@@tracker.evil.example");
     let records = vec![
         cname_record("apex.example.com.", "tracker.evil.example.", 300),
         a_record("tracker.evil.example.", [1, 2, 3, 4], 300),
     ];
-    let verdict = walk_response(&records, &filter, &profile, NamePolicy::Neutral, 16);
+    let verdict =
+        walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16);
     assert_eq!(
         verdict,
         Verdict::Allow,
-        "admin allow_domains must override tail block"
+        "operator allow must override the target block"
     );
 }
 
@@ -238,9 +244,16 @@ async fn block_path_invalidates_cache_no_poison() {
         _ => panic!("expected Fresh entry after insert"),
     };
 
-    let filter = filter_with_blocked(&[]);
-    let profile = Arc::new(profile_denying(&["tracker.evil.example"]));
-    let verdict = walk_response(entry.records(), &filter, &profile, NamePolicy::Neutral, 16);
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.example");
+    let verdict = walk_response_with_grant(
+        entry.records(),
+        "apex.example.com",
+        &filter,
+        &profile,
+        None,
+        16,
+    );
     let offending = match verdict {
         Verdict::Block { offending, .. } => offending,
         Verdict::Allow => panic!("post-cache-hit chain must trip"),
@@ -270,16 +283,34 @@ fn offending_byte_identity_carries_into_audit_label() {
     // trailing dot. This test pins the exact byte sequence the audit
     // log writes — frozen at "tracker.evil.example" lowercase, no
     // dot, regardless of upstream-supplied case / dot-form.
-    let filter = filter_with_blocked(&[]);
-    let profile = profile_denying(&["tracker.evil.example"]);
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("tracker.evil.example");
     let records = vec![
         cname_record("apex.example.com.", "Tracker.EVIL.Example.", 300),
         a_record("tracker.evil.example.", [1, 2, 3, 4], 300),
     ];
-    match walk_response(&records, &filter, &profile, NamePolicy::Neutral, 16) {
+    match walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16) {
         Verdict::Block { offending, .. } => {
             assert_eq!(offending.as_str(), "tracker.evil.example");
         }
         Verdict::Allow => panic!("case-mixed tail must still trip"),
+    }
+}
+
+#[test]
+fn conflicting_qname_owner_is_malformed_in_either_wire_order() {
+    let filter = FilterEngine::new();
+    let profile = compiled_profile("@@clean.example");
+    let clean = cname_record("apex.example.com.", "clean.example.", 300);
+    let blocked = cname_record("apex.example.com.", "blocked.example.", 300);
+
+    for records in [[clean.clone(), blocked.clone()], [blocked, clean]] {
+        assert!(matches!(
+            walk_response_with_grant(&records, "apex.example.com", &filter, &profile, None, 16,),
+            Verdict::Block {
+                source: BlockSource::CnameMalformed,
+                ..
+            }
+        ));
     }
 }

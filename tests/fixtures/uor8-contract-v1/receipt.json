@@ -1,0 +1,21 @@
+{
+  "contract_version": 1,
+  "operation_id": "operation-v1-local",
+  "request_id": "golden-apply-v1",
+  "changed": true,
+  "persistence": "committed",
+  "config_revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "operator_policy_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "activation": {
+    "state": "applied",
+    "correlation_id": "reload-v1-local",
+    "reload_outcome": "reloaded",
+    "active_config_revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "active_policy_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "daemon_instance_id": "instance-v1-local",
+    "superseded_by": null
+  },
+  "replication": "unavailable",
+  "audit": "recorded",
+  "diagnostics": []
+}

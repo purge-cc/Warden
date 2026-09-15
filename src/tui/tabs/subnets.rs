@@ -1,8 +1,8 @@
 //! Subnets tab — master/detail view of configured + discovered subnets.
 //!
 //! The left list mixes configured subnets with auto-discovered candidate
-//! buckets; the right card splits 3-ways: linechart of per-subnet hourly
-//! traffic on top, KV stats panel bottom-left, client list bottom-right.
+//! buckets. Traffic and clients share the wider center column; block rate
+//! and subnet details share the fixed-width right column.
 //! `discover_candidates` buckets unmapped IPs by /24 (v4) / /64 (v6) with a
 //! ≥2-host threshold; `filter_clients_in_subnet` resolves CIDR membership;
 //! `aggregate_subnet_hourly` sums element-wise the per-device
@@ -32,16 +32,19 @@
 //! to a row index every render keeps the cursor on the same logical
 //! row even when configured / discovered counts shift.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use crossterm::event::KeyCode;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+    Axis, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table, TableState, Widget, Wrap,
 };
 use ratatui::Frame;
 
@@ -49,10 +52,11 @@ use crate::config::cidr::Cidr;
 use crate::config::loader::LoadedConfig;
 use crate::config::schema::Subnet;
 use crate::ipc::protocol::{DeviceViewDto, UnmappedDeviceDto};
-use crate::tui::app::App;
+use crate::tui::app::{App, Leaf};
 use crate::tui::format::count as format_count;
+use crate::tui::mouse::{self, MouseAction, SortOrder};
+use crate::tui::tabs::devices::DETAIL_COLUMN_WIDTH;
 use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
 
 /// Operator-facing tag appended to every auto-discovered candidate row
 /// in the master list. Frozen by `tests/frozen_strings_s51.rs` — every
@@ -70,7 +74,11 @@ pub const SUBNET_SUGGESTED_TAG: &str = " [suggested]";
 /// branches on its own post-chrome `outer.width` instead, so the two
 /// tabs' thresholds are not directly comparable even where the
 /// numbers are close.
-const NARROW_THRESHOLD: u16 = 110;
+// Three-column mode starts only when the traffic/clients column can remain
+// wider than the shared 42-cell details column: 38 master + 1 gutter +
+// 42 details + 1 extra middle cell on either side of the split.
+const NARROW_THRESHOLD: u16 = 120;
+const DETAIL_MIN_HEIGHT: u16 = 27;
 
 // ── Public render entry point ──────────────────────────────────────────────
 
@@ -89,17 +97,20 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let total = configured.len() + candidates.len();
 
     if total == 0 {
-        // Single framed card, mirroring the Devices empty card.
-        let content = render_section_chrome(f, area, "Subnets", T.brand_red);
+        // Keep the empty state inside the same card as the populated list.
+        let content = theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "SUBNETS",
+            "Configured & Suggested Address Ranges",
+            theme::CardRole::Summary,
+        );
         render_empty(f, content);
         return;
     }
 
-    if area.width < NARROW_THRESHOLD {
-        // Single-column fallback: only the master list (self-framed).
-        // Operators on narrow terminals still see what's configured +
-        // suggested, they just lose the per-subnet detail card until
-        // they widen the window.
+    if area.width < NARROW_THRESHOLD || area.height < DETAIL_MIN_HEIGHT {
+        app.mouse.subnet_panel = 0;
         render_master(
             f,
             area,
@@ -109,54 +120,77 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             app.subnets.selected_id.as_deref(),
             &mut app.subnets.table_state,
         );
+        mouse::register(app, area, MouseAction::SubnetPanel(0));
+        register_master_mouse(app, area, total);
         return;
     }
 
-    // Two independent framed cards (master + detail), mirroring the
-    // Devices tab: each panel self-frames and the 1-cell gutter stays
-    // blank (no divider glyph). The master list card is fixed at 38
-    // cells — the same width as the Devices device-details card
-    // (`tabs/devices.rs`) — and the detail pane takes the rest.
-    let cols = Layout::horizontal([
-        Constraint::Length(38),
-        Constraint::Length(1),
-        Constraint::Min(60),
-    ])
-    .split(area);
+    let detail_width = DETAIL_COLUMN_WIDTH.min(area.width);
+    let list_width = (area.width / 3 + 1)
+        .min(area.width.saturating_sub(detail_width.saturating_mul(2)) + 1)
+        .max(32);
+    let list_area = Rect::new(area.x, area.y, list_width, area.height);
+    let right_area = Rect::new(
+        area.x + list_width.saturating_sub(1),
+        area.y,
+        area.width.saturating_sub(list_width) + 1,
+        area.height,
+    );
 
     render_master(
         f,
-        cols[0],
+        list_area,
         device_view,
         configured,
         &candidates,
         app.subnets.selected_id.as_deref(),
         &mut app.subnets.table_state,
     );
-    render_detail(f, cols[2], app, configured, &candidates);
+    mouse::register(app, list_area, MouseAction::SubnetPanel(0));
+    register_master_mouse(app, list_area, configured.len() + candidates.len());
+    render_detail(f, right_area, app, configured, &candidates);
 }
 
-/// Paint a 1-cell-wide vertical separator (`│`) for every row of `area`.
-/// Mirrors the post-Table separator pass at `tabs/query_log.rs:291` so
-/// the operator reads the master/detail and stats/clients gutters with
-/// the same column-divider glyph the Query Log table uses.
-fn draw_v_divider(f: &mut Frame, area: Rect) {
-    let style = Style::default().fg(T.text_muted);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        if area.x < buf.area.right() && y < buf.area.bottom() {
-            buf.set_string(area.x, y, "\u{2502}", style);
+/// Handle focus navigation for the five subnet panels. The root dispatcher
+/// calls this before the legacy Lists-style key handler, so arrows in a
+/// focused detail panel can never move the master subnet accidentally.
+pub fn handle_panel_key(app: &mut App, key: KeyCode) -> bool {
+    let panel = app.mouse.subnet_panel.min(4);
+    let max_scroll = app.mouse.subnet_clients_max_scroll.get();
+    app.mouse.subnet_clients_scroll = app.mouse.subnet_clients_scroll.min(max_scroll);
+    match key {
+        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown if panel == 2 => {
+            match key {
+                KeyCode::Up => {
+                    app.mouse.subnet_clients_scroll =
+                        app.mouse.subnet_clients_scroll.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    app.mouse.subnet_clients_scroll =
+                        app.mouse.subnet_clients_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => {
+                    app.mouse.subnet_clients_scroll =
+                        app.mouse.subnet_clients_scroll.saturating_sub(8)
+                }
+                KeyCode::PageDown => {
+                    app.mouse.subnet_clients_scroll =
+                        app.mouse.subnet_clients_scroll.saturating_add(8)
+                }
+                _ => unreachable!(),
+            }
+            app.mouse.subnet_clients_scroll = app.mouse.subnet_clients_scroll.min(max_scroll);
+            true
         }
-    }
-}
-
-/// Paint a 1-cell-tall horizontal separator (`─`) for every column of `area`.
-fn draw_h_divider(f: &mut Frame, area: Rect) {
-    let style = Style::default().fg(T.text_muted);
-    let buf = f.buffer_mut();
-    let line: String = "\u{2500}".repeat(area.width as usize);
-    if area.y < buf.area.bottom() {
-        buf.set_string(area.x, area.y, &line, style);
+        KeyCode::Home | KeyCode::End if panel == 2 => {
+            app.mouse.subnet_clients_scroll = if matches!(key, KeyCode::Home) {
+                0
+            } else {
+                max_scroll
+            };
+            true
+        }
+        _ => false,
     }
 }
 
@@ -174,18 +208,24 @@ fn render_master(
     // Self-framed card. Compact title (configured\u{00b7}suggested) — the long
     // "N configured \u{00b7} M suggested" form clips in the narrow master column.
     let title = format!("Subnets ({}\u{00b7}{})", configured.len(), candidates.len());
-    let content = render_section_chrome(f, area, &title, T.brand_red);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        &title,
+        &format!(
+            "{} Configured · {} Suggested",
+            configured.len(),
+            candidates.len()
+        ),
+        theme::CardRole::Summary,
+    );
 
     let header = Row::new(vec![
         Cell::from("ID / CIDR"),
         Cell::from("DEV"),
         Cell::from("PROFILE"),
     ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
-    );
+    .style(theme::table_heading_style(false));
 
     let rows: Vec<Row> = master_rows(configured, candidates, device_view).collect();
 
@@ -218,6 +258,43 @@ fn render_master(
     super::render_table(f, content, table, table_state, selected);
 }
 
+fn register_master_mouse(app: &App, area: Rect, row_count: usize) {
+    let offset = app.subnets.table_state.offset();
+    for (area, index) in master_row_hit_areas(area, row_count, offset) {
+        mouse::register(app, area, MouseAction::Row(Leaf::Subnets, index));
+    }
+}
+
+fn master_row_hit_areas(
+    area: Rect,
+    row_count: usize,
+    offset: usize,
+) -> impl Iterator<Item = (Rect, usize)> {
+    let content = card_body_area(area);
+    let visible_rows = content.height.saturating_sub(1) as usize / 2;
+    let count = visible_rows.min(row_count.saturating_sub(offset));
+    (0..count).map(move |visible| {
+        (
+            Rect::new(
+                content.x,
+                content.y + 1 + visible as u16 * 2,
+                content.width,
+                2,
+            ),
+            offset + visible,
+        )
+    })
+}
+
+fn card_body_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(3),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(4),
+    )
+}
+
 /// Build the master list rows: configured subnets first (by id, the
 /// stable insertion order from the TOML), then discovered candidates
 /// (populous-first, ties by CIDR ascending — see `discover_candidates`).
@@ -231,23 +308,31 @@ fn master_rows<'a>(
             .map(|dv| count_devices_in_cidrs(dv, &s.cidrs))
             .unwrap_or(0);
         Row::new(vec![
-            Cell::from(s.id.as_str().to_string()),
+            Cell::from(vec![
+                Line::from(s.id.as_str().to_string()),
+                Line::styled(s.cidrs.join(", "), Style::default().fg(T.text_muted)),
+            ]),
             Cell::from(dev_count.to_string()),
             Cell::from(s.profile.as_str().to_string()),
         ])
+        .height(2)
     });
 
     let candidate_rows = candidates.iter().map(|c| {
         Row::new(vec![
-            Cell::from(Span::styled(
-                format!("{}{}", c.cidr, SUBNET_SUGGESTED_TAG),
-                Style::default()
-                    .fg(T.text_muted)
-                    .add_modifier(Modifier::ITALIC),
-            )),
+            Cell::from(vec![
+                Line::styled(c.cidr.clone(), Style::default().fg(T.text_muted)),
+                Line::from(Span::styled(
+                    SUBNET_SUGGESTED_TAG,
+                    Style::default()
+                        .fg(T.text_muted)
+                        .add_modifier(Modifier::ITALIC),
+                )),
+            ]),
             Cell::from(c.host_count.to_string()),
             Cell::from(Span::styled("—", Style::default().fg(T.text_muted))),
         ])
+        .height(2)
     });
 
     configured_rows.chain(candidate_rows)
@@ -316,50 +401,108 @@ fn render_detail(
         .as_deref()
         .and_then(|key| find_selection(key, configured, candidates));
 
-    // Self-framed card. Title mirrors the master row's primary label —
-    // entity id for a configured subnet, CIDR for a candidate — the way
-    // the Devices "device details" card titles itself.
-    let title = match &selection {
-        Some(Selection::Configured(s)) => format!("Subnet \u{00b7} {}", s.id.as_str()),
-        Some(Selection::Candidate(c)) => format!("Subnet \u{00b7} {}", c.cidr),
-        None => "Subnet".to_string(),
-    };
-    let content = render_section_chrome(f, area, &title, T.brand_red);
-
     let Some(sel) = selection else {
-        render_detail_placeholder(f, content, "Select a subnet on the left to see traffic");
+        render_detail_placeholder(f, area, "Select a subnet on the left to see traffic");
         return;
     };
 
-    let rows = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(1),
-        Constraint::Min(10),
-    ])
-    .split(content);
+    let detail_width = DETAIL_COLUMN_WIDTH.min(area.width);
+    let center_width = area.width.saturating_sub(detail_width) + 1;
+    let top_height = (area.height * 2 / 5).clamp(12, 18).min(area.height);
+    let center = Rect::new(area.x, area.y, center_width, area.height);
+    let right = Rect::new(
+        area.x + center_width.saturating_sub(1),
+        area.y,
+        area.width.saturating_sub(center_width) + 1,
+        area.height,
+    );
+    let rows = theme::split_card_rows(center, top_height);
+    let right_rows = theme::split_card_rows(right, top_height);
 
-    let bottom = Layout::horizontal([
-        Constraint::Percentage(45),
-        Constraint::Length(1),
-        Constraint::Percentage(55),
-    ])
-    .split(rows[2]);
+    // Register the broad panel targets before the nested table header and
+    // sort targets. Mouse wheel resolution uses these rectangles to focus
+    // the panel before forwarding the wheel key.
+    mouse::register(app, rows[0], MouseAction::SubnetPanel(1));
+    mouse::register(app, rows[1], MouseAction::SubnetPanel(2));
+    mouse::register(app, right_rows[0], MouseAction::SubnetPanel(3));
+    mouse::register(app, right_rows[1], MouseAction::SubnetPanel(4));
 
     match sel {
         Selection::Configured(s) => {
-            render_chart(f, rows[0], app, &s.cidrs);
-            render_stats_for_configured(f, bottom[0], app, s);
-            render_clients(f, bottom[2], app, &s.cidrs);
+            render_traffic(f, rows[0], app, &s.cidrs);
+            render_clients(f, rows[1], app, &s.cidrs);
+            render_block_rate(f, right_rows[0], app, &s.cidrs);
+            render_stats_for_configured(f, right_rows[1], app, s);
         }
         Selection::Candidate(c) => {
-            render_chart_for_candidate(f, rows[0], app, c);
-            render_stats_for_candidate(f, bottom[0], c);
-            render_clients_for_candidate(f, bottom[2], app, c);
+            render_traffic_for_candidate(f, rows[0], app, c);
+            render_clients_for_candidate(f, rows[1], app, c);
+            render_block_rate_for_candidate(f, right_rows[0], app, c);
+            render_stats_for_candidate(f, right_rows[1], c);
         }
     }
+}
 
-    draw_h_divider(f, rows[1]);
-    draw_v_divider(f, bottom[1]);
+/// Render the keyboard-opened subnet inspection surface. Narrow layouts keep
+/// the master list uncluttered and expose these views through `i` and `c`;
+/// wide layouts use the same surface for a focused, full-height inspection.
+pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
+    use crate::tui::app::SubnetInspect;
+
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return;
+    };
+    let configured = loaded.config.subnets.as_slice();
+    let candidates = discover_candidates(
+        app.device_view
+            .as_ref()
+            .map(|view| view.unmapped.as_slice())
+            .unwrap_or(&[]),
+        configured,
+    );
+    let Some(selection) = app
+        .subnets
+        .selected_id
+        .as_deref()
+        .and_then(|key| find_selection(key, configured, &candidates))
+    else {
+        return;
+    };
+
+    let height = area.height.saturating_sub(2).min(34);
+    let mut inner =
+        crate::tui::modal_form::render_chrome_in(f, area, 88, height, "", T.text_primary, true);
+    if inner.is_empty() {
+        return;
+    }
+
+    crate::tui::modal_form::close_footer(f, crate::tui::modal_form::content_rect(inner));
+    inner.height = inner.height.saturating_sub(2);
+    match app.subnets.inspect {
+        Some(SubnetInspect::Clients) => match selection {
+            Selection::Configured(subnet) => {
+                render_clients_content(f, inner, app, &subnet.cidrs, true)
+            }
+            Selection::Candidate(candidate) => {
+                render_clients_for_candidate_content(f, inner, app, candidate, true)
+            }
+        },
+        Some(SubnetInspect::Details) => {
+            let detail_height = inner.height.min(12);
+            let rows = theme::split_card_rows(inner, detail_height);
+            match selection {
+                Selection::Configured(subnet) => {
+                    render_stats_for_configured_content(f, rows[0], app, subnet, true);
+                    render_clients_content(f, rows[1], app, &subnet.cidrs, true);
+                }
+                Selection::Candidate(candidate) => {
+                    render_stats_for_candidate_content(f, rows[0], candidate, true);
+                    render_clients_for_candidate_content(f, rows[1], app, candidate, true);
+                }
+            }
+        }
+        None => {}
+    }
 }
 
 enum Selection<'a> {
@@ -395,39 +538,16 @@ fn render_detail_placeholder(f: &mut Frame, area: Rect, text: &str) {
 
 // ── Chart sub-pane ─────────────────────────────────────────────────────────
 
-fn render_chart(f: &mut Frame, area: Rect, app: &App, cidrs: &[String]) {
+fn render_traffic(f: &mut Frame, area: Rect, app: &App, cidrs: &[String]) {
     let dv = app.device_view.as_ref();
     let buckets = dv
         .map(|d| aggregate_subnet_hourly(d, cidrs))
         .unwrap_or_else(|| vec![0u64; 24]);
-
-    // A compact block-rate gauge sits beside the 24h linechart, but only
-    // when the row is wide enough to keep the braille line legible. Below
-    // the threshold the gauge is dropped and the chart stays full-width —
-    // graceful degradation for narrow terminals (verified via CT pty
-    // smoke, not unit tests: a split that clips is invisible to a
-    // default-width render).
-    const GAUGE_W: u16 = 24;
-    const MIN_CHART_W: u16 = 46;
-    if area.width >= MIN_CHART_W + 1 + GAUGE_W {
-        let cols = Layout::horizontal([
-            Constraint::Min(MIN_CHART_W),
-            Constraint::Length(1),
-            Constraint::Length(GAUGE_W),
-        ])
-        .split(area);
-        paint_chart(f, cols[0], &buckets);
-        draw_v_divider(f, cols[1]);
-        let parsed: Vec<Cidr> = cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect();
-        let blocked_24h = dv.map(|d| blocked_24h_in(d, &parsed)).unwrap_or(0);
-        let queries_24h: u64 = buckets.iter().sum();
-        paint_block_gauge(f, cols[2], blocked_24h, queries_24h);
-    } else {
-        paint_chart(f, area, &buckets);
-    }
+    let blocked = dv.and_then(|d| aggregate_subnet_blocked_hourly(d, cidrs));
+    render_traffic_card(f, area, &buckets, blocked.as_deref(), false, dv.is_some());
 }
 
-fn render_chart_for_candidate(f: &mut Frame, area: Rect, app: &App, c: &CandidateSubnet) {
+fn render_traffic_for_candidate(f: &mut Frame, area: Rect, app: &App, c: &CandidateSubnet) {
     // Candidates are unmapped-only by definition (mapped IPs already
     // sit in their owner's `[[devices]]` row). Aggregate just the
     // unmapped ring intersecting the candidate CIDR.
@@ -435,15 +555,78 @@ fn render_chart_for_candidate(f: &mut Frame, area: Rect, app: &App, c: &Candidat
     let buckets = dv
         .map(|d| aggregate_subnet_hourly_unmapped_only(d, std::slice::from_ref(&c.cidr)))
         .unwrap_or_else(|| vec![0u64; 24]);
-    paint_chart(f, area, &buckets);
+    let blocked = dv.and_then(|d| {
+        aggregate_subnet_blocked_hourly_unmapped_only(d, std::slice::from_ref(&c.cidr))
+    });
+    render_traffic_card(f, area, &buckets, blocked.as_deref(), true, dv.is_some());
 }
 
-fn paint_chart(f: &mut Frame, area: Rect, buckets: &[u64]) {
+fn render_traffic_card(
+    f: &mut Frame,
+    area: Rect,
+    buckets: &[u64],
+    blocked: Option<&[u64]>,
+    suggested: bool,
+    available: bool,
+) {
+    let total = buckets
+        .iter()
+        .fold(0u64, |sum, value| sum.saturating_add(*value));
+    let blocked_total = blocked.map(|values| {
+        values
+            .iter()
+            .fold(0u64, |sum, value| sum.saturating_add(*value))
+    });
+    let prefix = if suggested { "Suggested · " } else { "" };
+    let description = if available {
+        format!(
+            "{prefix}24H Queries · Total {} · Blocked {}",
+            format_count(total),
+            blocked_total
+                .map(format_count)
+                .unwrap_or_else(|| "Unavailable".to_string())
+        )
+    } else {
+        "Waiting for Daemon".to_string()
+    };
+    let legend = Line::from(vec![
+        Span::styled("⠿ Total", Style::default().fg(T.chart_2)),
+        Span::raw("  "),
+        Span::styled(
+            if blocked.is_some() {
+                "⠿ Blocked"
+            } else {
+                "⠿ Blocked N/A"
+            },
+            Style::default().fg(T.brand_red),
+        ),
+    ]);
+    let body = theme::filled_card_with_subtitle(
+        f.buffer_mut(),
+        area,
+        "SUBNET TRAFFIC",
+        theme::card_subtitle_with_legend(area, &description, legend),
+        theme::CardRole::Analytics,
+    );
+    if available {
+        paint_chart(f, body, buckets, blocked);
+    } else {
+        f.render_widget(
+            Paragraph::new("Hourly data unavailable").style(Style::default().fg(T.text_muted)),
+            body,
+        );
+    }
+}
+
+fn paint_chart(f: &mut Frame, area: Rect, buckets: &[u64], blocked: Option<&[u64]>) {
     if area.height < 4 {
         return;
     }
     let total: u64 = buckets.iter().sum();
-    if total == 0 {
+    let blocked_total = blocked
+        .map(|values| values.iter().sum::<u64>())
+        .unwrap_or(0);
+    if total == 0 && blocked_total == 0 {
         let para = Paragraph::new(Span::styled(
             "  no traffic in the last 24h",
             Style::default().fg(T.text_muted),
@@ -457,15 +640,34 @@ fn paint_chart(f: &mut Frame, area: Rect, buckets: &[u64]) {
         .enumerate()
         .map(|(i, n)| (i as f64, *n as f64))
         .collect();
-    let max_y = buckets.iter().copied().max().unwrap_or(1) as f64;
+    let max_y = buckets
+        .iter()
+        .copied()
+        .chain(blocked.unwrap_or(&[]).iter().copied())
+        .max()
+        .unwrap_or(1) as f64;
     let x_max = (buckets.len().max(1) - 1) as f64;
 
-    let datasets = vec![Dataset::default()
-        .name("queries")
+    let mut datasets = vec![Dataset::default()
         .marker(Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(T.chart_2))
         .data(&series)];
+    let blocked_series: Vec<(f64, f64)> = blocked
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as f64, *n as f64))
+        .collect();
+    if blocked.is_some() {
+        datasets.push(
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(T.brand_red))
+                .data(&blocked_series),
+        );
+    }
 
     let x_labels: Vec<Span> = vec![
         "-24h".into(),
@@ -487,11 +689,9 @@ fn paint_chart(f: &mut Frame, area: Rect, buckets: &[u64]) {
                 .style(Style::default().fg(T.axis_label))
                 .bounds([0.0, (max_y * 1.1).max(1.0)])
                 .labels::<Vec<Span>>(vec!["0".into(), max_y.to_string().into()]),
-        );
+        )
+        .style(Style::default().fg(T.text_primary).bg(T.bg_elevated));
 
-    // 1-cell gutters on each side so the leftmost braille column
-    // doesn't paint glued to the section frame — same idiom dashboard
-    // uses for its 24h chart.
     let chart_cols = Layout::horizontal([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -499,6 +699,138 @@ fn paint_chart(f: &mut Frame, area: Rect, buckets: &[u64]) {
     ])
     .split(area);
     f.render_widget(chart, chart_cols[1]);
+}
+
+fn render_block_rate(f: &mut Frame, area: Rect, app: &App, cidrs: &[String]) {
+    let Some(dv) = app.device_view.as_ref() else {
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "BLOCK RATE",
+            "Hourly Estimates",
+            theme::CardRole::History,
+        );
+        f.render_widget(
+            Paragraph::new("Hourly data unavailable").style(Style::default().fg(T.text_muted)),
+            body,
+        );
+        return;
+    };
+    let queries = aggregate_subnet_hourly(dv, cidrs);
+    let blocked = aggregate_subnet_blocked_hourly(dv, cidrs);
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "BLOCK RATE",
+        "Hourly Estimates",
+        theme::CardRole::History,
+    );
+    paint_subnet_block_rate(f, body, &queries, blocked.as_deref());
+}
+
+fn render_block_rate_for_candidate(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    candidate: &CandidateSubnet,
+) {
+    let queries = app
+        .device_view
+        .as_ref()
+        .map(|dv| aggregate_subnet_hourly_unmapped_only(dv, std::slice::from_ref(&candidate.cidr)));
+    let blocked = app.device_view.as_ref().and_then(|dv| {
+        aggregate_subnet_blocked_hourly_unmapped_only(dv, std::slice::from_ref(&candidate.cidr))
+    });
+    let subtitle = if blocked.is_some() {
+        "Hourly Estimates · 24 UTC hours"
+    } else {
+        "Hourly Estimates · Blocked Unavailable"
+    };
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "BLOCK RATE",
+        subtitle,
+        theme::CardRole::History,
+    );
+    match queries {
+        Some(queries) => paint_subnet_block_rate(f, body, &queries, blocked.as_deref()),
+        None => f.render_widget(
+            Paragraph::new("Hourly data unavailable").style(Style::default().fg(T.text_muted)),
+            body,
+        ),
+    }
+}
+
+fn paint_subnet_block_rate(f: &mut Frame, area: Rect, queries: &[u64], blocked: Option<&[u64]>) {
+    if blocked.is_some_and(|values| values.len() != queries.len()) {
+        f.render_widget(
+            Paragraph::new("Hourly data unavailable (window mismatch)")
+                .style(Style::default().fg(T.text_muted)),
+            area,
+        );
+        return;
+    }
+    for (index, (label, hours)) in [("1h", 1usize), ("3h", 3), ("12h", 12), ("24h", 24)]
+        .into_iter()
+        .enumerate()
+    {
+        let y = area.y + index as u16 * 2;
+        if y + 1 >= area.bottom() {
+            break;
+        }
+        let start = queries.len().saturating_sub(hours);
+        let total: u64 = queries[start..].iter().sum();
+        let Some(blocked) = blocked else {
+            f.render_widget(
+                Paragraph::new(format!("{label:<3} — blocked unavailable"))
+                    .style(Style::default().fg(T.text_muted)),
+                Rect::new(area.x, y, area.width, 1),
+            );
+            continue;
+        };
+        let blocked_total: u64 = blocked[start..].iter().sum();
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            (blocked_total as f64 / total as f64).clamp(0.0, 1.0)
+        };
+        f.render_widget(
+            Paragraph::new(format!(
+                "{label:<3} {:>5.1}% {} / {}",
+                ratio * 100.0,
+                format_count(blocked_total),
+                format_count(total)
+            ))
+            .style(Style::default().fg(T.text_primary)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+        percentage_bar(
+            f.buffer_mut(),
+            Rect::new(area.x, y + 1, area.width, 1),
+            ratio,
+            T.brand_red,
+        );
+    }
+}
+
+fn percentage_bar(buf: &mut Buffer, area: Rect, ratio: f64, color: Color) {
+    let ratio = ratio.clamp(0.0, 1.0);
+    Gauge::default()
+        .ratio(ratio)
+        .label("")
+        .use_unicode(true)
+        .gauge_style(Style::default().fg(color).bg(T.border_default))
+        .render(area, buf);
+    let full_cells = (f64::from(area.width) * ratio).floor() as u16;
+    for y in area.y..area.bottom() {
+        for x in area.x..area.x + full_cells {
+            buf[(x, y)]
+                .set_symbol("░")
+                .set_fg(color)
+                .set_bg(T.border_default);
+        }
+    }
 }
 
 /// Block rate as a percentage, clamped to `[0, 100]`; `total` of 0 → 0.0.
@@ -514,51 +846,34 @@ fn block_rate_pct(blocked: u64, total: u64) -> f64 {
     }
 }
 
-/// Compact block-rate gauge shown beside the 24h linechart for a
-/// configured subnet. `blocked` and `total` are both rolling-24h counts
-/// (`Σ blocked_24h` and `Σ hourly_queries` over the subnet's devices),
-/// so the ratio is window-consistent with the chart it sits next to and
-/// can never exceed 100% — unlike the old lifetime-blocked ÷ queries-today
-/// stat, which could render >100%.
-fn paint_block_gauge(f: &mut Frame, area: Rect, blocked: u64, total: u64) {
-    if area.height < 4 || area.width < 8 {
-        return;
-    }
-    let pct = block_rate_pct(blocked, total);
-    let bar_w = area.width.saturating_sub(1) as usize;
-    let filled = ((pct / 100.0) * bar_w as f64).round() as usize;
-    let bar: String = "█".repeat(filled) + &"░".repeat(bar_w.saturating_sub(filled));
-    let rate_line = if total == 0 {
-        "  —".to_string()
-    } else {
-        format!("  {pct:.1}%")
-    };
-    let lines = vec![
-        Line::from(Span::styled(
-            "  Block rate",
-            Style::default().fg(T.text_muted),
-        )),
-        Line::from(Span::styled(
-            rate_line,
-            Style::default()
-                .fg(T.brand_red)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!(" {bar}"),
-            Style::default().fg(T.brand_red),
-        )),
-        Line::from(Span::styled(
-            format!("  {} / {}", format_count(blocked), format_count(total)),
-            Style::default().fg(T.text_muted),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines), area);
-}
-
 // ── Stats sub-pane (KV table, 6-8 metrics) ─────────────────────────────────
 
+fn detail_frame(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    description: &str,
+    role: theme::CardRole,
+    modal: bool,
+) -> Rect {
+    if modal {
+        crate::tui::modal_form::render_header(f, area, title, description)
+    } else {
+        theme::filled_card(f.buffer_mut(), area, title, description, role)
+    }
+}
+
 fn render_stats_for_configured(f: &mut Frame, area: Rect, app: &App, s: &Subnet) {
+    render_stats_for_configured_content(f, area, app, s, false);
+}
+
+fn render_stats_for_configured_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    s: &Subnet,
+    modal: bool,
+) {
     let dv = app.device_view.as_ref();
     let parsed: Vec<Cidr> = s.cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect();
     let device_counts = dv.map(|d| device_counts_in(d, &parsed));
@@ -591,7 +906,18 @@ fn render_stats_for_configured(f: &mut Frame, area: Rect, app: &App, s: &Subnet)
     };
 
     let lines: Vec<(&str, String)> = vec![
+        ("ID", s.id.as_str().to_string()),
+        (
+            "Name",
+            if s.display_name.is_empty() {
+                s.id.as_str().to_string()
+            } else {
+                s.display_name.clone()
+            },
+        ),
+        ("CIDRs", s.cidrs.join(", ")),
         ("Profile", s.profile.as_str().to_string()),
+        ("Priority", s.priority.to_string()),
         ("Source", source),
         ("Devices", device_label),
         ("Queries today", format_count(queries_today)),
@@ -602,10 +928,22 @@ fn render_stats_for_configured(f: &mut Frame, area: Rect, app: &App, s: &Subnet)
         ),
         ("Top vendor", top_vendor.unwrap_or_else(|| "—".into())),
     ];
-    paint_kv_table(f, area, &lines);
+    let body = detail_frame(
+        f,
+        area,
+        "SUBNET DETAILS",
+        "Identity, Policy & Activity",
+        theme::CardRole::History,
+        modal,
+    );
+    paint_kv_table(f, body, &lines);
 }
 
 fn render_stats_for_candidate(f: &mut Frame, area: Rect, c: &CandidateSubnet) {
+    render_stats_for_candidate_content(f, area, c, false);
+}
+
+fn render_stats_for_candidate_content(f: &mut Frame, area: Rect, c: &CandidateSubnet, modal: bool) {
     let vendor_breakdown = if c.vendor_tally.is_empty() {
         "—".to_string()
     } else {
@@ -624,7 +962,15 @@ fn render_stats_for_candidate(f: &mut Frame, area: Rect, c: &CandidateSubnet) {
         ("Top vendors", vendor_breakdown),
         ("Action", "press Enter to add as a configured subnet".into()),
     ];
-    paint_kv_table(f, area, &lines);
+    let body = detail_frame(
+        f,
+        area,
+        "SUBNET DETAILS",
+        "Suggested Subnet · Not Configured",
+        theme::CardRole::History,
+        modal,
+    );
+    paint_kv_table(f, body, &lines);
 }
 
 fn paint_kv_table(f: &mut Frame, area: Rect, lines: &[(&str, String)]) {
@@ -647,21 +993,59 @@ fn paint_kv_table(f: &mut Frame, area: Rect, lines: &[(&str, String)]) {
 // ── Clients sub-pane ───────────────────────────────────────────────────────
 
 fn render_clients(f: &mut Frame, area: Rect, app: &App, cidrs: &[String]) {
+    render_clients_content(f, area, app, cidrs, false);
+}
+
+fn render_clients_content(f: &mut Frame, area: Rect, app: &App, cidrs: &[String], modal: bool) {
     let Some(dv) = app.device_view.as_ref() else {
-        render_detail_placeholder(f, area, "  waiting for daemon\u{2026}");
+        let body = detail_frame(
+            f,
+            area,
+            "SUBNET CLIENTS",
+            "Waiting for Daemon",
+            theme::CardRole::Analytics,
+            modal,
+        );
+        render_detail_placeholder(f, body, "waiting for daemon\u{2026}");
         return;
     };
     let clients = filter_clients_in_subnet(dv, cidrs);
+    let body = detail_frame(
+        f,
+        area,
+        "SUBNET CLIENTS",
+        &format!("{} Clients · Queries Today (UTC)", clients.len()),
+        theme::CardRole::Analytics,
+        modal,
+    );
     if clients.is_empty() {
-        render_detail_placeholder(f, area, "  no clients in this subnet");
-        return;
+        render_detail_placeholder(f, body, "no clients in this subnet");
+    } else {
+        paint_client_table(f, body, &clients, app);
     }
-    paint_client_table(f, area, &clients);
 }
 
 fn render_clients_for_candidate(f: &mut Frame, area: Rect, app: &App, c: &CandidateSubnet) {
+    render_clients_for_candidate_content(f, area, app, c, false);
+}
+
+fn render_clients_for_candidate_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    c: &CandidateSubnet,
+    modal: bool,
+) {
     let Some(dv) = app.device_view.as_ref() else {
-        render_detail_placeholder(f, area, "  waiting for daemon\u{2026}");
+        let body = detail_frame(
+            f,
+            area,
+            "SUBNET CLIENTS",
+            "Suggested · Queries Today (UTC)",
+            theme::CardRole::Analytics,
+            modal,
+        );
+        render_detail_placeholder(f, body, "waiting for daemon\u{2026}");
         return;
     };
     // Candidate CIDRs are by construction unmapped-only; filter just
@@ -680,11 +1064,19 @@ fn render_clients_for_candidate(f: &mut Frame, area: Rect, app: &App, c: &Candid
             }
         }
     }
+    let body = detail_frame(
+        f,
+        area,
+        "SUBNET CLIENTS",
+        &format!("{} Clients · Queries Today (UTC)", rows.len()),
+        theme::CardRole::Analytics,
+        modal,
+    );
     if rows.is_empty() {
-        render_detail_placeholder(f, area, "  no observed clients");
-        return;
+        render_detail_placeholder(f, body, "no observed clients");
+    } else {
+        paint_client_table(f, body, &rows, app);
     }
-    paint_client_table(f, area, &rows);
 }
 
 /// One row in the per-subnet client list. Kept `pub` so the
@@ -698,20 +1090,41 @@ pub struct ClientRow {
     pub queries: u64,
 }
 
-fn paint_client_table(f: &mut Frame, area: Rect, clients: &[ClientRow]) {
-    let header = Row::new(vec![
-        Cell::from("IP"),
-        Cell::from("NAME"),
-        Cell::from("VENDOR"),
-        Cell::from("Q.TODAY"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
-    );
-    let rows: Vec<Row> = clients
+fn paint_client_table(f: &mut Frame, area: Rect, clients: &[ClientRow], app: &App) {
+    let mut sorted = clients.to_vec();
+    if let Some(sort) = app.mouse.subnet_client_sort {
+        sorted.sort_by(|a, b| compare_client(a, b, sort));
+    }
+    let header = Row::new(
+        ["IP", "NAME", "VENDOR", "Q.TODAY"]
+            .into_iter()
+            .enumerate()
+            .map(|(column, label)| {
+                Cell::from(mouse::sort_label(
+                    label,
+                    column,
+                    app.mouse.subnet_client_sort,
+                ))
+                .style(theme::table_heading_style(
+                    app.subnets.client_sort_focus == Some(column)
+                        || app
+                            .mouse
+                            .subnet_client_sort
+                            .is_some_and(|sort| sort.column == column),
+                ))
+            }),
+    )
+    .style(theme::table_heading_style(false));
+    let visible_rows = area.height.saturating_sub(1) as usize;
+    app.mouse
+        .subnet_clients_max_scroll
+        .set(sorted.len().saturating_sub(visible_rows));
+    let (offset, end) =
+        client_window_bounds(sorted.len(), visible_rows, app.mouse.subnet_clients_scroll);
+    let rows: Vec<Row> = sorted
         .iter()
+        .skip(offset)
+        .take(end.saturating_sub(offset))
         .map(|c| {
             Row::new(vec![
                 Cell::from(c.ip.clone()),
@@ -732,6 +1145,52 @@ fn paint_client_table(f: &mut Frame, area: Rect, clients: &[ClientRow]) {
     )
     .header(header);
     f.render_widget(table, area);
+    let constraints = [
+        Constraint::Length(15),
+        Constraint::Min(10),
+        Constraint::Length(16),
+        Constraint::Length(8),
+    ];
+    for (column, column_area) in crate::tui::ui::table_column_rects(area, &constraints, 1, 0)
+        .into_iter()
+        .enumerate()
+    {
+        mouse::register(app, column_area, MouseAction::SubnetClientSort(column));
+    }
+}
+
+fn client_window_bounds(total: usize, visible: usize, requested: usize) -> (usize, usize) {
+    let max_scroll = total.saturating_sub(visible);
+    let offset = requested.min(max_scroll);
+    (offset, total.min(offset.saturating_add(visible)))
+}
+
+fn compare_client(a: &ClientRow, b: &ClientRow, sort: SortOrder) -> Ordering {
+    let primary = match sort.column {
+        0 => compare_ip(&a.ip, &b.ip),
+        1 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        2 => a
+            .vendor
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b.vendor.as_deref().unwrap_or("").to_lowercase()),
+        3 => a.queries.cmp(&b.queries),
+        _ => Ordering::Equal,
+    };
+    let primary = if sort.descending {
+        primary.reverse()
+    } else {
+        primary
+    };
+    primary.then_with(|| a.ip.cmp(&b.ip))
+}
+
+fn compare_ip(a: &str, b: &str) -> Ordering {
+    match (IpAddr::from_str(a), IpAddr::from_str(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    }
 }
 
 // ── Discovery + aggregation ────────────────────────────────────────────────
@@ -904,6 +1363,33 @@ pub fn aggregate_subnet_hourly(dv: &DeviceViewDto, cidrs: &[String]) -> Vec<u64>
     out
 }
 
+/// Sum the optional per-device blocked ring using the same CIDR projection
+/// as queries. `None` is deliberately contagious: an old daemon or a
+/// partially unavailable device must remain visibly unavailable rather than
+/// becoming an invented zero-valued series.
+pub fn aggregate_subnet_blocked_hourly(dv: &DeviceViewDto, cidrs: &[String]) -> Option<Vec<u64>> {
+    let parsed: Vec<Cidr> = cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect();
+    if parsed.is_empty() {
+        return Some(vec![0; 24]);
+    }
+    let mut out = vec![0u64; 24];
+    for m in &dv.mapped {
+        if let Ok(ip) = IpAddr::from_str(&m.ip) {
+            if parsed.iter().any(|c| c.contains(ip)) {
+                add_optional_ring(&mut out, m.hourly_blocked.as_deref())?;
+            }
+        }
+    }
+    for u in &dv.unmapped {
+        if let Ok(ip) = IpAddr::from_str(&u.ip) {
+            if parsed.iter().any(|c| c.contains(ip)) {
+                add_optional_ring(&mut out, u.hourly_blocked.as_deref())?;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Same as [`aggregate_subnet_hourly`] but only walks the unmapped
 /// slice. Used by candidate buckets — mapped devices that happen to
 /// sit inside a candidate CIDR are by definition already covered by
@@ -924,6 +1410,25 @@ fn aggregate_subnet_hourly_unmapped_only(dv: &DeviceViewDto, cidrs: &[String]) -
     out
 }
 
+fn aggregate_subnet_blocked_hourly_unmapped_only(
+    dv: &DeviceViewDto,
+    cidrs: &[String],
+) -> Option<Vec<u64>> {
+    let parsed: Vec<Cidr> = cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect();
+    if parsed.is_empty() {
+        return Some(vec![0; 24]);
+    }
+    let mut out = vec![0u64; 24];
+    for u in &dv.unmapped {
+        if let Ok(ip) = IpAddr::from_str(&u.ip) {
+            if parsed.iter().any(|c| c.contains(ip)) {
+                add_optional_ring(&mut out, u.hourly_blocked.as_deref())?;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Add `src` into `dst` slot-by-slot. `src` shorter than 24 contributes
 /// only its prefix; `src` longer contributes the first 24 (wire format
 /// guarantees `[0]` = oldest, `[23]` = current hour, so a >24 ring
@@ -932,6 +1437,12 @@ fn add_ring(dst: &mut [u64], src: &[u64]) {
     for (i, v) in src.iter().enumerate().take(dst.len()) {
         dst[i] = dst[i].saturating_add(*v);
     }
+}
+
+fn add_optional_ring(dst: &mut [u64], src: Option<&[u64]>) -> Option<()> {
+    let src = src?;
+    add_ring(dst, src);
+    Some(())
 }
 
 // ── Stats helpers (configured-subnet pane) ─────────────────────────────────
@@ -985,7 +1496,7 @@ fn queries_today_in(dv: &DeviceViewDto, parsed: &[Cidr]) -> u64 {
 /// Rolling-24h blocked-query count summed over the subnet's devices
 /// (`MappedDeviceDto::blocked_24h` + `UnmappedDeviceDto::blocked_24h`).
 /// Pairs with `Σ hourly_queries` (via [`aggregate_subnet_hourly`]) for a
-/// window-consistent block rate — see [`paint_block_gauge`].
+/// window-consistent block rate — see [`paint_subnet_block_rate`].
 fn blocked_24h_in(dv: &DeviceViewDto, parsed: &[Cidr]) -> u64 {
     let mut n = 0u64;
     for m in &dv.mapped {
@@ -1045,7 +1556,13 @@ fn subnet_source_label(app: &App, s: &Subnet) -> String {
 // ── Empty / error states ───────────────────────────────────────────────────
 
 fn render_no_config(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Subnets", T.brand_red);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "SUBNETS",
+        "Configuration unavailable",
+        theme::CardRole::Summary,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             "  could not load config — fix it and press r to retry",
@@ -1114,6 +1631,7 @@ mod tests {
             online: false,
             vendor: vendor.map(|s| s.into()),
             hourly_queries: hourly,
+            hourly_blocked: None,
         }
     }
 
@@ -1141,7 +1659,32 @@ mod tests {
             network_name_wildcard: false,
             id: None,
             hourly_queries: hourly,
+            hourly_blocked: None,
             unfiltered: false,
+        }
+    }
+
+    fn with_blocked<T>(mut dto: T, hourly_blocked: Vec<u64>) -> T
+    where
+        T: SetHourlyBlocked,
+    {
+        dto.set_hourly_blocked(hourly_blocked);
+        dto
+    }
+
+    trait SetHourlyBlocked {
+        fn set_hourly_blocked(&mut self, value: Vec<u64>);
+    }
+
+    impl SetHourlyBlocked for MappedDeviceDto {
+        fn set_hourly_blocked(&mut self, value: Vec<u64>) {
+            self.hourly_blocked = Some(value);
+        }
+    }
+
+    impl SetHourlyBlocked for UnmappedDeviceDto {
+        fn set_hourly_blocked(&mut self, value: Vec<u64>) {
+            self.hourly_blocked = Some(value);
         }
     }
 
@@ -1194,36 +1737,94 @@ mod tests {
         })
     }
 
+    fn buffer_row(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        let area = *buf.area();
+        (area.x..area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
     #[test]
-    fn render_chart_shows_gauge_only_when_wide() {
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-        use ratatui::Terminal;
+    fn traffic_chart_paints_the_elevated_card_surface() {
+        use ratatui::{backend::TestBackend, Terminal};
 
-        let app = App::new();
-        let cidrs = vec!["10.0.0.0/24".to_string()];
-
-        // Wide row (≥ MIN_CHART_W + 1 + GAUGE_W) → gauge renders beside
-        // the linechart; its "Block rate" label must appear.
-        let mut wide = Terminal::new(TestBackend::new(90, 8)).unwrap();
-        wide.draw(|f| render_chart(f, Rect::new(0, 0, 90, 8), &app, &cidrs))
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal
+            .draw(|f| paint_chart(f, f.area(), &[1, 3, 2], Some(&[0, 1, 1])))
             .unwrap();
-        assert!(
-            buffer_contains(wide.backend().buffer(), "Block rate"),
-            "gauge must render beside the chart on a wide row"
-        );
+        let buffer = terminal.backend().buffer();
+        for y in 0..8 {
+            for x in 1..29 {
+                assert_eq!(buffer[(x, y)].bg, T.bg_elevated, "cell ({x}, {y})");
+            }
+        }
+    }
 
-        // Narrow row → gauge dropped so the braille linechart stays
-        // legible; the label must be absent (the clip that unit tests at
-        // default width would silently miss).
-        let mut narrow = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        narrow
-            .draw(|f| render_chart(f, Rect::new(0, 0, 60, 8), &app, &cidrs))
-            .unwrap();
-        assert!(
-            !buffer_contains(narrow.backend().buffer(), "Block rate"),
-            "gauge must be dropped on a narrow row"
-        );
+    #[test]
+    fn percentage_bar_keeps_track_and_fractional_endpoint() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        percentage_bar(&mut buffer, Rect::new(0, 0, 10, 1), 0.25, T.brand_red);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "░");
+        assert_eq!(buffer[(1, 0)].symbol(), "░");
+        assert_ne!(buffer[(2, 0)].symbol(), " ");
+        assert_ne!(buffer[(2, 0)].symbol(), "░");
+        assert_eq!(buffer[(9, 0)].bg, T.border_default);
+    }
+
+    #[test]
+    fn traffic_legend_stays_in_the_subtitle_with_both_series_colors() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for width in [44, 80, 125] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|f| {
+                    render_traffic_card(f, f.area(), &[4, 3, 1], Some(&[2, 1, 1]), false, true);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let subtitle = theme::card_subtitle_area(*buffer.area());
+            let row: String = (subtitle.x..subtitle.right())
+                .map(|x| buffer[(x, subtitle.y)].symbol())
+                .collect();
+            assert!(row.ends_with("⠿ Total  ⠿ Blocked"), "{row}");
+            assert_eq!(buffer[(subtitle.right() - 18, subtitle.y)].fg, T.chart_2);
+            assert_eq!(buffer[(subtitle.right() - 9, subtitle.y)].fg, T.brand_red);
+            for y in 3..11 {
+                let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                assert!(!row.contains("Total") && !row.contains("Blocked"));
+            }
+            for color in [T.chart_2, T.brand_red] {
+                assert!(
+                    (3..11).any(|y| (0..width).any(|x| {
+                        let cell = &buffer[(x, y)];
+                        cell.fg == color
+                            && cell
+                                .symbol()
+                                .chars()
+                                .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+                    })),
+                    "missing plotted series {color:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn traffic_distinguishes_missing_blocked_history_and_missing_daemon() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for available in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(44, 12)).unwrap();
+            terminal
+                .draw(|f| render_traffic_card(f, f.area(), &[4, 3, 1], None, false, available))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer_contains(buffer, "Blocked N/A"));
+            assert_eq!(
+                buffer_contains(buffer, "Hourly data unavailable"),
+                !available
+            );
+        }
     }
 
     // ── T1: master pane / detail layout ────────────────────────────────
@@ -1248,6 +1849,64 @@ mod tests {
     }
 
     #[test]
+    fn master_pane_renders_each_subnet_as_two_lines() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let configured = vec![mk_subnet(
+            "lan-corp",
+            &["10.10.0.0/16", "fd00:10::/64"],
+            "default",
+        )];
+        let candidates = vec![CandidateSubnet {
+            cidr: "192.168.50.0/24".into(),
+            host_count: 2,
+            queries_today: 3,
+            vendor_tally: Vec::new(),
+        }];
+        let mut table_state = TableState::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal
+            .draw(|f| {
+                render_master(
+                    f,
+                    f.area(),
+                    None,
+                    &configured,
+                    &candidates,
+                    Some("lan-corp"),
+                    &mut table_state,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer_row(buffer, 4).contains("lan-corp"));
+        assert!(buffer_row(buffer, 5).contains("10.10.0.0/16, fd00:10::/64"));
+        assert!(buffer_row(buffer, 6).contains("192.168.50.0/24"));
+        assert!(buffer_row(buffer, 7).contains(SUBNET_SUGGESTED_TAG));
+    }
+
+    #[test]
+    fn configured_details_include_config_identity_and_precedence() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut subnet = mk_subnet("lan-corp", &["10.10.0.0/16"], "strict");
+        subnet.display_name = "Corporate LAN".into();
+        subnet.priority = 50;
+        let app = App::new();
+        let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        terminal
+            .draw(|f| render_stats_for_configured(f, f.area(), &app, &subnet))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for value in ["lan-corp", "Corporate LAN", "10.10.0.0/16", "strict", "50"] {
+            assert!(
+                buffer_contains(buffer, value),
+                "missing detail value {value}"
+            );
+        }
+    }
+
+    #[test]
     fn s51_detail_renders_placeholder_when_no_selection() {
         // When `selected_id` doesn't resolve to any configured subnet
         // OR any candidate, `find_selection` returns None and the
@@ -1260,39 +1919,54 @@ mod tests {
     }
 
     #[test]
-    fn s51_detail_panels_split_3_ways() {
-        // The detail pane splits into chart (Length 8) on top, a 1-row
-        // horizontal divider, then a bottom row that further splits
-        // 45/1/55 horizontally with a vertical divider in the gutter.
-        // Walk the same Layout primitives with a fixed area to verify
-        // the chunks land at the documented sizes.
-        let area = Rect::new(0, 0, 60, 30);
-        let rows = Layout::vertical([
-            Constraint::Length(8),
-            Constraint::Length(1),
-            Constraint::Min(10),
-        ])
-        .split(area);
-        assert_eq!(rows[0].height, 8, "chart sub-pane is 8 rows tall");
-        assert_eq!(rows[1].height, 1, "horizontal divider is exactly 1 row");
-        assert_eq!(rows[2].height, 21, "bottom row claims the remainder");
-
-        let bottom = Layout::horizontal([
-            Constraint::Percentage(45),
-            Constraint::Length(1),
-            Constraint::Percentage(55),
-        ])
-        .split(rows[2]);
-        assert_eq!(
-            bottom.len(),
-            3,
-            "bottom row is three chunks (stats / gutter / clients)"
-        );
-        assert_eq!(bottom[1].width, 1, "middle gutter is exactly 1 cell");
-        assert!(
-            bottom[0].width > 0 && bottom[2].width > 0,
-            "stats + clients both painted"
-        );
+    fn detail_grid_uses_a_shared_gutter_and_fixed_right_column() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let area = Rect::new(0, 0, 100, 30);
+        let center_width = area.width - DETAIL_COLUMN_WIDTH + 1;
+        let columns = [
+            Rect::new(area.x, area.y, center_width, area.height),
+            Rect::new(
+                area.x + center_width - 1,
+                area.y,
+                DETAIL_COLUMN_WIDTH,
+                area.height,
+            ),
+        ];
+        assert_eq!(columns[1].width, DETAIL_COLUMN_WIDTH);
+        assert!(columns[0].width > columns[1].width);
+        let top_height = (area.height * 2 / 5).clamp(12, 18);
+        let rows = theme::split_card_rows(columns[0], top_height);
+        assert_eq!(rows[0].height, 12);
+        assert_eq!(rows[1].y, rows[0].bottom() - 1);
+        assert_eq!(rows[1].height, 19);
+        let mut app = App::new();
+        app.subnets.selected_id = Some("lan".into());
+        let configured = vec![mk_subnet("lan", &["10.0.0.0/8"], "default")];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_detail(f, f.area(), &app, &configured, &[]))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..30 {
+            let cell = &buffer[(columns[1].x, y)];
+            assert_eq!(cell.symbol(), " ");
+            assert_eq!(cell.bg, T.bg_main);
+        }
+        for x in 0..100 {
+            assert_eq!(buffer[(x, 11)].symbol(), " ");
+            assert_eq!(buffer[(x, 11)].bg, T.bg_main);
+        }
+        for x in [columns[0].x + 1, columns[1].x + 1] {
+            let role = if x == 1 {
+                theme::CardRole::Analytics
+            } else {
+                theme::CardRole::History
+            };
+            for y in [1, 12] {
+                assert_eq!(buffer[(x, y)].bg, T.card_title_bg(role));
+                assert_eq!(buffer[(x, y + 1)].bg, T.card_subtitle_bg(role));
+            }
+        }
     }
 
     #[test]
@@ -1417,6 +2091,151 @@ mod tests {
     }
 
     #[test]
+    fn s51_client_sort_is_numeric_textual_and_stable() {
+        let clients = vec![
+            ClientRow {
+                ip: "10.0.0.2".into(),
+                name: "same".into(),
+                vendor: Some("Acme".into()),
+                queries: 2,
+            },
+            ClientRow {
+                ip: "10.0.0.10".into(),
+                name: "same".into(),
+                vendor: Some("Acme".into()),
+                queries: 2,
+            },
+            ClientRow {
+                ip: "10.0.0.3".into(),
+                name: "Other".into(),
+                vendor: None,
+                queries: 9,
+            },
+        ];
+        let mut by_ip = clients.clone();
+        by_ip.sort_by(|a, b| {
+            compare_client(
+                a,
+                b,
+                SortOrder {
+                    column: 0,
+                    descending: false,
+                },
+            )
+        });
+        assert_eq!(
+            by_ip.iter().map(|c| c.ip.as_str()).collect::<Vec<_>>(),
+            vec!["10.0.0.2", "10.0.0.3", "10.0.0.10"]
+        );
+        let mut by_queries = clients.clone();
+        by_queries.sort_by(|a, b| {
+            compare_client(
+                a,
+                b,
+                SortOrder {
+                    column: 3,
+                    descending: true,
+                },
+            )
+        });
+        assert_eq!(by_queries[0].queries, 9);
+        assert_eq!(by_queries[1].ip, "10.0.0.10");
+        assert_eq!(by_queries[2].ip, "10.0.0.2");
+
+        for descending in [false, true] {
+            let mut by_equal_name = clients[..2].to_vec();
+            by_equal_name.sort_by(|a, b| {
+                compare_client(
+                    a,
+                    b,
+                    SortOrder {
+                        column: 1,
+                        descending,
+                    },
+                )
+            });
+            assert_eq!(
+                by_equal_name
+                    .iter()
+                    .map(|client| client.ip.as_str())
+                    .collect::<Vec<_>>(),
+                ["10.0.0.10", "10.0.0.2"],
+                "equal primary values retain an ascending immutable-IP tie"
+            );
+        }
+    }
+
+    #[test]
+    fn s51_subnet_mouse_geometry_has_exact_headers_and_separate_rows() {
+        let body = card_body_area(Rect::new(10, 4, 70, 16));
+        assert_eq!(body, Rect::new(12, 7, 66, 12));
+        let columns = Layout::horizontal([
+            Constraint::Length(15),
+            Constraint::Min(10),
+            Constraint::Length(16),
+            Constraint::Length(8),
+        ])
+        .split(Rect::new(body.x, body.y, body.width, 1));
+        assert_eq!(columns.iter().map(|c| c.width).sum::<u16>(), body.width);
+        assert_eq!(columns[0].x, body.x);
+        assert_eq!(columns[1].x, body.x + 15);
+        assert_eq!(columns[2].x, body.right() - 24);
+        assert_eq!(columns[3].x, body.right() - 8);
+        let first_client_row = body.y + 1;
+        assert_ne!(first_client_row, body.y, "client rows are below headers");
+        let targets = master_row_hit_areas(Rect::new(10, 4, 70, 16), 10, 3).collect::<Vec<_>>();
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0], (Rect::new(12, 8, 66, 2), 3));
+        assert_eq!(targets[1], (Rect::new(12, 10, 66, 2), 4));
+        assert_eq!(targets[4], (Rect::new(12, 16, 66, 2), 7));
+        assert!(targets
+            .windows(2)
+            .all(|pair| pair[0].0.bottom() == pair[1].0.y));
+        const {
+            assert!(NARROW_THRESHOLD > 38 + 1 + DETAIL_COLUMN_WIDTH + 1);
+        }
+    }
+
+    #[test]
+    fn detail_panel_arrows_do_not_swallow_master_navigation() {
+        let mut app = App::new();
+        app.subnets.table_state.select(Some(3));
+        app.mouse.subnet_panel = 4;
+        assert!(!handle_panel_key(&mut app, KeyCode::Left));
+        assert!(!handle_panel_key(&mut app, KeyCode::Right));
+        assert!(!handle_panel_key(&mut app, KeyCode::PageDown));
+        assert!(!handle_panel_key(&mut app, KeyCode::Esc));
+        assert_eq!(app.subnets.table_state.selected(), Some(3));
+
+        app.mouse.subnet_panel = 2;
+        app.mouse.subnet_clients_max_scroll.set(8);
+        assert!(handle_panel_key(&mut app, KeyCode::PageDown));
+        assert_eq!(app.mouse.subnet_clients_scroll, 8);
+    }
+
+    #[test]
+    fn s51_client_panel_scroll_clamps_and_reaches_the_last_visible_page() {
+        assert_eq!(client_window_bounds(20, 5, 0), (0, 5));
+        assert_eq!(client_window_bounds(20, 5, usize::MAX), (15, 20));
+        let mut app = App::new();
+        app.mouse.subnet_panel = 2;
+        app.mouse.subnet_clients_max_scroll.set(15);
+        for _ in 0..4 {
+            assert!(handle_panel_key(&mut app, KeyCode::PageDown));
+        }
+        assert_eq!(app.mouse.subnet_clients_scroll, 15);
+        assert_eq!(
+            client_window_bounds(20, 5, app.mouse.subnet_clients_scroll),
+            (15, 20)
+        );
+        assert!(handle_panel_key(&mut app, KeyCode::Home));
+        assert_eq!(app.mouse.subnet_clients_scroll, 0);
+        assert!(handle_panel_key(&mut app, KeyCode::End));
+        assert!(handle_panel_key(&mut app, KeyCode::Up));
+        assert_eq!(app.mouse.subnet_clients_scroll, 14);
+    }
+
+    #[test]
     fn s51_hourly_aggregation_handles_empty_ring() {
         // Pre-S44 daemons emit an empty `hourly_queries` vec. Summing
         // over a device with [] must yield the zero ring, not panic.
@@ -1446,6 +2265,50 @@ mod tests {
         for i in 0..24 {
             assert_eq!(agg[i], ring_a[i] + ring_b[i], "slot {i} sums element-wise");
         }
+    }
+
+    #[test]
+    fn s51_blocked_hourly_aggregation_preserves_order_and_maps_both_slices() {
+        let mapped = with_blocked(
+            mk_mapped_with_ring("10.0.0.5", "mapped", vec![4, 3, 1]),
+            vec![2, 1, 0],
+        );
+        let unmapped = with_blocked(
+            mk_unmapped_with_ring("10.0.0.6", None, 0, vec![8, 7, 6]),
+            vec![3, 2, 1],
+        );
+        let outside = with_blocked(
+            mk_unmapped_with_ring("10.0.1.6", None, 0, vec![99, 99, 99]),
+            vec![99, 99, 99],
+        );
+        let dv = DeviceViewDto {
+            mapped: vec![mapped],
+            unmapped: vec![unmapped, outside],
+        };
+        let queries = aggregate_subnet_hourly(&dv, &["10.0.0.0/24".into()]);
+        let blocked = aggregate_subnet_blocked_hourly(&dv, &["10.0.0.0/24".into()]).unwrap();
+        assert_eq!(&queries[..3], &[12, 10, 7]);
+        assert_eq!(&blocked[..3], &[5, 3, 1]);
+        assert_eq!(queries[3..].iter().sum::<u64>(), 0);
+        assert_eq!(blocked[3..].iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn s51_blocked_hourly_aggregation_is_unavailable_when_matching_device_lacks_series() {
+        let known = with_blocked(
+            mk_unmapped_with_ring("10.0.0.5", None, 0, vec![1; 24]),
+            vec![1; 24],
+        );
+        let old_daemon = mk_unmapped_with_ring("10.0.0.6", None, 0, vec![2; 24]);
+        let dv = DeviceViewDto {
+            mapped: vec![],
+            unmapped: vec![known, old_daemon],
+        };
+        assert_eq!(
+            aggregate_subnet_blocked_hourly(&dv, &["10.0.0.0/24".into()]),
+            None,
+            "missing hourly_blocked must not be converted into zeroes"
+        );
     }
 
     // ── Public constant — frozen string ────────────────────────────────

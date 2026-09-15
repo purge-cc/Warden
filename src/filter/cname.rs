@@ -1,21 +1,25 @@
 //! CNAME chain inspection.
 //!
-//! [`walk_response`] follows the CNAME chain returned by upstream and
+//! [`walk_response_with_grant`] follows the CNAME chain returned by upstream and
 //! decides whether any hop in the chain matches the active profile's
 //! filter (admin allow/deny, advanced rules, Tier 1 list bitmask). The
 //! function is profile-aware and stack-only for loop detection up to a
-//! 16-hop cap. Each hop materialises its target into a `CompactString`:
-//! inline (no heap) for targets ≤24 bytes, but heap-allocating for longer
-//! names — long CDN-flatten chains routinely exceed 24 bytes — so the
-//! happy path is allocation-light, not allocation-free.
+//! 16-hop cap. The runtime walker normalises each target into a bounded DNS presentation
+//! buffer and retains visited wire names by reference, so forwarded chains do
+//! not allocate even when a target exceeds `CompactString`'s inline capacity.
 
+#[cfg(test)]
 use std::fmt::Write as _;
 
 use compact_str::CompactString;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-use super::engine::{domain_matches_set, FilterEngine, FilterResult};
-use crate::profiles::profile::{DeviceOverlay, ResolvedProfile};
+use super::engine::FilterEngine;
+#[cfg(test)]
+use super::engine::{domain_matches_set, FilterResult};
+#[cfg(test)]
+use crate::profiles::profile::DeviceOverlay;
+use crate::profiles::profile::ResolvedProfile;
 
 /// Why a CNAME hop in the chain caused a block.
 ///
@@ -23,7 +27,7 @@ use crate::profiles::profile::{DeviceOverlay, ResolvedProfile};
 /// carry just enough payload to populate the audit log and TUI badge
 /// without a second filter probe at log time. The
 /// built-in variants ([`BlockSource::CnameLoop`],
-/// [`BlockSource::CnameDepthExceeded`]) are emitted by the walker
+/// [`BlockSource::CnameDepthExceeded`], [`BlockSource::CnameMalformed`]) are emitted by the walker
 /// itself when the chain shape is the threat — neither hop sits in any
 /// blocklist, but the chain is malformed (cycle) or unbounded
 /// (depth cap exceeded).
@@ -49,6 +53,9 @@ pub enum BlockSource {
     /// tracking would require a new variant that carries the full
     /// mask, NOT a wider payload on this variant.
     List(u8),
+    /// A mounted V5 Custom List rule.  Unlike `List`, this is operator
+    /// authored and carries its stable mount id rather than a corpus bit.
+    CustomList(crate::config::schema::Id),
     /// Admin advanced rule (`||domain^`, `||*.suffix^`, `/regex/`,
     /// optionally `$important`) matched and chose to block. The string
     /// carries the rule pattern label (e.g. `"tracker.com"`,
@@ -64,6 +71,9 @@ pub enum BlockSource {
     /// CNAME chain exceeded `max_depth` (typically
     /// `cache.cname_max_depth`, default 16).
     CnameDepthExceeded,
+    /// CNAME chain cannot be represented safely, or has competing links for
+    /// the same owner. These are malformed upstream data, not operator policy.
+    CnameMalformed,
 }
 
 impl BlockSource {
@@ -76,10 +86,12 @@ impl BlockSource {
     pub fn label(&self) -> &'static str {
         match self {
             BlockSource::List(_) => "list",
+            BlockSource::CustomList(_) => "custom_list",
             BlockSource::Rule(_) => "rule",
             BlockSource::AdminBlock => "admin_block",
             BlockSource::CnameLoop => "cname_loop",
             BlockSource::CnameDepthExceeded => "cname_depth_exceeded",
+            BlockSource::CnameMalformed => "cname_malformed",
         }
     }
 
@@ -102,10 +114,12 @@ impl BlockSource {
                     .unwrap_or_else(|| bit.to_string());
                 format!("{}:{name}", self.label())
             }
+            BlockSource::CustomList(id) => format!("{}:{}", self.label(), id.as_str()),
             BlockSource::Rule(pattern) => format!("{}:{pattern}", self.label()),
-            BlockSource::AdminBlock | BlockSource::CnameLoop | BlockSource::CnameDepthExceeded => {
-                self.label().to_string()
-            }
+            BlockSource::AdminBlock
+            | BlockSource::CnameLoop
+            | BlockSource::CnameDepthExceeded
+            | BlockSource::CnameMalformed => self.label().to_string(),
         }
     }
 }
@@ -167,6 +181,7 @@ pub enum Verdict {
 /// filter-bypass. That is the one fatal mistake this type exists to
 /// prevent; the default is [`NamePolicy::Neutral`] so drift degrades
 /// toward filtering, never toward passing everything.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NamePolicy {
     /// No operator allow matched the queried name. The response path
@@ -187,6 +202,7 @@ pub enum NamePolicy {
     DeviceAllow { override_profile_deny: bool },
 }
 
+#[cfg(test)]
 impl NamePolicy {
     /// Resolve the operator's allow verdict for `name`.
     ///
@@ -237,7 +253,7 @@ impl NamePolicy {
     /// Does the operator's allow on the queried name outrank a block
     /// attributed to `source` somewhere in the answer?
     ///
-    /// | policy | `List` | `Rule` / `AdminBlock` | `CnameLoop` / `CnameDepthExceeded` |
+    /// | policy | `List` | `Rule` / `AdminBlock` | chain malformation |
     /// |---|---|---|---|
     /// | `Neutral` | no | no | no |
     /// | `ProfileAllow` | yes | yes | **no** |
@@ -255,7 +271,7 @@ impl NamePolicy {
     ///   and loses unless the device carries `override_profile_deny` —
     ///   the same answer `apply_overlay` rows 6/7 give for the queried
     ///   name, so the two cannot disagree.
-    /// - **`CnameLoop` / `CnameDepthExceeded`** are defences against a
+    /// - **`CnameLoop` / `CnameDepthExceeded` / `CnameMalformed`** are defences against a
     ///   malformed answer, not policy. No allow switches them off. In
     ///   [`walk_response`] they are already unreachable here (both
     ///   `return` earlier in the loop body); saying so in the type too
@@ -267,9 +283,13 @@ impl NamePolicy {
         match source {
             // Malformation guards: never. Matched first so no allow arm
             // below can reach them.
-            BlockSource::CnameLoop | BlockSource::CnameDepthExceeded => false,
+            BlockSource::CnameLoop
+            | BlockSource::CnameDepthExceeded
+            | BlockSource::CnameMalformed => false,
             // External blocklist: any explicit allow on the queried name.
-            BlockSource::List(_) => !matches!(self, NamePolicy::Neutral),
+            BlockSource::List(_) | BlockSource::CustomList(_) => {
+                !matches!(self, NamePolicy::Neutral)
+            }
             // The operator's own profile-level deny.
             BlockSource::Rule(_) | BlockSource::AdminBlock => match self {
                 NamePolicy::Neutral => false,
@@ -334,6 +354,7 @@ const VISITED_CAPACITY: usize = MAX_HOPS + 1;
 /// O(n²) in the number of CNAME records, which the depth cap bounds at
 /// [`MAX_HOPS`]; zero allocation — [`Name`] comparison is case-insensitive by
 /// contract, so no lowercased copy is materialised.
+#[cfg(test)]
 fn chain_head(records: &[Record]) -> Option<usize> {
     records.iter().position(|rec| {
         // Type AND rdata, via `is_cname_link`. Deliberately belt-and-braces:
@@ -407,6 +428,7 @@ fn is_cname_link(rec: &Record) -> bool {
 /// `max_depth` is clamped to [`MAX_HOPS`] (16) so the loop
 /// detector's stack array cannot overflow regardless of operator
 /// config.
+#[cfg(test)]
 #[must_use]
 pub fn walk_response(
     records: &[Record],
@@ -442,7 +464,7 @@ pub fn walk_response(
         };
 
         let mut target = CompactString::default();
-        let _ = write!(target, "{}", &**cname);
+        let _ = write!(target, "{}", **cname);
         if target.ends_with('.') {
             target.pop();
         }
@@ -571,10 +593,235 @@ pub fn walk_response(
     Verdict::Allow
 }
 
+/// Evaluate a synthetic CNAME target with the original-QNAME grant.
+///
+/// An operator rewrite is served as a `original CNAME target` bridge. Its
+/// target is therefore subject to the same lattice as an upstream CNAME hop
+/// before the cache or upstream can produce a plain A/AAAA response.
+#[must_use]
+pub(crate) fn evaluate_synthetic_cname_hop(
+    target: &str,
+    engine: &FilterEngine,
+    profile: &ResolvedProfile,
+    grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
+) -> Verdict {
+    let Some(compiled) = profile.operator_rules.as_ref() else {
+        return Verdict::Block {
+            offending: CompactString::new("runtime-policy-missing"),
+            source: BlockSource::AdminBlock,
+        };
+    };
+    let (external, external_source) = engine.external_matches_attributed(target, profile);
+    let decision = compiled
+        .profile()
+        .evaluate_target_with_grant(target, grant, external, true);
+    if decision.verdict() == crate::filter::operator_rules::Verdict::Block {
+        let source = decision
+            .winning_rule()
+            .map(|hit| BlockSource::CustomList(hit.origin().list_id().clone()))
+            .or_else(|| {
+                (external == crate::filter::operator_rules::ExternalMatches::Deny)
+                    .then_some(external_source)
+                    .flatten()
+            })
+            .unwrap_or(BlockSource::AdminBlock);
+        return Verdict::Block {
+            offending: CompactString::new(target),
+            source,
+        };
+    }
+    Verdict::Allow
+}
+
+/// Response walk using the original-QNAME grant captured before the
+/// upstream request and is applied uniformly to every CNAME target. `qname`
+/// is the normalised name actually served from this response (after a rewrite,
+/// when one applies). It anchors the walk to that name's CNAME branch, so
+/// unrelated CNAME records in the same answer cannot choose the branch being
+/// inspected. Chain malformation is checked first and is never grantable.
+#[must_use]
+pub fn walk_response_with_grant(
+    records: &[Record],
+    qname: &str,
+    engine: &FilterEngine,
+    profile: &ResolvedProfile,
+    grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
+    max_depth: usize,
+) -> Verdict {
+    if profile.operator_rules.is_none() {
+        return Verdict::Block {
+            offending: CompactString::new("runtime-policy-missing"),
+            source: BlockSource::AdminBlock,
+        };
+    }
+    let cap = max_depth.min(MAX_HOPS);
+    // References point into `records`, whose lifetime encloses this walk. This
+    // avoids copying long targets to the heap only to detect a bounded cycle.
+    let mut visited: [Option<&Name>; VISITED_CAPACITY] = std::array::from_fn(|_| None);
+    let mut slots_used = 0usize;
+    let mut hops = 0usize;
+    // An answer section can contain unrelated CNAME branches. Only the branch
+    // whose first owner is the name served for this request can affect its
+    // verdict; choosing the answer-wide head would let a decoy branch hide it.
+    let mut start = None;
+    for record in records {
+        if !is_cname_link(record) || !owner_matches(&record.name, qname) {
+            continue;
+        }
+        if let Some(first) = start {
+            if !cname_targets_match(first, record) {
+                return malformed_qname_verdict(qname);
+            }
+        } else {
+            start = Some(record);
+        }
+    }
+    let Some(start) = start else {
+        return Verdict::Allow;
+    };
+    let mut next_record = Some(start);
+    while let Some(record) = next_record {
+        let RData::CNAME(ref cname) = record.data else {
+            break;
+        };
+        let target_name = &**cname;
+        let mut target_buffer = [0_u8; MAX_NORMALIZED_NAME_LEN];
+        let target = match normalize_target_name(target_name, &mut target_buffer) {
+            Ok(target) => target,
+            Err(()) => return malformed_name_verdict(target_name),
+        };
+        if hops >= cap {
+            return Verdict::Block {
+                offending: CompactString::new(target),
+                source: BlockSource::CnameDepthExceeded,
+            };
+        }
+        // Keep the served QNAME out of the visited stack: comparing it
+        // directly catches `A → B → A`, while the wire-name references still
+        // catch cycles wholly among response targets.
+        if owner_matches(target_name, qname)
+            || visited
+                .iter()
+                .take(slots_used)
+                .flatten()
+                .any(|seen| seen.eq_ignore_root(target_name))
+        {
+            return Verdict::Block {
+                offending: CompactString::new(target),
+                source: BlockSource::CnameLoop,
+            };
+        }
+
+        // Reject a fork before the policy evaluator sees the target. A grant
+        // can affect policy blocks, never malformed upstream data. Identical
+        // CNAME RRs are harmless duplicates and use the first wire record.
+        let mut following = None;
+        for candidate in records {
+            if !is_cname_link(candidate) || !candidate.name.eq_ignore_root(target_name) {
+                continue;
+            }
+            if let Some(first) = following {
+                if !cname_targets_match(first, candidate) {
+                    return malformed_name_verdict(target_name);
+                }
+            } else {
+                following = Some(candidate);
+            }
+        }
+
+        if let Verdict::Block { offending, source } =
+            evaluate_synthetic_cname_hop(target, engine, profile, grant)
+        {
+            return Verdict::Block { offending, source };
+        }
+        visited[slots_used] = Some(target_name);
+        slots_used += 1;
+        hops += 1;
+        next_record = following;
+    }
+    Verdict::Allow
+}
+
+/// Largest absolute DNS name in presentation form, excluding the root dot.
+/// Four maximal labels fit in 253 bytes once their three separators are added.
+const MAX_NORMALIZED_NAME_LEN: usize = 253;
+
+/// Convert a wire name to the lowercase dotted form accepted by the filter.
+///
+/// The output remains borrowed from `output`; callers must materialise it only
+/// when returning a blocking verdict. DNS name labels are raw octets, whereas
+/// the filter's domain interface is UTF-8 text, so non-ASCII, controls and an
+/// embedded dot fail closed instead of being escaped into a different name.
+fn normalize_target_name<'a>(
+    name: &Name,
+    output: &'a mut [u8; MAX_NORMALIZED_NAME_LEN],
+) -> Result<&'a str, ()> {
+    let mut length = 0usize;
+    let mut labels = 0usize;
+    for label in name.iter() {
+        if label.is_empty() || label.len() > 63 {
+            return Err(());
+        }
+        if labels != 0 {
+            if length == output.len() {
+                return Err(());
+            }
+            output[length] = b'.';
+            length += 1;
+        }
+        for &byte in label {
+            if !byte.is_ascii() || byte.is_ascii_control() || byte == b'.' {
+                return Err(());
+            }
+            if length == output.len() {
+                return Err(());
+            }
+            output[length] = byte.to_ascii_lowercase();
+            length += 1;
+        }
+        labels += 1;
+    }
+    if labels == 0 {
+        return Err(());
+    }
+    // Every accepted byte is ASCII, hence valid UTF-8; preserve the checked
+    // conversion so this network-facing parser never relies on that invariant
+    // being maintained by a future edit.
+    std::str::from_utf8(&output[..length]).map_err(|_| ())
+}
+
+/// Compare two usable CNAME records' targets without presentation conversion.
+fn cname_targets_match(left: &Record, right: &Record) -> bool {
+    matches!(
+        (&left.data, &right.data),
+        (RData::CNAME(left), RData::CNAME(right)) if left.eq_ignore_root(right)
+    )
+}
+
+/// Materialise a target only after the walker has decided to block.
+fn malformed_name_verdict(name: &Name) -> Verdict {
+    let mut output = [0_u8; MAX_NORMALIZED_NAME_LEN];
+    let offending = normalize_target_name(name, &mut output)
+        .map(CompactString::new)
+        .unwrap_or_else(|()| CompactString::new("malformed-cname"));
+    Verdict::Block {
+        offending,
+        source: BlockSource::CnameMalformed,
+    }
+}
+
+/// The served QNAME is already normalised by the handler before this walker.
+fn malformed_qname_verdict(qname: &str) -> Verdict {
+    Verdict::Block {
+        offending: CompactString::new(qname),
+        source: BlockSource::CnameMalformed,
+    }
+}
+
 /// Case-insensitive comparison of a record owner against an already-normalised
 /// domain (lowercase, no trailing dot) — **without allocating**.
 ///
-/// [`walk_response`] runs on every cache hit, so materialising a `String` per
+/// [`walk_response_with_grant`] runs on every cache hit, so materialising a `String` per
 /// record per hop to compare owners would put an allocation on the hot path for
 /// the sake of a comparison. Walking a [`Name`]'s label slices against the
 /// string's dot-separated segments costs nothing.
@@ -596,11 +843,15 @@ fn owner_matches(name: &Name, domain: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::schema::Id;
+    use crate::filter::engine::DomainMasks;
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+    };
     use crate::filter::rules::parse_rules;
     use ahash::RandomState;
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::Name;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -683,6 +934,161 @@ mod tests {
         p.unfiltered = false;
         engine.fixture_subscribe(&p.name, 1);
         p
+    }
+
+    fn compiled_profile_with_default(content: &str, block_all: bool) -> ResolvedProfile {
+        let limits = RuleCompileLimits::default();
+        let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+        let rules = Arc::new(
+            CompiledOperatorRules::compile(
+                &[PackSource {
+                    list_id: "rules",
+                    content,
+                }],
+                &[ProfileMounts {
+                    profile_id: "default",
+                    custom_lists: &["rules"],
+                    block_all,
+                }],
+                limits,
+                &admission,
+            )
+            .unwrap(),
+        );
+        let mut profile = permissive_filtered();
+        profile.bind_operator_rules(rules);
+        profile
+    }
+
+    fn compiled_profile(content: &str) -> ResolvedProfile {
+        compiled_profile_with_default(content, false)
+    }
+
+    #[test]
+    fn block_all_with_overlapping_external_directions_is_not_attributed_to_a_list() {
+        let mut domains = HashMap::with_hasher(RandomState::new());
+        domains.insert(
+            CompactString::new("target.test"),
+            DomainMasks {
+                allow_mask: 1,
+                block_mask: 2,
+            },
+        );
+        let engine = FilterEngine::with_per_direction_domain_map(domains);
+        engine.fixture_subscribe("default", 3);
+        let profile = compiled_profile_with_default("", true);
+
+        assert_eq!(
+            evaluate_synthetic_cname_hop("target.test", &engine, &profile, None),
+            Verdict::Block {
+                offending: CompactString::new("target.test"),
+                source: BlockSource::AdminBlock,
+            }
+        );
+    }
+
+    #[test]
+    fn walk_response_with_grant_follows_only_the_served_qname_branch_in_either_order() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("blocked.test");
+        let decoy = cname_record("decoy.test", "clean.test");
+        let served = cname_record("query.test", "blocked.test");
+
+        for records in [[decoy.clone(), served.clone()], [served, decoy]] {
+            assert_eq!(
+                walk_response_with_grant(&records, "query.test", &engine, &profile, None, 16),
+                Verdict::Block {
+                    offending: CompactString::new("blocked.test"),
+                    source: BlockSource::CustomList(Id::new("rules").unwrap()),
+                },
+                "the served branch must be walked regardless of the decoy branch wire order"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_response_with_grant_ignores_a_blocked_disjoint_decoy_in_either_order() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("blocked.test");
+        let decoy = cname_record("decoy.test", "blocked.test");
+        let served = cname_record("query.test", "clean.test");
+
+        for records in [[decoy.clone(), served.clone()], [served, decoy]] {
+            assert_eq!(
+                walk_response_with_grant(&records, "query.test", &engine, &profile, None, 16),
+                Verdict::Allow,
+                "a disconnected decoy branch must not affect the served name"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_response_with_grant_keeps_loop_and_depth_guards_on_the_served_branch() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("");
+
+        let looped = [
+            cname_record("query.test", "middle.test"),
+            cname_record("middle.test", "query.test"),
+        ];
+        assert!(matches!(
+            walk_response_with_grant(&looped, "query.test", &engine, &profile, None, 16),
+            Verdict::Block {
+                source: BlockSource::CnameLoop,
+                ..
+            }
+        ));
+
+        let deep = [
+            cname_record("query.test", "middle.test"),
+            cname_record("middle.test", "tail.test"),
+        ];
+        assert!(matches!(
+            walk_response_with_grant(&deep, "query.test", &engine, &profile, None, 1),
+            Verdict::Block {
+                source: BlockSource::CnameDepthExceeded,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn walk_response_with_grant_rejects_conflicting_qname_owner_in_either_order() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("@@clean.test");
+        let clean = cname_record("query.test", "clean.test");
+        let blocked = cname_record("query.test", "blocked.test");
+
+        for records in [[clean.clone(), blocked.clone()], [blocked, clean]] {
+            assert_eq!(
+                walk_response_with_grant(&records, "query.test", &engine, &profile, None, 16),
+                Verdict::Block {
+                    offending: CompactString::new("query.test"),
+                    source: BlockSource::CnameMalformed,
+                },
+                "a conflicting owner is malformed regardless of wire order or grant"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_response_with_grant_rejects_non_ascii_target() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("");
+        let non_ascii = Name::from_labels([&[0xff_u8][..], b"test".as_slice()]).unwrap();
+        let records = [Record::from_rdata(
+            Name::from_str("query.test").unwrap(),
+            300,
+            RData::CNAME(CNAME(non_ascii)),
+        )];
+
+        assert_eq!(
+            walk_response_with_grant(&records, "query.test", &engine, &profile, None, 16),
+            Verdict::Block {
+                offending: CompactString::new("malformed-cname"),
+                source: BlockSource::CnameMalformed,
+            }
+        );
     }
 
     #[test]

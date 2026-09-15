@@ -577,3 +577,220 @@ mod tests {
         }
     }
 }
+
+/// Authenticate the exact TLS leaf before HTTP can transmit a credential.
+pub fn build_fingerprint_client(
+    peer: &str,
+    fingerprint: &str,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::Client> {
+    let url = reqwest::Url::parse(peer).context("invalid primary address")?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(url.path(), "" | "/"),
+        "primary must be an HTTPS origin without credentials, query or path"
+    );
+    anyhow::ensure!(
+        super::manifest::is_hash(fingerprint),
+        "invalid certificate fingerprint"
+    );
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = ExactLeaf {
+        fingerprint: fingerprint.to_owned(),
+        algorithms: provider.signature_verification_algorithms,
+    };
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .context("build exact-leaf cluster client")
+}
+
+#[derive(Debug)]
+struct ExactLeaf {
+    fingerprint: String,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+impl rustls::client::danger::ServerCertVerifier for ExactLeaf {
+    fn verify_server_cert(
+        &self,
+        leaf: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        use subtle::ConstantTimeEq;
+        let actual = hex::encode(Sha256::digest(leaf.as_ref()));
+        if bool::from(actual.as_bytes().ct_eq(self.fingerprint.as_bytes())) {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(leaf.clone().into_owned())?;
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                std::sync::Arc::new(roots),
+                std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .map_err(|_| rustls::Error::General("invalid pinned certificate".into()))?;
+            verifier.verify_server_cert(leaf, intermediates, server_name, ocsp, now)
+        } else {
+            Err(rustls::Error::General(
+                "primary certificate fingerprint mismatch".into(),
+            ))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn server(
+        san: &str,
+        expired: bool,
+        redirect: bool,
+    ) -> (
+        String,
+        String,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![san.into()]).unwrap();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        if expired {
+            params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(2);
+            params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        }
+        let cert = params.self_signed(&key).unwrap();
+        let fingerprint = hex::encode(Sha256::digest(cert.der().as_ref()));
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut bytes = [0; 4096];
+                if let Ok(n) = stream.read(&mut bytes).await {
+                    if n > 0 {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let response = if redirect {
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:1/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+            }
+        });
+        (format!("https://{addr}"), fingerprint, requests, task)
+    }
+    #[tokio::test]
+    async fn mismatched_leaf_san_or_expiry_sends_no_http_secret() {
+        for (san, expired, mismatch) in [
+            ("127.0.0.1", false, true),
+            ("192.0.2.1", false, false),
+            ("127.0.0.1", true, false),
+        ] {
+            let (peer, fingerprint, requests, task) = server(san, expired, false).await;
+            let fingerprint = if mismatch {
+                "a".repeat(64)
+            } else {
+                fingerprint
+            };
+            let client =
+                build_fingerprint_client(&peer, &fingerprint, Duration::from_secs(2)).unwrap();
+            assert!(client
+                .post(&peer)
+                .bearer_auth("must-not-leak")
+                .body("invitation-secret")
+                .send()
+                .await
+                .is_err());
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn exact_leaf_works_and_redirect_is_never_followed() {
+        for redirect in [false, true] {
+            let (peer, fingerprint, requests, task) = server("127.0.0.1", false, redirect).await;
+            let client =
+                build_fingerprint_client(&peer, &fingerprint, Duration::from_secs(2)).unwrap();
+            let response = client
+                .post(&peer)
+                .bearer_auth("credential")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), if redirect { 307 } else { 200 });
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            task.abort();
+        }
+    }
+    #[test]
+    fn invitation_transport_refuses_plaintext_userinfo_and_non_origin_urls() {
+        for peer in [
+            "http://127.0.0.1:8053",
+            "https://user:password@192.0.2.1",
+            "https://192.0.2.1/path",
+            "https://192.0.2.1?secret=yes",
+            "https://192.0.2.1/#secret",
+        ] {
+            assert!(
+                build_fingerprint_client(peer, &"a".repeat(64), Duration::from_secs(1)).is_err()
+            );
+        }
+    }
+}

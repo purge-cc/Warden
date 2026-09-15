@@ -129,6 +129,9 @@ pub enum Commands {
     /// Initialize system: create user, dirs, default config (requires root).
     /// Prompts for the default profile and initial blocklist subscriptions.
     Init {
+        /// Local node display name, independent of the OS hostname.
+        #[arg(long)]
+        node_name: Option<String>,
         /// Overwrite an existing config file at the target path. By
         /// default `warden init` refuses to run if the target already
         /// exists so a hand-tuned config is never silently replaced.
@@ -166,25 +169,17 @@ pub enum Commands {
         /// subscription prompt; see `warden lists catalog`.
         #[arg(long)]
         lists: Option<String>,
-        /// Scaffold this node as a cluster SECONDARY: write only the
-        /// node-local sections and no policy at all — no
-        /// `[upstream]`, no `[[blocklists]]`, no `[profiles.*]`. Those
-        /// arrive from the primary, and a secondary's master carrying its
-        /// own copies is refused. Requires `--peer <primary-api-url>`.
-        ///
-        /// The result is deliberately NOT bootable until `warden cluster
-        /// join` runs: a node that is not syncing and names no resolver
-        /// would answer nothing, and failing at load beats failing at
-        /// query time.
+        /// Retired legacy secondary scaffold; use invitation-based cluster join.
         #[arg(
             long,
+            hide = true,
             requires = "peer",
             conflicts_with_all = ["upstream", "lists", "upstream_catalog"]
         )]
         cluster_secondary: bool,
         /// The primary's API base URL, e.g. `https://10.10.1.94:8053`.
         /// Only meaningful with `--cluster-secondary`.
-        #[arg(long, requires = "cluster_secondary")]
+        #[arg(long, hide = true, requires = "cluster_secondary")]
         peer: Option<String>,
         /// Also generate manpages into `/usr/local/share/man/man1/` via
         /// [`clap_mangen`]. Operator can override the target directory
@@ -225,10 +220,19 @@ pub enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Manage filtering profiles
+    /// Manage filtering profiles. Legacy rule writers are RETIRED: they do
+    /// not write. Use `warden custom-list` + `warden profile mount`.
     Profile {
         #[command(subcommand)]
         action: ProfileAction,
+    },
+    /// Manage operator-authored Custom Lists and their rules.
+    CustomList {
+        /// Work directly on the configured tree through the same service.
+        #[arg(long, global = true)]
+        offline: bool,
+        #[command(subcommand)]
+        action: CustomListAction,
     },
     /// Manage devices — the leaf entities of the resolver chain (id,
     /// ip, optional mac, profile, group memberships). Replaces the
@@ -238,6 +242,8 @@ pub enum Commands {
         action: DeviceAction,
     },
     /// Manage groups — named sets of device ids with a shared profile.
+    /// Legacy rule writers are RETIRED: they do not write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Group {
         #[command(subcommand)]
         action: GroupAction,
@@ -251,7 +257,8 @@ pub enum Commands {
         action: LabelAction,
     },
     /// Manage subnets — CIDR-range default profiles resolved via
-    /// longest-prefix match.
+    /// longest-prefix match. Legacy rule writers are RETIRED: they do not
+    /// write. Use `warden custom-list` + `warden profile mount`.
     Subnet {
         #[command(subcommand)]
         action: SubnetAction,
@@ -313,16 +320,14 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
         args: Vec<String>,
     },
-    /// Add or remove a rule scoped to the **default** profile (the one
-    /// `[server].default_profile` points at).
+    /// RETIRED — legacy default-profile rule surface. Performs no write.
+    /// Use `warden custom-list` + `warden profile mount`.
     Default {
         #[command(subcommand)]
         action: DefaultAction,
     },
-    /// Manage admin rules. Currently exposes the `undo`
-    /// verb that pops the last `[[admin_rules]]` row + cascades the
-    /// reference drop across every profile / device / group it
-    /// touched.
+    /// RETIRED — legacy admin-rule surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Rule {
         #[command(subcommand)]
         action: RuleVerb,
@@ -341,6 +346,11 @@ pub enum Commands {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Authorize node association and inspect guided node operations.
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
     },
     /// Print iptables/nftables rules for DNS enforcement
     FirewallRules,
@@ -381,12 +391,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = commands::logs::LogFormat::Text)]
         format: commands::logs::LogFormat,
     },
-    /// One-shot migration from the pre-v1 single-file config layout to
-    /// the v1 multi-file FHS tree under `/etc/purge-warden/`. Accepts v0,
-    /// v1, and mixed configs; writes a backup of the source file to
-    /// `<source-parent>/backups/pre-migration-<ts>.toml` before touching
-    /// anything. The produced tree is validated through the v1 loader
-    /// before the command returns.
+    /// Migrate configuration layouts and schema versions.
+    ///
+    /// `v4-to-v5` provides deterministic check/plan/apply plus receipt-bound
+    /// rollback and finalize. Older subcommands migrate historical layouts.
     Migrate {
         #[command(subcommand)]
         action: MigrateAction,
@@ -477,6 +485,45 @@ pub enum TunnelingAction {
 
 #[derive(Subcommand)]
 pub enum MigrateAction {
+    /// Plan, apply, roll back, or finalize the schema-4 to schema-5 policy migration.
+    #[command(group(
+        clap::ArgGroup::new("v4_to_v5_mode")
+            .required(true)
+            .multiple(false)
+            .args(["check", "plan", "re_plan", "apply_plan", "rollback", "finalize"])
+    ))]
+    V4ToV5 {
+        /// Analyze the current schema-4 tree without writing it.
+        #[arg(long, conflicts_with_all = ["plan", "re_plan", "apply_plan", "rollback", "finalize"])]
+        check: bool,
+        /// Emit check output as JSON.
+        #[arg(long, requires = "check")]
+        json: bool,
+        /// Write a deterministic migration plan to a new JSON file.
+        #[arg(long, value_name = "OUTPUT_PLAN", conflicts_with_all = ["check", "re_plan", "apply_plan", "rollback", "finalize"])]
+        plan: Option<PathBuf>,
+        /// Read granular, revision-bound planning choices from JSON.
+        #[arg(long, value_name = "CHOICES", requires = "re_plan")]
+        choices: Option<PathBuf>,
+        /// Recompute the plan with choices and write it to a new JSON file.
+        #[arg(long, value_name = "REVISED_PLAN", conflicts_with_all = ["check", "plan", "apply_plan", "rollback", "finalize"])]
+        re_plan: Option<PathBuf>,
+        /// Recompute and apply an approved plan under the exclusive config lock.
+        #[arg(long, value_name = "PLAN", requires = "expect_plan_hash", conflicts_with_all = ["check", "plan", "re_plan", "rollback", "finalize"])]
+        apply_plan: Option<PathBuf>,
+        /// Exact full plan hash approved for apply.
+        #[arg(long, value_name = "HASH", requires = "apply_plan")]
+        expect_plan_hash: Option<String>,
+        /// Restore the v4 tree owned by this migration receipt.
+        #[arg(long, value_name = "RECEIPT_ID", requires = "expect_revision", conflicts_with_all = ["check", "plan", "re_plan", "apply_plan", "finalize"])]
+        rollback: Option<String>,
+        /// Expected post-migration policy revision for rollback CAS.
+        #[arg(long, value_name = "REVISION", requires = "rollback")]
+        expect_revision: Option<String>,
+        /// Delete only the retained undo owned by this receipt.
+        #[arg(long, value_name = "RECEIPT_ID", conflicts_with_all = ["check", "plan", "re_plan", "apply_plan", "rollback"])]
+        finalize: Option<String>,
+    },
     /// Migrate a schema-3 config tree in place to schema 4.
     V3ToV4 {
         /// Path to the schema-3 master config.
@@ -704,6 +751,78 @@ mod migrate_v3_to_v4_cli_tests {
         assert!(!help.contains("--force"));
         assert!(!help.contains("--target"));
     }
+
+    #[test]
+    fn v4_to_v5_exposes_only_hash_bound_modes() {
+        for argv in [
+            vec!["warden", "migrate", "v4-to-v5", "--check", "--json"],
+            vec!["warden", "migrate", "v4-to-v5", "--plan", "plan.json"],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
+                "--choices",
+                "choices.json",
+                "--re-plan",
+                "revised.json",
+            ],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
+                "--apply-plan",
+                "plan.json",
+                "--expect-plan-hash",
+                "abc",
+            ],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
+                "--rollback",
+                "receipt",
+                "--expect-revision",
+                "abc",
+            ],
+            vec!["warden", "migrate", "v4-to-v5", "--finalize", "receipt"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok());
+        }
+        for argv in [
+            vec!["warden", "migrate", "v4-to-v5"],
+            vec!["warden", "migrate", "v4-to-v5", "--apply-plan", "plan.json"],
+            vec!["warden", "migrate", "v4-to-v5", "--rollback", "receipt"],
+            vec!["warden", "migrate", "v4-to-v5", "--check", "--force"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn v4_to_v5_help_names_choices_cas_and_no_force() {
+        let mut command = Cli::command();
+        let action = command
+            .find_subcommand_mut("migrate")
+            .unwrap()
+            .find_subcommand_mut("v4-to-v5")
+            .unwrap();
+        let help = action.render_long_help().to_string();
+        for flag in [
+            "--check",
+            "--json",
+            "--plan",
+            "--choices",
+            "--re-plan",
+            "--apply-plan",
+            "--expect-plan-hash",
+            "--rollback",
+            "--expect-revision",
+            "--finalize",
+        ] {
+            assert!(help.contains(flag), "missing {flag} in {help}");
+        }
+        assert!(!help.contains("--force"));
+    }
 }
 
 #[derive(Subcommand)]
@@ -862,37 +981,159 @@ pub enum CacheAction {
     },
 }
 
-/// `warden profile <verb>` operates on the v1 profile schema.
-/// Mutating verbs dispatch over IPC to the running daemon; read verbs
-/// (`list`, `show`) read the merged config tree locally.
-///
-/// Surface coverage (6 mutating verbs, 3 read-only):
-/// - MUTATE: `display_name`, `block_response`, `blocked_ttl_secs`,
-///   `block_all`, `admin_rules` (add/remove refs), `ecs` subtree.
-/// - READ-only count + drill-out: `lists` (the per-list direction
-///   override, written by `list-policy set` / `clear`), `tags` (inert —
-///   every write verb refuses), `local_records` (TUI Local DNS tab),
-///   `rewrite_rules` (`warden rewrite`).
-///
-/// `Allow` / `Deny` are carried from v0 — they synth an admin_rule
-/// entry + cross-ref add. The dedicated `admin-rule add` /
-/// `admin-rule remove` verbs work on existing `[[admin_rules]]` ids.
-///
-/// The six scalar fields take one generic `set <field> <value>`, as
-/// every other entity does. `admin_rules` is a list of references and
-/// `lists` is a three-state map, so neither folds into `set`: they keep
-/// their own sub-verbs. `tags` keeps its sub-verb too, but only so the
-/// refusal has somewhere to land.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct OperatorMutationArgs {
+    /// Validate and show the plan without committing it.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Require this exact byte-level configuration revision.
+    #[arg(long)]
+    pub expect_revision: Option<String>,
+    /// Idempotency key for this mutation.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// Output a stable JSON object.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CustomListAction {
+    /// List declared Custom Lists.
+    List {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Custom List.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Page through the complete rows of one Custom List.
+    Rules {
+        id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an empty Custom List.
+    Create {
+        id: String,
+        #[arg(long, default_value = "")]
+        display_name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        into: Option<String>,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Change descriptive metadata without changing rules or mounts.
+    Set {
+        id: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Add one simple allow or deny domain rule.
+    Add {
+        id: String,
+        domain: String,
+        #[arg(long, required_unless_present = "deny", conflicts_with = "deny")]
+        allow: bool,
+        #[arg(long, required_unless_present = "allow", conflicts_with = "allow")]
+        deny: bool,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Add one raw operator rule supported by the current schema.
+    AddRule {
+        id: String,
+        #[arg(long)]
+        rule: String,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Replace exactly one revision-bound row.
+    ReplaceRule {
+        id: String,
+        #[arg(long)]
+        row_ref: String,
+        #[arg(long)]
+        rule: String,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Remove exactly one revision-bound row.
+    RemoveRule {
+        id: String,
+        #[arg(long)]
+        row_ref: String,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Export the exact pack bytes after verifying every chunk.
+    Export {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a Custom List, optionally unmounting it atomically first.
+    Delete {
+        id: String,
+        #[arg(long)]
+        cascade_unmount: bool,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Build an atomic batch plan from a JSON operations file.
+    Plan {
+        #[arg(long)]
+        operations: PathBuf,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Apply a plan file using its opaque reference and full hash.
+    Apply {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        expect_plan_hash: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a durable operation receipt.
+    Operation {
+        operation_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `warden profile <verb>` operates on the current profile schema. Legacy rule
+/// writers are RETIRED, perform no write, and direct operators to
+/// `warden custom-list` + `warden profile mount`.
 #[derive(Subcommand)]
 pub enum ProfileAction {
-    /// List all v1 profiles with summary stats.
+    /// List all profiles with summary stats.
     List,
-    /// Show full v1 details for one profile.
+    /// Show full details for one profile.
     Show {
         /// Profile id (the map key in `[profiles.<id>]`).
         id: String,
     },
-    /// Add a new v1 profile.
+    /// Add a new profile.
     Add {
         /// Profile id (the map key in `[profiles.<id>]`). Charset
         /// `[a-z0-9-]`, 1..=64 bytes.
@@ -922,8 +1163,8 @@ pub enum ProfileAction {
     /// take dotted keys. Setting one leaves the other two as they were.
     ///
     /// Which blocklists this profile applies is not a field either:
-    /// use `warden profile list-policy`. Admin rules are a list of
-    /// references: use `warden profile admin-rule`.
+    /// use `warden profile list-policy`. Custom Lists are mounted with
+    /// `warden custom-list` + `warden profile mount`.
     #[command(verbatim_doc_comment)]
     Set {
         /// Profile id (the map key in `[profiles.<id>]`).
@@ -933,12 +1174,8 @@ pub enum ProfileAction {
         /// New value.
         value: String,
     },
-    /// Manage which existing `[[admin_rules]]` rows this profile
-    /// enforces. Rows are not created here — they are synthesised as a
-    /// side effect of `warden profile allow` / `warden profile deny`
-    /// (and the device / group / subnet / default equivalents), which
-    /// write the row and reference it in one step. `warden profile
-    /// show` lists the ids this profile currently names.
+    /// RETIRED — legacy profile admin-rule surface. Performs no write.
+    /// Use `warden custom-list` + `warden profile mount`.
     AdminRule {
         #[command(subcommand)]
         action: commands::profiles_v1::ProfileAdminRuleAction,
@@ -947,44 +1184,57 @@ pub enum ProfileAction {
     /// schedule still references the id — resolve the dangling
     /// references first.
     Remove { id: String },
-    /// Allow a domain on this profile — synthesises an
-    /// `@@||domain^` admin rule and references it. Use `--remove` to
-    /// undo a previous allow on the same domain.
-    Allow {
-        /// Profile id (the map key in `[profiles.<id>]`).
+    /// Mount one Custom List on an existing profile.
+    Mount {
         profile_id: String,
-        /// Domain (LDH ASCII; for IDN use the Punycode `xn--…` form).
+        #[arg(long)]
+        custom_list: String,
+        #[arg(long)]
+        offline: bool,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// Unmount one Custom List from an existing profile.
+    Unmount {
+        profile_id: String,
+        #[arg(long)]
+        custom_list: String,
+        #[arg(long)]
+        offline: bool,
+        #[command(flatten)]
+        mutation: OperatorMutationArgs,
+    },
+    /// RETIRED — legacy profile allow surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
+    Allow {
+        /// Compatibility-only profile id; accepted but performs no write.
+        profile_id: String,
+        /// Compatibility-only domain; accepted but performs no write.
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
-        /// Invert: drop a previous allow on the same domain (or the
-        /// rule named by `--id`), cascading the `[[admin_rules]]` row
-        /// drop when no other entity references the id.
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         remove: bool,
-        /// Optional `profiles.d/*.toml` slice to edit.
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Block a domain on this profile — synthesises a `||domain^`
-    /// admin rule. Use `--remove` to undo a previous block.
+    /// RETIRED — legacy profile deny surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Deny {
+        /// Compatibility-only profile id; accepted but performs no write.
         profile_id: String,
+        /// Compatibility-only domain; accepted but performs no write.
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         remove: bool,
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         into: Option<PathBuf>,
     },
@@ -1116,17 +1366,12 @@ pub enum DeviceAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Allow a domain ONLY for this device. Refused when the device's
-    /// profile explicitly denies the same domain, unless the device
-    /// entry sets `override_profile_deny = true`.
+    /// RETIRED — legacy device allow surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Allow {
         device_id: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1134,15 +1379,12 @@ pub enum DeviceAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Block a domain ONLY for this device.
+    /// RETIRED — legacy device deny surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Deny {
         device_id: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1150,10 +1392,8 @@ pub enum DeviceAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Manage the per-device rule references. Currently exposes
-    /// `prune`, which drops rule ids that no longer resolve to an
-    /// `[[admin_rules]]` row — the ones `warden config lint` warns
-    /// about.
+    /// RETIRED — legacy device rules and prune surface. Performs no write.
+    /// Use `warden custom-list` + `warden profile mount`.
     Rules {
         device_id: String,
         #[command(subcommand)]
@@ -1271,18 +1511,12 @@ pub enum GroupAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Allow a domain across every device in this group.
-    /// The rule lands on the Profile this group references, so it also
-    /// applies to every other group, subnet, or device pointing at that
-    /// same profile — the scope is the profile, not the group.
+    /// RETIRED — legacy group allow surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     ProfileAllow {
         group_id: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1290,16 +1524,12 @@ pub enum GroupAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Block a domain across every device in this group.
-    /// Same profile-wide scope as `profile-allow`.
+    /// RETIRED — legacy group deny surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     ProfileDeny {
         group_id: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1361,20 +1591,12 @@ pub enum SubnetAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Allow a domain across every device on this subnet.
-    /// The rule lands on the Profile this subnet references, so it also
-    /// applies to every other subnet, group, or device pointing at that
-    /// same profile — the scope is the profile, not the subnet. The
-    /// `subnet_or_cidr` arg accepts either the subnet id or any CIDR
-    /// in its `cidrs` list.
+    /// RETIRED — legacy subnet allow surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     ProfileAllow {
         subnet_or_cidr: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1382,16 +1604,12 @@ pub enum SubnetAction {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Block a domain across every device on this subnet.
-    /// Same profile-wide scope as `profile-allow`.
+    /// RETIRED — legacy subnet deny surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     ProfileDeny {
         subnet_or_cidr: String,
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1589,78 +1807,113 @@ pub enum TokenAction {
 }
 
 #[derive(Subcommand)]
+pub enum NodeAction {
+    /// Issue a one-use association token on the node you want to add.
+    Token {
+        /// Reachable local HTTPS address; the usual port is 8053.
+        #[arg(long, value_name = "IP:PORT", conflicts_with = "revoke")]
+        listen: Option<SocketAddr>,
+        /// Invalidate the unused token without changing membership or policy.
+        #[arg(long)]
+        revoke: bool,
+    },
+    /// Show node connections and the progress of guided operations.
+    Status {
+        /// Output status as JSON; association secrets are never included.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Abandon one exact unapplied pending Add on this standalone target.
+    AbandonPendingAdd {
+        /// Exact operation ID shown by `warden node status`.
+        #[arg(long, value_name = "ID")]
+        operation_id: String,
+        /// Confirm that only this target-local pending enrollment is abandoned.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Review recovery of a primary activation that has never served peers.
+    #[command(group(clap::ArgGroup::new("primary_recovery_action")
+        .required(true)
+        .args(["listen", "apply_preview", "cancel_preview"])))]
+    RecoverPrimary {
+        /// Prepare recovery at this machine's HTTPS address without applying it.
+        #[arg(long, value_name = "IP:PORT")]
+        listen: Option<SocketAddr>,
+        /// Apply the exact reviewed recovery; the daemon still needs a restart.
+        #[arg(long, value_name = "ID")]
+        apply_preview: Option<String>,
+        /// Discard an unapplied recovery preview.
+        #[arg(long, value_name = "ID")]
+        cancel_preview: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ClusterAction {
-    /// Primary: generate the cluster bearer token. The plaintext is
-    /// printed ONCE — carry it to the secondary. Only its SHA-256 hash is
-    /// stored, in `[cluster] token_hash`.
+    /// Retired shared-token setup; use create and invite.
+    #[command(hide = true)]
     Token,
-    /// Secondary: configure this node to follow a primary. Writes the
-    /// `[cluster]` section (role = secondary, peer, token_hash, enabled).
-    /// The peer and token are recorded, not contacted: nothing here proves
-    /// the primary is reachable or the token correct — the first sync does.
-    /// Undo with `warden cluster leave`.
+    /// Preview association with a primary and replacement of local policy.
     Join {
-        /// The primary's API base URL, e.g. https://10.10.1.94:8053
+        /// Primary HTTPS origin.
         #[arg(long)]
         peer: String,
-        /// Read the cluster bearer token from this file (0600). Preferred —
-        /// keeps the secret off the command line.
+        /// Read the invitation from a private file; otherwise read stdin.
         #[arg(long, value_name = "PATH")]
-        token_file: Option<PathBuf>,
-        /// The cluster bearer token, inline. DISCOURAGED: visible via `ps` /
-        /// /proc/<pid>/cmdline and saved to shell history — prefer --token-file
-        /// or piping it on stdin. When neither this nor --token-file is given,
-        /// the token is read from stdin.
+        invitation_file: Option<PathBuf>,
+        /// Local display name to save with the reviewed association.
         #[arg(long)]
-        token: Option<String>,
-        /// PEM certificate of the primary's API listener, pinned as the ONLY
-        /// trust anchor for the sync channel. Neither node has a
-        /// publicly-issued certificate, so without this the secondary cannot
-        /// complete a single poll against a non-loopback peer. Copy it from
-        /// the primary's `api.tls_cert`.
-        #[arg(long, value_name = "PATH")]
-        peer_cert: Option<PathBuf>,
+        node_name: Option<String>,
     },
-    /// Undo a join: turn clustering off and forget the peer this node was
-    /// following, leaving it standalone. Use this to recover a node whose
-    /// daemon refuses to start because its config still claims cluster
-    /// membership. Other settings, and any stored cluster token, are kept.
+    /// Preview leaving membership while retaining the current policy.
     Leave {
-        /// Set this node's own resolver while leaving, e.g. 10.0.0.1:53.
-        /// Required only on a secondary that joined but never synced: its
-        /// upstream would have arrived in the primary's bundle, and a
-        /// secondary's own master may not carry one, so leaving without this
-        /// would strand the node with no resolver. Cleared membership and this
-        /// value are written together — neither order works alone.
-        #[arg(long, value_name = "ADDR:PORT")]
+        /// Retired bootstrap resolver override.
+        #[arg(long, hide = true)]
         upstream: Option<String>,
     },
-    /// Primary: turn clustering on and mint the TLS material a secondary
-    /// will pin. Writes `[cluster]` and `[api]` in ONE validated write —
-    /// they cannot be separate, because `api.enabled = true` is refused at
-    /// load until the token hash and the TLS pair are all present together.
-    Enable {
-        /// This node's cluster role.
-        #[arg(long, value_enum)]
-        role: EnableRole,
-        /// An address a secondary will use to reach this node. Repeatable.
-        /// Required when this node has no `api.tls_cert` yet. Bare host or
-        /// IP — no scheme, no port, no path.
+    /// Preview creation of a primary with individual node credentials.
+    Create {
+        /// Address used by secondaries to reach this node; repeatable.
         #[arg(long = "san", value_name = "ADDR")]
         sans: Vec<String>,
-        /// Bind address for the API server, e.g. 192.0.2.10:8053. A primary
-        /// must be reachable by its secondaries, and the default listen is
-        /// loopback — without this the operator is back to hand-editing
-        /// TOML, which is what this verb exists to remove.
-        #[arg(long, value_name = "IP:PORT")]
+        /// Reachable API listener address.
+        #[arg(long)]
         api_listen: Option<SocketAddr>,
-        /// Certificate validity in days. A pinned self-signed certificate
-        /// has no CA to expire against, and rotating it means touching both
-        /// nodes — so the default is long on purpose.
+        /// Explicitly replace legacy shared-token membership with a backed-up primary.
+        #[arg(long)]
+        migrate_legacy: bool,
+    },
+    /// Compatibility spelling for primary creation.
+    Enable {
+        #[arg(long, value_enum)]
+        role: EnableRole,
+        #[arg(long = "san", value_name = "ADDR")]
+        sans: Vec<String>,
+        #[arg(long)]
+        api_listen: Option<SocketAddr>,
         #[arg(long, default_value_t = 3650)]
         validity_days: u32,
     },
-    /// Print this node's cluster role / peer / enabled state.
+    /// Apply exactly one previously reviewed preview.
+    Apply {
+        #[arg(long)]
+        preview_id: String,
+    },
+    /// Cancel a pending preview and its remote admission when reachable.
+    Cancel {
+        #[arg(long)]
+        preview_id: String,
+    },
+    /// Issue one private invitation valid for fifteen minutes.
+    Invite,
+    /// Change this node's display name without changing its identity.
+    Rename { name: String },
+    /// Revoke a node credential immediately; its DNS policy stays in place.
+    Revoke { node_id: String },
+    /// Preview replacing this standalone node's stable identity.
+    ResetIdentity,
+    /// Show saved membership and available active-runtime evidence.
     Status,
 }
 
@@ -1686,16 +1939,11 @@ pub enum AuditAction {
 
 #[derive(Subcommand)]
 pub enum DefaultAction {
-    /// Allow a domain across the default-profile resolver
-    /// chain (every unmapped device). Typed-confirm `DEFAULT` is
-    /// required even on the CLI to surface the broad blast radius.
+    /// RETIRED — legacy default-profile allow surface. Performs no write.
+    /// Use `warden custom-list` + `warden profile mount`.
     Allow {
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1707,14 +1955,11 @@ pub enum DefaultAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Block a domain across the default-profile chain.
+    /// RETIRED — legacy default-profile deny surface. Performs no write.
+    /// Use `warden custom-list` + `warden profile mount`.
     Deny {
         domain: String,
-        /// Optional explicit rule id. On add, the id given to the new
-        /// `[[admin_rules]]` row (default: auto-generated
-        /// `auto-<action>-<8hex>` via OsRng). With `--remove`, selects the
-        /// rule carrying this id instead of the first one matching the
-        /// domain — several rules may share an (action, domain).
+        /// Compatibility-only; accepted but performs no write.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -1728,17 +1973,15 @@ pub enum DefaultAction {
 
 #[derive(Subcommand)]
 pub enum RuleVerb {
-    /// Pop the last `[[admin_rules]]` row and cascade the
-    /// reference drop across every profile / device / group / subnet
-    /// that named it.
+    /// RETIRED — legacy admin-rule undo surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Undo,
 }
 
 #[derive(Subcommand)]
 pub enum DeviceRulesAction {
-    /// Walk a device's `allow_rules` + `deny_rules` and
-    /// drop ids that no longer exist in `[[admin_rules]]`. The recovery
-    /// path for `LIST_PRUNE_WARN`.
+    /// RETIRED — legacy device rules-prune surface. Performs no write. Use
+    /// `warden custom-list` + `warden profile mount`.
     Prune {
         #[arg(long)]
         into: Option<PathBuf>,

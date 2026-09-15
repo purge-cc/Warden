@@ -34,7 +34,7 @@ fn entry_with_result(result: &str, domain: &str) -> QueryLogDto {
 /// keypress-under-test does not trigger a tab-change poll (which
 /// would touch `last_error` via the dummy poller's ENOENT failure).
 fn app_on_query_log_with(entry: QueryLogDto) -> App {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::QueryLog;
     app.query_log.entries = vec![entry];
     app.query_log.table_state.select(Some(0));
@@ -130,7 +130,7 @@ async fn enter_on_refused_row_surfaces_specific_message() {
 
 #[tokio::test]
 async fn enter_with_no_selection_is_safe_noop() {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::QueryLog;
     // Empty entries + no selection — the early-returns in
     // `build_query_log_rule_modal` and the `_UNKNOWN` fallback

@@ -1,0 +1,6 @@
+{
+  "type": "operator_rules_apply",
+  "plan_ref": "plan-v1-local",
+  "plan_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "request_id": "golden-apply-v1"
+}

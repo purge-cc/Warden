@@ -32,9 +32,14 @@ mod tests {
         let out = render_default_string();
         // Single source of truth: identical to `warden init`.
         assert_eq!(out, crate::cli::commands::init::default_config());
-        // Must parse as TOML — the packaging seed depends on this.
-        let _: toml::Value =
-            toml::from_str(&out).expect("render-default output must be valid TOML");
+        // Must decode as the current strict schema — a generic TOML parse
+        // would accept legacy rule fields that the runtime must refuse.
+        let config: crate::config::schema::ConfigV5 =
+            toml::from_str(&out).expect("render-default output must be valid schema-5 TOML");
+        assert_eq!(
+            config.schema_version,
+            crate::config::schema::TARGET_SCHEMA_VERSION_V5
+        );
         assert!(!out.trim().is_empty(), "scaffold config must not be empty");
     }
 }

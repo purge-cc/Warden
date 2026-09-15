@@ -1,320 +1,414 @@
-//! `warden config restore <archive>` — staged replace from a tar.gz backup.
+//! Restore a validated archive through a recoverable TOML and pack transaction.
 //!
-//! Flow:
-//!
-//! 1. Extract the archive into a staging directory.
-//! 2. Locate the master `config.toml` in the staging tree.
-//! 3. Run [`crate::config::loader::load_config`] against the staged
-//!    master so every validator error is caught before the live tree
-//!    is touched.
-//! 4. If clean, atomically replace the live config file and every
-//!    sibling `*.d/` directory, copy the previous master aside as
-//!    `<name>.pre-restore-<ts>` for trivial rollback.
-//! 5. Optionally send `SIGHUP` to the running daemon (via its PID file)
-//!    so the swap is observable without a manual restart.
-//!
-//! Failure at step 3 leaves the live tree untouched and returns a
-//! non-zero exit code. The staging directory is dropped on exit.
+//! Only declared policy files enter the transaction inventory. Unreferenced
+//! files remain untouched, and the exclusive guard ends before reload is requested.
 
-use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::config::atomic_write::{
-    hardened_atomic_create_only_at, hardened_atomic_write_at, AtomicCreateOnlyAtOpts,
-    AtomicWriteAtOpts, AtomicWriteError,
-};
-use crate::config::loader;
-use crate::config::migration_journal;
-use crate::config::tree_io::{inspect_at, rename_noreplace_at, same_optional_inode};
-use crate::config::write_lock::{self, ConfigWriteLock};
 use anyhow::Context;
+use rand_core::RngCore;
 
-use super::backup::include_roots;
+use crate::config::custom_list::{self, PackOverlay};
+use crate::config::loader::{self, GuardedLoadFailure, LoaderOverlay};
+use crate::config::policy_revision::{
+    capture_coherent_loaded_v5_under_migration_guard, PolicyMemberKind, PolicyMemberState,
+    PolicyRevisionInventory, PolicyRevisionMember,
+};
+use crate::config::policy_transaction::{
+    self, Persistence, ReceiptStore, RecoveryOutcome, RepairDestinationSet, RepairRequest,
+    TransactionRequest,
+};
+use crate::config::schema::{Id, TARGET_SCHEMA_VERSION_V5 as SCHEMA_VERSION};
+use crate::config::write_lock::{self, MigrationWriteLock};
 
-/// Outcome of [`restore_archive`] — distinguishes a clean reinstall from
-/// a staged-config validation failure (which leaves the live tree
-/// untouched) so callers can render their own output. Hard I/O / archive
-/// errors are returned as `Err` instead.
+/// Persistence result returned without requesting daemon activation.
+/// Archive, I/O, recovery and uncertain-durability errors are returned as `Err`.
+#[derive(Debug)]
 pub enum RestoreOutcome {
-    /// The live config was replaced. `pre_restore` is the path the prior
-    /// master was saved to (`None` if there was no prior master).
-    Restored { pre_restore: Option<PathBuf> },
-    /// The staged config failed validation; the live tree is untouched.
-    /// Carries the formatted validator errors.
+    /// The policy transaction committed durably. Its recovery copy is retained
+    /// by the transaction backend; no standalone master backup is created.
+    Restored {
+        pre_restore: Option<PathBuf>,
+        changed: bool,
+        /// Invalid or absent live configuration was repaired; unnamed paths remain.
+        repair: bool,
+    },
+    /// Candidate validation failed before any live policy file changed.
     ValidationFailed(Vec<String>),
 }
 
-/// Restore the config tree from `archive` WITHOUT printing or signalling —
-/// so the TUI can call it inside the alternate screen. The CLI wrapper
-/// [`run_restore`] prints the summary, sends `SIGHUP`, and maps the
-/// outcome to a process exit code.
+/// Restore declared policy files without printing or signalling the daemon.
+/// The CLI wrapper [`run_restore`] requests reload after this function returns.
 pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<RestoreOutcome> {
-    if !archive.exists() {
-        anyhow::bail!("archive not found: {}", archive.display());
-    }
-
+    anyhow::ensure!(archive.exists(), "archive not found: {}", archive.display());
     let staging = StagingDir::create()?;
     extract_archive(archive, staging.path())?;
-
     let staged_master = locate_staged_master(staging.path(), live_config)?;
-
-    // Validate the staged tree before touching anything live. The load
-    // also tells us WHICH files the archive's config actually declares —
-    // the install set is derived from that instead of a hardcoded
-    // `KNOWN_INCLUDE_DIRS` list. Two properties come out of using the STAGED master's
-    // own graph rather than the archive's contents: an include the
-    // operator declared outside `<class>.d/` is reinstalled, and the set
-    // still bounds what an operator-supplied archive may write into the
-    // live config dir (an unreferenced member is extracted to staging and
-    // then simply not promoted).
+    let staged_root = staged_master
+        .parent()
+        .context("staged master has no parent")?;
+    custom_list::validate_flat_pack_tree(staged_root)
+        .context("refusing restore with an unsupported staged packs/ tree")?;
     let now = time::OffsetDateTime::now_utc();
-    let staged_loaded = match loader::load_config(&staged_master, now) {
+    let staged = match loader::load_config_v5_executable(&staged_master, now) {
         Ok(loaded) => loaded,
-        Err(errs) => {
+        Err(errors) => {
             return Ok(RestoreOutcome::ValidationFailed(
-                errs.iter().map(|e| e.to_string()).collect(),
+                errors.iter().map(ToString::to_string).collect(),
             ));
         }
     };
-    let staged_files = staged_loaded.files_loaded.clone();
-    // Read and bound the whole staged install set before acquiring the live
-    // tree. Nothing below this point needs to inspect the caller's path.
-    let staged_bytes = std::fs::read(&staged_master).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read staged master {}: {}",
-            staged_master.display(),
-            e
-        )
-    })?;
-    let staged_root = staged_master
+    let staged_inventory = staged_inventory(&staged)?;
+
+    let guard = write_lock::acquire_for_migration(live_config)?;
+    restore_staged_locked(&guard, live_config, &staged_inventory, now)
+}
+
+fn staged_inventory(loaded: &loader::LoadedConfigV5) -> anyhow::Result<PolicyRevisionInventory> {
+    staged_inventory_with_budget(loaded, policy_transaction::MAX_POLICY_BYTES)
+}
+
+fn staged_inventory_with_budget(
+    loaded: &loader::LoadedConfigV5,
+    transaction_budget: u64,
+) -> anyhow::Result<PolicyRevisionInventory> {
+    let root = loaded
+        .master_path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("staged master has no parent"))?;
-    let staged_master_name = staged_master
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("staged master has no file name"))?;
-    // A restored master that declares a custom list without its file is a
-    // daemon that will not start — the recovery tool causing the outage it
-    // exists to end. The pack files have to be promoted alongside the
-    // includes.
-    //
-    // The promotion rule is unchanged: only what the staged master declares
-    // is written into the live tree. Since the unit of promotion is a
-    // top-level directory name, the bound is applied by pruning the staged
-    // copy first, so the directory that gets promoted holds exactly the
-    // declared set.
-    let staged_pack_dir = crate::config::custom_list::pack_dir(staged_root);
-    let mut promote_packs = false;
-    if staged_pack_dir.is_dir() {
-        let declared: std::collections::HashSet<PathBuf> = staged_loaded
-            .config
-            .custom_lists
-            .iter()
-            .map(|cl| crate::config::custom_list::pack_path(staged_root, &cl.id))
-            .collect();
-        for entry in std::fs::read_dir(&staged_pack_dir)? {
-            let path = entry?.path();
-            if !declared.contains(&path) {
-                // Staging is a temp dir this function owns; nothing live is
-                // touched. An archive member no entry names is dropped here
-                // exactly as an unreferenced include is dropped by not
-                // appearing in `include_entries`.
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-        promote_packs = !declared.is_empty();
+        .context("staged master has no parent")?;
+    let mut members = Vec::new();
+    let mut toml_bytes = 0_u64;
+    let mut retained_bytes = 0_u64;
+    for path in &loaded.files_loaded {
+        let relative = path
+            .strip_prefix(root)
+            .context("staged TOML escaped its root")?;
+        let remaining = transaction_budget
+            .checked_sub(retained_bytes)
+            .context("restore candidate exceeds transaction byte budget")?;
+        let bytes = read_staged_file(
+            path,
+            loader::MAX_TOTAL_BYTES
+                .saturating_sub(toml_bytes)
+                .min(remaining),
+        )?;
+        let length = bytes.len() as u64;
+        toml_bytes = toml_bytes
+            .checked_add(length)
+            .context("restore TOML byte budget overflow")?;
+        retained_bytes = retained_bytes
+            .checked_add(length)
+            .context("restore transaction byte budget overflow")?;
+        members.push(PolicyRevisionMember::present(
+            if path == &loaded.master_path {
+                PolicyMemberKind::Master
+            } else {
+                PolicyMemberKind::Include
+            },
+            relative.to_path_buf(),
+            bytes,
+        )?);
     }
+    for list in &loaded.config.custom_lists {
+        let relative = custom_list::pack_path(Path::new(""), &list.id);
+        let remaining = transaction_budget
+            .checked_sub(retained_bytes)
+            .context("restore candidate exceeds transaction byte budget")?;
+        let bytes = read_staged_file(
+            &root.join(&relative),
+            u64::try_from(loaded.config.custom_list_limits.max_file_bytes)
+                .context("schema-5 pack limit does not fit the restore byte budget")?
+                .min(remaining),
+        )?;
+        retained_bytes = retained_bytes
+            .checked_add(bytes.len() as u64)
+            .context("restore transaction byte budget overflow")?;
+        members.push(PolicyRevisionMember::present(
+            PolicyMemberKind::Pack,
+            relative,
+            bytes,
+        )?);
+    }
+    Ok(PolicyRevisionInventory::new(members)?)
+}
 
-    // The master is installed above by its own atomic write; everything
-    // else the staged config reaches is an include entry to promote.
-    let mut include_entries: Vec<String> = include_roots(staged_root, &staged_files)?
-        .into_iter()
-        .filter(|e| e != staged_master_name)
-        .collect();
-    if promote_packs && !include_entries.iter().any(|e| e == "packs") {
-        include_entries.push("packs".to_string());
-    }
-
-    // The guard creates/adopts the canonical root, binds aliases, and is the
-    // sole live-tree capability. Its scope deliberately ends before callers
-    // print, signal, or await.
-    {
-        let guard = write_lock::acquire_for_write(live_config)?;
-        migration_journal::refuse_normal_access(guard.tree_io())?;
-        restore_staged_locked(
-            &guard,
-            live_config,
-            staged_root,
-            &staged_bytes,
-            &include_entries,
-        )
-    }
+fn read_staged_file(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file() && before.nlink() == 1 && before.len() <= cap,
+        "unsafe or oversized staged file: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    (&file)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        bytes.len() as u64 == before.len()
+            && after.len() == before.len()
+            && after.mtime() == before.mtime()
+            && after.mtime_nsec() == before.mtime_nsec()
+            && after.ctime() == before.ctime()
+            && after.ctime_nsec() == before.ctime_nsec(),
+        "staged file changed during capture: {}",
+        path.display()
+    );
+    Ok(bytes)
 }
 
 fn restore_staged_locked(
-    guard: &ConfigWriteLock,
+    guard: &MigrationWriteLock,
     requested_master: &Path,
-    staged_root: &Path,
-    staged_bytes: &[u8],
-    include_entries: &[String],
+    staged: &PolicyRevisionInventory,
+    now: time::OffsetDateTime,
 ) -> anyhow::Result<RestoreOutcome> {
     guard.verify_master(requested_master)?;
-    // This is the first restore-specific observation of the live tree.
-    let master_plan = guard.tree_io().plan_master_target()?;
-    let original_meta = master_plan.original_metadata().cloned();
-    let master_target = master_plan.materialize()?;
-    let root = guard.tree_io().backup_root_fd()?;
-    let owner = guard.admitted_side_lock_owner()?;
-    let canonical_root = guard
+    let active_transaction = crate::config::tree_io::inspect_at(
+        guard.tree_io().root,
+        OsStr::new(crate::config::migration_journal::TXN_DIR_NAME),
+    )?
+    .is_some();
+    let receipts = if active_transaction {
+        let data = crate::config::state_dir::open_for_migration(guard)?;
+        let receipts = ReceiptStore::open(&data, guard)?;
+        if matches!(
+            policy_transaction::recover_active(guard, &receipts)?,
+            RecoveryOutcome::LegacyActive
+        ) {
+            anyhow::bail!(
+                "unfinished v3-to-v4 migration: use its recovery workflow before restoring"
+            );
+        }
+        Some(receipts)
+    } else {
+        None
+    };
+    policy_transaction::preflight_restore_pack_tree(guard)
+        .context("refusing restore with an unsupported live packs/ tree")?;
+    let receipts = match receipts {
+        Some(receipts) => receipts,
+        None => {
+            let data = crate::config::state_dir::open_for_migration(guard)?;
+            ReceiptStore::open(&data, guard)?
+        }
+    };
+    let before = match loader::load_config_v5_for_repair_under_migration_guard(
+        guard,
+        guard.canonical_master(),
+        now,
+    ) {
+        Ok(live) => Some(capture_coherent_loaded_v5_under_migration_guard(
+            guard, &live, now,
+        )?),
+        Err(loader::EditorGuardedLoadFailure::Diagnostics(_)) => None,
+        Err(loader::EditorGuardedLoadFailure::Operational(error)) => return Err(error),
+    };
+    let repair = before.is_none();
+    let master_name = guard
         .canonical_master()
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("canonical config master has no parent"))?;
-
-    let mut original_source = None;
-    let mut original_bytes = None;
-    if let (Some(original), Some(meta)) = (master_target.original.as_ref(), original_meta.as_ref())
-    {
-        let mut source = write_lock::reopen_inspected(original, libc::O_RDONLY)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-        source.read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 == meta.len(),
-            "canonical master changed while capturing its recovery copy"
-        );
-        original_source = Some(source);
-        original_bytes = Some(bytes);
-    }
-
-    let mut pre_restore = match (original_source.as_mut(), original_meta.as_ref()) {
-        (Some(source), Some(meta)) => Some(create_pre_restore_copy(guard, source, meta)?),
-        _ => None,
+        .file_name()
+        .context("master has no name")?;
+    let after = PolicyRevisionInventory::new(
+        staged
+            .members()
+            .iter()
+            .map(|member| {
+                let path = if member.kind() == PolicyMemberKind::Master {
+                    PathBuf::from(master_name)
+                } else {
+                    member.path().to_path_buf()
+                };
+                let PolicyMemberState::Present(bytes) = member.state() else {
+                    anyhow::bail!("staged archive contains an absent member");
+                };
+                Ok(PolicyRevisionMember::present(
+                    member.kind(),
+                    path,
+                    bytes.clone(),
+                )?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    )?;
+    let destinations = if repair {
+        Some(RepairDestinationSet::capture(guard, &after)?)
+    } else {
+        None
     };
-
-    // Phase A is additive and completes before the master changes.
-    let mut swap = match prepare_include_entries(
-        &mut std::io::stderr(),
-        staged_root,
-        &root,
-        canonical_root,
-        include_entries,
-        owner,
-    ) {
-        Ok(swap) => swap,
-        Err(error) => {
-            let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
-            return match cleanup_pre_restore(pre_restore.take()) {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(error.context(format!(
-                    "cleanup of pre-restore artifact was incomplete: {cleanup:#}; inspect {artifact}"
-                ))),
-            };
-        }
-    };
-
-    if let Err(error) = hardened_atomic_write_at(
-        &master_target,
-        staged_bytes,
-        AtomicWriteAtOpts {
-            owner: Some(owner),
-            ..Default::default()
-        },
-    ) {
-        let landed = error.rename_landed();
-        let mut recovery_errors = Vec::new();
-        if landed {
-            if let Err(rollback) =
-                rollback_published_master(&master_target, original_bytes.as_deref())
-            {
-                recovery_errors.push(format!("canonical-master rollback failed: {rollback:#}"));
-            }
-        }
-        if let Err(cleanup) = swap.cleanup_incoming(&root) {
-            recovery_errors.push(format!("incoming cleanup failed: {cleanup:#}"));
-        }
-        let cause = anyhow::Error::new(error).context(format!(
-            "failed to install staged config at {}",
-            guard.canonical_master().display()
-        ));
-        if recovery_errors.is_empty() {
-            let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
-            if let Err(cleanup) = cleanup_pre_restore(pre_restore.take()) {
-                return Err(cause.context(format!(
-                    "cleanup of pre-restore artifact failed: {cleanup:#}; inspect {artifact}"
-                )));
-            }
-            return Err(cause);
-        }
-        return Err(cause.context(format!(
-            "restore recovery is incomplete ({}); retain and inspect {}",
-            recovery_errors.join("; "),
-            recovery_inventory(
-                &pre_restore,
-                guard.canonical_master(),
-                &swap,
-                &root,
-                canonical_root,
-            ),
-        )));
-    }
-
-    if let Err(error) = swap.promote(&root, |from_parent, from, to_parent, to| {
-        rename_noreplace_at(from_parent, from, to_parent, to)
-    }) {
-        let include_rollback = swap.rollback(&root);
-        let master_rollback = rollback_published_master(&master_target, original_bytes.as_deref());
-        match (include_rollback, master_rollback) {
-            (Ok(()), Ok(())) => {
-                let artifact = recovery_artifact(&pre_restore, guard.canonical_master());
-                if let Err(cleanup) = cleanup_pre_restore(pre_restore.take()) {
-                    return Err(error.context(format!(
-                        "restore rolled back, but cleanup of pre-restore artifact failed: \
-                         {cleanup:#}; inspect {artifact}"
-                    )));
-                }
-                return Err(error.context("restore aborted; live config rolled back"));
-            }
-            (include, master) => {
-                let mut failures = Vec::new();
-                if let Err(include) = include {
-                    failures.push(format!("include rollback failed: {include:#}"));
-                }
-                if let Err(master) = master {
-                    failures.push(format!("canonical-master rollback failed: {master:#}"));
-                }
-                return Err(error.context(format!(
-                    "restore recovery is incomplete ({}); retain and inspect {}",
-                    failures.join("; "),
-                    recovery_inventory(
-                        &pre_restore,
-                        guard.canonical_master(),
-                        &swap,
-                        &root,
-                        canonical_root,
-                    ),
-                )));
-            }
-        }
-    }
-
-    if let Err(error) = swap.finalize(&root) {
-        let artifacts = swap.recovery_artifacts(&root, canonical_root);
-        let retained = if artifacts.is_empty() {
-            format!("the include root {}", canonical_root.display())
-        } else {
-            artifacts.join(", ")
+    let after_paths: BTreeSet<_> = after.members().iter().map(|member| member.path()).collect();
+    let mut toml_overlay = LoaderOverlay::default();
+    let mut pack_overlay = PackOverlay::default();
+    for member in after.members() {
+        let PolicyMemberState::Present(bytes) = member.state() else {
+            anyhow::bail!("restore candidate contains an absent member");
         };
-        eprintln!(
-            "warning: restore committed, but cleanup retained {}: {error:#}",
-            retained
-        );
+        if member.kind() == PolicyMemberKind::Pack {
+            pack_overlay.stage(pack_id(member.path())?, bytes.clone());
+        } else {
+            let plan = guard.tree_io().plan_root_file_no_follow(member.path())?;
+            toml_overlay.stage_plan_reachable_only(
+                &plan,
+                String::from_utf8(bytes.clone()).context("staged TOML is not UTF-8")?,
+            )?;
+        }
     }
-    Ok(RestoreOutcome::Restored {
-        pre_restore: pre_restore.map(|(path, _)| path),
-    })
+    for member in before
+        .iter()
+        .flat_map(|(snapshot, _)| snapshot.inventory().members())
+    {
+        if !after_paths.contains(member.path()) {
+            if member.kind() == PolicyMemberKind::Pack {
+                pack_overlay.omit(pack_id(member.path())?);
+            } else {
+                let plan = guard.tree_io().plan_root_file_no_follow(member.path())?;
+                toml_overlay.omit_plan(&plan)?;
+            }
+        }
+    }
+
+    let mut random = [0_u8; 16];
+    rand_core::OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|error| anyhow::anyhow!("restore request identity entropy: {error}"))?;
+    let request_id = format!(
+        "restore-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let actor = format!("uid:{}", unsafe { libc::geteuid() });
+    let mut candidate_errors = None;
+    let validate = || {
+        custom_list::validate_flat_pack_tree_under_tree(guard.tree_io())?;
+        let candidate =
+            loader::load_config_v5_executable_with_policy_overlays_under_migration_guard(
+                guard,
+                guard.canonical_master(),
+                now,
+                Some(&toml_overlay),
+                Some(&pack_overlay),
+            )
+            .map_err(|failure| match failure {
+                GuardedLoadFailure::Diagnostics(errors) => {
+                    candidate_errors = Some(errors.iter().map(ToString::to_string).collect());
+                    anyhow::anyhow!("restored candidate failed validation")
+                }
+                GuardedLoadFailure::UnsafePath(error)
+                | GuardedLoadFailure::BudgetExceeded(error)
+                | GuardedLoadFailure::TreeChanged(error)
+                | GuardedLoadFailure::RecoveryRequired(error)
+                | GuardedLoadFailure::Storage(error) => error,
+            })?;
+        let root = guard
+            .canonical_master()
+            .parent()
+            .context("master has no parent")?;
+        let expected: BTreeSet<_> = after
+            .members()
+            .iter()
+            .filter(|member| member.kind() != PolicyMemberKind::Pack)
+            .map(|member| root.join(member.path()))
+            .collect();
+        let actual: BTreeSet<_> = candidate.files_loaded.into_iter().collect();
+        if actual != expected {
+            candidate_errors = Some(vec![
+                    "restored include graph would adopt an unowned live TOML file or omit an archived member; resolve the include collision before restoring".to_owned(),
+                ]);
+            anyhow::bail!("restored include graph differs from its closed inventory");
+        }
+        let expected_packs: BTreeSet<_> = after
+            .members()
+            .iter()
+            .filter(|member| member.kind() == PolicyMemberKind::Pack)
+            .map(|member| member.path().to_path_buf())
+            .collect();
+        let actual_packs: BTreeSet<_> = candidate
+            .config
+            .custom_lists
+            .iter()
+            .map(|list| custom_list::pack_path(Path::new(""), &list.id))
+            .collect();
+        if actual_packs != expected_packs {
+            candidate_errors = Some(vec![
+                "restored pack declarations differ from the archived inventory".to_owned(),
+            ]);
+            anyhow::bail!("restored pack graph differs from its closed inventory");
+        }
+        Ok(())
+    };
+    let result = if let Some(before) = &before {
+        let request = TransactionRequest {
+            request_id,
+            actor,
+            origin: "cli".to_owned(),
+            operation: "config.restore".to_owned(),
+            payload: after.revision().as_bytes().to_vec(),
+            expected_revision: before.0.revision(),
+            source_schema: u64::from(SCHEMA_VERSION),
+            target_schema: u64::from(SCHEMA_VERSION),
+        };
+        policy_transaction::apply(
+            guard,
+            &receipts,
+            &request,
+            before.0.inventory(),
+            &after,
+            validate,
+        )
+    } else {
+        let destinations = destinations.context("repair destinations were not captured")?;
+        let request = RepairRequest {
+            request_id,
+            actor,
+            origin: "cli".to_owned(),
+            operation: "config.restore.repair".to_owned(),
+            payload: Vec::new(),
+            expected_destinations: destinations.revision(),
+            source_schema: u64::from(SCHEMA_VERSION),
+            target_schema: u64::from(SCHEMA_VERSION),
+        };
+        policy_transaction::apply_repair(&receipts, &request, destinations, validate)
+    };
+    if let Some(errors) = candidate_errors {
+        return Ok(RestoreOutcome::ValidationFailed(errors));
+    }
+    let receipt = result?;
+    match receipt.persistence {
+        Persistence::Committed => Ok(RestoreOutcome::Restored {
+            pre_restore: None,
+            changed: receipt.changed_members != 0,
+            repair,
+        }),
+        Persistence::DurabilityUncertain => anyhow::bail!(
+            "restore durability_uncertain (transaction {}, request {}); recovery is required before another write; daemon activation was not requested: {}",
+            receipt.transaction_id, receipt.request_id,
+            receipt.failure.as_deref().unwrap_or("inspect the retained transaction receipt")
+        ),
+        status => anyhow::bail!(
+            "restore did not commit (transaction {}, persistence {status:?}); daemon activation was not requested",
+            receipt.transaction_id
+        ),
+    }
+}
+
+fn pack_id(path: &Path) -> anyhow::Result<Id> {
+    Id::new(
+        path.file_stem()
+            .and_then(OsStr::to_str)
+            .context("pack has no valid ID")?,
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// CLI entry point. Returns the intended process exit code (0 success,
@@ -337,18 +431,33 @@ pub fn run_restore(
             }
             Ok(1)
         }
-        RestoreOutcome::Restored { pre_restore } => {
+        RestoreOutcome::Restored {
+            pre_restore,
+            changed,
+            repair,
+        } => {
+            if !changed {
+                println!("config already matches the archive; no reload requested");
+                return Ok(0);
+            }
             if let Some(prev) = &pre_restore {
                 println!("saved previous config as {}", prev.display());
             }
-            println!("restored config to {}", live_config.display());
+            if repair {
+                println!(
+                    "repaired invalid config at {}; unnamed paths retained",
+                    live_config.display()
+                );
+            } else {
+                println!("restored config to {}", live_config.display());
+            }
             if let Some(pid) = pid_file {
                 if let Err(e) = send_sighup_from_pid(pid) {
                     eprintln!(
                         "note: SIGHUP reload failed: {e} — run `systemctl reload purge-warden` manually"
                     );
                 } else {
-                    println!("sent SIGHUP — daemon reloading");
+                    println!("sent SIGHUP — daemon activation is pending");
                 }
             }
             Ok(0)
@@ -530,28 +639,6 @@ fn is_unsafe_member_path(name: &str) -> bool {
     })
 }
 
-fn recovery_artifact(
-    pre_restore: &Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
-    canonical_master: &Path,
-) -> String {
-    pre_restore
-        .as_ref()
-        .map(|(path, _)| path.display().to_string())
-        .unwrap_or_else(|| canonical_master.display().to_string())
-}
-
-fn recovery_inventory(
-    pre_restore: &Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
-    canonical_master: &Path,
-    swap: &IncludeSwap,
-    root: &File,
-    canonical_root: &Path,
-) -> String {
-    let mut artifacts = vec![recovery_artifact(pre_restore, canonical_master)];
-    artifacts.extend(swap.recovery_artifacts(root, canonical_root));
-    artifacts.join(", ")
-}
-
 /// Select one safe root-level staged master. Hints preserve old archives;
 /// ambiguity is never resolved by filesystem enumeration order.
 fn locate_staged_master(staging: &Path, live_config: &Path) -> anyhow::Result<PathBuf> {
@@ -620,531 +707,6 @@ fn locate_staged_master(staging: &Path, live_config: &Path) -> anyhow::Result<Pa
     )
 }
 
-struct PreparedInclude {
-    incoming: OsString,
-    incoming_receipt: File,
-    live: OsString,
-    original: Option<File>,
-}
-
-struct Aside {
-    name: OsString,
-    live: OsString,
-    receipt: File,
-}
-
-struct Promoted {
-    name: OsString,
-    receipt: File,
-}
-
-struct IncludeSwap {
-    prepared: Vec<PreparedInclude>,
-    asides: Vec<Aside>,
-    promoted: Vec<Promoted>,
-}
-
-/// Phase A is entirely additive.  All later names are root-relative to the
-/// held descriptor, never to the caller's spelling of the config path.
-fn prepare_include_entries(
-    notices: &mut dyn Write,
-    staged_root: &Path,
-    root: &File,
-    canonical_root: &Path,
-    entries: &[String],
-    owner: (u32, u32),
-) -> anyhow::Result<IncludeSwap> {
-    let mut receipts = std::collections::HashMap::new();
-    for entry in entries {
-        let name = checked_live_entry_name(entry)?;
-        let current = inspect_at(root, name)?;
-        if let Some(current) = &current {
-            let meta = current.metadata()?;
-            anyhow::ensure!(
-                !meta.file_type().is_symlink()
-                    && (meta.is_dir() || (meta.is_file() && meta.nlink() == 1)),
-                "unsafe live include entry: {}",
-                canonical_root.join(entry).display()
-            );
-        }
-        receipts.insert(entry.clone(), current);
-    }
-
-    let mut swap = IncludeSwap {
-        prepared: Vec::new(),
-        asides: Vec::new(),
-        promoted: Vec::new(),
-    };
-    for entry in entries {
-        let staged = staged_root.join(entry);
-        let meta = match std::fs::symlink_metadata(&staged) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let _ = writeln!(
-                    notices,
-                    "warning: the restored config declares include entry {entry}, which the archive \
-                     does not contain; {} is left as it stands",
-                    canonical_root.join(entry).display()
-                );
-                continue;
-            }
-            Err(error) => {
-                let error =
-                    anyhow::Error::from(error).context(format!("staging include entry {entry}"));
-                return Err(abort_include_preparation(&mut swap, root, error));
-            }
-        };
-        if !meta.is_dir() && !meta.is_file() {
-            let error = anyhow::anyhow!(
-                "refusing to restore {}: not a regular file or directory",
-                staged.display()
-            );
-            return Err(abort_include_preparation(&mut swap, root, error));
-        }
-        let live = checked_live_entry_name(entry)?.to_os_string();
-        let incoming = match reserve_side_name(root, &live, "incoming") {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                return Err(abort_include_preparation(&mut swap, root, error));
-            }
-        };
-        let incoming_receipt = match copy_staged_entry_at(&staged, root, &incoming, owner) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let error = error.context(format!(
-                    "staging include entry {entry} at {}",
-                    canonical_root.join(&incoming).display()
-                ));
-                return Err(abort_include_preparation(&mut swap, root, error));
-            }
-        };
-        swap.prepared.push(PreparedInclude {
-            incoming,
-            incoming_receipt,
-            live,
-            original: receipts.remove(entry).expect("entry receipt"),
-        });
-    }
-    Ok(swap)
-}
-
-fn abort_include_preparation(
-    swap: &mut IncludeSwap,
-    root: &File,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    match swap.cleanup_incoming(root) {
-        Ok(()) => error,
-        Err(cleanup) => error.context(format!(
-            "cleanup after include preparation failure was incomplete: {cleanup:#}"
-        )),
-    }
-}
-
-impl IncludeSwap {
-    fn promote(
-        &mut self,
-        root: &File,
-        rename: impl Fn(&File, &OsStr, &File, &OsStr) -> std::io::Result<()>,
-    ) -> anyhow::Result<()> {
-        for item in &self.prepared {
-            let incoming = inspect_at(root, &item.incoming)
-                .map_err(anyhow::Error::from)
-                .context("inspecting staged include before promotion")?;
-            anyhow::ensure!(
-                same_optional_inode(Some(&item.incoming_receipt), incoming.as_ref())?,
-                "staged include entry changed before promotion: {:?}",
-                item.incoming
-            );
-            let current = inspect_at(root, &item.live)
-                .map_err(anyhow::Error::from)
-                .context("inspecting live include before promotion")?;
-            anyhow::ensure!(
-                same_optional_inode(item.original.as_ref(), current.as_ref())?,
-                "live include entry changed since its snapshot: {:?}",
-                item.live
-            );
-            if let Some(original) = &item.original {
-                let aside = reserve_side_name(root, &item.live, "pre-restore")?;
-                let receipt = original.try_clone()?;
-                rename(root, &item.live, root, &aside)
-                    .map_err(anyhow::Error::from)
-                    .context("moving live include aside")?;
-                self.asides.push(Aside {
-                    name: aside,
-                    live: item.live.clone(),
-                    receipt,
-                });
-            }
-            let receipt = item.incoming_receipt.try_clone()?;
-            rename(root, &item.incoming, root, &item.live)
-                .map_err(anyhow::Error::from)
-                .context("promoting staged include")?;
-            self.promoted.push(Promoted {
-                name: item.live.clone(),
-                receipt,
-            });
-            let installed = inspect_at(root, &item.live)
-                .map_err(anyhow::Error::from)
-                .context("inspecting promoted include")?;
-            anyhow::ensure!(
-                same_optional_inode(Some(&item.incoming_receipt), installed.as_ref())?,
-                "staged include entry changed during promotion: {:?}",
-                item.live
-            );
-        }
-        root.sync_all().context("sync restored include root")?;
-        self.verify_promoted(root)?;
-        Ok(())
-    }
-
-    fn finalize(&mut self, root: &File) -> anyhow::Result<()> {
-        self.verify_promoted(root)?;
-        for aside in &self.asides {
-            remove_owned_entry_at(root, &aside.name, &aside.receipt)
-                .with_context(|| format!("cleaning restore aside {:?}", aside.name))?;
-        }
-        root.sync_all()?;
-        Ok(())
-    }
-
-    fn verify_promoted(&self, root: &File) -> anyhow::Result<()> {
-        for promoted in &self.promoted {
-            let current = inspect_at(root, &promoted.name)?;
-            anyhow::ensure!(
-                same_optional_inode(Some(&promoted.receipt), current.as_ref())?,
-                "promoted include entry was replaced: {:?}",
-                promoted.name
-            );
-        }
-        Ok(())
-    }
-
-    fn cleanup_incoming(&mut self, root: &File) -> anyhow::Result<()> {
-        let mut errors = Vec::new();
-        for item in self.prepared.iter().rev() {
-            if let Err(error) = remove_owned_entry_at(root, &item.incoming, &item.incoming_receipt)
-            {
-                errors.push(format!("{:?}: {error:#}", item.incoming));
-            }
-        }
-        if let Err(error) = root.sync_all() {
-            errors.push(format!("include-root sync: {error}"));
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("incoming cleanup failures: {}", errors.join("; "))
-        }
-    }
-
-    fn rollback(&mut self, root: &File) -> anyhow::Result<()> {
-        let mut errors = Vec::new();
-        for promoted in self.promoted.iter().rev() {
-            if let Err(error) = remove_owned_entry_at(root, &promoted.name, &promoted.receipt) {
-                errors.push(format!("promoted {:?}: {error:#}", promoted.name));
-            }
-        }
-        for aside in self.asides.iter().rev() {
-            let restore = (|| -> anyhow::Result<()> {
-                let current = inspect_at(root, &aside.name)?;
-                anyhow::ensure!(
-                    same_optional_inode(Some(&aside.receipt), current.as_ref())?,
-                    "restore aside was replaced: {:?}",
-                    aside.name
-                );
-                rename_noreplace_at(root, &aside.name, root, &aside.live)?;
-                Ok(())
-            })();
-            if let Err(error) = restore {
-                errors.push(format!("aside {:?}: {error:#}", aside.name));
-            }
-        }
-        for item in self.prepared.iter().rev() {
-            if let Err(error) = remove_owned_entry_at(root, &item.incoming, &item.incoming_receipt)
-            {
-                errors.push(format!("incoming {:?}: {error:#}", item.incoming));
-            }
-        }
-        if let Err(error) = root.sync_all() {
-            errors.push(format!("include-root sync: {error}"));
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("include rollback failures: {}", errors.join("; "))
-        }
-    }
-
-    fn recovery_artifacts(&self, root: &File, canonical_root: &Path) -> Vec<String> {
-        let mut artifacts = Vec::new();
-        for (name, receipt) in self
-            .prepared
-            .iter()
-            .map(|item| (&item.incoming, &item.incoming_receipt))
-            .chain(
-                self.asides
-                    .iter()
-                    .map(|aside| (&aside.name, &aside.receipt)),
-            )
-        {
-            let display = canonical_root.join(name).display().to_string();
-            match inspect_at(root, name) {
-                Ok(None) => {}
-                Ok(Some(current)) => match same_optional_inode(Some(receipt), Some(&current)) {
-                    Ok(true) => artifacts.push(display),
-                    Ok(false) => artifacts.push(format!("{display} (replacement preserved)")),
-                    Err(error) => artifacts.push(format!("{display} (unverifiable: {error})")),
-                },
-                Err(error) => artifacts.push(format!("{display} (unverifiable: {error})")),
-            }
-        }
-        artifacts
-    }
-}
-
-fn checked_live_entry_name(entry: &str) -> anyhow::Result<&OsStr> {
-    let name = OsStr::new(entry);
-    crate::config::tree_io::check_basename(name)?;
-    anyhow::ensure!(
-        !write_lock::reserved_component(name),
-        "restore include entry uses reserved config namespace: {entry}"
-    );
-    Ok(name)
-}
-
-fn reserve_side_name(root: &File, entry: &OsStr, kind: &str) -> anyhow::Result<OsString> {
-    use rand_core::{OsRng, RngCore};
-    for _ in 0..8 {
-        let name = OsString::from(format!(
-            ".{}.{}-{}-{:016x}",
-            entry.to_string_lossy(),
-            kind,
-            std::process::id(),
-            OsRng.next_u64()
-        ));
-        if inspect_at(root, &name)?.is_none() {
-            return Ok(name);
-        }
-    }
-    anyhow::bail!("cannot reserve a unique restore side entry")
-}
-
-fn create_pre_restore_copy<'g>(
-    guard: &'g ConfigWriteLock,
-    source: &mut File,
-    metadata: &std::fs::Metadata,
-) -> anyhow::Result<(PathBuf, crate::config::tree_io::PinnedTarget<'g>)> {
-    source.seek(SeekFrom::Start(0))?;
-    let timestamp = time::OffsetDateTime::now_utc()
-        .format(&time::macros::format_description!(
-            "[year][month][day]T[hour][minute][second]Z"
-        ))
-        .map_err(|e| anyhow::anyhow!("failed to format timestamp: {e}"))?;
-    for suffix in 0_u32.. {
-        let mut side = guard
-            .canonical_master()
-            .with_extension(format!("toml.pre-restore-{timestamp}"))
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("canonical master has no filename"))?
-            .to_os_string();
-        if suffix != 0 {
-            side.push(format!("-{suffix}"));
-        }
-        let plan = guard.tree_io().plan_root_file_no_follow(Path::new(&side))?;
-        if !plan.is_new() {
-            continue;
-        }
-        let target = plan.materialize()?;
-        match hardened_atomic_create_only_at(
-            &target,
-            source,
-            metadata.len(),
-            AtomicCreateOnlyAtOpts {
-                mode: Some(metadata.mode() & 0o7777),
-                owner: Some((metadata.uid(), metadata.gid())),
-                #[cfg(test)]
-                test_failure: None,
-            },
-        ) {
-            Ok(()) => return Ok((target.display().to_path_buf(), target)),
-            Err(AtomicWriteError::TargetExists { .. }) => continue,
-            Err(error) => return Err(anyhow::Error::new(error)),
-        }
-    }
-    unreachable!("u32 pre-restore copy suffix space exhausted")
-}
-
-fn cleanup_pre_restore(
-    pre_restore: Option<(PathBuf, crate::config::tree_io::PinnedTarget<'_>)>,
-) -> anyhow::Result<()> {
-    if let Some((_, target)) = pre_restore {
-        target.rollback_target()?.unlink()?;
-    }
-    Ok(())
-}
-
-fn rollback_published_master(
-    target: &crate::config::tree_io::PinnedTarget<'_>,
-    original: Option<&[u8]>,
-) -> anyhow::Result<()> {
-    let rollback = target.rollback_target()?;
-    match original {
-        Some(bytes) => hardened_atomic_write_at(&rollback, bytes, AtomicWriteAtOpts::default())?,
-        None => rollback.unlink()?,
-    }
-    Ok(())
-}
-
-fn copy_staged_entry_at(
-    source: &Path,
-    parent: &File,
-    name: &OsStr,
-    owner: (u32, u32),
-) -> anyhow::Result<File> {
-    let meta = std::fs::symlink_metadata(source)?;
-    if meta.is_dir() {
-        let destination = mkdir_new_at(parent, name, owner)?;
-        if let Err(error) = (|| -> anyhow::Result<()> {
-            copy_dir_contents_at(source, &destination, owner)?;
-            destination.sync_all()?;
-            parent.sync_all()?;
-            Ok(())
-        })() {
-            if let Err(cleanup) = remove_owned_entry_at(parent, name, &destination) {
-                return Err(error.context(format!(
-                    "removing failed incoming directory {:?}: {cleanup:#}",
-                    name
-                )));
-            }
-            return Err(error);
-        }
-        Ok(destination)
-    } else if meta.is_file() {
-        copy_regular_file_at(source, parent, name, owner)
-    } else {
-        anyhow::bail!(
-            "refusing to restore {}: not a regular file or directory",
-            source.display()
-        )
-    }
-}
-
-fn copy_dir_contents_at(
-    source: &Path,
-    destination: &File,
-    owner: (u32, u32),
-) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source = entry.path();
-        let name = entry.file_name();
-        crate::config::tree_io::check_basename(&name)?;
-        let meta = entry.file_type()?;
-        if meta.is_dir() {
-            let child = mkdir_new_at(destination, &name, owner)?;
-            copy_dir_contents_at(&source, &child, owner)?;
-            child.sync_all()?;
-        } else if meta.is_file() {
-            copy_regular_file_at(&source, destination, &name, owner)?;
-        } else {
-            anyhow::bail!(
-                "refusing to restore {}: not a regular file or directory",
-                source.display()
-            )
-        }
-    }
-    destination.sync_all()?;
-    Ok(())
-}
-
-fn mkdir_new_at(parent: &File, name: &OsStr, owner: (u32, u32)) -> anyhow::Result<File> {
-    use std::os::unix::ffi::OsStrExt;
-    crate::config::tree_io::check_basename(name)?;
-    let name_c = std::ffi::CString::new(name.as_bytes())?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o750) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let dir = write_lock::open_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    if let Err(error) = set_restore_owner_and_mode(&dir, owner, 0o750) {
-        if let Err(cleanup) = remove_owned_entry_at(parent, name, &dir) {
-            return Err(error.context(format!("removing failed incoming directory: {cleanup:#}")));
-        }
-        return Err(error);
-    }
-    Ok(dir)
-}
-
-fn copy_regular_file_at(
-    source: &Path,
-    parent: &File,
-    name: &OsStr,
-    owner: (u32, u32),
-) -> anyhow::Result<File> {
-    let mut input = File::open(source)?;
-    let mut output = write_lock::open_at(
-        parent,
-        name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    )?;
-    if let Err(error) = (|| -> anyhow::Result<()> {
-        std::io::copy(&mut input, &mut output)?;
-        set_restore_owner_and_mode(&output, owner, 0o640)?;
-        output.sync_all()?;
-        Ok(())
-    })() {
-        if let Err(cleanup) = remove_owned_entry_at(parent, name, &output) {
-            return Err(error.context(format!(
-                "removing failed incoming file {:?}: {cleanup:#}",
-                name
-            )));
-        }
-        return Err(error);
-    }
-    Ok(output)
-}
-
-fn set_restore_owner_and_mode(file: &File, owner: (u32, u32), mode: u32) -> anyhow::Result<()> {
-    if unsafe { libc::geteuid() } == 0
-        && unsafe { libc::fchown(file.as_raw_fd(), owner.0, owner.1) } != 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    let meta = file.metadata()?;
-    anyhow::ensure!(
-        (meta.uid(), meta.gid()) == owner,
-        "cannot preserve admitted config-tree ownership"
-    );
-    Ok(())
-}
-
-fn remove_owned_entry_at(root: &File, name: &OsStr, receipt: &File) -> anyhow::Result<()> {
-    let Some(entry) = inspect_at(root, name)? else {
-        return Ok(());
-    };
-    anyhow::ensure!(
-        same_optional_inode(Some(receipt), Some(&entry))?,
-        "restore side entry was replaced; retaining {:?}",
-        name
-    );
-    let meta = entry.metadata()?;
-    anyhow::ensure!(
-        !meta.file_type().is_symlink() && (meta.is_dir() || meta.is_file()),
-        "refusing to remove unsafe restore side entry: {:?}",
-        name
-    );
-    if meta.is_dir() {
-        let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd())).join(name);
-        std::fs::remove_dir_all(path)?;
-    } else {
-        crate::config::tree_io::unlink_at(root, name)?;
-    }
-    root.sync_all()?;
-    Ok(())
-}
-
 fn send_sighup_from_pid(pid_file: &Path) -> anyhow::Result<()> {
     // Reuse the shared `u32` reader: it rejects a leading '-' at parse (so
     // `-1`/`-N` can never reach `kill`), as well as empty/garbage content,
@@ -1189,8 +751,10 @@ fn send_sighup_from_pid(pid_file: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::cli::commands::config::backup::run_backup;
+    use crate::config::migration_journal;
+    use std::os::unix::fs::PermissionsExt;
 
-    const BASE: &str = r#"schema_version = 4
+    const BASE: &str = r#"schema_version = 5
 
 [server]
 listen = "127.0.0.1:15353"
@@ -1210,21 +774,42 @@ servers = ["192.0.2.1:53"]
 
     #[test]
     fn restore_roundtrip_reinstates_identical_config() {
-        // Write a config, back it up, overwrite with garbage, restore,
-        // and verify the restored content matches the original.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         std::fs::write(&config, BASE).unwrap();
-
         let archive = run_backup(&config, None).unwrap();
+        std::fs::write(&config, format!("{BASE}\n# edited\n")).unwrap();
 
-        // Simulate the live file being damaged.
-        std::fs::write(&config, b"garbage = true\n").unwrap();
+        assert_eq!(run_restore(&config, &archive, None).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), BASE);
+        assert!(!dir.path().join(migration_journal::TXN_DIR_NAME).exists());
+        assert!(dir.path().join(policy_transaction::STORE_DIR_NAME).is_dir());
+    }
 
-        let rc = run_restore(&config, &archive, None).unwrap();
-        assert_eq!(rc, 0);
-        let reloaded = std::fs::read_to_string(&config).unwrap();
-        assert_eq!(reloaded, BASE);
+    #[test]
+    fn staged_inventory_admits_the_exact_transaction_budget_and_rejects_plus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!("{BASE}\n[[custom_lists]]\nid = \"streaming\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("packs")).unwrap();
+        let pack = b"||media.example.test^\n";
+        std::fs::write(dir.path().join("packs/streaming.txt"), pack).unwrap();
+        let loaded = loader::load_config_v5(&config, time::OffsetDateTime::UNIX_EPOCH).unwrap();
+        let exact = std::fs::metadata(&config).unwrap().len() + pack.len() as u64;
+
+        assert!(staged_inventory_with_budget(&loaded, exact).is_ok());
+        let error = staged_inventory_with_budget(&loaded, exact - 1)
+            .expect_err("one byte over the transaction budget must reject before retention");
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe or oversized staged file"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1240,12 +825,12 @@ servers = ["192.0.2.1:53"]
 
         let live = tempfile::tempdir().unwrap();
         let live_config = live.path().join("config.toml");
-        std::fs::write(&live_config, "old = true\n").unwrap();
+        std::fs::write(&live_config, format!("{BASE}\n# edited\n")).unwrap();
         let acquisitions = Rc::new(Cell::new(0));
         let seen = Rc::clone(&acquisitions);
         let outcome = write_lock::with_test_hook(
             move |event| {
-                if event == write_lock::TestEvent::WriteRootLocked {
+                if event == write_lock::TestEvent::RootLocked {
                     seen.set(seen.get() + 1);
                 }
             },
@@ -1267,36 +852,29 @@ servers = ["192.0.2.1:53"]
         let source_config = source.path().join("config.toml");
         std::fs::write(&source_config, BASE).unwrap();
         let archive = run_backup(&source_config, None).unwrap();
-
         let live = tempfile::tempdir().unwrap();
         let live_config = live.path().join("config.toml");
-        let old = b"old = true\n";
-        std::fs::write(&live_config, old).unwrap();
+        std::fs::write(&live_config, BASE).unwrap();
         let fence = live.path().join(migration_journal::TXN_DIR_NAME);
+        std::fs::create_dir(&fence).unwrap();
+        std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = fence.join("journal.json");
+        let legacy = b"{\"format_version\":1}\n";
+        std::fs::write(&journal, legacy).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        let error = match write_lock::with_test_hook(
-            move |event| {
-                if event == write_lock::TestEvent::WriteRootLocked {
-                    std::fs::create_dir(&fence).unwrap();
-                }
-            },
-            || restore_archive(&live_config, &archive),
-        ) {
-            Ok(_) => panic!("a fenced destination must be refused"),
-            Err(error) => error,
-        };
+        let error = restore_archive(&live_config, &archive).unwrap_err();
         assert!(
             error.to_string().contains("unfinished v3-to-v4 migration"),
             "{error:#}"
         );
-        assert_eq!(std::fs::read(&live_config).unwrap(), old);
-        assert!(std::fs::read_dir(live.path()).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("pre-restore")
-        }));
+        assert_eq!(std::fs::read_to_string(&live_config).unwrap(), BASE);
+        assert_eq!(std::fs::read(&journal).unwrap(), legacy);
+        assert!(!live
+            .path()
+            .join(policy_transaction::STORE_DIR_NAME)
+            .exists());
+        assert_eq!(std::fs::read_dir(&fence).unwrap().count(), 1);
     }
 
     #[test]
@@ -1307,39 +885,33 @@ servers = ["192.0.2.1:53"]
         let source_config = source.path().join("config.toml");
         std::fs::write(&source_config, BASE).unwrap();
         let archive = run_backup(&source_config, None).unwrap();
-
         let live = tempfile::tempdir().unwrap();
         let real = live.path().join("real");
         let front = live.path().join("front");
         std::fs::create_dir(&real).unwrap();
         std::fs::create_dir(&front).unwrap();
         let canonical = real.join("config.toml");
-        std::fs::write(&canonical, "old = true\n").unwrap();
+        std::fs::write(&canonical, format!("{BASE}\n# edited\n")).unwrap();
         let alias = front.join("active.toml");
         symlink("../real/config.toml", &alias).unwrap();
 
-        let pre_restore = match restore_archive(&alias, &archive).unwrap() {
-            RestoreOutcome::Restored { pre_restore } => pre_restore.unwrap(),
-            RestoreOutcome::ValidationFailed(errors) => {
-                panic!("valid archive failed validation: {errors:?}")
+        assert!(matches!(
+            restore_archive(&alias, &archive).unwrap(),
+            RestoreOutcome::Restored {
+                changed: true,
+                pre_restore: None,
+                repair: false,
             }
-        };
+        ));
         assert!(std::fs::symlink_metadata(&alias)
             .unwrap()
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read_to_string(&canonical).unwrap(), BASE);
         assert_eq!(std::fs::read_to_string(&alias).unwrap(), BASE);
-        assert_eq!(pre_restore.parent(), Some(real.as_path()));
-        assert!(pre_restore
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("config.toml.pre-restore-"));
-        assert_eq!(
-            std::fs::read_to_string(pre_restore).unwrap(),
-            "old = true\n"
-        );
+        assert!(real.join(policy_transaction::STORE_DIR_NAME).is_dir());
+        assert!(real.join(policy_transaction::RECEIPT_DIR).is_dir());
+        assert!(!front.join(policy_transaction::RECEIPT_DIR).exists());
     }
 
     /// An include that does NOT live in a `<class>.d/` directory must
@@ -1361,7 +933,7 @@ servers = ["192.0.2.1:53"]
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"custom/*.toml\"]\n\n\
+            "schema_version = 5\nincludes = [\"custom/*.toml\"]\n\n\
              [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1388,9 +960,9 @@ servers = ["192.0.2.1:53"]
             "backup omitted the declared non-conventional include: {listing}"
         );
 
-        // Destroy both halves, then restore.
+        // Replace the old declared graph with another valid policy.
         std::fs::remove_dir_all(dir.path().join("custom")).unwrap();
-        std::fs::write(&config, b"garbage = true\n").unwrap();
+        std::fs::write(&config, BASE).unwrap();
 
         assert_eq!(run_restore(&config, &archive, None).unwrap(), 0);
         assert_eq!(
@@ -1399,7 +971,7 @@ servers = ["192.0.2.1:53"]
             "custom/policy.toml was not reinstalled"
         );
         // The restored tree must actually load — the operator-visible half.
-        let loaded = loader::load_config(&config, time::OffsetDateTime::now_utc())
+        let loaded = loader::load_config_v5(&config, time::OffsetDateTime::now_utc())
             .expect("restored config must load; a dropped include breaks default_profile");
         assert!(loaded.config.profiles.contains_key("kids"));
     }
@@ -1415,7 +987,7 @@ servers = ["192.0.2.1:53"]
         let config = dir.path().join("config.toml");
         std::fs::write(
             &config,
-            "schema_version = 4\nincludes = [\"extra.toml\"]\n\n\
+            "schema_version = 5\nincludes = [\"extra.toml\"]\n\n\
              [server]\ndefault_profile = \"kids\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
         )
         .unwrap();
@@ -1424,14 +996,14 @@ servers = ["192.0.2.1:53"]
 
         let archive = run_backup(&config, None).unwrap();
         std::fs::remove_file(&extra).unwrap();
-        std::fs::write(&config, b"garbage = true\n").unwrap();
+        std::fs::write(&config, BASE).unwrap();
 
         assert_eq!(run_restore(&config, &archive, None).unwrap(), 0);
         assert!(
             extra.exists(),
             "a top-level include FILE was captured but not reinstalled"
         );
-        let loaded = loader::load_config(&config, time::OffsetDateTime::now_utc())
+        let loaded = loader::load_config_v5(&config, time::OffsetDateTime::now_utc())
             .expect("restored config must load");
         assert!(loaded.config.profiles.contains_key("kids"));
     }
@@ -1523,49 +1095,67 @@ servers = ["192.0.2.1:53"]
     }
 
     #[test]
-    fn restoring_an_old_master_over_live_pack_files_leaves_a_loadable_tree() {
-        // The other direction: an archive predating custom lists restored
-        // over a tree that has them. The restored master declares none, so
-        // the leftover files are orphans — reported by lint, not fatal.
+    fn restore_rejects_a_nested_pack_tree_before_touching_live_state() {
         let src = tempfile::tempdir().unwrap();
         let src_config = src.path().join("config.toml");
-        std::fs::write(&src_config, BASE).unwrap();
-        let archive = run_backup(&src_config, None).unwrap();
+        std::fs::write(
+            &src_config,
+            format!("{BASE}\n[[custom_lists]]\nid = \"mine\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.path().join("packs/sub")).unwrap();
+        std::fs::write(src.path().join("packs/mine.txt"), b"||ads.example.test^\n").unwrap();
+        std::fs::write(src.path().join("packs/sub/x.txt"), b"nested\n").unwrap();
+        let (_output, archive) = raw_archive(src.path());
 
+        let live = tempfile::tempdir().unwrap();
+        let live_config = live.path().join("config.toml");
+        let before = format!("{BASE}\n# live sentinel\n");
+        std::fs::write(&live_config, &before).unwrap();
+
+        let error = restore_archive(&live_config, &archive)
+            .expect_err("a nested pack tree must be refused");
+        assert!(error.to_string().contains("unsupported staged packs/ tree"));
+        assert_eq!(std::fs::read_to_string(&live_config).unwrap(), before);
+        assert_no_restore_artifacts(live.path());
+        assert!(
+            std::fs::read_dir(live.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("pre-restore")),
+            "preflight must run before any live recovery artifact is created"
+        );
+    }
+
+    #[test]
+    fn restoring_an_old_master_deletes_only_previously_declared_packs() {
+        let source = tempfile::tempdir().unwrap();
+        let source_config = source.path().join("config.toml");
+        std::fs::write(&source_config, BASE).unwrap();
+        let archive = run_backup(&source_config, None).unwrap();
         let live = tempfile::tempdir().unwrap();
         let live_config = live.path().join("config.toml");
         std::fs::write(
             &live_config,
-            format!("{BASE}\n[[custom_lists]]\nid = \"minecraft\"\n"),
+            format!("{BASE}\n[[custom_lists]]\nid = \"retired\"\n"),
         )
         .unwrap();
         std::fs::create_dir(live.path().join("packs")).unwrap();
-        std::fs::write(
-            live.path().join("packs").join("minecraft.txt"),
-            "@@||cdn.example.com^\n",
-        )
-        .unwrap();
+        let retired = live.path().join("packs/retired.txt");
+        let orphan = live.path().join("packs/orphan.txt");
+        std::fs::write(&retired, "||old.example.test^\n").unwrap();
+        std::fs::write(&orphan, "||orphan.example.test^\n").unwrap();
+        let orphan_inode = std::fs::metadata(&orphan).unwrap().ino();
 
         assert_eq!(run_restore(&live_config, &archive, None).unwrap(), 0);
-        crate::config::loader::load_config(&live_config, time::OffsetDateTime::now_utc())
-            .expect("the restored tree must load");
-
-        // The archive being restored predates custom lists and never
-        // captured this file, so it is not recoverable if restore deletes
-        // it — losing an operator-authored file to a master rollback is
-        // exactly the class backup/restore exists to prevent.
-        let orphan = live.path().join("packs").join("minecraft.txt");
-        assert!(
-            orphan.exists(),
-            "restore deleted a live pack file that no include entry named — \
-             the restored master no longer declares it, but the bytes are \
-             still the operator's and are gone if this fails"
-        );
+        loader::load_config_v5(&live_config, time::OffsetDateTime::now_utc()).unwrap();
+        assert!(!retired.exists());
         assert_eq!(
             std::fs::read_to_string(&orphan).unwrap(),
-            "@@||cdn.example.com^\n",
-            "restore must not modify a file it does not promote"
+            "||orphan.example.test^\n"
         );
+        assert_eq!(std::fs::metadata(&orphan).unwrap().ino(), orphan_inode);
     }
 
     #[test]
@@ -1580,7 +1170,7 @@ servers = ["192.0.2.1:53"]
         let bad_config = bad_dir.path().join("config.toml");
         std::fs::write(
             &bad_config,
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [server]
 default_profile = "missing-profile"
@@ -1598,11 +1188,790 @@ servers = ["192.0.2.1:53"]
 "#,
         )
         .unwrap();
-        let archive = run_backup(&bad_config, None).unwrap();
+        let (_output, archive) = raw_archive(bad_dir.path());
 
         let rc = run_restore(&live, &archive, None).unwrap();
         assert_eq!(rc, 1, "invalid archive must not overwrite live config");
         assert_eq!(std::fs::read_to_string(&live).unwrap(), BASE);
+    }
+
+    #[test]
+    fn restore_rejects_uncompilable_pack_before_touching_live_state() {
+        let live_dir = tempfile::tempdir().unwrap();
+        let live = live_dir.path().join("config.toml");
+        std::fs::write(&live, BASE).unwrap();
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.toml"),
+            r#"schema_version = 5
+
+[server]
+default_profile = "default"
+
+[[custom_lists]]
+id = "policy"
+
+[profiles.default]
+custom_lists = ["policy"]
+
+[upstream]
+servers = ["192.0.2.1:53"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir(source.path().join("packs")).unwrap();
+        std::fs::write(source.path().join("packs/policy.txt"), "bad..example\n").unwrap();
+        let (_output, archive) = raw_archive(source.path());
+
+        assert!(matches!(
+            restore_archive(&live, &archive).unwrap(),
+            RestoreOutcome::ValidationFailed(errors)
+                if errors.iter().any(|error| error.contains("row 1"))
+        ));
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), BASE);
+        assert_no_restore_artifacts(live_dir.path());
+    }
+
+    fn raw_archive(root: &Path) -> (tempfile::TempDir, PathBuf) {
+        let output = tempfile::tempdir().unwrap();
+        let archive = output.path().join("archive.tar.gz");
+        assert!(std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(root)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success());
+        (output, archive)
+    }
+
+    fn assert_no_restore_artifacts(root: &Path) {
+        for name in [
+            migration_journal::TXN_DIR_NAME,
+            policy_transaction::STORE_DIR_NAME,
+            policy_transaction::RECEIPT_DIR,
+        ] {
+            assert!(
+                !root.join(name).exists(),
+                "unexpected restore artifact: {name}"
+            );
+        }
+        assert!(std::fs::read_dir(root).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            !name.contains("pre-restore") && !name.contains(".incoming-")
+        }));
+    }
+
+    #[test]
+    fn restore_repairs_invalid_or_absent_master_and_missing_or_invalid_include() {
+        for kind in [
+            "syntax",
+            "schema",
+            "absent",
+            "missing-include",
+            "invalid-include",
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            let archived = BASE.replacen(
+                "schema_version = 5",
+                "schema_version = 5\nincludes = [\"restored.toml\"]",
+                1,
+            );
+            std::fs::write(source.path().join("config.toml"), &archived).unwrap();
+            std::fs::write(source.path().join("restored.toml"), "[profiles.restored]\n").unwrap();
+            let (_output, archive) = raw_archive(source.path());
+            let live = tempfile::tempdir().unwrap();
+            let master = live.path().join("config.toml");
+            match kind {
+                "syntax" => std::fs::write(&master, "[broken").unwrap(),
+                "schema" => std::fs::write(&master, "damaged = true\n").unwrap(),
+                "absent" => {}
+                "missing-include" | "invalid-include" => {
+                    std::fs::write(
+                        &master,
+                        BASE.replacen(
+                            "schema_version = 5",
+                            "schema_version = 5\nincludes = [\"stale.toml\"]",
+                            1,
+                        ),
+                    )
+                    .unwrap();
+                    if kind == "invalid-include" {
+                        std::fs::write(live.path().join("stale.toml"), "[broken").unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let previous = std::fs::metadata(&master).ok();
+            if previous.is_some() {
+                std::fs::set_permissions(&master, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::fs::write(live.path().join("unnamed.toml"), "# preserve\n").unwrap();
+            let unnamed_inode = std::fs::metadata(live.path().join("unnamed.toml"))
+                .unwrap()
+                .ino();
+            assert!(
+                matches!(
+                    restore_archive(&master, &archive).unwrap(),
+                    RestoreOutcome::Restored {
+                        changed: true,
+                        repair: true,
+                        ..
+                    }
+                ),
+                "{kind}"
+            );
+            assert_eq!(std::fs::read_to_string(&master).unwrap(), archived);
+            assert_eq!(
+                std::fs::metadata(&master).unwrap().mode() & 0o777,
+                if previous.is_some() { 0o600 } else { 0o640 }
+            );
+            assert_eq!(
+                std::fs::metadata(live.path().join("unnamed.toml"))
+                    .unwrap()
+                    .ino(),
+                unnamed_inode
+            );
+            if kind == "invalid-include" {
+                assert_eq!(
+                    std::fs::read(live.path().join("stale.toml")).unwrap(),
+                    b"[broken"
+                );
+            }
+            loader::load_config_v5(&master, time::OffsetDateTime::now_utc()).unwrap();
+            let inode = std::fs::metadata(&master).unwrap().ino();
+            assert!(matches!(
+                restore_archive(&master, &archive).unwrap(),
+                RestoreOutcome::Restored {
+                    changed: false,
+                    repair: false,
+                    ..
+                }
+            ));
+            assert_eq!(std::fs::metadata(&master).unwrap().ino(), inode);
+            assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn repair_restores_named_packs_and_includes_without_deleting_stale_or_orphan_paths() {
+        let source = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        for root in [source.path(), live.path()] {
+            std::fs::create_dir(root.join("policy")).unwrap();
+            std::fs::create_dir(root.join("packs")).unwrap();
+        }
+        let archived = BASE.replacen(
+            "schema_version = 5",
+            "schema_version = 5\nincludes = [\"policy/kept.toml\", \"policy/new.toml\"]",
+            1,
+        ) + "\n[[custom_lists]]\nid = \"kept\"\n[[custom_lists]]\nid = \"new\"\n";
+        std::fs::write(source.path().join("config.toml"), &archived).unwrap();
+        for (path, bytes) in [
+            ("policy/kept.toml", "[profiles.kept]\n"),
+            ("policy/new.toml", "[profiles.new]\n"),
+            ("packs/kept.txt", "||kept.example.test^\n"),
+            ("packs/new.txt", "||new.example.test^\n"),
+        ] {
+            std::fs::write(source.path().join(path), bytes).unwrap();
+        }
+        let master = live.path().join("config.toml");
+        std::fs::write(&master, "[broken").unwrap();
+        for path in [
+            "policy/kept.toml",
+            "policy/stale.toml",
+            "packs/kept.txt",
+            "packs/orphan.txt",
+        ] {
+            std::fs::write(live.path().join(path), "# old\n").unwrap();
+            std::fs::set_permissions(
+                live.path().join(path),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let unnamed: Vec<_> = ["policy/stale.toml", "packs/orphan.txt"]
+            .into_iter()
+            .map(|path| (path, std::fs::metadata(live.path().join(path)).unwrap()))
+            .collect();
+        let (_output, archive) = raw_archive(source.path());
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored {
+                repair: true,
+                changed: true,
+                ..
+            }
+        ));
+        for path in [
+            "policy/kept.toml",
+            "policy/new.toml",
+            "packs/kept.txt",
+            "packs/new.txt",
+        ] {
+            assert_eq!(
+                std::fs::read(live.path().join(path)).unwrap(),
+                std::fs::read(source.path().join(path)).unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(live.path().join(path)).unwrap().mode() & 0o777,
+                if path.contains("kept") { 0o600 } else { 0o640 }
+            );
+        }
+        for (path, metadata) in unnamed {
+            assert_eq!(
+                std::fs::metadata(live.path().join(path)).unwrap().ino(),
+                metadata.ino()
+            );
+            assert_eq!(std::fs::read(live.path().join(path)).unwrap(), b"# old\n");
+        }
+        loader::load_config_v5(&master, time::OffsetDateTime::now_utc()).unwrap();
+    }
+
+    #[test]
+    fn repair_rejects_archive_glob_adoption_before_intent() {
+        let source = tempfile::tempdir().unwrap();
+        let archived = BASE.replacen(
+            "schema_version = 5",
+            "schema_version = 5\nincludes = [\"policy/*.toml\"]",
+            1,
+        );
+        std::fs::write(source.path().join("config.toml"), archived).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        std::fs::write(&master, "[broken").unwrap();
+        std::fs::create_dir(live.path().join("policy")).unwrap();
+        let orphan = live.path().join("policy/orphan.toml");
+        std::fs::write(&orphan, "[profiles.orphan]\n").unwrap();
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::ValidationFailed(_)
+        ));
+        assert_eq!(std::fs::read(&master).unwrap(), b"[broken");
+        assert_eq!(std::fs::read(&orphan).unwrap(), b"[profiles.orphan]\n");
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn repair_rejects_unsafe_named_include_destinations() {
+        for kind in ["symlink", "hardlink", "fifo", "socket", "directory"] {
+            let source = tempfile::tempdir().unwrap();
+            let archived = BASE.replacen(
+                "schema_version = 5",
+                "schema_version = 5\nincludes = [\"include.toml\"]",
+                1,
+            );
+            std::fs::write(source.path().join("config.toml"), archived).unwrap();
+            std::fs::write(source.path().join("include.toml"), "[profiles.included]\n").unwrap();
+            let (_output, archive) = raw_archive(source.path());
+            let live = tempfile::tempdir().unwrap();
+            let master = live.path().join("config.toml");
+            std::fs::write(&master, "[broken").unwrap();
+            let bad = live.path().join("include.toml");
+            let other = live.path().join("foreign.toml");
+            std::fs::write(&other, "# preserve\n").unwrap();
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&other, &bad).unwrap(),
+                "hardlink" => std::fs::hard_link(&other, &bad).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(bad.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: name is a valid NUL-terminated path and mode is valid.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "socket" => {
+                    let _listener = std::os::unix::net::UnixListener::bind(&bad).unwrap();
+                }
+                "directory" => std::fs::create_dir(&bad).unwrap(),
+                _ => unreachable!(),
+            }
+            let inode = std::fs::symlink_metadata(&bad).unwrap().ino();
+            assert!(restore_archive(&master, &archive).is_err(), "{kind}");
+            assert_eq!(std::fs::symlink_metadata(&bad).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&master).unwrap(), b"[broken");
+            assert_eq!(std::fs::read(&other).unwrap(), b"# preserve\n");
+            assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn restore_rejects_unsafe_live_packs_before_creating_artifacts() {
+        for kind in ["nested", "symlink", "hardlink", "fifo", "socket"] {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::write(source.path().join("config.toml"), BASE).unwrap();
+            let (_output, archive) = raw_archive(source.path());
+            let live = tempfile::tempdir().unwrap();
+            let master = live.path().join("config.toml");
+            std::fs::write(&master, BASE).unwrap();
+            std::fs::create_dir(live.path().join("packs")).unwrap();
+            let bad = live.path().join("packs/unsafe.txt");
+            match kind {
+                "nested" => {
+                    std::fs::create_dir(&bad).unwrap();
+                    std::fs::write(bad.join("nested.txt"), "preserve\n").unwrap();
+                }
+                "symlink" => std::os::unix::fs::symlink(&master, &bad).unwrap(),
+                "hardlink" => {
+                    std::fs::hard_link(source.path().join("config.toml"), &bad).unwrap();
+                }
+                "fifo" => {
+                    let name = std::ffi::CString::new(bad.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: name is a valid NUL-terminated path and mode is valid.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "socket" => {
+                    let _listener = std::os::unix::net::UnixListener::bind(&bad).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let inode = std::fs::symlink_metadata(&bad).unwrap().ino();
+
+            let error = restore_archive(&master, &archive).unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported live packs/ tree"),
+                "{kind}: {error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&master).unwrap(), BASE);
+            assert_eq!(std::fs::symlink_metadata(&bad).unwrap().ino(), inode);
+            assert_no_restore_artifacts(live.path());
+        }
+    }
+
+    #[test]
+    fn restore_mixes_named_creates_replacements_and_deletions_preserving_orphans() {
+        let source = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        for root in [source.path(), live.path()] {
+            std::fs::create_dir(root.join("policy")).unwrap();
+            std::fs::create_dir(root.join("packs")).unwrap();
+        }
+        let archived = BASE.replacen(
+            "schema_version = 5",
+            "schema_version = 5\nincludes = [\"policy/shared.toml\", \"policy/created.toml\"]",
+            1,
+        )
+            + "\n[[custom_lists]]\nid = \"shared\"\n[[custom_lists]]\nid = \"created\"\n";
+        let current = BASE.replacen(
+            "schema_version = 5",
+            "schema_version = 5\nincludes = [\"policy/shared.toml\", \"policy/deleted.toml\"]",
+            1,
+        )
+            + "\n[[custom_lists]]\nid = \"shared\"\n[[custom_lists]]\nid = \"deleted\"\n";
+        let master = live.path().join("config.toml");
+        std::fs::write(source.path().join("config.toml"), &archived).unwrap();
+        std::fs::write(&master, current).unwrap();
+        for (path, bytes) in [
+            (
+                "policy/shared.toml",
+                "[profiles.shared]\ndisplay_name = \"New\"\n",
+            ),
+            ("policy/created.toml", "[profiles.created]\n"),
+            ("packs/shared.txt", "@@||new.example.test^\n"),
+            ("packs/created.txt", "||created.example.test^\n"),
+        ] {
+            std::fs::write(source.path().join(path), bytes).unwrap();
+        }
+        for (path, bytes) in [
+            (
+                "policy/shared.toml",
+                "[profiles.shared]\ndisplay_name = \"Old\"\n",
+            ),
+            ("policy/deleted.toml", "[profiles.deleted]\n"),
+            ("packs/shared.txt", "||old.example.test^\n"),
+            ("packs/deleted.txt", "||deleted.example.test^\n"),
+            ("policy/orphan.toml", "# operator-owned orphan\n"),
+            ("packs/orphan.txt", "||orphan.example.test^\n"),
+        ] {
+            std::fs::write(live.path().join(path), bytes).unwrap();
+        }
+        let shared = live.path().join("packs/shared.txt");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let root_inodes: Vec<_> = ["policy", "packs", "policy/orphan.toml", "packs/orphan.txt"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    std::fs::metadata(live.path().join(name)).unwrap().ino(),
+                )
+            })
+            .collect();
+        let (_output, archive) = raw_archive(source.path());
+
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), archived);
+        for path in [
+            "policy/shared.toml",
+            "policy/created.toml",
+            "packs/shared.txt",
+            "packs/created.txt",
+        ] {
+            assert_eq!(
+                std::fs::read(live.path().join(path)).unwrap(),
+                std::fs::read(source.path().join(path)).unwrap(),
+                "{path}"
+            );
+        }
+        for path in ["policy/deleted.toml", "packs/deleted.txt"] {
+            assert!(!live.path().join(path).exists(), "{path}");
+        }
+        for (path, inode) in root_inodes {
+            assert_eq!(
+                std::fs::metadata(live.path().join(path)).unwrap().ino(),
+                inode,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("packs/orphan.txt")).unwrap(),
+            "||orphan.example.test^\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("policy/orphan.toml")).unwrap(),
+            "# operator-owned orphan\n"
+        );
+        assert_eq!(std::fs::metadata(&shared).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(live.path().join("packs/created.txt"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        loader::load_config_v5(&master, time::OffsetDateTime::now_utc()).unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_a_collision_with_an_undeclared_live_pack() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.toml"),
+            format!("{BASE}\n[[custom_lists]]\nid = \"shared\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir(source.path().join("packs")).unwrap();
+        std::fs::write(
+            source.path().join("packs/shared.txt"),
+            "||new.example.test^\n",
+        )
+        .unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        std::fs::write(&master, BASE).unwrap();
+        std::fs::create_dir(live.path().join("packs")).unwrap();
+        let orphan = live.path().join("packs/shared.txt");
+        std::fs::write(&orphan, "||owned.example.test^\n").unwrap();
+        let inode = std::fs::metadata(&orphan).unwrap().ino();
+
+        let error = restore_archive(&master, &archive).unwrap_err();
+        assert!(error.to_string().contains("RevisionConflict"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), BASE);
+        assert_eq!(
+            std::fs::read_to_string(&orphan).unwrap(),
+            "||owned.example.test^\n"
+        );
+        assert_eq!(std::fs::metadata(&orphan).unwrap().ino(), inode);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn restore_revalidates_the_complete_live_candidate_before_intent() {
+        for orphan_bytes in ["[profiles.default]\n", "[profiles.orphan]\n"] {
+            let source = tempfile::tempdir().unwrap();
+            let candidate = BASE.replacen(
+                "schema_version = 5",
+                "schema_version = 5\nincludes = [\"extra/*.toml\"]",
+                1,
+            ) + "\n[[custom_lists]]\nid = \"created\"\n";
+            std::fs::write(source.path().join("config.toml"), candidate).unwrap();
+            std::fs::create_dir(source.path().join("packs")).unwrap();
+            std::fs::write(
+                source.path().join("packs/created.txt"),
+                "||created.example.test^\n",
+            )
+            .unwrap();
+            let (_output, archive) = raw_archive(source.path());
+            let live = tempfile::tempdir().unwrap();
+            let master = live.path().join("config.toml");
+            std::fs::write(&master, BASE).unwrap();
+            std::fs::create_dir(live.path().join("extra")).unwrap();
+            let orphan = live.path().join("extra/orphan.toml");
+            std::fs::write(&orphan, orphan_bytes).unwrap();
+
+            assert!(matches!(
+                restore_archive(&master, &archive).unwrap(),
+                RestoreOutcome::ValidationFailed(_)
+            ));
+            assert_eq!(std::fs::read_to_string(&master).unwrap(), BASE);
+            assert_eq!(std::fs::read_to_string(&orphan).unwrap(), orphan_bytes);
+            assert!(!live.path().join("packs").exists());
+            assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn restore_propagates_a_pack_tree_race_as_an_operational_failure() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.toml"),
+            format!("{BASE}\n# restored\n"),
+        )
+        .unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        let current = format!("{BASE}\n# current\n");
+        std::fs::write(&master, &current).unwrap();
+        let events = Rc::new(Cell::new(0_usize));
+        let seen = Rc::clone(&events);
+        let packs = live.path().join("packs");
+
+        let result = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::OverlayResolved {
+                    let count = seen.get() + 1;
+                    seen.set(count);
+                    if count == 3 {
+                        std::fs::create_dir_all(&packs).unwrap();
+                        std::fs::create_dir(packs.join("late-subtree")).unwrap();
+                    }
+                }
+            },
+            || restore_archive(&master, &archive),
+        );
+
+        let error = result.expect_err("pack-tree drift must stay operational");
+        assert!(
+            error.to_string().contains("pack tree") || error.to_string().contains("custom list"),
+            "{error:#}"
+        );
+        assert_eq!(events.get(), 3);
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), current);
+        assert!(live.path().join("packs/late-subtree").is_dir());
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn restore_recovers_a_prepared_transaction_before_capturing_live_revision() {
+        let source = tempfile::tempdir().unwrap();
+        let desired = format!("{BASE}\n# restored\n");
+        std::fs::write(source.path().join("config.toml"), &desired).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        std::fs::write(&master, BASE).unwrap();
+        {
+            let guard = write_lock::acquire_for_migration(&master).unwrap();
+            let data = crate::config::state_dir::open_for_migration(&guard).unwrap();
+            let receipts = ReceiptStore::open(&data, &guard).unwrap();
+            let before = PolicyRevisionInventory::new(vec![PolicyRevisionMember::present(
+                PolicyMemberKind::Master,
+                PathBuf::from("config.toml"),
+                BASE.as_bytes().to_vec(),
+            )
+            .unwrap()])
+            .unwrap();
+            let after = PolicyRevisionInventory::new(vec![PolicyRevisionMember::present(
+                PolicyMemberKind::Master,
+                PathBuf::from("config.toml"),
+                format!("{BASE}\n# interrupted\n").into_bytes(),
+            )
+            .unwrap()])
+            .unwrap();
+            let request = TransactionRequest {
+                request_id: "interrupted-restore".to_owned(),
+                actor: "restore-test".to_owned(),
+                origin: "cli".to_owned(),
+                operation: "config.restore".to_owned(),
+                payload: b"interrupted".to_vec(),
+                expected_revision: before.revision(),
+                source_schema: u64::from(SCHEMA_VERSION),
+                target_schema: u64::from(SCHEMA_VERSION),
+            };
+            let prepared = policy_transaction::prepare(
+                &guard,
+                &receipts,
+                &request,
+                &before,
+                &after,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(matches!(
+                prepared,
+                policy_transaction::PrepareOutcome::Prepared(_)
+            ));
+            drop(prepared);
+        }
+        assert!(live.path().join(migration_journal::TXN_DIR_NAME).exists());
+
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), desired);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+        loader::load_config_v5(&master, time::OffsetDateTime::now_utc()).unwrap();
+    }
+
+    #[test]
+    fn restore_recovers_a_linked_pack_rollback_stage_before_live_pack_preflight() {
+        let source = tempfile::tempdir().unwrap();
+        let desired = format!("{BASE}\n[[custom_lists]]\nid = \"payload\"\n# restored\n");
+        std::fs::write(source.path().join("config.toml"), &desired).unwrap();
+        std::fs::create_dir(source.path().join("packs")).unwrap();
+        std::fs::write(
+            source.path().join("packs/payload.txt"),
+            "||restored.example.test^\n",
+        )
+        .unwrap();
+        let (_output, archive) = raw_archive(source.path());
+
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        let current = format!("{BASE}\n[[custom_lists]]\nid = \"payload\"\n# current\n");
+        let before_pack = b"||before.example.test^\n";
+        std::fs::write(&master, &current).unwrap();
+        std::fs::create_dir(live.path().join("packs")).unwrap();
+        let pack = live.path().join("packs/payload.txt");
+        std::fs::write(&pack, before_pack).unwrap();
+
+        let stage_name = ".warden-write-0123456789abcdef0123456789abcdef";
+        {
+            let guard = write_lock::acquire_for_migration(&master).unwrap();
+            let data = crate::config::state_dir::open_for_migration(&guard).unwrap();
+            let receipts = ReceiptStore::open(&data, &guard).unwrap();
+            let before = PolicyRevisionInventory::new(vec![
+                PolicyRevisionMember::present(
+                    PolicyMemberKind::Master,
+                    PathBuf::from("config.toml"),
+                    current.as_bytes().to_vec(),
+                )
+                .unwrap(),
+                PolicyRevisionMember::present(
+                    PolicyMemberKind::Pack,
+                    PathBuf::from("packs/payload.txt"),
+                    before_pack.to_vec(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let after = PolicyRevisionInventory::new(vec![
+                PolicyRevisionMember::present(
+                    PolicyMemberKind::Master,
+                    PathBuf::from("config.toml"),
+                    format!("{current}\n# interrupted\n").into_bytes(),
+                )
+                .unwrap(),
+                PolicyRevisionMember::present(
+                    PolicyMemberKind::Pack,
+                    PathBuf::from("packs/payload.txt"),
+                    b"||interrupted.example.test^\n".to_vec(),
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let request = TransactionRequest {
+                request_id: "interrupted-pack-restore".to_owned(),
+                actor: "restore-test".to_owned(),
+                origin: "cli".to_owned(),
+                operation: "config.restore".to_owned(),
+                payload: b"interrupted-pack".to_vec(),
+                expected_revision: before.revision(),
+                source_schema: u64::from(SCHEMA_VERSION),
+                target_schema: u64::from(SCHEMA_VERSION),
+            };
+            let prepared = match policy_transaction::prepare(
+                &guard,
+                &receipts,
+                &request,
+                &before,
+                &after,
+                || Ok(()),
+            )
+            .unwrap()
+            {
+                policy_transaction::PrepareOutcome::Prepared(transaction) => transaction,
+                policy_transaction::PrepareOutcome::Replay(_) => panic!("unexpected replay"),
+            };
+
+            let stage = live.path().join("packs").join(stage_name);
+            std::fs::write(&stage, before_pack).unwrap();
+            std::fs::set_permissions(&stage, std::fs::metadata(&pack).unwrap().permissions())
+                .unwrap();
+            let stage_metadata = std::fs::metadata(&stage).unwrap();
+            let pack_directory = std::fs::metadata(live.path().join("packs")).unwrap();
+            let journal_path = live
+                .path()
+                .join(migration_journal::TXN_DIR_NAME)
+                .join(migration_journal::JOURNAL_NAME);
+            let mut journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+            let pack_member = journal["members"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|member| member["path"] == "packs/payload.txt")
+                .unwrap();
+            let before_state = pack_member["before"].clone();
+            pack_member["rollback_staging"] = serde_json::json!({
+                "parent": {"device": pack_directory.dev(), "inode": pack_directory.ino()},
+                "name": stage_name,
+                "payload": {"device": stage_metadata.dev(), "inode": stage_metadata.ino()},
+                "payload_uid": stage_metadata.uid(),
+                "payload_gid": stage_metadata.gid(),
+                "payload_mode": stage_metadata.mode() & 0o7777,
+                "payload_length": stage_metadata.len(),
+                "payload_digest": before_state["digest"].clone(),
+                "linked": true,
+            });
+            std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            drop(prepared);
+        }
+
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&master).unwrap(), desired);
+        assert_eq!(
+            std::fs::read_to_string(live.path().join("packs/payload.txt")).unwrap(),
+            "||restored.example.test^\n"
+        );
+        assert!(!live.path().join("packs").join(stage_name).exists());
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn repeated_restore_is_a_noop_and_does_not_rewrite_policy_files() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("config.toml"), BASE).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let live = tempfile::tempdir().unwrap();
+        let master = live.path().join("config.toml");
+        std::fs::write(&master, format!("{BASE}\n# before\n")).unwrap();
+
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        let inode = std::fs::metadata(&master).unwrap().ino();
+        assert!(matches!(
+            restore_archive(&master, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: false, .. }
+        ));
+        assert_eq!(std::fs::metadata(&master).unwrap().ino(), inode);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
     }
 
     #[test]
@@ -1664,228 +2033,6 @@ servers = ["192.0.2.1:53"]
         assert_eq!(std::fs::read_to_string(&live).unwrap(), BASE);
     }
 
-    /// A failure during the Phase B *rename* (the only
-    /// destructive window) must roll the whole swap back — every live
-    /// `.d/` left byte-identical to its pre-restore content and no
-    /// transient side path leaked into the config dir.
-    #[test]
-    fn install_include_entries_rolls_back_on_phase_b_failure() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        for d in ["devices.d", "profiles.d"] {
-            let p = live.path().join(d);
-            std::fs::create_dir(&p).unwrap();
-            std::fs::write(p.join("e.toml"), format!("original-{d}")).unwrap();
-            let s = staged.path().join(d);
-            std::fs::create_dir(&s).unwrap();
-            std::fs::write(s.join("e.toml"), format!("new-{d}")).unwrap();
-        }
-
-        // Inject a Phase B failure on the SECOND dir's promotion (the
-        // `incoming → live_sub` rename whose target is `…/profiles.d`).
-        // The aside rename (target `…/.profiles.d.pre-restore-…`) and
-        // every devices.d rename run for real.
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut Vec::new(),
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string(), "profiles.d".to_string()],
-            (meta.uid(), meta.gid()),
-        )
-        .unwrap();
-        let res = swap.promote(&root, |from_parent, from, to_parent, to| {
-            if to == OsStr::new("profiles.d") {
-                return Err(std::io::Error::other("injected"));
-            }
-            rename_noreplace_at(from_parent, from, to_parent, to)
-        });
-        assert!(
-            res.is_err(),
-            "injected Phase B failure must surface as an error"
-        );
-        swap.rollback(&root).unwrap();
-
-        for d in ["devices.d", "profiles.d"] {
-            let got = std::fs::read_to_string(live.path().join(d).join("e.toml")).unwrap();
-            assert_eq!(got, format!("original-{d}"), "{d} must be rolled back");
-        }
-        for entry in std::fs::read_dir(live.path()).unwrap() {
-            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            assert!(
-                !name.contains(".incoming-") && !name.contains(".pre-restore-"),
-                "leftover swap artifact in config dir: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn rollback_preserves_a_replacement_at_a_promoted_name() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        for name in ["devices.d", "profiles.d"] {
-            std::fs::create_dir(live.path().join(name)).unwrap();
-            std::fs::write(live.path().join(name).join("entry.toml"), "old").unwrap();
-            std::fs::create_dir(staged.path().join(name)).unwrap();
-            std::fs::write(staged.path().join(name).join("entry.toml"), "new").unwrap();
-        }
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut Vec::new(),
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string(), "profiles.d".to_string()],
-            (meta.uid(), meta.gid()),
-        )
-        .unwrap();
-        let visible_root = live.path().to_path_buf();
-        let error = swap
-            .promote(&root, |from_parent, from, to_parent, to| {
-                if to == OsStr::new("profiles.d") {
-                    std::fs::remove_dir_all(visible_root.join("devices.d"))?;
-                    std::fs::write(visible_root.join("devices.d"), "replacement")?;
-                    return Err(std::io::Error::other("injected"));
-                }
-                rename_noreplace_at(from_parent, from, to_parent, to)
-            })
-            .unwrap_err();
-        assert!(error.to_string().contains("promoting staged include"));
-        assert!(swap.rollback(&root).is_err());
-        assert_eq!(
-            std::fs::read_to_string(live.path().join("devices.d")).unwrap(),
-            "replacement",
-            "rollback must not delete an inode it did not create"
-        );
-        assert_eq!(
-            std::fs::read_to_string(live.path().join("profiles.d/entry.toml")).unwrap(),
-            "old"
-        );
-    }
-
-    #[test]
-    fn promotion_refuses_replaced_incoming_entries_and_reports_each_artifact() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        for name in ["devices.d", "profiles.d"] {
-            std::fs::create_dir(live.path().join(name)).unwrap();
-            std::fs::write(live.path().join(name).join("entry.toml"), "old").unwrap();
-            std::fs::create_dir(staged.path().join(name)).unwrap();
-            std::fs::write(staged.path().join(name).join("entry.toml"), "new").unwrap();
-        }
-        let root = File::open(live.path()).unwrap();
-        let metadata = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut Vec::new(),
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string(), "profiles.d".to_string()],
-            (metadata.uid(), metadata.gid()),
-        )
-        .unwrap();
-        let incoming = swap
-            .prepared
-            .iter()
-            .map(|item| item.incoming.clone())
-            .collect::<Vec<_>>();
-        for name in &incoming {
-            std::fs::remove_dir_all(live.path().join(name)).unwrap();
-            std::fs::write(live.path().join(name), "replacement").unwrap();
-        }
-
-        let error = swap
-            .promote(&root, rename_noreplace_at)
-            .expect_err("a replaced incoming inode must not be promoted");
-        assert!(error.to_string().contains("changed before promotion"));
-        for name in ["devices.d", "profiles.d"] {
-            assert_eq!(
-                std::fs::read_to_string(live.path().join(name).join("entry.toml")).unwrap(),
-                "old"
-            );
-        }
-
-        let artifacts = swap.recovery_artifacts(&root, live.path()).join("; ");
-        let cleanup = swap.cleanup_incoming(&root).unwrap_err().to_string();
-        for name in incoming {
-            let name = name.to_string_lossy();
-            assert!(artifacts.contains(name.as_ref()), "{artifacts}");
-            assert!(artifacts.contains("replacement preserved"), "{artifacts}");
-            assert!(cleanup.contains(name.as_ref()), "{cleanup}");
-        }
-    }
-
-    #[test]
-    fn production_include_copy_normalizes_modes_and_refuses_symlinks() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let staged = tempfile::tempdir().unwrap();
-        let source = staged.path().join("entry.toml");
-        std::fs::write(&source, "value = true\n").unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let live = tempfile::tempdir().unwrap();
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let owner = (meta.uid(), meta.gid());
-
-        copy_staged_entry_at(&source, &root, OsStr::new("incoming.toml"), owner).unwrap();
-        assert_eq!(
-            std::fs::metadata(live.path().join("incoming.toml"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o640
-        );
-
-        let link = staged.path().join("link.toml");
-        symlink(&source, &link).unwrap();
-        assert!(copy_staged_entry_at(&link, &root, OsStr::new("link.toml"), owner).is_err());
-        assert!(!live.path().join("link.toml").exists());
-    }
-
-    /// Mirror semantics: a successful swap makes the live `.d/`
-    /// equal to the archive — a file the operator hand-dropped that is
-    /// absent from the archive is removed (whole-dir replacement).
-    #[test]
-    fn install_include_entries_mirror_drops_unmanaged_files() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        let live_d = live.path().join("devices.d");
-        std::fs::create_dir(&live_d).unwrap();
-        std::fs::write(live_d.join("managed.toml"), "v1").unwrap();
-        std::fs::write(live_d.join("hand-dropped.toml"), "operator").unwrap();
-        let staged_d = staged.path().join("devices.d");
-        std::fs::create_dir(&staged_d).unwrap();
-        std::fs::write(staged_d.join("managed.toml"), "v2").unwrap();
-
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut Vec::new(),
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string()],
-            (meta.uid(), meta.gid()),
-        )
-        .unwrap();
-        swap.promote(&root, rename_noreplace_at).unwrap();
-        swap.finalize(&root).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(live_d.join("managed.toml")).unwrap(),
-            "v2"
-        );
-        assert!(
-            !live_d.join("hand-dropped.toml").exists(),
-            "mirror semantics: unmanaged file must be removed by restore"
-        );
-    }
-
     // ── archive member type + restored perms ─────────────
 
     #[test]
@@ -1899,6 +2046,7 @@ servers = ["192.0.2.1:53"]
         std::fs::write(payload.join("config.toml"), BASE).unwrap();
         let fifo = payload.join("evil.fifo");
         let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: cpath is a valid NUL-terminated path and mode is valid.
         let rc = unsafe { libc::mkfifo(cpath.as_ptr(), 0o644) };
         assert_eq!(rc, 0, "mkfifo must succeed for the test");
 
@@ -2036,7 +2184,7 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn the_staged_master_fallback_never_picks_secrets_toml() {
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(staging.path().join("config.toml"), "schema_version = 4\n").unwrap();
+        std::fs::write(staging.path().join("config.toml"), "schema_version = 5\n").unwrap();
         std::fs::write(staging.path().join("secrets.toml"), "token = \"x\"\n").unwrap();
         // Live master named something else, so the direct hit misses and
         // the fallback runs.
@@ -2056,7 +2204,7 @@ servers = ["192.0.2.1:53"]
     fn the_staged_master_fallback_refuses_ambiguity() {
         let staging = tempfile::tempdir().unwrap();
         for name in ["zulu.toml", "alpha.toml", "mike.toml"] {
-            std::fs::write(staging.path().join(name), "schema_version = 4\n").unwrap();
+            std::fs::write(staging.path().join(name), "schema_version = 5\n").unwrap();
         }
         let live = staging.path().join("warden.toml");
 
@@ -2071,8 +2219,8 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn the_staged_master_prefers_the_live_masters_own_name() {
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(staging.path().join("alpha.toml"), "schema_version = 4\n").unwrap();
-        std::fs::write(staging.path().join("warden.toml"), "schema_version = 4\n").unwrap();
+        std::fs::write(staging.path().join("alpha.toml"), "schema_version = 5\n").unwrap();
+        std::fs::write(staging.path().join("warden.toml"), "schema_version = 5\n").unwrap();
         let live = staging.path().join("warden.toml");
 
         let picked = locate_staged_master(staging.path(), &live).unwrap();
@@ -2082,94 +2230,11 @@ servers = ["192.0.2.1:53"]
     #[test]
     fn the_staged_master_accepts_a_safe_exact_non_toml_name() {
         let staging = tempfile::tempdir().unwrap();
-        std::fs::write(staging.path().join("warden.conf"), "schema_version = 4\n").unwrap();
-        std::fs::write(staging.path().join("other.toml"), "schema_version = 4\n").unwrap();
+        std::fs::write(staging.path().join("warden.conf"), "schema_version = 5\n").unwrap();
+        std::fs::write(staging.path().join("other.toml"), "schema_version = 5\n").unwrap();
         let live = staging.path().join("warden.conf");
 
         let picked = locate_staged_master(staging.path(), &live).unwrap();
         assert_eq!(picked.file_name().unwrap(), "warden.conf");
-    }
-
-    // ── a declared include the archive does not contain ──────────────
-
-    /// The archive's master declares `devices.d/` and the archive does
-    /// not populate it. The live directory then survives untouched while
-    /// the restored master still globs it, so every device the operator
-    /// removed before taking the backup comes back — and the command
-    /// reported success in silence.
-    ///
-    /// Replacing the live directory would delete operator config, so this
-    /// pins the warning rather than the deletion; the mirror-semantics
-    /// repair is a separate, destructive decision.
-    #[test]
-    fn a_declared_but_absent_include_entry_is_reported_not_skipped_silently() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        let live_d = live.path().join("devices.d");
-        std::fs::create_dir(&live_d).unwrap();
-        std::fs::write(live_d.join("kid-tablet.toml"), "removed before backup").unwrap();
-        // `staged/devices.d` deliberately absent.
-
-        let mut notices: Vec<u8> = Vec::new();
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut notices,
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string()],
-            (meta.uid(), meta.gid()),
-        )
-        .unwrap();
-        swap.promote(&root, rename_noreplace_at).unwrap();
-        swap.finalize(&root).unwrap();
-
-        let seen = String::from_utf8(notices).unwrap();
-        assert!(
-            seen.contains("devices.d"),
-            "the un-mirrored entry must be named: {seen:?}"
-        );
-        assert!(
-            live_d.join("kid-tablet.toml").exists(),
-            "this fix warns; it does not delete live config"
-        );
-    }
-
-    /// Negative control: an entry the archive DOES contain is promoted
-    /// silently. Without this, a warning emitted unconditionally would
-    /// satisfy the test above.
-    #[test]
-    fn a_populated_include_entry_is_promoted_without_a_warning() {
-        let live = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        let staged_d = staged.path().join("devices.d");
-        std::fs::create_dir(&staged_d).unwrap();
-        std::fs::write(staged_d.join("kid-tablet.toml"), "v2").unwrap();
-
-        let mut notices: Vec<u8> = Vec::new();
-        let root = File::open(live.path()).unwrap();
-        let meta = root.metadata().unwrap();
-        let mut swap = prepare_include_entries(
-            &mut notices,
-            staged.path(),
-            &root,
-            live.path(),
-            &["devices.d".to_string()],
-            (meta.uid(), meta.gid()),
-        )
-        .unwrap();
-        swap.promote(&root, rename_noreplace_at).unwrap();
-        swap.finalize(&root).unwrap();
-
-        assert!(
-            notices.is_empty(),
-            "a mirrored entry needs no warning: {:?}",
-            String::from_utf8(notices).unwrap()
-        );
-        assert_eq!(
-            std::fs::read_to_string(live.path().join("devices.d/kid-tablet.toml")).unwrap(),
-            "v2"
-        );
     }
 }

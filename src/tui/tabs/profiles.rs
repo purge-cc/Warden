@@ -31,167 +31,254 @@
 //! Add / Edit / Delete open [`crate::tui::profile_modal::ProfileModal`]
 //! and submit through the Phase 1 IPC verbs — see `tui/mod.rs`.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
+use std::cmp::Ordering;
 
-use std::collections::BTreeMap;
-
-use crate::config::custom_list::CustomListStore;
 use crate::config::loader::LoadedConfig;
 use crate::config::schema::{Blocklist, Profile};
 use crate::config::settings::EcsMode;
 use crate::lists::status::BlocklistStatusDto;
 use crate::profiles::profile::resolve_profile_blocklist_ids;
-use crate::tui::app::App;
+use crate::tui::app::{App, Leaf};
+use crate::tui::detail_panel;
 use crate::tui::format::count as humanize_domains;
-use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
+use crate::tui::modal_form::{self, ValueKind};
+use crate::tui::mouse::{self, MouseAction, SortOrder};
+use crate::tui::profile_modal;
+use crate::tui::theme::{self, CardRole, T};
 
-/// Below this *inner* width (measured after `render_section_chrome` takes
-/// its border) the master/detail split collapses to master-only — the
-/// side-card needs room for the KV rows + the "What it blocks" summary to
-/// stay legible.
-///
-/// Not the same number as the Subnets tab's `NARROW_THRESHOLD`, and not
-/// measured against the same rect: that one is 110 against the pre-chrome
-/// `area.width`. Both are deliberately conservative; neither is derived
-/// from the other.
-const NARROW_THRESHOLD: u16 = 100;
+/// The shared master/detail floor: 60 list cells, one gutter, 42 detail.
+const NARROW_THRESHOLD: u16 = 108;
+const COLUMN_SPACING: u16 = 2;
+const HEADERS: [&str; 5] = ["ID", "DISPLAY NAME", "LISTS", "BLOCK-ALL", "ECS"];
+
+/// One stable profile identity and its captured display data. Rendering and
+/// input index this single sorted vector, never the map's declaration order.
+#[derive(Debug, Clone)]
+pub struct ProfileRow {
+    pub id: String,
+    pub profile: Profile,
+}
+
+pub fn display_row_key(row: &ProfileRow) -> &str {
+    &row.id
+}
+
+pub fn index_of_display_key(rows: &[ProfileRow], selected: Option<&str>) -> Option<usize> {
+    let selected = selected?;
+    rows.iter().position(|row| row.id == selected)
+}
+
+/// Whether the editing stage is hosted by the wide yellow detail card.
+/// Confirmations and outcomes deliberately remain centered overlays.
+pub fn inline_editor_visible(_viewport_width: u16, app: &App) -> bool {
+    app.active_leaf == Leaf::Profiles
+        && app
+            .profiles
+            .modal
+            .as_ref()
+            .is_some_and(|modal| matches!(modal.stage, profile_modal::Stage::EditingForm(_)))
+}
 
 // ── Public render entry point ────────────────────────────────────────
 
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some(loaded) = app.loaded_config.as_ref() else {
+    if app.loaded_config.is_none() {
         render_no_config(f, area);
         return;
-    };
-
-    let profiles = &loaded.config.profiles;
-    let title = format!("Profiles ({})", profiles.len());
-    let outer = render_section_chrome(f, area, &title, T.text_secondary);
+    }
+    let profiles = build_display_rows(app);
 
     if profiles.is_empty() {
-        render_empty(f, outer);
+        render_empty_master_detail(f, area, app);
         return;
     }
 
-    if outer.width < NARROW_THRESHOLD {
-        // Single-column fallback: master list only. The operator still
-        // sees every profile; the detail card returns when they widen.
-        render_master(
-            f,
-            outer,
-            profiles,
-            app.profiles.selected_id.as_deref(),
-            &mut app.profiles.table_state,
-        );
+    let detail_key = index_of_display_key(&profiles, app.profiles.selected_id.as_deref())
+        .and_then(|index| profiles.get(index))
+        .or_else(|| profiles.first())
+        .map(|row| row.id.as_str())
+        .unwrap_or_default();
+    detail_panel::prepare(app, Leaf::Profiles, detail_key);
+
+    if inline_editor_visible(area.width, app) && area.width < NARROW_THRESHOLD {
+        profile_modal::render_inline_editor(f, area, app.profiles.modal.as_ref().unwrap());
         return;
     }
 
-    let cols = Layout::horizontal([
-        Constraint::Percentage(38),
-        Constraint::Length(1),
-        Constraint::Percentage(62),
-    ])
-    .split(outer);
+    if area.width < NARROW_THRESHOLD {
+        // Right enters the focused document at narrow widths; Left/Esc
+        // restores this identity-stable master list.
+        if detail_panel::focused(app, Leaf::Profiles) {
+            let loaded = app.loaded_config.as_ref().expect("checked above");
+            render_detail(f, area, app, loaded, &profiles);
+        } else {
+            render_master(f, area, app, &profiles);
+        }
+        return;
+    }
 
-    render_master(
-        f,
-        cols[0],
-        profiles,
-        app.profiles.selected_id.as_deref(),
-        &mut app.profiles.table_state,
-    );
-    render_detail(f, cols[2], app, loaded, profiles);
-    draw_v_divider(f, cols[1]);
+    let cols = proportional_columns(area);
+
+    render_master(f, cols[0], app, &profiles);
+    if inline_editor_visible(area.width, app) {
+        profile_modal::render_inline_editor(f, cols[1], app.profiles.modal.as_ref().unwrap());
+    } else {
+        let loaded = app.loaded_config.as_ref().expect("checked above");
+        render_detail(f, cols[1], app, loaded, &profiles);
+    }
+}
+
+fn proportional_columns(area: Rect) -> [Rect; 2] {
+    let left = (u32::from(area.width) * 42 / 100) as u16;
+    [
+        Rect::new(area.x, area.y, left, area.height),
+        Rect::new(
+            area.x + left.saturating_sub(1),
+            area.y,
+            area.width.saturating_sub(left).saturating_add(1),
+            area.height,
+        ),
+    ]
 }
 
 // ── Master pane ──────────────────────────────────────────────────────
 
-fn render_master(
-    f: &mut Frame,
-    area: Rect,
-    profiles: &BTreeMap<String, Profile>,
-    selected_id: Option<&str>,
-    table_state: &mut TableState,
-) {
-    let header = Row::new(vec![
-        Cell::from("ID"),
-        Cell::from("DISPLAY NAME"),
-        Cell::from("RULES"),
-        Cell::from("BLOCK-ALL"),
-        Cell::from("ECS"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
+fn render_master(f: &mut Frame, area: Rect, app: &mut App, profiles: &[ProfileRow]) {
+    let subtitle = format!("{} Policy Bundles \u{00b7} Stable IDs", profiles.len());
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "PROFILES",
+        &subtitle,
+        CardRole::Analytics,
     );
+    let constraints = profile_constraints();
+    let columns = crate::tui::ui::table_column_rects(body, &constraints, COLUMN_SPACING, 0);
+    let sort = app.mouse.sort(Leaf::Profiles);
+    let header = Row::new(HEADERS.iter().enumerate().map(|(index, label)| {
+        Cell::from(sort_header(label, index, sort)).style(theme::table_heading_style(
+            sort.is_some_and(|order| order.column == index),
+        ))
+    }))
+    .style(theme::table_heading_style(false));
 
-    let rows: Vec<Row> = master_rows(profiles);
+    let rows: Vec<Row> = profiles
+        .iter()
+        .map(|row| master_row(&row.id, &row.profile))
+        .collect();
 
     // Resolve `selected_id` back to a row index every frame — modal CRUD
     // moves rows in/out, so an index from the previous frame is stale.
     // The scroll offset persists regardless (see `tabs::subnets::render_master`
     // for why that is safe across a row-count change).
-    let selected =
-        resolve_selected_index(profiles, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
+    let selected = index_of_display_key(profiles, app.profiles.selected_id.as_deref())
+        .or_else(|| (!rows.is_empty()).then_some(0));
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(12),
-            Constraint::Min(14),
-            Constraint::Length(6),
-            Constraint::Length(10),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(theme::highlight_style());
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(COLUMN_SPACING)
+        .row_highlight_style(theme::highlight_style());
 
-    super::render_table(f, area, table, table_state, selected);
+    super::render_table(f, body, table, &mut app.profiles.table_state, selected);
+    for (index, rect) in columns.iter().enumerate() {
+        mouse::register(app, *rect, MouseAction::Sort(Leaf::Profiles, index));
+    }
+    let offset = app.profiles.table_state.offset();
+    for (visible, index) in (0..profiles.len())
+        .skip(offset)
+        .take(body.height.saturating_sub(1) as usize)
+        .enumerate()
+    {
+        mouse::register(
+            app,
+            Rect::new(body.x, body.y + 1 + visible as u16, body.width, 1),
+            MouseAction::Row(Leaf::Profiles, index),
+        );
+    }
 }
 
-/// Build the master list rows — one per profile, in `BTreeMap` key
-/// order (stable across frames).
-fn master_rows(profiles: &BTreeMap<String, Profile>) -> Vec<Row<'static>> {
-    profiles
+fn master_row(id: &str, p: &Profile) -> Row<'static> {
+    let block_all = if p.block_all {
+        Cell::from(Span::styled(
+            "yes",
+            Style::default()
+                .fg(T.brand_red)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(Span::styled("no", Style::default().fg(T.text_muted)))
+    };
+    Row::new(vec![
+        Cell::from(id.to_string()),
+        Cell::from(p.display_name.clone()),
+        Cell::from((p.lists.len() + p.custom_lists.len()).to_string()),
+        block_all,
+        Cell::from(ecs_summary(p)),
+    ])
+}
+
+fn profile_constraints() -> [Constraint; HEADERS.len()] {
+    [
+        Constraint::Min(12),
+        Constraint::Min(14),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(8),
+    ]
+}
+
+fn sort_header(label: &str, index: usize, sort: Option<SortOrder>) -> String {
+    match sort.filter(|sort| sort.column == index) {
+        Some(sort) if sort.descending => format!("{label} ▼"),
+        Some(_) => format!("{label} ▲"),
+        None => label.to_string(),
+    }
+}
+
+/// The sole display sequence for Profiles. Numeric columns use their native
+/// values and every equal sort falls back to the immutable profile id.
+pub fn build_display_rows(app: &App) -> Vec<ProfileRow> {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ProfileRow> = loaded
+        .config
+        .profiles
         .iter()
-        .map(|(id, p)| {
-            let block_all = if p.block_all {
-                Cell::from(Span::styled(
-                    "yes",
-                    Style::default()
-                        .fg(T.brand_red)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Cell::from(Span::styled("no", Style::default().fg(T.text_muted)))
-            };
-            Row::new(vec![
-                Cell::from(id.clone()),
-                Cell::from(p.display_name.clone()),
-                Cell::from(p.admin_rules.len().to_string()),
-                block_all,
-                Cell::from(ecs_summary(p)),
-            ])
+        .map(|(id, profile)| ProfileRow {
+            id: id.clone(),
+            profile: profile.clone(),
         })
-        .collect()
-}
-
-/// Resolve `selected_id` back to its index in the master row list.
-/// `None` when the key no longer matches any profile (e.g. just
-/// deleted) — the caller falls back to row 0.
-pub fn resolve_selected_index(
-    profiles: &BTreeMap<String, Profile>,
-    selected: Option<&str>,
-) -> Option<usize> {
-    let key = selected?;
-    profiles.keys().position(|id| id == key)
+        .collect();
+    if let Some(sort) = app.mouse.sort(Leaf::Profiles) {
+        rows.sort_by(|left, right| {
+            let order = match sort.column {
+                0 => left.id.cmp(&right.id),
+                1 => left
+                    .profile
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&right.profile.display_name.to_lowercase()),
+                2 => (left.profile.lists.len() + left.profile.custom_lists.len())
+                    .cmp(&(right.profile.lists.len() + right.profile.custom_lists.len())),
+                3 => left.profile.block_all.cmp(&right.profile.block_all),
+                4 => ecs_summary(&left.profile).cmp(&ecs_summary(&right.profile)),
+                _ => Ordering::Equal,
+            };
+            let order = if sort.descending {
+                order.reverse()
+            } else {
+                order
+            };
+            order.then_with(|| left.id.cmp(&right.id))
+        });
+    }
+    rows
 }
 
 // ── Detail pane (side-card) ──────────────────────────────────────────
@@ -201,85 +288,193 @@ fn render_detail(
     area: Rect,
     app: &App,
     loaded: &LoadedConfig,
-    profiles: &BTreeMap<String, Profile>,
+    profiles: &[ProfileRow],
 ) {
-    let selection = app
-        .profiles
-        .selected_id
-        .as_deref()
-        .and_then(|key| profiles.get_key_value(key));
+    let selection = index_of_display_key(profiles, app.profiles.selected_id.as_deref())
+        .and_then(|index| profiles.get(index))
+        .or_else(|| profiles.first());
 
-    let Some((id, profile)) = selection else {
-        let para = Paragraph::new(Span::styled(
-            " select a profile on the left",
-            Style::default().fg(T.text_muted),
-        ));
-        f.render_widget(para, area);
+    let Some(selection) = selection else {
         return;
     };
+    let id = &selection.id;
+    let profile = &selection.profile;
+    let subtitle = format!("{id} \u{00b7} Policy Bundle");
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "PROFILE DETAILS",
+        &subtitle,
+        CardRole::History,
+    );
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(24);
 
-    // ── MUTATE fields (D4) ──
-    lines.push(kv_str("Id", id, T.text_primary));
-    lines.push(kv_str(
-        "Display name",
+    lines.extend(modal_form::section_band_with_role(
+        "Identity",
+        content.width,
+        CardRole::Summary,
+    ));
+    lines.push(modal_form::value_row(
+        "id",
+        id,
+        false,
+        ValueKind::Identity,
+        None,
+        content.width,
+    ));
+    lines.push(modal_form::value_row(
+        "display name",
         &profile.display_name,
-        T.text_primary,
+        false,
+        ValueKind::Editable,
+        None,
+        content.width,
     ));
-    lines.push(kv_str(
-        "Block response",
-        &block_response_label(profile),
-        T.text_primary,
+    lines.push(Line::default());
+    lines.extend(modal_form::section_band_with_role(
+        "Blocking",
+        content.width,
+        CardRole::Summary,
     ));
-    lines.push(kv_str(
-        "Blocked TTL",
-        &blocked_ttl_label(profile),
-        T.text_primary,
+    let response = block_response_label(profile);
+    lines.push(modal_form::value_row(
+        "block response",
+        &response,
+        false,
+        ValueKind::Blocking,
+        None,
+        content.width,
     ));
-    lines.push(kv(
-        "Block all",
+    let ttl = blocked_ttl_label(profile);
+    lines.push(modal_form::value_row(
+        "blocked ttl",
+        &ttl,
+        false,
+        ValueKind::Editable,
+        None,
+        content.width,
+    ));
+    lines.push(modal_form::value_row(
+        "block all",
+        if profile.block_all { "yes" } else { "no" },
+        false,
         if profile.block_all {
-            Span::styled(
-                "yes",
-                Style::default()
-                    .fg(T.brand_red)
-                    .add_modifier(Modifier::BOLD),
-            )
+            ValueKind::Blocking
         } else {
-            Span::styled("no", Style::default().fg(T.text_muted))
+            ValueKind::Healthy
         },
+        None,
+        content.width,
     ));
-    lines.push(kv_str(
-        "Admin rules",
-        &admin_rules_label(profile),
-        T.text_primary,
+    lines.push(Line::default());
+    lines.extend(modal_form::section_band_with_role(
+        "ECS & Privacy",
+        content.width,
+        CardRole::Summary,
     ));
-    lines.push(kv_str("ECS", &ecs_detail_label(profile), T.text_primary));
-
-    lines.push(divider_line(area.width));
+    let ecs = ecs_detail_label(profile);
+    lines.push(modal_form::value_row(
+        "ecs",
+        &ecs,
+        false,
+        ValueKind::Identity,
+        None,
+        content.width,
+    ));
 
     // "What it blocks" summary — offline: resolve the profile's effective
     // blocklists through `effective_direction` (each list's `base` as
-    // overridden by `profiles.<id>.lists`; `profile.tags` decides nothing)
-    // and sum their polled domain counts. Replaces the former read-only
-    // drill-out pointer block — the collections it pointed at now surface
-    // as the demoted "Also" line. The per-list override rows in the
-    // profile editor (`profile_modal.rs` `LIST_OVERRIDE_HINT`) are where
-    // an operator with no effective lists actually sets direction.
+    // overridden by `profiles.<id>.lists`; `profile.tags` decides nothing).
+    lines.push(Line::default());
+    lines.extend(modal_form::section_band_with_role(
+        "What it blocks",
+        content.width,
+        CardRole::Analytics,
+    ));
     let summary = profile_blocks_summary(profile, &loaded.config.blocklists, &app.lists.entries);
-    push_blocks_summary(&mut lines, &summary, profile, &loaded.custom_lists);
+    push_blocks_summary(&mut lines, &summary, profile, app.operator_catalog.as_ref());
 
-    lines.push(divider_line(area.width));
-
-    // ── Reference count (also the delete pre-check input) ──
-    lines.push(kv_str(
-        "Referenced by",
+    lines.push(Line::default());
+    lines.extend(modal_form::section_band_with_role(
+        "References",
+        content.width,
+        CardRole::Summary,
+    ));
+    lines.push(modal_form::value_row(
+        "referenced by",
         &reference_summary(loaded, id),
-        T.text_secondary,
+        false,
+        ValueKind::Identity,
+        None,
+        content.width,
     ));
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let detail = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(1),
+    );
+    detail_panel::render(f, detail, app, Leaf::Profiles, id, lines);
+    if content.height > 0 {
+        let footer = Rect::new(content.x, content.bottom() - 1, content.width, 1);
+        let actions = [modal_form::Action::new(
+            "  Edit  ",
+            false,
+            modal_form::ActionKind::Primary,
+            "Enter edits this profile",
+        )
+        .on_key(crossterm::event::KeyCode::Enter)];
+        f.render_widget(
+            Paragraph::new(modal_form::action_row(&actions, footer.width)),
+            footer,
+        );
+        for (rect, key) in modal_form::action_regions(&actions, footer) {
+            mouse::register(app, rect, MouseAction::Key(key.code));
+        }
+    }
+}
+
+fn render_empty_master_detail(f: &mut Frame, area: Rect, app: &App) {
+    if area.width < NARROW_THRESHOLD {
+        let body = theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "PROFILES",
+            "Configured Policy Bundles",
+            CardRole::Analytics,
+        );
+        render_empty(f, body);
+        return;
+    }
+    let cols = proportional_columns(area);
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        cols[0],
+        "PROFILES",
+        "Configured Policy Bundles",
+        CardRole::Analytics,
+    );
+    render_empty(f, body);
+    if inline_editor_visible(area.width, app) {
+        profile_modal::render_inline_editor(f, cols[1], app.profiles.modal.as_ref().unwrap());
+    } else {
+        let detail = theme::filled_card(
+            f.buffer_mut(),
+            cols[1],
+            "PROFILE DETAILS",
+            "Select a Policy Bundle",
+            CardRole::History,
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  add a profile to inspect its policy and mounts",
+                Style::default().fg(T.text_muted),
+            )),
+            detail,
+        );
+    }
 }
 
 // ── Profile reference counting ───────────────────────────────────────
@@ -405,18 +600,6 @@ fn blocked_ttl_label(profile: &Profile) -> String {
     }
 }
 
-fn admin_rules_label(profile: &Profile) -> String {
-    if profile.admin_rules.is_empty() {
-        return "(none)".to_string();
-    }
-    profile
-        .admin_rules
-        .iter()
-        .map(|r| r.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 // ── "What it blocks" summary ──────────────────────────────────────────
 //
 // The Profiles detail pane summarises the effective blocklists a profile
@@ -442,12 +625,15 @@ pub const PROFILE_BLOCKS_LOADING: &str = "(loading…)";
 pub const PROFILE_BLOCKS_PARTIAL: &str = "(partial)";
 
 /// KV label for the custom-lists mount line, sibling of `Blocklists`.
-/// Counts come from `LoadedConfig::custom_lists` — the store already
-/// parsed at config load — never from re-reading pack files.
+/// Counts come from the daemon-owned operator-policy catalogue. The config
+/// snapshot only says what a profile mounts; it is not an authoritative pack
+/// parse and must not be presented as one.
 pub const PROFILE_LABEL_CUSTOM_LISTS: &str = "Custom lists";
 /// Custom-lists-line value when the profile mounts zero custom lists —
 /// not an error, since most profiles will have none.
 pub const PROFILE_CUSTOM_LISTS_NONE: &str = "none mounted";
+/// Mount metadata has not landed, so rules/validation counts are unknown.
+pub const PROFILE_CUSTOM_LISTS_UNAVAILABLE: &str = "catalog unavailable";
 
 /// Domain-count state of the "What it blocks" summary. Kept distinct from
 /// the resolved-list vector so the renderer picks the right count-line copy:
@@ -594,15 +780,8 @@ fn push_blocks_summary(
     lines: &mut Vec<Line<'static>>,
     summary: &BlocksSummary,
     profile: &Profile,
-    custom_list_store: &CustomListStore,
+    catalog: Option<&crate::tui::operator_policy::PolicyCatalog>,
 ) {
-    lines.push(Line::from(Span::styled(
-        format!(" {PROFILE_LABEL_WHAT_IT_BLOCKS}"),
-        Style::default()
-            .fg(T.text_secondary)
-            .add_modifier(Modifier::BOLD),
-    )));
-
     // Blocklists line — names, or a block_all / empty sentence.
     let value = blocklists_value(summary);
     let value_color = if summary.block_all {
@@ -625,9 +804,10 @@ fn push_blocks_summary(
         ]));
     }
 
-    // Custom lists line — sibling of Blocklists, after its count-line
-    // continuation.
-    lines.push(custom_lists_line(profile, custom_list_store));
+    // Custom lists are siblings of Blocklists, after its count-line
+    // continuation. Keep each mount on an atomic logical row so a narrow
+    // detail pane cannot wrap `(missing)` into an unreadable fragment.
+    lines.extend(custom_lists_lines(profile, catalog));
 
     // Demoted local-records / rewrites pointer.
     lines.push(Line::from(vec![
@@ -647,76 +827,112 @@ fn push_blocks_summary(
     ]));
 }
 
-/// One `custom_lists` mount, resolved against the loaded [`CustomListStore`].
+/// One `custom_lists` mount, resolved against catalogue metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CustomListMount {
-    /// Present in the store — counts read off the already-compiled pack.
+    /// Present in the daemon catalogue — counts include validation rows.
     Present {
         id: String,
-        allow: usize,
-        deny: usize,
+        rules: usize,
+        malformed: usize,
     },
     /// The profile names an id absent from the store. The validator
     /// refuses this on load; the TUI also renders configs that bypassed it.
     Missing { id: String },
 }
 
-/// Resolve a profile's `custom_lists` ids against the loaded store, in the
-/// profile's own declaration order. Pure — unit-tested directly, same
-/// shape as [`profile_blocks_summary`].
-fn resolve_custom_list_mounts(profile: &Profile, store: &CustomListStore) -> Vec<CustomListMount> {
-    profile
-        .custom_lists
-        .iter()
-        .map(|id| match store.get(id) {
-            Some(compiled) => CustomListMount::Present {
-                id: id.as_str().to_string(),
-                allow: compiled.allow.len(),
-                deny: compiled.deny.len(),
-            },
-            None => CustomListMount::Missing {
-                id: id.as_str().to_string(),
-            },
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CustomListMounts {
+    Unavailable,
+    Resolved(Vec<CustomListMount>),
 }
 
-/// Build the `Custom lists` KV line. Each mount is coloured on its own —
-/// present in `text_primary`, missing in `T.error` — so one dangling
-/// reference among several valid mounts doesn't paint the whole line as
-/// broken, and doesn't hide inside a single flat colour either.
-fn custom_lists_line(profile: &Profile, store: &CustomListStore) -> Line<'static> {
-    let mounts = resolve_custom_list_mounts(profile, store);
+/// Resolve a profile's declared mounts against the catalogue, preserving the
+/// profile's order. A missing catalogue is not treated as an empty one.
+fn resolve_custom_list_mounts(
+    profile: &Profile,
+    catalog: Option<&crate::tui::operator_policy::PolicyCatalog>,
+) -> CustomListMounts {
+    if profile.custom_lists.is_empty() {
+        return CustomListMounts::Resolved(Vec::new());
+    }
+    let Some(catalog) = catalog else {
+        return CustomListMounts::Unavailable;
+    };
+    CustomListMounts::Resolved(
+        profile
+            .custom_lists
+            .iter()
+            .map(
+                |id| match catalog.lists.iter().find(|list| list.id == id.as_str()) {
+                    Some(list) => CustomListMount::Present {
+                        id: id.as_str().to_string(),
+                        rules: list.rule_count,
+                        malformed: list.invalid_rows,
+                    },
+                    None => CustomListMount::Missing {
+                        id: id.as_str().to_string(),
+                    },
+                },
+            )
+            .collect(),
+    )
+}
+
+/// Build the `Custom lists` KV rows. Each mount is coloured on its own —
+/// present in `text_primary`, missing in `T.error` — and occupies one row so
+/// the status remains intact when the detail pane is narrow.
+fn custom_lists_lines(
+    profile: &Profile,
+    catalog: Option<&crate::tui::operator_policy::PolicyCatalog>,
+) -> Vec<Line<'static>> {
+    let mounts = resolve_custom_list_mounts(profile, catalog);
+    let CustomListMounts::Resolved(mounts) = mounts else {
+        return vec![kv_str(
+            PROFILE_LABEL_CUSTOM_LISTS,
+            PROFILE_CUSTOM_LISTS_UNAVAILABLE,
+            T.warning,
+        )];
+    };
     if mounts.is_empty() {
-        return kv_str(
+        return vec![kv_str(
             PROFILE_LABEL_CUSTOM_LISTS,
             PROFILE_CUSTOM_LISTS_NONE,
             T.text_secondary,
-        );
+        )];
     }
 
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{:<14}", PROFILE_LABEL_CUSTOM_LISTS),
-            Style::default().fg(T.text_muted),
-        ),
-    ];
-    for (i, mount) in mounts.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(", ", Style::default().fg(T.text_muted)));
-        }
-        spans.push(match mount {
-            CustomListMount::Present { id, allow, deny } => Span::styled(
-                format!("{id} ({allow} allow, {deny} deny)"),
-                Style::default().fg(T.text_primary),
-            ),
-            CustomListMount::Missing { id } => {
-                Span::styled(format!("{id} (missing)"), Style::default().fg(T.error))
-            }
-        });
-    }
-    Line::from(spans)
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let value = match mount {
+                CustomListMount::Present {
+                    id,
+                    rules,
+                    malformed,
+                } => Span::styled(
+                    if *malformed == 0 {
+                        format!("{id} ({rules} rules)")
+                    } else {
+                        format!("{id} ({rules} rules, {malformed} malformed)")
+                    },
+                    Style::default().fg(T.text_primary),
+                ),
+                CustomListMount::Missing { id } => {
+                    Span::styled(format!("{id} (missing)"), Style::default().fg(T.error))
+                }
+            };
+            kv(
+                if index == 0 {
+                    PROFILE_LABEL_CUSTOM_LISTS
+                } else {
+                    ""
+                },
+                value,
+            )
+        })
+        .collect()
 }
 
 fn kv(label: &'static str, value: Span<'static>) -> Line<'static> {
@@ -734,29 +950,16 @@ fn kv_str(label: &'static str, value: &str, color: Color) -> Line<'static> {
     )
 }
 
-fn divider_line(width: u16) -> Line<'static> {
-    Line::from(Span::styled(
-        "\u{2500}".repeat(width as usize),
-        Style::default().fg(T.text_muted),
-    ))
-}
-
-/// Paint a 1-cell-wide vertical separator for every row of `area`.
-/// Mirrors the Subnets tab's master/detail gutter.
-fn draw_v_divider(f: &mut Frame, area: Rect) {
-    let style = Style::default().fg(T.text_muted);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        if area.x < buf.area.right() && y < buf.area.bottom() {
-            buf.set_string(area.x, y, "\u{2502}", style);
-        }
-    }
-}
-
 // ── Empty / error states ─────────────────────────────────────────────
 
 fn render_no_config(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Profiles", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "PROFILES",
+        "Configuration Unavailable",
+        CardRole::Analytics,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             "  could not load config — fix it and press r to retry",
@@ -764,6 +967,90 @@ fn render_no_config(f: &mut Frame, area: Rect) {
         )),
         content,
     );
+}
+
+pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return;
+    };
+    if !app.profiles.info_open {
+        return;
+    }
+    let rows = build_display_rows(app);
+    let Some(selected) = index_of_display_key(&rows, app.profiles.selected_id.as_deref())
+        .and_then(|index| rows.get(index))
+        .or_else(|| rows.first())
+    else {
+        return;
+    };
+    let profile = &selected.profile;
+    let inherited = profile
+        .lists
+        .iter()
+        .map(|(id, policy)| format!("{}={}", id.as_str(), policy.wire_str()))
+        .collect::<Vec<_>>();
+    let mounts = profile
+        .custom_lists
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>();
+    let prose = vec![
+        modal_form::ProseRow::emphasis(
+            format!("ID              {}", selected.id),
+            ValueKind::Identity,
+        ),
+        modal_form::ProseRow::plain(format!("Display         {}", profile.display_name)),
+        modal_form::ProseRow::plain(format!("Block response  {}", block_response_label(profile))),
+        modal_form::ProseRow::plain(format!("Blocked TTL     {}", blocked_ttl_label(profile))),
+        modal_form::ProseRow::plain(format!(
+            "Block all       {}",
+            if profile.block_all { "yes" } else { "no" }
+        )),
+        modal_form::ProseRow::plain(format!("ECS             {}", ecs_detail_label(profile))),
+        modal_form::ProseRow::verbatim(
+            format!(
+                "List overrides  {}",
+                if inherited.is_empty() {
+                    "None".to_string()
+                } else {
+                    inherited.join(", ")
+                }
+            ),
+            ValueKind::Identity,
+        ),
+        modal_form::ProseRow::verbatim(
+            format!(
+                "Custom mounts   {}",
+                if mounts.is_empty() {
+                    "None".to_string()
+                } else {
+                    mounts.join(", ")
+                }
+            ),
+            ValueKind::Identity,
+        ),
+        modal_form::ProseRow::plain(format!(
+            "Referenced by    {}",
+            reference_summary(loaded, &selected.id)
+        )),
+    ];
+    let spec = modal_form::NoticeSpec {
+        title: "Profile Details".into(),
+        desc: "Effective filter policy and references".into(),
+        prose,
+        keys: "[Enter / i / Esc] close".into(),
+        actions: vec![modal_form::Action::new(
+            "  [Esc] Close  ",
+            false,
+            modal_form::ActionKind::Neutral,
+            "",
+        )
+        .on_key(crossterm::event::KeyCode::Esc)],
+        ..Default::default()
+    };
+    modal_form::render_modal(f, area, 78, |width| {
+        (modal_form::notice_body(&spec, width), ())
+    });
 }
 
 fn render_empty(f: &mut Frame, area: Rect) {
@@ -783,13 +1070,79 @@ fn render_empty(f: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::config::custom_list::CompiledCustomList;
     use crate::config::schema::{ConfigV1, Id, Profile};
+    use crate::operator_rules::{Capabilities, ListDetail, Metadata, TransportLimits};
     use crate::tui::app::{Leaf, Section};
+    use crate::tui::operator_policy::PolicyCatalog;
 
     fn id(s: &str) -> Id {
         Id::new(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn painted_edit_button_has_an_exact_mouse_target() {
+        use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::known_standalone_for_test();
+        app.active_leaf = Leaf::Profiles;
+        app.loaded_config = Some(loaded_with(ConfigV1 {
+            profiles: mk_profiles(),
+            ..Default::default()
+        }));
+        app.profiles.selected_id = Some("default".into());
+        mouse::reset(&app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(164, 36)).unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let (x, y) = (0..36)
+            .find_map(|y| {
+                let row: String = (0..164).map(|x| buffer[(x, y)].symbol()).collect();
+                row.find(" Edit ").map(|x| (x as u16, y))
+            })
+            .expect("painted Edit button");
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            mouse::action(&app, click(x)),
+            Some(MouseAction::Key(KeyCode::Enter))
+        );
+        assert_eq!(
+            mouse::action(&app, click(x + 5)),
+            Some(MouseAction::Key(KeyCode::Enter))
+        );
+        assert_ne!(
+            mouse::action(&app, click(x - 1)),
+            Some(MouseAction::Key(KeyCode::Enter))
+        );
+        assert_ne!(
+            mouse::action(&app, click(x + 6)),
+            Some(MouseAction::Key(KeyCode::Enter))
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let poller = crate::tui::ipc_poller::IpcPoller::new(&temp.path().join("absent.sock"));
+        let config = temp.path().join("config.toml");
+        crate::tui::handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &poller,
+            &config,
+        )
+        .await;
+        let sort_before = app.mouse.sort(Leaf::Profiles);
+        crate::tui::handle_mouse(&mut app, click(x), &poller, &config).await;
+        assert_eq!(
+            app.mouse.sort(Leaf::Profiles),
+            sort_before,
+            "Edit must not activate the focused sort column"
+        );
+        assert!(app.profiles.modal.is_some());
     }
 
     fn mk_profiles() -> BTreeMap<String, Profile> {
@@ -814,6 +1167,47 @@ mod tests {
             total_bytes: 0,
             provenance: Default::default(),
             custom_lists: Default::default(),
+        }
+    }
+
+    fn custom_list_catalog(lists: Vec<(&str, usize, usize)>) -> PolicyCatalog {
+        PolicyCatalog {
+            capabilities: Capabilities {
+                contract_version: crate::operator_rules::CONTRACT_VERSION,
+                schema_version: 5,
+                operator_rule_grammar: 1,
+                operations: Vec::new(),
+                semantic_hash: true,
+                activation_ack: true,
+                cluster_artifact: false,
+                limits: TransportLimits::IPC,
+            },
+            metadata: Metadata {
+                contract_version: crate::operator_rules::CONTRACT_VERSION,
+                schema_version: 5,
+                config_revision: "config-r1".into(),
+                desired_operator_policy_hash: String::new(),
+                active_policy: None,
+                activation_in_sync: true,
+                lists: lists.len(),
+                mounted_lists: 0,
+                orphan_packs: 0,
+            },
+            lists: lists
+                .into_iter()
+                .map(|(id, rules, malformed)| ListDetail {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    description: String::new(),
+                    config_revision: "config-r1".into(),
+                    pack_revision: format!("{id}-r1"),
+                    bytes: 0,
+                    rule_count: rules,
+                    invalid_rows: malformed,
+                    profiles: Vec::new(),
+                })
+                .collect(),
+            orphan_packs: Vec::new(),
         }
     }
 
@@ -843,18 +1237,117 @@ mod tests {
     #[test]
     fn master_rows_one_per_profile() {
         let profiles = mk_profiles();
-        let rows = master_rows(&profiles);
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_with(ConfigV1 {
+            profiles,
+            ..Default::default()
+        }));
+        let rows = build_display_rows(&app);
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
-    fn resolve_selected_index_hits_and_misses() {
+    fn display_row_index_hits_and_misses() {
         let profiles = mk_profiles();
-        // BTreeMap order: "default" (0), "kids" (1).
-        assert_eq!(resolve_selected_index(&profiles, Some("default")), Some(0));
-        assert_eq!(resolve_selected_index(&profiles, Some("kids")), Some(1));
-        assert_eq!(resolve_selected_index(&profiles, Some("ghost")), None);
-        assert_eq!(resolve_selected_index(&profiles, None), None);
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_with(ConfigV1 {
+            profiles,
+            ..Default::default()
+        }));
+        let rows = build_display_rows(&app);
+        assert_eq!(index_of_display_key(&rows, Some("default")), Some(0));
+        assert_eq!(index_of_display_key(&rows, Some("kids")), Some(1));
+        assert_eq!(index_of_display_key(&rows, Some("ghost")), None);
+        assert_eq!(index_of_display_key(&rows, None), None);
+    }
+
+    #[test]
+    fn display_rows_sort_numeric_list_counts_and_keep_selection_by_id() {
+        let mut profiles = mk_profiles();
+        profiles.get_mut("default").unwrap().custom_lists = vec![id("one")];
+        profiles.get_mut("kids").unwrap().custom_lists = vec![id("one"), id("two")];
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_with(ConfigV1 {
+            profiles,
+            ..Default::default()
+        }));
+        app.mouse.toggle_sort(Leaf::Profiles, 2);
+        let ascending = build_display_rows(&app);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "kids"]
+        );
+
+        app.profiles.selected_id = Some("kids".to_string());
+        app.mouse.toggle_sort(Leaf::Profiles, 2);
+        let descending = build_display_rows(&app);
+        assert_eq!(
+            index_of_display_key(&descending, app.profiles.selected_id.as_deref()),
+            Some(0),
+            "the immutable id follows its row when a numeric sort reverses"
+        );
+    }
+
+    #[test]
+    fn display_name_sort_uses_unicode_case_and_keeps_id_ties_ascending() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "zeta".to_string(),
+            Profile {
+                display_name: "Äther".into(),
+                ..Default::default()
+            },
+        );
+        profiles.insert(
+            "alpha".to_string(),
+            Profile {
+                display_name: "äther".into(),
+                ..Default::default()
+            },
+        );
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_with(ConfigV1 {
+            profiles,
+            ..Default::default()
+        }));
+
+        app.mouse.toggle_sort(Leaf::Profiles, 1);
+        for descending in [false, true] {
+            let rows = build_display_rows(&app);
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                ["alpha", "zeta"],
+                "Unicode-equivalent display names retain an ascending immutable-id tie"
+            );
+            if !descending {
+                app.mouse.toggle_sort(Leaf::Profiles, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn solved_profile_headers_match_the_mouse_click_gutters() {
+        let body = Rect::new(5, 7, 80, 1);
+        let columns =
+            crate::tui::ui::table_column_rects(body, &profile_constraints(), COLUMN_SPACING, 0);
+        assert_eq!(columns.first().unwrap().x, body.x);
+        assert!(columns.last().unwrap().right() <= body.right());
+        assert!(columns
+            .windows(2)
+            .all(|pair| pair[0].right().saturating_add(COLUMN_SPACING) == pair[1].x));
+    }
+
+    #[test]
+    fn profile_editor_is_modal_when_narrow_and_inline_when_wide() {
+        let mut app = App::new();
+        app.profiles.modal = Some(profile_modal::ProfileModal::open_add());
+        assert!(!inline_editor_visible(NARROW_THRESHOLD, &app));
+        app.active_leaf = Leaf::Profiles;
+        assert!(inline_editor_visible(NARROW_THRESHOLD - 1, &app));
+        assert!(inline_editor_visible(NARROW_THRESHOLD, &app));
     }
 
     // ── reference counting ────────────────────────────────────────────
@@ -865,7 +1358,7 @@ mod tests {
         // the fixture via TOML — the same pattern the Local DNS tab
         // tests use. A device + a subnet both reference "kids".
         let toml_src = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -953,7 +1446,7 @@ profile = "kids"
                 content.push_str(buf[(x, y)].symbol());
             }
         }
-        assert!(content.contains("Profiles"));
+        assert!(content.contains("PROFILES"));
     }
 
     #[test]
@@ -978,10 +1471,10 @@ profile = "kids"
                 content.push_str(buf[(x, y)].symbol());
             }
         }
-        assert!(content.contains("Profiles (2)"));
+        assert!(content.contains("PROFILES"));
         assert!(content.contains("kids"));
         // Side-card "What it blocks" summary renders for the selected profile.
-        assert!(content.contains("What it blocks"));
+        assert!(content.contains("WHAT IT BLOCKS"));
     }
 
     // ── "What it blocks" summary — pure composition (tui-wave1) ────────
@@ -994,7 +1487,7 @@ profile = "kids"
     /// `block_all`, which supersedes list resolution entirely.
     fn mk_blocks_config() -> ConfigV1 {
         let toml_src = r#"
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["1.1.1.1"]
@@ -1190,7 +1683,7 @@ url = "https://lists.example/adult.txt"
             }
         }
 
-        assert!(content.contains("What it blocks"));
+        assert!(content.contains("WHAT IT BLOCKS"));
         assert!(content.contains("Ads Basic"));
         assert!(content.contains("Malware Core"));
         assert!(content.contains("152K domains"));
@@ -1214,50 +1707,39 @@ url = "https://lists.example/adult.txt"
 
     // ── Custom lists mount line ─────────────────────────────────────────
 
-    fn mk_custom_list_store() -> CustomListStore {
-        let mut store = CustomListStore::new();
-        store.insert(
-            id("videogames"),
-            CompiledCustomList {
-                allow: vec!["a.example".into(), "b.example".into()],
-                deny: vec!["c.example".into()],
-                skipped: 0,
-            },
-        );
-        store
-    }
-
     #[test]
     fn custom_list_mounts_resolve_present_and_missing() {
         let profile = Profile {
             custom_lists: vec![id("videogames"), id("ghost-list")],
             ..Default::default()
         };
-        let store = mk_custom_list_store();
+        let catalog = custom_list_catalog(vec![("videogames", 3, 1)]);
 
-        let mounts = resolve_custom_list_mounts(&profile, &store);
+        let mounts = resolve_custom_list_mounts(&profile, Some(&catalog));
 
-        // Declaration order is preserved — same as `admin_rules_label`.
+        // Declaration order is preserved.
         assert_eq!(
             mounts,
-            vec![
+            CustomListMounts::Resolved(vec![
                 CustomListMount::Present {
                     id: "videogames".to_string(),
-                    allow: 2,
-                    deny: 1,
+                    rules: 3,
+                    malformed: 1,
                 },
                 CustomListMount::Missing {
                     id: "ghost-list".to_string(),
                 },
-            ]
+            ])
         );
     }
 
     #[test]
     fn custom_list_mounts_empty_when_profile_mounts_none() {
         let profile = Profile::default();
-        let store = mk_custom_list_store();
-        assert!(resolve_custom_list_mounts(&profile, &store).is_empty());
+        assert_eq!(
+            resolve_custom_list_mounts(&profile, None),
+            CustomListMounts::Resolved(Vec::new())
+        );
     }
 
     /// The indented domain-count line is a continuation of Blocklists, not
@@ -1274,15 +1756,16 @@ url = "https://lists.example/adult.txt"
 
         let mut cfg = mk_blocks_config();
         cfg.profiles.get_mut("kids").unwrap().custom_lists = vec![id("videogames")];
-        let mut loaded = loaded_with(cfg);
-        loaded.custom_lists = mk_custom_list_store();
+        let loaded = loaded_with(cfg);
 
         let mut app = App::new();
+        app.active_leaf = Leaf::Profiles;
         // Landed poll on both lists `kids` resolves to, so the indented
         // count line renders (same fixture as
         // `render_shows_resolved_lists_and_domain_count`).
         app.lists.entries = vec![dto("ads-basic", 100_000), dto("mal-core", 52_000)];
         app.loaded_config = Some(loaded);
+        app.operator_catalog = Some(custom_list_catalog(vec![("videogames", 3, 1)]));
         app.profiles.selected_id = Some("kids".to_string());
 
         term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &mut app))
@@ -1300,24 +1783,32 @@ url = "https://lists.example/adult.txt"
             .iter()
             .position(|r| r.contains(PROFILE_LABEL_BLOCKLISTS))
             .expect("Blocklists row renders");
-        let count_row = &rows[blocklists_y + 1];
+        let custom_lists_y = rows
+            .iter()
+            .position(|row| row.contains(PROFILE_LABEL_CUSTOM_LISTS))
+            .expect("Custom lists row renders before the detail viewport ends");
+        let blocklists_body = rows[blocklists_y..custom_lists_y].join("\n");
         assert!(
-            count_row.contains("152K domains"),
-            "row right after Blocklists is not its count-line continuation:\n{}",
+            blocklists_body.contains("152K domains"),
+            "the wrapped Blocklists continuation lost its domain count:\n{}",
             rows.join("\n")
         );
         assert!(
-            !count_row.contains(PROFILE_LABEL_CUSTOM_LISTS),
-            "Custom lists landed on the count line's row instead of after it:\n{}",
+            blocklists_y < custom_lists_y,
+            "Custom lists must follow the complete wrapped Blocklists value:\n{}",
             rows.join("\n")
         );
-        let custom_lists_row = &rows[blocklists_y + 2];
-        assert!(
-            custom_lists_row.contains(PROFILE_LABEL_CUSTOM_LISTS),
-            "Custom lists is not the row immediately after the count line:\n{}",
-            rows.join("\n")
-        );
-        assert!(custom_lists_row.contains("videogames (2 allow, 1 deny)"));
+        assert!(detail_panel::focus(&app, Leaf::Profiles));
+        assert!(detail_panel::handle_detail_key(
+            &mut app,
+            crossterm::event::KeyCode::End
+        ));
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 30), &mut app))
+            .unwrap();
+        let tail = term.backend().to_string();
+        for token in ["videogames", "(3", "rules,", "malformed)"] {
+            assert!(tail.contains(token), "missing {token:?} after End:\n{tail}");
+        }
     }
 
     #[test]
@@ -1336,16 +1827,24 @@ url = "https://lists.example/adult.txt"
                 ..Default::default()
             },
         );
-        let mut loaded = loaded_with(ConfigV1 {
+        let loaded = loaded_with(ConfigV1 {
             profiles,
             ..Default::default()
         });
-        loaded.custom_lists = mk_custom_list_store();
 
         let mut app = App::new();
+        app.active_leaf = Leaf::Profiles;
         app.loaded_config = Some(loaded);
+        app.operator_catalog = Some(custom_list_catalog(vec![("videogames", 3, 1)]));
         app.profiles.selected_id = Some("kids".to_string());
 
+        term.draw(|f| render(f, Rect::new(0, 0, 160, 30), &mut app))
+            .unwrap();
+        assert!(detail_panel::focus(&app, Leaf::Profiles));
+        assert!(detail_panel::handle_detail_key(
+            &mut app,
+            crossterm::event::KeyCode::End
+        ));
         term.draw(|f| render(f, Rect::new(0, 0, 160, 30), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1359,33 +1858,35 @@ url = "https://lists.example/adult.txt"
         let content = rows.join("\n");
 
         assert!(content.contains(PROFILE_LABEL_CUSTOM_LISTS));
-        assert!(
-            content.contains("videogames (2 allow, 1 deny)"),
-            "present mount not rendered as id (N allow, M deny):\n{content}"
-        );
-        assert!(
-            content.contains("ghost-list (missing)"),
-            "dangling mount not rendered as id (missing):\n{content}"
-        );
+        for token in [
+            "videogames",
+            "(3",
+            "rules,",
+            "malformed)",
+            "ghost-list",
+            "(missing)",
+        ] {
+            assert!(
+                content.contains(token),
+                "mount token {token:?} not rendered from catalogue metadata after End:\n{content}"
+            );
+        }
 
         // A whole-line colour would hide the dangling reference among the
         // valid ones — each mount must carry its own colour.
-        let row_y = rows
-            .iter()
-            .position(|r| r.contains(PROFILE_LABEL_CUSTOM_LISTS))
-            .expect("Custom lists row renders");
-        let row = &rows[row_y];
-        // `find` returns a BYTE offset; the frame's left border + gutter
-        // divider are multi-byte glyphs, so the column is the CHAR count
-        // up to that offset, not the byte offset itself.
-        let present_x = row[..row.find("videogames").expect("present id renders")]
-            .chars()
-            .count() as u16;
-        let missing_x = row[..row.find("ghost-list").expect("missing id renders")]
-            .chars()
-            .count() as u16;
-        assert_eq!(buf[(present_x, row_y as u16)].fg, T.text_primary);
-        assert_eq!(buf[(missing_x, row_y as u16)].fg, T.error);
+        let find_cell = |needle: &str| {
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} must remain reachable after End"));
+            let x = row[..row.find(needle).unwrap()].chars().count() as u16;
+            (x, y as u16)
+        };
+        let present = find_cell("videogames");
+        let missing = find_cell("ghost-list");
+        assert_eq!(buf[present].fg, T.text_primary);
+        assert_eq!(buf[missing].fg, T.error);
     }
 
     #[test]
@@ -1396,13 +1897,22 @@ url = "https://lists.example/adult.txt"
         let mut term = Terminal::new(backend).unwrap();
 
         let mut app = App::new();
+        app.active_leaf = Leaf::Profiles;
         app.loaded_config = Some(loaded_with(ConfigV1 {
             profiles: mk_profiles(),
             ..Default::default()
         }));
+        app.operator_catalog = Some(custom_list_catalog(Vec::new()));
         // "default" mounts no custom lists (`Profile::default()`).
         app.profiles.selected_id = Some("default".to_string());
 
+        term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &mut app))
+            .unwrap();
+        assert!(detail_panel::focus(&app, Leaf::Profiles));
+        assert!(detail_panel::handle_detail_key(
+            &mut app,
+            crossterm::event::KeyCode::End
+        ));
         term.draw(|f| render(f, Rect::new(0, 0, 120, 24), &mut app))
             .unwrap();
         let buf = term.backend().buffer().clone();
@@ -1414,16 +1924,11 @@ url = "https://lists.example/adult.txt"
             })
             .collect();
 
-        let row_y = rows
+        let (row_y, row) = rows
             .iter()
-            .position(|r| r.contains(PROFILE_LABEL_CUSTOM_LISTS))
-            .expect("Custom lists row renders");
-        let row = &rows[row_y];
-        assert!(
-            row.contains(PROFILE_CUSTOM_LISTS_NONE),
-            "zero-mount row does not show the none-mounted sentinel:\n{row}"
-        );
-        // Byte offset -> char offset (same border/gutter skew as above).
+            .enumerate()
+            .find(|(_, row)| row.contains(PROFILE_CUSTOM_LISTS_NONE))
+            .expect("zero-mount sentinel remains reachable after End");
         let value_x = row[..row.find(PROFILE_CUSTOM_LISTS_NONE).unwrap()]
             .chars()
             .count() as u16;
@@ -1440,8 +1945,7 @@ url = "https://lists.example/adult.txt"
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         // Just above `NARROW_THRESHOLD` so the side-card still renders, but
-        // the 62% split leaves it tight enough that the value must wrap
-        // rather than fit on one physical row.
+        // the 62% split is narrow enough to expose status fragmentation.
         let width = NARROW_THRESHOLD + 5;
         let backend = TestBackend::new(width, 30);
         let mut term = Terminal::new(backend).unwrap();
@@ -1455,14 +1959,14 @@ url = "https://lists.example/adult.txt"
                 ..Default::default()
             },
         );
-        let mut loaded = loaded_with(ConfigV1 {
+        let loaded = loaded_with(ConfigV1 {
             profiles,
             ..Default::default()
         });
-        loaded.custom_lists = mk_custom_list_store();
 
         let mut app = App::new();
         app.loaded_config = Some(loaded);
+        app.operator_catalog = Some(custom_list_catalog(vec![("videogames", 3, 1)]));
         app.profiles.selected_id = Some("kids".to_string());
 
         term.draw(|f| render(f, Rect::new(0, 0, width, 30), &mut app))
@@ -1486,33 +1990,23 @@ url = "https://lists.example/adult.txt"
             );
         let label_row = &rows[row_y];
 
-        // Confirm this width actually forces a wrap — the whole point of
-        // the test. If the full value fit on one physical row, a
-        // truncation bug in a narrower pane would slip past every
-        // assertion below it.
+        // The second mount belongs on its own continuation row. Keeping a
+        // mount atomic prevents Paragraph wrapping from splitting its status
+        // into `(m` / `issing)` fragments.
         assert!(
             !label_row.contains("(missing)"),
-            "value fit on one row — this width does not exercise the wrap:\n{content}"
+            "the missing mount must use a continuation row:\n{content}"
         );
 
-        // `Wrap { trim: false }` on the side-card Paragraph must carry the
-        // overflow onto the next row, not drop it. Checked per token rather
-        // than as one contiguous phrase: a legitimate wrap point between
-        // tokens (e.g. between "(2" and "allow,") would break a combined-
-        // phrase match without the row actually losing anything.
-        for token in [
-            "videogames",
-            "(2",
-            "allow,",
-            "deny)",
-            "ghost-list",
-            "(missing)",
-        ] {
-            assert!(
-                content.contains(token),
-                "token {token:?} missing from a narrow detail pane — silent truncation:\n{content}"
-            );
-        }
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("videogames (3 rules, 1 malformed)")),
+            "the valid mount summary must remain readable on one row:\n{content}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("ghost-list (missing)")),
+            "the dangling mount warning must remain readable on one row:\n{content}"
+        );
     }
 
     /// The `TAGS` master column is gone — header AND cell.

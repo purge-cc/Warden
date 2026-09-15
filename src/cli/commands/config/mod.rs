@@ -3,7 +3,7 @@
 //! Split into one file per action to keep each handler focused:
 //! - [`show`] — print merged config, optionally annotated / resolved / filtered.
 //! - [`lint`] — validate without touching the daemon.
-//! - [`diff`] — structured diff between two v1 config files.
+//! - [`diff`] — structured diff between two schema-5 config files.
 //! - [`edit`] — open config in `$EDITOR` then validate.
 //! - [`backup`] — timestamped tar.gz snapshot of the config tree.
 //! - [`restore`] — staged replace of the live config from a tar.gz.

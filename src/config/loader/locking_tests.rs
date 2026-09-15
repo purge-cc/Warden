@@ -662,6 +662,7 @@ fn secrets_and_custom_packs_use_the_held_root() {
         4,
         now(),
         None,
+        None,
         &mut AuditWarnings::emitting(),
     )
     .unwrap();
@@ -694,7 +695,14 @@ fn custom_pack_parent_cannot_escape_the_root() {
     .unwrap();
     std::os::unix::fs::symlink(outside.path(), dir.path().join("packs")).unwrap();
     let errors = load_config(&master, now()).unwrap_err();
-    assert!(errors[0].context().reason.contains("escapes config root"));
+    assert!(
+        errors[0]
+            .context()
+            .reason
+            .contains("unsupported flat Custom List pack tree"),
+        "{}",
+        errors[0]
+    );
     assert_eq!(
         fs::read_to_string(outside.path().join("mine.txt")).unwrap(),
         "||external.example.test^\n"

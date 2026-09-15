@@ -13,7 +13,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -46,7 +46,7 @@ fn editor_save_refreshes_loaded_config_not_just_the_viewer() {
     let edited = dir.path().join("edited.toml");
     std::fs::write(
         &edited,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -61,7 +61,7 @@ display_name = "Edited By Operator"
     .unwrap();
 
     let mut app = App::new();
-    app.loaded_config = load_v1_config(&master);
+    app.loaded_config = load_current_config(&master);
     assert_eq!(
         app.loaded_config.as_ref().unwrap().config.profiles["default"].display_name,
         "Default",
@@ -135,7 +135,7 @@ fn invalid_staged_edit_leaves_the_live_bytes_and_cache_unchanged() {
     let invalid = dir.path().join("invalid.toml");
     std::fs::write(&invalid, "schema_version = [\n").unwrap();
     let mut app = App::new();
-    app.loaded_config = load_v1_config(&master);
+    app.loaded_config = load_current_config(&master);
 
     let outcome = run_file_editor_guarded(&mut app, &master, &format!("cp {}", invalid.display()));
 
@@ -170,7 +170,7 @@ fn editor_uses_the_canonical_master_when_started_through_an_alias() {
     let edited = alias_dir.path().join("edited.toml");
     std::fs::write(
         &edited,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -228,7 +228,7 @@ parent="$(dirname "$stage")"
 printf '%s %s %s\n' "$(stat -c '%a' "$parent")" "$(stat -c '%a' "$stage")" "$parent" > "$marker"
 printf 'editor backup\n' > "$stage~"
 cat > "$stage.next" <<'TOML'
-schema_version = 4
+schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -275,7 +275,7 @@ fn saved_refresh_failure_keeps_caches_and_still_requests_reload() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let mut app = App::new();
-    app.loaded_config = load_v1_config(&master);
+    app.loaded_config = load_current_config(&master);
     app.file.config_text = "old text".to_string();
     app.file.sections = vec!["old".to_string()];
     assert!(

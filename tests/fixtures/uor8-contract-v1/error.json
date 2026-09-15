@@ -1,0 +1,7 @@
+{
+  "type": "operator_rules_error",
+  "error": {
+    "code": "revision_conflict",
+    "message": "configuration changed; read and plan again"
+  }
+}

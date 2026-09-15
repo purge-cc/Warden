@@ -39,7 +39,7 @@ use purge_warden::ipc::protocol::{IpcCommand, IpcResponse, ProfileUpdatePatch, T
 use purge_warden::ipc::socket_client;
 use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 
-const MASTER_SEED: &str = r#"schema_version = 4
+const MASTER_SEED: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -88,6 +88,7 @@ async fn spawn_fixture() -> Fixture {
         upstream_mode: "plain".into(),
         upstream_count: 0,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -95,6 +96,7 @@ async fn spawn_fixture() -> Fixture {
         api_token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(Some(token_hash))),
         config_path: Some(master.clone()),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         list_statuses: None,
         list_state: None,
         local_records_hits: None,
@@ -110,6 +112,8 @@ async fn spawn_fixture() -> Fixture {
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
 
     let handle = spawn_ipc_server(socket_path.clone(), Arc::new(state))

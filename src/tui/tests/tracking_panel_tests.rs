@@ -17,7 +17,7 @@ fn panel_loads_from_config_defaults() {
 }
 
 #[test]
-fn focus_cycles_through_three_fields() {
+fn focus_cycles_through_fields_and_actions() {
     let panel = baseline_panel();
     let f0 = panel.focus;
     let f1 = f0.next();
@@ -25,8 +25,10 @@ fn focus_cycles_through_three_fields() {
     let f3 = f2.next();
     assert_eq!(f1, TrackingFocus::Mode);
     assert_eq!(f2, TrackingFocus::Retention);
-    assert_eq!(f3, TrackingFocus::Enabled, "cycle wraps around");
-    assert_eq!(f0.prev(), TrackingFocus::Retention);
+    assert_eq!(f3, TrackingFocus::Discard);
+    assert_eq!(f3.next(), TrackingFocus::Save);
+    assert_eq!(f3.next().next(), TrackingFocus::Enabled);
+    assert_eq!(f0.prev(), TrackingFocus::Save);
 }
 
 #[test]
@@ -94,5 +96,67 @@ fn frozen_strings_are_pinned() {
     assert_eq!(
         crate::tui::tabs::settings::TRACKING_SAMPLED_LABEL,
         "Sampled (10%)"
+    );
+}
+
+#[tokio::test]
+async fn successful_tracking_save_closes_form_and_refreshes_config_values() {
+    if super::profile_creation_tests::isolated_auth_process("tui::tracking_panel_tests::successful_tracking_save_closes_form_and_refreshes_config_values") { return; }
+    use crate::ipc::protocol::{IpcCommand, IpcResponse};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = "schema_version = 5\n[upstream]\nservers = [\"192.0.2.1:53\"]\n[server]\ndefault_profile = \"home\"\n[profiles.home]\ndisplay_name = \"Home\"\n";
+    std::fs::write(&path, config).unwrap();
+    let socket = dir.path().join("tracking.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let master = path.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        let command: IpcCommand = serde_json::from_str(&line).unwrap();
+        assert!(
+            matches!(command, IpcCommand::TrackingConfigUpdate { patch, .. } if patch.retention_days == Some(14))
+        );
+        std::fs::write(
+            master,
+            format!("{config}\n[tracking]\nretention_days = 14\n"),
+        )
+        .unwrap();
+        let mut response = serde_json::to_vec(&IpcResponse::Ok {
+            message: "tracking config updated".into(),
+        })
+        .unwrap();
+        response.push(b'\n');
+        stream.write_all(&response).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let mut app = App::known_standalone_for_test();
+    app.active_leaf = Leaf::Settings;
+    app.loaded_config = load_current_config(&path);
+    let mut panel = baseline_panel();
+    panel.retention_days = 14;
+    panel.retention_input = "14".into();
+    let patch = panel.to_patch();
+    app.settings.tracking_panel = Some(panel);
+    action_handlers::tracking(&mut app, patch, &IpcPoller::new(&socket)).await;
+    server.await.unwrap();
+    assert!(app.settings.tracking_panel.is_none());
+    assert_eq!(
+        app.loaded_config
+            .as_ref()
+            .unwrap()
+            .config
+            .tracking
+            .retention_days,
+        14
     );
 }

@@ -154,6 +154,7 @@ pub struct RemoveConfirm {
     pub id: String,
     pub display_name: String,
     pub cidrs: Vec<String>,
+    pub focus: usize,
 }
 
 impl FormField {
@@ -387,6 +388,7 @@ impl SubnetModal {
                 id: subnet.id.as_str().to_string(),
                 display_name: subnet.display_name.clone(),
                 cidrs: subnet.cidrs.clone(),
+                focus: 0,
             }),
         }
     }
@@ -434,27 +436,19 @@ impl SubnetModal {
 
 // ── Render (Archetype F / C via `modal_form`) ──────────────────────────
 //
-// Every span in this module comes out of `modal_form`; not one colour is
-// chosen here. That is deliberate, not an aesthetic preference: the
-// ecosystem colour rule has exactly one implementation, so every modal
-// surface cannot drift apart. Pinned by
-// `no_hand_rolled_colour_in_this_module` below.
-
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, ValueKind};
+use crate::tui::theme::{CardRole, T};
 
-/// Nav-key legend copy. Byte-identical to the legacy
-/// `modal_form::keys_line()` string this modal used before the
-/// migration to `modal_form`, which changes chrome, layout and colour
-/// and leaves the keying alone, so the legend it advertises must not
-/// move either.
-///
-/// The action row bakes its own key into each button's label
-/// (`[Esc] Discard` / `[Enter] Save`), so a blanket "Enter save · Esc
-/// cancel" here would be a second, redundant source of the same fact.
-const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} change";
+const MODAL_W: u16 = 68;
+
+/// The field hint supplies the context needed at each focus stop, leaving
+/// the footer clear for the compact actions.
+const KEYS: &str = "";
 
 /// Draw the modal as an overlay anchored on the tab content rect.
 /// Branches on the stage so the operator sees the form, the confirm
@@ -476,10 +470,9 @@ const KEYS: &str = "\u{21b9}/\u{2191}\u{2193} move \u{b7} \u{2190}/\u{2192} chan
 /// Remove confirm and the outcome screens carry their meaning in the
 /// body — a `Blocking`/`Healthy` value colour — instead of in the frame.
 pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &SubnetModal) {
-    const W: u16 = 64;
     match &modal.stage {
         Stage::EditingForm(form) => {
-            let render = modal_form::render_modal(f, anchor, W, |w| form_body(form, w));
+            let render = modal_form::render_modal(f, anchor, MODAL_W, |w| form_body(form, w));
             // The `_` caret of the old grid is gone; the focused text
             // field hosts the real terminal cursor, as the Lists
             // reference does. `place_cursor` no-ops when that row is
@@ -490,22 +483,37 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &SubnetModal) {
         }
         Stage::ConfirmingRemove(rc) => {
             let spec = remove_notice(rc);
-            modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+            modal_form::render_modal(f, anchor, MODAL_W, |w| {
+                (modal_form::notice_body(&spec, w), ())
+            });
         }
         Stage::Submitted(outcome) => {
             let spec = outcome_notice(outcome);
-            modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+            modal_form::render_modal(f, anchor, MODAL_W, |w| {
+                (modal_form::notice_body(&spec, w), ())
+            });
         }
     }
 }
 
 /// Title + description band copy for the add/edit form.
 fn band_text(form: &AddForm) -> (String, &'static str) {
-    const DESC: &str = "map a range of client addresses to the profile they get";
+    const DESC: &str = "Identity, Address Ranges & Policy";
     match form.mode {
         FormMode::Add => ("Add subnet".to_string(), DESC),
-        FormMode::Edit => (format!("Edit subnet \u{b7} {}", form.id), DESC),
+        FormMode::Edit => ("Edit subnet".to_string(), DESC),
     }
+}
+
+fn form_section(label: &str, width: u16, role: CardRole) -> Line<'static> {
+    let label = modal_form::fit(&label.to_uppercase(), width as usize);
+    Line::styled(
+        crate::tui::text::pad(&label, width as usize),
+        Style::default()
+            .fg(T.text_inverse)
+            .bg(T.card_title_bg(role))
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// Build the add/edit form as an Archetype-F [`modal_form::ScrollBody`] —
@@ -525,13 +533,12 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     let (title, desc) = band_text(form);
     let mut rows = modal_form::FormRows::new(&title, desc, width);
 
-    // IDENTITY
-    rows.section("Identity");
+    rows.line(form_section("Identity", width, CardRole::Summary));
     if form.mode == FormMode::Add {
         let f = focus == FormField::Id;
         rows.text_field(
             modal_form::value_row(
-                "id",
+                "ID",
                 &form.id,
                 f,
                 ValueKind::Identity,
@@ -549,7 +556,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         // focusable but cannot be reached is the same silent class of
         // defect as a row that can be reached but not seen.
         rows.line(modal_form::value_row(
-            "id",
+            "ID",
             &form.id,
             false,
             ValueKind::Identity,
@@ -560,7 +567,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     let dn = focus == FormField::DisplayName;
     rows.text_field(
         modal_form::value_row(
-            "display name",
+            "Display Name",
             &form.display_name,
             dn,
             ValueKind::Editable,
@@ -573,12 +580,11 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     );
     rows.spacer();
 
-    // RANGE
-    rows.section("Range");
+    rows.line(form_section("Address Ranges", width, CardRole::Analytics));
     let cidrs = focus == FormField::Cidrs;
     rows.text_field(
         modal_form::value_row(
-            "cidrs",
+            "CIDRs",
             &form.cidrs,
             cidrs,
             ValueKind::Identity,
@@ -589,10 +595,20 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         field_hint(FormField::Cidrs),
         chars(&form.cidrs),
     );
+    rows.spacer();
+    rows.spacer();
+
+    rows.line(form_section("Policy", width, CardRole::History));
+    let profile = focus == FormField::Profile;
+    rows.field(
+        modal_form::selector_row("Profile", form.profile_option_label(), profile, width),
+        profile,
+        field_hint(FormField::Profile),
+    );
     let priority = focus == FormField::Priority;
     rows.text_field(
         modal_form::value_row(
-            "priority",
+            "Priority",
             &form.priority_input,
             priority,
             ValueKind::Editable,
@@ -603,16 +619,11 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
         field_hint(FormField::Priority),
         chars(&form.priority_input),
     );
+    // Keep the reference modal's 23-row frame and its breathing room above
+    // the footer without making the section headers two-row components.
     rows.spacer();
-
-    // POLICY
-    rows.section("Policy");
-    let profile = focus == FormField::Profile;
-    rows.field(
-        modal_form::selector_row("profile", form.profile_option_label(), profile, width),
-        profile,
-        field_hint(FormField::Profile),
-    );
+    rows.spacer();
+    rows.spacer();
     // Discard left, Save right — the one `Primary` fill sits right-most
     // on every Archetype-F form. The focus ring still reaches `Submit`
     // before `Cancel`, unchanged — same precedent as `profile_modal.rs`'s
@@ -625,17 +636,19 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     // that destroys something already saved.
     let actions = [
         Action::new(
-            "  [Esc] Discard  ",
+            "Discard",
             focus == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
-            "  [Enter] Save  ",
+            "Save",
             focus == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -668,12 +681,8 @@ fn field_hint(f: FormField) -> &'static str {
 
 /// The Remove confirm as an Archetype-C notice.
 ///
-/// The keying is unchanged (D7′): a single `y` / `n` keypress, no focus
-/// ring. The actions are painted with their key in the label because of
-/// that — they orient, they are not Tab targets — and **neither is
-/// `Primary`, so the modal has no filled button at all**. The one teal
-/// fill means "this is the action"; a destructive confirm should not be
-/// advertising one.
+/// The familiar `y` / `n` shortcuts remain available, while the two
+/// actions also participate in a keyboard focus ring for discoverability.
 fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
     NoticeSpec {
         hint_rows: None,
@@ -695,8 +704,10 @@ fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
         hint: "device mappings are untouched — only resolution by range changes".to_string(),
         keys: "[y] confirm   [n / Esc] cancel".to_string(),
         actions: vec![
-            Action::new("  [n] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Remove  ", false, ActionKind::Destructive, ""),
+            Action::new("  [n] Cancel  ", rc.focus == 0, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  [y] Remove  ", rc.focus == 1, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
 }
@@ -731,7 +742,8 @@ fn outcome_notice(outcome: &SubmitOutcome) -> NoticeSpec {
         error,
         hint: String::new(),
         keys: "[any key] close".to_string(),
-        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")],
+        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")
+            .on_key(crossterm::event::KeyCode::Esc)],
     }
 }
 

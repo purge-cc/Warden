@@ -27,7 +27,7 @@ fn mk_cfg(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
             &master,
-            "schema_version = 4\n\n             [upstream]\nservers = [\"192.0.2.1:53\"]\n\n             [server]\ndefault_profile = \"default\"\n\n             [profiles.default]\ndisplay_name = \"Default\"\n",
+            "schema_version = 5\n\n             [upstream]\nservers = [\"192.0.2.1:53\"]\n\n             [server]\ndefault_profile = \"default\"\n\n             [profiles.default]\ndisplay_name = \"Default\"\n",
         )
         .unwrap();
     master
@@ -133,29 +133,8 @@ async fn ctrl_s_saves_the_group_modal_from_the_last_field() {
     }
 }
 
-/// The profile modal's half of `arm_valve_then_ctrl_s!` retired with
-/// the tag picker it armed: this form no longer has one, so there is
-/// no slug for a save to drop and nothing to report. The macro is
-/// still exercised by the Subnets and Groups twins above.
-///
-/// N14 still has to hold on the field that replaced it, and that is
-/// what this asserts: `Ctrl+S` saves from a per-list override row,
-/// which is the deepest field in the Edit ring and therefore the one
-/// an operator is most likely to be standing on. Written against a
-/// ghost socket, so the save FAILS — which is still the point, just not
-/// the same point it used to be.
-///
-/// **`profile-01` (2026-08-28 review) inverted the passing signal.**
-/// Before that fix, `submit_profile_modal` dropped to `Stage::Submitted`
-/// on every outcome including a refused save, so this test's proof that
-/// "the chord did something" was `Stage::Submitted(_)` — a modal still
-/// in `EditingForm` meant the keystroke never reached the submit path.
-/// After the fix, a `Failed` outcome deliberately KEEPS the form open
-/// (mirrors `submit_subnet_modal` / `submit_local_dns_modal`), so
-/// `Stage::Submitted(_)` is no longer reachable from this path at all —
-/// asserting it here would be asserting the regression `profile-01`
-/// fixed. The signal that the chord was not swallowed is now
-/// `form.error_message` carrying the poller's refusal.
+/// Ctrl+S submits from a list row. A refused write retains the draft,
+/// whether the error fits inline or needs its scrollable details.
 #[tokio::test]
 async fn ctrl_s_saves_the_profile_modal_from_a_list_override_row() {
     use crate::tui::profile_modal::{FormField, ProfileModal, Stage};
@@ -192,14 +171,21 @@ async fn ctrl_s_saves_the_profile_modal_from_a_list_override_row() {
     ctrl_s.modifiers = KeyModifiers::CONTROL;
     handle_profile_modal_key(&mut app, ctrl_s, &poller(), &cfg).await;
 
-    match &app.profiles.modal.as_ref().expect("modal still open").stage {
-        Stage::EditingForm(f) => assert!(
-            f.error_message.is_some(),
-            "Ctrl+S on a panel row must reach the submit path and report the \
-             refusal, not sit silent — it was swallowed if error_message is None"
-        ),
-        other => panic!("a refused save must keep the form open (profile-01), got {other:?}"),
-    }
+    let form = match &app.profiles.modal.as_ref().expect("modal still open").stage {
+        Stage::EditingForm(form) => form,
+        Stage::ReviewingError(review) => &review.form,
+        other => panic!("a refused save must keep the form recoverable, got {other:?}"),
+    };
+    assert!(
+        form.error_message.is_some(),
+        "Ctrl+S must report the refusal"
+    );
+    assert_eq!(form.focused, FormField::ListOverride(0));
+    assert_eq!(
+        form.lists_draft
+            .get(&crate::config::schema::Id::new("ads").unwrap()),
+        Some(&crate::config::schema::blocklist::ListPolicy::Deny),
+    );
 }
 
 /// `profile-01`, direct: a refused Add needs no daemon round-trip — `id`

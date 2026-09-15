@@ -1,15 +1,13 @@
 use super::*;
 
-/// Minimal config: one profile, one subnet tagged `["ads"]`. Real
-/// `load_config` (not a hand-built `ConfigV1`) so `set_fields_inner`
-/// / `apply_tags_inner` see the same TOML document shape they do in
-/// production.
+/// Minimal current-schema config: one profile and one subnet. Real loading
+/// ensures `set_fields_inner` sees the same document shape as production.
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -25,7 +23,6 @@ id = "lan"
 display_name = "LAN"
 cidrs = ["10.0.0.0/24"]
 profile = "home"
-tags = ["ads"]
 "#,
     )
     .unwrap();

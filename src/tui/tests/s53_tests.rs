@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::commands::blocklists::{run_add, LIST_DELETE_CONFIRM_FAILED};
-use crate::config::loader::load_config;
+use crate::config::loader::load_current_config as load_config;
 use crate::config::schema::{BlocklistBase, BlocklistFormat, BlocklistTrust};
 use crate::tui::app::{App, EditField, EditListModal, EditModalMode, IntervalChoice, Leaf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -22,7 +22,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -62,7 +62,7 @@ async fn seed_with_one_list(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn app_with_modal_for(master: &Path, modal: EditListModal) -> App {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     let loaded = load_config(master, time::OffsetDateTime::now_utc()).unwrap();
     app.loaded_config = Some(loaded);
     app.active_leaf = Leaf::Lists;
@@ -576,14 +576,12 @@ async fn unsigned_promote_consent_handler_keeps_source_and_operation() {
 
 // ── the [K] path's gate ─────────────────────────────────────────
 
-/// A master config with one deny-list carrying **no `tags` key at
-/// all** — the shape `content-gambling` has on the CT, and the one
-/// the loader promotes.
+/// A current-schema master config with one deny-list.
 fn master_with_untagged_deny(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -593,7 +591,6 @@ default_profile = "default"
 
 [profiles.default]
 display_name = "Default"
-tags = ["uncategorized"]
 
 [[blocklists]]
 id = "content-gambling"
@@ -613,19 +610,8 @@ fn app_loaded_from(master: &Path) -> App {
     app
 }
 
-/// **The discriminating test for the whole change.**
-///
-/// The list has no `tags` in its file, so flipping it to `allow`
-/// must be refused. But the loaded config the TUI holds shows it
-/// tagged `["uncategorized"]`, because the loader promotes untagged
-/// deny-lists — so a gate written against the in-memory state
-/// returns `Proceed` and the operator gets a standing exemption for
-/// every device on the profile carrying that tag.
-///
-/// The first assertion establishes that the two sources really do
-/// disagree here. Without it this test would keep passing against a
-/// fixture that had quietly stopped exercising the promotion, and a
-/// green test that no longer discriminates is worse than none.
+/// A remote unsigned list still needs explicit consent before becoming an
+/// allow-direction list.
 #[test]
 fn the_k_gate_on_an_untagged_remote_list_asks_for_consent_now() {
     let dir = tempfile::tempdir().unwrap();
@@ -645,16 +631,12 @@ fn the_k_gate_on_an_untagged_remote_list_asks_for_consent_now() {
     );
 }
 
-/// With a real tag in the file, the same list reaches the consent
-/// question. The companion to the test above: it proves the refusal
-/// there was about the tags and not about the gate refusing
-/// everything.
+/// Trust, not retired tag metadata, determines whether the direction change
+/// can proceed without a typed consent step.
 #[test]
-fn the_k_gate_asks_for_consent_once_the_file_carries_a_tag() {
+fn the_k_gate_distinguishes_remote_and_local_trust() {
     let dir = tempfile::tempdir().unwrap();
     let master = master_with_untagged_deny(&dir);
-    let doc = std::fs::read_to_string(&master).unwrap();
-    std::fs::write(&master, format!("{doc}tags = [\"kids\"]\n")).unwrap();
     let app = app_loaded_from(&master);
 
     assert_eq!(
@@ -798,18 +780,9 @@ fn the_edit_builder_writes_every_blocklist_field() {
     let value = build_blocklist_value(&modal).expect("fixture must serialise");
     let tbl = value.as_table().expect("a row is a table");
 
-    // **`tags` left `FIELDS` in `plp-s5d`, and dropping it quietly
-    // would have been indistinguishable from the defect this test
-    // exists to catch** — a field the builder forgot, reset to its
-    // serde default on the next save. So the omission is asserted
-    // rather than merely absent: the builder must write NO `tags` key,
-    // deliberately, and if someone restores the write this goes red
-    // instead of the list silently agreeing with them.
-    //
-    // Why not writing it is the safe direction: see the note on
-    // `build_blocklist_value`. In short, `Blocklist` is
-    // `deny_unknown_fields`, so once `plp-s5a` removes the field a row
-    // still carrying `tags = [...]` fails to LOAD.
+    // The current blocklist shape intentionally has no tag field. A
+    // reintroduced legacy key must be caught here before a whole-row save
+    // can make a current policy unloadable.
     assert!(
         !tbl.contains_key("tags"),
         "the builder wrote a `tags` key; `plp-s5d` removed it on purpose \
@@ -976,8 +949,8 @@ fn catalog_batch_updates_each_fragment_owner_and_adds_once_to_the_creation_targe
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let master_text = std::fs::read_to_string(&master).unwrap().replace(
-        "schema_version = 4\n",
-        "schema_version = 4\nincludes = [\"fragments/*.toml\"]\n",
+        "schema_version = 5\n",
+        "schema_version = 5\nincludes = [\"fragments/*.toml\"]\n",
     );
     std::fs::write(&master, master_text).unwrap();
     let fragments = dir.path().join("fragments");
@@ -1215,8 +1188,8 @@ fn list_edit_updates_its_fragment_owner_without_creating_a_master_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let master_text = std::fs::read_to_string(&master).unwrap().replace(
-        "schema_version = 4\n",
-        "schema_version = 4\nincludes = [\"fragments/*.toml\"]\n",
+        "schema_version = 5\n",
+        "schema_version = 5\nincludes = [\"fragments/*.toml\"]\n",
     );
     std::fs::write(&master, master_text).unwrap();
     let fragments = dir.path().join("fragments");
@@ -1635,7 +1608,7 @@ fn write_promote_master(dir: &tempfile::TempDir, orphan_source: &str) -> PathBuf
     std::fs::write(
         &master,
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1788,39 +1761,24 @@ async fn s53_promote_discard_button_removes_orphan_without_creating_entry() {
 // exercised by `s53_enter_on_focused_list_row_opens_edit_modal_via_handle_lists_key`
 // below (against a v2-shape fixture).
 
-// ── S53 follow-up — `[a]` Add mode + `[B]` catalog picker ────────
+// ── S53 follow-up — `[a]` subscription source chooser ───────────
 
 #[tokio::test]
-async fn s53_a_hotkey_opens_add_modal_with_blank_buffers() {
+async fn s53_a_hotkey_opens_import_source_chooser() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.loaded_config = Some(load_config(&master, time::OffsetDateTime::now_utc()).unwrap());
     app.active_leaf = Leaf::Lists;
     let poller = dummy_poller(dir.path());
 
     handle_lists_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
 
-    let modal = app
-        .lists
-        .edit_modal
-        .as_ref()
-        .expect("`a` must open the edit modal in Add mode");
-    match &modal.mode {
-        crate::tui::app::EditModalMode::Add => {}
-        other => panic!("expected Add mode, got {other:?}"),
-    }
-    assert!(modal.blocklist_id.is_empty(), "id starts blank");
-    assert!(modal.url.is_empty(), "url starts blank");
-    assert!(modal.display_name.is_empty(), "display_name starts blank");
-    assert!(
-        matches!(modal.focus, EditField::ListId),
-        "focus starts on ListId"
-    );
+    assert_eq!(app.lists.import_source, Some(0));
 }
 
-/// The first-run welcome screen tells a fresh operator to press `B` or
-/// `a` on the Lists leaf. Those two letters have no table to be derived
+/// The first-run welcome screen tells a fresh operator to press `a` on
+/// the Lists leaf. That letter has no table to be derived
 /// from — unlike the `g <letter>` jumps, which `welcome_copy` builds
 /// from `Leaf::mnemonic`, so they cannot go stale — and this is the only
 /// thing between that screen and a hint pointing at a dead key.
@@ -1835,8 +1793,8 @@ async fn s53_a_hotkey_opens_add_modal_with_blank_buffers() {
 async fn welcome_banner_lists_keys_are_live_bindings() {
     let copy = crate::tui::welcome_banner::welcome_copy();
     assert!(
-        copy.contains("  B  ") && copy.contains("  a  "),
-        "welcome copy no longer advertises `B` / `a` — retarget this pin \
+        copy.contains("  a  ") && !copy.contains("  B  "),
+        "welcome copy must advertise only the live Lists add key — retarget this pin \
              at whatever it advertises now instead of deleting it:\n{copy}"
     );
 
@@ -1844,22 +1802,20 @@ async fn welcome_banner_lists_keys_are_live_bindings() {
     let master = mk_master(&dir);
     let poller = dummy_poller(dir.path());
 
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.loaded_config = Some(load_config(&master, time::OffsetDateTime::now_utc()).unwrap());
     app.active_leaf = Leaf::Lists;
     handle_lists_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
-    assert!(
-        app.lists.edit_modal.is_some(),
+    assert_eq!(
+        app.lists.import_source,
+        Some(0),
         "the welcome screen sends a fresh operator to `a` on Lists, and it opened nothing"
     );
 
-    let mut app = App::new();
-    app.loaded_config = Some(load_config(&master, time::OffsetDateTime::now_utc()).unwrap());
-    app.active_leaf = Leaf::Lists;
-    handle_lists_key(&mut app, key(KeyCode::Char('B')), &poller, &master).await;
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
     assert!(
         app.lists.catalog_picker.is_some(),
-        "the welcome screen sends a fresh operator to `B` on Lists, and it opened nothing"
+        "Enter on the chooser's purge.cc option must open the catalog"
     );
 }
 
@@ -1875,25 +1831,18 @@ async fn welcome_banner_lists_keys_are_live_bindings() {
 async fn s53_add_mode_cancel_button_closes_modal_with_no_writes() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.loaded_config = Some(load_config(&master, time::OffsetDateTime::now_utc()).unwrap());
     app.active_leaf = Leaf::Lists;
     let poller = dummy_poller(dir.path());
 
     handle_lists_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
-    let mut modal = app
-        .lists
-        .edit_modal
-        .clone()
-        .expect("Add modal must be open");
-    modal.focus = EditField::DeleteButton;
-    app.lists.edit_modal = Some(modal);
-
-    handle_lists_edit_modal_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
+    assert_eq!(app.lists.import_source, Some(0));
+    handle_key(&mut app, key(KeyCode::Esc), &poller, &master).await;
 
     assert!(
         app.lists.edit_modal.is_none(),
-        "Cancel button must close the modal"
+        "Cancel must close the source chooser"
     );
     let loaded = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert!(
@@ -1903,16 +1852,16 @@ async fn s53_add_mode_cancel_button_closes_modal_with_no_writes() {
 }
 
 #[tokio::test]
-async fn b_hotkey_opens_catalog_picker_with_baselines_correct() {
+async fn source_chooser_opens_catalog_picker_with_baselines_correct() {
     // One [[blocklists]] entry carrying the catalog URL for
     // privacy/ads — that row must open ticked and every other row
-    // untouched, with nothing staged: Save right after `B` has to be
+    // untouched, with nothing staged: Save right after opening has to be
     // a no-op, or the picker writes changes the operator never made.
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1930,18 +1879,19 @@ display_name = "Default"
 "#,
     )
     .unwrap();
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.loaded_config = Some(load_config(&master, time::OffsetDateTime::now_utc()).unwrap());
     app.active_leaf = Leaf::Lists;
     let poller = dummy_poller(dir.path());
 
-    handle_lists_key(&mut app, key(KeyCode::Char('B')), &poller, &master).await;
+    handle_lists_key(&mut app, key(KeyCode::Char('a')), &poller, &master).await;
+    handle_key(&mut app, key(KeyCode::Enter), &poller, &master).await;
 
     let picker = app
         .lists
         .catalog_picker
         .as_ref()
-        .expect("`B` must open the catalog picker");
+        .expect("the purge.cc source choice must open the catalog picker");
     let subscribed: Vec<&str> = picker
         .rows
         .iter()
@@ -1974,14 +1924,14 @@ display_name = "Default"
 }
 
 /// The config the batch-save tests run against: one subscribed list
-/// carrying operator-set metadata (tags, a non-default interval, a
+/// carrying operator-set metadata (a non-default interval and a
 /// display name that is NOT the catalog's), so a save that rebuilds the
 /// entry from catalog defaults instead of patching it shows up as loss.
 fn catalog_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -1994,7 +1944,6 @@ id = "privacy-ads"
 display_name = "My renamed ads list"
 url = "https://lists.purge.cc/ads.txt"
 update_interval_hours = 6
-tags = ["kids"]
 
 [profiles.default]
 display_name = "Default"
@@ -2005,10 +1954,11 @@ display_name = "Default"
 }
 
 async fn open_picker(master: &Path, poller: &IpcPoller) -> App {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.loaded_config = Some(load_config(master, time::OffsetDateTime::now_utc()).unwrap());
     app.active_leaf = Leaf::Lists;
-    handle_lists_key(&mut app, key(KeyCode::Char('B')), poller, master).await;
+    handle_lists_key(&mut app, key(KeyCode::Char('a')), poller, master).await;
+    handle_key(&mut app, key(KeyCode::Enter), poller, master).await;
     app
 }
 

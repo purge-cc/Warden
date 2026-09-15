@@ -3,13 +3,13 @@
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Tabs};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::tui::app::{App, Leaf, Section};
-use crate::tui::theme::{framed_block_colored, T};
+use crate::tui::theme::{self, CardRole, T};
 use crate::tui::wordmark;
-use crate::tui::{help, tabs};
+use crate::tui::{help, mouse, tabs};
 
 /// Minimum terminal size to render the full layout.
 const MIN_WIDTH: u16 = 80;
@@ -39,15 +39,24 @@ fn too_small_msg_rect(area: Rect) -> Rect {
 /// transient may occlude.
 fn layout_chunks(area: Rect, app: &App) -> std::rc::Rc<[Rect]> {
     Layout::vertical([
-        Constraint::Length(4), // header — 1 blank pad row + 3-row wordmark
-        Constraint::Length(menu_card_height(app)), // unified menu card (3 or 5)
-        Constraint::Min(10),   // tab content
-        Constraint::Length(1), // footer
+        Constraint::Length(if area.height < 32 { 1 } else { 4 }),
+        Constraint::Length(menu_card_height(app)), // permanent two-row menu band
+        Constraint::Min(10),                       // tab content
+        Constraint::Length(1),                     // footer
     ])
     .split(area)
 }
 
+#[cfg(test)]
+pub(crate) fn content_area_for_test(area: Rect, app: &App) -> Rect {
+    layout_chunks(area, app)[2]
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
+    theme::set_active(app.theme);
+    // Hit regions are frame-local. Reset before the size guard so a resize
+    // cannot leave stale menu clicks registered against the prior frame.
+    mouse::reset(app);
     let area = f.area();
 
     // Terminal too small guard
@@ -71,20 +80,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // A single card hosts both the section row and (on
-    // multi-leaf sections) a sub-tab row separated by a U+2500 divider.
-    // Card height is 3 on singleton sections (Dashboard / Query Log)
-    // and 5 on multi-leaf sections (Network / Filters / Configuration) —
-    // see `menu_card_height` for the contract. The chunk count is now
-    // a constant 4 (header / menu_card / content / footer); the dynamic
-    // height lives inside the menu_card constraint instead of branching
-    // the chunk list.
     let chunks = layout_chunks(area, app);
 
     render_header(f, chunks[0], app);
     render_menu_card(f, chunks[1], app);
     render_active_tab(f, chunks[2], app);
+    mouse::render_sort_focus(f, app);
     render_footer(f, chunks[3], app);
+
+    crate::tui::filter_chips::render_text_editor(f, chunks[2], app);
+    crate::tui::filter_chips::render_choice_editor(f, chunks[2], app);
 
     // Transient action feedback floats over the tab content,
     // never over the footer legend or the menu card — the two permanent
@@ -105,7 +110,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // after this line. It did not hold for the overlays a *tab* draws
     // inside `render_active_tab`, because that ran at the top of this
     // function, before the toast.
-    if !tab_dispatched_overlay_open(app) {
+    if !tab_dispatched_overlay_open(app)
+        && !crate::tui::filter_chips::text_editor_open(app)
+        && !crate::tui::filter_chips::choice_editor_open(app)
+    {
         if let Some(status) = app.visible_status() {
             crate::tui::toast::render(f, chunks[2], status);
         }
@@ -113,7 +121,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Help overlay (on top of everything)
     if app.show_help {
-        help::render(f, app.active_leaf);
+        let mut scroll = app.help_scroll;
+        help::render_for_app(f, chunks[2], app, &mut scroll);
+        app.help_scroll = scroll;
     }
 
     // Query Log rule picker — drawn ABOVE the help overlay
@@ -127,19 +137,38 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // shouldn't happen in normal use — both modals belong to specific
     // tabs) land the freshly-opened one on top.
     if let Some(modal) = app.local_dns.modal.as_ref() {
-        crate::tui::local_dns_modal::render_overlay(f, chunks[2], modal);
+        if !tabs::local_dns::inline_editor_visible(chunks[2].width, app) {
+            crate::tui::local_dns_modal::render_overlay(f, chunks[2], modal);
+        }
+    }
+    if app.local_dns.inspect_open {
+        tabs::local_dns::render_detail_overlay(f, chunks[2], app);
     }
 
     // Settings restore picker modal overlay — only ever Some while on the
     // Settings tab (opened via `R`). Same single-open gate as the others.
     if let Some(modal) = app.settings.restore_modal.as_ref() {
-        crate::tui::backup_restore_modal::render_overlay(f, chunks[2], modal);
+        crate::tui::backup_restore_modal::render_overlay(
+            f,
+            chunks[2],
+            modal,
+            app.settings.confirmation_primary,
+            app.settings.report_scroll,
+            &app.settings.report_max_scroll,
+        );
     }
 
     // Settings backup confirm modal overlay — only ever Some while on
     // the Settings tab (opened via `b`). Parallel to the restore overlay.
     if let Some(modal) = app.settings.backup_modal.as_ref() {
-        crate::tui::backup_restore_modal::render_backup_overlay(f, chunks[2], modal);
+        crate::tui::backup_restore_modal::render_backup_overlay(
+            f,
+            chunks[2],
+            modal,
+            app.settings.confirmation_primary,
+            app.settings.report_scroll,
+            &app.settings.report_max_scroll,
+        );
     }
 
     // Subnets modal overlay (Add / Edit / Delete). Same gate
@@ -148,17 +177,27 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(modal) = app.subnets.modal.as_ref() {
         crate::tui::subnet_modal::render_overlay(f, chunks[2], modal);
     }
+    if app.subnets.inspect.is_some() {
+        tabs::subnets::render_inspect_overlay(f, chunks[2], app);
+    }
 
     // Groups modal overlay (Add / Edit / Delete). Same
     // single-open-tab-modal pattern as Subnets.
     if let Some(modal) = app.groups.modal.as_ref() {
-        crate::tui::group_modal::render_overlay(f, chunks[2], modal);
+        if !tabs::groups::inline_editor_visible(chunks[2].width, app) {
+            crate::tui::group_modal::render_overlay(f, chunks[2], modal);
+        }
+    }
+    if app.groups.inspect_open {
+        tabs::groups::render_detail_overlay(f, chunks[2], app);
     }
 
     // Labels modal overlay (Add / Edit / Delete). Same
     // single-open-tab-modal pattern as Groups.
     if let Some(modal) = app.labels.modal.as_ref() {
-        crate::tui::label_modal::render_overlay(f, chunks[2], modal);
+        if modal.form().is_none() {
+            crate::tui::label_modal::render_overlay(f, chunks[2], modal);
+        }
     }
 
     // Custom Lists modals. Same single-open-tab-modal pattern.
@@ -168,11 +207,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(picker) = app.custom_lists.mount_picker.as_ref() {
         crate::tui::custom_list_modal::render_mount_picker(f, chunks[2], picker);
     }
+    if app.active_leaf == Leaf::CustomLists {
+        crate::tui::tabs::custom_lists::render_info_overlay(f, chunks[2], app);
+    }
 
     // Profiles modal overlay (Add / Edit / Delete). Same
     // single-open-tab-modal pattern as Subnets / Local DNS.
-    if let Some(modal) = app.profiles.modal.as_ref() {
-        crate::tui::profile_modal::render_overlay(f, chunks[2], modal);
+    if !tabs::profiles::inline_editor_visible(chunks[2].width, app) {
+        if let Some(modal) = app.profiles.modal.as_ref() {
+            crate::tui::profile_modal::render_overlay(f, chunks[2], modal);
+        }
+    }
+    if app.active_leaf == Leaf::Profiles {
+        crate::tui::tabs::profiles::render_info_overlay(f, chunks[2], app);
     }
 
     // Resolver modal overlay — drawn after the per-tab
@@ -182,66 +229,84 @@ pub fn render(f: &mut Frame, app: &mut App) {
         crate::tui::resolver_modal::render_overlay(f, chunks[2], modal);
     }
 
+    crate::tui::operator_policy::render(f, chunks[2], app);
+
+    crate::tui::detail_panel::render_information(f, chunks[2], app);
+
     // Welcome banner overlay — drawn last so it lands on
     // top of everything else on first launch. The handle_key path
     // dismisses it on any keypress before any other modal/handler gets
     // to consume the event, so this draw order also matches the input
     // priority (top z-index ↔ first handler wins).
     if let Some(banner) = app.welcome_banner.as_ref() {
+        mouse::begin_overlay();
         crate::tui::welcome_banner::render_overlay(f, banner, area);
     }
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    // Header is pure branding: 3 rows of block-letter wordmark, no
-    // frame, no chrome. The RUNNING pill lives in the System panel's
-    // "Status" row and the version lives in the footer's bottom-left
-    // slot. The `app` ref is kept unused so future
-    // header-level signals can plug in without touching the call site.
-    let _ = app;
-
+    let notice = tabs::dashboard::health_notice(app);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
+    if area.height <= 1 {
+        let mut spans = vec![Span::styled(
+            " WARDEN",
+            Style::default()
+                .fg(T.brand_red)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if let Some((message, color)) = notice.as_ref() {
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    crate::tui::text::fit(message, area.width.saturating_sub(9) as usize)
+                ),
+                Style::default().fg(*color),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    if let Some((message, color)) = notice.as_ref() {
+        f.render_widget(
+            Paragraph::new(crate::tui::text::fit(
+                message,
+                area.width.saturating_sub(2) as usize,
+            ))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(*color)),
+            Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
+        );
+    }
     let purge = wordmark::PURGE_COMPACT;
     let warden = wordmark::WARDEN_COMPACT;
-    // 1 leading + 19 PURGE + 3 gap + 25 WARDEN = 48 cells
-    let wm_width: u16 = 48;
-
-    // Beta-status tag riding the wordmark's top row (superscript feel):
-    // amber = caution, telling operators this is a pre-1.0 build that may
-    // still have bugs. 2-space gap keeps it clear of the WARDEN glyphs.
-    // Not BOLD so it stays visually smaller than the wordmark. The version
-    // number itself lives in the footer, so this is a status flag, not a
-    // version string. Its width is added to the render rect below —
-    // otherwise the span would be clipped to the wordmark's 48 cells.
-    const BETA_TAG: &str = "  Beta Version";
-    let beta_tag_width = BETA_TAG.chars().count() as u16;
+    // One leading cell sits outside the compact wordmark footprint.
+    let wm_width = wordmark::COMPACT_WIDTH + 1;
 
     let red = Style::default()
         .fg(T.brand_red)
         .add_modifier(Modifier::BOLD);
-    let white = Style::default()
-        .fg(T.text_primary)
-        .add_modifier(Modifier::BOLD);
-    let amber = Style::default().fg(T.warning);
 
     // Zip the two wordmark consts so the row count follows the data
     // (`[&str; 3]`) instead of a hardcoded `0..3`: a future resize of
     // either const can no longer out-of-bounds-panic the render path.
-    // `enumerate()` lets the beta tag ride row 0 only.
     let wm_lines: Vec<Line> = purge
         .iter()
         .zip(warden.iter())
-        .enumerate()
-        .map(|(i, (p, w))| {
-            let mut spans = vec![
+        .map(|(p, w)| {
+            Line::from(vec![
                 Span::raw(" "),
                 Span::styled(p.to_string(), red),
                 Span::raw("   "),
-                Span::styled(w.to_string(), white),
-            ];
-            if i == 0 {
-                spans.push(Span::styled(BETA_TAG, amber));
-            }
-            Line::from(spans)
+                Span::styled(
+                    w.to_string(),
+                    Style::default()
+                        .fg(T.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
         })
         .collect();
 
@@ -252,203 +317,264 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     // rows, the wordmark occupies the lower 3 (drawn at y+1).
     // `saturating_sub(1)` keeps a degenerate 0/1-row slot from claiming a
     // row that isn't there.
-    let w = (wm_width + beta_tag_width).min(area.width);
+    let w = wm_width.min(area.width);
     let wm_height = area.height.saturating_sub(1).min(3);
     let wm_area = Rect::new(area.x, area.y + 1, w, wm_height);
     f.render_widget(Paragraph::new(wm_lines), wm_area);
 }
 
-/// Unified menu card — replaces the two stacked cards
-/// (top-level section bar + sub-tab strip) shipped earlier. A single
-/// outer frame in `T.text_primary` hosts up to two horizontal rows
-/// separated by a thin U+2500 divider in `T.text_muted`. The colour
-/// delta between border and divider is the cue: the brilliant outer
-/// border reads as "container", the muted divider as "this belongs
-/// to that". Operators see one widget with two rows instead of two
-/// peer cards.
-///
-/// Card height is 3 (top border + section row + bottom border) on
-/// singleton sections and 5 (adds divider + leaf row) on multi-leaf
-/// sections — driven by `menu_card_height`. The two values must agree
-/// or ratatui will leave a blank gap or clip the divider; the
-/// `menu_card_height_*` tests pin that contract.
-/// Section nav visibility. Every section is always visible except
-/// the cluster-gated `Section::Cluster`, hidden from the bar (and the numeric
-/// hotkey) unless `cluster_visible()`. Always-true on a default build (no
-/// `Section::Cluster` variant exists to hide).
-fn section_visible(section: Section, app: &App) -> bool {
-    #[cfg(feature = "cluster")]
-    if matches!(section, Section::Cluster) {
-        return app.cluster_visible();
-    }
-    #[cfg(not(feature = "cluster"))]
-    let _ = (section, app);
+/// Nodes remains discoverable in Configuration while standalone.
+fn section_visible(_section: Section, _app: &App) -> bool {
     true
 }
 
-/// Sub-tab title with the leaf's `g <letter>`
-/// mnemonic underlined **in place** inside its own label — `Profiles`
-/// underlines the `P`, `Lists` the `i`, `Devices` the `v`. Costs zero
-/// columns, which is why it beat a bracketed `[p]` suffix: the Filters
-/// row would have grown 31 → 47 cols.
-///
-/// The four leaves whose mnemonic is not their initial (deVices, lIsts,
-/// rUles, sEttings) were previously unguessable — the letters existed
-/// only in the `?` help screen. This surfaces them in the chrome.
-///
-/// Falls back to an unstyled label if the mnemonic is absent from the
-/// label. That is a broken invariant (pinned by
-/// `every_mnemonic_occurs_in_its_leaf_label`), but a missing underline is
-/// cosmetic and a panic on the render path is not.
-fn leaf_title_line(leaf: Leaf) -> Line<'static> {
-    let label = leaf.label();
-    let Some(off) = leaf.mnemonic_offset() else {
-        return Line::from(label);
-    };
-    let ch_len = label[off..]
-        .chars()
-        .next()
-        .map(char::len_utf8)
-        .unwrap_or_default();
-    let mut spans = Vec::with_capacity(3);
-    if off > 0 {
-        spans.push(Span::raw(&label[..off]));
-    }
-    spans.push(Span::styled(
-        &label[off..off + ch_len],
-        Style::default().add_modifier(Modifier::UNDERLINED),
-    ));
-    if off + ch_len < label.len() {
-        spans.push(Span::raw(&label[off + ch_len..]));
-    }
-    Line::from(spans)
-}
-
 fn render_menu_card(f: &mut Frame, area: Rect, app: &App) {
-    let card = framed_block_colored(T.text_primary);
-    let inner = card.inner(area);
-    f.render_widget(card, area);
-
     let active_section = app.active_leaf.section();
-    let leaves = active_section.leaves();
-    let multi_leaf = leaves.len() >= 2;
+    let leaves: Vec<Leaf> = active_section
+        .leaves()
+        .iter()
+        .copied()
+        .filter(|leaf| leaf.is_menu_leaf())
+        .collect();
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        area,
+    );
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+    let main = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+    let submenu = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1).min(1),
+    );
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(T.bg_surface)),
+        main,
+    );
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(T.navigation_submenu_bg)),
+        submenu,
+    );
 
-    // Row 0: section bar — top-level entries with the brand-red active
-    // highlight following the active leaf's owning section. The
-    // Cluster section is runtime-filtered out unless `cluster_visible()`, so
-    // the highlight index is the active section's position WITHIN the visible
-    // list, not its absolute `index()`.
     let visible_sections: Vec<Section> = Section::ALL
         .iter()
         .copied()
         .filter(|s| section_visible(*s, app))
         .collect();
-    let section_row = Rect::new(inner.x, inner.y, inner.width, 1);
     let section_titles: Vec<Line> = visible_sections
         .iter()
-        .map(|s| Line::from(s.label()))
+        .map(|s| Line::from(s.label().to_uppercase()))
         .collect();
     let active_section_idx = visible_sections
         .iter()
         .position(|s| *s == active_section)
         .unwrap_or(0);
-    let section_tabs = Tabs::new(section_titles)
-        .select(active_section_idx)
-        .style(Style::default().fg(T.text_secondary))
-        .highlight_style(
-            Style::default()
-                .fg(T.brand_red)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(" | ");
-    f.render_widget(section_tabs, section_row);
+    render_navigation(f, main, section_titles.clone(), active_section_idx, " ");
+    register_navigation(
+        app,
+        main,
+        &section_titles,
+        active_section_idx,
+        " ",
+        |index| mouse::MouseAction::Section(visible_sections[index]),
+    );
 
-    if multi_leaf {
-        // Row 1: thin horizontal divider — U+2500 box-drawing
-        // horizontal repeated full inner width. Held in `text_muted`
-        // so it reads as quieter than the outer border (which is in
-        // `text_primary`); the brightness delta is what produces the
-        // "principal / subordinate" hierarchy.
-        let divider_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-        let divider_str: String = "\u{2500}".repeat(inner.width as usize);
-        let divider = Paragraph::new(Line::from(Span::styled(
-            divider_str,
-            Style::default().fg(T.text_muted),
-        )));
-        f.render_widget(divider, divider_row);
+    // A section with one page has no submenu; retain only its empty band.
+    if leaves.len() <= 1 {
+        return;
+    }
+    let leaf_titles: Vec<Line> = leaves
+        .iter()
+        .map(|leaf| Line::from(leaf.label().to_uppercase()))
+        .collect();
+    let active_idx = leaves
+        .iter()
+        .position(|leaf| *leaf == app.active_leaf)
+        .unwrap_or(0);
+    let leaf_row = Rect::new(
+        submenu.x.saturating_add(2),
+        submenu.y,
+        submenu.width.saturating_sub(2),
+        submenu.height,
+    );
+    render_navigation(f, leaf_row, leaf_titles.clone(), active_idx, " ");
+    register_navigation(app, leaf_row, &leaf_titles, active_idx, " ", |index| {
+        mouse::MouseAction::Leaf(leaves[index])
+    });
+}
 
-        // Row 2: sub-tab strip for the active section's leaves.
-        // Quieter ` · ` divider — it lives inside the active section's
-        // bracket so the eye doesn't need a hard separator.
-        let leaf_row = Rect::new(inner.x, inner.y + 2, inner.width, 1);
-        let leaf_titles: Vec<Line> = leaves.iter().map(|l| leaf_title_line(*l)).collect();
-        let active_idx = leaves
+/// Keep the active label inside a contiguous window; chevrons expose overflow.
+fn navigation_window(
+    titles: &[Line<'_>],
+    selected: usize,
+    width: u16,
+    divider: &str,
+) -> (usize, usize) {
+    let divider_width = Line::raw(divider).width();
+    let size = |start: usize, end: usize| -> usize {
+        titles[start..end]
             .iter()
-            .position(|l| *l == app.active_leaf)
-            .unwrap_or(0);
-        let leaf_tabs = Tabs::new(leaf_titles)
-            .select(active_idx)
-            .style(Style::default().fg(T.text_secondary))
-            .highlight_style(
-                Style::default()
-                    .fg(T.brand_red)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .divider(" \u{00b7} ");
-        f.render_widget(leaf_tabs, leaf_row);
+            .map(|line| line.width() + 2)
+            .sum::<usize>()
+            + end.saturating_sub(start + 1) * divider_width
+            + usize::from(start > 0) * 2
+            + usize::from(end < titles.len()) * 2
+    };
+    if titles.is_empty() {
+        return (0, 0);
+    }
+    if size(0, titles.len()) <= width as usize {
+        return (0, titles.len());
+    }
+    let mut start = selected.min(titles.len() - 1);
+    let mut end = start + 1;
+    while start > 0 && size(start - 1, end) <= width as usize {
+        start -= 1;
+    }
+    while end < titles.len() && size(start, end + 1) <= width as usize {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn render_navigation(
+    f: &mut Frame,
+    area: Rect,
+    titles: Vec<Line<'static>>,
+    selected: usize,
+    divider: &'static str,
+) {
+    let (start, end) = navigation_window(&titles, selected, area.width, divider);
+    let left = u16::from(start > 0) * 2;
+    let right = u16::from(end < titles.len()) * 2;
+    if left > 0 {
+        f.render_widget(
+            Paragraph::new("‹ ").style(Style::default().fg(T.text_muted)),
+            Rect::new(area.x, area.y, left.min(area.width), 1),
+        );
+    }
+    if right > 0 && area.width >= right {
+        f.render_widget(
+            Paragraph::new(" ›").style(Style::default().fg(T.text_muted)),
+            Rect::new(area.right() - right, area.y, right, 1),
+        );
+    }
+    let row = Rect::new(
+        area.x + left.min(area.width),
+        area.y,
+        area.width.saturating_sub(left + right),
+        area.height,
+    );
+    let mut x = row.x;
+    let gap = Line::raw(divider).width() as u16;
+    for (index, title) in titles.iter().enumerate().take(end).skip(start) {
+        let width = (title.width() as u16)
+            .saturating_add(2)
+            .min(row.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let style = if index == selected {
+            Style::default()
+                .fg(T.navigation_active_fg)
+                .bg(T.navigation_active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(T.text_secondary)
+        };
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(title.spans.iter().cloned());
+        spans.push(Span::raw(" "));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(style),
+            Rect::new(x, row.y, width, row.height),
+        );
+        x = x.saturating_add(width).saturating_add(gap);
     }
 }
 
-/// Outer height of the unified menu card for the active leaf. Returns
-/// 3 on singleton sections (Dashboard / Query Log) and 5 on multi-leaf
-/// sections (Network / Filters / Configuration). The value MUST equal the
-/// number of rows `render_menu_card` actually paints, otherwise
-/// ratatui's vertical Layout leaves a blank gap below the card or
-/// clips the divider — neither degrades into a friendly mode.
-fn menu_card_height(app: &App) -> u16 {
-    if section_has_subtabs(app.active_leaf.section()) {
-        5
-    } else {
-        3
+/// Register exactly the padded label cells painted by [`render_navigation`].
+/// The same overflow window is used by both paths, so hidden labels cannot
+/// retain stale hit regions at narrow widths.
+fn register_navigation(
+    app: &App,
+    area: Rect,
+    titles: &[Line<'_>],
+    selected: usize,
+    divider: &str,
+    action: impl Fn(usize) -> mouse::MouseAction,
+) {
+    let (start, end) = navigation_window(titles, selected, area.width, divider);
+    let left = u16::from(start > 0) * 2;
+    let right = u16::from(end < titles.len()) * 2;
+    let mut x = area.x.saturating_add(left).min(area.right());
+    let right_edge = area.right().saturating_sub(right);
+    let divider_width = Line::raw(divider).width() as u16;
+    for (index, title) in titles.iter().enumerate().take(end).skip(start) {
+        let width = (title.width() as u16)
+            .saturating_add(2)
+            .min(right_edge.saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        mouse::register(app, Rect::new(x, area.y, width, 1), action(index));
+        x = x.saturating_add(width).saturating_add(divider_width);
     }
 }
 
-/// Whether the active section needs a sub-tab row inside the menu
-/// card. Renamed from the former `should_render_subtab_strip`
-/// — the predicate now drives card height (3 vs 5) instead of the
-/// visibility of a separate strip card.
-pub(crate) fn section_has_subtabs(section: Section) -> bool {
-    section.leaves().len() >= 2
+/// Both menu rows remain reserved on every screen, including singleton sections.
+fn menu_card_height(_app: &App) -> u16 {
+    2
 }
 
-/// Render the Gauge-Anatomy chrome (white frame + bold colored title
-/// as the first interior row) and return the content sub-rect ready
-/// for a table or paragraph. Single source of truth so the 9 leaf
-/// tabs stay column-aligned with the menu card above (first title
-/// glyph at column `area.x + 2`, matching the menu card's first tab
-/// glyph after the rounded border + ratatui's default Tabs padding).
+/// Draw a borderless card surrounded by a one-cell page-background gutter.
+/// The title and subtitle are separate, full-width coordinated bands; the
+/// returned rectangle is the padded neutral body available to page content.
+pub(crate) fn render_card(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    subtitle: &str,
+    role: CardRole,
+) -> Rect {
+    theme::filled_card(f.buffer_mut(), area, title, subtitle, role)
+}
+
+/// Render a borderless, single-title section card while preserving the legacy
+/// page API. Pages migrate to [`render_card`] as they gain a subtitle.
 pub(crate) fn render_section_chrome(
     f: &mut Frame,
     area: Rect,
     title: &str,
     title_color: Color,
 ) -> Rect {
-    let block = framed_block_colored(T.text_primary);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let padded_x = inner.x.saturating_add(1);
-    let padded_w = inner.width.saturating_sub(2);
-
-    let title_area = Rect {
-        x: padded_x,
-        y: inner.y,
-        width: padded_w,
-        height: 1,
-    };
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(T.bg_main)),
+        area,
+    );
+    let surface = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if surface.is_empty() {
+        return surface;
+    }
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(T.bg_elevated)),
+        surface,
+    );
+    let title_area = Rect::new(surface.x, surface.y, surface.width, 1);
     f.render_widget(
         Paragraph::new(Span::styled(
-            title.to_string(),
+            title.to_uppercase(),
             Style::default()
                 .fg(title_color)
                 .add_modifier(Modifier::BOLD),
@@ -457,10 +583,10 @@ pub(crate) fn render_section_chrome(
     );
 
     Rect {
-        x: padded_x,
-        y: inner.y.saturating_add(1),
-        width: padded_w,
-        height: inner.height.saturating_sub(1),
+        x: surface.x.saturating_add(1),
+        y: surface.y.saturating_add(1),
+        width: surface.width.saturating_sub(2),
+        height: surface.height.saturating_sub(1),
     }
 }
 
@@ -475,6 +601,29 @@ pub(crate) fn render_section_chrome(
 ///
 /// Run AFTER the table render so the glyphs paint over the empty spacing
 /// cells rather than under them.
+/// Match Ratatui's zero-origin solver, including a reserved selection marker.
+pub(crate) fn table_column_rects(
+    area: Rect,
+    constraints: &[Constraint],
+    spacing: u16,
+    highlight: u16,
+) -> Vec<Rect> {
+    Layout::horizontal(constraints.iter().copied())
+        .flex(Flex::Start)
+        .spacing(spacing)
+        .split(Rect::new(0, 0, area.width.saturating_sub(highlight), 1))
+        .iter()
+        .map(|column| {
+            Rect::new(
+                area.x.saturating_add(highlight).saturating_add(column.x),
+                area.y,
+                column.width,
+                1,
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn draw_table_column_separators(
     f: &mut Frame,
     area: Rect,
@@ -520,6 +669,18 @@ pub(crate) fn draw_table_column_separators(
 }
 
 fn render_active_tab(f: &mut Frame, area: Rect, app: &mut App) {
+    #[cfg(feature = "cluster")]
+    let area = if let Some(banner) = crate::tui::nodes::policy_banner(app) {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        f.render_widget(
+            Paragraph::new(format!(" {banner}"))
+                .style(Style::default().fg(T.warning).bg(T.bg_elevated)),
+            rows[0],
+        );
+        rows[1]
+    } else {
+        area
+    };
     match app.active_leaf {
         Leaf::Dashboard => tabs::dashboard::render(f, area, app),
         Leaf::QueryLog => tabs::query_log::render(f, area, app),
@@ -536,7 +697,7 @@ fn render_active_tab(f: &mut Frame, area: Rect, app: &mut App) {
         Leaf::Groups => tabs::groups::render(f, area, app),
         Leaf::Labels => tabs::labels::render(f, area, app),
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => tabs::cluster::render(f, area, app),
+        Leaf::Nodes => tabs::nodes::render(f, area, app),
     }
 }
 
@@ -575,12 +736,32 @@ fn render_active_tab(f: &mut Frame, area: Rect, app: &mut App) {
 /// `every_tab_dispatched_overlay_suppresses_the_toast` is what makes
 /// forgetting visible.
 fn tab_dispatched_overlay_open(app: &App) -> bool {
-    app.file.section_jump.is_some()
+    tabs::query_log::overlay_open(app)
+        || app.file.section_jump.is_some()
         || app.rules.edit_modal.is_some()
         || app.rules.add_modal.is_some()
+        || app.lists.import_source.is_some()
         || app.lists.catalog_picker.is_some()
         || app.lists.kind_confirm.is_some()
         || app.lists.edit_modal.is_some()
+        || app.devices.inspect_open
+        || app.subnets.modal.is_some()
+        || app.subnets.inspect.is_some()
+        || app.groups.modal.is_some()
+        || app.groups.inspect_open
+        || app.local_dns.modal.is_some()
+        || app.local_dns.inspect_open
+        || app.profiles.modal.is_some()
+        || {
+            #[cfg(feature = "cluster")]
+            {
+                app.nodes.dialog.is_some()
+            }
+            #[cfg(not(feature = "cluster"))]
+            {
+                false
+            }
+        }
 }
 
 /// Test seam over [`render_footer`]: the footer's key legend only becomes
@@ -592,48 +773,25 @@ pub(crate) fn render_footer_for_test(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    // The footer is a pure key-hint + transient-
-    // message line. The `polling … Ns ● healthy` and `daemon
-    // unreachable` paths were retired — RUNNING/DISCONNECTED in the
-    // header pill already carries the connection state, and the poll
-    // cadence is developer info the operator doesn't consume.
-    //
-    // Priority on the left slot when present: startup warning >
-    // paused > tab-specific key hints.
-    //
-    // The transient action status is NOT in that chain
-    // — it renders as a toast over the tab content instead
-    // (`toast::render`). It shared `cols[1]` with the key hints, so
-    // every reported outcome blanked the "what can I press on this tab"
-    // cluster, which for Lists is `[a] add [e] edit [d] delete [b]
-    // browse …` — the discovery surface for the very screen the
-    // operator is working on. That is the wrong trade at any duration,
-    // which is why the fix moves the message rather than shortening it.
-    //
-    // The startup warning and `paused` keep their priority: they are
-    // *states*, not events. A state is a legitimate legend replacement
-    // because it persists and is itself the current context.
+    if mouse::overlay_open(app) || app.settings.tracking_panel.is_some() {
+        let version = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
+        let cols =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(version.len() as u16)])
+                .split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(elide_hints(tab_hints_for(app), cols[0].width))),
+            cols[0],
+        );
+        f.render_widget(
+            Paragraph::new(version)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(T.text_muted)),
+            cols[1],
+        );
+        return;
+    }
     let tab_hints = tab_hints_for(app);
-    // Only the key-hint legend is a list of droppable hints. The startup
-    // warning and `paused` are prose in the same slot, and `elide_hints`
-    // would treat either as one indivisible group and drop it whole —
-    // replacing a state the operator needs with a bare marker. They keep
-    // the old clip behaviour, which for them is correct: the warning is
-    // already a headline chosen to fit (see the comment below), and
-    // `paused` is 10 cells.
     let left_is_legend = app.startup_warning.is_none() && !app.paused;
-    // The HEADLINE, never the full warning. This column is
-    // `Constraint::Min(20)` and the `Paragraph` below carries no `.wrap()`,
-    // so ratatui clips whatever does not fit — with no ellipsis, so a
-    // truncated sentence is indistinguishable from a complete one. The full
-    // text ran ~260 characters and lost its entire remedy to that clip on a
-    // 210-column terminal. The detail now lives on the startup notice
-    // overlay, which wraps; this slot carries only what fits intact.
-    //
-    // No "press X for details" pointer: the notice re-shows on every launch
-    // while the state is bad (unlike the once-per-operator welcome), so the
-    // detail is never more than a relaunch away, and a key binding that
-    // exists only in one rare state is worse than the state being visible.
     let left = if let Some(ref warn) = app.startup_warning {
         Line::from(vec![
             Span::styled(" \u{25cc} ", Style::default().fg(T.warning)),
@@ -648,30 +806,15 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("  press [p] to resume", Style::default().fg(T.text_muted)),
         ])
     } else {
-        // No breadcrumb prefix (`<Section> ▸ <Leaf>`) here.
-        // The active section + leaf are already visible in the menu
-        // card at the top of every frame,
-        // so repeating the path in the footer would be duplicate chrome.
-        // Footer-left now carries only tab-specific key hints.
         Line::from(tab_hints)
     };
 
-    // Version sits in the leftmost slot, moved out of the header
-    // to keep the wordmark area free of runtime chrome.
-    // Format ` vX.Y.Z ` in muted gray so it stays unobtrusive but
-    // always visible — until `plan_footer` decides the width cannot
-    // afford chrome, which at the 80-column floor it cannot.
     let version_text = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
     let version_w = version_text.len() as u16;
 
-    // `s-tui-footer-legend-clipped-at-80-cols`: the slot widths are now
-    // derived from what the three clusters actually need at THIS width,
-    // rather than from a `Min(20)` that silently clipped whatever the
-    // other two left behind. See `plan_footer` for the give-up order.
     let plan = if left_is_legend {
         plan_footer(area.width, version_w, hint_width(&left.spans))
     } else {
-        // A state in the left slot does not get to strip the globals.
         FooterPlan {
             show_version: true,
             compact_globals: false,
@@ -685,60 +828,87 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let globals_w = hint_width(&globals);
     let version_w = if plan.show_version { version_w } else { 0 };
 
-    let cols = Layout::horizontal([
-        Constraint::Length(version_w),
-        Constraint::Min(0),
-        Constraint::Length(globals_w),
-    ])
-    .split(area);
-
-    // Elide against the width the legend was ACTUALLY given, not against
-    // the plan's estimate — the layout solver is the authority on how the
-    // cells were split, and a marker computed against anything else can
-    // still overrun.
+    let available = area.width.saturating_sub(version_w);
+    let left_budget = available.saturating_sub(globals_w);
     let left = if left_is_legend {
-        Line::from(elide_hints(left.spans, cols[1].width))
+        Line::from(elide_hints(left.spans, left_budget))
     } else {
         left
     };
-
+    let left_w = (left.width() as u16).min(left_budget);
+    f.render_widget(
+        Paragraph::new(left),
+        Rect::new(area.x, area.y, left_w, area.height),
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(globals)),
+        Rect::new(
+            area.x.saturating_add(left_w),
+            area.y,
+            globals_w.min(available.saturating_sub(left_w)),
+            area.height,
+        ),
+    );
     if plan.show_version {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                version_text,
-                Style::default().fg(T.text_muted),
-            ))),
-            cols[0],
+            Paragraph::new(version_text)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(T.text_muted)),
+            Rect::new(
+                area.right().saturating_sub(version_w),
+                area.y,
+                version_w.min(area.width),
+                area.height,
+            ),
         );
     }
-    f.render_widget(Paragraph::new(left), cols[1]);
-    f.render_widget(
-        Paragraph::new(Line::from(globals)).alignment(Alignment::Right),
-        cols[2],
-    );
 }
 
-/// Common key-span constructor. Bracket chars in muted gray, the key
-/// itself in accent white, the label in muted gray. Matches the
-/// pre-S41.1 styling contract.
-fn key_span(k: &'static str, label: &'static str) -> [Span<'static>; 4] {
+/// A highlighted key cell followed by its quieter description.
+/// Keep internal padding styled so whole-hint elision only splits between hints.
+pub(super) fn key_span(k: &'static str, label: &'static str) -> [Span<'static>; 4] {
     [
-        Span::styled("[", Style::default().fg(T.text_muted)),
-        Span::styled(k, Style::default().fg(T.text_primary)),
-        Span::styled("] ", Style::default().fg(T.text_muted)),
-        Span::styled(label, Style::default().fg(T.text_muted)),
+        Span::styled(" ", Style::default().bg(T.bg_highlight)),
+        Span::styled(
+            k,
+            Style::default()
+                .fg(T.text_primary)
+                .bg(T.bg_highlight)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().bg(T.bg_highlight)),
+        Span::styled(label, Style::default().fg(T.text_secondary)),
     ]
 }
 
-/// Global keybind hints — always rendered on the right of the footer,
-/// regardless of tab. `[r] refresh  [p] pause  [s] resolver  [?] help  [q] quit`.
+/// Format a leaf-owned compact legend with the shared key/description styles.
+/// This is presentation only; input actions always use typed hit targets.
+fn compact_hint_spans(hints: &'static str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for hint in hints.split(" · ") {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        if let Some((key, description)) = hint.split_once(' ') {
+            spans.extend(key_span(key, description));
+        } else {
+            spans.push(Span::styled(hint, Style::default().fg(T.text_secondary)));
+        }
+    }
+    spans
+}
+
 fn global_hints() -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.extend(key_span("Tab", "screen"));
+    spans.push(Span::raw("  "));
+    spans.extend(key_span("T", "theme"));
+    spans.push(Span::raw("  "));
     spans.extend(key_span("r", "refresh"));
     spans.push(Span::raw("  "));
     spans.extend(key_span("p", "pause"));
     spans.push(Span::raw("  "));
-    spans.extend(key_span("s", "resolver"));
+    spans.extend(key_span("S", "resolver"));
     spans.push(Span::raw("  "));
     spans.extend(key_span("?", "help"));
     spans.push(Span::raw("  "));
@@ -747,49 +917,17 @@ fn global_hints() -> Vec<Span<'static>> {
     spans
 }
 
-/// The global cluster with the labels dropped — `[r] [p] [s] [?] [q]`.
-///
-/// 20 cells against the labelled cluster's 57. Used only when the full
-/// footer does not fit (see [`plan_footer`]); at any comfortable width the
-/// labelled form is what renders.
-///
-/// The keys survive and the words go, rather than the reverse, because a
-/// key the operator can still see is recoverable — `?` is on it and opens
-/// the help overlay, which carries every one of these verbs in full. A
-/// dropped *key* is not recoverable from anywhere on screen.
+/// Preserve every global key at narrow widths, using the same key-cell style.
 fn global_hints_compact() -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for k in ["r", "p", "s", "?", "q"] {
-        spans.push(Span::styled("[", Style::default().fg(T.text_muted)));
-        spans.push(Span::styled(k, Style::default().fg(T.text_primary)));
-        spans.push(Span::styled("] ", Style::default().fg(T.text_muted)));
+    let mut spans = Vec::new();
+    for key in ["Tab", "T", "r", "p", "S", "?", "q"] {
+        spans.extend(key_span(key, ""));
     }
     spans
 }
 
-/// What the footer gives up, in order, when `width` cannot hold it whole.
-///
-/// `s-tui-footer-legend-clipped-at-80-cols`: at the declared 80-column
-/// floor the three slots want 9 + 45 + 57 = 111 cells, and the leaf legend
-/// is the one that lost — `Constraint::Min(20)` handed it 20 cells and the
-/// `Paragraph` clipped it mid-token to `[Enter] edit  [a] a`, with no
-/// ellipsis, so a cut legend was indistinguishable from a complete one.
-///
-/// The ladder inverts what used to happen, and the order is the argument:
-///
-/// 1. **the version goes first.** It is chrome. Nothing is navigable by it.
-/// 2. **then the global labels**, to [`global_hints_compact`] — all five
-///    keys stay, only the words go, and `[?]` reaches the help overlay
-///    where the words live.
-/// 3. **the leaf legend elides last**, at whole-hint granularity with a
-///    marker ([`elide_hints`]) — never mid-token.
-///
-/// That order follows the same argument that moved
-/// the transient status off this row: the leaf legend is the first-launch
-/// discovery surface *for the tab the operator is on*. The globals are
-/// five keys that never change and are one `?` away. Spending the
-/// tab-specific surface to preserve the universal one is backwards, and
-/// spending it silently is the actual defect.
+/// The version stays at the right edge. Compact global descriptions first,
+/// then elide complete context hints with a visible marker.
 struct FooterPlan {
     show_version: bool,
     compact_globals: bool,
@@ -803,17 +941,10 @@ fn plan_footer(width: u16, version_w: u16, leaf_w: u16) -> FooterPlan {
             compact_globals: false,
         };
     }
-    if leaf_w + full_globals <= width {
-        return FooterPlan {
-            show_version: false,
-            compact_globals: false,
-        };
-    }
-    // Still short: keep the version off and compact the globals. If even
-    // this does not fit, `elide_hints` marks the remainder — there is no
-    // width at which the legend is silently cut again.
+    // The version is the fixed right edge. At the 80-column floor compact
+    // global labels first, then elide only whole context hints.
     FooterPlan {
-        show_version: false,
+        show_version: true,
         compact_globals: true,
     }
 }
@@ -840,7 +971,9 @@ fn elide_hints(spans: Vec<Span<'static>>, budget: u16) -> Vec<Span<'static>> {
     let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     for span in spans {
-        let is_sep = !span.content.is_empty() && span.content.trim().is_empty();
+        let is_sep = span.style == Style::default()
+            && !span.content.is_empty()
+            && span.content.trim().is_empty();
         if is_sep {
             if !current.is_empty() {
                 groups.push(std::mem::take(&mut current));
@@ -890,7 +1023,7 @@ fn elide_hints(spans: Vec<Span<'static>>, budget: u16) -> Vec<Span<'static>> {
 /// field popup, the Lists catalog picker, the restore picker, the scope
 /// menu) and the single-input lookups (resolver, tag create/rename) have
 /// no field-to-field focus and no values to cycle, so the form legend
-/// would be wrong for them and they keep the leaf's own hints.
+/// would be wrong for them; they receive the current overlay hints.
 ///
 /// `rules.add_modal` **used to be excluded on purpose** and no longer is.
 /// Its handler was a nav-grammar outlier — Up/Down cycled values
@@ -997,7 +1130,13 @@ fn form_modal_open(app: &App) -> bool {
     {
         return true;
     }
-    false
+    app.custom_lists.modal.as_ref().is_some_and(|modal| {
+        matches!(
+            modal.stage,
+            crate::tui::custom_list_modal::Stage::EditingForm(_)
+                | crate::tui::custom_list_modal::Stage::AddingRule(_)
+        )
+    })
 }
 
 /// The one navigation grammar every form modal answers to. Mirrors the
@@ -1021,6 +1160,37 @@ fn modal_form_hints() -> Vec<Span<'static>> {
 /// the operator always sees the shortcuts relevant to the active tab.
 /// Empty for tabs whose only keys are in the global cluster.
 fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
+    if app.welcome_banner.is_some() {
+        return compact_hint_spans("Any-key continue");
+    }
+    if app.operator_policy.is_some() {
+        return compact_hint_spans("↑↓ scroll · r recover/refresh · Tab screen · q quit");
+    }
+    if app.resolver_modal.is_some() {
+        return compact_hint_spans("Enter resolve · Ctrl+u clear · Esc close");
+    }
+    if app
+        .settings
+        .restore_modal
+        .as_ref()
+        .is_some_and(|modal| modal.is_submitted())
+        || matches!(
+            app.settings.backup_modal,
+            Some(crate::tui::backup_restore_modal::BackupModal::Submitted { .. })
+        )
+    {
+        return compact_hint_spans("↑↓ scroll · PgUp/PgDn page · Enter/Esc close");
+    }
+    if let Some(modal) = &app.query_log_rule_modal {
+        use crate::tui::query_log_rule_modal::Stage;
+        return match &modal.stage {
+            Stage::Picking => {
+                compact_hint_spans("↑↓ move · Space select · Enter review · n new list · Esc close")
+            }
+            Stage::NewList(_) => modal_form_hints(),
+            Stage::Done(_) => compact_hint_spans("↑↓ scroll   Enter close   Esc close"),
+        };
+    }
     // Every modal overlay is drawn into `chunks[2]`, so the
     // footer stays visible underneath one. That made the leaf's CRUD
     // cluster (`[a] add  [e] edit  [d] delete`) the advertised legend
@@ -1030,19 +1200,92 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
     if form_modal_open(app) {
         return modal_form_hints();
     }
+    if tabs::query_log::overlay_open(app) {
+        return compact_hint_spans(tabs::query_log::footer_hint(app));
+    }
+    if crate::tui::filter_chips::text_editor_open(app) {
+        return compact_hint_spans("Tab focus · Ctrl+s apply · Esc discard");
+    }
+    if crate::tui::filter_chips::choice_editor_open(app) {
+        return compact_hint_spans("↑↓ choose · Tab focus · Enter apply · Esc discard");
+    }
+    if app
+        .filter_focus
+        .is_some_and(|(leaf, _)| leaf == app.active_leaf)
+    {
+        return compact_hint_spans("Tab/Shift+Tab move · Enter open · Del clear · Esc table");
+    }
+    if app.lists.import_source.is_some() {
+        return compact_hint_spans("Tab focus · ↑↓ choose · Enter activate · Esc cancel");
+    }
+    if app.custom_lists.mount_picker.is_some() {
+        return compact_hint_spans("↑↓ move · Space toggle · Ctrl+s review · Esc discard");
+    }
+    if app.show_help {
+        return compact_hint_spans("PgUp/PgDn page · Home/End jump · Esc close");
+    }
+    if app.devices.inspect_open || app.groups.inspect_open || app.local_dns.inspect_open {
+        return compact_hint_spans("↑↓ scroll · PgUp/PgDn page · Esc close");
+    }
+    if app.subnets.inspect.is_some() {
+        return match app.subnets.inspect {
+            Some(crate::tui::app::SubnetInspect::Clients) => {
+                compact_hint_spans("↑↓ scroll · s sort · i details · Esc close")
+            }
+            _ => compact_hint_spans("c clients · Esc close"),
+        };
+    }
+    if mouse::overlay_open(app) {
+        return compact_hint_spans("Esc close");
+    }
+    if app.settings.tracking_panel.is_some() {
+        return compact_hint_spans("Tab focus · Space toggle · s save · Esc close");
+    }
+
+    #[cfg(feature = "cluster")]
+    if crate::tui::nodes::is_replicated_leaf(app.active_leaf)
+        && !crate::tui::nodes::policy_access(app).editable
+    {
+        let hints = match app.active_leaf {
+            Leaf::Dashboard => "↑↓ scroll · read-only policy",
+            Leaf::QueryLog => "f filters · i details · read-only policy",
+            Leaf::Devices => "f filters · → details · read-only policy",
+            Leaf::Profiles | Leaf::Groups | Leaf::LocalDns | Leaf::Subnets => {
+                "→ details · ↑↓ select · read-only policy"
+            }
+            Leaf::Lists => "f filters · ↑↓ select · read-only policy",
+            Leaf::Rules => "f filter · / search · read-only policy",
+            Leaf::CustomLists | Leaf::Labels => "←→ panel · ↑↓ select · read-only policy",
+            Leaf::File => "/ jump · read-only policy",
+            _ => "read-only policy",
+        };
+        return compact_hint_spans(hints);
+    }
+    #[cfg(feature = "cluster")]
+    if app.active_leaf == Leaf::Settings && !crate::tui::nodes::policy_access(app).editable {
+        return compact_hint_spans("b backup · t tracking · restore locked to primary");
+    }
+
+    if matches!(
+        app.active_leaf,
+        Leaf::Devices | Leaf::Profiles | Leaf::Groups | Leaf::LocalDns
+    ) && crate::tui::detail_panel::focused(app, app.active_leaf)
+    {
+        return compact_hint_spans("↑↓ scroll · PgUp/PgDn page · Esc table · e edit");
+    }
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::raw(" "));
+    if matches!(
+        app.active_leaf,
+        Leaf::QueryLog | Leaf::Devices | Leaf::Lists | Leaf::Logs
+    ) {
+        spans.extend(key_span("f", "filters"));
+        spans.push(Span::raw("  "));
+    }
     match app.active_leaf {
         Leaf::Dashboard => {
-            spans.extend(key_span(
-                "d",
-                if app.dashboard.show_daily {
-                    "hourly"
-                } else {
-                    "daily"
-                },
-            ));
+            spans.extend(key_span("↑↓", "scroll"));
         }
         Leaf::Devices => {
             // Promote is reached via Enter on an unmapped row (the
@@ -1057,7 +1300,7 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // isn't a CRUD verb.
             spans.extend(key_span("a", "add"));
             spans.push(Span::raw("  "));
-            spans.extend(key_span("e", "edit"));
+            spans.extend(key_span("i", "details"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("d", "delete"));
         }
@@ -1071,7 +1314,9 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // footer only has room for the CRUD cluster.
             spans.extend(key_span("a", "add"));
             spans.push(Span::raw("  "));
-            spans.extend(key_span("e", "edit"));
+            spans.extend(key_span("Enter", "edit"));
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("i", "details"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("d", "delete"));
         }
@@ -1083,6 +1328,8 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             spans.extend(key_span("e", "edit"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("d", "delete"));
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("i", "info"));
         }
         Leaf::Lists => {
             // The edit modal is the primary mutation surface;
@@ -1092,13 +1339,15 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // collide with the global cluster (r/p/?/q/s) — pinned by
             // `lists_footer_no_collision_with_global_cluster`.
             //
-            // `[B] purge.cc` and `[K] kind` left the footer —
+            // Catalog selection and `[K] kind` live behind other surfaces —
             // both still work, both now live only in `?`. The `c`
             // create-category + `m` move-category
             // hints were removed earlier still, with the dead modals.
             spans.extend(key_span("Enter", "edit"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("a", "add"));
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("d", "delete"));
         }
         Leaf::Rules => {
             // Rules tab is interactive: Enter opens the
@@ -1117,6 +1366,8 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // the selected row's status (BLOCKED → allowlist, ALLOWED
             // → blocklist, neutral statuses → muted "not actionable").
             // Empty Query Log or no selection → no hint at all.
+            spans.extend(key_span("i", "details"));
+            spans.push(Span::raw("  "));
             spans.extend(query_log_hint_spans(app));
         }
         Leaf::Settings => {
@@ -1155,6 +1406,8 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // The `↑↓` / `←→` motion cluster left the footer —
             // both still work (Left/Right stay real bindings here),
             // they now live only in `?`.
+            spans.extend(key_span("←→", "panel"));
+            spans.push(Span::raw("  "));
             spans.extend(key_span("a", "add"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("e", "edit"));
@@ -1182,6 +1435,7 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
                 spans.extend(key_span("d", "delete"));
                 spans.push(Span::raw("  "));
                 spans.extend(key_span("m", "mount"));
+
                 // No arrow row: this cluster plus the global one already
                 // fills 80 columns, and arrow motion needs no footer hint
                 // — it lives in `?` like every other leaf's.
@@ -1190,13 +1444,13 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // different here than on the list pane, which is exactly why
             // the legend has to follow the focus rather than name both.
             crate::tui::app::CustomListsFocus::Rules => {
-                spans.extend(key_span("a", "add rule"));
+                spans.extend(key_span("a", "add"));
                 spans.push(Span::raw("  "));
-                spans.extend(key_span("e", "edit rule"));
+                spans.extend(key_span("e", "edit"));
                 spans.push(Span::raw("  "));
-                spans.extend(key_span("d", "remove rule"));
+                spans.extend(key_span("d", "remove"));
                 spans.push(Span::raw("  "));
-                spans.extend(key_span("Esc", "lists"));
+                spans.extend(key_span("v", "lists"));
             }
         },
         // Full CRUD. The three openers go on the footer rather
@@ -1209,7 +1463,9 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
         Leaf::Groups => {
             spans.extend(key_span("a", "add"));
             spans.push(Span::raw("  "));
-            spans.extend(key_span("e", "edit"));
+            spans.extend(key_span("Enter", "edit"));
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("i", "details"));
             spans.push(Span::raw("  "));
             spans.extend(key_span("d", "delete"));
         }
@@ -1225,13 +1481,25 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
         // `?` next to the two keys that make it meaningful.
         Leaf::Logs => {
             spans.extend(key_span("/", "search"));
-            spans.push(Span::raw("  "));
-            spans.extend(key_span("f", "level"));
         }
-        // Read-only roster; the only tab key is row
-        // selection via the arrows, which needs no footer hint.
         #[cfg(feature = "cluster")]
-        Leaf::Cluster => {}
+        Leaf::Nodes => {
+            spans.extend(key_span("/", "search"));
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("o/O", "sort"));
+            spans.push(Span::raw("  "));
+            if crate::tui::nodes::can_add_node(app) {
+                spans.extend(key_span("a", "add"));
+                spans.push(Span::raw("  "));
+                spans.extend(key_span("Enter", "edit"));
+            }
+            if crate::tui::nodes::can_remove_node(app) {
+                spans.push(Span::raw("  "));
+                spans.extend(key_span("d", "remove"));
+            }
+            spans.push(Span::raw("  "));
+            spans.extend(key_span("u", "recover"));
+        }
         Leaf::Subnets => {
             // Subnets is full CRUD + promote, but the affordance used to
             // live only in the `?` overlay and the zero-state prompt, so
@@ -1244,9 +1512,9 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
             // Leaf now has an explicit arm, so no catch-all remains.
             spans.extend(key_span("a", "add"));
             spans.push(Span::raw("  "));
-            spans.extend(key_span("e", "edit"));
+            spans.extend(key_span("i", "details"));
             spans.push(Span::raw("  "));
-            spans.extend(key_span("d", "delete"));
+            spans.extend(key_span("c", "clients"));
         }
     }
     spans
@@ -1297,18 +1565,11 @@ fn muted_hint(k: &'static str, label: &'static str) -> Vec<Span<'static>> {
     ]
 }
 
-/// Display cells occupied by `spans`.
-///
-/// Counted per `char`, not per byte: the form legend carries `↑↓` and
-/// `←→`, which are 3 bytes and 1 cell each, so a byte sum overstates it
-/// by 8 and elides a legend that fits. Single-width by construction —
-/// every glyph the footer paints is ASCII or a single-cell arrow; a
-/// wide grapheme here would need `unicode-width`, and the test below
-/// is what fails if one arrives.
+/// Display cells occupied by the rendered hints.
 fn hint_width(spans: &[Span<'_>]) -> u16 {
     spans
         .iter()
-        .map(|s| s.content.chars().count())
+        .map(|s| crate::tui::text::width(&s.content))
         .sum::<usize>()
         .min(u16::MAX as usize) as u16
 }
@@ -1329,6 +1590,72 @@ mod tests {
     // can produce (`stty rows 0`, a 1-col pane). The panic vector is a
     // 0-row buffer, which `TestBackend` cannot construct, so drive the
     // pure rect math directly.
+    #[test]
+    fn wordmark_keeps_the_brand_and_product_names_distinct() {
+        let mut app = App::new();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(164, 46)).unwrap();
+        term.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer[(1, 1)].fg, T.brand_red);
+        assert_eq!(buffer[(23, 1)].fg, T.text_primary);
+    }
+
+    #[test]
+    fn active_navigation_label_survives_overflow() {
+        let labels: Vec<Line> = [
+            "Dashboard",
+            "Query Log",
+            "Network",
+            "Filters",
+            "Configuration",
+            "Logs",
+            "Cluster",
+        ]
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+        for active in 0..labels.len() {
+            let (start, end) = navigation_window(&labels, active, 78, " | ");
+            assert!(start <= active && active < end);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(78, 1)).unwrap();
+            term.draw(|f| render_navigation(f, f.area(), labels.clone(), active, " | "))
+                .unwrap();
+            let row: String = (0..78)
+                .map(|x| term.backend().buffer()[(x, 0)].symbol())
+                .collect();
+            assert!(row.contains(&labels[active].to_string()), "{active}: {row}");
+        }
+    }
+
+    #[test]
+    fn borderless_card_keeps_black_gutter_and_two_full_width_bands() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        let mut body = Rect::default();
+        term.draw(|f| {
+            body = render_card(f, f.area(), "System", "Live DNS health", CardRole::Summary);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        assert_eq!(body, Rect::new(2, 3, 26, 6));
+        assert_eq!(buffer[(0, 0)].bg, T.bg_main, "outer gutter is page black");
+        for x in 1..29 {
+            assert_eq!(
+                buffer[(x, 1)].bg,
+                T.card_summary_title_bg,
+                "title band fills the card width"
+            );
+            assert_eq!(
+                buffer[(x, 2)].bg,
+                T.card_summary_subtitle_bg,
+                "subtitle gets its own band"
+            );
+        }
+    }
+
     #[test]
     fn too_small_msg_rect_never_escapes_the_frame() {
         // 0-row buffer with room horizontally: the raw rect would be
@@ -1358,7 +1685,7 @@ mod tests {
     /// question from whether it fits.
     ///
     /// This doc used to end "at the 80-col floor the Lists legend already
-    /// clips mid-hint (`[Enter] edit  [a] a`) — pre-existing and
+    /// clips mid-hint (`Enter edit  a a`) — pre-existing and
     /// orthogonal". That was true when written and is no longer:
     /// `s-tui-footer-legend-clipped-at-80-cols` closed it. The floor now
     /// has its own tests below, at exactly 80, because a legend that fits
@@ -1396,8 +1723,8 @@ mod tests {
     // The footer's left slot belongs to the tab keyboard
     // legend, permanently. Before this the transient status shared
     // `cols[1]` with `tab_hints_for` and won, so the moment any action
-    // reported an outcome the operator lost `[Enter] edit  [a] add  [B]
-    // purge.cc  [K] kind` — the discovery surface for the screen they
+    // reported an outcome the operator lost the Lists action cluster
+    // — the discovery surface for the screen they
     // were on — and on six leaves never got it back.
     //
     // The severity styling did not disappear, it moved: it is now
@@ -1520,22 +1847,22 @@ mod tests {
 
     #[test]
     fn lists_legend_is_not_cut_mid_hint_at_the_80_column_floor() {
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Lists;
         let footer = footer_text_at(&app, FOOTER_FLOOR_COLS);
 
-        // The exact byte sequence the defect produced. `[a] a` is a
-        // truncation of `[a] add` that reads as a complete hint for a key
+        // The exact byte sequence the defect produced. `a a` is a
+        // truncation of `a add` that reads as a complete hint for a key
         // that does something beginning with "a", which is why it is
         // worse than a dropped hint and worth pinning literally.
         assert!(
-            !footer.contains("[a] a "),
+            !footer.contains("a a "),
             "legend still cut mid-token at {FOOTER_FLOOR_COLS} cols: {footer:?}"
         );
-        // This leaf's footer shrunk to two hints — `[B] purge.cc`
-        // and `[K] kind` moved to `?` (they are not dropped, just no
+        // This leaf's footer keeps only its most common direct actions;
+        // and `K kind` moved to `?` (they are not dropped, just no
         // longer footer-resident), so this test no longer pins them.
-        for hint in ["[Enter] edit", "[a] add"] {
+        for hint in ["Enter edit", "a add"] {
             assert!(
                 footer.contains(hint),
                 "hint {hint:?} lost at the declared floor: {footer:?}"
@@ -1552,7 +1879,7 @@ mod tests {
         let mut app = App::new();
         app.active_leaf = Leaf::Lists;
         let footer = footer_text_at(&app, FOOTER_FLOOR_COLS);
-        for key in ["[r]", "[p]", "[s]", "[?]", "[q]"] {
+        for key in [" Tab ", " T ", " r ", " p ", " S ", " ? ", " q "] {
             assert!(
                 footer.contains(key),
                 "global key {key:?} dropped at the floor: {footer:?}"
@@ -1569,7 +1896,7 @@ mod tests {
         app.active_leaf = Leaf::Lists;
         let footer = footer_text_at(&app, FOOTER_TEST_COLS);
         assert!(
-            footer.contains("[r] refresh"),
+            footer.contains("r refresh"),
             "labels must not be spent at a width that can afford them: {footer:?}"
         );
         assert!(
@@ -1619,25 +1946,22 @@ mod tests {
             "a hint is dropped whole or kept whole: {text:?}"
         );
         assert!(
-            text.contains("[Enter] edit"),
+            text.contains("Enter edit"),
             "elision runs right-to-left, so the first hint survives: {text:?}"
         );
     }
 
     #[test]
     fn footer_keeps_tab_hints_while_a_status_is_live() {
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Lists;
         let quiet = footer_text(&app);
-        assert!(
-            quiet.contains("[a] add"),
-            "baseline legend missing: {quiet}"
-        );
+        assert!(quiet.contains("a add"), "baseline legend missing: {quiet}");
 
         app.status_ok("list 'privacy/ads' saved".to_string());
         let live = footer_text(&app);
         assert!(
-            live.contains("[Enter] edit") && live.contains("[a] add"),
+            live.contains("Enter edit") && live.contains("a add"),
             "the tab legend must survive a live status; got: {live}"
         );
         assert!(
@@ -1649,7 +1973,7 @@ mod tests {
         app.status_err("refresh failed: connection refused".to_string());
         let live_err = footer_text(&app);
         assert!(
-            live_err.contains("[a] add"),
+            live_err.contains("a add"),
             "an error must not displace the legend either; got: {live_err}"
         );
     }
@@ -1663,9 +1987,8 @@ mod tests {
         use crate::tui::toast;
 
         let area = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
-        // Dashboard is a singleton section (3-row card), Lists a
-        // multi-leaf one (5-row card) — the two shapes the content rect
-        // can take. Pinned so this covers both, not one twice.
+        // The permanent submenu band gives every section the same content
+        // geometry, including Dashboard's singleton section.
         let mut heights = Vec::new();
         for leaf in [Leaf::Dashboard, Leaf::Lists] {
             let mut app = App::new();
@@ -1702,7 +2025,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(heights, vec![3, 5], "both card shapes must be exercised");
+        assert_eq!(heights, vec![2, 2], "the menu is always two rows");
     }
 
     // …and the half a rect test cannot reach: that `render` actually
@@ -1766,130 +2089,47 @@ mod tests {
         });
         let warned = footer_text(&app);
         assert!(warned.contains("no config file found"));
-        assert!(!warned.contains("[a] add"));
+        assert!(!warned.contains("a add"));
 
         app.startup_warning = None;
         app.paused = true;
         let paused = footer_text(&app);
         assert!(paused.contains("paused"));
-        assert!(!paused.contains("[a] add"));
+        assert!(!paused.contains("a add"));
     }
 
-    // The mnemonic underline is an SGR-4
-    // attribute. `tmux capture-pane -p` STRIPS it, so a plain pty smoke
-    // passes identically whether the underline renders or not; only
-    // `capture-pane -pe` sees it, and even then a naive grep for
-    // `\033\[[0-9;]*4[;m]` false-positives on `\033[34m` (blue fg).
-    // This buffer-level test is the always-on proof.
     #[test]
-    fn subtab_strip_underlines_exactly_the_mnemonic_char_of_each_leaf() {
+    fn permanent_caps_submenu_hides_legacy_rules_and_file() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = App::new();
-        app.active_leaf = Leaf::Profiles; // Filters section, 4 leaves
-        let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        app.active_leaf = Leaf::Profiles;
+        let mut term = Terminal::new(TestBackend::new(80, 2)).unwrap();
         term.draw(|f| render_menu_card(f, f.area(), &app)).unwrap();
-        let buffer = term.backend().buffer().clone();
-
-        // Card rows: 0 border, 1 section bar, 2 divider, 3 leaf strip.
-        let underlined: Vec<String> = (0..80)
-            .map(|x| &buffer[(x, 3)])
-            .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
-            .map(|c| c.symbol().to_string())
+        let filters: String = (0..80)
+            .map(|x| term.backend().buffer()[(x, 1)].symbol())
             .collect();
+        assert!(filters.contains("PROFILES") && filters.contains("CUSTOM LISTS"));
+        assert!(!filters.contains("RULES"));
 
-        // Profiles→P, Lists→i, Custom Lists→t, Rules→u. Exactly one cell per
-        // leaf, in strip order. A stray extra hit means a span boundary is
-        // wrong.
-        //
-        // The `t` is the one worth reading: `mnemonic_offset` CALCULATES the
-        // underline position rather than taking it as a constant, so this is
-        // what proves it landed on the `t` of "Cus**t**om" and not on some
-        // other cell of a two-word label.
-        assert_eq!(
-            underlined,
-            vec!["P", "i", "t", "u"],
-            "sub-tab strip must underline exactly one mnemonic char per leaf"
-        );
-    }
-
-    #[test]
-    fn configuration_subtab_strip_underlines_all_four_leaves() {
-        // Twin of the test above, on the section that gained a strip.
-        // Settings used to be a singleton and painted no sub-tab
-        // row at all, so nothing covered the underline there — and `e` is the
-        // hardest mnemonic to place, being neither leaf's initial.
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut app = App::new();
-        app.active_leaf = Leaf::Settings; // Configuration section, 5 leaves
-        let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        app.active_leaf = Leaf::Settings;
         term.draw(|f| render_menu_card(f, f.area(), &app)).unwrap();
-        let buffer = term.backend().buffer().clone();
-
-        let underlined: Vec<String> = (0..80)
-            .map(|x| &buffer[(x, 3)])
-            .filter(|c| c.modifier.contains(Modifier::UNDERLINED))
-            .map(|c| c.symbol().to_string())
+        let configuration: String = (0..80)
+            .map(|x| term.backend().buffer()[(x, 1)].symbol())
             .collect();
-
-        // Settings→e (the second strong consonant rule: `s` is taken by
-        // Subnets, so sEttings underlines its `e`).
-        // `logs-tab`: Log Messages→M. Every letter of "Logs" is already a
-        // mnemonic or the `g` prefix, so the leaf is labelled "Log
-        // Messages" and takes the free `m` at the second word's initial —
-        // this row is where that decision becomes visible to an operator.
-        //
-        // FOUR leaves: the Tags→T entry is gone with the
-        // tab, and Log Messages→M was added. Taking either side of
-        // that alone would have resurrected the Tags leaf or
-        // deleted the Logs one.
-        assert_eq!(
-            underlined,
-            vec!["b", "e", "F", "M"],
-            "Configuration sub-tab strip must underline exactly one mnemonic char per leaf"
-        );
-    }
-
-    #[test]
-    fn underline_survives_highlight_style_on_the_active_leaf() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        // ratatui 0.29 `Tabs` patches the selected title with
-        // `highlight_style`. `Style::patch` unions modifiers, so UNDERLINED
-        // should survive alongside the BOLD highlight — but "should" is not
-        // proof, and the active leaf is the one span where the two collide.
-        let mut app = App::new();
-        app.active_leaf = Leaf::Lists; // mnemonic 'i', mid-word, and active
-        let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
-        term.draw(|f| render_menu_card(f, f.area(), &app)).unwrap();
-        let buffer = term.backend().buffer().clone();
-
-        let cell = (0..80)
-            .map(|x| &buffer[(x, 3)])
-            .find(|c| c.modifier.contains(Modifier::UNDERLINED) && c.symbol() == "i")
-            .expect("active leaf `Lists` must still underline its `i`");
-        assert!(
-            cell.modifier.contains(Modifier::BOLD),
-            "active leaf must keep the BOLD highlight as well as the underline"
-        );
-        assert_eq!(
-            cell.fg, T.brand_red,
-            "active leaf keeps the brand-red highlight colour"
-        );
+        assert!(configuration.contains("LABELS") && configuration.contains("LOG MESSAGES"));
+        assert!(!configuration.contains("FILE"));
     }
 
     #[test]
     fn global_hints_carry_the_five_always_on_keys() {
         let rendered = spans_to_string(&global_hints());
-        assert!(rendered.contains("[r] refresh"));
-        assert!(rendered.contains("[p] pause"));
-        assert!(rendered.contains("[s] resolver"));
-        assert!(rendered.contains("[?] help"));
-        assert!(rendered.contains("[q] quit"));
+        assert!(rendered.contains("r refresh"));
+        assert!(rendered.contains("p pause"));
+        assert!(rendered.contains("S resolver"));
+        assert!(rendered.contains("? help"));
+        assert!(rendered.contains("q quit"));
     }
 
     // ── The footer advertises the modal nav grammar ─────────────────────
@@ -1902,22 +2142,22 @@ mod tests {
     #[test]
     fn footer_swaps_to_the_modal_grammar_while_a_form_is_open() {
         use crate::tui::app::{DeviceFormState, DeviceModal};
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Devices;
 
         let leaf_hints = spans_to_string(&tab_hints_for(&app));
         assert!(
-            leaf_hints.contains("[a] add"),
+            leaf_hints.contains("a add"),
             "precondition: the Devices leaf cluster; got: {leaf_hints}"
         );
 
         app.devices.modal = Some(DeviceModal::Form(DeviceFormState::new_add()));
         let modal_hints = spans_to_string(&tab_hints_for(&app));
         for expected in [
-            "\u{2191}\u{2193}] move",
-            "\u{2190}\u{2192}] change",
-            "[Ctrl+s] save",
-            "[Esc] discard",
+            "\u{2191}\u{2193} move",
+            "\u{2190}\u{2192} change",
+            "Ctrl+s save",
+            "Esc discard",
         ] {
             assert!(
                 modal_hints.contains(expected),
@@ -1925,19 +2165,19 @@ mod tests {
             );
         }
         assert!(
-            !modal_hints.contains("[a] add"),
+            !modal_hints.contains("a add"),
             "the leaf cluster is dead while a form is open; got: {modal_hints}"
         );
 
         app.devices.modal = None;
         assert!(
-            spans_to_string(&tab_hints_for(&app)).contains("[a] add"),
+            spans_to_string(&tab_hints_for(&app)).contains("a add"),
             "closing the form must restore the leaf cluster"
         );
     }
 
     #[test]
-    fn footer_keeps_leaf_hints_for_confirms_and_pickers() {
+    fn footer_confirms_and_pickers_hide_inactive_leaf_commands() {
         use crate::tui::app::{DeviceModal, EditModalMode};
         // A y/n confirm has no field focus and nothing to cycle.
         let mut app = App::new();
@@ -1947,8 +2187,8 @@ mod tests {
             display_name: "Kids tablet".into(),
         });
         assert!(
-            spans_to_string(&tab_hints_for(&app)).contains("[a] add"),
-            "a delete confirm must not claim the form grammar"
+            spans_to_string(&tab_hints_for(&app)).contains("Esc close"),
+            "a delete confirm must advertise its close action"
         );
 
         // Same for the Lists typed-id confirm screen.
@@ -1960,8 +2200,8 @@ mod tests {
         };
         app.lists.edit_modal = Some(modal);
         assert!(
-            spans_to_string(&tab_hints_for(&app)).contains("[a] add"),
-            "the typed-id confirm must not claim the form grammar"
+            spans_to_string(&tab_hints_for(&app)).contains("Esc close"),
+            "the typed-id confirm must advertise its close action"
         );
 
         // A form whose popup picker is open routes Up/Down to the popup
@@ -1980,8 +2220,8 @@ mod tests {
         });
         app.devices.modal = Some(DeviceModal::Form(form));
         assert!(
-            spans_to_string(&tab_hints_for(&app)).contains("[a] add"),
-            "a form with its popup picker open must not claim the form grammar"
+            spans_to_string(&tab_hints_for(&app)).contains("Esc close"),
+            "a form with its popup picker open must advertise its close action"
         );
 
         // Non-form stages of the Tier-1 trio: the confirm and the
@@ -1994,12 +2234,13 @@ mod tests {
                     id: "lan".into(),
                     display_name: "LAN".into(),
                     cidrs: vec!["10.10.1.0/24".into()],
+                    focus: 0,
                 },
             ),
         });
         assert!(
-            spans_to_string(&tab_hints_for(&app)).contains("[a] add"),
-            "the Subnets remove confirm must not claim the form grammar"
+            spans_to_string(&tab_hints_for(&app)).contains("Esc close"),
+            "the Subnets remove confirm must advertise its close action"
         );
     }
 
@@ -2025,31 +2266,24 @@ mod tests {
     }
 
     #[test]
-    fn tab_hints_for_dashboard_toggle_label_matches_state() {
-        let mut app = App::new();
-        app.active_leaf = Leaf::Dashboard;
-        app.dashboard.show_daily = false;
+    fn dashboard_footer_only_advertises_overview_navigation() {
+        let app = App::known_standalone_for_test();
         let rendered = spans_to_string(&tab_hints_for(&app));
-        assert!(rendered.contains("[d] daily"));
-
-        app.dashboard.show_daily = true;
-        let rendered = spans_to_string(&tab_hints_for(&app));
-        assert!(rendered.contains("[d] hourly"));
+        assert!(rendered.contains("scroll"), "{rendered}");
+        assert!(!rendered.contains("details"));
+        assert!(!rendered.contains("panels"));
+        assert!(!rendered.contains("hour"));
+        assert!(!rendered.contains("day"));
     }
 
     #[test]
-    fn tab_hints_for_subnets_carries_crud_cluster() {
-        // Subnets graduated from the "no footer key" cohort (Onda-1): the
-        // add/edit/delete openers are now surfaced in the footer so the
-        // affordance isn't buried in the `?` overlay or the zero-state.
-        // Promote-candidate stays contextual (Enter on a `[suggested]`
-        // row), not a fixed footer key.
-        let mut app = App::new();
+    fn tab_hints_for_subnets_carries_primary_network_actions() {
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Subnets;
         let rendered = spans_to_string(&tab_hints_for(&app));
-        assert!(rendered.contains("[a] add"), "got: {rendered}");
-        assert!(rendered.contains("[e] edit"), "got: {rendered}");
-        assert!(rendered.contains("[d] delete"), "got: {rendered}");
+        assert!(rendered.contains("a add"), "got: {rendered}");
+        assert!(rendered.contains("i details"), "got: {rendered}");
+        assert!(rendered.contains("c clients"), "got: {rendered}");
     }
 
     /// The three openers reach the footer.
@@ -2065,12 +2299,12 @@ mod tests {
     /// reddens this instead of silently colliding.
     #[test]
     fn labels_footer_carries_the_crud_cluster_without_colliding() {
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Labels;
         let rendered = spans_to_string(&tab_hints_for(&app));
-        assert!(rendered.contains("[a] add"), "got: {rendered}");
-        assert!(rendered.contains("[e] edit"), "got: {rendered}");
-        assert!(rendered.contains("[d] delete"), "got: {rendered}");
+        assert!(rendered.contains("a add"), "got: {rendered}");
+        assert!(rendered.contains("e edit"), "got: {rendered}");
+        assert!(rendered.contains("d delete"), "got: {rendered}");
 
         let globals = spans_to_string(&global_hints());
         for pat in ["[a]", "[e]", "[d]"] {
@@ -2088,7 +2322,7 @@ mod tests {
     /// An earlier formula defined the budget as
     /// `80 - version_w - hint_width(&global_hints())`
     /// — the full five-key labelled cluster — which presupposes
-    /// `global_hints()` also shrinking to `[?] help  [q] quit`. That
+    /// `global_hints()` also shrinking to `? help  q quit`. That
     /// shrink is frozen out
     /// (`every_global_key_survives_the_80_column_floor` stays). Against
     /// the frozen five-key cluster that formula gives a
@@ -2129,7 +2363,7 @@ mod tests {
         let budget = 80u16.saturating_sub(hint_width(&global_hints_compact()));
 
         for leaf in Leaf::ALL {
-            let mut app = App::new();
+            let mut app = App::known_standalone_for_test();
             app.active_leaf = leaf;
             let hints = tab_hints_for(&app);
 
@@ -2144,7 +2378,9 @@ mod tests {
             let mut groups = 0usize;
             let mut in_group = false;
             for span in &hints {
-                let is_sep = !span.content.is_empty() && span.content.trim().is_empty();
+                let is_sep = span.style == Style::default()
+                    && !span.content.is_empty()
+                    && span.content.trim().is_empty();
                 if is_sep {
                     in_group = false;
                 } else if !in_group {
@@ -2187,7 +2423,7 @@ mod tests {
             hint_width(&modal_form_hints())
         );
         assert!(
-            text.contains("[Esc] discard"),
+            text.contains("Esc discard"),
             "the modal's own exit key must survive at the floor: {text:?}"
         );
     }
@@ -2197,13 +2433,13 @@ mod tests {
         // The `c` create-category + `m`
         // move-category hints were removed with the dead modals.
         //
-        // `[K] kind` left the
+        // `K kind` left the
         // footer too. It still toggles BLOCK ↔ ALLOW; it now lives only
-        // in `?`, alongside `[B] purge.cc`.
+        // in `?`.
         let mut app = App::new();
         app.active_leaf = Leaf::Lists;
         let rendered = spans_to_string(&tab_hints_for(&app));
-        for gone in ["[K] kind", "[c] category", "[m] move"] {
+        for gone in ["K kind", "c category", "m move"] {
             assert!(
                 !rendered.contains(gone),
                 "Lists footer must NOT surface removed hint `{gone}`; got: {rendered}"
@@ -2216,12 +2452,12 @@ mod tests {
         // Enter is the primary edit gesture but used to have no
         // footer hint, so operators kept thinking it was a no-op. Pin
         // the affordance so future refactors don't quietly drop it.
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Lists;
         let rendered = spans_to_string(&tab_hints_for(&app));
         assert!(
-            rendered.contains("[Enter] edit"),
-            "Lists footer must surface `[Enter] edit`; got: {rendered}"
+            rendered.contains("Enter edit"),
+            "Lists footer must surface `Enter edit`; got: {rendered}"
         );
     }
 
@@ -2232,38 +2468,35 @@ mod tests {
         // key into this letter space, this
         // test catches the collision before operators do.
         //
-        // `B` and `K` left the footer (they still bind, in `?`
-        // only), so only `a` remains to check here.
-        let mut app = App::new();
+        // The global cluster must leave the leaf-local add key free.
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Lists;
         let lists_hints = spans_to_string(&tab_hints_for(&app));
         let global_hints = spans_to_string(&global_hints());
         assert!(
-            lists_hints.contains("[a]"),
+            lists_hints.contains(" a add"),
             "Lists footer must surface `[a]`; got: {lists_hints}"
         );
         assert!(
-            !global_hints.contains("[a]"),
+            !global_hints.contains(" a "),
             "global cluster must NOT also bind `[a]` (collides with Lists tab); got: {global_hints}"
         );
     }
 
     #[test]
     fn lists_footer_carries_add_and_drops_catalog_affordance() {
-        // Pins `[a] add` (the universal form) alongside
-        // `[B] purge.cc` (the curated catalog browser). The
-        // catalog hint has left the footer — it still opens the browser, it
-        // now lives only in `?` — so `[a] add` is the surviving half.
-        let mut app = App::new();
+        // The source chooser behind `a` owns both URL and curated-catalog
+        // subscription flows.
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Lists;
         let rendered = spans_to_string(&tab_hints_for(&app));
         assert!(
-            rendered.contains("[a] add"),
-            "Lists footer must surface `[a] add`; got: {rendered}"
+            rendered.contains("a add"),
+            "Lists footer must surface `a add`; got: {rendered}"
         );
         assert!(
-            !rendered.contains("[B] purge.cc"),
-            "Lists footer must NOT surface `[B] purge.cc`; got: {rendered}"
+            !rendered.contains("B purge.cc"),
+            "Lists footer must NOT surface `B purge.cc`; got: {rendered}"
         );
     }
 
@@ -2273,75 +2506,197 @@ mod tests {
         // Pin the two hints so future refactors can't drop them;
         // operators rely on the footer to discover the affordances.
         //
-        // `[f] filter` left the footer — it still cycles the
+        // `f filter` left the footer — it still cycles the
         // chip, it now lives only in `?`.
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Rules;
         let rendered = spans_to_string(&tab_hints_for(&app));
-        for hint in ["[Enter] edit", "[d] delete"] {
+        for hint in ["Enter edit", "d delete"] {
             assert!(
                 rendered.contains(hint),
                 "Rules footer must surface `{hint}`; got: {rendered}"
             );
         }
         assert!(
-            !rendered.contains("[f] filter"),
-            "Rules footer must NOT surface `[f] filter`; got: {rendered}"
+            !rendered.contains("f filter"),
+            "Rules footer must NOT surface `f filter`; got: {rendered}"
         );
     }
 
     // ── Unified menu card ────────────────────────────────────────────
 
     #[test]
-    fn section_has_subtabs_only_on_multi_leaf_sections() {
-        // Network and Filters each carry ≥2 leaves and pull
-        // a sub-tab row inside the unified card. Dashboard and Query Log
-        // are the singleton sections and skip both the divider and the
-        // sub-tab row — the menu card collapses to 3 rows on those tabs.
-        //
-        // Configuration took Tags in, so the section Settings
-        // used to own alone is now multi-leaf and DOES paint a strip. That
-        // flips this assertion, and with it the card height on the
-        // Settings tab from 3 to 5 — the value must match what
-        // `render_menu_card` actually paints or ratatui clips the border.
-        assert!(!section_has_subtabs(Section::Dashboard));
-        assert!(!section_has_subtabs(Section::QueryLog));
-        assert!(section_has_subtabs(Section::Network));
-        assert!(section_has_subtabs(Section::Filters));
-        assert!(section_has_subtabs(Section::Configuration));
-    }
-
-    #[test]
-    fn menu_card_height_is_3_on_singleton_sections() {
-        // The card collapses to 3 rows (top border + section row +
-        // bottom border) when the active section has only one leaf.
-        // This value MUST match the number of rows `render_menu_card`
-        // paints on those sections — a 1-row mismatch would either
-        // leave a blank gap below the card or clip the bottom border.
-        // Settings dropped off this list — its section gained Tags,
-        // so it now pays the 5-row card. Dashboard and Query Log are the last
-        // two singletons.
-        let mut app = App::new();
-        for leaf in [Leaf::Dashboard, Leaf::QueryLog] {
-            app.active_leaf = leaf;
-            assert_eq!(
-                menu_card_height(&app),
-                3,
-                "{leaf:?} is in a singleton section; card height must be 3"
-            );
+    fn header_is_black_and_has_no_node_metadata() {
+        for height in [1, 4] {
+            let app = App::known_standalone_for_test();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(164, height)).unwrap();
+            terminal.draw(|f| render_header(f, f.area(), &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..height {
+                for x in 0..164 {
+                    assert_eq!(buffer[(x, y)].bg, Color::Black);
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+            }
+            for removed in ["standalone", "policy", "corpus", "role unknown"] {
+                assert!(!text.to_lowercase().contains(removed), "{text}");
+            }
         }
     }
 
     #[test]
-    fn menu_card_height_is_5_on_multi_leaf_sections() {
-        // The card grows to 5 rows on multi-leaf sections: top border
-        // + section row + divider row + sub-tab row + bottom border.
-        // Pin every leaf in Network, Filters and Configuration so a future
-        // leaf promotion that accidentally lands somewhere outside those
-        // sections (e.g. a new singleton) trips this test instead
-        // of silently shipping a clipped chrome.
+    fn navigation_margins_spacing_and_mouse_targets_match() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = App::new();
+        app.active_leaf = Leaf::Devices;
+        mouse::reset(&app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(164, 2)).unwrap();
+        terminal
+            .draw(|f| render_menu_card(f, f.area(), &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, 0)].symbol(), "D");
+        assert_eq!(buffer[(14, 0)].symbol(), "Q");
+        assert_eq!(buffer[(4, 1)].symbol(), "D");
+        assert_eq!(buffer[(3, 1)].bg, T.navigation_active_bg);
+        assert_eq!(buffer[(11, 1)].bg, T.navigation_active_bg);
+        for y in 0..2 {
+            for x in [0, 163] {
+                assert_eq!(buffer[(x, y)].bg, Color::Black);
+                assert_eq!(
+                    mouse::action(
+                        &app,
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: x,
+                            row: y,
+                            modifiers: KeyModifiers::NONE
+                        }
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            mouse::action(
+                &app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 14,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE
+                }
+            ),
+            Some(mouse::MouseAction::Section(Section::QueryLog))
+        );
+    }
+
+    #[test]
+    fn footer_shortcuts_form_a_left_cluster_with_only_version_on_right() {
+        let app = App::known_standalone_for_test();
+        let row = footer_text_at(&app, 164);
+        let quit_end = row.find("q quit").unwrap() + "q quit".len();
+        let version = row.find(concat!("v", env!("CARGO_PKG_VERSION"))).unwrap();
+        assert!(
+            quit_end < 120,
+            "global actions must follow the left legend: {row:?}"
+        );
+        assert!(row[quit_end..version].trim().is_empty());
+        assert!(version > 150);
+    }
+
+    #[test]
+    fn every_section_renders_both_menu_bands() {
+        let mut app = App::new();
+        for section in Section::ALL {
+            app.active_leaf = section.default_leaf();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 2)).unwrap();
+            terminal
+                .draw(|frame| render_menu_card(frame, frame.area(), &app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(100, 0)].bg, T.bg_surface);
+            assert_eq!(buffer[(100, 1)].bg, T.navigation_submenu_bg);
+        }
+    }
+
+    #[test]
+    fn single_page_sections_keep_an_empty_unclickable_submenu_band() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = App::new();
+        for leaf in [Leaf::Dashboard, Leaf::QueryLog] {
+            app.active_leaf = leaf;
+            for width in [80, 125] {
+                mouse::reset(&app);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 2)).unwrap();
+                terminal
+                    .draw(|frame| render_menu_card(frame, frame.area(), &app))
+                    .unwrap();
+                for x in 0..width {
+                    let cell = &terminal.backend().buffer()[(x, 1)];
+                    assert_eq!(cell.symbol(), " ", "{leaf:?} at column {x}");
+                    assert_eq!(
+                        cell.bg,
+                        if x == 0 || x == width - 1 {
+                            Color::Black
+                        } else {
+                            T.navigation_submenu_bg
+                        }
+                    );
+                    assert_eq!(
+                        mouse::action(
+                            &app,
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: x,
+                                row: 1,
+                                modifiers: KeyModifiers::NONE,
+                            }
+                        ),
+                        None,
+                        "an empty submenu has no hidden click target"
+                    );
+                }
+            }
+        }
+
+        app.active_leaf = Leaf::Devices;
+        mouse::reset(&app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 2)).unwrap();
+        terminal
+            .draw(|frame| render_menu_card(frame, frame.area(), &app))
+            .unwrap();
+        let row: String = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
+            .collect();
+        let x = row.find("SUBNETS").expect("Network retains its submenu") as u16;
+        assert_eq!(
+            mouse::action(
+                &app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: 1,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            Some(mouse::MouseAction::Leaf(Leaf::Subnets))
+        );
+    }
+
+    #[test]
+    fn menu_card_height_keeps_the_submenu_band_on_every_section() {
         let mut app = App::new();
         for leaf in [
+            Leaf::Dashboard,
+            Leaf::QueryLog,
             Leaf::Devices,
             Leaf::Subnets,
             Leaf::LocalDns,
@@ -2355,8 +2710,8 @@ mod tests {
             app.active_leaf = leaf;
             assert_eq!(
                 menu_card_height(&app),
-                5,
-                "{leaf:?} is in a multi-leaf section; card height must be 5"
+                2,
+                "{leaf:?} must retain the permanent submenu row"
             );
         }
     }
@@ -2372,7 +2727,7 @@ mod tests {
     // It had also drifted: the fixture set `active_leaf = Leaf::Labels`,
     // so by the end it was asserting on the LABELS footer under a name
     // promising Tags — which is why its failure here read as
-    // "[a] add [e] edit [d] delete" rather than "[a] new tag".
+    // "a add e edit d delete" rather than "a new tag".
 
     #[test]
     fn settings_footer_carries_backup_restore_cluster() {
@@ -2380,11 +2735,11 @@ mod tests {
         // footer so the discoverability gap that landed with the initial
         // Backup/Restore feature can never silently reappear. `R` is
         // uppercase to dodge the global `[r]` refresh — same case-distinct
-        // pattern Tags already uses for `[R] rename`.
-        let mut app = App::new();
+        // pattern Tags already uses for `R rename`.
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Settings;
         let rendered = spans_to_string(&tab_hints_for(&app));
-        for hint in ["[b] backup", "[R] restore", "[t] tracking"] {
+        for hint in ["b backup", "R restore", "t tracking"] {
             assert!(
                 rendered.contains(hint),
                 "Settings footer must surface `{hint}`; got: {rendered}"
@@ -2413,33 +2768,39 @@ mod tests {
 
     #[test]
     fn tab_hints_for_devices_carries_mapping_keys() {
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::Devices;
         let rendered = spans_to_string(&tab_hints_for(&app));
         // Pin the cluster operators rely on so a future cleanup can't
         // silently drop one of them. Ordered front-to-back as they
-        // render — `a` first because Add is the answer when Promote
+        // render. Add is the fallback when Promote
         // refuses (no ARP MAC). Promote has no dedicated key here:
         // Enter dispatches contextually based on the focused row's
         // variant, freeing `p` for the global pause.
-        for key in ["[a] add", "[e] edit", "[d] delete"] {
+        for key in ["f filters", "a add", "i details", "d delete"] {
             assert!(
                 rendered.contains(key),
                 "Devices footer must surface `{key}`; got: {rendered}"
             );
         }
-        // `[G] group-by` left the footer — it still cycles, it
+        assert!(
+            help::per_leaf_rows(Leaf::Devices)
+                .iter()
+                .any(|row| row.key == "a / e / d" && row.desc.contains("Edit")),
+            "the edit shortcut remains discoverable in help"
+        );
+        // `G group-by` left the footer — it still cycles, it
         // now lives only in `?`.
         assert!(
-            !rendered.contains("[G] group-by"),
-            "Devices footer must NOT carry `[G] group-by`; got: {rendered}"
+            !rendered.contains("G group-by"),
+            "Devices footer must NOT carry `G group-by`; got: {rendered}"
         );
-        // Defensive: `[p] promote` is retired — the global
-        // `[p] pause` lives in the right cluster and pressing `p` on
+        // Defensive: `p promote` is retired — the global
+        // `p pause` lives in the right cluster and pressing `p` on
         // Devices must fall through to it.
         assert!(
-            !rendered.contains("[p] promote"),
-            "Devices footer must NOT carry `[p] promote` (collides with global pause); got: {rendered}"
+            !rendered.contains("p promote"),
+            "Devices footer must NOT carry `p promote` (collides with global pause); got: {rendered}"
         );
     }
 
@@ -2450,7 +2811,7 @@ mod tests {
     /// `QueryLog`. Returns the prepared `App` ready for `tab_hints_for`.
     fn app_with_query_log_row(result: &str) -> App {
         use crate::ipc::protocol::QueryLogDto;
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::QueryLog;
         app.query_log.entries = vec![QueryLogDto {
             timestamp: "2026-05-02T12:00:00Z".into(),
@@ -2474,8 +2835,8 @@ mod tests {
         let app = app_with_query_log_row("BLOCKED");
         let rendered = spans_to_string(&tab_hints_for(&app));
         assert!(
-            rendered.contains("[Enter] allowlist this query"),
-            "BLOCKED row must surface `[Enter] allowlist this query`; got: {rendered}"
+            rendered.contains("Enter allowlist this query"),
+            "BLOCKED row must surface `Enter allowlist this query`; got: {rendered}"
         );
         assert!(
             !rendered.contains("blocklist"),
@@ -2490,8 +2851,8 @@ mod tests {
         let app = app_with_query_log_row("ALLOWED");
         let rendered = spans_to_string(&tab_hints_for(&app));
         assert!(
-            rendered.contains("[Enter] blocklist this query"),
-            "ALLOWED row must surface `[Enter] blocklist this query`; got: {rendered}"
+            rendered.contains("Enter blocklist this query"),
+            "ALLOWED row must surface `Enter blocklist this query`; got: {rendered}"
         );
         assert!(
             !rendered.contains("allowlist"),

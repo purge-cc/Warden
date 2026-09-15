@@ -43,6 +43,12 @@ pub struct ClusterConfig {
     /// the daemon is byte-identical to a standalone node.
     pub enabled: bool,
 
+    /// Membership protocol; absent for legacy shared-token configurations.
+    pub membership_version: Option<u32>,
+    pub cluster_id: Option<String>,
+    pub primary_node_id: Option<String>,
+    pub primary_cert_fingerprint: Option<String>,
+
     /// This node's [`ClusterRole`]. Default [`ClusterRole::Primary`].
     pub role: ClusterRole,
 
@@ -53,9 +59,7 @@ pub struct ClusterConfig {
     /// unset.
     pub node_name: Option<String>,
 
-    /// Split-brain tiebreak: the lower number wins on primary recovery.
-    /// Operator-managed; distinctness from the peer is a
-    /// warn-only concern, not enforced here.
+    /// Legacy compatibility field. Automatic promotion is not supported.
     pub priority: u32,
 
     /// The primary's API base URL a secondary polls, e.g.
@@ -91,8 +95,7 @@ pub struct ClusterConfig {
     /// one interval. Default 15.
     pub poll_interval_secs: u64,
 
-    /// Consecutive-failure window before a secondary promotes itself,
-    /// seconds. Default 45 (three missed 15 s beats).
+    /// Legacy compatibility field. Nodes never promote themselves.
     pub failover_after_secs: u64,
 
     /// Optional defence-in-depth: CIDRs allowed to reach `/api/cluster/*`
@@ -113,6 +116,10 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            membership_version: None,
+            cluster_id: None,
+            primary_node_id: None,
+            primary_cert_fingerprint: None,
             role: ClusterRole::Primary,
             node_name: None,
             priority: 1,
@@ -421,6 +428,10 @@ mod tests {
             poll_interval_secs: 20,
             failover_after_secs: 60,
             allow_peer: vec!["10.10.1.94/32".into()],
+            membership_version: None,
+            cluster_id: None,
+            primary_node_id: None,
+            primary_cert_fingerprint: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: ClusterConfig = toml::from_str(&s).unwrap();

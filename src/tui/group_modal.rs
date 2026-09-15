@@ -172,6 +172,7 @@ pub struct RemoveConfirm {
     /// and `remove_inner` — which refuses only on the device-side
     /// back-reference — will happily remove it.
     pub devices: Vec<String>,
+    pub focus: usize,
 }
 
 impl FormField {
@@ -356,6 +357,7 @@ impl GroupModal {
                     .iter()
                     .map(|d| d.as_str().to_string())
                     .collect(),
+                focus: 0,
             }),
         }
     }
@@ -408,10 +410,12 @@ impl GroupModal {
 // exactly one implementation of that so the surfaces cannot drift apart.
 // Pinned by `no_hand_rolled_colour_in_this_module` below.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, ValueKind};
+use crate::tui::theme::{self, CardRole};
 
 /// Nav-key legend copy — byte-identical to the Subnets modal's.
 ///
@@ -451,6 +455,48 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &GroupModal) {
             modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
         }
     }
+}
+
+/// Render an add/edit form inside a wide page's detail card. The form state
+/// remains the captured modal state; only its presentation changes.
+pub fn render_inline_editor(f: &mut Frame, area: Rect, modal: &GroupModal) -> bool {
+    let Stage::EditingForm(form) = &modal.stage else {
+        return false;
+    };
+    let (title, desc) = band_text(form);
+    let body_area = theme::filled_card(f.buffer_mut(), area, &title, desc, CardRole::History);
+    let (mut body, mut cursor) = form_body(form, body_area.width);
+    // The card supplies the paired bands; retain the modal's intentional
+    // breathing room before the first coloured section rule.
+    body.head = vec![Line::default()];
+    if body.scrollable
+        && modal_form::will_scroll(
+            body_area.height as usize,
+            body.head.len(),
+            body.fields.len(),
+            body.tail.len(),
+        )
+    {
+        (body, cursor) = form_body(form, body_area.width.saturating_sub(1));
+        body.head = vec![Line::default()];
+    }
+    let view = modal_form::render_scroll_body(f, body_area, &body);
+    if let Some((row, caret)) = cursor {
+        if row >= view.offset && row < view.offset + view.view_h {
+            let position = Position {
+                x: body_area
+                    .x
+                    .saturating_add(modal_form::VALUE_COL as u16 + caret),
+                y: body_area
+                    .y
+                    .saturating_add((view.head_h + row - view.offset) as u16),
+            };
+            if position.x < body_area.right() && position.y < body_area.bottom() {
+                f.set_cursor_position(position);
+            }
+        }
+    }
+    true
 }
 
 /// Title + description band copy for the add/edit form.
@@ -528,7 +574,7 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
     rows.spacer();
 
     // MEMBERSHIP
-    rows.section("Membership");
+    rows.section_with_role("Membership", CardRole::Analytics);
     let devices = focus == FormField::Devices;
     rows.text_field(
         modal_form::value_row(
@@ -586,13 +632,15 @@ fn form_body(form: &AddForm, width: u16) -> (modal_form::ScrollBody, Option<(usi
             focus == FormField::Cancel,
             ActionKind::Neutral,
             field_hint(FormField::Cancel),
-        ),
+        )
+        .on_key(crossterm::event::KeyCode::Esc),
         Action::new(
             "  [Enter] Save  ",
             focus == FormField::Submit,
             ActionKind::Primary,
             field_hint(FormField::Submit),
-        ),
+        )
+        .on_save(),
     ];
 
     let tail = modal_form::form_tail(
@@ -624,11 +672,9 @@ fn field_hint(f: FormField) -> &'static str {
 
 /// The Remove confirm as an Archetype-C notice.
 ///
-/// The keying is a single `y` / `n` keypress, no focus ring. The actions
-/// are painted with their key in the label because of that — they orient,
-/// they are not Tab targets — and **neither is `Primary`, so the modal
-/// has no filled button at all**. The one teal fill means "this is the
-/// action"; a destructive confirm should not be advertising one.
+/// The `y` / `n` shortcuts remain available, while Tab/arrows and Enter
+/// operate a two-action focus ring. Neither action is primary, so the
+/// destructive choice is never presented as a recommendation.
 ///
 /// The membership count is in the body rather than a footnote because it
 /// is the consequence: `groups_for_device` matches on the **forward**
@@ -664,8 +710,10 @@ fn remove_notice(rc: &RemoveConfirm) -> NoticeSpec {
         hint: "the devices themselves are untouched — only this binding goes".to_string(),
         keys: "[y] confirm   [n / Esc] cancel".to_string(),
         actions: vec![
-            Action::new("  [n] Cancel  ", false, ActionKind::Neutral, ""),
-            Action::new("  [y] Remove  ", false, ActionKind::Destructive, ""),
+            Action::new("  [n] Cancel  ", rc.focus == 0, ActionKind::Neutral, "")
+                .on_key(crossterm::event::KeyCode::Esc),
+            Action::new("  [y] Remove  ", rc.focus == 1, ActionKind::Destructive, "")
+                .on_key(crossterm::event::KeyCode::Char('y')),
         ],
     }
 }
@@ -723,7 +771,8 @@ fn outcome_notice(outcome: &SubmitOutcome) -> NoticeSpec {
         error,
         hint: String::new(),
         keys: "[any key] close".to_string(),
-        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")],
+        actions: vec![Action::new("  Close  ", false, ActionKind::Primary, "")
+            .on_key(crossterm::event::KeyCode::Esc)],
     }
 }
 
@@ -940,7 +989,7 @@ mod tests {
     // `tabs::lists::commit_tag_picker`.
 
     #[test]
-    fn form_renders_banded_sections_and_the_active_marker() {
+    fn form_renders_banded_sections_and_the_value_focus() {
         let mut modal = GroupModal::open_add(vec!["default".into()], 0);
         let form = modal.form_mut().unwrap();
         form.id = "phones".into(); // focus defaults to Id on Add
@@ -955,7 +1004,19 @@ mod tests {
             "the `_` caret is the cursor's job"
         );
         assert!(text.contains("phones"), "the focused value still renders");
-        assert!(text.contains('◀'), "active row carries the focus marker");
+        let (body, cursor) = form_body(form, 60);
+        let (row, caret) = cursor.expect("focused text field records its cursor");
+        assert_eq!(caret, 6);
+        assert!(body.fields[row].spans[0].style.bg.is_none());
+        assert!(
+            body.fields[row]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|span| span.style.bg == Some(theme::T.info)),
+            "only the focused value surface carries the highlight"
+        );
+        assert!(!text.contains('◀') && !text.contains('▌'));
         assert!(text.contains("Save") && text.contains("Discard"));
     }
 
@@ -971,12 +1032,7 @@ mod tests {
         let pos = term.get_cursor_position().unwrap();
 
         let dump = dump_buffer(term.backend().buffer());
-        // Located by the focus marker, not by the value: exactly one row
-        // carries `◀`.
-        let row = dump
-            .lines()
-            .position(|l| l.contains('\u{25c0}'))
-            .expect("the focused row must be on screen") as u16;
+        let row = pos.y;
         assert!(
             dump.lines().nth(row as usize).unwrap().contains("phones"),
             "the focused row is the id row:\n{dump}"
@@ -984,11 +1040,16 @@ mod tests {
         assert_eq!(pos.y, row, "cursor must sit on the focused row:\n{dump}");
         // Modal is 64 wide and centred in 100 columns → inner left edge is
         // 18 + 1 border; the caret lands VALUE_COL + len("phones") in.
-        let inner_x = (100 - 64) / 2 + 1;
+        let inner_x = (100 - 64) / 2 + 2;
         assert_eq!(
             pos.x,
             inner_x + modal_form::VALUE_COL as u16 + 6,
             "cursor must sit at the end of the typed value:\n{dump}"
+        );
+        assert_eq!(
+            term.backend().buffer()[(inner_x + modal_form::VALUE_COL as u16, row)].bg,
+            theme::T.info,
+            "the value under the cursor is highlighted"
         );
     }
 
@@ -1067,10 +1128,6 @@ mod tests {
             dump.contains("77"),
             "the focused field's value is off-screen:\n{dump}"
         );
-        assert!(
-            dump.contains('\u{25c0}'),
-            "the focus marker must be on screen with the action row:\n{dump}"
-        );
     }
 
     #[test]
@@ -1131,6 +1188,7 @@ mod tests {
                 display_name: "Family phones".into(),
                 profile: "kids".into(),
                 devices: vec!["phone-1".into(), "phone-2".into()],
+                focus: 0,
             }),
         };
         let dump = render_overlay_in(&modal, 80, 14);
@@ -1144,7 +1202,7 @@ mod tests {
             "the members that lose this binding must be named:\n{dump}"
         );
         assert!(
-            dump.contains("[y] confirm") && dump.contains("[y] Remove"),
+            dump.contains("[y] confirm") && dump.contains("Remove"),
             "the y/n keying must stay legible:\n{dump}"
         );
     }
@@ -1282,6 +1340,7 @@ mod tests {
             display_name: "Family phones".into(),
             profile: "kids".into(),
             devices: vec!["phone-1".into(), "phone-2".into()],
+            focus: 0,
         };
         println!(
             "--- remove confirm (Archetype C) ---\n{}",

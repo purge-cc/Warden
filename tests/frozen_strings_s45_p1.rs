@@ -39,3 +39,8 @@ fn cname_depth_exceeded_label_is_frozen() {
         "cname_depth_exceeded"
     );
 }
+
+#[test]
+fn cname_malformed_label_is_frozen() {
+    assert_eq!(BlockSource::CnameMalformed.label(), "cname_malformed");
+}

@@ -11,26 +11,22 @@ use super::types::ResourceBudgetStore;
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::super::proc_reader;
     use super::super::types::ResourceBudgetSnapshot;
 
     /// Per-sampler clock-tick cache. Resolved once via `sysconf(_SC_CLK_TCK)`
     /// so the sample-time path doesn't pay for an FFI call every tick.
-    pub(super) fn clock_ticks_per_sec() -> u64 {
+    pub(super) fn clock_ticks_per_sec() -> Option<u64> {
         // `sysconf` is a plain POSIX call with no aliasing hazards. The
         // result is constant for the life of the process — caching at
         // start time is safe and matches every other crate that reads it.
         let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        if raw <= 0 {
-            100 // sensible Linux default; observed `getconf CLK_TCK` on dev
-        } else {
-            raw as u64
-        }
+        u64::try_from(raw).ok().filter(|ticks| *ticks > 0)
     }
 
-    /// Pure sample function — collects one snapshot from `/proc/self/*`,
+    /// Collect one snapshot from `/proc/self/*`,
     /// computes the user-mode CPU delta against the caller's `prev_*`
     /// state, and updates that state in place.
     ///
@@ -49,13 +45,19 @@ mod linux {
 
         let stat = proc_reader::read_proc_file(Path::new("/proc/self/stat")).ok()?;
         let utime_now = proc_reader::parse_utime_ticks(&stat)?;
-
-        let fd_count = proc_reader::count_directory_entries(Path::new("/proc/self/fd")).ok()?;
-
         let now = Instant::now();
+
+        // read_dir opens a descriptor that appears in /proc/self/fd itself;
+        // exclude the sampler's transient directory descriptor from the count.
+        let fd_count = proc_reader::count_directory_entries(Path::new("/proc/self/fd"))
+            .ok()?
+            .saturating_sub(1);
+
+        let meminfo = proc_reader::read_proc_file(Path::new("/proc/meminfo")).ok();
         let cpu_user_pct = match (prev_utime.take(), prev_instant.take()) {
             (Some(prev_u), Some(prev_t)) => {
-                let elapsed_ms = now.saturating_duration_since(prev_t).as_millis() as u64;
+                let elapsed_ms = u64::try_from(now.saturating_duration_since(prev_t).as_millis())
+                    .unwrap_or(u64::MAX);
                 compute_cpu_user_pct(utime_now.saturating_sub(prev_u), clk_tck, elapsed_ms)
             }
             _ => 0,
@@ -69,6 +71,20 @@ mod linux {
             fd_count,
             cpu_user_pct,
             rss_warn_mb,
+            swap_mb: proc_reader::parse_vm_kb(&status, "VmSwap").map(|kb| kb / 1024),
+            peak_rss_mb: proc_reader::parse_vm_kb(&status, "VmHWM").map(|kb| kb / 1024),
+            mem_available_mb: meminfo
+                .as_deref()
+                .and_then(|s| proc_reader::parse_vm_kb(s, "MemAvailable"))
+                .map(|kb| kb / 1024),
+            mem_total_mb: meminfo
+                .as_deref()
+                .and_then(proc_reader::parse_meminfo_total_kb)
+                .map(|kb| kb / 1024),
+            sampled_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs()),
         })
     }
 
@@ -84,8 +100,11 @@ mod linux {
         if clk_tck == 0 || elapsed_ms == 0 {
             return 0;
         }
-        let pct = utime_delta.saturating_mul(100_000) / (clk_tck.saturating_mul(elapsed_ms));
-        if pct > u8::MAX as u64 {
+        // Both u64 operands fit exactly in u128; saturating either u64
+        // product before division would change the ratio on long intervals.
+        let pct =
+            u128::from(utime_delta) * 100_000 / (u128::from(clk_tck) * u128::from(elapsed_ms));
+        if pct > u128::from(u8::MAX) {
             u8::MAX
         } else {
             pct as u8
@@ -124,7 +143,10 @@ mod linux {
     /// Inner async loop. Factored out so tests can poke at the sampler
     /// without spawning a tokio task.
     pub(super) async fn run(store: super::ResourceBudgetStore, tick: Duration, rss_warn_mb: u64) {
-        let clk_tck = clock_ticks_per_sec();
+        let Some(clk_tck) = clock_ticks_per_sec() else {
+            tracing::warn!("resource sampler unavailable: could not determine CPU clock ticks");
+            return;
+        };
         let mut prev_utime: Option<u64> = None;
         let mut prev_instant: Option<Instant> = None;
         let mut ticker = tokio::time::interval(tick);
@@ -181,6 +203,17 @@ mod tests {
     }
 
     #[test]
+    fn cpu_ratio_preserves_large_products_before_final_saturation() {
+        assert_eq!(linux::compute_cpu_user_pct(u64::MAX, u64::MAX, 1000), 100);
+        assert_eq!(
+            linux::compute_cpu_user_pct(u64::MAX, 100, u64::MAX),
+            u8::MAX
+        );
+        assert_eq!(linux::compute_cpu_user_pct(1, u64::MAX, u64::MAX), 0);
+        assert_eq!(linux::compute_cpu_user_pct(1, 0, 1000), 0);
+    }
+
+    #[test]
     fn compute_cpu_user_pct_typical() {
         // 50 ticks of utime over 1000 ms with 100 ticks/sec → 50% CPU.
         assert_eq!(linux::compute_cpu_user_pct(50, 100, 1000), 50);
@@ -195,7 +228,7 @@ mod tests {
 
     #[test]
     fn sample_once_first_call_returns_zero_cpu_then_real_delta() {
-        let clk_tck = linux::clock_ticks_per_sec();
+        let clk_tck = linux::clock_ticks_per_sec().expect("Linux must report clock ticks");
         let mut prev_utime: Option<u64> = None;
         let mut prev_instant: Option<Instant> = None;
         let first = linux::sample_once(clk_tck, &mut prev_utime, &mut prev_instant, 256)
@@ -210,6 +243,11 @@ mod tests {
             "process always has at least stdin/stdout/stderr"
         );
         assert_eq!(first.rss_warn_mb, 256);
+        assert!(first.sampled_at.is_some());
+        assert!(first.swap_mb.is_some());
+        assert!(first.peak_rss_mb.is_some());
+        assert!(first.mem_total_mb.is_some_and(|mb| mb > 0));
+        assert!(first.mem_available_mb.is_some());
         assert!(prev_utime.is_some());
         assert!(prev_instant.is_some());
     }
@@ -223,6 +261,8 @@ mod tests {
             fd_count: 42,
             cpu_user_pct: 7,
             rss_warn_mb: 256,
+            sampled_at: Some(rss_mb),
+            ..Default::default()
         }
     }
 

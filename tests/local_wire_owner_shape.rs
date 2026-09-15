@@ -43,7 +43,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncoder};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponse;
 
-use purge_warden::config::schema::{ConfigV1, Device, Id, Profile};
+use purge_warden::config::schema::{ConfigV1, Device, Id, Profile, TARGET_SCHEMA_VERSION_V5};
 use purge_warden::config::settings::{
     CacheConfig, LocalDnsConfig, LocalDnsRecord, LocalDnsRecordType,
 };
@@ -52,8 +52,10 @@ use purge_warden::dns::edns::EdnsClientSubnet;
 use purge_warden::dns::error::DnsError;
 use purge_warden::dns::handler::ForwardHandler;
 use purge_warden::dns::local::LocalRecords;
+use purge_warden::filter::operator_rules::{
+    CompileAdmission, CompiledOperatorRules, ProfileMounts, RuleCompileLimits,
+};
 use purge_warden::filter::FilterEngine;
-use purge_warden::lists::source_key::SourceBitMap;
 use purge_warden::profiles::ProfileResolver;
 use purge_warden::upstream::{Upstream, UpstreamResponse};
 
@@ -122,6 +124,7 @@ impl Upstream for TrapUpstream {
                 RData::A(A(Ipv4Addr::new(203, 0, 113, 1))),
             )],
             response_code: ResponseCode::NoError,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: Vec::new(),
@@ -210,7 +213,7 @@ fn resolver_with(records: Vec<LocalDnsRecord>) -> Arc<ProfileResolver> {
         ..Default::default()
     };
     let mut config = ConfigV1 {
-        schema_version: 1,
+        schema_version: TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.server.allow_from = vec!["10.0.0.0/8".into()];
@@ -235,10 +238,21 @@ fn resolver_with(records: Vec<LocalDnsRecord>) -> Arc<ProfileResolver> {
         network_name: None,
         network_name_wildcard: false,
     });
-    Arc::new(ProfileResolver::build(
+    let mounts: Vec<_> = config
+        .profiles
+        .keys()
+        .map(|profile_id| ProfileMounts {
+            profile_id,
+            custom_lists: &[],
+            block_all: false,
+        })
+        .collect();
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = CompiledOperatorRules::compile(&[], &mounts, limits, &admission).unwrap();
+    Arc::new(ProfileResolver::build_with_operator_rules(
         &config,
-        &SourceBitMap::default(),
-        &purge_warden::config::custom_list::CustomListStore::new(),
+        Arc::new(rules),
     ))
 }
 

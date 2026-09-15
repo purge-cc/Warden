@@ -29,6 +29,12 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
             | cli::Commands::Completion { .. }
             | cli::Commands::FirewallRules
             | cli::Commands::Migrate { .. }
+            | cli::Commands::CustomList { offline: true, .. }
+            | cli::Commands::Profile {
+                action:
+                    cli::ProfileAction::Mount { offline: true, .. }
+                    | cli::ProfileAction::Unmount { offline: true, .. }
+            }
             // Refresh loads its configuration inside run_update so a broken
             // config can return its documented CONFIG exit code.
             | cli::Commands::Lists { action: cli::ListsAction::Refresh }
@@ -46,9 +52,6 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
             // to skip reading them.
             | cli::Commands::Cluster {
                 action: cli::ClusterAction::Token
-                    | cli::ClusterAction::Join { .. }
-                    | cli::ClusterAction::Leave { .. }
-                    | cli::ClusterAction::Enable { .. }
             }
     )
 }
@@ -78,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     let command = cli.command.unwrap_or(cli::Commands::Dashboard);
 
-    // Load socket path from the v1 config (needed by commands that connect to
+    // Load the socket path from the current config (needed by commands that connect to
     // the running daemon via IPC). main-01: only IPC-bound commands need it, so
     // skip the eager parse for Init/Config/Migrate/Completion/Start/… — a fresh
     // box running `warden init` no longer prints a spurious "cannot read
@@ -89,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     // foreground work.
     let now = time::OffsetDateTime::now_utc();
     let socket_path = if command_needs_socket(&command) {
-        match config::loader::load_config(&config_path, now) {
+        match config::loader::load_current_config(&config_path, now) {
             Ok(loaded) => loaded.config.socket.path,
             Err(errs) => {
                 eprintln!(
@@ -128,6 +131,11 @@ async fn main() -> anyhow::Result<()> {
             daemon,
             safe_mode,
         } => {
+            if daemon {
+                cli::commands::start::spawn_daemon(&pid_file, &config_path)?;
+                return Ok(());
+            }
+            let runtime_lease = config::runtime_lease::acquire_for_daemon(&config_path)?;
             // Safe mode bypasses every on-disk config file and runs a
             // hardcoded minimum-risk configuration — see
             // `cli::commands::start::safe_mode_config` for the exact shape.
@@ -138,14 +146,11 @@ async fn main() -> anyhow::Result<()> {
                     config::custom_list::CustomListStore::new(),
                 )
             } else {
-                // Load and validate the v1 config. `load_config` returns
-                // `LoadedConfig`, carrying `ConfigV1` + provenance
-                // metadata. Validation errors are collected and printed
-                // with the `(file, line, entity, suggestion)` context
-                // attached by the loader — each line is one actionable
-                // fix.
+                cli::commands::start::recover_policy_transaction_before_load(&config_path)?;
+                #[cfg(feature = "cluster")]
+                cli::commands::start::prepare_nodes_before_load(&config_path).await?;
                 let now = time::OffsetDateTime::now_utc();
-                let mut loaded = match config::loader::load_config(&config_path, now) {
+                let mut loaded = match config::loader::load_config_v5(&config_path, now) {
                     Ok(l) => l,
                     Err(errs) => {
                         eprintln!("config validation failed ({} error(s)):", errs.len());
@@ -164,23 +169,11 @@ async fn main() -> anyhow::Result<()> {
                              restart. To bring the daemon up on a known-good fallback while \
                              you fix the file, run `warden start --safe-mode`."
                         );
-                        anyhow::bail!("invalid v1 config at {}", config_path.display());
+                        anyhow::bail!("invalid schema-5 config at {}", config_path.display());
                     }
                 };
 
-                // Apply CLI overrides directly to the `ConfigV1`. The
-                // overrides mirror the legacy `apply_cli_overrides` logic:
-                // `--listen` replaces `[server].listen`; `--upstream`
-                // replaces `[upstream].servers`; `--lists` and
-                // `--update-interval` replace the corresponding
-                // `[lists]` fields.
-                apply_cli_overrides_v1(
-                    &mut loaded.config,
-                    listen,
-                    upstream,
-                    lists,
-                    update_interval,
-                )?;
+                apply_cli_overrides(&mut loaded.config, listen, upstream, lists, update_interval)?;
                 // `--listen` lands after the load-time validator ran, so the
                 // open-resolver refusal (unspecified bind + empty allow_from)
                 // must be re-asserted on the flag path — otherwise
@@ -203,23 +196,37 @@ async fn main() -> anyhow::Result<()> {
                         loaded.config.server.listen
                     );
                 }
-                (loaded.config, loaded.custom_lists)
+                (
+                    loaded.config.validation_projection()?,
+                    config::custom_list::CustomListStore::new(),
+                )
             };
 
-            // Init tracing (skip for daemon fork — the child re-inits).
-            if !daemon {
-                init_tracing(&config.server.log_level);
-            }
+            init_tracing(&config.server.log_level);
 
-            cli::commands::start::run_start(
+            let outcome = cli::commands::start::run_start(
                 &config,
                 &custom_lists,
                 &config_path,
                 &pid_file,
                 blocklist.as_deref(),
-                daemon,
+                runtime_lease,
+                if safe_mode {
+                    cli::commands::start::RuntimeCapabilityAttestation::Disabled
+                } else {
+                    cli::commands::start::RuntimeCapabilityAttestation::AuthoritativeSchema5Tree
+                },
             )
             .await?;
+            match outcome {
+                cli::commands::start::StartOutcome::Stopped => {}
+                #[cfg(feature = "cluster")]
+                cli::commands::start::StartOutcome::ManagedRestart(_) => {
+                    std::process::exit(
+                        purge_warden::cluster::managed_restart::MANAGED_RESTART_EXIT_CODE as i32,
+                    );
+                }
+            }
         }
 
         cli::Commands::Stop { force } => {
@@ -242,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         cli::Commands::Init {
             force,
             yes,
+            node_name,
             listen,
             upstream,
             upstream_catalog,
@@ -252,7 +260,9 @@ async fn main() -> anyhow::Result<()> {
             install_manpages,
             man_dir,
         } => {
+            anyhow::ensure!(!cluster_secondary, "legacy secondary scaffolding is retired; initialize a standalone node, then use cluster join with an invitation");
             let overrides = cli::commands::init::InitOverrides {
+                node_name,
                 listen,
                 upstream,
                 upstream_catalog,
@@ -465,6 +475,42 @@ async fn main() -> anyhow::Result<()> {
             cli::ProfileAction::Remove { id } => {
                 cli::commands::profiles_v1::run_remove(&socket_path, &id).await?;
             }
+            cli::ProfileAction::Mount {
+                profile_id,
+                custom_list,
+                offline,
+                mutation,
+            } => {
+                let code = cli::commands::custom_list::run_profile_mount(
+                    profile_id,
+                    custom_list,
+                    true,
+                    mutation,
+                    offline,
+                    &config_path,
+                    &socket_path,
+                )
+                .await?;
+                cli::exit_codes::exit_with(code);
+            }
+            cli::ProfileAction::Unmount {
+                profile_id,
+                custom_list,
+                offline,
+                mutation,
+            } => {
+                let code = cli::commands::custom_list::run_profile_mount(
+                    profile_id,
+                    custom_list,
+                    false,
+                    mutation,
+                    offline,
+                    &config_path,
+                    &socket_path,
+                )
+                .await?;
+                cli::exit_codes::exit_with(code);
+            }
             cli::ProfileAction::Allow {
                 profile_id,
                 domain,
@@ -504,6 +550,12 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             }
         },
+
+        cli::Commands::CustomList { offline, action } => {
+            let code = cli::commands::custom_list::run(action, offline, &config_path, &socket_path)
+                .await?;
+            cli::exit_codes::exit_with(code);
+        }
 
         cli::Commands::Device { action } => match action {
             cli::DeviceAction::List { live, json } => {
@@ -1074,11 +1126,12 @@ async fn main() -> anyhow::Result<()> {
             // `ConfigV1` derives `Default`, so a missing or broken config
             // still falls back to the default listen address rather than
             // failing this command outright.
-            let listen = config::loader::load_config(&config_path, time::OffsetDateTime::now_utc())
-                .map(|loaded| loaded.config)
-                .unwrap_or_default()
-                .server
-                .listen;
+            let listen =
+                config::loader::load_current_config(&config_path, time::OffsetDateTime::now_utc())
+                    .map(|loaded| loaded.config)
+                    .unwrap_or_default()
+                    .server
+                    .listen;
             cli::commands::firewall_rules::run_firewall_rules(listen);
         }
 
@@ -1104,45 +1157,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        cli::Commands::Cluster { action } => match action {
-            cli::ClusterAction::Token => {
-                cli::commands::cluster::run_token(&config_path)?;
-            }
-            cli::ClusterAction::Join {
-                peer,
-                token,
-                token_file,
-                peer_cert,
-            } => {
-                cli::commands::cluster::run_join_pinned(
-                    &config_path,
-                    &peer,
-                    token.as_deref(),
-                    token_file.as_deref(),
-                    peer_cert.as_deref(),
-                )?;
-            }
-            cli::ClusterAction::Enable {
-                role,
-                sans,
-                api_listen,
-                validity_days,
-            } => {
-                cli::commands::cluster::run_enable(
-                    &config_path,
-                    role,
-                    &sans,
-                    api_listen,
-                    validity_days,
-                )?;
-            }
-            cli::ClusterAction::Leave { upstream } => {
-                cli::commands::cluster::run_leave(&config_path, upstream.as_deref())?;
-            }
-            cli::ClusterAction::Status => {
-                cli::commands::cluster::run_status(&socket_path, &config_path).await?;
-            }
-        },
+        cli::Commands::Cluster { action } => {
+            cli::commands::cluster::run_nodes(&config_path, &socket_path, action).await?;
+        }
+
+        cli::Commands::Node { action } => {
+            cli::commands::node::run_node(&config_path, &socket_path, action).await?;
+        }
 
         cli::Commands::Stats { action } => match action {
             cli::StatsAction::TopBlocked { limit, json } => {
@@ -1200,6 +1221,34 @@ async fn main() -> anyhow::Result<()> {
         cli::Commands::Tags { .. } => refuse_retired_tags_verb()?,
 
         cli::Commands::Migrate { action } => match action {
+            cli::MigrateAction::V4ToV5 {
+                check,
+                json,
+                plan,
+                choices,
+                re_plan,
+                apply_plan,
+                expect_plan_hash,
+                rollback,
+                expect_revision,
+                finalize,
+            } => {
+                let rc = cli::commands::migrate::v4_to_v5::run(
+                    &config_path,
+                    &pid_file,
+                    check,
+                    json,
+                    plan.as_deref(),
+                    choices.as_deref(),
+                    re_plan.as_deref(),
+                    apply_plan.as_deref(),
+                    expect_plan_hash.as_deref(),
+                    rollback.as_deref(),
+                    expect_revision.as_deref(),
+                    finalize.as_deref(),
+                )?;
+                std::process::exit(rc);
+            }
             cli::MigrateAction::V3ToV4 {
                 from_config,
                 check,
@@ -1448,13 +1497,10 @@ Subscribe first, then start:
 
 `warden lists catalog` shows the available list ids.";
 
-/// Apply CLI overrides to a [`config::schema::ConfigV1`] in place.
-/// Replaces the retired v0 `Settings::apply_cli_overrides` so
-/// `--listen` / `--upstream` / `--update-interval` keep working against
-/// the v1 config format. `--lists` is refused — see
-/// [`START_LISTS_FLAG_RETIRED`].
-fn apply_cli_overrides_v1(
-    config: &mut config::schema::ConfigV1,
+/// Apply startup-only overrides before the schema-5 configuration is
+/// projected onto the non-rule runtime settings.
+fn apply_cli_overrides(
+    config: &mut config::schema::ConfigV5,
     listen: Option<std::net::SocketAddr>,
     upstream: Vec<String>,
     lists: Vec<String>,
@@ -1720,14 +1766,12 @@ mod tests {
     /// the three verbs reds here, and would otherwise send `status` to
     /// `./control.sock` on any install whose socket is elsewhere.
     #[test]
-    fn only_cluster_status_needs_the_socket() {
+    fn modern_cluster_operations_resolve_the_local_socket() {
         for action in [
-            cli::ClusterAction::Token,
             cli::ClusterAction::Join {
                 peer: "https://192.0.2.1:8053".into(),
-                token: None,
-                token_file: None,
-                peer_cert: None,
+                invitation_file: None,
+                node_name: None,
             },
             cli::ClusterAction::Leave { upstream: None },
             // S4. The array is not exhaustive over `ClusterAction`, so
@@ -1741,8 +1785,8 @@ mod tests {
             },
         ] {
             assert!(
-                !command_needs_socket(&cli::Commands::Cluster { action }),
-                "config-editing cluster verbs must not force a config parse"
+                command_needs_socket(&cli::Commands::Cluster { action }),
+                "modern node operations must resolve the shared lifecycle socket"
             );
         }
         assert!(
@@ -1773,8 +1817,8 @@ mod tests {
     /// that cannot filter. The other overrides must keep working.
     #[test]
     fn lists_flag_is_refused_and_leaves_the_config_alone() {
-        let mut c = config::schema::ConfigV1::default();
-        let err = apply_cli_overrides_v1(
+        let mut c = config::schema::ConfigV5::default();
+        let err = apply_cli_overrides(
             &mut c,
             None,
             Vec::new(),
@@ -1796,8 +1840,8 @@ mod tests {
 
     #[test]
     fn other_start_overrides_still_apply() {
-        let mut c = config::schema::ConfigV1::default();
-        apply_cli_overrides_v1(
+        let mut c = config::schema::ConfigV5::default();
+        apply_cli_overrides(
             &mut c,
             Some("127.0.0.1:15353".parse().unwrap()),
             vec!["9.9.9.9:53".to_string()],

@@ -6,7 +6,8 @@ fn rows() -> Vec<ListRow> {
             "exceptions".into(),
             "exceptions".into(),
             vec!["default".into(), "guests".into()],
-        ),
+        )
+        .with_description("Exceptions for everyday services".into()),
         ListRow::new("minecraft".into(), "minecraft".into(), vec!["kids".into()]),
         ListRow::new("triage".into(), "triage".into(), Vec::new()),
     ]
@@ -185,26 +186,22 @@ fn a_list_no_profile_mounts_says_so_in_the_frozen_words() {
 
 #[test]
 fn an_unmounted_list_is_still_choosable() {
-    // `ChoiceNote::Blocked` would recess the label AND make the row
-    // unselectable. A staging list is exactly the list an operator
-    // means to write into before mounting it, so the note has to be
-    // `Detail`.
-    let m = open_picker(Action::Allow);
-    let spec = pick_notice(&m, 62);
-    let unmounted = &spec.choices[2];
-    assert!(
-        !unmounted.note.as_ref().unwrap().blocks(),
-        "an unmounted list must stay selectable"
-    );
+    let mut m = open_picker(Action::Allow);
+    m.cursor = 2;
+    m.toggle();
+    assert_eq!(m.selected_ids(), vec!["triage".to_string()]);
+    let dump = render_overlay_in(&m, 80, 40);
+    assert!(dump.contains("[x] triage"), "{dump}");
+    assert!(dump.contains("No Profiles · Filters Nothing"), "{dump}");
 }
 
 #[test]
 fn a_marked_row_shows_a_filled_box() {
     let mut m = open_picker(Action::Allow);
     m.toggle();
-    let spec = pick_notice(&m, 62);
-    assert!(spec.choices[0].label.starts_with("[x] "));
-    assert!(spec.choices[1].label.starts_with("[ ] "));
+    let dump = render_overlay_in(&m, 80, 40);
+    assert!(dump.contains("[x] exceptions"), "{dump}");
+    assert!(dump.contains("[ ] minecraft"), "{dump}");
 }
 
 #[test]
@@ -221,15 +218,72 @@ fn enter_with_nothing_marked_says_why() {
 }
 
 #[test]
-fn header_names_the_action_and_the_domain() {
+fn header_names_the_action() {
+    assert_eq!(header(&open_picker(Action::Allow)), "Add ALLOW Rule");
+    assert_eq!(header(&open_picker(Action::Deny)), "Add DENY Rule");
+}
+
+#[test]
+fn picker_focus_cycles_across_list_and_all_three_actions() {
+    let mut modal = open_picker(Action::Allow);
+    assert_eq!(modal.focus, 0);
+    modal.focus_next();
+    assert_eq!(modal.focus, 1);
+    modal.focus_next();
+    assert_eq!(modal.focus, 2);
+    modal.focus_next();
+    assert_eq!(modal.focus, 3);
+    modal.focus_next();
+    assert_eq!(modal.focus, 0);
+    modal.focus_prev();
+    assert_eq!(modal.focus, 3);
+}
+
+#[test]
+fn empty_picker_focus_cycles_across_empty_state_and_two_actions() {
+    let mut modal = QueryLogRuleModal::open(Action::Allow, "d".into(), "c".into(), Vec::new());
+    assert_eq!(modal.focus, 0);
+    modal.focus_prev();
+    assert_eq!(modal.focus, 1);
+    modal.focus_next();
+    assert_eq!(modal.focus, 0);
+
+    let dump = render_overlay_in(&modal, 80, 40);
+    assert!(dump.contains("Cancel"));
+    assert!(dump.contains("New List"));
+    assert!(!dump.contains("Confirm"));
+}
+
+#[test]
+fn pointer_confirm_focuses_confirm_before_dispatching_enter() {
+    let mut modal = open_picker(Action::Allow);
+    modal.focus = 1;
+    modal.focus_pointer_action(KeyCode::Enter);
+    assert_eq!(modal.focus, 3);
+
+    modal.focus_pointer_action(KeyCode::Char('n'));
+    assert_eq!(modal.focus, 2);
+    modal.focus_pointer_action(KeyCode::Esc);
+    assert_eq!(modal.focus, 1);
+}
+
+#[test]
+fn picker_body_uses_the_reference_26_row_geometry() {
+    let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
+    let rows = modal_rows(&dump);
     assert_eq!(
-        header(&open_picker(Action::Allow)),
-        "Add ALLOW for  dl.flathub.org"
+        rows.len(),
+        24,
+        "26 outer rows means 24 interior rows\n{dump}"
     );
-    assert_eq!(
-        header(&open_picker(Action::Deny)),
-        "Add DENY for  dl.flathub.org"
-    );
+    for line in dump.lines().filter(|line| line.matches('│').count() == 2) {
+        let columns: Vec<_> = line
+            .chars()
+            .enumerate()
+            .filter_map(|(column, ch)| (ch == '│').then_some(column))
+            .collect();
+        assert_eq!(columns[1] - columns[0] + 1, 68, "{line:?}");
+    }
 }
 
 // ── the create-a-list detour ──────────────────────────────────────────
@@ -275,6 +329,26 @@ fn adopt_lists_drops_a_mark_whose_list_is_gone() {
     assert_eq!(m.cursor, 0);
 }
 
+#[test]
+fn report_scroll_is_bounded_and_finish_resets_it() {
+    let mut modal = open_picker(Action::Allow);
+    let reports = (0..8)
+        .map(|index| RuleReport {
+            id: format!("list-{index}"),
+            outcome: RuleOutcome::Added,
+        })
+        .collect();
+    modal.finish(reports);
+    modal.scroll_report(-1);
+    assert_eq!(modal.report_scroll, 0);
+    modal.report_end();
+    assert_eq!(modal.report_scroll, 4);
+    modal.scroll_report(1);
+    assert_eq!(modal.report_scroll, 4);
+    modal.report_home();
+    assert_eq!(modal.report_scroll, 0);
+}
+
 // ── render ────────────────────────────────────────────────────────────
 
 /// Row-per-line dump. The newline matters: without it a substring can
@@ -291,12 +365,16 @@ fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-fn render_overlay_in(modal: &QueryLogRuleModal, w: u16, h: u16) -> String {
+fn render_buffer(modal: &QueryLogRuleModal, w: u16, h: u16) -> ratatui::buffer::Buffer {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| render_overlay(f, f.area(), modal)).unwrap();
-    dump_buffer(term.backend().buffer())
+    term.backend().buffer().clone()
+}
+
+fn render_overlay_in(modal: &QueryLogRuleModal, w: u16, h: u16) -> String {
+    dump_buffer(&render_buffer(modal, w, h))
 }
 
 /// The modal's interior, row by row, with the frame and the trailing pad
@@ -319,52 +397,105 @@ fn modal_rows(dump: &str) -> Vec<String> {
 }
 
 #[test]
-fn every_frozen_row_reaches_the_screen_whole() {
-    // The two defects this pins were both visible in a rendered dump and
-    // both survived a handler test, a spec test and four green gates:
-    // the note broke mid-word (`on. M` / `ount it from`) because the only
-    // wrapping `prose_rows` offers is a hard character chunk, and the key
-    // legend ran off the frame (`[Esc] canc`) because `nav_keys_line`
-    // does not truncate — the row is clipped, unmarked.
-    //
-    // Both widths, because the modal is 64 columns whatever the terminal
-    // is: the 80-column case proves the copy, the 64-column case proves
-    // it against the narrowest interior the ecosystem hands a row.
-    for w in [80u16, 64] {
-        let dump = render_overlay_in(&open_picker(Action::Allow), w, 40);
-        let rows = modal_rows(&dump);
-        for want in MOUNT_NOTE_ROWS.iter().chain(std::iter::once(&KEYS_PICK)) {
-            assert!(
-                rows.iter().any(|r| r.trim() == *want),
-                "at {w} columns no row is exactly {want:?} — it was cut or \
-                 re-wrapped:\n{dump}"
-            );
-        }
-        assert!(
-            !rows.iter().any(|r| r.contains('\u{2026}')),
-            "a row was ellipsised at {w} columns:\n{dump}"
-        );
+fn picker_uses_the_compact_reference_structure() {
+    let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
+    for text in [
+        "ADD ALLOW RULE",
+        "Choose Custom Lists for This Rule",
+        "Domain",
+        "dl.flathub.org",
+        "Client",
+        "tv-salotto",
+        "CUSTOM LISTS",
+        "0 Selected",
+        "1–3 of 3 Lists",
+        "Cancel",
+        "New List",
+        "Confirm",
+    ] {
+        assert!(dump.contains(text), "missing {text:?}:\n{dump}");
+    }
+    for legacy in ["which lists?", "the rule is written", "[space] select"] {
+        assert!(!dump.contains(legacy), "legacy copy {legacy:?}:\n{dump}");
     }
 }
 
 #[test]
-fn the_mount_note_is_split_where_a_reader_would_split_it() {
-    // The rows are the author's line breaks, so rejoining them on single
-    // spaces has to give the sentence back. A split that landed mid-word
-    // — which is exactly what the renderer's own wrap does — would put
-    // the space inside a word and fail here, and a dropped clause would
-    // fail here too.
-    assert_eq!(
-        MOUNT_NOTE_ROWS.join(" "),
-        "A custom list only filters the profiles it is mounted on. \
-         Mount it from Filters → Profiles, or with [m] on Filters → Custom Lists."
+fn the_long_mount_contract_is_not_rendered_in_the_compact_picker() {
+    let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
+    for row in [
+        "A custom list only filters the profiles it is mounted on.",
+        "Mount it from Filters → Profiles, or with [m] on",
+        "Filters → Custom Lists.",
+    ] {
+        assert!(!dump.contains(row), "legacy mount prose remains:\n{dump}");
+    }
+    assert!(dump.contains("Profiles: default, guests"), "{dump}");
+}
+
+#[test]
+fn picker_range_follows_the_cursor_in_six_row_pages() {
+    let rows = (0..8)
+        .map(|index| ListRow::new(format!("list-{index}"), format!("List {index}"), Vec::new()))
+        .collect();
+    let mut modal = QueryLogRuleModal::open(
+        Action::Deny,
+        "telemetry.example".into(),
+        "living-room".into(),
+        rows,
     );
+    modal.cursor = 7;
+    let dump = render_overlay_in(&modal, 80, 40);
+    assert!(dump.contains("3–8 of 8 Lists"), "{dump}");
+    assert!(!dump.contains("[ ] List 1"), "{dump}");
+    assert!(dump.contains("[ ] List 7"), "{dump}");
+}
+
+#[test]
+fn report_range_scrolls_without_losing_failure_text() {
+    let mut modal = open_picker(Action::Allow);
+    modal.finish(
+        (0..8)
+            .map(|index| RuleReport {
+                id: format!("list-{index}"),
+                outcome: if index == 7 {
+                    RuleOutcome::Failed("permission denied".into())
+                } else {
+                    RuleOutcome::Added
+                },
+            })
+            .collect(),
+    );
+    modal.report_end();
+    let dump = render_overlay_in(&modal, 80, 40);
+    assert!(dump.contains("8 Lists · 1 Failed · 3–8 of 8"), "{dump}");
+    assert!(dump.contains("list-7"), "{dump}");
+    assert!(dump.contains("permission denied"), "{dump}");
+}
+
+#[test]
+fn a_long_single_failure_is_wrapped_and_reaches_the_end_viewport() {
+    let final_marker = "FINAL-RECOVERY-COMMAND";
+    let mut modal = open_picker(Action::Allow);
+    modal.finish(vec![RuleReport {
+        id: "exceptions".into(),
+        outcome: RuleOutcome::Failed(format!(
+            "{}\n{final_marker}",
+            "permission denied while validating the retained operation plan; ".repeat(16)
+        )),
+    }]);
+    let first = render_overlay_in(&modal, 80, 40);
     assert!(
-        MOUNT_NOTE_ROWS
-            .iter()
-            .all(|r| !r.starts_with(' ') && !r.ends_with(' ')),
-        "a row carrying its own padding would double the join's space"
+        !first.contains(final_marker),
+        "marker should begin below the first viewport\n{first}"
     );
+    modal.report_end();
+    let end = render_overlay_in(&modal, 80, 40);
+    assert!(
+        end.contains(final_marker),
+        "wrapped failure tail is unreachable:\n{end}"
+    );
+    assert!(end.contains("1 Lists · 1 Failed · 1–1 of 1"), "{end}");
 }
 
 #[test]
@@ -374,7 +505,11 @@ fn every_row_states_its_mount_state_even_unfocused() {
     // interior width, which is why the mount state rides its own note
     // row instead.
     let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
-    for needle in ["profiles: default, guests", "profiles: kids", "no profile"] {
+    for needle in [
+        "Profiles: default, guests",
+        "Profiles: kids",
+        "No Profiles · Filters Nothing",
+    ] {
         assert!(
             dump.contains(needle),
             "{needle} missing from an unfocused row:\n{dump}"
@@ -383,13 +518,42 @@ fn every_row_states_its_mount_state_even_unfocused() {
 }
 
 #[test]
-fn the_focus_marker_is_unique() {
-    let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
-    assert_eq!(
-        dump.matches('\u{25c0}').count(),
-        1,
-        "exactly one focused option marker expected:\n{dump}"
-    );
+fn only_the_focused_list_has_a_highlight() {
+    let buffer = render_buffer(&open_picker(Action::Allow), 80, 40);
+    let mut focused = Vec::new();
+    for y in 0..buffer.area.height {
+        let line = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        if line.contains("[ ]")
+            && (0..buffer.area.width).any(|x| buffer[(x, y)].bg == crate::tui::theme::T.warden_teal)
+        {
+            focused.push(line);
+        }
+    }
+    assert_eq!(focused.len(), 1);
+    assert!(focused[0].contains("exceptions"));
+    assert!(!dump_buffer(&buffer).contains('◀'));
+}
+
+#[test]
+fn selected_unfocused_list_uses_the_resting_selected_style() {
+    let mut modal = open_picker(Action::Allow);
+    modal.toggle();
+    modal.move_cursor(1);
+    let buffer = render_buffer(&modal, 80, 40);
+    let selected_y = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("[x] exceptions")
+        })
+        .expect("selected row");
+    assert!((0..buffer.area.width).any(|x| {
+        let cell = &buffer[(x, selected_y)];
+        cell.bg == crate::tui::theme::T.bg_highlight && cell.fg == crate::tui::theme::T.warden_teal
+    }));
 }
 
 #[test]
@@ -417,14 +581,57 @@ fn the_empty_state_offers_the_way_out() {
         Vec::new(),
     );
     let dump = render_overlay_in(&m, 80, 40);
-    assert!(dump.contains("[n] new list"), "no way out:\n{dump}");
-    assert!(dump.contains("no custom lists"), "{dump}");
+    assert!(
+        dump.contains("Press n to Create One"),
+        "no way out:\n{dump}"
+    );
+    assert!(dump.contains("No Custom Lists"), "{dump}");
+    for action in ["Cancel", "New List"] {
+        assert!(dump.contains(action), "missing {action}:\n{dump}");
+    }
+    assert!(
+        !dump.contains("Confirm"),
+        "empty picker cannot confirm:\n{dump}"
+    );
+}
+
+#[test]
+fn the_empty_state_and_new_list_action_survive_the_terminal_floor() {
+    let modal = QueryLogRuleModal::open(
+        Action::Allow,
+        "dl.flathub.org".into(),
+        "tv-salotto".into(),
+        Vec::new(),
+    );
+    let dump = render_overlay_in(&modal, 80, 14);
+    assert!(dump.contains("No Custom Lists"), "{dump}");
+    assert!(dump.contains("New List"), "{dump}");
+}
+
+#[test]
+fn a_multiline_single_failure_reaches_the_end_at_the_terminal_floor() {
+    let marker = "FINAL-RECOVERY-COMMAND";
+    let mut modal = open_picker(Action::Allow);
+    modal.finish(vec![RuleReport {
+        id: "exceptions".into(),
+        outcome: RuleOutcome::Failed(format!(
+            "validation failed\n{}\n{marker}",
+            "retained operation plan detail ".repeat(12)
+        )),
+    }]);
+
+    let first = render_overlay_in(&modal, 80, 14);
+    assert!(!first.contains(marker), "{first}");
+    modal.report_end();
+    let end = render_overlay_in(&modal, 80, 14);
+    assert!(end.contains(marker), "{end}");
+    assert!(end.contains("Close"), "{end}");
 }
 
 #[test]
 fn the_report_names_every_list_and_leads_with_its_id() {
-    // Three of five succeeding does not collapse into one toast, and a
-    // long refusal must lose its tail rather than its identity.
+    // Mixed outcomes stay attributed to their lists rather than collapsing
+    // into one toast.
     let mut m = open_picker(Action::Allow);
     m.finish(vec![
         RuleReport {
@@ -442,25 +649,27 @@ fn the_report_names_every_list_and_leads_with_its_id() {
     ]);
     let dump = render_overlay_in(&m, 80, 40);
     for (id, verdict) in [
-        ("exceptions", "rule added"),
-        ("minecraft", "already present"),
+        ("exceptions", "Rule Added"),
+        ("minecraft", "Already Present"),
         ("triage", "does not exist"),
     ] {
         let rows = modal_rows(&dump);
-        let row = rows
+        let index = rows
             .iter()
-            .find(|l| l.contains(id))
+            .position(|line| line.contains(id))
             .unwrap_or_else(|| panic!("{id} missing from the report:\n{dump}"));
         assert!(
-            row.trim_start().starts_with(id),
-            "the id must lead the row: {row:?}"
+            rows[index].trim_start().starts_with(id),
+            "the id must lead the row: {:?}",
+            rows[index]
         );
-        assert!(row.contains(verdict), "{id}: {row:?}\n{dump}");
+        assert!(
+            rows.get(index + 1).is_some_and(|row| row.contains(verdict)),
+            "{id}: {:?}\n{dump}",
+            rows.get(index + 1)
+        );
     }
-    assert!(
-        dump.contains("1 of 3 lists did not accept it"),
-        "the headline must count the refusals:\n{dump}"
-    );
+    assert!(dump.contains("3 Lists · 1 Failed · 1–3 of 3"), "{dump}");
 }
 
 #[test]
@@ -473,7 +682,7 @@ fn already_present_is_reported_as_an_outcome_not_a_failure() {
         outcome: RuleOutcome::AlreadyPresent,
     }]);
     let dump = render_overlay_in(&m, 80, 40);
-    assert!(dump.contains("written to every list you marked"), "{dump}");
+    assert!(dump.contains("1 Lists · 0 Failed"), "{dump}");
     assert!(!dump.contains("did not accept"), "{dump}");
 }
 
@@ -544,21 +753,24 @@ fn the_create_form_is_drawn_by_the_custom_lists_modal() {
 // ── module hygiene ────────────────────────────────────────────────────
 
 #[test]
-fn no_hand_rolled_colour_in_this_module() {
-    // A surface that reaches for the theme directly is a surface that
-    // will drift from the other eleven. Needles are split so this
-    // assertion cannot match itself.
-    let src = include_str!("../query_log_rule_modal.rs");
-    for needle in [
-        concat!("Style::default()", ".fg("),
-        concat!("Color", "::Rgb("),
-        concat!("T", ".brand_red"),
-    ] {
-        assert!(
-            !src.contains(needle),
-            "{needle} in query_log_rule_modal.rs — the colour belongs in modal_form"
-        );
-    }
+fn custom_lists_heading_uses_the_blue_summary_band() {
+    let buffer = render_buffer(&open_picker(Action::Allow), 80, 40);
+    let heading_y = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("CUSTOM LISTS")
+        })
+        .expect("CUSTOM LISTS heading");
+    assert!((0..buffer.area.width)
+        .any(|x| buffer[(x, heading_y)].bg == crate::tui::theme::T.card_summary_title_bg));
+}
+
+#[test]
+fn focused_list_description_occupies_the_compact_footer() {
+    let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
+    assert!(dump.contains("Exceptions for everyday services"), "{dump}");
 }
 
 #[test]

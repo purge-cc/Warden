@@ -1,0 +1,7 @@
+@@||media.example^
+@@||priority.example^$important
+||conflict.example^$important
+@@||conflict.example^
+||*.games.example^
+@@||*.trusted.example^$noapex
+@@/^rx[0-9]+\.example$/

@@ -36,7 +36,7 @@ use toml_edit::DocumentMut;
 use crate::auth::token::generate_token;
 use crate::config::error::ConfigError;
 use crate::config::loader;
-use crate::config::schema::SCHEMA_VERSION_V1;
+use crate::config::schema::TARGET_SCHEMA_VERSION_V5;
 use crate::config::write_lock::{acquire_for_write, ConfigWriteLock};
 use crate::ipc::auth_token::{load_token_at, save_token_at};
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
@@ -70,9 +70,13 @@ pub async fn run_generate(
     let now = time::OffsetDateTime::now_utc();
     let plaintext = {
         let guard = acquire_for_write(config_path)?;
-        let loaded =
-            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-                .map_err(format_load_errs)?;
+        let loaded = loader::load_config_for_schema_under_guard(
+            &guard,
+            config_path,
+            TARGET_SCHEMA_VERSION_V5,
+            now,
+        )
+        .map_err(format_load_errs)?;
 
         if loaded.config.api.token_hash.is_some() {
             anyhow::bail!("token already exists. Use `warden token regenerate` to replace it.");
@@ -138,9 +142,13 @@ pub async fn run_regenerate(
 
     let plaintext = {
         let guard = acquire_for_write(config_path)?;
-        let _loaded =
-            loader::load_config_for_schema_under_guard(&guard, config_path, SCHEMA_VERSION_V1, now)
-                .map_err(format_load_errs)?;
+        let _loaded = loader::load_config_for_schema_under_guard(
+            &guard,
+            config_path,
+            TARGET_SCHEMA_VERSION_V5,
+            now,
+        )
+        .map_err(format_load_errs)?;
 
         let (plaintext, hash) = generate_token();
 
@@ -338,7 +346,7 @@ mod tests {
     /// Full v1 master covering every section that a legacy writer used to
     /// silently drop. The regenerate round-trip must preserve each one
     /// byte-for-byte on disk.
-    const FULL_V1_MASTER: &str = r#"schema_version = 4
+    const FULL_V1_MASTER: &str = r#"schema_version = 5
 includes = ["devices.d/*.toml", "profiles.d/*.toml"]
 
 [server]
@@ -482,10 +490,10 @@ servers = ["192.0.2.1:53"]
             .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).expect("master reloads cleanly");
+        let loaded = loader::load_current_config(&master, now).expect("master reloads cleanly");
         let cfg = &loaded.config;
 
-        assert_eq!(cfg.schema_version, SCHEMA_VERSION_V1);
+        assert_eq!(cfg.schema_version, TARGET_SCHEMA_VERSION_V5);
         assert_eq!(cfg.includes.len(), 2);
         assert!(cfg.includes.iter().any(|g| g.contains("devices.d")));
         assert!(cfg.includes.iter().any(|g| g.contains("profiles.d")));
@@ -599,7 +607,7 @@ display_name = "Default"
 
         // Master carries the new hash.
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap();
+        let loaded = loader::load_current_config(&master, now).unwrap();
         assert_eq!(loaded.config.api.token_hash.as_deref().unwrap().len(), 64);
         // Plaintext was saved.
         assert!(token_path.exists());
@@ -729,7 +737,7 @@ display_name = "Default"
             .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).expect("v1 master reloads");
+        let loaded = loader::load_current_config(&master, now).expect("v1 master reloads");
         let hash = loaded
             .config
             .api
@@ -755,7 +763,7 @@ display_name = "Default"
             .unwrap();
 
         let now = time::OffsetDateTime::now_utc();
-        let loaded = loader::load_config(&master, now).unwrap();
+        let loaded = loader::load_current_config(&master, now).unwrap();
         let new_hash = loaded
             .config
             .api
@@ -1064,7 +1072,7 @@ display_name = "Default"
             "the alias itself must remain a symlink"
         );
         assert_eq!(
-            loader::load_config(&master, time::OffsetDateTime::now_utc())
+            loader::load_current_config(&master, time::OffsetDateTime::now_utc())
                 .unwrap()
                 .config
                 .api
@@ -1156,7 +1164,7 @@ display_name = "Default"
                 "{name} awaits while holding the OS guard"
             );
             assert!(
-                !guarded.contains("loader::load_config("),
+                !guarded.contains("loader::load_current_config("),
                 "{name} uses the normal loader inside its guarded region"
             );
             assert!(

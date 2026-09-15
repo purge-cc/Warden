@@ -71,6 +71,23 @@ static TEMP_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// validation, or a rename blocked by some pre-existing path conflict.
 #[derive(Debug, Error)]
 pub enum AtomicWriteError {
+    #[error("anonymous journal staging is unavailable for {target}: {source}")]
+    AnonymousStagingUnsupported {
+        target: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("anonymous journal callback rejected staging for {target}: {reason}")]
+    JournalCallback { target: PathBuf, reason: String },
+    #[error("anonymous journal receipt callback rejected staging for {target}: {reason}")]
+    JournalReceiptCallback { target: PathBuf, reason: String },
+    #[error("transaction boundary callback rejected {boundary} for {target}: {reason}")]
+    TransactionBoundaryCallback {
+        target: PathBuf,
+        boundary: AtomicWriteBoundary,
+        rename_landed: bool,
+        reason: String,
+    },
     #[error("create-only target must have an absent snapshot: {target}")]
     TargetMustBeAbsent { target: PathBuf },
     #[error("create-only target already exists: {target}")]
@@ -172,6 +189,13 @@ impl AtomicWriteError {
     /// Whether this error was raised after the target rename committed.
     pub fn rename_landed(&self) -> bool {
         matches!(self, Self::PostRenameFsync { .. })
+            || matches!(
+                self,
+                Self::TransactionBoundaryCallback {
+                    rename_landed: true,
+                    ..
+                }
+            )
     }
 }
 
@@ -184,6 +208,11 @@ pub(crate) enum AtomicWriteTestFailure {
     TempFsync,
     ParentOpen,
     ParentFsync,
+    AnonymousAfterLink,
+    AnonymousOpenUnsupported,
+    AnonymousOpenError,
+    AnonymousLinkUnsupported,
+    AnonymousLinkError,
 }
 
 /// Borrowed validator closure type used by [`AtomicWriteOpts::validator`].
@@ -556,6 +585,116 @@ pub fn hardened_atomic_write(
 
 pub(crate) type AtomicWriteFdValidator<'a> = &'a dyn Fn(&File, &Path) -> Result<(), String>;
 
+/// Records an anonymous staging inode before it has a visible directory
+/// entry. `parent` is the descriptor-pinned target parent, `payload` is the
+/// still-unlinked inode, and `basename` is the reserved name linked only
+/// after this callback returns successfully.
+pub(crate) type AnonymousStagingCallback<'a> =
+    &'a dyn Fn(&File, &File, &std::ffi::OsStr) -> Result<(), String>;
+
+/// Records the durable named receipt after an anonymous inode has been linked
+/// and its parent directory has been synced. The arguments identify the same
+/// pinned parent, inode, and reserved basename supplied to the pre-link
+/// callback.
+pub(crate) type AnonymousStagingAfterLinkCallback<'a> =
+    &'a dyn Fn(&File, &File, &std::ffi::OsStr) -> Result<(), String>;
+pub(crate) type AnonymousAfterLinkCallback<'a> = &'a dyn Fn() -> Result<(), String>;
+
+/// Exact syscall boundaries exposed only by the opt-in transaction writers.
+/// A callback can terminate the process at either side of a durability step
+/// without installing process-global hooks or changing ordinary writers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicWriteBoundary {
+    BeforeAnonymousInodeFsync,
+    AfterAnonymousInodeFsync,
+    BeforeStagingLink,
+    AfterStagingLink,
+    BeforeStagingLinkParentFsync,
+    AfterStagingLinkParentFsync,
+    BeforePromotionRename,
+    AfterPromotionRename,
+    BeforePostRenameParentFsync,
+    AfterPostRenameParentFsync,
+}
+
+impl std::fmt::Display for AtomicWriteBoundary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BeforeAnonymousInodeFsync => "before anonymous inode fsync",
+            Self::AfterAnonymousInodeFsync => "after anonymous inode fsync",
+            Self::BeforeStagingLink => "before staging link",
+            Self::AfterStagingLink => "after staging link",
+            Self::BeforeStagingLinkParentFsync => "before staging-link parent fsync",
+            Self::AfterStagingLinkParentFsync => "after staging-link parent fsync",
+            Self::BeforePromotionRename => "before promotion rename",
+            Self::AfterPromotionRename => "after promotion rename",
+            Self::BeforePostRenameParentFsync => "before post-rename parent fsync",
+            Self::AfterPostRenameParentFsync => "after post-rename parent fsync",
+        })
+    }
+}
+
+pub(crate) type AtomicWriteBoundaryCallback<'a> =
+    &'a dyn Fn(AtomicWriteBoundary) -> Result<(), String>;
+
+/// Selects a descriptor-relative staging backend. Ordinary writes retain the
+/// established private-directory backend unless a transaction explicitly
+/// asks to journal an anonymous inode before publication.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum AtomicStaging<'a> {
+    #[default]
+    PrivateDirectory,
+    JournaledAnonymous {
+        before_link: AnonymousStagingCallback<'a>,
+        after_link: Option<AnonymousAfterLinkCallback<'a>>,
+    },
+}
+
+/// Inputs for [`stage_journaled_anonymous_at_with_transaction_boundaries`].
+/// The requested ownership and mode are applied before either callback sees
+/// the anonymous inode.
+pub(crate) struct AnonymousStageOpts<'a> {
+    pub(crate) validator: Option<AtomicWriteFdValidator<'a>>,
+    pub(crate) mode: u32,
+    pub(crate) owner: (u32, u32),
+    /// Durably records intent while the inode has no directory entry.
+    pub(crate) before_link: AnonymousStagingCallback<'a>,
+    /// Records the linked receipt only after the parent fsync makes its name
+    /// durable. `None` is suitable only when the caller has another durable
+    /// way to discover the staged name.
+    pub(crate) after_link: Option<AnonymousStagingAfterLinkCallback<'a>>,
+}
+
+/// A durable named staging copy retained by a journaled transaction. Dropping
+/// this handle does not unlink `basename`; recovery owns its eventual cleanup.
+pub(crate) struct AnonymousStagedPayload {
+    pub(crate) basename: std::ffi::OsString,
+    pub(crate) payload: File,
+}
+
+/// Create and durably name a rollback payload beneath `target`'s exact pinned
+/// parent while observing every physical durability boundary.
+///
+/// The pre-link callback may safely record a receipt whose named entry is
+/// absent. The optional post-link callback runs only after the link and parent
+/// fsync, so its receipt denotes a durable named rollback copy across SIGKILL.
+pub(crate) fn stage_journaled_anonymous_at_with_transaction_boundaries(
+    target: &super::tree_io::PinnedTarget<'_>,
+    content: &[u8],
+    opts: AnonymousStageOpts<'_>,
+    boundaries: AtomicWriteBoundaryCallback<'_>,
+) -> Result<AnonymousStagedPayload, AtomicWriteError> {
+    anonymous::stage_only(
+        target,
+        content,
+        opts,
+        Some(boundaries),
+        #[cfg(test)]
+        None,
+    )
+}
+
+mod anonymous;
 mod staging;
 
 pub(crate) struct AtomicWriteAtOpts<'a> {
@@ -564,6 +703,9 @@ pub(crate) struct AtomicWriteAtOpts<'a> {
     /// Owner for an absent target. Existing targets retain snapshot ownership.
     pub owner: Option<(u32, u32)>,
     pub fsync_parent: bool,
+    /// Opt-in journaled anonymous staging. The default keeps private staging
+    /// directories for existing callers.
+    pub staging: AtomicStaging<'a>,
     #[cfg(test)]
     pub(crate) test_failure: Option<AtomicWriteTestFailure>,
 }
@@ -575,6 +717,7 @@ impl Default for AtomicWriteAtOpts<'_> {
             mode: None,
             owner: None,
             fsync_parent: true,
+            staging: AtomicStaging::PrivateDirectory,
             #[cfg(test)]
             test_failure: None,
         }
@@ -585,6 +728,26 @@ pub(crate) fn hardened_atomic_write_at(
     target: &super::tree_io::PinnedTarget<'_>,
     content: &[u8],
     opts: AtomicWriteAtOpts<'_>,
+) -> Result<(), AtomicWriteError> {
+    hardened_atomic_write_at_inner(target, content, opts, None)
+}
+
+/// Descriptor-relative writer with an opt-in observer around each physical
+/// anonymous staging and promotion durability boundary.
+pub(crate) fn hardened_atomic_write_at_with_transaction_boundaries(
+    target: &super::tree_io::PinnedTarget<'_>,
+    content: &[u8],
+    opts: AtomicWriteAtOpts<'_>,
+    boundaries: AtomicWriteBoundaryCallback<'_>,
+) -> Result<(), AtomicWriteError> {
+    hardened_atomic_write_at_inner(target, content, opts, Some(boundaries))
+}
+
+fn hardened_atomic_write_at_inner(
+    target: &super::tree_io::PinnedTarget<'_>,
+    content: &[u8],
+    opts: AtomicWriteAtOpts<'_>,
+    boundaries: Option<AtomicWriteBoundaryCallback<'_>>,
 ) -> Result<(), AtomicWriteError> {
     use super::tree_io::rename_at;
     use std::io::Seek;
@@ -601,6 +764,21 @@ pub(crate) fn hardened_atomic_write_at(
         .mode
         .or_else(|| meta.as_ref().map(|m| m.mode() & 0o7777))
         .unwrap_or(DEFAULT_TARGET_MODE);
+    if let AtomicStaging::JournaledAnonymous {
+        before_link,
+        after_link,
+    } = opts.staging
+    {
+        return anonymous::write(
+            target,
+            content,
+            &opts,
+            before_link,
+            after_link,
+            boundaries,
+            mode,
+        );
+    }
     let mut staging = staging::StagingDirectory::create(&target.parent).map_err(|source| {
         AtomicWriteError::WriteTemp {
             tmp: path.to_path_buf(),
@@ -772,14 +950,31 @@ pub(crate) fn hardened_atomic_write_at(
 }
 
 /// Options for [`hardened_atomic_create_only_at`].
-#[derive(Default)]
-pub(crate) struct AtomicCreateOnlyAtOpts {
+pub(crate) struct AtomicCreateOnlyAtOpts<'a> {
+    /// Inspect the fully written, durable staging inode before publication.
+    pub(crate) validator: Option<AtomicWriteFdValidator<'a>>,
     /// Mode for the new target. `None` uses [`DEFAULT_TARGET_MODE`] (`0o640`).
     pub(crate) mode: Option<u32>,
     /// Owner for the new target. `None` derives it from the pinned parent.
     pub(crate) owner: Option<(u32, u32)>,
+    /// Opt-in journaled anonymous staging. The default keeps private staging
+    /// directories for existing callers.
+    pub(crate) staging: AtomicStaging<'a>,
     #[cfg(test)]
     pub(crate) test_failure: Option<AtomicWriteTestFailure>,
+}
+
+impl Default for AtomicCreateOnlyAtOpts<'_> {
+    fn default() -> Self {
+        Self {
+            validator: None,
+            mode: None,
+            owner: None,
+            staging: AtomicStaging::PrivateDirectory,
+            #[cfg(test)]
+            test_failure: None,
+        }
+    }
 }
 
 /// Create an absent pinned target from a seekable spool without replacement.
@@ -791,7 +986,29 @@ pub(crate) fn hardened_atomic_create_only_at(
     target: &super::tree_io::PinnedTarget<'_>,
     source: &mut File,
     expected_size: u64,
-    opts: AtomicCreateOnlyAtOpts,
+    opts: AtomicCreateOnlyAtOpts<'_>,
+) -> Result<(), AtomicWriteError> {
+    hardened_atomic_create_only_at_inner(target, source, expected_size, opts, None)
+}
+
+/// Create-only writer with an opt-in observer around each physical anonymous
+/// staging and promotion durability boundary.
+pub(crate) fn hardened_atomic_create_only_at_with_transaction_boundaries(
+    target: &super::tree_io::PinnedTarget<'_>,
+    source: &mut File,
+    expected_size: u64,
+    opts: AtomicCreateOnlyAtOpts<'_>,
+    boundaries: AtomicWriteBoundaryCallback<'_>,
+) -> Result<(), AtomicWriteError> {
+    hardened_atomic_create_only_at_inner(target, source, expected_size, opts, Some(boundaries))
+}
+
+fn hardened_atomic_create_only_at_inner(
+    target: &super::tree_io::PinnedTarget<'_>,
+    source: &mut File,
+    expected_size: u64,
+    opts: AtomicCreateOnlyAtOpts<'_>,
+    boundaries: Option<AtomicWriteBoundaryCallback<'_>>,
 ) -> Result<(), AtomicWriteError> {
     use super::tree_io::rename_noreplace_at;
     use std::os::unix::io::AsRawFd;
@@ -803,6 +1020,21 @@ pub(crate) fn hardened_atomic_create_only_at(
         });
     }
     check_create_only_target_absent(target, path)?;
+    if let AtomicStaging::JournaledAnonymous {
+        before_link,
+        after_link,
+    } = opts.staging
+    {
+        return anonymous::create_only(
+            target,
+            source,
+            expected_size,
+            &opts,
+            before_link,
+            after_link,
+            boundaries,
+        );
+    }
     source
         .seek(SeekFrom::Start(0))
         .map_err(|source| AtomicWriteError::ReadSource {
@@ -902,6 +1134,24 @@ pub(crate) fn hardened_atomic_create_only_at(
             path: tmp.clone(),
             source,
         })?;
+        if let Some(validator) = opts.validator {
+            let mut validated = file
+                .try_clone()
+                .map_err(|source| AtomicWriteError::WriteTemp {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            validated
+                .rewind()
+                .map_err(|source| AtomicWriteError::WriteTemp {
+                    tmp: tmp.clone(),
+                    source,
+                })?;
+            validator(&validated, &tmp).map_err(|reason| AtomicWriteError::Validation {
+                target: path.to_path_buf(),
+                reason,
+            })?;
+        }
         check_create_only_target_absent(target, path)?;
 
         let promoted = file
@@ -981,7 +1231,7 @@ fn check_create_only_target_absent(
 }
 
 /// `-1`/MAX is the POSIX fchown sentinel for leaving that field intact.
-fn needed_owner_ids(
+pub(super) fn needed_owner_ids(
     current_uid: u32,
     current_gid: u32,
     desired_uid: u32,
@@ -1000,7 +1250,7 @@ fn needed_owner_ids(
     (uid != libc::uid_t::MAX || gid != libc::gid_t::MAX).then_some((uid, gid))
 }
 
-fn copy_spool_exact(
+pub(super) fn copy_spool_exact(
     source: &mut File,
     destination: &mut File,
     expected_size: u64,
@@ -1051,7 +1301,11 @@ fn copy_spool_exact(
     Ok(())
 }
 
-fn classify_noreplace_error(path: &Path, tmp: PathBuf, source: std::io::Error) -> AtomicWriteError {
+pub(super) fn classify_noreplace_error(
+    path: &Path,
+    tmp: PathBuf,
+    source: std::io::Error,
+) -> AtomicWriteError {
     match source.kind() {
         std::io::ErrorKind::AlreadyExists => AtomicWriteError::TargetExists {
             target: path.to_path_buf(),
@@ -1449,6 +1703,573 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AtomicWriteError::Validation { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "pristine");
+    }
+
+    #[test]
+    fn descriptor_staging_defaults_to_private_directory() {
+        assert!(matches!(
+            AtomicWriteAtOpts::default().staging,
+            AtomicStaging::PrivateDirectory
+        ));
+        assert!(matches!(
+            AtomicCreateOnlyAtOpts::default().staging,
+            AtomicStaging::PrivateDirectory
+        ));
+    }
+
+    #[test]
+    fn anonymous_staging_replaces_only_after_callback_observes_unlinked_inode() {
+        use crate::config::tree_io::inspect_at;
+        use crate::config::write_lock::{acquire_for_write, WRITE_STAGE_PREFIX};
+        use std::cell::Cell;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let callback_called = Cell::new(false);
+        let callback = |parent: &File, payload: &File, basename: &std::ffi::OsStr| {
+            callback_called.set(true);
+            assert_eq!(payload.metadata().unwrap().nlink(), 0);
+            assert!(inspect_at(parent, basename).unwrap().is_none());
+            let bytes = basename.as_bytes();
+            assert!(bytes.starts_with(WRITE_STAGE_PREFIX.as_bytes()));
+            assert_eq!(bytes.len(), WRITE_STAGE_PREFIX.len() + 32);
+            assert!(bytes[WRITE_STAGE_PREFIX.len()..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)));
+            Ok(())
+        };
+
+        hardened_atomic_write_at(
+            &target,
+            b"after",
+            AtomicWriteAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &callback,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(callback_called.get());
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"after");
+    }
+
+    #[test]
+    fn anonymous_staging_create_only_publishes_zero_length_payload() {
+        use crate::config::write_lock::acquire_for_write;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("empty.pack");
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_root_file_no_follow(Path::new("empty.pack"))
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"").unwrap();
+        let callback = |_parent: &File, payload: &File, _basename: &std::ffi::OsStr| {
+            assert_eq!(payload.metadata().unwrap().nlink(), 0);
+            Ok(())
+        };
+
+        hardened_atomic_create_only_at(
+            &target,
+            &mut source,
+            0,
+            AtomicCreateOnlyAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &callback,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::metadata(target_path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn anonymous_staging_create_only_publishes_spooled_bytes() {
+        use crate::config::write_lock::acquire_for_write;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("body.pack");
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_root_file_no_follow(Path::new("body.pack"))
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"spooled payload").unwrap();
+        let callback = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| Ok(());
+
+        hardened_atomic_create_only_at(
+            &target,
+            &mut source,
+            b"spooled payload".len() as u64,
+            AtomicCreateOnlyAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &callback,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(target_path).unwrap(), b"spooled payload");
+    }
+
+    #[test]
+    fn anonymous_staging_callback_refusal_leaves_no_visible_entry() {
+        use crate::config::write_lock::{acquire_for_write, WRITE_STAGE_PREFIX};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let callback = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| {
+            Err("journal unavailable".into())
+        };
+
+        let error = hardened_atomic_write_at(
+            &target,
+            b"after",
+            AtomicWriteAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &callback,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AtomicWriteError::JournalCallback { .. }));
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"before");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(WRITE_STAGE_PREFIX)));
+    }
+
+    #[test]
+    fn anonymous_staging_post_link_failure_keeps_the_journaled_entry() {
+        use crate::config::write_lock::{acquire_for_write, WRITE_STAGE_PREFIX};
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let stage = RefCell::new(None);
+        let callback = |_parent: &File, _payload: &File, basename: &std::ffi::OsStr| {
+            *stage.borrow_mut() = Some(basename.to_os_string());
+            Ok(())
+        };
+
+        let error = hardened_atomic_write_at(
+            &target,
+            b"after",
+            AtomicWriteAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &callback,
+                    after_link: None,
+                },
+                test_failure: Some(AtomicWriteTestFailure::AnonymousAfterLink),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AtomicWriteError::Fsync { .. }));
+        let stage = stage.borrow().clone().expect("callback records basename");
+        assert!(stage.to_string_lossy().starts_with(WRITE_STAGE_PREFIX));
+        let stage_path = dir.path().join(stage);
+        let metadata = std::fs::metadata(&stage_path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(std::fs::read(stage_path).unwrap(), b"after");
+        assert_eq!(std::fs::read(target_path).unwrap(), b"before");
+    }
+
+    #[test]
+    fn stage_only_keeps_target_intact_and_receipt_follows_durable_link() {
+        use crate::config::tree_io::inspect_at;
+        use crate::config::write_lock::acquire_for_write;
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let before_seen = Cell::new(false);
+        let after_seen = Cell::new(false);
+        let before_link = |parent: &File, payload: &File, basename: &std::ffi::OsStr| {
+            before_seen.set(true);
+            assert_eq!(payload.metadata().unwrap().nlink(), 0);
+            assert!(inspect_at(parent, basename).unwrap().is_none());
+            Ok(())
+        };
+        let after_link = |parent: &File, payload: &File, basename: &std::ffi::OsStr| {
+            after_seen.set(true);
+            let named = inspect_at(parent, basename).unwrap().expect("linked stage");
+            assert_eq!(payload.metadata().unwrap().nlink(), 1);
+            assert_eq!(
+                named.metadata().unwrap().ino(),
+                payload.metadata().unwrap().ino()
+            );
+            Ok(())
+        };
+        let owner = std::fs::metadata(dir.path()).unwrap();
+
+        let boundaries = |_| Ok(());
+        let staged = stage_journaled_anonymous_at_with_transaction_boundaries(
+            &target,
+            b"rollback copy",
+            AnonymousStageOpts {
+                validator: None,
+                mode: 0o640,
+                owner: (owner.uid(), owner.gid()),
+                before_link: &before_link,
+                after_link: Some(&after_link),
+            },
+            &boundaries,
+        )
+        .unwrap();
+
+        assert!(before_seen.get());
+        assert!(after_seen.get());
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"before");
+        assert_eq!(
+            std::fs::read(dir.path().join(&staged.basename)).unwrap(),
+            b"rollback copy"
+        );
+        assert_eq!(staged.payload.metadata().unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn transaction_boundary_observer_brackets_replace_syscalls_in_order() {
+        use crate::config::write_lock::acquire_for_write;
+        use std::cell::RefCell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let journal = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| Ok(());
+        let observed = RefCell::new(Vec::new());
+        let boundaries = |boundary| {
+            observed.borrow_mut().push(boundary);
+            Ok(())
+        };
+
+        hardened_atomic_write_at_with_transaction_boundaries(
+            &target,
+            b"after",
+            AtomicWriteAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &journal,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+            &boundaries,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *observed.borrow(),
+            [
+                AtomicWriteBoundary::BeforeAnonymousInodeFsync,
+                AtomicWriteBoundary::AfterAnonymousInodeFsync,
+                AtomicWriteBoundary::BeforeStagingLink,
+                AtomicWriteBoundary::AfterStagingLink,
+                AtomicWriteBoundary::BeforeStagingLinkParentFsync,
+                AtomicWriteBoundary::AfterStagingLinkParentFsync,
+                AtomicWriteBoundary::BeforePromotionRename,
+                AtomicWriteBoundary::AfterPromotionRename,
+                AtomicWriteBoundary::BeforePostRenameParentFsync,
+                AtomicWriteBoundary::AfterPostRenameParentFsync,
+            ]
+        );
+        assert_eq!(std::fs::read(target_path).unwrap(), b"after");
+    }
+
+    #[test]
+    fn transaction_boundary_observer_brackets_stage_only_durability() {
+        use crate::config::write_lock::acquire_for_write;
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("slice.toml");
+        std::fs::write(&target_path, "before").unwrap();
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_target(&target_path)
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let journal = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| Ok(());
+        let observed = RefCell::new(Vec::new());
+        let boundaries = |boundary| {
+            observed.borrow_mut().push(boundary);
+            Ok(())
+        };
+        let owner = std::fs::metadata(dir.path()).unwrap();
+
+        let staged = stage_journaled_anonymous_at_with_transaction_boundaries(
+            &target,
+            b"rollback",
+            AnonymousStageOpts {
+                validator: None,
+                mode: 0o640,
+                owner: (owner.uid(), owner.gid()),
+                before_link: &journal,
+                after_link: None,
+            },
+            &boundaries,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *observed.borrow(),
+            [
+                AtomicWriteBoundary::BeforeAnonymousInodeFsync,
+                AtomicWriteBoundary::AfterAnonymousInodeFsync,
+                AtomicWriteBoundary::BeforeStagingLink,
+                AtomicWriteBoundary::AfterStagingLink,
+                AtomicWriteBoundary::BeforeStagingLinkParentFsync,
+                AtomicWriteBoundary::AfterStagingLinkParentFsync,
+            ]
+        );
+        assert_eq!(std::fs::read(target_path).unwrap(), b"before");
+        assert_eq!(
+            std::fs::read(dir.path().join(staged.basename)).unwrap(),
+            b"rollback"
+        );
+    }
+
+    #[test]
+    fn transaction_boundary_observer_brackets_create_only_syscalls_in_order() {
+        use crate::config::write_lock::acquire_for_write;
+        use std::cell::RefCell;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("new.pack");
+        let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+        let target = guard
+            .tree_io()
+            .plan_root_file_no_follow(Path::new("new.pack"))
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"new").unwrap();
+        let journal = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| Ok(());
+        let observed = RefCell::new(Vec::new());
+        let boundaries = |boundary| {
+            observed.borrow_mut().push(boundary);
+            Ok(())
+        };
+
+        hardened_atomic_create_only_at_with_transaction_boundaries(
+            &target,
+            &mut source,
+            3,
+            AtomicCreateOnlyAtOpts {
+                staging: AtomicStaging::JournaledAnonymous {
+                    before_link: &journal,
+                    after_link: None,
+                },
+                ..Default::default()
+            },
+            &boundaries,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *observed.borrow(),
+            [
+                AtomicWriteBoundary::BeforeAnonymousInodeFsync,
+                AtomicWriteBoundary::AfterAnonymousInodeFsync,
+                AtomicWriteBoundary::BeforeStagingLink,
+                AtomicWriteBoundary::AfterStagingLink,
+                AtomicWriteBoundary::BeforeStagingLinkParentFsync,
+                AtomicWriteBoundary::AfterStagingLinkParentFsync,
+                AtomicWriteBoundary::BeforePromotionRename,
+                AtomicWriteBoundary::AfterPromotionRename,
+                AtomicWriteBoundary::BeforePostRenameParentFsync,
+                AtomicWriteBoundary::AfterPostRenameParentFsync,
+            ]
+        );
+        assert_eq!(std::fs::read(target_path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn injected_anonymous_open_and_link_errors_are_classified_without_publication() {
+        use crate::config::write_lock::{acquire_for_write, WRITE_STAGE_PREFIX};
+
+        for (failure, unsupported, journal_called) in [
+            (
+                AtomicWriteTestFailure::AnonymousOpenUnsupported,
+                true,
+                false,
+            ),
+            (AtomicWriteTestFailure::AnonymousOpenError, false, false),
+            (AtomicWriteTestFailure::AnonymousLinkUnsupported, true, true),
+            (AtomicWriteTestFailure::AnonymousLinkError, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target_path = dir.path().join("slice.toml");
+            std::fs::write(&target_path, "before").unwrap();
+            let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+            let target = guard
+                .tree_io()
+                .plan_target(&target_path)
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let called = std::cell::Cell::new(false);
+            let journal = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| {
+                called.set(true);
+                Ok(())
+            };
+
+            let error = hardened_atomic_write_at(
+                &target,
+                b"after",
+                AtomicWriteAtOpts {
+                    staging: AtomicStaging::JournaledAnonymous {
+                        before_link: &journal,
+                        after_link: None,
+                    },
+                    test_failure: Some(failure),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(called.get(), journal_called);
+            assert_eq!(
+                matches!(error, AtomicWriteError::AnonymousStagingUnsupported { .. }),
+                unsupported,
+                "unexpected classification for {failure:?}: {error:?}"
+            );
+            assert_eq!(std::fs::read(&target_path).unwrap(), b"before");
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(WRITE_STAGE_PREFIX)));
+        }
+    }
+
+    #[test]
+    fn transaction_boundary_error_reports_promotion_disposition() {
+        use crate::config::write_lock::acquire_for_write;
+
+        for (boundary, landed) in [
+            (AtomicWriteBoundary::BeforePromotionRename, false),
+            (AtomicWriteBoundary::AfterPromotionRename, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target_path = dir.path().join("slice.toml");
+            std::fs::write(&target_path, "before").unwrap();
+            let guard = acquire_for_write(&dir.path().join("config.toml")).unwrap();
+            let target = guard
+                .tree_io()
+                .plan_target(&target_path)
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let journal = |_parent: &File, _payload: &File, _basename: &std::ffi::OsStr| Ok(());
+            let stop = |observed| {
+                if observed == boundary {
+                    Err("stop".into())
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = hardened_atomic_write_at_with_transaction_boundaries(
+                &target,
+                b"after",
+                AtomicWriteAtOpts {
+                    staging: AtomicStaging::JournaledAnonymous {
+                        before_link: &journal,
+                        after_link: None,
+                    },
+                    ..Default::default()
+                },
+                &stop,
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                AtomicWriteError::TransactionBoundaryCallback { .. }
+            ));
+            assert_eq!(error.rename_landed(), landed);
+            assert_eq!(
+                std::fs::read(&target_path).unwrap(),
+                if landed {
+                    b"after".as_slice()
+                } else {
+                    b"before".as_slice()
+                }
+            );
+        }
     }
 }
 

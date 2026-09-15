@@ -1,0 +1,24 @@
+{
+  "cursor_request": {
+    "cursor": "Y29uZmlnLXYxOnBhY2stdjEKbG9jYWwtcnVsZXMKMg",
+    "limit": 50
+  },
+  "page": {
+    "contract_version": 1,
+    "id": "local-rules",
+    "config_revision": "config-v1",
+    "pack_revision": "pack-v1",
+    "rows": [
+      {
+        "line": 3,
+        "raw": "||telemetry.invalid^",
+        "row_ref": "local-rules:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "rule_key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "action": "deny",
+        "valid": true,
+        "duplicate": false
+      }
+    ],
+    "next_cursor": "Y29uZmlnLXYxOnBhY2stdjEKbG9jYWwtcnVsZXMKMw"
+  }
+}

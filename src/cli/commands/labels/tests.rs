@@ -4,7 +4,7 @@ fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -38,7 +38,7 @@ fn fake_socket(dir: &tempfile::TempDir) -> PathBuf {
 }
 
 fn labels_of(master: &Path) -> Vec<Label> {
-    load_config(master, time::OffsetDateTime::now_utc())
+    load_current_config(master, time::OffsetDateTime::now_utc())
         .unwrap()
         .config
         .labels
@@ -459,7 +459,7 @@ fn mk_split_tree(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 includes = ["labels.d/*.toml"]
 
 [server]

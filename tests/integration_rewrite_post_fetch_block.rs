@@ -51,15 +51,17 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncoder};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponse;
 
-use purge_warden::config::schema::{AdminRule, ConfigV1, Device, Id, Profile};
+use purge_warden::config::schema::{ConfigV1, CustomList, Device, Id, Profile};
 use purge_warden::config::settings::{CacheConfig, RewriteRule};
 use purge_warden::dns::cache::DnsCache;
 use purge_warden::dns::edns::EdnsClientSubnet;
 use purge_warden::dns::error::DnsError;
 use purge_warden::dns::handler::ForwardHandler;
 use purge_warden::filter::ip_filter::IpFilter;
+use purge_warden::filter::operator_rules::{
+    CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+};
 use purge_warden::filter::FilterEngine;
-use purge_warden::lists::source_key::SourceBitMap;
 use purge_warden::profiles::ProfileResolver;
 use purge_warden::upstream::{Upstream, UpstreamResponse};
 
@@ -125,6 +127,7 @@ impl Upstream for ScriptedUpstream {
         Ok(UpstreamResponse {
             records,
             response_code: ResponseCode::NoError,
+            generation: None,
             soa_minimum_ttl: None,
             #[cfg(feature = "dnssec")]
             authority: Vec::new(),
@@ -193,16 +196,15 @@ fn request_for(qname: &str) -> Request {
 /// A resolver mapping `CLIENT_IP` to a profile that rewrites `ORIGINAL` to
 /// `TARGET` and denies `EVIL`.
 ///
-/// The deny arrives through `admin_rules`: a simple exact `||evil.example^`
-/// lands in `ResolvedProfile::deny_domains` at resolver build. That matters
-/// because the post-fetch chain walk (`filter::cname::walk_response`) is
-/// **profile-aware** — it evaluates each CNAME target against the resolved
+/// The deny arrives through the schema-5 compiled Custom List snapshot. That
+/// matters because the post-fetch chain walk (`filter::cname::walk_response`)
+/// is **profile-aware** — it evaluates each CNAME target against the resolved
 /// profile, not through the flat `FilterEngine::is_blocked`. An empty engine is
-/// therefore enough; no blocklist file is involved.
+/// therefore enough; no downloaded blocklist is involved.
 fn resolver_with_rewrite_and_deny() -> Arc<ProfileResolver> {
     let profile = Profile {
         display_name: "demo".into(),
-        admin_rules: vec![Id::new("deny-evil").unwrap()],
+        custom_lists: vec![Id::new("rules").unwrap()],
         rewrite_rules: vec![RewriteRule {
             from: "shop.example".into(),
             to: "tracker.example".into(),
@@ -211,14 +213,15 @@ fn resolver_with_rewrite_and_deny() -> Arc<ProfileResolver> {
         ..Default::default()
     };
     let mut config = ConfigV1 {
-        schema_version: 1,
+        schema_version: purge_warden::config::schema::TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.server.allow_from = vec!["10.0.0.0/8".into()];
     config.server.default_profile = Some(Id::new("demo").unwrap());
-    config.admin_rules.push(AdminRule {
-        id: Id::new("deny-evil").unwrap(),
-        rule: "||evil.example^".into(),
+    config.custom_lists.push(CustomList {
+        id: Id::new("rules").unwrap(),
+        display_name: "Rules".into(),
+        description: String::new(),
     });
     config.profiles.insert("demo".to_string(), profile);
     config.devices.push(Device {
@@ -240,11 +243,25 @@ fn resolver_with_rewrite_and_deny() -> Arc<ProfileResolver> {
         network_name: None,
         network_name_wildcard: false,
     });
-    Arc::new(ProfileResolver::build(
-        &config,
-        &SourceBitMap::default(),
-        &purge_warden::config::custom_list::CustomListStore::new(),
-    ))
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let rules = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content: "||evil.example^",
+            }],
+            &[ProfileMounts {
+                profile_id: "demo",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    Arc::new(ProfileResolver::build_with_operator_rules(&config, rules))
 }
 
 fn handler_with(

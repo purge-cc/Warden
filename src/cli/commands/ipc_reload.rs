@@ -62,8 +62,8 @@ type TokenLoader = dyn Fn() -> io::Result<Option<String>> + Send + Sync;
 /// across every editor subcommand.
 #[derive(Debug)]
 pub enum ReloadOutcome {
-    /// Daemon accepted the reload — the on-disk change is now live in
-    /// memory without a restart.
+    /// Daemon accepted the reload request. This generic path has no revision
+    /// correlation, so it does not certify which on-disk change became live.
     Reloaded,
     /// Daemon is not running (no socket, connection refused, connect or
     /// read timeout). The change stays on disk and takes effect at the
@@ -197,7 +197,7 @@ fn looks_like_auth_mismatch(outcome: &ReloadOutcome) -> bool {
 pub fn report_reload_outcome(outcome: &ReloadOutcome) {
     match outcome {
         ReloadOutcome::Reloaded => {
-            println!("daemon reloaded — change is live");
+            println!("daemon accepted the reload request — activation is not correlated");
         }
         ReloadOutcome::DaemonUnreachable => {
             println!("daemon not running — change will take effect on next start");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::loader::load_current_config;
 use crate::config::schema::validator::format_base_ignore_list_is_inert;
 use crate::lists::status::{BlocklistStatusDto, ListStatus, ParsedCounts};
 use crate::tui::app::App;
@@ -48,7 +49,7 @@ fn app_with_overridden_lists_and_profiles() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -80,8 +81,7 @@ base = "ignore"
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let mut app = App::new();
     app.loaded_config = Some(loaded);
     app
@@ -258,8 +258,9 @@ fn render_list_row_uses_parsed_ok_for_entries_display() {
         used_by_profiles: Vec::new(),
         is_stale: false,
         inert_reason: None,
+        source_is_catalog: false,
     };
-    let row = render_list_row(meta);
+    let row = render_list_row_with_columns(meta, &list_columns(240));
     let rendered = row_text(&row);
     assert!(
         rendered.contains("4.0K") || rendered.contains("4043"),
@@ -281,7 +282,7 @@ fn render_list_row_uses_parsed_ok_for_entries_display() {
 fn render_list_row_carries_kind_badge_block_for_block_kind() {
     let mut meta = test_meta("a");
     meta.base = BlocklistBase::Deny;
-    let row = render_list_row(meta);
+    let row = render_list_row_with_columns(meta, &list_columns(240));
     let rendered = row_text(&row);
     assert!(
         rendered.contains("\u{25A3} BLOCK"),
@@ -294,7 +295,7 @@ fn render_list_row_carries_kind_badge_allow_for_allow_kind() {
     let mut meta = test_meta("a");
     meta.base = BlocklistBase::Allow;
     meta.trust = BlocklistTrust::Local; // allow requires local trust.
-    let row = render_list_row(meta);
+    let row = render_list_row_with_columns(meta, &list_columns(240));
     let rendered = row_text(&row);
     assert!(
         rendered.contains("\u{25A1} ALLOW"),
@@ -306,7 +307,7 @@ fn render_list_row_carries_kind_badge_allow_for_allow_kind() {
 fn render_list_row_format_column_shows_autodetected_label() {
     let mut meta = test_meta("a");
     meta.format = Some(BlocklistFormat::Adguard);
-    let row = render_list_row(meta);
+    let row = render_list_row_with_columns(meta, &list_columns(240));
     assert!(
         row_text(&row).contains("AdGuard"),
         "format column must surface `AdGuard` for the AdGuard variant"
@@ -317,10 +318,74 @@ fn render_list_row_format_column_shows_autodetected_label() {
 fn render_list_row_format_column_shows_em_dash_when_unknown() {
     let mut meta = test_meta("a");
     meta.format = None;
-    let row = render_list_row(meta);
+    let row = render_list_row_with_columns(meta, &list_columns(240));
     assert!(
         row_text(&row).contains('\u{2014}'),
         "missing format must render as `—` (em dash)"
+    );
+}
+
+#[test]
+fn source_column_uses_catalog_identity_not_host_substrings() {
+    let catalog = crate::lists::catalog::Catalog::fallback();
+    let entry = catalog
+        .entries()
+        .first()
+        .expect("fallback catalog is non-empty");
+    let entry_id = entry.id();
+    let mut purge = test_meta(&entry_id);
+    purge.dto.source = entry.url.clone();
+    purge.source_is_catalog = true;
+    assert_eq!(source_label(&purge), "PURGE");
+
+    let mut spoof = test_meta("custom");
+    spoof.canonical_id = Some(entry_id.clone());
+    spoof.dto.id = Some(entry_id);
+    spoof.dto.source = "https://lists.purge.cc.evil.example/custom.txt".into();
+    assert_eq!(source_label(&spoof), "CUSTOM");
+
+    let mut app = App::new();
+    app.lists.entries = vec![spoof.dto.clone()];
+    let projected = build_grouped_rows(&app);
+    assert_eq!(source_label(&projected[0]), "CUSTOM");
+}
+
+#[test]
+fn narrow_list_columns_keep_operational_fields_visible() {
+    let columns = list_columns(78);
+    let labels: Vec<_> = columns.iter().map(|column| column.label).collect();
+    assert_eq!(
+        labels,
+        vec!["", "ID", "SOURCE", "DIRECTION", "ENTRIES", "STATUS"]
+    );
+    assert!(columns.len() >= 5);
+}
+
+#[test]
+fn grouped_rows_are_sorted_by_selected_column_with_canonical_tie_break() {
+    let mut app = App::new();
+    app.lists.entries = vec![
+        BlocklistStatusDto {
+            source: "https://custom.example/z.txt".into(),
+            id: Some("z-list".into()),
+            parsed_ok: 20,
+            ..Default::default()
+        },
+        BlocklistStatusDto {
+            source: "https://custom.example/a.txt".into(),
+            id: Some("a-list".into()),
+            parsed_ok: 20,
+            ..Default::default()
+        },
+    ];
+    app.mouse.toggle_sort(Leaf::Lists, 5);
+    let rows = build_grouped_rows(&app);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.selection_key())
+            .collect::<Vec<_>>(),
+        vec!["id:a-list", "id:z-list"],
+        "equal displayed totals use the canonical selection key as a stable tie-break"
     );
 }
 
@@ -339,7 +404,8 @@ fn build_row_uses_canonical_id_when_present_does_not_panic() {
     let dto =
         BlocklistStatusDto::from_status("privacy/ads".into(), Some("privacy-ads".into()), &status);
     let empty_inert = std::collections::HashMap::new();
-    let _row = render_list_row(build_meta(&app, &dto, &empty_inert));
+    let _row =
+        render_list_row_with_columns(build_meta(&app, &dto, &empty_inert), &list_columns(240));
     let mut dto2 = BlocklistStatusDto {
         source: "raw-url".into(),
         id: None,
@@ -349,7 +415,8 @@ fn build_row_uses_canonical_id_when_present_does_not_panic() {
     dto2.last_outcome = "never_fetched".into();
     app.lists.entries = vec![dto2];
     let dto_ref = &app.lists.entries[0].clone();
-    let _row2 = render_list_row(build_meta(&app, dto_ref, &empty_inert));
+    let _row2 =
+        render_list_row_with_columns(build_meta(&app, dto_ref, &empty_inert), &list_columns(240));
 }
 
 // ── fixtures ────────────────────────────────────────────────────
@@ -371,6 +438,43 @@ fn test_meta(id: &str) -> ListRowMeta {
         used_by_profiles: Vec::new(),
         is_stale: false,
         inert_reason: None,
+        source_is_catalog: false,
+    }
+}
+
+#[test]
+fn updated_sort_keeps_missing_timestamps_last_in_both_directions() {
+    let mut older = test_meta("older");
+    older.dto.last_refresh_at = Some("2026-09-10T08:00:00Z".into());
+    let mut newer = test_meta("newer");
+    newer.dto.last_refresh_at = Some("2026-09-11T08:00:00Z".into());
+    let missing_z = test_meta("missing-z");
+    let missing_a = test_meta("missing-a");
+
+    for (descending, expected) in [
+        (
+            false,
+            ["id:older", "id:newer", "id:missing-a", "id:missing-z"],
+        ),
+        (
+            true,
+            ["id:newer", "id:older", "id:missing-a", "id:missing-z"],
+        ),
+    ] {
+        let mut rows = [
+            missing_z.clone(),
+            newer.clone(),
+            missing_a.clone(),
+            older.clone(),
+        ];
+        rows.sort_by(|left, right| compare_rows(left, right, 7, descending));
+        assert_eq!(
+            rows.iter()
+                .map(ListRowMeta::selection_key)
+                .collect::<Vec<_>>(),
+            expected,
+            "descending={descending}"
+        );
     }
 }
 
@@ -399,7 +503,7 @@ fn build_grouped_rows_collapses_canonical_id_duplicates() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -417,8 +521,7 @@ display_name = "Default"
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
 
     let mut app = App::new();
     app.loaded_config = Some(loaded);
@@ -468,7 +571,7 @@ fn build_meta_falls_back_to_url_match_when_dto_id_is_none() {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -486,8 +589,7 @@ display_name = "Default"
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let mut app = App::new();
     app.loaded_config = Some(loaded);
     let dto = BlocklistStatusDto {
@@ -688,8 +790,9 @@ fn stale_badge_renders_when_threshold_exceeded() {
         used_by_profiles: Vec::new(),
         is_stale: true,
         inert_reason: None,
+        source_is_catalog: false,
     };
-    let rendered = row_text(&render_list_row(meta));
+    let rendered = row_text(&render_list_row_with_columns(meta, &list_columns(240)));
     assert!(
         rendered.contains("Stale"),
         "row text must surface the Stale badge: {rendered}"
@@ -740,8 +843,9 @@ fn stale_badge_absent_when_within_threshold() {
         used_by_profiles: Vec::new(),
         is_stale: false,
         inert_reason: None,
+        source_is_catalog: false,
     };
-    let rendered = row_text(&render_list_row(meta));
+    let rendered = row_text(&render_list_row_with_columns(meta, &list_columns(240)));
     assert!(
         !rendered.contains("Stale"),
         "fresh row text must NOT include the Stale badge: {rendered}"
@@ -784,8 +888,9 @@ fn last_update_and_stale_badge_agree_when_never_succeeded() {
         used_by_profiles: Vec::new(),
         is_stale,
         inert_reason: None,
+        source_is_catalog: false,
     };
-    let rendered = row_text(&render_list_row(meta));
+    let rendered = row_text(&render_list_row_with_columns(meta, &list_columns(240)));
     assert!(
         rendered.contains("<never>"),
         "cell must not fabricate a success timestamp from a failed attempt: {rendered}"
@@ -829,6 +934,7 @@ fn meta_with(canonical_id: Option<&str>, source: &str) -> ListRowMeta {
         used_by_profiles: Vec::new(),
         is_stale: false,
         inert_reason: None,
+        source_is_catalog: false,
     }
 }
 
@@ -860,14 +966,14 @@ fn dto_for(id: &str, url: &str) -> BlocklistStatusDto {
     }
 }
 
-/// One profile ("home", tags=["ads"]), one deny list tagged "ads".
-/// Every list has effect — the zero-inert control fixture.
+/// One profile and one deny list. Every list has effect — the zero-inert
+/// control fixture.
 fn app_with_no_inert_lists() -> App {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -877,18 +983,15 @@ default_profile = "home"
 
 [profiles.home]
 display_name = "Home"
-tags = ["ads"]
 
 [[blocklists]]
 id = "healthy"
 display_name = "Healthy List"
 url = "https://example.com/healthy.txt"
-tags = ["ads"]
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let mut app = App::new();
     app.lists.entries = vec![dto_for("healthy", "https://example.com/healthy.txt")];
     app.loaded_config = Some(loaded);
@@ -917,7 +1020,7 @@ fn app_with_two_inert_lists() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -927,13 +1030,11 @@ default_profile = "home"
 
 [profiles.home]
 display_name = "Home"
-tags = ["ads"]
 
 [[blocklists]]
 id = "healthy"
 display_name = "Healthy List"
 url = "https://example.com/healthy.txt"
-tags = ["ads"]
 
 [[blocklists]]
 id = "mycompany"
@@ -941,7 +1042,6 @@ display_name = "My Company Allow"
 url = "https://example.com/mycompany.txt"
 base = "allow"
 trust = "local"
-tags = []
 
 [[blocklists]]
 id = "orphaned"
@@ -951,8 +1051,7 @@ base = "ignore"
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let mut app = App::new();
     app.lists.entries = vec![
         dto_for("healthy", "https://example.com/healthy.txt"),
@@ -973,7 +1072,7 @@ fn app_with_two_genuinely_inert_lists() -> App {
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -983,13 +1082,11 @@ default_profile = "home"
 
 [profiles.home]
 display_name = "Home"
-tags = ["ads"]
 
 [[blocklists]]
 id = "healthy"
 display_name = "Healthy List"
 url = "https://example.com/healthy.txt"
-tags = ["ads"]
 
 [[blocklists]]
 id = "orphaned-a"
@@ -1005,8 +1102,7 @@ base = "ignore"
 "#,
     )
     .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     let mut app = App::new();
     app.lists.entries = vec![
         dto_for("healthy", "https://example.com/healthy.txt"),
@@ -1049,63 +1145,6 @@ fn inert_reason_flags_base_ignore_and_not_an_untagged_allow_list() {
 }
 
 #[test]
-fn inert_reason_none_when_only_a_group_tag_reaches_the_list() {
-    // Regression for the exact bug lane `cli-write-paths` found in
-    // validator.rs's `check_tag_intersections`: a list reached only
-    // through `group.tags` (no device/profile/subnet carries the
-    // tag directly) must NOT be flagged inert. Now exercises
-    // `validator::inert_blocklists` directly via `build_grouped_rows`,
-    // so this is a live regression guard, not a copy that can drift.
-    let dir = tempfile::tempdir().unwrap();
-    let master = dir.path().join("config.toml");
-    std::fs::write(
-        &master,
-        r#"schema_version = 4
-
-[upstream]
-servers = ["192.0.2.1:53"]
-
-[server]
-default_profile = "home"
-
-[profiles.home]
-display_name = "Home"
-
-[[groups]]
-id = "iot"
-display_name = "IoT"
-profile = "home"
-tags = ["iot-only"]
-
-[[blocklists]]
-id = "group-reached"
-display_name = "Group Reached"
-url = "https://example.com/group-reached.txt"
-tags = ["iot-only"]
-"#,
-    )
-    .unwrap();
-    let loaded =
-        crate::config::loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
-    let mut app = App::new();
-    app.lists.entries = vec![dto_for(
-        "group-reached",
-        "https://example.com/group-reached.txt",
-    )];
-    app.loaded_config = Some(loaded);
-
-    let rows = build_grouped_rows(&app);
-    let meta = rows
-        .iter()
-        .find(|m| m.canonical_id.as_deref() == Some("group-reached"))
-        .unwrap();
-    assert_eq!(
-        meta.inert_reason, None,
-        "a list reached only via a group tag must not be flagged inert"
-    );
-}
-
-#[test]
 fn inert_reason_is_none_when_schema_entry_missing() {
     // Orphan row: DTO with no matching `[[blocklists]]` entry —
     // nothing to judge, must not be flagged.
@@ -1122,7 +1161,7 @@ fn row_text_shows_warning_glyph_only_on_inert_rows() {
     for row in rows {
         let inert = row.inert_reason.is_some();
         let id = row.canonical_id.clone().unwrap();
-        let text = row_text(&render_list_row(row));
+        let text = row_text(&render_list_row_with_columns(row, &list_columns(240)));
         assert_eq!(
             text.contains('\u{26A0}'),
             inert,
@@ -1236,7 +1275,10 @@ fn render_shows_badge_and_pinned_summary_when_fleet_has_inert_lists() {
     // that holds because its subject scrolled out of view is not a
     // control arm — it is a coincidence with an assertion attached, and
     // it fails the first time the layout moves for an unrelated reason.
-    let summary = normalized.split("Lists (").next().unwrap_or(&normalized);
+    let summary = normalized
+        .split("SUBSCRIPTIONS")
+        .next()
+        .unwrap_or(&normalized);
     assert!(
         !summary.contains("mycompany"),
         "an untagged allow-list is inherited, not inert — it must not be \
@@ -1274,7 +1316,7 @@ fn inert_summary_band_fits_two_reasons_at_the_80_col_floor() {
          3-row band used to lose:\n{dump}"
     );
     assert!(
-        dump.contains("Healthy List"),
+        dump.contains("healthy"),
         "the band must not evict the table it sits above:\n{dump}"
     );
 }
@@ -1301,19 +1343,11 @@ fn section_header_carries_a_full_width_background_band() {
     let [header, _rule] = modal_form::section_band("Identity", 60);
     // First span = the teal, bold label on the bg_surface band.
     let first = &header.spans[0];
-    assert_eq!(
-        first.style.bg,
-        Some(T.bg_surface),
-        "section header label must sit on a background band"
-    );
+    assert_eq!(first.style.bg, None, "section text is not a filled band");
     assert!(first.content.contains("IDENTITY"));
     // Last span = trailing pad, also banded → the band fills the row.
     let last = header.spans.last().unwrap();
-    assert_eq!(
-        last.style.bg,
-        Some(T.bg_surface),
-        "the band must fill the full row width"
-    );
+    assert!(last.content.contains(' '), "section rule follows the label");
 }
 
 // A test that pinned the tags row's old inline "(type / ↑↓ pick / …)"
@@ -1642,7 +1676,7 @@ fn the_refusal_band_does_not_push_the_table_off_an_80x24_screen() {
          at the 80-col floor — a fixed-height band used to lose it:\n{dump}"
     );
     assert!(
-        dump.contains("Healthy List"),
+        dump.contains("healthy"),
         "the band must not evict the table it sits above:\n{dump}"
     );
 }
@@ -1665,12 +1699,9 @@ fn flatten(line: &Line<'static>) -> String {
 }
 
 #[test]
-fn emerald_marks_exactly_one_row_whatever_holds_focus() {
-    // Stated as "at most once per frame",
-    // but a raw span count is the wrong unit — the focused row legally
-    // carries a rule, a marker and a dot. The checkable invariant is
-    // that emerald never appears on two different ROWS, because it is
-    // the answer to "where am I" and two answers make it a lie.
+fn emerald_focus_marks_at_most_one_interactive_row() {
+    // Semantic section rules may share the accent, while interactive focus
+    // must still identify one row. Their hairline distinguishes static headings.
     for focus in [
         EditField::DisplayName,
         EditField::ListId,
@@ -1686,11 +1717,22 @@ fn emerald_marks_exactly_one_row_whatever_holds_focus() {
         let buf = render_edit_modal_to_buffer(&modal);
         let mut rows = std::collections::BTreeSet::new();
         for y in 0..buf.area.height {
+            let section = (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "─");
+            if section {
+                continue;
+            }
             for x in 0..buf.area.width {
                 if buf[(x, y)].fg == T.emerald_ping {
                     rows.insert(y);
                 }
             }
+        }
+        if focus == EditField::Advanced {
+            assert_eq!(
+                rows.len(),
+                1,
+                "the focused Advanced control must be visible"
+            );
         }
         assert!(
             rows.len() <= 1,
@@ -1874,10 +1916,9 @@ fn focus_rule_replaces_the_indent_so_the_value_column_never_shifts() {
 }
 
 #[test]
-fn save_is_the_only_filled_button() {
-    // One filled button per modal, and destructive actions
-    // are outlined — a filled red beside a filled primary is how an
-    // operator deletes the list they meant to save.
+fn buttons_use_neutral_surfaces_and_highlight_the_focused_action() {
+    // Every action has a surface; focus replaces the neutral resting fill
+    // with the action colour, and destructive focus uses the red action token.
     let row = modal_form::action_row(
         &[
             modal_form::Action::new("  Delete  ", true, modal_form::ActionKind::Destructive, ""),
@@ -1887,13 +1928,28 @@ fn save_is_the_only_filled_button() {
         62,
     );
     let filled: Vec<_> = row.spans.iter().filter(|s| s.style.bg.is_some()).collect();
-    assert_eq!(filled.len(), 1, "exactly one button may be filled");
-    assert_eq!(filled[0].style.bg, Some(T.warden_teal));
-    assert!(filled[0].content.contains("Save"));
-    assert!(
-        row.spans.iter().all(|s| s.style.bg != Some(T.brand_red)),
-        "a focused Delete must not become a red slab"
+    assert_eq!(filled.len(), 3, "every button has a visible surface");
+    assert_eq!(
+        row.spans
+            .iter()
+            .filter(|s| s.style.bg == Some(T.red_glow))
+            .count(),
+        1,
+        "the focused destructive action is the sole filled red button"
     );
+    assert_eq!(
+        row.spans
+            .iter()
+            .filter(|s| s.style.bg == Some(T.bg_highlight))
+            .count(),
+        2,
+        "unfocused actions retain the neutral resting surface"
+    );
+    let focused = filled
+        .iter()
+        .find(|span| span.style.bg == Some(T.red_glow))
+        .unwrap();
+    assert!(focused.content.contains("Delete"));
 }
 
 #[test]
@@ -1967,7 +2023,7 @@ fn button_row_survives_the_declared_minimum_terminal() {
     assert!(s.contains("Save"), "Save unreachable at 80x24:\n{s}");
     assert!(s.contains("Cancel"), "Cancel unreachable at 80x24:\n{s}");
     // And the title must survive too — you have to know what you're editing.
-    assert!(s.contains("Add list"), "title band lost:\n{s}");
+    assert!(s.contains("ADD SUBSCRIPTION"), "title band lost:\n{s}");
 }
 
 /// **At the floor**: the two description rows are on screen,
@@ -2086,6 +2142,8 @@ fn scroll_body_allocates_tail_before_head_and_fields() {
     // Unit-level pin on the allocation order, independent of the Lists
     // modal's particular row counts.
     let body = modal_form::ScrollBody {
+        action_hits: Vec::new(),
+        field_hits: Vec::new(),
         head: vec![Line::from("HEAD1"), Line::from("HEAD2")],
         fields: (0..20).map(|i| Line::from(format!("F{i}"))).collect(),
         tail: vec![Line::from("HINT"), Line::from("BUTTONS")],
@@ -2310,7 +2368,7 @@ fn render_unsigned_allow_confirm_in(
 fn floor_unsigned_allow_confirm_keeps_every_row_it_promises() {
     let s = render_unsigned_allow_confirm_in("content-gambling", "ZZQQ", None, 80, 14);
     for needle in [
-        UNSIGNED_ALLOW_CONFIRM_TITLE,
+        "TURN THIS INTO AN ALLOW LIST?",
         UNSIGNED_ALLOW_CONFIRM_RISK_1,
         UNSIGNED_ALLOW_CONFIRM_RISK_2,
         UNSIGNED_ALLOW_CONFIRM_PROMPT,

@@ -32,6 +32,9 @@ use crate::config::schema::Id;
 /// See module docs for the layer taxonomy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSource {
+    /// A mounted V5 Custom List supplied the winning operator rule.  Existing
+    /// Profile/Device decoder variants remain unchanged for historical logs.
+    CustomList(Id),
     /// A `[[admin_rules]]` entry referenced by a `[profiles.<id>]`
     /// block matched. The carried `Id` is the profile id (NOT the
     /// admin_rule id) — that is the layer attribution the operator
@@ -55,6 +58,7 @@ impl RuleSource {
     /// `warden audit tail` output.
     pub fn as_label(&self) -> &'static str {
         match self {
+            Self::CustomList(_) => "custom-list",
             Self::Profile(_) => "profile",
             Self::Device(_) => "device",
             Self::AdminBuiltin => "admin-builtin",
@@ -66,6 +70,7 @@ impl RuleSource {
     /// `None` because there is no entity id (the rule is hard-coded).
     pub fn entity_id(&self) -> Option<&Id> {
         match self {
+            Self::CustomList(id) => Some(id),
             Self::Profile(id) => Some(id),
             Self::Device(id) => Some(id),
             Self::AdminBuiltin => None,

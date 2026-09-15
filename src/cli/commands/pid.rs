@@ -8,7 +8,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -66,6 +66,21 @@ fn acquire_pid_lock_with_retry(
     path: &Path,
     retry_transient_contention: bool,
 ) -> Result<std::fs::File, PidLockError> {
+    for _ in 0..8 {
+        match acquire_linked_pid_lock(path, retry_transient_contention) {
+            Err(PidLockError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {}
+            result => return result,
+        }
+    }
+    Err(PidLockError::Io(std::io::Error::from_raw_os_error(
+        libc::ESTALE,
+    )))
+}
+
+fn acquire_linked_pid_lock(
+    path: &Path,
+    retry_transient_contention: bool,
+) -> Result<std::fs::File, PidLockError> {
     // Ensure the parent directory exists. In production systemd creates
     // /run/purge-warden/ via `RuntimeDirectory=`, but a foreground/dev
     // invocation (`warden start` after a `systemctl stop` wiped the
@@ -82,8 +97,22 @@ fn acquire_pid_lock_with_retry(
         .write(true)
         .create(true)
         .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(PidLockError::Io)?;
+    let metadata = file.metadata().map_err(PidLockError::Io)?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(PidLockError::Io(std::io::Error::from_raw_os_error(
+            libc::EINVAL,
+        )));
+    }
+
+    #[cfg(test)]
+    AFTER_PID_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
 
     // Non-blocking exclusive lock. If another process holds it, we get
     // EWOULDBLOCK immediately instead of waiting.
@@ -157,6 +186,21 @@ fn acquire_pid_lock_with_retry(
         return Err(PidLockError::Io(err));
     }
 
+    // Never start on a detached inode if the PID pathname was replaced while
+    // we waited for flock.
+    let linked = std::fs::symlink_metadata(path).map_err(|error| {
+        PidLockError::Io(if error.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::from_raw_os_error(libc::ESTALE)
+        } else {
+            error
+        })
+    })?;
+    if !linked.is_file() || linked.dev() != metadata.dev() || linked.ino() != metadata.ino() {
+        return Err(PidLockError::Io(std::io::Error::from_raw_os_error(
+            libc::ESTALE,
+        )));
+    }
+
     // We hold the lock. Truncate and write our PID.
     let mut f = file;
     f.set_len(0).map_err(PidLockError::Io)?;
@@ -171,6 +215,142 @@ fn acquire_pid_lock_with_retry(
         "PID file locked"
     );
     Ok(f)
+}
+
+/// Hold the effective daemon PID lease without changing an existing PID file.
+/// The inode stays linked after release so a legacy waiter cannot start on a
+/// detached lock. New files inherit the deployment owner and readable PID mode.
+#[derive(Debug)]
+pub(crate) struct OfflinePidLease {
+    _file: std::fs::File,
+}
+
+pub(crate) fn acquire_offline_pid_lease(
+    path: &Path,
+    deployment_owner: Option<&std::fs::Metadata>,
+) -> anyhow::Result<OfflinePidLease> {
+    use crate::config::{tree_io, write_lock};
+    let name = path
+        .file_name()
+        .filter(|name| *name != "." && *name != "..")
+        .ok_or_else(|| anyhow::anyhow!("PID lease must name a file"))?
+        .to_os_string();
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = offline_pid_parent(parent_path, deployment_owner)?;
+    let parent_owner = parent.metadata()?;
+    // Node state is owned by the daemon even when its PID directory was
+    // recreated by root after systemd removed RuntimeDirectory on stop.
+    let owner = deployment_owner
+        .filter(|owner| owner.uid() != 0)
+        .unwrap_or(&parent_owner);
+    let (file, created) = match write_lock::open_at(
+        &parent,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
+        0o644,
+    ) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let inspected = write_lock::open_at(&parent, &name, libc::O_PATH, 0)?;
+            let meta = inspected.metadata()?;
+            anyhow::ensure!(
+                meta.is_file() && meta.nlink() == 1,
+                "NodeOfflineUnproven: unsafe PID lease"
+            );
+            (
+                write_lock::reopen_inspected(&inspected, libc::O_RDONLY | libc::O_NONBLOCK)?,
+                false,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if created {
+        write_lock::preserve_owner(&file, owner)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        file.sync_all()?;
+        parent.sync_all()?;
+    }
+    // SAFETY: the descriptor owns a regular, no-follow PID file.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!(
+                "NodeNotOffline: a daemon holds the effective PID lease {}",
+                path.display()
+            );
+        }
+        return Err(error.into());
+    }
+    let linked = tree_io::inspect_at(&parent, &name)?
+        .ok_or_else(|| anyhow::anyhow!("NodeOfflineUnproven: PID lease disappeared"))?;
+    let ours = file.metadata()?;
+    let current = linked.metadata()?;
+    anyhow::ensure!(
+        current.is_file() && current.dev() == ours.dev() && current.ino() == ours.ino(),
+        "NodeOfflineUnproven: PID lease changed"
+    );
+    Ok(OfflinePidLease { _file: file })
+}
+
+fn offline_pid_parent(
+    path: &Path,
+    deployment_owner: Option<&std::fs::Metadata>,
+) -> anyhow::Result<std::fs::File> {
+    use crate::config::write_lock;
+    use std::os::unix::ffi::OsStrExt;
+    let absolute = std::env::current_dir()?.join(path);
+    let mut components = absolute.components().peekable();
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open("/")?;
+    while let Some(component) = components.next() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            _ => anyhow::bail!("unsafe PID directory component"),
+        };
+        match write_lock::open_at(&directory, name, libc::O_PATH | libc::O_DIRECTORY, 0) {
+            Ok(next) => directory = next,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && components.peek().is_none() =>
+            {
+                // Only the final runtime directory may be created. Its owner
+                // must be able to traverse it after a privileged migration.
+                let parent_owner = directory.metadata()?;
+                let owner = deployment_owner
+                    .filter(|owner| owner.uid() != 0)
+                    .unwrap_or(&parent_owner);
+                let c_name = std::ffi::CString::new(name.as_bytes())?;
+                let created =
+                    unsafe { libc::mkdirat(directory.as_raw_fd(), c_name.as_ptr(), 0o750) } == 0;
+                if !created {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(error.into());
+                    }
+                }
+                let next =
+                    write_lock::open_at(&directory, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                if created {
+                    write_lock::preserve_owner(&next, owner)?;
+                    next.set_permissions(std::fs::Permissions::from_mode(0o750))?;
+                    next.sync_all()?;
+                    write_lock::reopen_inspected(&directory, libc::O_RDONLY | libc::O_DIRECTORY)?
+                        .sync_all()?;
+                }
+                directory = next;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(write_lock::reopen_inspected(
+        &directory,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )?)
 }
 
 /// Write the current process ID to the PID file (no locking).
@@ -366,8 +546,219 @@ pub fn send_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_PID_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acquire_offline_pid_lease(path: &Path) -> anyhow::Result<OfflinePidLease> {
+        super::acquire_offline_pid_lease(path, None)
+    }
+
+    #[test]
+    fn offline_pid_lease_preserves_exclusion_inode_and_compatible_owner_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom.pid");
+        let lease = acquire_offline_pid_lease(&path).unwrap();
+        assert!(matches!(
+            try_acquire_pid_lock(&path),
+            Err(PidLockError::AlreadyRunning(_))
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().uid(),
+            std::fs::metadata(root.path()).unwrap().uid()
+        );
+        drop(lease);
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        let daemon = acquire_pid_lock(&path).unwrap();
+        assert!(acquire_offline_pid_lease(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("NodeNotOffline"));
+        drop(daemon);
+        let before = std::fs::read(&path).unwrap();
+        drop(acquire_offline_pid_lease(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let created = root.path().join("temporary.pid");
+        let lease = acquire_offline_pid_lease(&created).unwrap();
+        std::fs::rename(&created, root.path().join("detached.pid")).unwrap();
+        std::fs::write(&created, "replacement").unwrap();
+        drop(lease);
+        assert_eq!(std::fs::read(&created).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn offline_pid_lease_refuses_symlinks_and_hardlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.pid");
+        std::fs::write(&target, "untouched").unwrap();
+        let alias = root.path().join("alias.pid");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(acquire_offline_pid_lease(&alias).is_err());
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::hard_link(&target, &alias).unwrap();
+        assert!(acquire_offline_pid_lease(&alias).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn daemon_cannot_start_with_a_pid_inode_removed_while_it_waited() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom.pid");
+        let first = acquire_offline_pid_lease(&path).unwrap();
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let daemon_path = path.clone();
+        let daemon = std::thread::spawn(move || {
+            AFTER_PID_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    opened_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            try_acquire_pid_lock(&daemon_path)
+        });
+        opened_rx.recv().unwrap();
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let _second = acquire_offline_pid_lease(&path).unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            daemon.join().unwrap(),
+            Err(PidLockError::AlreadyRunning(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn legacy_flock_waiter_stays_visible_after_offline_lease_release() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.pid");
+        let lease = acquire_offline_pid_lease(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(waiter_path)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            // SAFETY: the file descriptor is live; this models the old daemon's flock without an inode recheck.
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            locked_tx.send(file.metadata().unwrap().ino()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        opened_rx.recv().unwrap();
+        drop(lease);
+        assert_eq!(locked_rx.recv().unwrap(), inode);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert!(acquire_offline_pid_lease(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("NodeNotOffline"));
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        drop(acquire_offline_pid_lease(&path).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn offline_pid_lease_traverses_execute_only_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("execute-only");
+        let parent = ancestor.join("runtime");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let path = parent.join("daemon.pid");
+        let outcome = acquire_offline_pid_lease(&path);
+        // Restore directory readability for tempfile's recursive cleanup.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(outcome.unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn offline_pid_creation_uses_the_deployment_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("node-state");
+        std::fs::create_dir(&state).unwrap();
+        // Root-run test deployments can exercise a distinct daemon identity.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&state, Some(65534), Some(65534)).unwrap();
+        }
+        let owner = std::fs::metadata(&state).unwrap();
+        let path = root.path().join("deployment.pid");
+        drop(super::acquire_offline_pid_lease(&path, Some(&owner)).unwrap());
+        let actual = std::fs::metadata(&path).unwrap();
+        assert_eq!((actual.uid(), actual.gid()), (owner.uid(), owner.gid()));
+        assert_eq!(actual.mode() & 0o777, 0o644);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn offline_pid_parent_creation_is_deployment_accessible_and_does_not_change_ancestors() {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = root.path().join("node-state");
+        std::fs::create_dir(&state).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&state, Some(65534), Some(65534)).unwrap();
+        }
+        let owner = std::fs::metadata(&state).unwrap();
+        let ancestor = std::fs::metadata(root.path()).unwrap();
+        let parent = root.path().join("runtime");
+        let path = parent.join("daemon.pid");
+        drop(super::acquire_offline_pid_lease(&path, Some(&owner)).unwrap());
+        let created = std::fs::metadata(&parent).unwrap();
+        assert_eq!((created.uid(), created.gid()), (owner.uid(), owner.gid()));
+        assert_eq!(created.mode() & 0o777, 0o750);
+        let mut probe = std::process::Command::new("/bin/sh");
+        probe
+            .args([
+                "-c",
+                "test -x \"$1\" && test -r \"$2\" && test -w \"$2\"",
+                "pid-access",
+            ])
+            .arg(&parent)
+            .arg(&path);
+        if unsafe { libc::geteuid() } == 0 {
+            probe.gid(owner.gid()).uid(owner.uid());
+        }
+        assert!(probe.status().unwrap().success());
+        let after = std::fs::metadata(root.path()).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (ancestor.uid(), ancestor.gid(), ancestor.mode())
+        );
+        let existing = std::fs::metadata(&parent).unwrap();
+        drop(super::acquire_offline_pid_lease(&path, Some(&ancestor)).unwrap());
+        let after = std::fs::metadata(&parent).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (existing.uid(), existing.gid(), existing.mode())
+        );
+
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        assert!(super::acquire_offline_pid_lease(&alias.join("other.pid"), Some(&owner)).is_err());
+        assert!(!parent.join("other.pid").exists());
+        assert!(super::acquire_offline_pid_lease(
+            &root.path().join("absent/nested/daemon.pid"),
+            Some(&owner)
+        )
+        .is_err());
+        assert!(!root.path().join("absent").exists());
+    }
 
     /// A daemon starting while `pid_file_state` is probing must still
     /// get the lock.

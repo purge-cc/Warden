@@ -7,19 +7,18 @@
 //!
 //! So both carve-outs are held by test, not by reasoning:
 //!
-//! 1. **the sync's own install still succeeds on a secondary.** `apply.rs`
-//!    stages, validates and installs into `cluster.d/` directly and never
-//!    touches the validating writers. That is true structurally today; this
-//!    file's job is to keep it true. Note the deliberate contrast with
-//!    `target::tests::cs8_secondary_policy_guard`: the same directory is
-//!    refused for manual writes and permitted to the sync.
+//! 1. **the sync's own install still succeeds on a secondary.** The artifact
+//!    receiver stages, validates and installs the complete policy through its
+//!    guarded transaction, without entering the operator validating writers.
+//!    Its executable regression lives beside the crate-private receiver API;
+//!    this file keeps the route fence visible from outside the module.
 //! 2. **`warden lists refresh` stays allowed.** It is node-local, and since
 //!    S1 gave the secondary a real list manager it now does what it says
 //!    (pre-S1 it SIGHUPed a node whose reload path early-returned while
 //!    printing "lists will reload" — a lie).
 //!
-//! Only the live installer test needs `--features cluster`; the route and
-//! retired-interface fences remain active in the default test configuration.
+//! The route and retired-interface fences remain active in the default test
+//! configuration; the live artifact installer test runs with `cluster`.
 
 // ── carve-out 2: `warden lists refresh` (ungated) ───────────────────────
 
@@ -54,30 +53,31 @@ fn lists_refresh_does_not_route_through_the_validating_writers() {
     }
 }
 
-/// The same assertion for the sync's installer, at the route.
-///
-/// A live `apply_bundle` call (below) proves the carve-out holds for the
-/// bundle this test happens to build. This proves it holds because
-/// `apply.rs` does not use that machinery at all — which is the property the
-/// design actually relies on.
+/// The same assertion for the artifact receiver's guarded install route.
+/// Its in-module test also exercises the async wrapper and reload signal.
 #[test]
-fn apply_does_not_route_through_the_validating_writers() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cluster/apply.rs"))
-        .expect("apply.rs is readable");
-    let production = src
-        .split("#[cfg(test)]")
-        .next()
-        .expect("apply.rs has a body before its test module");
-    for writer in [
-        "write_value_validated_locked",
-        "write_values_validated_locked",
-        "promote_validated",
+fn artifact_receiver_does_not_route_through_the_validating_writers() {
+    for relative in [
+        "src/cluster/artifact_apply.rs",
+        "src/cluster/transaction.rs",
     ] {
-        assert!(
-            !production.contains(writer),
-            "cluster apply now routes through {writer}; the CS8 guard would refuse the \
-             sync's own install and the secondary would never receive policy again."
-        );
+        let src = std::fs::read_to_string(format!("{}/{relative}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|error| panic!("{relative} is readable: {error}"));
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| panic!("{relative} has production code before its tests"));
+        for writer in [
+            "write_value_validated_locked",
+            "write_values_validated_locked",
+            "promote_validated",
+        ] {
+            assert!(
+                !production.contains(writer),
+                "artifact receiver route {relative} enters {writer}; the secondary policy \
+                 install would be rejected by the operator-writer guard"
+            );
+        }
     }
 }
 
@@ -112,78 +112,5 @@ fn c512_retired_public_writer_interfaces_stay_absent() {
                 "C5.12 retired public interface `{symbol}` returned in {relative}"
             );
         }
-    }
-}
-
-// ── carve-out 1: the sync's own install (cluster feature) ───────────────
-
-#[cfg(feature = "cluster")]
-mod install {
-    use purge_warden::cluster::apply::apply_bundle;
-    use purge_warden::cluster::policy::ClusterPolicyBundle;
-
-    /// A joined secondary, shaped per §5.3: node-local keep-list only.
-    const SECONDARY_MASTER: &str = r#"schema_version = 4
-includes = ["cluster.d/*.toml"]
-
-[server]
-listen = "127.0.0.1:15353"
-
-[api]
-token_hash = ""
-
-[cluster]
-enabled = true
-role = "secondary"
-peer = "https://192.0.2.10:8053"
-token_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-"#;
-
-    /// Policy only — the CS3 fence (`deny_unknown_fields` on
-    /// `ClusterPolicyBundle`) rejects any node-local section here.
-    const BUNDLE: &str = r#"schema_version = 4
-
-[server]
-default_profile = "default"
-
-[profiles.default]
-display_name = "Default"
-
-[upstream]
-servers = ["192.0.2.1:53"]
-
-[[devices]]
-id = "tablet"
-display_name = "Tablet"
-ip = "192.0.2.50"
-"#;
-
-    /// The install the whole feature exists to perform must still succeed on
-    /// a secondary — and it installs `[[devices]]`, which the target unit
-    /// tests prove an operator cannot write there by hand.
-    #[tokio::test]
-    async fn a_secondary_still_installs_a_synced_policy_bundle() {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        std::fs::write(&master, SECONDARY_MASTER).unwrap();
-
-        // The receiver must outlive the call: `apply_bundle` signals a reload
-        // on it and treats a closed channel as a shutdown.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let hash = ClusterPolicyBundle::hash_of(BUNDLE);
-
-        apply_bundle(&master, BUNDLE, &hash, &tx)
-            .await
-            .expect("CS8 must not block the sync's own install");
-
-        let installed = dir.path().join("cluster.d/00-cluster-policy.toml");
-        assert!(
-            installed.exists(),
-            "the bundle should be on disk at {}",
-            installed.display()
-        );
-        assert!(std::fs::read_to_string(&installed)
-            .unwrap()
-            .contains("tablet"));
     }
 }

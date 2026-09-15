@@ -28,12 +28,14 @@ pub mod group;
 pub mod id;
 pub mod label;
 pub mod load;
+pub mod node;
 pub mod profile;
 pub mod resource_budget;
 pub mod retired;
 pub mod retired_keys;
 pub mod schedule;
 pub mod subnet;
+pub mod target_v5;
 pub mod validator;
 
 pub use admin_rule::AdminRule;
@@ -48,11 +50,17 @@ pub use group::Group;
 pub use id::Id;
 pub use label::{Label, LabelKind};
 pub use load::load_from_str_collect_for_schema;
+pub use node::NodeConfig;
 pub use profile::{BlockResponseV1, Profile, ProfileEcsConfig};
 pub use resource_budget::ResourceBudgetConfig;
 pub use retired::{RetiredEntry, RetiredType, RETIREMENT_WINDOW_DAYS};
 pub use schedule::{Schedule, ScheduleTargetType};
 pub use subnet::Subnet;
+pub use target_v5::{
+    ConfigV5, CustomListLimitsV5, DeviceV5, MigrationOriginV1, ProfileV5, TARGET_SCHEMA_VERSION_V5,
+    TARGET_V5_NODE_LOCAL_SECTIONS, TARGET_V5_REPLICATED_SECTIONS,
+    TARGET_V5_SECTIONS_EXCLUDED_FROM_REPLICATION,
+};
 pub use validator::validate_collect_for_schema;
 
 use std::collections::BTreeMap;
@@ -356,6 +364,10 @@ pub struct ConfigV1 {
     /// identity: never replicated to a peer.
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    /// Local identity and display name; never replicated.
+    #[serde(default)]
+    pub node: NodeConfig,
 }
 
 /// Manual `Default` so a Rust-side `ConfigV1::default()` carries a real
@@ -406,6 +418,7 @@ impl Default for ConfigV1 {
             resource_budget: ResourceBudgetConfig::default(),
             backup: BackupConfig::default(),
             cluster: ClusterConfig::default(),
+            node: NodeConfig::default(),
         }
     }
 }
@@ -467,6 +480,7 @@ pub const REPLICATED_SECTIONS: &[&str] = &[
     "groups",
     "subnets",
     "schedules",
+    "custom_lists",
     "admin_rules",
     "labels",
     "upstream",
@@ -483,13 +497,9 @@ pub const REPLICATED_SECTIONS: &[&str] = &[
 /// Sections that never cross the wire. Replicating any of
 /// these would overwrite the secondary's own identity with the primary's.
 pub const NODE_LOCAL_SECTIONS: &[&str] = &[
-    // A `[[custom_lists]]` row is a pointer to a file on THIS node's disk.
-    // Replication ships config sections, not files, so a replicated pointer
-    // would name a file the secondary does not have — and an unreadable pack
-    // is a load error, so the secondary would refuse to start. Not
-    // replicating is strictly safer than replicating half of it. Its limits
-    // table follows it: ceilings for a reader that never runs are noise.
-    "custom_lists",
+    // Custom List declarations cross the wire with their pack bytes in the
+    // same cluster artifact. Admission ceilings belong to the receiving node:
+    // a primary may describe requirements, but cannot raise a secondary's cap.
     "custom_list_limits",
     "tracking",
     "socket",
@@ -497,6 +507,7 @@ pub const NODE_LOCAL_SECTIONS: &[&str] = &[
     "resource_budget",
     "backup",
     "cluster",
+    "node",
 ];
 
 /// Neither replicated nor node-local. `includes` is a list of path globs
@@ -997,6 +1008,7 @@ servers = ["192.0.2.1:53"]
             resource_budget: _,
             backup: _,
             cluster: _,
+            node: _,
 
             // ── excluded, with a reason ──
             // `includes` is a list of path globs resolved against the LOCAL
@@ -1053,28 +1065,15 @@ servers = ["192.0.2.1:53"]
     /// the build move again, including a harmful one. This names the one
     /// case where the wrong bucket is an outage rather than a lint.
     ///
-    /// A `[[custom_lists]]` row points at `packs/<id>.txt` on the node's own
-    /// disk. Replication ships config sections, never files, so a replicated
-    /// row would reach a secondary with no such file — and an unreadable pack
-    /// is a load error, so that secondary refuses to start. The primary would
-    /// take it down by syncing.
-    ///
-    /// If a later sprint teaches replication to ship pack bodies, this test
-    /// is the thing to delete, and deleting it should require saying so.
+    /// Declarations and bytes form one replicated artifact, while admission
+    /// ceilings remain authoritative on the receiving node.
     #[test]
-    fn a_custom_list_declaration_never_crosses_the_wire() {
-        for key in ["custom_lists", "custom_list_limits"] {
-            assert!(
-                !REPLICATED_SECTIONS.contains(&key),
-                "'{key}' must not be replicated: it points at a file on this \
-                 node's disk that replication cannot carry, and the secondary \
-                 refuses to start on a pack it cannot read"
-            );
-            assert!(
-                NODE_LOCAL_SECTIONS.contains(&key),
-                "'{key}' must be node-local"
-            );
-        }
+    fn custom_list_declarations_replicate_but_receiver_limits_do_not() {
+        assert!(REPLICATED_SECTIONS.contains(&"custom_lists"));
+        assert!(!NODE_LOCAL_SECTIONS.contains(&"custom_lists"));
+
+        assert!(!REPLICATED_SECTIONS.contains(&"custom_list_limits"));
+        assert!(NODE_LOCAL_SECTIONS.contains(&"custom_list_limits"));
     }
 
     /// The subtraction the secondary-master guard performs must be a

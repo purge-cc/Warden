@@ -112,6 +112,43 @@ pub const IPC_ERROR_NO_CONFIG_PATH: &str =
     "this daemon was started without a config path bound to its IPC \
      interface; mutating verbs are disabled. Restart the daemon via \
      `warden --config <path> start`.";
+pub const IPC_ERROR_CUSTOM_LISTS_MIXED_PROFILE_PATCH: &str =
+    "custom_lists cannot be mixed with legacy profile fields; submit a separate atomic mount/unmount request";
+pub const IPC_ERROR_LEGACY_PROFILE_RULES_RETIRED: &str =
+    crate::cli::commands::rules::LEGACY_RULES_RETIRED;
+pub const IPC_ERROR_OPERATOR_RULES_UNAVAILABLE: &str = "operator-rules service is unavailable";
+pub const IPC_ERROR_CUSTOM_LIST_MOUNT_UPDATE_FAILED: &str = "custom-list mount update failed";
+
+pub const IPC_ERROR_POLICY_OWNED_BY_PRIMARY: &str =
+    "policy is managed by the primary; edit it on that node";
+pub const IPC_ERROR_NODE_DEPARTURE_UNCONFIRMED: &str =
+    "node departure requires a verified active policy and list corpus; wait for activation";
+pub const IPC_ERROR_NODE_PREVIEW_FAILED: &str =
+    "could not prepare the node change; check Nodes status and the daemon log before retrying or cancelling a pending preview";
+pub const IPC_ERROR_NODE_APPLY_FAILED: &str =
+    "node change could not be confirmed; check Nodes status and the daemon log before retrying. Saved changes may require recovery or restart";
+pub const IPC_ERROR_NODE_CANCEL_FAILED: &str =
+    "node cancellation could not be confirmed; check Nodes status and the daemon log before trying again";
+pub const IPC_ERROR_NODE_STATUS_UNAVAILABLE: &str =
+    "node observation is unavailable or stale; see the daemon log for details";
+pub const IPC_ERROR_NODE_CONTROL_INVALID: &str =
+    "the Nodes request is not valid for the current node, address, or membership state; review the fields and current status";
+pub const IPC_ERROR_NODE_CONTROL_LISTEN_REQUIRED: &str =
+    "choose this node's reachable LAN address with warden node token --listen IP:8053";
+pub const IPC_ERROR_NODE_CONTROL_UPGRADE_REQUIRED: &str =
+    "this peer needs a Warden upgrade before guided Nodes management is available; its existing policy sync is preserved";
+pub const IPC_ERROR_NODE_CONTROL_EXPIRED: &str =
+    "the association or review expired; issue a new token and review it again";
+pub const IPC_ERROR_NODE_CONTROL_CONFLICT: &str =
+    "configuration or reviewed artifacts changed; prepare and review the operation again";
+pub const IPC_ERROR_NODE_CONTROL_UNREACHABLE: &str =
+    "the managed node could not be reached through its pinned HTTPS endpoint; check its address and retry or resume";
+pub const IPC_ERROR_NODE_CONTROL_SUPERVISOR: &str =
+    "managed restart is unavailable; run Warden as the supported systemd service with exit 75 configured, then resume the operation";
+pub const IPC_ERROR_NODE_CONTROL_RECOVERY: &str =
+    "the operation remains durable and needs recovery; refresh Nodes and use Resume";
+pub const IPC_ERROR_NODE_CONTROL_FAILED: &str =
+    "the Nodes operation could not be completed; its durable status is still available";
 
 pub const IPC_ERROR_RETENTION_OUT_OF_RANGE: &str = "retention_days must be between 1 and 365.";
 pub const IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE: &str =
@@ -187,6 +224,8 @@ pub const IPC_ERROR_OVERRIDE_ALLOW_NEEDS_CONSENT: &str =
      with `warden blocklist set-trust {list} remote-unsigned --accept-unsigned-allow`; \
      a profile override cannot declare it on the list's behalf, because the \
      declaration belongs to the list and reaches every profile that allows it.";
+pub const IPC_ERROR_CUSTOM_LIST_MOUNT_NOT_COMMITTED: &str =
+    "custom-list mount update did not commit (operation_id={operation_id}, persistence={persistence})";
 
 // ─────────────────────────────────────────────────────────────────────
 // IpcError enum.
@@ -238,6 +277,18 @@ pub enum IpcError {
     NoProfileResolver,
     NoProfilesResolverPromote,
     NoConfigPath,
+    CustomListsMixedProfilePatch,
+    LegacyProfileRulesRetired,
+    OperatorRulesUnavailable,
+    CustomListMountUpdateFailed,
+    PolicyOwnedByPrimary,
+    NodeDepartureUnconfirmed,
+    NodePreviewFailed,
+    NodeApplyFailed,
+    NodeCancelFailed,
+    NodeStatusUnavailable,
+    #[cfg(feature = "cluster")]
+    NodeControl(crate::cluster::node_control::NodeControlErrorCode),
 
     RetentionDaysOutOfRange,
     LogModeRateOutOfRange,
@@ -299,6 +350,10 @@ pub enum IpcError {
         id: String,
         list: String,
     },
+    CustomListMountNotCommitted {
+        operation_id: String,
+        persistence: String,
+    },
 
     Internal,
 }
@@ -340,6 +395,36 @@ impl IpcError {
             Self::NoProfileResolver => IPC_ERROR_NO_PROFILE_RESOLVER.to_string(),
             Self::NoProfilesResolverPromote => IPC_ERROR_NO_PROFILES_RESOLVER_PROMOTE.to_string(),
             Self::NoConfigPath => IPC_ERROR_NO_CONFIG_PATH.to_string(),
+            Self::CustomListsMixedProfilePatch => {
+                IPC_ERROR_CUSTOM_LISTS_MIXED_PROFILE_PATCH.to_string()
+            }
+            Self::LegacyProfileRulesRetired => IPC_ERROR_LEGACY_PROFILE_RULES_RETIRED.to_string(),
+            Self::OperatorRulesUnavailable => IPC_ERROR_OPERATOR_RULES_UNAVAILABLE.to_string(),
+            Self::CustomListMountUpdateFailed => {
+                IPC_ERROR_CUSTOM_LIST_MOUNT_UPDATE_FAILED.to_string()
+            }
+            Self::PolicyOwnedByPrimary => IPC_ERROR_POLICY_OWNED_BY_PRIMARY.to_string(),
+            Self::NodeDepartureUnconfirmed => IPC_ERROR_NODE_DEPARTURE_UNCONFIRMED.to_string(),
+            Self::NodePreviewFailed => IPC_ERROR_NODE_PREVIEW_FAILED.to_string(),
+            Self::NodeApplyFailed => IPC_ERROR_NODE_APPLY_FAILED.to_string(),
+            Self::NodeCancelFailed => IPC_ERROR_NODE_CANCEL_FAILED.to_string(),
+            Self::NodeStatusUnavailable => IPC_ERROR_NODE_STATUS_UNAVAILABLE.to_string(),
+            #[cfg(feature = "cluster")]
+            Self::NodeControl(code) => {
+                use crate::cluster::node_control::NodeControlErrorCode as Code;
+                match code {
+                    Code::InvalidInput => IPC_ERROR_NODE_CONTROL_INVALID,
+                    Code::ListenRequired => IPC_ERROR_NODE_CONTROL_LISTEN_REQUIRED,
+                    Code::CapabilityUpgradeRequired => IPC_ERROR_NODE_CONTROL_UPGRADE_REQUIRED,
+                    Code::AuthorizationExpired => IPC_ERROR_NODE_CONTROL_EXPIRED,
+                    Code::Conflict => IPC_ERROR_NODE_CONTROL_CONFLICT,
+                    Code::PeerUnavailable => IPC_ERROR_NODE_CONTROL_UNREACHABLE,
+                    Code::SupervisorUnsupported => IPC_ERROR_NODE_CONTROL_SUPERVISOR,
+                    Code::RecoveryRequired => IPC_ERROR_NODE_CONTROL_RECOVERY,
+                    Code::Internal => IPC_ERROR_NODE_CONTROL_FAILED,
+                }
+                .to_string()
+            }
             Self::RetentionDaysOutOfRange => IPC_ERROR_RETENTION_OUT_OF_RANGE.to_string(),
             Self::LogModeRateOutOfRange => IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE.to_string(),
             Self::ConfigReadFailed => IPC_ERROR_CONFIG_READ_FAILED.to_string(),
@@ -368,6 +453,12 @@ impl IpcError {
             Self::OverrideAllowNeedsConsent { id, list } => IPC_ERROR_OVERRIDE_ALLOW_NEEDS_CONSENT
                 .replace("{id}", id)
                 .replace("{list}", list),
+            Self::CustomListMountNotCommitted {
+                operation_id,
+                persistence,
+            } => IPC_ERROR_CUSTOM_LIST_MOUNT_NOT_COMMITTED
+                .replace("{operation_id}", operation_id)
+                .replace("{persistence}", persistence),
             Self::Internal => IPC_ERROR_INTERNAL.to_string(),
         }
     }

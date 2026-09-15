@@ -1,39 +1,12 @@
-//! Admin-rule write helpers + scope-aware mutation seat.
+//! Compatibility surface for retired loose admin-rule commands.
 //!
-//! Every rule add / remove / undo / prune lands through one of the
-//! helpers in this module. The CLI clap subcommands
+//! Every rule add, remove, move, undo, and prune entry point returns
+//! [`LEGACY_RULES_RETIRED`] before acquiring a lock, reading configuration,
+//! contacting the daemon, or writing. The CLI clap subcommands
 //! (`warden {profile,device,group,subnet,default} {allow,deny}`,
 //! `warden rule undo`, `warden device rules prune`) and the TUI scope
-//! modal both call the same underlying functions — one mutation surface,
-//! no new IPC verbs.
-//!
-//! The seats are sync — synchronous file IO inside an outer async CLI
-//! handler — so the TUI can call them from a batch loop without
-//! `.await`-per-row.
-//!
-//! # `add_inner` write order (atomicity)
-//!
-//! Every add touches **two** TOML slices: the master holding
-//! `[[admin_rules]]`, and the entity file holding the reference
-//! (`Profile.admin_rules` / `Device.allow_rules` / `Device.deny_rules`).
-//! Both slices are staged in memory and handed to
-//! [`super::target::write_values_validated_locked`], which validates the merged
-//! `{master + includes + both staged slices}` BEFORE promoting either.
-//! Nothing cross-reference-invalid is ever renamed into place, so the
-//! orphan-rule window (a master row with no entity reference) never
-//! reaches disk. The slices promote master-row-first so every
-//! inter-rename intermediate is itself valid (an unreferenced
-//! `admin_rules` row is fine; a reference must never outlive its row).
-//!
-//! # `RULE_REFUSED_OVERRIDE` write-time gate
-//!
-//! For Device + Allow scope, [`add_inner`] inverts truth-table Row 6 from
-//! [`crate::profiles::resolver::apply_overlay`]: if the device's
-//! effective profile has an explicit deny on the same domain AND the
-//! device's `override_profile_deny` flag is `false`, the write is
-//! refused with the frozen [`RULE_REFUSED_OVERRIDE`] string. The daemon
-//! enforces the same row defensively at runtime; the gate is a UX guard
-//! catching the conflict before any TOML mutation lands.
+//! modal share these fail-closed entry points. Current operator policy is
+//! expressed by Custom Lists mounted on profiles.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,13 +15,9 @@ use ahash::RandomState;
 use anyhow::{bail, Context};
 use compact_str::CompactString;
 use rand_core::{OsRng, RngCore};
-#[cfg(test)]
-use time::OffsetDateTime;
 use toml::Value;
 
 use crate::config::audit::{AuditEvent, AuditRecord, AuditResult};
-#[cfg(test)]
-use crate::config::loader::load_config;
 use crate::config::schema::admin_rule::{format_rule_invalid_domain, validate_domain};
 use crate::config::schema::id::Id;
 use crate::config::schema::ConfigV1;
@@ -57,12 +26,7 @@ use crate::filter::rules::{parse_rules, RuleAction as ParsedRuleAction};
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
 
-#[cfg(test)]
-use super::audit::audit_log_path_for;
 use super::audit_emit::{current_uid, persist_cli_mutation_audit};
-use super::ipc_reload;
-#[cfg(test)]
-use super::local_dns::profile_scoped::load_for_resolution;
 use super::local_dns::profile_scoped::{
     ensure_profile_exists_in, find_profile_entry_mut, find_profile_target_file_locked,
     load_for_resolution_locked,
@@ -265,6 +229,16 @@ pub fn format_rule_undo_ok(id: &str, rule_string: &str) -> String {
 /// Emitted by [`undo_inner`] when the admin_rules list is empty.
 pub const RULE_UNDO_EMPTY: &str = "No rule to undo: admin_rules list is empty.";
 
+/// Legacy loose admin rules and per-device allow/deny overlays no longer
+/// participate in operator policy. Keep this error at every old writer so an
+/// upgrade cannot acknowledge a policy edit that has no supported home.
+pub const LEGACY_RULES_RETIRED: &str =
+    "Legacy allow/deny rules and device overlays are retired. Create a Custom List and mount it on the target profile instead.";
+
+fn reject_legacy_rule_write() -> anyhow::Result<()> {
+    bail!(LEGACY_RULES_RETIRED)
+}
+
 /// Profile named by a `--profile` / group / subnet scope is absent from
 /// the merged config.
 pub const RULES_PROFILE_NOT_FOUND: &str =
@@ -297,6 +271,7 @@ pub(crate) fn add_inner(
     explicit_id: Option<&str>,
     into: Option<&Path>,
 ) -> anyhow::Result<ChangeOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     add_inner_locked(
         &guard,
@@ -319,6 +294,7 @@ pub(crate) fn add_inner_locked(
     explicit_id: Option<&str>,
     into: Option<&Path>,
 ) -> anyhow::Result<ChangeOutcome> {
+    reject_legacy_rule_write()?;
     // 1. Validate domain → canonical lowercase form.
     let canonical = validate_domain(domain_input)
         .map_err(|reason| anyhow::anyhow!(format_rule_invalid_domain(domain_input, &reason)))?;
@@ -465,6 +441,7 @@ pub(crate) enum RemoveOutcome {
 /// that have no rule id to offer (the REST allow-list handler, the tests
 /// that predate `--id`). Removing by id is the same engine with the filter
 /// supplied — there is deliberately no second removal path.
+#[cfg(test)]
 pub(crate) fn remove_inner(
     config_path: &Path,
     scope: Scope<'_>,
@@ -472,11 +449,13 @@ pub(crate) fn remove_inner(
     domain_input: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     remove_inner_locked(&guard, config_path, scope, action, domain_input, into)
 }
 
 /// Guarded counterpart to [`remove_inner`] for compound callers.
+#[cfg(test)]
 pub(crate) fn remove_inner_locked(
     guard: &ConfigWriteLock,
     config_path: &Path,
@@ -485,6 +464,7 @@ pub(crate) fn remove_inner_locked(
     domain_input: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<RemoveOutcome> {
+    reject_legacy_rule_write()?;
     remove_inner_matching_locked(guard, config_path, scope, action, domain_input, into, None)
 }
 
@@ -500,7 +480,7 @@ pub(crate) fn remove_inner_locked(
 ///
 /// Scope is preserved either way: this unlinks ONE entity and drops the
 /// `[[admin_rules]]` row only when nothing else still points at it. That
-/// is a different contract from [`remove_admin_rule_by_id`], which unlinks
+/// is a different contract from [`remove_admin_rule_by_id_without_reload`], which unlinks
 /// every entity and drops the row unconditionally — correct for the TUI's
 /// "delete this rule everywhere" affordance, wrong for a scoped verb.
 pub(crate) fn remove_inner_matching(
@@ -511,6 +491,7 @@ pub(crate) fn remove_inner_matching(
     into: Option<&Path>,
     id_filter: Option<&str>,
 ) -> anyhow::Result<RemoveOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     remove_inner_matching_locked(
         &guard,
@@ -533,6 +514,7 @@ pub(crate) fn remove_inner_matching_locked(
     into: Option<&Path>,
     id_filter: Option<&str>,
 ) -> anyhow::Result<RemoveOutcome> {
+    reject_legacy_rule_write()?;
     let canonical = validate_domain(domain_input)
         .map_err(|reason| anyhow::anyhow!(format_rule_invalid_domain(domain_input, &reason)))?;
     let rule_string = action.rule_string(&canonical);
@@ -1169,25 +1151,11 @@ pub(crate) fn flip_at_at_prefix(rule_string: &str) -> String {
     }
 }
 
-/// Outcome of [`move_admin_rule`].
-#[derive(Debug)]
-#[allow(dead_code)] // `reload_outcome` is currently inspected only via
-                    // the Debug derive (e.g. for error logs); the TUI
-                    // submit handler reads `master_rewritten` and
-                    // discards the rest. Keep the field so future
-                    // surfaces (CLI shim, audit log) have it ready.
-pub(crate) enum MoveOutcome {
-    /// `(old_scope, old_action) == (new_scope, new_action)` — no
-    /// writes touched disk. Modal closes silently.
+/// Durable result of [`move_admin_rule_without_reload`], before any IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveWriteOutcome {
     NoOp,
-    /// At least one of action/scope changed. `master_rewritten` is
-    /// `true` when the `[[admin_rules]]` rule string was rewritten
-    /// (action flipped). `reload_outcome` carries whether the daemon
-    /// picked up the change.
-    Applied {
-        master_rewritten: bool,
-        reload_outcome: ipc_reload::ReloadOutcome,
-    },
+    Applied { master_rewritten: bool },
 }
 
 /// Move an admin rule between scopes and/or flip its action. Used by
@@ -1201,7 +1169,7 @@ pub(crate) enum MoveOutcome {
 /// - **scope changed** (different storage location — including same
 ///   device with allow→deny field swap): remove ref from old entity,
 ///   add ref to new entity.
-/// - **neither changed**: returns [`MoveOutcome::NoOp`] without
+/// - **neither changed**: returns [`MoveWriteOutcome::NoOp`] without
 ///   touching disk.
 ///
 /// The flip and the reference move are staged together and validated as
@@ -1209,16 +1177,17 @@ pub(crate) enum MoveOutcome {
 /// string with the reference still in the old field) can never be the
 /// on-disk truth. A move never removes the `[[admin_rules]]` row, so no
 /// intermediate can dangle.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn move_admin_rule(
+/// Stage, validate and commit a rule move without output or daemon reload.
+/// The writer guard is released before returning the durable outcome.
+pub(crate) fn move_admin_rule_without_reload(
     config_path: &Path,
-    socket_path: &Path,
     rule_id: &str,
     old_scope: Scope<'_>,
     old_action: Action,
     new_scope: Scope<'_>,
     new_action: Action,
-) -> anyhow::Result<MoveOutcome> {
+) -> anyhow::Result<MoveWriteOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     let action_changed = old_action != new_action;
     let old_resolution = resolve_scope_target_locked(&guard, config_path, &old_scope, None)?;
@@ -1232,7 +1201,7 @@ pub(crate) async fn move_admin_rule(
         || (matches!(&new_resolution.target, EntityTarget::Device { .. }) && action_changed);
 
     if !action_changed && !storage_changed {
-        return Ok(MoveOutcome::NoOp);
+        return Ok(MoveWriteOutcome::NoOp);
     }
 
     // Stage every mutation this move makes — the master rule-string flip
@@ -1291,17 +1260,13 @@ pub(crate) async fn move_admin_rule(
     write_values_validated_locked(&guard, &master, &writes)?;
     drop(guard);
 
-    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
-    Ok(MoveOutcome::Applied {
-        master_rewritten,
-        reload_outcome,
-    })
+    Ok(MoveWriteOutcome::Applied { master_rewritten })
 }
 
 /// Locate the `[[admin_rules]]` entry with id `rule_id` in an already-read
 /// master `doc` and flip its `rule` string via [`flip_at_at_prefix`], in
 /// place. The write + validation is the caller's responsibility — folded
-/// into [`move_admin_rule`]'s combined pre-promote batch so the flip and the
+/// into [`move_admin_rule_without_reload`]'s combined pre-promote batch so the flip and the
 /// reference move are validated together and promoted atomically.
 fn flip_master_rule_in_doc(doc: &mut Value, rule_id: &str) -> anyhow::Result<()> {
     let table = doc
@@ -1337,7 +1302,7 @@ fn flip_master_rule_in_doc(doc: &mut Value, rule_id: &str) -> anyhow::Result<()>
 
 /// Read `path` into the per-file doc map on first touch (so multiple
 /// mutations to the same file coalesce into one staged slice) and return a
-/// mutable handle. Backs [`move_admin_rule`]'s combined staging.
+/// mutable handle. Backs [`move_admin_rule_without_reload`]'s combined staging.
 fn stage_doc_locked<'a>(
     guard: &ConfigWriteLock,
     config_path: &Path,
@@ -1353,36 +1318,27 @@ fn stage_doc_locked<'a>(
     Ok(docs.get_mut(path).expect("doc just inserted"))
 }
 
-/// Outcome of [`remove_admin_rule_by_id`].
-#[derive(Debug)]
-#[allow(dead_code)] // The TUI consumes the variants via `let _ = outcome`
-                    // and lets the modal handler shape the footer text.
-                    // Variants kept named for symmetry with [`MoveOutcome`].
-pub(crate) enum RemoveByIdOutcome {
-    /// No `[[admin_rules]]` entry with that id existed.
+/// Durable result of [`remove_admin_rule_by_id_without_reload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveByIdWriteOutcome {
     NotFound,
-    /// Removed `n_refs` references across entities + dropped the
-    /// master row. `reload_outcome` carries the post-write reload.
-    Removed {
-        n_refs: usize,
-        reload_outcome: ipc_reload::ReloadOutcome,
-    },
+    Removed { n_refs: usize },
 }
 
-/// Walk every device + every profile, drop every reference to
-/// `rule_id`, then drop the master `[[admin_rules]]` row. Used by the
-/// TUI Rules-tab delete-confirm flow — the existing
-/// [`remove_inner`] requires `(scope, action, domain)` to FIND the
-/// rule_id, but the TUI already has the id from the row. This helper
-/// skips the find walk and operates directly by id.
+/// Walk every device and profile, drop every reference to `rule_id`, then
+/// drop the master `[[admin_rules]]` row. Callers that already resolved a
+/// displayed row can operate directly by id without another domain lookup.
 ///
-/// Coalesces all single-file mutations into one validate; multi-file
-/// layouts use the sequential per-file pattern from [`remove_inner`].
-pub(crate) async fn remove_admin_rule_by_id(
+/// Coalesces all single-file mutations into one validation. Multi-file
+/// layouts retain the same ordered per-file staging semantics as scoped
+/// removal.
+/// Remove all references and the master row without output or daemon reload.
+/// Validation covers the entire staged batch before any file is promoted.
+pub(crate) fn remove_admin_rule_by_id_without_reload(
     config_path: &Path,
-    socket_path: &Path,
     rule_id: &str,
-) -> anyhow::Result<RemoveByIdOutcome> {
+) -> anyhow::Result<RemoveByIdWriteOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     let cfg = load_for_resolution_locked(&guard, config_path)?;
     let cfg = &cfg;
@@ -1392,7 +1348,7 @@ pub(crate) async fn remove_admin_rule_by_id(
     // surface decides how to phrase this).
     let exists_in_master = cfg.admin_rules.iter().any(|r| r.id.as_str() == rule_id);
     if !exists_in_master {
-        return Ok(RemoveByIdOutcome::NotFound);
+        return Ok(RemoveByIdWriteOutcome::NotFound);
     }
 
     // Collect every entity ref. Stored as (file_path, resolution,
@@ -1504,11 +1460,7 @@ pub(crate) async fn remove_admin_rule_by_id(
     write_values_validated_locked(&guard, &master, &writes)?;
     drop(guard);
 
-    let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
-    Ok(RemoveByIdOutcome::Removed {
-        n_refs,
-        reload_outcome,
-    })
+    Ok(RemoveByIdWriteOutcome::Removed { n_refs })
 }
 
 // ── override gate ────────────────────────────────────────────────────
@@ -1603,14 +1555,12 @@ fn check_override_required_locked(
 
 // ── public CLI handlers ────────────────────────────────
 
-/// Shared dispatcher for every `warden {profile,device,group,subnet,
-/// default} {allow,deny}` clap variant. Validates → calls
-/// [`add_inner`] / [`remove_inner`] → emits the success / NoOp /
-/// NotFound message → fires the shared reload via
+/// Compatibility dispatcher for the legacy `warden {profile,device,group,
+/// subnet,default} {allow,deny}` clap variants. It validates the request,
+/// delegates to the guarded writer, reports the outcome, and fires reload via
 /// [`super::ipc_reload::attempt_reload`].
 ///
-/// Sync helpers `add_inner` / `remove_inner` keep the file IO inline;
-/// only the post-write reload is async.
+/// File I/O remains synchronous; only the post-write reload is asynchronous.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
     config_path: &Path,
@@ -1997,6 +1947,7 @@ fn master_last_admin_rule(master_doc: &Value) -> Option<(String, String)> {
 /// layouts are handled via a per-file walker, mirroring the cascade
 /// used elsewhere in this module.
 pub(crate) fn undo_inner(config_path: &Path) -> anyhow::Result<UndoOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     undo_inner_locked(&guard, config_path)
 }
@@ -2005,6 +1956,7 @@ pub(crate) fn undo_inner_locked(
     guard: &ConfigWriteLock,
     config_path: &Path,
 ) -> anyhow::Result<UndoOutcome> {
+    reject_legacy_rule_write()?;
     // Pick the victim from the MASTER's own top-level
     // `[[admin_rules]]` tail. `add_inner` always appends the new row there,
     // so undo must pop from the same place add pushes. The merged view
@@ -2207,6 +2159,7 @@ pub(crate) fn prune_inner(
     device_id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<PruneOutcome> {
+    reject_legacy_rule_write()?;
     let guard = acquire_for_write(config_path)?;
     prune_inner_locked(&guard, config_path, device_id, into)
 }
@@ -2217,6 +2170,7 @@ pub(crate) fn prune_inner_locked(
     device_id: &str,
     into: Option<&Path>,
 ) -> anyhow::Result<PruneOutcome> {
+    reject_legacy_rule_write()?;
     let cfg = load_for_resolution_locked(guard, config_path)?;
     let known_ids: HashSet<String> = cfg
         .admin_rules

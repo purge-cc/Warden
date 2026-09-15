@@ -42,7 +42,7 @@ use super::migration_journal::{self, FenceRefusal};
 use super::schema::{
     load::load_from_str_collect_for_schema,
     validator::{validate_collect_for_schema, AuditWarnings},
-    ConfigV1, SCHEMA_VERSION_V1,
+    ConfigV1, ConfigV5, SCHEMA_VERSION_V1, TARGET_SCHEMA_VERSION_V5,
 };
 use super::tree_io::{
     for_each_dir_name, DestinationIdentity, MasterIdentityChanged, MemberKey, ResolvedEntry,
@@ -111,6 +111,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     // Primary/secondary cluster replication (node-local, inert by
     // default). Singleton section, so NOT in ARRAY_OF_TABLES_KEYS / NAMED_MAP_KEYS.
     "cluster",
+    "node",
     // DEPRECATED legacy alias for `[[devices]]` — accepted at load
     // time with a `tracing::warn!`.
     "clients",
@@ -212,6 +213,20 @@ pub struct LoadedConfig {
     /// profile compilation never touches the disk.
     pub custom_lists: crate::config::custom_list::CustomListStore,
 }
+
+/// Complete schema-5 configuration loaded through the guarded include/merge
+/// and flat-pack pipeline.
+#[derive(Debug)]
+pub struct LoadedConfigV5 {
+    pub config: ConfigV5,
+    pub master_path: PathBuf,
+    pub files_loaded: Vec<PathBuf>,
+    pub total_bytes: u64,
+    pub provenance: ProvenanceMap,
+    pub pack_bodies: crate::config::target_v5::PackBodiesV5,
+}
+
+pub(crate) type LoadedV5Candidate = LoadedConfigV5;
 
 /// A read-substitution + extra-member + omission overlay for
 /// [`load_config_with_overlay`].
@@ -315,7 +330,6 @@ impl LoaderOverlay {
     /// Model removal of an existing descriptor-pinned member after validation.
     /// A path spelling could change before unlink, so omissions only accept a
     /// [`TargetPlan`].
-    #[cfg(any(feature = "cluster", test))]
     pub(crate) fn omit_plan(&mut self, plan: &TargetPlan<'_>) -> anyhow::Result<()> {
         anyhow::ensure!(
             !plan.is_new(),
@@ -406,6 +420,7 @@ impl LoaderOverlay {
                 .insert(entry.key().clone(), destination.clone())
             {
                 if expected != destination {
+                    mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
                     return Err(tree_errors(
                         path,
                         anyhow::anyhow!("overlay destination changed"),
@@ -497,7 +512,7 @@ fn probe_declared_schema_version_inner(tree: TreeIo<'_>) -> Result<u32, Vec<Conf
                 err.context_mut().line = line_of_top_key(&src, "schema_version");
                 err
             })
-            .collect()
+            .collect::<Vec<_>>()
     })
 }
 
@@ -518,6 +533,19 @@ pub fn load_config(
     now: OffsetDateTime,
 ) -> Result<LoadedConfig, Vec<ConfigError>> {
     load_config_for_schema(master_path, SCHEMA_VERSION_V1, now)
+}
+
+/// Load the current schema and project its non-rule fields for callers that
+/// have not yet adopted [`LoadedConfigV5`] directly.
+///
+/// The returned `custom_lists` store is intentionally empty: schema-5 pack
+/// rules must be compiled through the bounded operator-rule compiler, never
+/// through the historical simple-list parser.
+pub fn load_current_config(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    load_config_for_schema(master_path, TARGET_SCHEMA_VERSION_V5, now)
 }
 
 /// [`load_config`] with an explicit required schema version.
@@ -557,11 +585,148 @@ pub fn load_config_collect(
         Ok(guard) => guard,
         Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
     };
-    let mut warns = AuditWarnings::emitting();
-    let result = load_config_inner(guard.tree_io(), SCHEMA_VERSION_V1, now, None, &mut warns);
+    let mut warns = AuditWarnings::silent();
+    let result = load_config_inner(
+        guard.tree_io(),
+        SCHEMA_VERSION_V1,
+        now,
+        None,
+        None,
+        &mut warns,
+    );
     match result {
         Ok(loaded) => (Ok(loaded), warns.into_messages()),
         Err(errs) => (Err(errs), Vec::new()),
+    }
+}
+
+/// Current-schema equivalent of [`load_config_collect`].
+pub fn load_current_config_collect(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> (Result<LoadedConfig, Vec<ConfigError>>, Vec<String>) {
+    let guard = match write_lock::acquire_for_read(master_path) {
+        Ok(guard) => guard,
+        Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
+    };
+    let mut warns = AuditWarnings::silent();
+    let result = load_config_inner(
+        guard.tree_io(),
+        TARGET_SCHEMA_VERSION_V5,
+        now,
+        None,
+        None,
+        &mut warns,
+    );
+    match result {
+        Ok(loaded) => (Ok(loaded), warns.into_messages()),
+        Err(errs) => (Err(errs), Vec::new()),
+    }
+}
+
+/// Current-schema load for a lifecycle owner that must report audit warnings.
+///
+/// Ordinary reads stay quiet. Daemon boot owns this explicit emitting path
+/// because it runs after tracing is installed.
+pub(crate) fn load_current_config_emitting_collect(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> (Result<LoadedConfig, Vec<ConfigError>>, Vec<String>) {
+    let guard = match write_lock::acquire_for_read(master_path) {
+        Ok(guard) => guard,
+        Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
+    };
+    let mut warns = AuditWarnings::emitting();
+    let result = load_config_inner(
+        guard.tree_io(),
+        TARGET_SCHEMA_VERSION_V5,
+        now,
+        None,
+        None,
+        &mut warns,
+    );
+    match result {
+        Ok(loaded) => (Ok(loaded), warns.into_messages()),
+        Err(errs) => (Err(errs), Vec::new()),
+    }
+}
+
+/// Current-schema lint load that also proves the complete rule candidate compiles.
+pub fn load_current_config_executable_collect(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> (Result<LoadedConfig, Vec<ConfigError>>, Vec<String>) {
+    let guard = match write_lock::acquire_for_read(master_path) {
+        Ok(guard) => guard,
+        Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
+    };
+    if let Err(err) = migration_journal::refuse_normal_access(guard.tree_io()) {
+        return (Err(lock_errors(master_path, err)), Vec::new());
+    }
+    let mut warns = AuditWarnings::silent();
+    let result = load_config_v5_executable_inner(guard.tree_io(), now, None, None, &mut warns)
+        .and_then(project_loaded_v5);
+    match result {
+        Ok(loaded) => (Ok(loaded), warns.into_messages()),
+        Err(errors) => (Err(errors), Vec::new()),
+    }
+}
+
+/// Load the current schema-5 runtime configuration and every declared Custom
+/// List body as one validated snapshot.
+pub fn load_config_v5(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> Result<LoadedConfigV5, Vec<ConfigError>> {
+    let guard =
+        write_lock::acquire_for_read(master_path).map_err(|err| lock_errors(master_path, err))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_v5_inner(
+        guard.tree_io(),
+        now,
+        None,
+        None,
+        &mut AuditWarnings::silent(),
+        true,
+    )
+}
+
+/// Load and compile a complete schema-5 candidate under one offline admission.
+pub fn load_config_v5_executable(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> Result<LoadedConfigV5, Vec<ConfigError>> {
+    let guard =
+        write_lock::acquire_for_read(master_path).map_err(|err| lock_errors(master_path, err))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_v5_executable_inner(
+        guard.tree_io(),
+        now,
+        None,
+        None,
+        &mut AuditWarnings::silent(),
+    )
+}
+
+/// Schema-5 runtime load with operator-facing warnings returned as data.
+pub fn load_config_v5_collect(
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> (Result<LoadedConfigV5, Vec<ConfigError>>, Vec<String>) {
+    let guard = match write_lock::acquire_for_read(master_path) {
+        Ok(guard) => guard,
+        Err(err) => return (Err(lock_errors(master_path, err)), Vec::new()),
+    };
+    if let Err(err) = migration_journal::refuse_normal_access(guard.tree_io()) {
+        return (Err(lock_errors(master_path, err)), Vec::new());
+    }
+    let mut warns = AuditWarnings::silent();
+    let result = load_config_v5_inner(guard.tree_io(), now, None, None, &mut warns, true);
+    match result {
+        Ok(loaded) => (Ok(loaded), warns.into_messages()),
+        Err(errors) => (Err(errors), Vec::new()),
     }
 }
 
@@ -604,7 +769,8 @@ pub fn load_config_with_overlay_for_schema(
         expected_schema,
         now,
         overlay,
-        &mut AuditWarnings::emitting(),
+        None,
+        &mut AuditWarnings::silent(),
     )
 }
 
@@ -615,8 +781,43 @@ pub(crate) enum EditorGuardedLoadFailure {
     Operational(anyhow::Error),
 }
 
+/// Failure classes preserved for policy services which hold a pinned tree
+/// guard.  Ordinary loader callers retain their historical `Vec<ConfigError>`
+/// interface; this seam prevents those diagnostics from erasing an admission,
+/// path-safety, budget, or identity failure before the service can select its
+/// public error code.
+#[derive(Debug)]
+pub(crate) enum GuardedLoadFailure {
+    Diagnostics(Vec<ConfigError>),
+    UnsafePath(anyhow::Error),
+    BudgetExceeded(anyhow::Error),
+    TreeChanged(anyhow::Error),
+    RecoveryRequired(anyhow::Error),
+    Storage(anyhow::Error),
+}
+
+#[derive(Clone, Copy)]
+enum GuardedLoadKind {
+    UnsafePath,
+    BudgetExceeded,
+    TreeChanged,
+    Storage,
+}
+
+impl GuardedLoadKind {
+    const fn priority(self) -> u8 {
+        match self {
+            Self::TreeChanged => 4,
+            Self::UnsafePath => 3,
+            Self::BudgetExceeded => 2,
+            Self::Storage => 1,
+        }
+    }
+}
+
 thread_local! {
     static EDITOR_LOAD_PROVENANCE: RefCell<Option<Cell<bool>>> = const { RefCell::new(None) };
+    static GUARDED_LOAD_PROVENANCE: RefCell<Option<Cell<Option<GuardedLoadKind>>>> = const { RefCell::new(None) };
 }
 
 struct EditorLoadProvenance(Option<bool>);
@@ -637,12 +838,63 @@ fn editor_load_provenance() -> EditorLoadProvenance {
 }
 
 fn mark_editor_identity_failure(err: &anyhow::Error) {
+    let operational_io = err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|source| source.kind() != std::io::ErrorKind::NotFound);
     if err.downcast_ref::<MasterIdentityChanged>().is_some() {
-        EDITOR_LOAD_PROVENANCE.with(|slot| {
-            if let Some(marker) = slot.borrow().as_ref() {
-                marker.set(true);
+        mark_editor_operational_failure();
+        mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
+    } else if operational_io {
+        mark_editor_operational_failure();
+        mark_guarded_load_failure(GuardedLoadKind::Storage);
+    }
+}
+
+fn mark_editor_operational_failure() {
+    EDITOR_LOAD_PROVENANCE.with(|slot| {
+        if let Some(marker) = slot.borrow().as_ref() {
+            marker.set(true);
+        }
+    });
+}
+
+fn mark_guarded_load_failure(kind: GuardedLoadKind) {
+    GUARDED_LOAD_PROVENANCE.with(|slot| {
+        if let Some(marker) = slot.borrow().as_ref() {
+            let replace = marker
+                .get()
+                .is_none_or(|existing| kind.priority() > existing.priority());
+            if replace {
+                marker.set(Some(kind));
             }
-        });
+        }
+    });
+}
+
+fn mark_editor_pack_failure(error: &crate::config::custom_list::PackReadError) {
+    use crate::config::custom_list::PackReadError;
+    if matches!(
+        error,
+        PackReadError::Permission { .. }
+            | PackReadError::Symlink { .. }
+            | PackReadError::HardLink { .. }
+            | PackReadError::Io { .. }
+    ) {
+        mark_editor_operational_failure();
+    }
+    match error {
+        PackReadError::Symlink { .. } | PackReadError::HardLink { .. } => {
+            mark_guarded_load_failure(GuardedLoadKind::UnsafePath);
+        }
+        PackReadError::TooLarge { .. }
+        | PackReadError::AggregateTooLarge { .. }
+        | PackReadError::TooManyMembers { .. } => {
+            mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
+        }
+        PackReadError::Permission { .. } | PackReadError::Io { .. } => {
+            mark_guarded_load_failure(GuardedLoadKind::Storage);
+        }
+        PackReadError::Missing { .. } | PackReadError::NotUtf8 { .. } => {}
     }
 }
 
@@ -673,6 +925,66 @@ fn with_editor_load_provenance<T>(
     }
 }
 
+struct GuardedLoadProvenance(Option<Option<GuardedLoadKind>>);
+
+impl Drop for GuardedLoadProvenance {
+    fn drop(&mut self) {
+        GUARDED_LOAD_PROVENANCE.with(|slot| {
+            *slot.borrow_mut() = self.0.take().map(Cell::new);
+        });
+    }
+}
+
+fn guarded_load_provenance() -> GuardedLoadProvenance {
+    let previous =
+        GUARDED_LOAD_PROVENANCE.with(|slot| slot.borrow_mut().take().map(|marker| marker.get()));
+    GUARDED_LOAD_PROVENANCE.with(|slot| *slot.borrow_mut() = Some(Cell::new(None)));
+    GuardedLoadProvenance(previous)
+}
+
+fn guarded_load_message(errors: &[ConfigError]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "guarded config load failed: {}",
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn with_guarded_load_provenance<T>(
+    load: impl FnOnce() -> Result<T, Vec<ConfigError>>,
+) -> Result<T, GuardedLoadFailure> {
+    let _scope = guarded_load_provenance();
+    match load() {
+        Ok(value) => Ok(value),
+        Err(errors) => {
+            let message = guarded_load_message(&errors);
+            match GUARDED_LOAD_PROVENANCE.with(|slot| slot.borrow().as_ref().and_then(|m| m.get()))
+            {
+                Some(GuardedLoadKind::UnsafePath) => Err(GuardedLoadFailure::UnsafePath(message)),
+                Some(GuardedLoadKind::BudgetExceeded) => {
+                    Err(GuardedLoadFailure::BudgetExceeded(message))
+                }
+                Some(GuardedLoadKind::TreeChanged) => Err(GuardedLoadFailure::TreeChanged(message)),
+                Some(GuardedLoadKind::Storage) => Err(GuardedLoadFailure::Storage(message)),
+                None => Err(GuardedLoadFailure::Diagnostics(errors)),
+            }
+        }
+    }
+}
+
+fn guarded_load_guard_error(error: anyhow::Error) -> GuardedLoadFailure {
+    if error.downcast_ref::<FenceRefusal>().is_some() {
+        GuardedLoadFailure::RecoveryRequired(error)
+    } else if error.downcast_ref::<MasterIdentityChanged>().is_some() {
+        GuardedLoadFailure::TreeChanged(error)
+    } else {
+        GuardedLoadFailure::Storage(error)
+    }
+}
+
 #[allow(dead_code, reason = "guarded read-modify-write API")]
 pub(crate) fn load_config_for_schema_under_guard(
     guard: &ConfigWriteLock,
@@ -683,24 +995,48 @@ pub(crate) fn load_config_for_schema_under_guard(
     load_config_with_overlay_for_schema_under_guard(guard, master_path, expected_schema, now, None)
 }
 
-pub(crate) fn load_config_for_schema_under_editor_guard(
+pub(crate) fn load_config_v5_executable_under_editor_guard(
     guard: &ConfigWriteLock,
     master_path: &Path,
-    expected_schema: u32,
     now: OffsetDateTime,
-) -> Result<LoadedConfig, EditorGuardedLoadFailure> {
+) -> Result<LoadedConfigV5, EditorGuardedLoadFailure> {
     guard
         .verify_master(master_path)
         .map_err(EditorGuardedLoadFailure::Operational)?;
     migration_journal::refuse_normal_access(guard.tree_io())
         .map_err(EditorGuardedLoadFailure::Operational)?;
     with_editor_load_provenance(|| {
-        load_config_inner(
+        load_config_v5_executable_inner(
             guard.tree_io(),
-            expected_schema,
             now,
             None,
-            &mut AuditWarnings::emitting(),
+            None,
+            &mut AuditWarnings::silent(),
+        )
+    })
+}
+
+/// Load a live schema-5 policy for restore while keeping invalid or absent
+/// policy files distinct from operational tree failures.
+pub(crate) fn load_config_v5_for_repair_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+) -> Result<LoadedConfigV5, EditorGuardedLoadFailure> {
+    guard
+        .verify_root_linked()
+        .map_err(EditorGuardedLoadFailure::Operational)?;
+    guard
+        .verify_master(master_path)
+        .map_err(EditorGuardedLoadFailure::Operational)?;
+    with_editor_load_provenance(|| {
+        load_config_v5_inner(
+            guard.tree_io(),
+            now,
+            None,
+            None,
+            &mut AuditWarnings::silent(),
+            true,
         )
     })
 }
@@ -722,7 +1058,29 @@ pub(crate) fn load_config_with_overlay_for_schema_under_guard(
         expected_schema,
         now,
         overlay,
-        &mut AuditWarnings::emitting(),
+        None,
+        &mut AuditWarnings::silent(),
+    )
+}
+
+/// Validate and compile the staged current-schema tree before promotion.
+pub(crate) fn load_config_v5_executable_with_overlay_under_guard(
+    guard: &ConfigWriteLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+) -> Result<LoadedConfigV5, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|err| lock_errors(master_path, err))?;
+    load_config_v5_executable_inner(
+        guard.tree_io(),
+        now,
+        overlay,
+        None,
+        &mut AuditWarnings::silent(),
     )
 }
 
@@ -748,7 +1106,8 @@ pub(crate) fn load_config_for_schema_under_read_guard(
         expected_schema,
         now,
         None,
-        &mut AuditWarnings::emitting(),
+        None,
+        &mut AuditWarnings::silent(),
     )
 }
 
@@ -773,8 +1132,83 @@ pub(crate) fn load_config_with_overlay_for_schema_under_read_guard(
         expected_schema,
         now,
         overlay,
-        &mut AuditWarnings::emitting(),
+        None,
+        &mut AuditWarnings::silent(),
     )
+}
+
+/// Validate a complete TOML and pack candidate without releasing its shared lock.
+pub(crate) fn load_config_with_policy_overlays_under_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    migration_journal::refuse_normal_access(guard.tree_io())
+        .map_err(|e| lock_errors(master_path, e))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        pack_overlay,
+        &mut AuditWarnings::silent(),
+    )
+}
+
+/// Load a complete current schema-5 policy through an already-held shared
+/// guard, preserving loader failure classes for the policy service.
+pub(crate) fn load_config_v5_with_policy_overlays_under_service_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfigV5, GuardedLoadFailure> {
+    guard
+        .verify_master(master_path)
+        .map_err(guarded_load_guard_error)?;
+    migration_journal::refuse_normal_access(guard.tree_io()).map_err(guarded_load_guard_error)?;
+    with_guarded_load_provenance(|| {
+        load_config_v5_inner(
+            guard.tree_io(),
+            now,
+            overlay,
+            pack_overlay,
+            &mut AuditWarnings::silent(),
+            true,
+        )
+    })
+}
+
+/// Service-read load for the lifecycle owner that must publish validator audit
+/// warnings. Other service reads deliberately use the quiet sibling above.
+pub(crate) fn load_config_v5_with_policy_overlays_emitting_under_service_read_guard(
+    guard: &ConfigReadLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfigV5, GuardedLoadFailure> {
+    guard
+        .verify_master(master_path)
+        .map_err(guarded_load_guard_error)?;
+    migration_journal::refuse_normal_access(guard.tree_io()).map_err(guarded_load_guard_error)?;
+    with_guarded_load_provenance(|| {
+        load_config_v5_inner(
+            guard.tree_io(),
+            now,
+            overlay,
+            pack_overlay,
+            &mut AuditWarnings::emitting(),
+            true,
+        )
+    })
 }
 
 /// Return the loaded document whose declared include would select an exact
@@ -966,12 +1400,273 @@ pub(crate) fn load_config_with_overlay_for_schema_under_migration_guard(
         expected_schema,
         now,
         overlay,
-        &mut AuditWarnings::emitting(),
+        None,
+        &mut AuditWarnings::silent(),
     )
+}
+
+/// Validate staged TOML and Custom List pack bytes as one candidate while an
+/// exclusive transaction guard is held.
+///
+/// Pack bodies are deliberately separate from [`LoaderOverlay`]: they are
+/// policy inputs derived from declarations, never TOML include members.
+pub(crate) fn load_config_with_policy_overlays_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    load_config_inner(
+        guard.tree_io(),
+        expected_schema,
+        now,
+        overlay,
+        pack_overlay,
+        &mut AuditWarnings::silent(),
+    )
+}
+
+/// Load a complete current schema-5 policy while an exclusive transaction
+/// guard is held, retaining typed admission failures for the service layer.
+pub(crate) fn load_config_v5_with_policy_overlays_under_service_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfigV5, GuardedLoadFailure> {
+    guard
+        .verify_master(master_path)
+        .map_err(guarded_load_guard_error)?;
+    with_guarded_load_provenance(|| {
+        load_config_v5_inner(
+            guard.tree_io(),
+            now,
+            overlay,
+            pack_overlay,
+            &mut AuditWarnings::silent(),
+            true,
+        )
+    })
+}
+
+/// Validate and compile an offline transaction candidate before promotion.
+pub(crate) fn load_config_v5_executable_with_policy_overlays_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedConfigV5, GuardedLoadFailure> {
+    guard
+        .verify_master(master_path)
+        .map_err(guarded_load_guard_error)?;
+    with_guarded_load_provenance(|| {
+        load_config_v5_executable_inner(
+            guard.tree_io(),
+            now,
+            overlay,
+            pack_overlay,
+            &mut AuditWarnings::silent(),
+        )
+    })
+}
+
+/// Decode a schema-5 policy candidate through the same descriptor-guarded
+/// include and overlay merger used by runtime loads. Semantic validation and
+/// rule compilation stay with the schema-5 transaction caller.
+pub(crate) fn load_merged_v5_with_policy_overlays_under_migration_guard(
+    guard: &MigrationWriteLock,
+    master_path: &Path,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+) -> Result<LoadedV5Candidate, Vec<ConfigError>> {
+    guard
+        .verify_master(master_path)
+        .map_err(|e| tree_errors(master_path, e))?;
+    load_config_v5_inner(
+        guard.tree_io(),
+        now,
+        overlay,
+        pack_overlay,
+        &mut AuditWarnings::silent(),
+        false,
+    )
+}
+
+fn load_config_v5_inner(
+    tree: TreeIo<'_>,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+    warns: &mut AuditWarnings,
+    validate_semantics: bool,
+) -> Result<LoadedConfigV5, Vec<ConfigError>> {
+    let (master_path, ctx) = load_merged_ctx(tree, now, overlay, warns)?;
+    let config: ConfigV5 = toml::Value::Table(ctx.merged.clone())
+        .try_into()
+        .map_err(|error: toml::de::Error| vec![classify_merged_error(error, &ctx.provenance)])?;
+    if config.schema_version != TARGET_SCHEMA_VERSION_V5 {
+        return Err(vec![ConfigError::VersionMismatch(
+            ErrorContext::new(format!(
+                "schema_version = {} but this candidate requires {}",
+                config.schema_version, TARGET_SCHEMA_VERSION_V5
+            ))
+            .with_file(master_path),
+        )]);
+    }
+    let limits =
+        crate::filter::operator_rules::RuleCompileLimits::try_from(&config.custom_list_limits)
+            .map_err(|error| {
+                vec![ConfigError::ValidationFailed(
+                    ErrorContext::new(format!("schema-5 custom-list limits are invalid: {error}"))
+                        .with_entity("custom_list_limits"),
+                )]
+            })?;
+    let max_file_bytes = u64::try_from(limits.max_file_bytes).map_err(|_| {
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new("schema-5 custom-list max_file_bytes is not representable")
+                .with_entity("custom_list_limits"),
+        )]
+    })?;
+    let max_total_bytes = u64::try_from(limits.max_total_bytes).map_err(|_| {
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new("schema-5 custom-list max_total_bytes is not representable")
+                .with_entity("custom_list_limits"),
+        )]
+    })?;
+    crate::config::custom_list::validate_flat_pack_tree_under_tree_with_overlay(
+        tree,
+        pack_overlay,
+    )
+    .map_err(|error| {
+        mark_editor_operational_failure();
+        mark_guarded_load_failure(if error.member_limit_exceeded().is_some() {
+            GuardedLoadKind::BudgetExceeded
+        } else {
+            GuardedLoadKind::UnsafePath
+        });
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new(error.to_string())
+                .with_entity("custom_lists".to_string())
+                .with_suggestion(
+                    "replace links/special entries with plain files and move nested content out of packs/",
+                ),
+        )]
+    })?;
+    let pack_bodies = crate::config::custom_list::read_pack_bodies_under_tree(
+        tree,
+        &config.custom_lists,
+        max_file_bytes,
+        limits.max_lists,
+        max_total_bytes,
+        pack_overlay,
+    )
+    .map_err(|failures| {
+        for (_, error) in &failures {
+            mark_editor_pack_failure(error);
+        }
+        failures
+            .into_iter()
+            .map(|(id, error)| {
+                ConfigError::ValidationFailed(
+                    ErrorContext::new(format!("custom list \"{id}\": {error}"))
+                        .with_entity(format!("custom_lists.{id}"))
+                        .with_suggestion(error.remedy()),
+                )
+            })
+            .collect::<Vec<_>>()
+    })?;
+
+    let pack_bodies = crate::config::target_v5::PackBodiesV5::new(pack_bodies);
+    if validate_semantics {
+        let secrets = crate::config::secrets::load_secrets_under_tree(tree).ok();
+        if let Err(error) = crate::config::target_v5::validate_v5_collect_with_bodies(
+            &config,
+            &pack_bodies,
+            now,
+            warns,
+            secrets.as_ref(),
+        ) {
+            return match error {
+                crate::config::target_v5::TargetV5Error::Validation(errors) => Err(errors
+                    .into_iter()
+                    .map(|error| enrich_with_provenance(error, &ctx.provenance))
+                    .collect()),
+                error => Err(vec![ConfigError::ValidationFailed(
+                    ErrorContext::new(error.to_string())
+                        .with_entity("custom_list_limits")
+                        .with_suggestion(
+                            "adjust the schema-5 policy and Custom List limits, then retry",
+                        ),
+                )]),
+            };
+        }
+    }
+
+    Ok(LoadedConfigV5 {
+        config,
+        master_path,
+        files_loaded: ctx.files_loaded,
+        total_bytes: ctx.total_bytes,
+        provenance: ctx.provenance,
+        pack_bodies,
+    })
+}
+
+fn load_config_v5_executable_inner(
+    tree: TreeIo<'_>,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+    warns: &mut AuditWarnings,
+) -> Result<LoadedConfigV5, Vec<ConfigError>> {
+    let loaded = load_config_v5_inner(tree, now, overlay, pack_overlay, warns, false)?;
+    let secrets = crate::config::secrets::load_secrets_under_tree(tree).ok();
+    crate::config::target_v5::validate_and_compile_v5_one_shot(
+        &loaded.config,
+        &loaded.pack_bodies,
+        now,
+        warns,
+        secrets.as_ref(),
+    )
+    .map(drop)
+    .map_err(|error| target_v5_errors(error, &loaded.provenance))?;
+    Ok(loaded)
+}
+
+fn target_v5_errors(
+    error: crate::config::target_v5::TargetV5Error,
+    provenance: &ProvenanceMap,
+) -> Vec<ConfigError> {
+    match error {
+        crate::config::target_v5::TargetV5Error::Validation(errors) => errors
+            .into_iter()
+            .map(|error| enrich_with_provenance(error, provenance))
+            .collect(),
+        error => vec![ConfigError::ValidationFailed(
+            ErrorContext::new(error.to_string())
+                .with_entity("custom_lists")
+                .with_suggestion("fix the schema-5 operator rules or compiled limits, then retry"),
+        )],
+    }
 }
 
 fn tree_errors(path: &Path, err: anyhow::Error) -> Vec<ConfigError> {
     mark_editor_identity_failure(&err);
+    if let Some(source) = err.downcast_ref::<std::io::Error>() {
+        if matches!(source.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+            mark_guarded_load_failure(GuardedLoadKind::UnsafePath);
+        } else {
+            mark_guarded_load_failure(GuardedLoadKind::Storage);
+        }
+    }
     let ctx = ErrorContext::new(format!("{err:#}")).with_file(path.to_path_buf());
     if err.downcast_ref::<std::io::Error>().is_some() {
         vec![ConfigError::Parse(ctx)]
@@ -998,19 +1693,16 @@ fn lock_errors(master: &Path, err: anyhow::Error) -> Vec<ConfigError> {
 
 /// Shared body of [`load_config_with_overlay`] and [`load_config_collect`].
 ///
-/// `warns` collects the validator's audit WARNs. Every production caller
-/// passes an [`AuditWarnings::emitting`] collector and discards it, so
-/// journald behaviour is exactly what it was before the collector existed.
-fn load_config_inner(
-    tree: TreeIo<'_>,
-    expected_schema: u32,
+/// `warns` collects the validator's audit WARNs. Ordinary readers pass a
+/// silent collector; lifecycle owners opt into structured tracing explicitly.
+fn load_merged_ctx<'g, 'o>(
+    tree: TreeIo<'g>,
     now: OffsetDateTime,
-    overlay: Option<&LoaderOverlay>,
+    overlay: Option<&'o LoaderOverlay>,
     warns: &mut AuditWarnings,
-) -> Result<LoadedConfig, Vec<ConfigError>> {
+) -> Result<(PathBuf, LoadCtx<'g, 'o>), Vec<ConfigError>> {
     let canonical_master = tree.identity.canonical_master.clone();
     let overlay = overlay.map(|ov| ov.bind(tree)).transpose()?;
-
     let mut ctx = LoadCtx {
         tree,
         master_schema_version: None,
@@ -1024,19 +1716,10 @@ fn load_config_inner(
         deprecations: Vec::new(),
         overlay,
     };
-
-    // Master file is loaded first; its directory is the config root.
     let master = tree
         .resolve_key(&tree.master_key())
         .map_err(|e| tree_errors(&canonical_master, e))?;
     load_file(master, &mut ctx, 0, now)?;
-
-    // Overlay extra members: brand-new include slices a validating writer is
-    // creating. Load each as if a glob had matched it (depth 1) so the merged
-    // validation sees the post-rename file set. A non-empty list also forces
-    // the multi-file merge path below (a new member means the tree is no
-    // longer single-file). With `None` / empty this loop never runs, so the
-    // fast-path decision and everything downstream stay byte-identical.
     let extras = ctx
         .overlay
         .as_ref()
@@ -1048,7 +1731,6 @@ fn load_config_inner(
             .map_err(|e| tree_errors(&tree.display(&key), e))?;
         load_file(entry, &mut ctx, 1, now)?;
     }
-
     #[cfg(test)]
     write_lock::test_event(write_lock::TestEvent::OverlayResolved);
     if let Some(overlay) = &ctx.overlay {
@@ -1063,19 +1745,25 @@ fn load_config_inner(
             }
         }
     }
-
-    // config-lint-blind-to-loader-deprecations: hand the key-deprecation
-    // notices to the caller's collector.
-    //
-    // Placed HERE, above the single-file fast-path branch, deliberately: it is
-    // the one point both exits pass through. Draining inside the multi-file
-    // arm would test green on a multi-file fixture and do nothing on the
-    // shipped layout, which is single-file — the same asymmetry that made
-    // `s1-followup-load-from-str-collect` a real defect rather than a
-    // cosmetic one.
     for msg in std::mem::take(&mut ctx.deprecations) {
         warns.push(msg);
     }
+    Ok((canonical_master, ctx))
+}
+
+fn load_config_inner(
+    tree: TreeIo<'_>,
+    expected_schema: u32,
+    now: OffsetDateTime,
+    overlay: Option<&LoaderOverlay>,
+    pack_overlay: Option<&crate::config::custom_list::PackOverlay>,
+    warns: &mut AuditWarnings,
+) -> Result<LoadedConfig, Vec<ConfigError>> {
+    if expected_schema == TARGET_SCHEMA_VERSION_V5 {
+        return load_config_v5_inner(tree, now, overlay, pack_overlay, warns, true)
+            .and_then(project_loaded_v5);
+    }
+    let (canonical_master, mut ctx) = load_merged_ctx(tree, now, overlay, warns)?;
 
     // Resolve `secrets.toml` here so the validator can cross-check
     // `auth_token_ref` against the names that actually exist. Loaded here,
@@ -1133,7 +1821,7 @@ fn load_config_inner(
         // The `auth_token_ref` cross-check is preserved: it rides
         // on the `secrets` argument above, which the single pass now carries.
         // That check fires on the shipped single-file layout or on nobody.
-        let custom_lists = build_custom_list_store(tree, &config)?;
+        let custom_lists = build_custom_list_store(tree, &config, pack_overlay)?;
         return Ok(LoadedConfig {
             config,
             master_path: canonical_master,
@@ -1163,7 +1851,7 @@ fn load_config_inner(
     );
     match verdict {
         Ok(()) => {
-            let custom_lists = build_custom_list_store(tree, &config)?;
+            let custom_lists = build_custom_list_store(tree, &config, pack_overlay)?;
             Ok(LoadedConfig {
                 config,
                 master_path: canonical_master,
@@ -1180,6 +1868,24 @@ fn load_config_inner(
     }
 }
 
+fn project_loaded_v5(loaded: LoadedConfigV5) -> Result<LoadedConfig, Vec<ConfigError>> {
+    let config = loaded.config.validation_projection().map_err(|error| {
+        vec![ConfigError::ValidationFailed(
+            ErrorContext::new(error.to_string())
+                .with_entity("custom_list_limits")
+                .with_suggestion("adjust the schema-5 Custom List limits, then retry"),
+        )]
+    })?;
+    Ok(LoadedConfig {
+        config,
+        master_path: loaded.master_path,
+        files_loaded: loaded.files_loaded,
+        total_bytes: loaded.total_bytes,
+        provenance: loaded.provenance,
+        custom_lists: crate::config::custom_list::CustomListStore::new(),
+    })
+}
+
 /// Read the pack files once per load, against the master's own parent.
 ///
 /// `root` is the one fence the whole include graph is confined to, so a
@@ -1194,13 +1900,39 @@ fn load_config_inner(
 fn build_custom_list_store(
     tree: TreeIo<'_>,
     config: &ConfigV1,
+    overlay: Option<&crate::config::custom_list::PackOverlay>,
 ) -> Result<crate::config::custom_list::CustomListStore, Vec<ConfigError>> {
+    crate::config::custom_list::validate_flat_pack_tree_under_tree_with_overlay(tree, overlay)
+        .map_err(|error| {
+            mark_editor_operational_failure();
+            // The scanner records a member-limit refusal separately from
+            // path-shape violations, so this preserves the distinction
+            // without parsing display text.
+            mark_guarded_load_failure(
+                if error.member_limit_exceeded().is_some() {
+                    GuardedLoadKind::BudgetExceeded
+                } else {
+                    GuardedLoadKind::UnsafePath
+                },
+            );
+            vec![ConfigError::ValidationFailed(
+                ErrorContext::new(error.to_string())
+                    .with_entity("custom_lists".to_string())
+                    .with_suggestion(
+                        "replace links/special entries with plain files and move nested content out of packs/",
+                    ),
+            )]
+        })?;
     crate::config::custom_list::build_store_under_tree(
         tree,
         &config.custom_lists,
         config.custom_list_limits.max_file_bytes,
+        overlay,
     )
     .map_err(|failures| {
+        for (_, error) in &failures {
+            mark_editor_pack_failure(error);
+        }
         failures
             .into_iter()
             .map(|(id, e)| {
@@ -1255,10 +1987,10 @@ fn overlay_omits(
     let Some(expected) = overlay.and_then(|overlay| overlay.omissions.get(entry.key())) else {
         return Ok(false);
     };
-    anyhow::ensure!(
-        entry.destination()? == *expected,
-        "omitted overlay destination changed since its snapshot"
-    );
+    if entry.destination()? != *expected {
+        mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
+        anyhow::bail!("omitted overlay destination changed since its snapshot");
+    }
     Ok(true)
 }
 
@@ -1284,6 +2016,7 @@ fn load_file<'g>(
             .map_err(|e| tree_errors(canonical, e.into()))?
             != *expected
         {
+            mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
             return Err(tree_errors(
                 canonical,
                 anyhow::anyhow!("overlay destination changed since its snapshot"),
@@ -1341,6 +2074,7 @@ fn load_file<'g>(
         .map(|bytes| bytes.len() as u64)
         .unwrap_or_else(|| opened.as_ref().expect("unstaged file opened").1.len());
     if ctx.total_bytes.saturating_add(file_len) > MAX_TOTAL_BYTES {
+        mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
                 "aggregate include size would exceed {} bytes (>{} MB cap reading {}, which is {} bytes)",
@@ -1364,6 +2098,7 @@ fn load_file<'g>(
 
     ctx.total_bytes = ctx.total_bytes.saturating_add(src.len() as u64);
     if ctx.total_bytes > MAX_TOTAL_BYTES {
+        mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
                 "aggregate include size exceeded {} bytes (>{} MB cap after loading {})",
@@ -1377,6 +2112,7 @@ fn load_file<'g>(
 
     ctx.files_loaded.push(canonical.to_path_buf());
     if ctx.files_loaded.len() > MAX_INCLUDE_FILES {
+        mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
                 "include file count exceeded {} (hard cap {})",
@@ -1509,6 +2245,7 @@ fn load_file<'g>(
                 .resolve_key(&child_key)
                 .map_err(|e| tree_errors(&ctx.tree.display(&child_key), e))?;
             if child.key() != &child_key {
+                mark_guarded_load_failure(GuardedLoadKind::TreeChanged);
                 return Err(tree_errors(
                     child.display(),
                     anyhow::anyhow!("include reachability changed during resolution"),
@@ -1791,12 +2528,14 @@ fn track_include_member(
 ) -> anyhow::Result<()> {
     if out.insert(key.clone()) && !ctx.loaded.contains(&key) && !ctx.loading_stack.contains(&key) {
         *new_members += 1;
-        anyhow::ensure!(
-            ctx.files_loaded.len() + *new_members <= MAX_INCLUDE_FILES,
-            "include file count exceeded {} (hard cap {})",
-            ctx.files_loaded.len() + *new_members,
-            MAX_INCLUDE_FILES
-        );
+        if ctx.files_loaded.len() + *new_members > MAX_INCLUDE_FILES {
+            mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
+            anyhow::bail!(
+                "include file count exceeded {} (hard cap {})",
+                ctx.files_loaded.len() + *new_members,
+                MAX_INCLUDE_FILES
+            );
+        }
     }
     Ok(())
 }
@@ -1813,12 +2552,14 @@ fn read_open_config_to_string_capped(
         .take(cap.saturating_add(1))
         .read_to_string(&mut buf)
         .map_err(|io_err| {
+            mark_guarded_load_failure(GuardedLoadKind::Storage);
             vec![ConfigError::Parse(
                 ErrorContext::new(format!("cannot read config: {io_err}"))
                     .with_file(path.to_path_buf()),
             )]
         })?;
     if read as u64 > cap {
+        mark_guarded_load_failure(GuardedLoadKind::BudgetExceeded);
         return Err(vec![ConfigError::ValidationFailed(
             ErrorContext::new(format!(
                 "config file grew past the remaining {cap}-byte aggregate budget while loading (N11 TOCTOU guard)"

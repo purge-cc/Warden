@@ -157,7 +157,7 @@ pub const WELCOME_DESC: &str = "First launch — three things to set up";
 /// **Every `g <letter>` is derived from [`Leaf::mnemonic`], never typed.**
 /// A hint typed by hand is a hint that survives the binding it describes —
 /// which is exactly how `[5]` outlived the `5` key. The leaf-local keys
-/// (`B` and `a` on Lists, `e` on File) have no such table and are pinned by
+/// (`a` on Lists, `e` on File) have no such table and are pinned by
 /// test instead; see `welcome_copy_advertises_only_live_leaf_local_keys`.
 ///
 /// **State-independent by construction.** This runs before the config is
@@ -180,8 +180,8 @@ pub fn welcome_copy() -> String {
          $EDITOR to change it.\n\
          \n\
          2  Lists — until one is subscribed warden resolves normally and \
-         blocks nothing. {lists} (g {i}), then  B  to browse the purge.cc \
-         catalog or  a  to add one by URL.\n\
+         blocks nothing. {lists} (g {i}), then  a  to choose the purge.cc \
+         catalog or add one by URL.\n\
          \n\
          3  Point your clients here — warden sees no query until your \
          router's DHCP, or each machine, names this box as its DNS server. \
@@ -564,14 +564,14 @@ mod tests {
     /// the table is the operator-facing contract and `Leaf::Logs`'s own
     /// help block already declares the invariant that makes it meaningful
     /// ("every binding `handle_logs_key` answers to has a row here.
-    /// Non-negotiable"). The real pin for `a` and `B` drives the live
+    /// Non-negotiable"). The real pin for `a` drives the live
     /// handler and lives in `tui::mod`'s
     /// `welcome_banner_lists_keys_are_live_bindings`, because
     /// `handle_lists_key` is private, async, and needs a poller.
     #[test]
     fn welcome_copy_advertises_only_live_leaf_local_keys() {
         let copy = welcome_copy();
-        for (leaf, key) in [(Leaf::Lists, "B"), (Leaf::Lists, "a"), (Leaf::File, "e")] {
+        for (leaf, key) in [(Leaf::Lists, "a"), (Leaf::File, "e")] {
             assert!(
                 crate::tui::help::per_leaf_rows(leaf)
                     .iter()
@@ -842,17 +842,19 @@ mod tests {
         );
     }
 
-    /// Archetype C, not the hand-rolled block it used to be. The red `▌`
-    /// tick is `modal_form::title_band`'s first cell and nothing else in the
-    /// ecosystem draws it, so its presence is the cheap structural proof
-    /// that the shared chrome is what rendered.
+    /// The accepted shared modal chrome is a square frame with a paired
+    /// title/description treatment; the former title-band tick is retired.
     #[test]
     fn overlay_uses_the_ecosystem_title_band() {
         let banner = WelcomeBanner::not_ready("headline here", "detail here");
         let dump = render_to_lines(&banner).join("\n");
         assert!(
-            dump.contains('\u{258c}'),
-            "no title-band tick — the overlay is not Archetype C:\n{dump}"
+            dump.contains("┌────────────────"),
+            "square modal frame missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("DASHBOARD IS NOT READING YOUR CONFIGURATION"),
+            "title band missing:\n{dump}"
         );
     }
 

@@ -2,6 +2,8 @@ use super::*;
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData};
 use std::net::Ipv4Addr;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 impl CacheLookup {
     /// Extract a fresh entry.
@@ -56,6 +58,84 @@ fn test_record(ttl: u32) -> Record {
         ttl,
         RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
     )
+}
+
+#[tokio::test]
+async fn stale_upstream_generation_is_not_retained() {
+    let cache = DnsCache::new(&test_config());
+    let current = Arc::new(AtomicU64::new(2));
+    let stale = UpstreamGenerationStamp::new(
+        1,
+        current,
+        #[cfg(feature = "dnssec")]
+        None,
+    );
+
+    cache
+        .insert_with_upstream_generation(
+            "generation.example",
+            RecordType::A,
+            DNSClass::IN,
+            vec![test_record(300)],
+            ResponseCode::NoError,
+            None,
+            None,
+            Some(stale),
+        )
+        .await;
+
+    assert!(matches!(
+        cache
+            .lookup("generation.example", RecordType::A, DNSClass::IN, None)
+            .await,
+        CacheLookup::Miss
+    ));
+}
+
+#[tokio::test]
+async fn generation_change_during_singleflight_removes_completed_fill() {
+    let cache = DnsCache::new(&test_config());
+    let current = Arc::new(AtomicU64::new(1));
+    let stamp = UpstreamGenerationStamp::new(
+        1,
+        Arc::clone(&current),
+        #[cfg(feature = "dnssec")]
+        None,
+    );
+    let (key, prior) = cache
+        .lookup_keyed(
+            "singleflight-generation.example",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        )
+        .await;
+    assert!(matches!(prior, CacheLookup::Miss));
+
+    let entry = cache
+        .fetch_with_keyed_state(key, None, || async {
+            current.store(2, std::sync::atomic::Ordering::Release);
+            Ok((
+                vec![test_record(300)],
+                ResponseCode::NoError,
+                None,
+                Some(stamp),
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(entry.records().len(), 1, "original waiter keeps its answer");
+    assert!(matches!(
+        cache
+            .lookup(
+                "singleflight-generation.example",
+                RecordType::A,
+                DNSClass::IN,
+                None,
+            )
+            .await,
+        CacheLookup::Miss
+    ));
 }
 
 #[tokio::test]
@@ -1081,6 +1161,7 @@ fn needs_prefetch_false_at_50_percent_ttl() {
         response_code: ResponseCode::NoError,
         created_at: Instant::now() - Duration::from_secs(150), // 50% elapsed
         ttl: Duration::from_secs(300),
+        upstream_generation: None,
     };
     // 150s remaining out of 300s = 50% → threshold 0.1 → not near expiry
     assert!(!entry.needs_prefetch(0.1));
@@ -1093,6 +1174,7 @@ fn needs_prefetch_true_at_5_percent_ttl() {
         response_code: ResponseCode::NoError,
         created_at: Instant::now() - Duration::from_secs(285), // 95% elapsed
         ttl: Duration::from_secs(300),
+        upstream_generation: None,
     };
     // 15s remaining out of 300s = 5% → threshold 0.1 → near expiry
     assert!(entry.needs_prefetch(0.1));
@@ -1105,6 +1187,7 @@ fn needs_prefetch_false_when_expired() {
         response_code: ResponseCode::NoError,
         created_at: Instant::now() - Duration::from_secs(600), // way past TTL
         ttl: Duration::from_secs(300),
+        upstream_generation: None,
     };
     // Expired → remaining is zero → should NOT prefetch
     assert!(!entry.needs_prefetch(0.1));
@@ -1120,6 +1203,7 @@ fn needs_prefetch_false_for_nan_threshold() {
         response_code: ResponseCode::NoError,
         created_at: Instant::now() - Duration::from_secs(285),
         ttl: Duration::from_secs(300),
+        upstream_generation: None,
     };
     assert!(!entry.needs_prefetch(f64::NAN));
     assert!(!entry.needs_prefetch(f64::INFINITY));

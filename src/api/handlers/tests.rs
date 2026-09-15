@@ -6,7 +6,7 @@ use crate::filter::FilterEngine;
 use crate::tracking::StatsEngine;
 use axum::body::Body;
 use axum::http::Request;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use std::time::Instant;
 use tower::util::ServiceExt;
@@ -49,10 +49,13 @@ pub(crate) fn test_state_with_stats() -> Arc<ApiState> {
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     })
 }
 
@@ -85,10 +88,13 @@ pub(crate) fn test_state_with_rate_limit(limit: u32) -> (Arc<ApiState>, &'static
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
     (state, TOKEN)
 }
@@ -164,10 +170,13 @@ fn test_state_with_blocklists() -> Arc<ApiState> {
         list_statuses: Some(registry),
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     })
 }
 
@@ -194,10 +203,13 @@ fn test_state_no_blocklists() -> Arc<ApiState> {
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     })
 }
 
@@ -399,6 +411,32 @@ async fn api_status_names_a_refused_and_frozen_corpus() {
     assert_eq!(body["lists_cycle"]["outcome"], serde_json::json!("refused"));
 }
 
+#[tokio::test]
+async fn api_status_reads_the_current_upstream_generation() {
+    let mut state = test_state_with_stats();
+    let config = crate::config::settings::UpstreamConfig {
+        servers: vec!["127.0.0.1:5301".into(), "127.0.0.1:5302".into()],
+        ..Default::default()
+    };
+    let runtime = Arc::new(
+        crate::upstream::ReloadableUpstream::from_config(
+            &config,
+            &[],
+            &reqwest::Client::new(),
+            &crate::config::settings::DnssecConfig::default(),
+        )
+        .unwrap(),
+    );
+    let mutable = Arc::get_mut(&mut state).expect("unique API state");
+    mutable.upstream_mode = "stale-mode".into();
+    mutable.upstream_count = 99;
+    mutable.upstream = Some(runtime);
+
+    let body = read_body_json(get_status(State(state)).await.into_response()).await;
+    assert_eq!(body["upstream_mode"], serde_json::json!("plain"));
+    assert_eq!(body["upstream_count"], serde_json::json!(2));
+}
+
 /// The control arm for the pair above: a healthy daemon must publish the
 /// keys as `null`, not omit them. An absent key and a healthy one are
 /// indistinguishable to a consumer, which is how a scraper reads a
@@ -447,31 +485,46 @@ async fn api_and_metrics_use_completed_registry_domain_count() {
     );
 }
 
-/// §4.2 G1a — `GET /api/query/{domain}` carries block attribution.
-/// A default profile with `block_all` blocks every name via the
-/// admin layer → `blocked_by = "admin_block"` present in the JSON.
+/// `GET /api/query/{domain}` reports compiled Custom List attribution.
 #[tokio::test]
 async fn query_domain_reports_block_source() {
     use crate::config::schema::{ConfigV1, Id, Profile};
+    use crate::filter::operator_rules::{
+        CompileAdmission, CompiledOperatorRules, PackSource, ProfileMounts, RuleCompileLimits,
+    };
     use crate::profiles::ProfileResolver;
 
     let mut config = ConfigV1 {
-        schema_version: 4,
+        schema_version: crate::config::schema::TARGET_SCHEMA_VERSION_V5,
         ..Default::default()
     };
     config.profiles.insert(
         "strict".into(),
         Profile {
-            block_all: true,
             ..Default::default()
         },
     );
     config.server.default_profile = Some(Id::new("strict").unwrap());
-    let bit_map = crate::lists::source_key::SourceBitMap::default();
-    let profiles = Arc::new(ProfileResolver::build(
-        &config,
-        &bit_map,
-        &crate::config::custom_list::CustomListStore::new(),
+    let limits = RuleCompileLimits::default();
+    let admission = CompileAdmission::new(limits.max_compiled_bytes_total, 1).unwrap();
+    let compiled = Arc::new(
+        CompiledOperatorRules::compile(
+            &[PackSource {
+                list_id: "rules",
+                content: "blocked.example",
+            }],
+            &[ProfileMounts {
+                profile_id: "strict",
+                custom_lists: &["rules"],
+                block_all: false,
+            }],
+            limits,
+            &admission,
+        )
+        .unwrap(),
+    );
+    let profiles = Arc::new(ProfileResolver::build_with_operator_rules(
+        &config, compiled,
     ));
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel(1);
@@ -494,17 +547,20 @@ async fn query_domain_reports_block_source() {
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     let app = Router::new()
         .route("/api/query/{domain}", get(query_domain))
         .with_state(state);
     let req = Request::builder()
-        .uri("/api/query/anything.example")
+        .uri("/api/query/blocked.example")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -512,7 +568,25 @@ async fn query_domain_reports_block_source() {
 
     let body = read_body_json(resp).await;
     assert_eq!(body["blocked"], serde_json::json!(true));
-    assert_eq!(body["blocked_by"], serde_json::json!("admin_block"));
+    assert_eq!(body["blocked_by"], serde_json::json!("custom_list:rules"));
+}
+
+#[tokio::test]
+async fn query_domain_without_profiles_fails_closed() {
+    let state = test_state_with_stats();
+    let app = Router::new()
+        .route("/api/query/{domain}", get(query_domain))
+        .with_state(state);
+    let req = Request::builder()
+        .uri("/api/query/example.com")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = read_body_json(resp).await;
+    assert_eq!(body["blocked"], serde_json::json!(true));
+    assert!(body.get("blocked_by").is_none());
 }
 
 #[tokio::test]
@@ -591,10 +665,13 @@ async fn blocklist_stats_plan_aliases_return_the_canonical_response_identity() {
         list_statuses: Some(registry),
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     for alias in [
@@ -722,10 +799,13 @@ fn registry_with_overlapping_substrings() -> Arc<ApiState> {
         list_statuses: Some(registry),
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     })
 }
 
@@ -836,18 +916,6 @@ fn list_body_rejects_id_one_byte_over_cap() {
 }
 
 #[test]
-fn whitelist_body_rejects_domain_over_253() {
-    let domain = "a".repeat(254);
-    let body = serde_json::json!({ "domain": domain });
-    let err = expect_serde_err(serde_json::from_value::<WhitelistBody>(body));
-    let msg = err.to_string();
-    assert!(
-        msg.contains("'domain'") && msg.contains("254") && msg.contains("253"),
-        "expected field+sizes in error, got: {msg}"
-    );
-}
-
-#[test]
 fn logs_query_rejects_overlong_domain() {
     // The deserialize_with helper runs against any deserializer,
     // so a JSON-shaped value is sufficient to pin the cap. axum's
@@ -899,7 +967,7 @@ async fn add_list_returns_400_on_overlong_id_via_router() {
     // so the config write lock is never touched. Mirrors the M-42
     // security guarantee at the trust boundary, not just the unit
     // level.
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "m42-overlong-id");
     let state = test_state_with_config_path(path.clone());
     let app = Router::new()
@@ -943,12 +1011,10 @@ fn api_mutation_temp_config(content: &str, suffix: &str) -> std::path::PathBuf {
     path
 }
 
-/// §4.27-A: load the v1 config for post-mutation assertions.
-/// Replaces the pre-migration `Settings::from_file(&path)` checks —
-/// the API mutation handlers are now v1-native.
-fn load_v1(path: &std::path::Path) -> crate::config::schema::ConfigV1 {
-    crate::config::loader::load_config(path, time::OffsetDateTime::now_utc())
-        .expect("v1 config must load")
+/// Load the current schema configuration for post-mutation assertions.
+fn load_current_config(path: &std::path::Path) -> crate::config::schema::ConfigV1 {
+    crate::config::loader::load_current_config(path, time::OffsetDateTime::now_utc())
+        .expect("current config must load")
         .config
 }
 
@@ -990,10 +1056,13 @@ fn test_state_with_config_path_and_reload(
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     })
 }
 
@@ -1013,7 +1082,7 @@ async fn get_config_redacts_cluster_token_hash() {
     let api_hash = "a".repeat(64);
     let cluster_hash = "b".repeat(64);
     let initial = format!(
-        "schema_version = 4\n\n[api]\ntoken_hash = \"{api_hash}\"\n\n\
+        "schema_version = 5\n\n[api]\ntoken_hash = \"{api_hash}\"\n\n\
          [cluster]\ntoken_hash = \"{cluster_hash}\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n"
     );
     let path = api_mutation_temp_config(&initial, "a2-redaction");
@@ -1040,7 +1109,7 @@ async fn get_config_redacts_cluster_token_hash() {
 async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
     // Mirrors the IPC concurrency regression test
     // (`client_add_concurrent_calls_serialize_through_write_lock`).
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h15-concurrent");
     let state = test_state_with_config_path(path.clone());
 
@@ -1073,7 +1142,7 @@ async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
     assert_eq!(r1.status(), StatusCode::OK);
     assert_eq!(r2.status(), StatusCode::OK);
 
-    let config = load_v1(&path);
+    let config = load_current_config(&path);
     assert_eq!(
         config.lists.sources.len(),
         2,
@@ -1097,7 +1166,7 @@ async fn h_15_add_list_concurrent_calls_serialize_through_write_lock() {
 async fn list_edit_preconditions_preserve_disk_and_skip_reload() {
     let temp = tempfile::tempdir().unwrap();
     let master = temp.path().join("config.toml");
-    let initial = "# preserve this\nschema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[lists]\nsources = [\"privacy/ads\"]\n";
+    let initial = "# preserve this\nschema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[lists]\nsources = [\"privacy/ads\"]\n";
     std::fs::write(&master, initial).unwrap();
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
     let state = test_state_with_config_path_and_reload(master.clone(), reload_tx);
@@ -1158,7 +1227,7 @@ async fn list_edits_preserve_includes_in_a_multi_file_tree() {
     let master = root.join("config.toml");
     std::fs::write(
         &master,
-        "# master comment\nschema_version = 4\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "# master comment\nschema_version = 5\nincludes = [\"devices.d/*.toml\", \"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let device_before = (std::fs::read(&device).unwrap(), metadata_identity(&device));
@@ -1198,7 +1267,7 @@ async fn list_edits_preserve_includes_in_a_multi_file_tree() {
         ),
         profile_before
     );
-    assert!(load_v1(&master).lists.sources.is_empty());
+    assert!(load_current_config(&master).lists.sources.is_empty());
 }
 
 #[cfg(unix)]
@@ -1216,7 +1285,7 @@ async fn list_edits_follow_a_cross_directory_master_alias() {
     let master = real_root.join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\nincludes = [\"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\nincludes = [\"profiles.d/*.toml\"]\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let alias = alias_root.join("config.toml");
@@ -1239,7 +1308,7 @@ async fn list_edits_follow_a_cross_directory_master_alias() {
             .status(),
         StatusCode::OK
     );
-    assert!(load_v1(&master)
+    assert!(load_current_config(&master)
         .lists
         .sources
         .iter()
@@ -1268,16 +1337,20 @@ async fn list_edits_follow_a_cross_directory_master_alias() {
     );
     assert!(real_root.join(".warden-config.lock").exists());
     assert!(!alias_root.join(".warden-config.lock").exists());
-    assert!(load_v1(&alias).lists.sources.is_empty());
+    assert!(load_current_config(&alias).lists.sources.is_empty());
 }
 
 #[tokio::test]
 async fn list_edit_releases_mutation_mutex_before_reload_send() {
+    // Config edits perform durable writes; under the full parallel suite those
+    // writes can wait behind unrelated fsync-heavy tests. Keep the watchdog
+    // bounded while leaving the ordering assertions unchanged.
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let temp = tempfile::tempdir().unwrap();
     let master = temp.path().join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
@@ -1297,7 +1370,7 @@ async fn list_edit_releases_mutation_mutex_before_reload_send() {
         .into_response()
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         while !std::fs::read_to_string(&master).unwrap().contains(source_a) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1316,7 +1389,7 @@ async fn list_edit_releases_mutation_mutex_before_reload_send() {
         .await
         .into_response()
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         while !std::fs::read_to_string(&master).unwrap().contains(source_b) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1326,14 +1399,14 @@ async fn list_edit_releases_mutation_mutex_before_reload_send() {
 
     for _ in 0..2 {
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), reload_rx.recv())
+            tokio::time::timeout(TEST_TIMEOUT, reload_rx.recv())
                 .await
                 .expect("a blocked reload send must resume"),
             Some(None)
         );
     }
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), add_a)
+        tokio::time::timeout(TEST_TIMEOUT, add_a)
             .await
             .expect("first handler must complete")
             .unwrap()
@@ -1341,7 +1414,7 @@ async fn list_edit_releases_mutation_mutex_before_reload_send() {
         StatusCode::OK
     );
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(2), add_b)
+        tokio::time::timeout(TEST_TIMEOUT, add_b)
             .await
             .expect("second handler must complete")
             .unwrap()
@@ -1451,6 +1524,10 @@ async fn list_edit_coordinates_with_an_external_guarded_writer() {
         return;
     }
 
+    // This test starts a second test-process and performs several fsyncs. A
+    // parallel full-suite run can delay scheduling well beyond the normal
+    // millisecond-scale path, so use a bounded but load-tolerant watchdog.
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let temp = tempfile::tempdir().unwrap();
     let real_root = temp.path().join("real");
     let alias_root = temp.path().join("alias");
@@ -1459,7 +1536,7 @@ async fn list_edit_coordinates_with_an_external_guarded_writer() {
     let master = real_root.join("config.toml");
     std::fs::write(
         &master,
-        "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
     )
     .unwrap();
     let alias = alias_root.join("config.toml");
@@ -1478,10 +1555,8 @@ async fn list_edit_coordinates_with_an_external_guarded_writer() {
         .into_response()
     });
     tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            acquired.recv_timeout(std::time::Duration::from_secs(2))
-        }),
+        TEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || acquired.recv_timeout(TEST_TIMEOUT)),
     )
     .await
     .expect("API must acquire the filesystem lock")
@@ -1499,7 +1574,7 @@ async fn list_edit_coordinates_with_an_external_guarded_writer() {
             .spawn()
             .unwrap(),
     );
-    wait_for_test_marker(&contended_marker, std::time::Duration::from_secs(2)).await;
+    wait_for_test_marker(&contended_marker, TEST_TIMEOUT).await;
     assert!(
         writer.try_wait().unwrap().is_none(),
         "external writer bypassed the API lock"
@@ -1507,129 +1582,22 @@ async fn list_edit_coordinates_with_an_external_guarded_writer() {
 
     release.send(()).unwrap();
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), api)
+        tokio::time::timeout(TEST_TIMEOUT, api)
             .await
             .expect("API handler must complete")
             .unwrap()
             .status(),
         StatusCode::OK
     );
-    let status = wait_for_test_child(&mut writer, std::time::Duration::from_secs(3)).await;
+    let status = wait_for_test_child(&mut writer, TEST_TIMEOUT).await;
     assert!(status.success(), "external writer failed: {status}");
-    let config = load_v1(&master);
+    let config = load_current_config(&master);
     assert!(config
         .lists
         .sources
         .iter()
         .any(|item| item == "https://example.com/api.txt"));
     assert_eq!(config.lists.max_total_domains, 123456);
-}
-
-// ── T2.8 H-16: domain validation at the API trust boundary ────────
-//
-// The shared `config::schema::admin_rule::validate_domain` is
-// already exhaustively tested for individual rule semantics
-// (~20 unit tests in admin_rule.rs). These tests pin only the
-// **API-surface contract**: 400 status, plain-English body, and
-// that the validator is actually being called from the handler
-// (not bypassed) for each of the three call-sites.
-#[tokio::test]
-async fn h_16_add_whitelist_rejects_double_dot_with_400() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "h16-wl-double-dot");
-    let state = test_state_with_config_path(path.clone());
-
-    let resp = add_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: "bad..example.com".into(),
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = read_body_json(resp).await;
-    let msg = body["error"].as_str().unwrap();
-    assert!(
-        msg.contains("not a valid domain"),
-        "operator-facing 400 must say 'not a valid domain', got: {msg}"
-    );
-    assert!(
-        msg.contains("consecutive dots"),
-        "400 must explain the specific violation, got: {msg}"
-    );
-
-    // Rejected before the lock + before disk write — file unchanged.
-    let raw = std::fs::read_to_string(&path).unwrap();
-    assert!(!raw.contains("bad..example.com"));
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn h_16_add_whitelist_rejects_control_char_with_400() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "h16-wl-ctrl");
-    let state = test_state_with_config_path(path.clone());
-
-    // Newline in the body — log injection vector if accepted.
-    let resp = add_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: "evil.com\nINJECTED".into(),
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = read_body_json(resp).await;
-    let msg = body["error"].as_str().unwrap();
-    assert!(
-        msg.contains("control byte"),
-        "control-char 400 must name the violation, got: {msg}"
-    );
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn h_16_add_whitelist_rejects_oversize_label_with_400() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "h16-wl-oversize");
-    let state = test_state_with_config_path(path.clone());
-
-    // 64-octet label exceeds RFC 1035's 63-octet limit.
-    let oversize_label = "a".repeat(64);
-    let resp = add_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: format!("{oversize_label}.example.com"),
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn h_16_remove_whitelist_rejects_invalid_domain_with_400() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "h16-wl-rm-bad");
-    let state = test_state_with_config_path(path.clone());
-
-    let resp = remove_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: ".leading-dot.com".into(),
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    std::fs::remove_file(&path).ok();
 }
 
 #[tokio::test]
@@ -1656,10 +1624,13 @@ async fn h_16_query_domain_rejects_invalid_path_segment_with_400() {
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     let resp = query_domain(State(state), Path("bad..example.com".into()))
@@ -1669,72 +1640,17 @@ async fn h_16_query_domain_rejects_invalid_path_segment_with_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// The current-schema list endpoint remains a supported mutator.
 #[tokio::test]
-async fn h_16_add_whitelist_lowercases_canonical_form() {
-    // Validator returns the lowercased canonical form; the
-    // resulting `@@||...^` rule on disk must use it, regardless of
-    // how the operator capitalised the input. This makes the
-    // disk-side rule list deterministic for downstream filter
-    // engine matching.
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "h16-wl-lower");
-    let state = test_state_with_config_path(path.clone());
-
-    let resp = add_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: "Example.COM".into(),
-        }),
-    )
-    .await
-    .into_response();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // v1: the rule lands as an `[[admin_rules]]` row referenced by
-    // `profiles.default.admin_rules`. Reconstruct the allow-rule
-    // strings the same way `get_whitelist` does.
-    let config = load_v1(&path);
-    let profile = config
-        .profiles
-        .get("default")
-        .expect("default profile must exist");
-    let allow: Vec<&str> = profile
-        .admin_rules
-        .iter()
-        .filter_map(|rid| {
-            config
-                .admin_rules
-                .iter()
-                .find(|ar| ar.id.as_str() == rid.as_str())
-        })
-        .map(|ar| ar.rule.as_str())
-        .collect();
-    assert!(
-        allow.contains(&"@@||example.com^"),
-        "rule must use canonical lowercase, got: {allow:?}"
-    );
-    std::fs::remove_file(&path).ok();
-}
-
-// ── §4.27-A: the REST API now mutates v1 masters natively ─────────
-//
-// Pre-§4.27-A the API only spoke v0 `Settings`; a v1 master tripped
-// the writer's `guard_against_v1_master` and the handler returned
-// 409 with a "use the CLI instead" hint (the T2.8 H-19 behaviour).
-// The mutation path is v1-native now — these tests pin that the
-// endpoints succeed on a v1 master and the change lands in the v1
-// schema. (They are the inverted successors of the two
-// `h_19_*_on_v1_master_returns_409_with_cli_hint` tests.)
-#[tokio::test]
-async fn add_list_on_v1_master_succeeds() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "v1-add-list");
+async fn add_list_on_current_schema_master_succeeds() {
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let path = api_mutation_temp_config(initial, "v5-add-list");
     let state = test_state_with_config_path(path.clone());
 
     let resp = add_list(
         State(state),
         Json(ListBody {
-            id: "https://example.com/list-v1.txt".into(),
+            id: "https://example.com/list-v5.txt".into(),
         }),
     )
     .await
@@ -1742,54 +1658,16 @@ async fn add_list_on_v1_master_succeeds() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // The source landed in the v1 `[lists].sources` table.
-    let config = load_v1(&path);
+    // The source landed in the current `[lists].sources` table.
+    let config = load_current_config(&path);
     assert!(
         config
             .lists
             .sources
             .iter()
-            .any(|src| src == "https://example.com/list-v1.txt"),
-        "add_list must persist into the v1 [lists].sources, got: {:?}",
+            .any(|src| src == "https://example.com/list-v5.txt"),
+        "add_list must persist into the current [lists].sources, got: {:?}",
         config.lists.sources
-    );
-
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn add_whitelist_on_v1_master_succeeds() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "v1-add-wl");
-    let state = test_state_with_config_path(path.clone());
-
-    let resp = add_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: "example.com".into(),
-        }),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // The allow rule landed as an `[[admin_rules]]` row referenced
-    // by `profiles.default.admin_rules`.
-    let config = load_v1(&path);
-    let profile = config
-        .profiles
-        .get("default")
-        .expect("default profile must exist");
-    let has_rule = profile.admin_rules.iter().any(|rid| {
-        config
-            .admin_rules
-            .iter()
-            .any(|ar| ar.id.as_str() == rid.as_str() && ar.rule == "@@||example.com^")
-    });
-    assert!(
-        has_rule,
-        "add_whitelist must reference an @@||example.com^ admin rule from the default profile"
     );
 
     std::fs::remove_file(&path).ok();
@@ -1801,7 +1679,7 @@ async fn h_17_add_list_reload_channel_closed_returns_500_with_restart_hint() {
     // Drop the receiver immediately — the next `send().await` on
     // the sender returns `SendError`, simulating "daemon shutting
     // down" between the disk write and the reload notification.
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "h17-closed");
 
     let cache = DnsCache::new(&CacheConfig::default());
@@ -1827,10 +1705,13 @@ async fn h_17_add_list_reload_channel_closed_returns_500_with_restart_hint() {
         list_statuses: None,
         list_labels: Arc::new(vec![None; 64]),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         #[cfg(feature = "cluster")]
         cluster: None,
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     });
 
     let resp = add_list(
@@ -1866,7 +1747,7 @@ async fn h_17_add_list_reload_channel_closed_returns_500_with_restart_hint() {
     // Disk write still happened — the change is durable, only the
     // in-memory reload was lost. That is the worst-case fault model
     // H-17 makes visible.
-    let config = load_v1(&path);
+    let config = load_current_config(&path);
     assert_eq!(config.lists.sources.len(), 1);
     assert!(config
         .lists
@@ -1906,7 +1787,7 @@ async fn healthz_body_carries_only_the_liveness_contract() {
 /// write, leaving the config byte-identical.
 #[tokio::test]
 async fn add_list_refuses_a_url_the_fetcher_would_reject() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "addlist-bad-url");
     let before = std::fs::read(&path).expect("fixture readable");
     let state = test_state_with_config_path(path.clone());
@@ -1933,7 +1814,7 @@ async fn add_list_refuses_a_url_the_fetcher_would_reject() {
 /// not URLs — the guard must not swallow them.
 #[tokio::test]
 async fn add_list_still_accepts_a_catalogue_slug() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
     let path = api_mutation_temp_config(initial, "addlist-slug");
     let state = test_state_with_config_path(path.clone());
 
@@ -1947,164 +1828,12 @@ async fn add_list_still_accepts_a_catalogue_slug() {
     .into_response();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let config = load_v1(&path);
+    let config = load_current_config(&path);
     assert!(
         config.lists.sources.iter().any(|src| src == "privacy/ads"),
         "a catalogue slug must still persist, got: {:?}",
         config.lists.sources
     );
-    std::fs::remove_file(&path).ok();
-}
-
-/// Keeps whatever the `fmt` layer wrote, so a test can read the audit
-/// line the operator's log would have received.
-#[derive(Clone, Default)]
-struct AuditSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl AuditSink {
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("audit sink").clone()).expect("fmt output is utf8")
-    }
-}
-
-impl std::io::Write for AuditSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("audit sink").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditSink {
-    type Writer = AuditSink;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// A thread-local audit capture that survives running beside its
-/// siblings.
-///
-/// `tracing` caches each callsite's interest process-wide, and while
-/// only ONE dispatcher is registered that cache is computed against
-/// whichever thread happens to reach the callsite first. A parallel
-/// test that touches the same audit line first therefore caches
-/// `never`, after which this thread's subscriber is never consulted
-/// and the capture comes back empty — a failure with nothing to do
-/// with the code under test. Keeping a second dispatcher registered
-/// forces the full-list rebuild, which resolves the callsite the same
-/// way whichever thread asks.
-struct AuditCapture {
-    sink: AuditSink,
-    _forces_full_list_rebuild: tracing::Dispatch,
-    _default: tracing::subscriber::DefaultGuard,
-}
-
-impl AuditCapture {
-    fn arm() -> Self {
-        fn subscriber(sink: AuditSink) -> impl tracing::Subscriber + Send + Sync + 'static {
-            tracing_subscriber::fmt()
-                .with_writer(sink)
-                .with_ansi(false)
-                .finish()
-        }
-        let sink = AuditSink::default();
-        let second = tracing::Dispatch::new(subscriber(AuditSink::default()));
-        let default = tracing::subscriber::set_default(subscriber(sink.clone()));
-        Self {
-            sink,
-            _forces_full_list_rebuild: second,
-            _default: default,
-        }
-    }
-
-    fn text(&self) -> String {
-        self.sink.text()
-    }
-}
-
-/// Default (current-thread) runtime on purpose: the audit line is
-/// emitted after an `await` on `spawn_blocking`, and the subscriber
-/// is installed on *this* thread only. A multi-threaded runtime could
-/// resume the continuation on a worker that has no capture armed.
-#[tokio::test]
-async fn whitelist_mutations_audit_the_rule_that_reached_disk() {
-    let initial = "schema_version = 4\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
-    let path = api_mutation_temp_config(initial, "audit-canonical");
-    let state = test_state_with_config_path(path.clone());
-
-    let capture = AuditCapture::arm();
-    let resp = add_whitelist(
-        State(state.clone()),
-        Json(WhitelistBody {
-            domain: "@@||EVIL.COM^".into(),
-        }),
-    )
-    .await
-    .into_response();
-    let logged = capture.text();
-    drop(capture);
-    assert!(
-        !logged.is_empty(),
-        "nothing was captured at all — the harness lost the event, \
-         which is not a claim about the handler"
-    );
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = read_body_json(resp).await;
-    assert_eq!(
-        body["message"].as_str().unwrap(),
-        "whitelisted: evil.com",
-        "the response must name the rule that landed, not the raw input"
-    );
-
-    // What actually reached disk.
-    let config = load_v1(&path);
-    let profile = config
-        .profiles
-        .get("default")
-        .expect("default profile must exist");
-    assert!(
-        profile.admin_rules.iter().any(|rid| config
-            .admin_rules
-            .iter()
-            .any(|ar| ar.id.as_str() == rid.as_str() && ar.rule == "@@||evil.com^")),
-        "expected an @@||evil.com^ rule on disk"
-    );
-
-    assert!(
-        logged.contains("domain=evil.com"),
-        "audit must name the canonical rule, got: {logged}"
-    );
-    assert!(
-        logged.contains("submitted=@@||EVIL.COM^"),
-        "audit must keep the raw input traceable, got: {logged}"
-    );
-    assert!(
-        !logged.contains("domain=@@||EVIL.COM^"),
-        "audit must not report the pre-canonical input as the rule, got: {logged}"
-    );
-
-    let capture = AuditCapture::arm();
-    let resp = remove_whitelist(
-        State(state),
-        Json(WhitelistBody {
-            domain: "@@||Evil.Com^".into(),
-        }),
-    )
-    .await
-    .into_response();
-    let logged = capture.text();
-    drop(capture);
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = read_body_json(resp).await;
-    assert_eq!(body["message"].as_str().unwrap(), "removed: evil.com");
-    assert!(
-        logged.contains("domain=evil.com") && logged.contains("submitted=@@||Evil.Com^"),
-        "remove must audit the canonical rule too, got: {logged}"
-    );
-
     std::fs::remove_file(&path).ok();
 }
 
@@ -2249,4 +1978,68 @@ async fn new_path_has_no_deprecation_headers() {
     assert!(!resp.headers().contains_key("deprecation"));
     assert!(!resp.headers().contains_key("sunset"));
     assert!(!resp.headers().contains_key("link"));
+}
+
+#[tokio::test]
+async fn whitelist_endpoints_are_gone_and_never_touch_config() {
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let path = api_mutation_temp_config(initial, "retired-whitelist");
+    let before = std::fs::read(&path).unwrap();
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+    let state = test_state_with_config_path_and_reload(path.clone(), reload_tx);
+    let app = Router::new()
+        .route("/api/whitelist", get(get_whitelist))
+        .route("/api/whitelist/add", post(add_whitelist))
+        .route("/api/whitelist/remove", delete(remove_whitelist))
+        .with_state(state.clone());
+
+    let get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/whitelist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::GONE);
+    let body = read_body_json(get).await;
+    assert_eq!(body["error"], LEGACY_WHITELIST_RETIRED);
+
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/whitelist/add")
+                .header("content-type", "application/json")
+                .body(Body::from("{not-json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::GONE);
+
+    let remove = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/whitelist/remove")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), StatusCode::GONE);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reload_rx.recv())
+            .await
+            .is_err(),
+        "retired endpoints must not request a daemon reload"
+    );
+    drop(state);
+    std::fs::remove_file(&path).ok();
 }

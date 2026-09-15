@@ -15,19 +15,20 @@ use std::path::Path;
 
 /// Extract a `VmRSS:` / `VmSize:` style kilobyte value from a
 /// `/proc/self/status` blob. Returns `None` when the key is absent or
-/// the value column can't be parsed as a `u64`.
+/// the value column can't be parsed as a `u64`, or the unit is not `kB`.
 ///
 /// The line format is `<key>:<whitespace><value><whitespace>kB`. We
 /// match by exact `<key>:` prefix so a future `VmRSSPeak:` (or similar)
 /// can't get picked up by a naive substring match.
 pub fn parse_vm_kb(status_text: &str, key: &str) -> Option<u64> {
-    let prefix = format!("{key}:");
     for line in status_text.lines() {
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            return rest
-                .split_whitespace()
-                .next()
-                .and_then(|tok| tok.parse::<u64>().ok());
+        if let Some(rest) = line
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            let mut columns = rest.split_whitespace();
+            let value = columns.next()?.parse::<u64>().ok()?;
+            return (columns.next() == Some("kB") && columns.next().is_none()).then_some(value);
         }
     }
     None
@@ -172,5 +173,40 @@ Buffers:           45678 kB
     fn count_directory_entries_zero_for_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(count_directory_entries(dir.path()).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod optional_memory_tests {
+    use super::*;
+
+    #[test]
+    fn memory_parser_rejects_wrong_units_overflow_and_trailing_garbage() {
+        for line in [
+            "VmSwap: 1 MB",
+            "VmSwap: 1",
+            "VmSwap: 1 kB junk",
+            "VmSwap: -1 kB",
+            "VmSwap: 18446744073709551616 kB",
+        ] {
+            assert_eq!(parse_vm_kb(line, "VmSwap"), None, "{line}");
+        }
+        assert_eq!(
+            parse_vm_kb("VmSwap: 18446744073709551615 kB", "VmSwap"),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn optional_memory_distinguishes_zero_missing_and_malformed() {
+        let status = "VmRSS: 1024 kB\nVmSwap: 0 kB\nVmHWM: 4096 kB\n";
+        assert_eq!(parse_vm_kb(status, "VmSwap"), Some(0));
+        assert_eq!(parse_vm_kb(status, "VmHWM"), Some(4096));
+        assert_eq!(parse_vm_kb("VmRSS: 1024 kB\n", "VmSwap"), None);
+        assert_eq!(parse_vm_kb("VmSwap: unavailable kB\n", "VmSwap"), None);
+        let meminfo = "MemFree: 12 kB\nMemAvailable: 2048 kB\nMemTotal: 4096 kB\n";
+        assert_eq!(parse_vm_kb(meminfo, "MemAvailable"), Some(2048));
+        assert_eq!(parse_meminfo_total_kb(meminfo), Some(4096));
+        assert_eq!(parse_vm_kb("MemFree: 12 kB\n", "MemAvailable"), None);
     }
 }

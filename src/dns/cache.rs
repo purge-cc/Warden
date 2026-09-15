@@ -30,6 +30,7 @@ use moka::Expiry;
 
 use crate::config::settings::CacheConfig;
 use crate::dns::edns::EcsPrefix;
+use crate::upstream::UpstreamGenerationStamp;
 
 /// Cache key: lowercase domain + query type + DNS class + optional ECS
 /// prefix bucket.
@@ -55,6 +56,7 @@ pub(crate) type CacheKey = (CompactString, RecordType, DNSClass, Option<EcsPrefi
 pub struct CacheEntry {
     records: Arc<[Record]>,
     response_code: ResponseCode,
+    upstream_generation: Option<UpstreamGenerationStamp>,
     created_at: Instant,
     /// How long this entry is considered fresh.
     ttl: Duration,
@@ -100,6 +102,23 @@ impl CacheEntry {
 
     pub fn response_code(&self) -> ResponseCode {
         self.response_code
+    }
+
+    /// DNSSEC validator pinned to the upstream generation that produced this
+    /// entry, when DNSSEC was enabled for that generation.
+    #[cfg(feature = "dnssec")]
+    pub(crate) fn upstream_dnssec_validator(
+        &self,
+    ) -> Option<Arc<crate::dns::dnssec_validator::DnssecValidator>> {
+        self.upstream_generation
+            .as_ref()
+            .and_then(UpstreamGenerationStamp::dnssec_validator)
+    }
+
+    fn upstream_generation_is_current(&self) -> bool {
+        self.upstream_generation
+            .as_ref()
+            .is_none_or(UpstreamGenerationStamp::is_current)
     }
 
     /// True if this entry represents a negative response (NXDOMAIN or NODATA).
@@ -168,6 +187,7 @@ impl CacheEntry {
         Self {
             records: records.into(),
             response_code,
+            upstream_generation: None,
             created_at: Instant::now(),
             ttl: Duration::from_secs(300),
         }
@@ -430,8 +450,20 @@ impl DnsCache {
             .await;
         match prior {
             CacheLookup::Fresh(entry) => Ok(entry),
-            CacheLookup::Stale(entry) => self.fetch_with_keyed_state(key, Some(entry), fetch).await,
-            CacheLookup::Miss => self.fetch_with_keyed_state(key, None, fetch).await,
+            CacheLookup::Stale(entry) => {
+                self.fetch_with_keyed_state(key, Some(entry), || async {
+                    let (records, response_code, soa_minimum_ttl) = fetch().await?;
+                    Ok((records, response_code, soa_minimum_ttl, None))
+                })
+                .await
+            }
+            CacheLookup::Miss => {
+                self.fetch_with_keyed_state(key, None, || async {
+                    let (records, response_code, soa_minimum_ttl) = fetch().await?;
+                    Ok((records, response_code, soa_minimum_ttl, None))
+                })
+                .await
+            }
         }
     }
 
@@ -458,7 +490,15 @@ impl DnsCache {
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<
-            Output = Result<(Vec<Record>, ResponseCode, Option<u32>), super::error::DnsError>,
+            Output = Result<
+                (
+                    Vec<Record>,
+                    ResponseCode,
+                    Option<u32>,
+                    Option<UpstreamGenerationStamp>,
+                ),
+                super::error::DnsError,
+            >,
         >,
     {
         if stale_prior.is_some() {
@@ -479,7 +519,8 @@ impl DnsCache {
         let result = self
             .cache
             .try_get_with(key.clone(), async {
-                let (records, response_code, soa_minimum_ttl) = fetch().await?;
+                let (records, response_code, soa_minimum_ttl, upstream_generation) =
+                    fetch().await?;
 
                 // Defense in depth: even if a future caller forgets to
                 // return Err(Uncacheable) for a SERVFAIL/Refused response,
@@ -504,11 +545,23 @@ impl DnsCache {
                 Ok(CacheEntry {
                     records: Arc::from(records),
                     response_code,
+                    upstream_generation,
                     created_at: Instant::now(),
                     ttl,
                 }) as Result<CacheEntry, super::error::DnsError>
             })
             .await;
+
+        if result
+            .as_ref()
+            .is_ok_and(|entry| !entry.upstream_generation_is_current())
+        {
+            // A generation changed while this singleflight fetch was in
+            // flight. The original waiter may use its completed answer, but
+            // it must not remain cached for the answer TTL. Cache hits pay no
+            // generation load; this check runs only after an upstream fetch.
+            self.cache.invalidate(&key).await;
+        }
 
         match result {
             Ok(entry) => Ok(entry),
@@ -550,6 +603,33 @@ impl DnsCache {
         soa_minimum_ttl: Option<u32>,
         ecs_prefix: Option<EcsPrefix>,
     ) {
+        self.insert_with_upstream_generation(
+            domain,
+            record_type,
+            dns_class,
+            records,
+            response_code,
+            soa_minimum_ttl,
+            ecs_prefix,
+            None,
+        )
+        .await;
+    }
+
+    /// Cache an answer together with the reloadable upstream generation that
+    /// produced it. Used by background refresh paths that bypass singleflight.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn insert_with_upstream_generation(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+        dns_class: DNSClass,
+        records: Vec<Record>,
+        response_code: ResponseCode,
+        soa_minimum_ttl: Option<u32>,
+        ecs_prefix: Option<EcsPrefix>,
+        upstream_generation: Option<UpstreamGenerationStamp>,
+    ) {
         if matches!(
             response_code,
             ResponseCode::ServFail | ResponseCode::Refused
@@ -573,6 +653,7 @@ impl DnsCache {
         let entry = CacheEntry {
             records: Arc::from(records),
             response_code,
+            upstream_generation,
             created_at: Instant::now(),
             ttl,
         };
@@ -583,7 +664,15 @@ impl DnsCache {
             dns_class,
             ecs_prefix,
         );
-        self.cache.insert(key, entry).await;
+        self.cache.insert(key.clone(), entry).await;
+        if self
+            .cache
+            .get(&key)
+            .await
+            .is_some_and(|entry| !entry.upstream_generation_is_current())
+        {
+            self.cache.invalidate(&key).await;
+        }
     }
 
     /// Compute TTL: min of all record TTLs, clamped to [min_ttl, max_ttl].

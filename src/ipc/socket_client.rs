@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use super::auth_token::{load_token, NO_TOKEN_FILE_MSG};
-use super::protocol::{CommandTier, IpcCommand, IpcResponse};
+use super::protocol::{CommandTier, IpcCommand, IpcResponse, OPERATOR_RULES_MAX_BYTES};
 
 /// Deadline applied to every phase of an IPC exchange — connect, write,
 /// read. One constant so [`send_command`]'s documented bound cannot drift
@@ -21,6 +21,8 @@ pub const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// read-side margin for serialisation and socket scheduling while retaining
 /// the normal short connect/write budget.
 pub const FORCE_LIST_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60 + 15);
+/// Terminal operator-rule apply may queue behind other bounded jobs.
+pub const OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60 + 15);
 
 #[derive(Clone, Copy)]
 struct CommandTimeouts {
@@ -40,6 +42,34 @@ const FORCE_LIST_REFRESH_TIMEOUTS: CommandTimeouts = CommandTimeouts {
     write: IPC_TIMEOUT,
     read: FORCE_LIST_REFRESH_RESPONSE_TIMEOUT,
 };
+
+const OPERATOR_RULES_APPLY_TIMEOUTS: CommandTimeouts = CommandTimeouts {
+    connect: IPC_TIMEOUT,
+    write: IPC_TIMEOUT,
+    read: OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT,
+};
+
+#[cfg(feature = "cluster")]
+const NODES_LIFECYCLE_TIMEOUTS: CommandTimeouts = CommandTimeouts {
+    connect: IPC_TIMEOUT,
+    write: IPC_TIMEOUT,
+    read: Duration::from_secs(45 * 60),
+};
+
+fn is_local_node_lifecycle(command: &IpcCommand) -> bool {
+    #[cfg(feature = "cluster")]
+    if matches!(
+        command,
+        IpcCommand::NodesPreview { .. }
+            | IpcCommand::NodesApply { .. }
+            | IpcCommand::NodesCancel { .. }
+            | IpcCommand::NodeControl { .. }
+    ) {
+        return true;
+    }
+    let _ = command;
+    false
+}
 
 /// Write one JSON command line and close the write half, under `deadline`.
 ///
@@ -70,18 +100,34 @@ where
 ///   (`/var/lib/purge-warden/token`) and attached before serialization.
 ///   If no token file is present, the call fails up-front with a plain-
 ///   English error telling the operator to run `warden token generate`
-///   — the command is never sent in that state.
+///   — the command is never sent in that state. Node lifecycle commands may
+///   authenticate through the daemon's local socket ownership check instead.
 /// - `ReadOnly` commands are sent as-is. No token lookup happens, so
 ///   `warden status` works even on a fresh install with no token.
 /// - Ordinary commands apply [`IPC_TIMEOUT`] independently to connect,
-///   write, and read. `ForceListRefresh` keeps the short connect/write
-///   limits but uses [`FORCE_LIST_REFRESH_RESPONSE_TIMEOUT`] for its one
-///   completion response.
+///   write, and read. `ForceListRefresh` and `OperatorRulesApply` keep the
+///   short connect/write limits but extend the read while waiting for their
+///   terminal response.
 pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::Result<IpcResponse> {
-    let timeouts = if matches!(command, IpcCommand::ForceListRefresh { .. }) {
-        FORCE_LIST_REFRESH_TIMEOUTS
-    } else {
-        ORDINARY_COMMAND_TIMEOUTS
+    let timeouts = match command {
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodesPreview { .. }
+        | IpcCommand::NodesApply { .. }
+        | IpcCommand::NodesCancel { .. } => NODES_LIFECYCLE_TIMEOUTS,
+        #[cfg(feature = "cluster")]
+        IpcCommand::NodeControl { request, .. }
+            if !matches!(
+                request,
+                crate::cluster::node_control::NodeControlCommand::Status
+            ) =>
+        {
+            NODES_LIFECYCLE_TIMEOUTS
+        }
+        IpcCommand::ForceListRefresh { .. } => FORCE_LIST_REFRESH_TIMEOUTS,
+        IpcCommand::OperatorRulesApply { .. } | IpcCommand::OperatorRulesReplay { .. } => {
+            OPERATOR_RULES_APPLY_TIMEOUTS
+        }
+        _ => ORDINARY_COMMAND_TIMEOUTS,
     };
     send_command_with_timeouts(socket_path, command, timeouts).await
 }
@@ -99,6 +145,7 @@ async fn send_command_with_timeouts(
 
     let command = match command.tier() {
         CommandTier::ReadOnly => command,
+        CommandTier::Admin if is_local_node_lifecycle(&command) => command,
         CommandTier::Mutating | CommandTier::Admin if command.token().is_some() => {
             // Caller already attached a token explicitly — do not override.
             // `warden token regenerate` relies on this: it must authenticate
@@ -122,15 +169,22 @@ async fn send_command_with_timeouts(
         }
     };
 
+    // Serialize and enforce the complete post-auth envelope before opening a
+    // socket. An oversized request must be rejected locally even when no
+    // daemon is reachable.
+    let mut cmd_json = serde_json::to_string(&command)?;
+    if command.is_operator_rules() && cmd_json.len() > OPERATOR_RULES_MAX_BYTES {
+        anyhow::bail!(
+            "operator-rules request exceeds the 60 KiB IPC limit; use REST for larger atomic batches"
+        );
+    }
+    cmd_json.push('\n');
+
     let stream = tokio::time::timeout(timeouts.connect, UnixStream::connect(socket_path))
         .await
         .map_err(|_| anyhow::anyhow!("connection timeout"))??;
 
     let (reader, mut writer) = stream.into_split();
-
-    // Send command as JSON line
-    let mut cmd_json = serde_json::to_string(&command)?;
-    cmd_json.push('\n');
     write_command_line(&mut writer, &cmd_json, timeouts.write).await?;
 
     // Read response line
@@ -143,8 +197,26 @@ async fn send_command_with_timeouts(
     if line.is_empty() {
         anyhow::bail!("daemon closed connection without response");
     }
+    if command.is_operator_rules()
+        && line.trim_end_matches(['\r', '\n']).len() > OPERATOR_RULES_MAX_BYTES
+    {
+        anyhow::bail!("operator-rules response exceeds the 60 KiB IPC limit");
+    }
 
     let response: IpcResponse = serde_json::from_str(line.trim())?;
+    if matches!(&command, IpcCommand::QueryLogs { client_ips, .. } if !client_ips.is_empty())
+        && matches!(
+            &response,
+            IpcResponse::QueryLogs {
+                client_ips_applied: false,
+                ..
+            }
+        )
+    {
+        anyhow::bail!(
+            "The daemon did not confirm exact client filtering; upgrade the daemon and retry."
+        );
+    }
     Ok(response)
 }
 
@@ -167,6 +239,65 @@ mod tests {
     use crate::ipc::socket_server::{spawn_ipc_server, DaemonState};
     use std::sync::Arc;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn exact_clients_require_acknowledgement_on_the_query_response_itself() {
+        for (selected, ack, accepted) in [
+            (true, None, false),
+            (true, Some(false), false),
+            (true, Some(true), true),
+            (false, None, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("query.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let mut wire = serde_json::json!({"type": "query_logs", "entries": [],
+                "logging_enabled": true, "file_state": "Ok"});
+            if let Some(ack) = ack {
+                wire["client_ips_applied"] = serde_json::json!(ack);
+            }
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut line = String::new();
+                BufReader::new(&mut stream)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let request: IpcCommand = serde_json::from_str(&line).unwrap();
+                assert!(matches!(request, IpcCommand::QueryLogs { .. }));
+                stream
+                    .write_all(format!("{wire}\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let cmd = IpcCommand::QueryLogs {
+                limit: 10,
+                client: None,
+                client_ips: if selected {
+                    vec!["10.0.0.1".into()]
+                } else {
+                    vec![]
+                },
+                blocked_only: false,
+                domain: None,
+                since_secs: None,
+                cursor: None,
+                advanced: None,
+                token: Some("test-token".into()),
+            };
+            let result = send_command(&path, &cmd).await;
+            if accepted {
+                assert!(matches!(result.unwrap(), IpcResponse::QueryLogs { .. }));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("did not confirm exact client filtering"));
+            }
+            server.await.unwrap();
+        }
+    }
 
     /// The write half must honour the same deadline connect and read do.
     ///
@@ -217,6 +348,17 @@ mod tests {
             FORCE_LIST_REFRESH_RESPONSE_TIMEOUT
         );
         assert!(FORCE_LIST_REFRESH_RESPONSE_TIMEOUT > Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn operator_rules_apply_keeps_short_io_setup_and_waits_for_terminal_receipt() {
+        assert_eq!(OPERATOR_RULES_APPLY_TIMEOUTS.connect, IPC_TIMEOUT);
+        assert_eq!(OPERATOR_RULES_APPLY_TIMEOUTS.write, IPC_TIMEOUT);
+        assert_eq!(
+            OPERATOR_RULES_APPLY_TIMEOUTS.read,
+            OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT
+        );
+        assert!(OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT > IPC_TIMEOUT);
     }
 
     #[tokio::test]
@@ -325,8 +467,11 @@ mod tests {
                 blocked_by,
             } => {
                 assert_eq!(domain, "example.com");
-                assert!(!blocked);
-                assert!(blocked_by.is_none(), "allowed domain carries no source");
+                assert!(blocked, "a missing resolver must fail closed");
+                assert!(
+                    blocked_by.is_none(),
+                    "a missing resolver has no policy attribution"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -377,6 +522,7 @@ mod tests {
             upstream_mode: "plain".into(),
             upstream_count: 2,
             upstream_servers: Vec::new(),
+            upstream_runtime: None,
             list_count: 0,
             started_at: Instant::now(),
             shutdown_tx: None,
@@ -397,8 +543,11 @@ mod tests {
             )),
             daemon_uid: crate::ipc::socket_server::current_euid(),
             resource_budget_store: crate::resource_budget::types::new_store(),
+            operator_rule_jobs: None,
             #[cfg(feature = "cluster")]
             cluster_observe: None,
+            #[cfg(feature = "cluster")]
+            node_controller: None,
         }
     }
 }

@@ -19,16 +19,19 @@
 use purge_warden::ipc::errors::{
     ipc_error, IpcError, IPC_ERROR_COMMAND_TOO_LARGE, IPC_ERROR_CONCURRENT_EDIT,
     IPC_ERROR_CONFIG_READ_FAILED, IPC_ERROR_CONFIG_SAVED_RELOAD_CLOSED,
-    IPC_ERROR_CONFIG_WRITE_FAILED, IPC_ERROR_DEVICE_NOT_FOUND, IPC_ERROR_DUPLICATE_DEVICE_IP,
-    IPC_ERROR_DUPLICATE_DEVICE_NAME, IPC_ERROR_DUPLICATE_PROFILE_ID, IPC_ERROR_INTERNAL,
-    IPC_ERROR_INVALID_ARGUMENT, IPC_ERROR_INVALID_COMMAND, IPC_ERROR_INVALID_PROFILE_ID,
-    IPC_ERROR_LIST_MANAGER_CHANNEL_CLOSED, IPC_ERROR_LIST_MANAGER_NOT_RUNNING,
-    IPC_ERROR_LIST_MANAGER_NO_ACK, IPC_ERROR_LIST_MANAGER_UNAVAILABLE,
-    IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED, IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT,
-    IPC_ERROR_LIST_REFRESH_BUSY, IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED,
-    IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT, IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT,
-    IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE, IPC_ERROR_NO_ARP_MAC_FOR_IP, IPC_ERROR_NO_CONFIG_PATH,
-    IPC_ERROR_NO_PROFILES_RESOLVER_PROMOTE, IPC_ERROR_NO_PROFILE_RESOLVER,
+    IPC_ERROR_CONFIG_WRITE_FAILED, IPC_ERROR_CUSTOM_LISTS_MIXED_PROFILE_PATCH,
+    IPC_ERROR_CUSTOM_LIST_MOUNT_NOT_COMMITTED, IPC_ERROR_CUSTOM_LIST_MOUNT_UPDATE_FAILED,
+    IPC_ERROR_DEVICE_NOT_FOUND, IPC_ERROR_DUPLICATE_DEVICE_IP, IPC_ERROR_DUPLICATE_DEVICE_NAME,
+    IPC_ERROR_DUPLICATE_PROFILE_ID, IPC_ERROR_INTERNAL, IPC_ERROR_INVALID_ARGUMENT,
+    IPC_ERROR_INVALID_COMMAND, IPC_ERROR_INVALID_PROFILE_ID,
+    IPC_ERROR_LEGACY_PROFILE_RULES_RETIRED, IPC_ERROR_LIST_MANAGER_CHANNEL_CLOSED,
+    IPC_ERROR_LIST_MANAGER_NOT_RUNNING, IPC_ERROR_LIST_MANAGER_NO_ACK,
+    IPC_ERROR_LIST_MANAGER_UNAVAILABLE, IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED,
+    IPC_ERROR_LIST_REFRESH_ACCEPTANCE_TIMEOUT, IPC_ERROR_LIST_REFRESH_BUSY,
+    IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED, IPC_ERROR_LIST_REFRESH_COMPLETION_TIMEOUT,
+    IPC_ERROR_LIST_REFRESH_ENQUEUE_TIMEOUT, IPC_ERROR_LOG_MODE_RATE_OUT_OF_RANGE,
+    IPC_ERROR_NO_ARP_MAC_FOR_IP, IPC_ERROR_NO_CONFIG_PATH, IPC_ERROR_NO_PROFILES_RESOLVER_PROMOTE,
+    IPC_ERROR_NO_PROFILE_RESOLVER, IPC_ERROR_OPERATOR_RULES_UNAVAILABLE,
     IPC_ERROR_PROFILE_NOT_FOUND, IPC_ERROR_RELOAD_CHANNEL_CLOSED, IPC_ERROR_RELOAD_NOT_AVAILABLE,
     IPC_ERROR_RETENTION_OUT_OF_RANGE, IPC_ERROR_SHUTDOWN_CHANNEL_CLOSED,
     IPC_ERROR_SHUTDOWN_NOT_AVAILABLE, IPC_ERROR_STAGE_FAILED, IPC_ERROR_TARGET_READ_FAILED,
@@ -45,6 +48,20 @@ use purge_warden::ipc::protocol::IpcResponse;
 // `git grep` for the literal turns up this file as the place the
 // change must be reviewed.
 // ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn node_lifecycle_errors_are_frozen_and_do_not_claim_rollback() {
+    for (kind, expected) in [
+        (IpcError::PolicyOwnedByPrimary, "policy is managed by the primary; edit it on that node"),
+        (IpcError::NodeDepartureUnconfirmed, "node departure requires a verified active policy and list corpus; wait for activation"),
+        (IpcError::NodePreviewFailed, "could not prepare the node change; check Nodes status and the daemon log before retrying or cancelling a pending preview"),
+        (IpcError::NodeApplyFailed, "node change could not be confirmed; check Nodes status and the daemon log before retrying. Saved changes may require recovery or restart"),
+        (IpcError::NodeCancelFailed, "node cancellation could not be confirmed; check Nodes status and the daemon log before trying again"),
+        (IpcError::NodeStatusUnavailable, "node observation is unavailable or stale; see the daemon log for details"),
+    ] {
+        assert_eq!(kind.operator_message(), expected);
+    }
+}
 
 #[test]
 fn ipc_error_command_too_large_is_frozen() {
@@ -285,6 +302,38 @@ fn ipc_error_internal_is_frozen() {
 }
 
 #[test]
+fn ipc_error_custom_list_mount_variants_are_frozen() {
+    assert_eq!(
+        IPC_ERROR_CUSTOM_LISTS_MIXED_PROFILE_PATCH,
+        "custom_lists cannot be mixed with legacy profile fields; submit a separate atomic mount/unmount request"
+    );
+    assert_eq!(
+        IPC_ERROR_LEGACY_PROFILE_RULES_RETIRED,
+        "Legacy allow/deny rules and device overlays are retired. Create a Custom List and mount it on the target profile instead."
+    );
+    assert_eq!(
+        IPC_ERROR_OPERATOR_RULES_UNAVAILABLE,
+        "operator-rules service is unavailable"
+    );
+    assert_eq!(
+        IPC_ERROR_CUSTOM_LIST_MOUNT_UPDATE_FAILED,
+        "custom-list mount update failed"
+    );
+    assert_eq!(
+        IPC_ERROR_CUSTOM_LIST_MOUNT_NOT_COMMITTED,
+        "custom-list mount update did not commit (operation_id={operation_id}, persistence={persistence})"
+    );
+    assert_eq!(
+        IpcError::CustomListMountNotCommitted {
+            operation_id: "op-7".into(),
+            persistence: "aborted".into(),
+        }
+        .operator_message(),
+        "custom-list mount update did not commit (operation_id=op-7, persistence=aborted)"
+    );
+}
+
+#[test]
 fn ipc_error_config_saved_reload_closed_is_frozen() {
     assert_eq!(
         IPC_ERROR_CONFIG_SAVED_RELOAD_CLOSED,
@@ -516,6 +565,16 @@ fn ipc_error_wire_payload_carries_no_path() {
         IpcError::NoProfileResolver,
         IpcError::NoProfilesResolverPromote,
         IpcError::NoConfigPath,
+        IpcError::CustomListsMixedProfilePatch,
+        IpcError::LegacyProfileRulesRetired,
+        IpcError::OperatorRulesUnavailable,
+        IpcError::CustomListMountUpdateFailed,
+        IpcError::PolicyOwnedByPrimary,
+        IpcError::NodeDepartureUnconfirmed,
+        IpcError::NodePreviewFailed,
+        IpcError::NodeApplyFailed,
+        IpcError::NodeCancelFailed,
+        IpcError::NodeStatusUnavailable,
         IpcError::RetentionDaysOutOfRange,
         IpcError::LogModeRateOutOfRange,
         IpcError::ConfigReadFailed,

@@ -14,6 +14,9 @@ fn reserved_names_are_rejected_for_masters_and_members_after_alias_resolution() 
         ".warden-migration",
         ".warden-migration.cleanup-",
         ".warden-migration.cleanup-deadbeef",
+        ".warden-policy-transactions",
+        ".warden-policy-receipts",
+        ".warden-node-control",
         ".warden-write-",
         ".warden-write-stale",
     ]
@@ -509,6 +512,35 @@ fn root_created_lock_inherits_master_owner_and_rejects_existing_wrong_owner() {
     assert!(acquire_for_write(&master).is_err());
 }
 
+#[test]
+fn migration_guard_refuses_replacement_of_existing_or_new_roots_and_their_parents() {
+    for existing in [false, true] {
+        for replace_parent in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let parent = base.path().join("parent");
+            fs::create_dir(&parent).unwrap();
+            let root = parent.join("root");
+            if existing {
+                fs::create_dir(&root).unwrap();
+            }
+            let guard = acquire_for_migration(&root.join("config.toml")).unwrap();
+            guard.verify_root_linked().unwrap();
+            fs::rename(
+                if replace_parent { &parent } else { &root },
+                base.path().join("detached"),
+            )
+            .unwrap();
+            fs::create_dir_all(&root).unwrap();
+
+            assert!(guard.verify_root_linked().is_err());
+            assert_ne!(
+                inode(&guard.tree_io().root.metadata().unwrap()),
+                inode(&fs::metadata(&root).unwrap())
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_thread_runtime_can_acquire() {
     let dir = tempfile::tempdir().unwrap();
@@ -527,6 +559,8 @@ fn reserved_alias_spellings_cannot_bypass_the_namespace_policy() {
         ".warden-config.lock",
         ".warden-migration",
         ".warden-migration.cleanup-obsolete",
+        ".warden-policy-transactions",
+        ".warden-policy-receipts",
         ".warden-write-obsolete",
     ] {
         let dir = tempfile::tempdir().unwrap();

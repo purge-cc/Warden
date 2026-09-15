@@ -2,15 +2,14 @@ use super::*;
 use crate::config::schema::Group;
 
 /// Minimal config: two profiles, two devices, and a group carrying a
-/// populated `devices` list AND a populated `tags` array. Real
-/// `load_config` (not a hand-built `ConfigV1`) so the writers see the
-/// same TOML document shape they do in production.
+/// populated `devices` list. Real current-schema loading (not a hand-built
+/// `ConfigV1`) ensures the writers see the same document shape as production.
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let master = dir.path().join("config.toml");
     std::fs::write(
         &master,
-        r#"schema_version = 4
+        r#"schema_version = 5
 
 [upstream]
 servers = ["192.0.2.1:53"]
@@ -40,7 +39,6 @@ display_name = "Phones"
 profile = "home"
 priority = 7
 devices = ["phone-1", "phone-2"]
-tags = ["ads"]
 "#,
     )
     .unwrap();
@@ -78,7 +76,7 @@ fn raw_str_array(tbl: &toml::value::Table, key: &str) -> Vec<String> {
 }
 
 fn loaded_group(config_path: &std::path::Path, id: &str) -> Group {
-    crate::config::loader::load_config(config_path, time::OffsetDateTime::now_utc())
+    crate::config::loader::load_current_config(config_path, time::OffsetDateTime::now_utc())
         .unwrap()
         .config
         .groups
@@ -96,7 +94,7 @@ fn loaded_group(config_path: &std::path::Path, id: &str) -> Group {
 /// dashboard, which is the state the key first arrives in.
 fn app_on(config_path: &std::path::Path) -> App {
     App {
-        loaded_config: load_v1_config(config_path),
+        loaded_config: load_current_config(config_path),
         ..App::default()
     }
 }
@@ -114,8 +112,8 @@ fn snapshot_of(g: &Group) -> group_modal::OriginalSnapshot {
 // ── §9.1 (2): the round-trip that would have caught the
 //              `accept_unsigned_allow` bug ──────────────────────────
 
-/// **The DG5 gate for the TUI submit path.** Rename a group that
-/// carries both `devices` and `tags`, then read the file back and
+/// **The DG5 gate for the TUI submit path.** Rename a group with
+/// membership, then read the file back and
 /// assert nothing else moved.
 ///
 /// `groups.rs` already pins this for `add_inner`'s row builder. This
@@ -163,20 +161,6 @@ fn dg5_a_tui_rename_preserves_every_other_group_field_on_disk() {
         raw_str_array(&row, "devices"),
         vec!["phone-1".to_string(), "phone-2".to_string()],
         "membership is the group's entire substance and must survive a rename"
-    );
-    // **`plp-s5d`: this assertion is load-bearing, and more so than
-    // before.** It used to guard a second writer (`entity_tags`) that
-    // ran alongside the scalar batch. That writer is gone, and the
-    // modal no longer shows or carries `tags` at all — so this is now
-    // the proof that removing the picker did NOT quietly start
-    // stripping the operator's `tags` array from the file on every
-    // save. `set_fields_inner` writes only the fields it is handed, so
-    // an untouched key survives; that is the property, and this reads
-    // the FILE back to check it rather than trusting the writer.
-    assert_eq!(
-        raw_str_array(&row, "tags"),
-        vec!["ads".to_string()],
-        "a scalar-only save must leave the operator's tags array on disk untouched"
     );
     assert_eq!(row.get("profile").and_then(|v| v.as_str()), Some("home"));
     assert_eq!(row.get("priority").and_then(|v| v.as_integer()), Some(7));
@@ -296,7 +280,7 @@ fn groups_add_opens_on_an_empty_config() {
     let master = dir.path().join("config.toml");
     std::fs::write(
             &master,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n",
         )
         .unwrap();
@@ -330,7 +314,7 @@ fn groups_edit_and_delete_stay_inert_on_an_empty_config() {
     let master = dir.path().join("config.toml");
     std::fs::write(
             &master,
-            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
+            "schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[server]\ndefault_profile = \"home\"\n\n\
              [profiles.home]\ndisplay_name = \"Home\"\n",
         )
         .unwrap();

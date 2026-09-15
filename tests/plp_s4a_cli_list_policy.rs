@@ -27,7 +27,7 @@
 //! reached disk. Every write below goes through a real `socket_server`
 //! over a tempdir socket and is asserted against the re-parsed master, and
 //! the round-trip test then reads that same file back through
-//! `load_config` and the renderer — so the write half and the read half
+//! `load_current_config` and the renderer — so the write half and the read half
 //! are measured against one artefact rather than two mocks.
 
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ use purge_warden::cli::commands::profiles_v1::{
     parse_list_policy, ListPolicyRow, LIST_POLICY_DISABLED_NOTE, LIST_POLICY_INHERITED,
     LIST_POLICY_OVERRIDDEN, LIST_POLICY_TOKENS,
 };
-use purge_warden::config::loader::load_config;
+use purge_warden::config::loader::load_current_config;
 use purge_warden::config::schema::blocklist::ListPolicy;
 use purge_warden::dns::cache::DnsCache;
 use purge_warden::filter::FilterEngine;
@@ -66,7 +66,7 @@ use purge_warden::ipc::socket_server::{spawn_ipc_server, DaemonState};
 /// Upstream is RFC 5737 TEST-NET-1 and every list URL is first-party —
 /// warden ships no provider defaults and a fixture is not the place to
 /// introduce one.
-const MASTER_SEED: &str = r#"schema_version = 4
+const MASTER_SEED: &str = r#"schema_version = 5
 
 [server]
 default_profile = "default"
@@ -156,6 +156,7 @@ async fn spawn_fixture() -> Fixture {
         upstream_mode: "plain".into(),
         upstream_count: 0,
         upstream_servers: Vec::new(),
+        upstream_runtime: None,
         list_count: 0,
         started_at: Instant::now(),
         shutdown_tx: None,
@@ -163,6 +164,7 @@ async fn spawn_fixture() -> Fixture {
         api_token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(Some(token_hash))),
         config_path: Some(master.clone()),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        operator_rule_jobs: None,
         list_statuses: None,
         list_state: None,
         local_records_hits: None,
@@ -178,6 +180,8 @@ async fn spawn_fixture() -> Fixture {
         resource_budget_store: purge_warden::resource_budget::types::new_store(),
         #[cfg(feature = "cluster")]
         cluster_observe: None,
+        #[cfg(feature = "cluster")]
+        node_controller: None,
     };
 
     let handle = spawn_ipc_server(socket_path.clone(), Arc::new(state))
@@ -232,7 +236,7 @@ fn lists_on_disk(fx: &Fixture, profile: &str) -> Option<toml::value::Table> {
 /// Read the master back through the real loader and render `profile`'s
 /// rows with the shipped renderer.
 fn rows_from_disk(fx: &Fixture, profile: &str) -> Vec<ListPolicyRow> {
-    let loaded = load_config(&fx.master, time::OffsetDateTime::now_utc())
+    let loaded = load_current_config(&fx.master, time::OffsetDateTime::now_utc())
         .unwrap_or_else(|e| panic!("master must load: {e:?}"));
     let prof = loaded
         .config
@@ -271,7 +275,8 @@ fn plp_s4a_show_tells_inherited_from_overridden() {
     let dir = tempfile::tempdir().expect("tempdir");
     let master = dir.path().join("config.toml");
     std::fs::write(&master, MASTER_SEED).expect("seed");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).expect("fixture must load");
+    let loaded =
+        load_current_config(&master, time::OffsetDateTime::now_utc()).expect("fixture must load");
     let prof = loaded.config.profiles.get("kids").expect("kids");
     let rows = list_policy_rows(prof, &loaded.config.blocklists);
 
@@ -324,7 +329,8 @@ fn plp_s4a_a_disabled_list_is_annotated_not_reported_as_ignore() {
     let dir = tempfile::tempdir().expect("tempdir");
     let master = dir.path().join("config.toml");
     std::fs::write(&master, MASTER_SEED).expect("seed");
-    let loaded = load_config(&master, time::OffsetDateTime::now_utc()).expect("fixture must load");
+    let loaded =
+        load_current_config(&master, time::OffsetDateTime::now_utc()).expect("fixture must load");
     let prof = loaded.config.profiles.get("kids").expect("kids");
     let rows = list_policy_rows(prof, &loaded.config.blocklists);
 

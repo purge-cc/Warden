@@ -1321,6 +1321,23 @@ impl ListStatusRegistry {
         (*self.completed_snapshot.load_full()).clone()
     }
 
+    /// Publish an idle, verified replacement manager's rows and completion as
+    /// the next live sequence. The previous manager must already be retired.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_prepared(&self, prepared: &Self) {
+        let _publication = self
+            .completed_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshot = prepared.consistent_snapshot();
+        snapshot.cycle.seq = self.completed_snapshot.load().cycle.seq.saturating_add(1);
+        self.generation.store(prepared.generation.load_full());
+        self.corpus_refusal
+            .store(prepared.corpus_refusal.load_full());
+        self.corpus_freeze.store(prepared.corpus_freeze.load_full());
+        self.completed_snapshot.store(Arc::new(snapshot));
+    }
+
     #[cfg(test)]
     fn set_completed_publication_hook_for_test(&self, hook: CompletedPublicationHook) {
         let mut slot = self

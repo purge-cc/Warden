@@ -233,11 +233,14 @@ fn overwrite(target: &mut Table, key: &str, new_item: &Item) {
 
     target.insert(key, new_item.clone());
 
-    if let (Some(decor), Some(v)) = (
-        old_value_decor,
-        target.get_mut(key).and_then(Item::as_value_mut),
-    ) {
-        *v.decor_mut() = decor;
+    if let Some(decor) = old_value_decor {
+        match target.get_mut(key) {
+            Some(Item::Value(value)) => *value.decor_mut() = decor,
+            // Normalising an inline table moves its trailing comment from
+            // the value line to the resulting table header.
+            Some(Item::Table(table)) => *table.decor_mut() = decor,
+            _ => {}
+        }
     }
     if let (Some(decor), Some(mut k)) = (old_key_decor, target.key_mut(key)) {
         *k.leaf_decor_mut() = decor;
@@ -455,6 +458,28 @@ display_name = "Adults"
             "editing `adults` stripped the comment inside `kids`:\n{out}"
         );
         assert!(out.contains("block_all"), "the edit did not land:\n{out}");
+    }
+
+    #[test]
+    fn inline_table_trailing_comment_survives_conversion_to_a_table() {
+        let source = r#"[profiles.kids]
+display_name = "Kids"
+lists = { privacy = "deny" } # list override comment
+"#;
+        let mut value = parse(source);
+        value["profiles"]["kids"].as_table_mut().unwrap().insert(
+            "custom_lists".into(),
+            toml::Value::Array(vec![toml::Value::String("family-rules".into())]),
+        );
+
+        let rendered = render_preserving(source, &value).unwrap();
+        assert!(rendered.contains("profiles.kids.lists"), "{rendered}");
+        assert_eq!(rendered.matches("# list override comment").count(), 1);
+        assert_eq!(parse(&rendered), value);
+
+        let repeated = render_preserving(&rendered, &value).unwrap();
+        assert_eq!(repeated.matches("# list override comment").count(), 1);
+        assert_eq!(parse(&repeated), value);
     }
 
     /// A new file has no formatting to keep; the seat must still work.

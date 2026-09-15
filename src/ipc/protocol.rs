@@ -40,6 +40,38 @@ use serde::{Deserialize, Serialize};
 use crate::config::schema::blocklist::ListPolicy;
 use crate::config::schema::profile::BlockResponseV1;
 use crate::config::settings::{ClientConfig, EcsMode};
+use crate::operator_rules::{
+    BatchRequest, Capabilities, ExportChunk, ExportRequest, ListDetail, ListPage, Metadata,
+    OperatorRulesError, PageRequest, PlanImpactPage, PlanSummary, Receipt, RulePage,
+};
+
+/// Maximum serialized size of an operator-rules request or response.
+pub const OPERATOR_RULES_MAX_BYTES: usize = 60 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "read", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CustomListsReadRequest {
+    List {
+        #[serde(flatten)]
+        page: PageRequest,
+    },
+    Show {
+        id: String,
+    },
+    Rules {
+        id: String,
+        #[serde(flatten)]
+        page: PageRequest,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "read", content = "result", rename_all = "snake_case")]
+pub enum CustomListsReadResponse {
+    List(ListPage),
+    Show(ListDetail),
+    Rules(RulePage),
+}
 
 /// Privilege tier required to execute a command.
 ///
@@ -58,6 +90,53 @@ pub enum CommandTier {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcCommand {
+    /// Report the schema-4 operator-rules bridge and IPC limits.
+    OperatorRulesCapabilities,
+    /// Report redacted aggregate Custom List metadata.
+    CustomListsMetadata,
+    /// Read authenticated Custom List inventory, detail, or rule rows.
+    CustomListsRead {
+        request: CustomListsReadRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Read one revision-bound, bounded pack chunk.
+    CustomListExportChunk {
+        request: ExportRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Create a plan or page through a plan retained by the daemon.
+    OperatorRulesPlan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<BatchRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_ref: Option<String>,
+        #[serde(flatten)]
+        page: PageRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Apply a retained plan by opaque reference and full hash.
+    OperatorRulesApply {
+        plan_ref: String,
+        plan_hash: String,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Validate and resolve an idempotent direct-command retry.
+    OperatorRulesReplay {
+        request: BatchRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Read a durable operator-rules operation receipt.
+    OperatorRulesOperation {
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
     /// Request daemon status (uptime, listen address, domain count, cache stats).
     Status,
     /// Test if a domain would be blocked by the running daemon's filter.
@@ -141,6 +220,9 @@ pub enum IpcCommand {
         limit: usize,
         #[serde(default)]
         client: Option<String>,
+        /// Exact client IP OR-set, ANDed with the remaining filters before paging.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        client_ips: Vec<String>,
         #[serde(default)]
         blocked_only: bool,
         #[serde(default)]
@@ -347,6 +429,32 @@ pub enum IpcCommand {
     /// `cluster`-feature only, so it is absent from the default build.
     #[cfg(feature = "cluster")]
     ClusterStatus,
+    #[cfg(feature = "cluster")]
+    NodesStatus,
+    #[cfg(feature = "cluster")]
+    NodeControl {
+        request: crate::cluster::node_control::NodeControlCommand,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    #[cfg(feature = "cluster")]
+    NodesPreview {
+        request: crate::cluster::lifecycle::LifecycleRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    #[cfg(feature = "cluster")]
+    NodesApply {
+        preview_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    #[cfg(feature = "cluster")]
+    NodesCancel {
+        preview_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
 }
 
 /// Partial update for a configured device. Each field uses
@@ -501,6 +609,11 @@ pub struct ProfileUpdatePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_all: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **RETIRED — captured only so the daemon can reject it.**
+    ///
+    /// Presence, including `{ "add": [], "remove": [] }`, is legacy
+    /// intent. Dropping this field would let serde silently acknowledge an
+    /// old client's policy edit. Use Custom List mount operations instead.
     pub admin_rules: Option<AdminRulesPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecs: Option<EcsPatch>,
@@ -542,22 +655,12 @@ pub struct ProfileUpdatePatch {
     /// Delta over `Profile.custom_lists`, the ids of operator-authored
     /// rule files this profile mounts.
     ///
-    /// **Unlike [`Self::lists`], this is NOT the only write path for the
-    /// field it edits, and the asymmetry is deliberate.** This seat serves
-    /// the profile-shaped gesture — *one profile, N lists* — where a mount
-    /// rides the same atomic patch as the display name and the per-list
-    /// overrides. The list-shaped gesture — *one list, N profiles* — edits
-    /// the config files directly instead, because the profiles it touches
-    /// can be declared in different include files: a per-profile
-    /// round-trip would run one full validation and one rename each, so a
-    /// refusal half-way would leave the operator's intent partly applied
-    /// with nothing saying which half landed.
-    ///
-    /// The two cannot disagree about the file. Both end at
-    /// `[profiles.<id>].custom_lists` as a plain array of ids, and both
-    /// read the current value before writing it back. What they do not
-    /// share is atomicity across profiles — the axis each one is shaped
-    /// around.
+    /// This compatibility seat accepts only the profile-shaped mount delta;
+    /// it cannot be mixed with legacy profile fields in the same patch.
+    /// Mount and unmount operations then enter the shared operator-rules
+    /// service, which performs one validated transaction while preserving
+    /// every unrelated profile field. List-shaped callers use that same
+    /// service and may update multiple profiles atomically in one batch.
     ///
     /// `skip_serializing_if` is not cosmetic here — a client that emits
     /// `"custom_lists": null` on every save changes the bytes of every
@@ -733,7 +836,9 @@ impl IpcCommand {
     /// Return the privilege tier required to execute this command.
     pub fn tier(&self) -> CommandTier {
         match self {
-            Self::Status
+            Self::OperatorRulesCapabilities
+            | Self::CustomListsMetadata
+            | Self::Status
             | Self::Query { .. }
             | Self::DomainCount
             | Self::GetAllDevices
@@ -746,7 +851,13 @@ impl IpcCommand {
             | Self::ProfileCreate { .. }
             | Self::ProfileUpdate { .. }
             | Self::ProfileDelete { .. } => CommandTier::Mutating,
-            Self::Shutdown { .. }
+            Self::CustomListsRead { .. }
+            | Self::CustomListExportChunk { .. }
+            | Self::OperatorRulesPlan { .. }
+            | Self::OperatorRulesApply { .. }
+            | Self::OperatorRulesReplay { .. }
+            | Self::OperatorRulesOperation { .. }
+            | Self::Shutdown { .. }
             | Self::DaemonLogs { .. }
             | Self::QueryLogs { .. }
             | Self::TrackingStats { .. }
@@ -757,7 +868,22 @@ impl IpcCommand {
             | Self::DevicePromote { .. }
             | Self::TrackingConfigUpdate { .. } => CommandTier::Admin,
             #[cfg(feature = "cluster")]
-            Self::ClusterStatus => CommandTier::ReadOnly,
+            Self::ClusterStatus | Self::NodesStatus => CommandTier::ReadOnly,
+            #[cfg(feature = "cluster")]
+            Self::NodeControl { request, .. } => {
+                if matches!(
+                    request,
+                    crate::cluster::node_control::NodeControlCommand::Status
+                ) {
+                    CommandTier::ReadOnly
+                } else {
+                    CommandTier::Admin
+                }
+            }
+            #[cfg(feature = "cluster")]
+            Self::NodesPreview { .. } | Self::NodesApply { .. } | Self::NodesCancel { .. } => {
+                CommandTier::Admin
+            }
         }
     }
 
@@ -770,6 +896,14 @@ impl IpcCommand {
     /// `tests/frozen_strings_ipc_actions.rs`.
     pub fn action_name(&self) -> &'static str {
         match self {
+            Self::OperatorRulesCapabilities => "operator_rules.capabilities",
+            Self::CustomListsMetadata => "custom_lists.metadata",
+            Self::CustomListsRead { .. } => "custom_lists.read",
+            Self::CustomListExportChunk { .. } => "custom_list.export_chunk",
+            Self::OperatorRulesPlan { .. } => "operator_rules.plan",
+            Self::OperatorRulesApply { .. } => "operator_rules.apply",
+            Self::OperatorRulesReplay { .. } => "operator_rules.replay",
+            Self::OperatorRulesOperation { .. } => "operator_rules.operation",
             Self::Status => "status",
             Self::Query { .. } => "query",
             Self::CacheFlush { .. } => "cache.flush",
@@ -795,6 +929,39 @@ impl IpcCommand {
             Self::ProfileDelete { .. } => "profile.delete",
             #[cfg(feature = "cluster")]
             Self::ClusterStatus => "cluster.status",
+            #[cfg(feature = "cluster")]
+            Self::NodesStatus => "nodes.status",
+            #[cfg(feature = "cluster")]
+            Self::NodeControl { request, .. } => match request {
+                crate::cluster::node_control::NodeControlCommand::Status => "node.status",
+                crate::cluster::node_control::NodeControlCommand::TokenPrepare { .. } => {
+                    "node.token.prepare"
+                }
+                crate::cluster::node_control::NodeControlCommand::TokenRevoke => {
+                    "node.token.revoke"
+                }
+                crate::cluster::node_control::NodeControlCommand::PreviewAdd { .. } => {
+                    "node.add.preview"
+                }
+                crate::cluster::node_control::NodeControlCommand::PreviewEdit { .. } => {
+                    "node.edit.preview"
+                }
+                crate::cluster::node_control::NodeControlCommand::PreviewRemove { .. } => {
+                    "node.remove.preview"
+                }
+                crate::cluster::node_control::NodeControlCommand::Apply { .. } => "node.apply",
+                crate::cluster::node_control::NodeControlCommand::Cancel { .. } => "node.cancel",
+                crate::cluster::node_control::NodeControlCommand::Resume { .. } => "node.resume",
+                crate::cluster::node_control::NodeControlCommand::AbandonPreparingAdd {
+                    ..
+                } => "node.add.abandon_pending",
+            },
+            #[cfg(feature = "cluster")]
+            Self::NodesPreview { .. } => "nodes.preview",
+            #[cfg(feature = "cluster")]
+            Self::NodesApply { .. } => "nodes.apply",
+            #[cfg(feature = "cluster")]
+            Self::NodesCancel { .. } => "nodes.cancel",
         }
     }
 
@@ -802,7 +969,13 @@ impl IpcCommand {
     /// have no token slot and return `None`.
     pub fn token(&self) -> Option<&str> {
         match self {
-            Self::CacheFlush { token, .. }
+            Self::CustomListsRead { token, .. }
+            | Self::CustomListExportChunk { token, .. }
+            | Self::OperatorRulesPlan { token, .. }
+            | Self::OperatorRulesApply { token, .. }
+            | Self::OperatorRulesReplay { token, .. }
+            | Self::OperatorRulesOperation { token, .. }
+            | Self::CacheFlush { token, .. }
             | Self::Reload { token }
             | Self::ForgetList { token, .. }
             | Self::ForceListRefresh { token }
@@ -819,14 +992,21 @@ impl IpcCommand {
             | Self::ProfileCreate { token, .. }
             | Self::ProfileUpdate { token, .. }
             | Self::ProfileDelete { token, .. } => token.as_deref(),
-            Self::Status
+            Self::OperatorRulesCapabilities
+            | Self::CustomListsMetadata
+            | Self::Status
             | Self::Query { .. }
             | Self::DomainCount
             | Self::GetAllDevices
             | Self::BlocklistStats { .. }
             | Self::LocalRecordsHits => None,
             #[cfg(feature = "cluster")]
-            Self::ClusterStatus => None,
+            Self::ClusterStatus | Self::NodesStatus => None,
+            #[cfg(feature = "cluster")]
+            Self::NodesPreview { token, .. }
+            | Self::NodesApply { token, .. }
+            | Self::NodesCancel { token, .. }
+            | Self::NodeControl { token, .. } => token.as_deref(),
         }
     }
 
@@ -837,6 +1017,44 @@ impl IpcCommand {
     /// transparently before sending.
     pub fn with_token(self, t: Option<String>) -> Self {
         match self {
+            Self::CustomListsRead { request, token: _ } => {
+                Self::CustomListsRead { request, token: t }
+            }
+            Self::CustomListExportChunk { request, token: _ } => {
+                Self::CustomListExportChunk { request, token: t }
+            }
+            Self::OperatorRulesPlan {
+                request,
+                plan_ref,
+                page,
+                token: _,
+            } => Self::OperatorRulesPlan {
+                request,
+                plan_ref,
+                page,
+                token: t,
+            },
+            Self::OperatorRulesApply {
+                plan_ref,
+                plan_hash,
+                request_id,
+                token: _,
+            } => Self::OperatorRulesApply {
+                plan_ref,
+                plan_hash,
+                request_id,
+                token: t,
+            },
+            Self::OperatorRulesReplay { request, token: _ } => {
+                Self::OperatorRulesReplay { request, token: t }
+            }
+            Self::OperatorRulesOperation {
+                operation_id,
+                token: _,
+            } => Self::OperatorRulesOperation {
+                operation_id,
+                token: t,
+            },
             Self::CacheFlush { domain, .. } => Self::CacheFlush { domain, token: t },
             Self::Reload { .. } => Self::Reload { token: t },
             Self::ForgetList { id, .. } => Self::ForgetList { id, token: t },
@@ -856,6 +1074,7 @@ impl IpcCommand {
             Self::QueryLogs {
                 limit,
                 client,
+                client_ips,
                 blocked_only,
                 domain,
                 since_secs,
@@ -865,6 +1084,7 @@ impl IpcCommand {
             } => Self::QueryLogs {
                 limit,
                 client,
+                client_ips,
                 blocked_only,
                 domain,
                 since_secs,
@@ -928,14 +1148,44 @@ impl IpcCommand {
             },
             Self::ProfileDelete { id, .. } => Self::ProfileDelete { id, token: t },
             #[cfg(feature = "cluster")]
-            c @ Self::ClusterStatus => c,
-            other @ (Self::Status
+            c @ (Self::ClusterStatus | Self::NodesStatus) => c,
+            #[cfg(feature = "cluster")]
+            Self::NodesPreview { request, .. } => Self::NodesPreview { request, token: t },
+            #[cfg(feature = "cluster")]
+            Self::NodeControl { request, .. } => Self::NodeControl { request, token: t },
+            #[cfg(feature = "cluster")]
+            Self::NodesApply { preview_id, .. } => Self::NodesApply {
+                preview_id,
+                token: t,
+            },
+            #[cfg(feature = "cluster")]
+            Self::NodesCancel { preview_id, .. } => Self::NodesCancel {
+                preview_id,
+                token: t,
+            },
+            other @ (Self::OperatorRulesCapabilities
+            | Self::CustomListsMetadata
+            | Self::Status
             | Self::Query { .. }
             | Self::DomainCount
             | Self::GetAllDevices
             | Self::BlocklistStats { .. }
             | Self::LocalRecordsHits) => other,
         }
+    }
+
+    pub fn is_operator_rules(&self) -> bool {
+        matches!(
+            self,
+            Self::OperatorRulesCapabilities
+                | Self::CustomListsMetadata
+                | Self::CustomListsRead { .. }
+                | Self::CustomListExportChunk { .. }
+                | Self::OperatorRulesPlan { .. }
+                | Self::OperatorRulesApply { .. }
+                | Self::OperatorRulesReplay { .. }
+                | Self::OperatorRulesOperation { .. }
+        )
     }
 }
 
@@ -1052,6 +1302,32 @@ impl From<crate::lists::status::RegistrySnapshot> for ListRegistrySnapshotDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcResponse {
+    OperatorRulesCapabilities {
+        capabilities: Capabilities,
+    },
+    CustomListsMetadata {
+        metadata: Metadata,
+    },
+    CustomListsRead {
+        response: CustomListsReadResponse,
+    },
+    CustomListExportChunk {
+        chunk: ExportChunk,
+    },
+    OperatorRulesPlan {
+        plan_ref: String,
+        summary: PlanSummary,
+        impact: PlanImpactPage,
+    },
+    OperatorRulesApply {
+        receipt: Receipt,
+    },
+    OperatorRulesOperation {
+        receipt: Receipt,
+    },
+    OperatorRulesError {
+        error: OperatorRulesError,
+    },
     /// Daemon status information.
     Status {
         /// PID of the running daemon.
@@ -1182,6 +1458,20 @@ pub enum IpcResponse {
         /// collapses both cases to `None`).
         #[serde(default)]
         resource_budget: Option<crate::resource_budget::ResourceBudgetSnapshot>,
+        /// Estimated installed corpus allocations; absent on older daemons.
+        #[serde(default)]
+        lists_memory_bytes: Option<u64>,
+        /// Whether QueryLogs accepts an exact, validated client IP OR-set.
+        #[serde(default)]
+        query_log_client_ips_supported: bool,
+        /// Whether tracking is enabled in the running daemon's configuration.
+        /// None means the daemon predates this availability field.
+        #[serde(default)]
+        tracking_enabled: Option<bool>,
+        /// Whether this daemon produces Top Lists counts for the 24h window.
+        /// False on older payloads; a nonempty legacy ranking remains usable.
+        #[serde(default)]
+        top_lists_24h_supported: bool,
         /// Per-server upstream list (primary servers then
         /// fallback), each carrying its literal address + encryption
         /// kind. Lets the TUI System card / `warden status` render the
@@ -1210,11 +1500,16 @@ pub enum IpcResponse {
         blocked_by: Option<String>,
     },
     /// Generic success response.
-    Ok { message: String },
+    Ok {
+        message: String,
+    },
     /// Ack for `IpcCommand::ForgetList`. `was_cached` echoes whether
     /// the source had any in-memory or on-disk state before the call —
     /// `false` is the idempotent / no-op case, not an error.
-    ListForgotten { id: String, was_cached: bool },
+    ListForgotten {
+        id: String,
+        was_cached: bool,
+    },
     /// Completed result of [`IpcCommand::ForceListRefresh`]. The snapshot is
     /// the actor-returned value, never a second read of shared state.
     ListRefreshCompleted {
@@ -1226,7 +1521,9 @@ pub enum IpcResponse {
         max_total_domains: Option<u64>,
     },
     /// Domain count response.
-    DomainCount { count: usize },
+    DomainCount {
+        count: usize,
+    },
     /// Tracking stats (global + top-N + time-series).
     TrackingStats {
         queries_total: u64,
@@ -1327,7 +1624,9 @@ pub enum IpcResponse {
     /// Per-device stats table. The `clients` field name on the wire is
     /// retained for decode-compat with older CLI readers.
     #[serde(alias = "client_list")]
-    DeviceList { clients: Vec<DeviceStatEntry> },
+    DeviceList {
+        clients: Vec<DeviceStatEntry>,
+    },
     /// Mapped + unmapped device view (`GetAllDevices`).
     #[serde(alias = "client_view")]
     DeviceView(DeviceViewDto),
@@ -1342,6 +1641,12 @@ pub enum IpcResponse {
     /// upgrade boundary.
     QueryLogs {
         entries: Vec<QueryLogDto>,
+        /// Confirms the exact IP predicate was installed for this response.
+        /// Missing on older daemons: clients must reject an unacknowledged
+        /// response when their request selected exact IPs, even if a prior
+        /// Status exchange reported support before a daemon restart.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        client_ips_applied: bool,
         logging_enabled: bool,
         file_state: QueryLogFileState,
         /// Resume point for the next (older) page. `None` means the
@@ -1380,14 +1685,36 @@ pub enum IpcResponse {
     /// Per-record local-DNS hit-count snapshot. Order matches the
     /// daemon-side DashMap iteration which is unspecified — the TUI
     /// builds its own `(scope, domain) → count` lookup at render time.
-    LocalRecordsHitsList { entries: Vec<LocalRecordsHitEntry> },
+    LocalRecordsHitsList {
+        entries: Vec<LocalRecordsHitEntry>,
+    },
     /// Reply to [`IpcCommand::ClusterStatus`]. Carries the whole view
     /// as one DTO (reused by the dashboard status dot + Cluster tab).
     /// `cluster`-feature only.
     #[cfg(feature = "cluster")]
-    ClusterStatus { status: ClusterStatusDto },
+    ClusterStatus {
+        status: ClusterStatusDto,
+    },
+    #[cfg(feature = "cluster")]
+    NodesStatus {
+        status: Box<crate::cluster::lifecycle::LifecycleStatus>,
+    },
+    #[cfg(feature = "cluster")]
+    NodesPreview {
+        preview: Box<crate::cluster::lifecycle::LifecyclePreview>,
+    },
+    #[cfg(feature = "cluster")]
+    NodesResult {
+        result: Box<crate::cluster::lifecycle::LifecycleResult>,
+    },
+    #[cfg(feature = "cluster")]
+    NodeControl {
+        reply: Box<crate::cluster::node_control::NodeControlReply>,
+    },
     /// Error response.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// This node's cluster view, as returned over IPC. On a secondary the
@@ -1651,6 +1978,13 @@ pub struct MappedDeviceDto {
     /// daemons forward-compatible.
     #[serde(default)]
     pub hourly_queries: Vec<u64>,
+    /// Per-hour blocked-query counts for the last 24 hours, oldest-first,
+    /// with the same window and length contract as `hourly_queries`.
+    /// `None` means the daemon did not provide this projection; it is
+    /// deliberately distinct from a known all-zero series for compatibility
+    /// with older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hourly_blocked: Option<Vec<u64>>,
     /// Opt-out flag. When `true`, the resolver short-circuits filtering
     /// for this device but keeps monitoring active. Surfaced as the
     /// `[⚠ UNFILTERED]` badge on the Devices tab card. Defaults to
@@ -1688,6 +2022,10 @@ pub struct UnmappedDeviceDto {
     /// as `MappedDeviceDto::hourly_queries`.
     #[serde(default)]
     pub hourly_queries: Vec<u64>,
+    /// Per-hour blocked-query counts for the last 24 hours, oldest-first.
+    /// `None` means this daemon did not provide the series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hourly_blocked: Option<Vec<u64>>,
 }
 
 /// Outcome of the daemon's attempt to read the query-log file. Paired
@@ -1719,10 +2057,13 @@ pub enum QueryLogFileState {
 /// makes every call site harder to read. Bundling them also means the
 /// next dimension (Tier 2's resolved client-IP set) adds a field rather
 /// than another argument to thread through two signatures.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QueryLogRequest {
     pub limit: usize,
     pub client: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub client_ips: Vec<String>,
     pub blocked_only: bool,
     pub domain: Option<String>,
     pub since_secs: Option<u64>,

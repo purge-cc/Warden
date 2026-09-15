@@ -63,21 +63,28 @@
 //! - State: `app::GroupsState` (cursor, the modal, table viewport)
 //! - Tests: render + pure fns here; key handling in `tui/tests/`, declared from `mod.rs`
 
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use std::cmp::Ordering;
+
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::config::schema::{Device, Group};
-use crate::tui::app::App;
-use crate::tui::theme::{self, T};
-use crate::tui::ui::render_section_chrome;
+use crate::tui::app::{App, Leaf};
+use crate::tui::detail_panel;
+use crate::tui::group_modal;
+use crate::tui::modal_form::{self, ValueKind};
+use crate::tui::mouse::{self, MouseAction, SortOrder};
+use crate::tui::theme::{self, CardRole, T};
 
 /// Below this width the master/detail split collapses to master-only.
 /// Mirrors Profiles and Subnets — the side card needs ≥40 cells for its
 /// KV rows to stay legible.
-const NARROW_THRESHOLD: u16 = 100;
+const NARROW_THRESHOLD: u16 = 108;
+const COLUMN_SPACING: u16 = 2;
+const HEADERS: [&str; 5] = ["ID", "DISPLAY NAME", "PROFILE", "PRI", "DEVICES"];
 
 /// Shown when the config parsed but declares no groups.
 ///
@@ -88,56 +95,110 @@ const NARROW_THRESHOLD: u16 = 100;
 /// stale.
 pub const EMPTY_HINT: &str = "  press a to add the first group";
 
-pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some(loaded) = app.loaded_config.as_ref() else {
-        render_no_config(f, area);
-        return;
-    };
+/// Whether an edit form belongs in this page's wide detail card. Remove
+/// confirms and outcomes intentionally remain overlays.
+pub fn inline_editor_visible(viewport_width: u16, app: &App) -> bool {
+    app.active_leaf == Leaf::Groups
+        && viewport_width >= NARROW_THRESHOLD
+        && app
+            .groups
+            .modal
+            .as_ref()
+            .is_some_and(|modal| matches!(modal.stage, group_modal::Stage::EditingForm(_)))
+}
 
-    let groups = &loaded.config.groups;
+pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     // Both panes need the device side to resolve membership; it comes
     // from the SAME `LoadedConfig` as `groups` on purpose — one file,
     // one read, no skew, and no dependency on the daemon being up.
-    let devices = &loaded.config.devices;
-    let title = format!("Groups ({})", groups.len());
-    let outer = render_section_chrome(f, area, &title, T.text_secondary);
+    let Some(devices) = app
+        .loaded_config
+        .as_ref()
+        .map(|loaded| loaded.config.devices.clone())
+    else {
+        render_no_config(f, area);
+        return;
+    };
+    let groups = build_display_rows(app);
 
     if groups.is_empty() {
-        render_empty(f, outer);
+        if area.width >= NARROW_THRESHOLD {
+            let cols = split_list_detail(area);
+            let body = theme::filled_card(
+                f.buffer_mut(),
+                cols[0],
+                "GROUPS",
+                "Configured Device Policy Bindings",
+                CardRole::Analytics,
+            );
+            render_empty(f, body);
+            if inline_editor_visible(area.width, app) {
+                group_modal::render_inline_editor(f, cols[1], app.groups.modal.as_ref().unwrap());
+            } else {
+                let detail = theme::filled_card(
+                    f.buffer_mut(),
+                    cols[1],
+                    "GROUP DETAILS",
+                    "Select a Policy Binding",
+                    CardRole::History,
+                );
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        "  add a group to inspect its policy and membership",
+                        Style::default().fg(T.text_muted),
+                    )),
+                    detail,
+                );
+            }
+        } else {
+            let body = theme::filled_card(
+                f.buffer_mut(),
+                area,
+                "GROUPS",
+                "Configured Device Policy Bindings",
+                CardRole::Analytics,
+            );
+            render_empty(f, body);
+        }
         return;
     }
 
-    if outer.width < NARROW_THRESHOLD {
-        // Single-column fallback: the operator still sees every group;
-        // the detail card returns when they widen the terminal.
-        render_master(
-            f,
-            outer,
-            groups,
-            devices,
-            app.groups.selected_id.as_deref(),
-            &mut app.groups.table_state,
-        );
+    let detail_key = selected_group(&groups, app)
+        .map(|group| group.id.as_str())
+        .unwrap_or_default();
+    detail_panel::prepare(app, Leaf::Groups, detail_key);
+
+    if area.width < NARROW_THRESHOLD {
+        if detail_panel::focused(app, Leaf::Groups) {
+            render_detail(f, area, app, &groups, &devices);
+        } else {
+            render_master(f, area, app, &groups, &devices);
+        }
         return;
     }
 
-    let cols = Layout::horizontal([
-        Constraint::Percentage(38),
-        Constraint::Length(1),
-        Constraint::Percentage(62),
-    ])
-    .split(outer);
+    let cols = split_list_detail(area);
 
-    render_master(
-        f,
-        cols[0],
-        groups,
-        devices,
-        app.groups.selected_id.as_deref(),
-        &mut app.groups.table_state,
-    );
-    render_detail(f, cols[2], app, groups, devices);
-    draw_v_divider(f, cols[1]);
+    render_master(f, cols[0], app, &groups, &devices);
+    if inline_editor_visible(area.width, app) {
+        group_modal::render_inline_editor(f, cols[1], app.groups.modal.as_ref().unwrap());
+    } else {
+        render_detail(f, cols[1], app, &groups, &devices);
+    }
+}
+
+fn split_list_detail(area: Rect) -> [Rect; 2] {
+    let list_width = ((u32::from(area.width) * 42) / 100) as u16;
+    let overlap = u16::from(list_width > 0 && area.width > 0);
+    [
+        Rect::new(area.x, area.y, list_width, area.height),
+        Rect::new(
+            area.x + list_width.saturating_sub(overlap),
+            area.y,
+            area.width.saturating_sub(list_width) + overlap,
+            area.height,
+        ),
+    ]
 }
 
 // ── Membership ───────────────────────────────────────────────────────
@@ -215,26 +276,24 @@ fn member_count(g: &Group, devices: &[Device]) -> usize {
 
 // ── Master pane ──────────────────────────────────────────────────────
 
-fn render_master(
-    f: &mut Frame,
-    area: Rect,
-    groups: &[Group],
-    devices: &[Device],
-    selected_id: Option<&str>,
-    table_state: &mut TableState,
-) {
-    let header = Row::new(vec![
-        Cell::from("ID"),
-        Cell::from("DISPLAY NAME"),
-        Cell::from("PROFILE"),
-        Cell::from("PRI"),
-        Cell::from("DEVICES"),
-    ])
-    .style(
-        Style::default()
-            .fg(T.brand_red)
-            .add_modifier(Modifier::BOLD),
+fn render_master(f: &mut Frame, area: Rect, app: &mut App, groups: &[Group], devices: &[Device]) {
+    let subtitle = format!("{} Policy Bindings \u{00b7} Stable IDs", groups.len());
+    let body = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "GROUPS",
+        &subtitle,
+        CardRole::Analytics,
     );
+    let constraints = group_constraints();
+    let columns = solved_columns(body, &constraints);
+    let sort = app.mouse.sort(Leaf::Groups);
+    let header = Row::new(HEADERS.iter().enumerate().map(|(index, label)| {
+        Cell::from(sort_header(label, index, sort)).style(theme::table_heading_style(
+            sort.is_some_and(|order| order.column == index),
+        ))
+    }))
+    .style(theme::table_heading_style(false));
 
     let rows: Vec<Row> = groups
         .iter()
@@ -254,23 +313,58 @@ fn render_master(
     // rows, and a stale index then points at the wrong group. The scroll
     // offset persists regardless (see `tabs::subnets::render_master` for
     // why that is safe across a row-count change).
-    let selected =
-        resolve_selected_index(groups, selected_id).or_else(|| (!rows.is_empty()).then_some(0));
+    let selected = resolve_selected_index(groups, app.groups.selected_id.as_deref())
+        .or_else(|| (!rows.is_empty()).then_some(0));
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(12),
-            Constraint::Min(14),
-            Constraint::Min(12),
-            Constraint::Length(4),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(theme::highlight_style());
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(COLUMN_SPACING)
+        .row_highlight_style(theme::highlight_style());
 
-    super::render_table(f, area, table, table_state, selected);
+    super::render_table(f, body, table, &mut app.groups.table_state, selected);
+    for (index, rect) in columns.iter().enumerate() {
+        mouse::register(app, *rect, MouseAction::Sort(Leaf::Groups, index));
+    }
+    let offset = app.groups.table_state.offset();
+    for (visible, index) in (0..groups.len())
+        .skip(offset)
+        .take(body.height.saturating_sub(1) as usize)
+        .enumerate()
+    {
+        mouse::register(
+            app,
+            Rect::new(body.x, body.y + 1 + visible as u16, body.width, 1),
+            MouseAction::Row(Leaf::Groups, index),
+        );
+    }
+}
+
+fn group_constraints() -> [Constraint; HEADERS.len()] {
+    [
+        Constraint::Min(12),
+        Constraint::Min(14),
+        Constraint::Min(12),
+        Constraint::Length(4),
+        Constraint::Length(8),
+    ]
+}
+
+fn solved_columns(area: Rect, constraints: &[Constraint]) -> Vec<Rect> {
+    Layout::horizontal(constraints.iter().copied())
+        .flex(Flex::Start)
+        .spacing(COLUMN_SPACING)
+        .split(Rect::new(0, 0, area.width, 1))
+        .iter()
+        .map(|column| Rect::new(area.x + column.x, area.y, column.width, 1))
+        .collect()
+}
+
+fn sort_header(label: &str, index: usize, sort: Option<SortOrder>) -> String {
+    match sort.filter(|sort| sort.column == index) {
+        Some(sort) if sort.descending => format!("{label} ▼"),
+        Some(_) => format!("{label} ▲"),
+        None => label.to_string(),
+    }
 }
 
 /// Index of `selected_id` in the current group list, or `None` when the
@@ -278,6 +372,38 @@ fn render_master(
 pub fn resolve_selected_index(groups: &[Group], selected_id: Option<&str>) -> Option<usize> {
     let want = selected_id?;
     groups.iter().position(|g| g.id.as_str() == want)
+}
+
+/// The one display sequence for Groups. Mouse and keyboard row indexes refer
+/// to this sorted vector, never directly to the config's declaration order.
+pub fn build_display_rows(app: &App) -> Vec<Group> {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return Vec::new();
+    };
+    let mut groups = loaded.config.groups.clone();
+    let devices = &loaded.config.devices;
+    if let Some(sort) = app.mouse.sort(Leaf::Groups) {
+        groups.sort_by(|left, right| {
+            let order = match sort.column {
+                0 => left.id.as_str().cmp(right.id.as_str()),
+                1 => left
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase()),
+                2 => left.profile.as_str().cmp(right.profile.as_str()),
+                3 => left.priority.cmp(&right.priority),
+                4 => member_count(left, devices).cmp(&member_count(right, devices)),
+                _ => Ordering::Equal,
+            };
+            let order = if sort.descending {
+                order.reverse()
+            } else {
+                order
+            };
+            order.then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+    }
+    groups
 }
 
 /// The group the detail pane describes: the anchored selection, else the
@@ -291,33 +417,83 @@ fn selected_group<'a>(groups: &'a [Group], app: &App) -> Option<&'a Group> {
 // ── Detail pane ──────────────────────────────────────────────────────
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices: &[Device]) {
+    render_detail_content(f, area, app, groups, devices, false);
+}
+
+fn render_detail_content(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    groups: &[Group],
+    devices: &[Device],
+    modal: bool,
+) {
     let Some(g) = selected_group(groups, app) else {
         return;
     };
     let members = members_of(g, devices);
+    let subtitle = format!("{} \u{00b7} Profile Policy Binding", g.id.as_str());
+    let content = if modal {
+        let content = modal_form::render_header(f, area, "GROUP DETAILS", &subtitle);
+        modal_form::close_footer(f, content)
+    } else {
+        theme::filled_card(
+            f.buffer_mut(),
+            area,
+            "GROUP DETAILS",
+            &subtitle,
+            CardRole::History,
+        )
+    };
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("  {}", g.id.as_str()),
-        Style::default()
-            .fg(T.text_primary)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", g.display_name),
-        Style::default().fg(T.text_secondary),
-    )));
-    lines.push(Line::from(""));
+    lines.extend(modal_form::section_band_with_role(
+        "Identity",
+        content.width,
+        CardRole::Summary,
+    ));
+    lines.push(modal_form::value_row(
+        "id",
+        g.id.as_str(),
+        false,
+        ValueKind::Identity,
+        None,
+        content.width,
+    ));
+    lines.push(modal_form::value_row(
+        "display name",
+        &g.display_name,
+        false,
+        ValueKind::Editable,
+        None,
+        content.width,
+    ));
+    lines.push(Line::default());
 
     // `profile` + `priority` read as one fact because they are one:
     // which single profile a member resolves, and what breaks the tie.
-    lines.push(kv(
-        "Profile",
-        format!("{}  (priority {})", g.profile.as_str(), g.priority),
+    lines.extend(modal_form::section_band_with_role(
+        "Policy",
+        content.width,
+        CardRole::Summary,
     ));
-    lines.push(kv("Members", format!("{} device(s)", members.len())));
-
-    lines.push(Line::from(""));
+    lines.push(modal_form::value_row(
+        "profile",
+        g.profile.as_str(),
+        false,
+        ValueKind::Identity,
+        None,
+        content.width,
+    ));
+    lines.push(modal_form::value_row(
+        "priority",
+        &g.priority.to_string(),
+        false,
+        ValueKind::Caution,
+        None,
+        content.width,
+    ));
+    lines.push(Line::default());
 
     // The semantics an operator gets wrong. Stated on the surface that
     // shows both fields, not only in the design doc.
@@ -337,14 +513,20 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices
         Style::default().fg(T.text_muted),
     )));
 
+    lines.extend(modal_form::section_band_with_role(
+        "Membership",
+        content.width,
+        CardRole::Analytics,
+    ));
+    lines.push(modal_form::value_row(
+        "members",
+        &format!("{} device(s)", members.len()),
+        false,
+        ValueKind::Healthy,
+        None,
+        content.width,
+    ));
     if !members.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Members",
-            Style::default()
-                .fg(T.brand_red)
-                .add_modifier(Modifier::BOLD),
-        )));
         // Pad to the longest id so the side markers form a column. Capped
         // so one pathological id cannot push every marker off a 60-cell
         // detail pane — `Wrap` would fold it onto the next line, which
@@ -388,32 +570,31 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App, groups: &[Group], devices
         }
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    detail_panel::render(f, content, app, Leaf::Groups, g.id.as_str(), lines);
 }
 
-fn kv(key: &str, value: String) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("  {key:<9}"), Style::default().fg(T.text_muted)),
-        Span::styled(value, Style::default().fg(T.text_primary)),
-    ])
-}
-
-// ── Chrome ───────────────────────────────────────────────────────────
-
-/// Paint a 1-cell-wide vertical separator for every row of `area`.
-/// Mirrors the Profiles/Subnets master-detail gutter.
-fn draw_v_divider(f: &mut Frame, area: Rect) {
-    let style = Style::default().fg(T.text_muted);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        if area.x < buf.area.right() && y < buf.area.bottom() {
-            buf.set_string(area.x, y, "\u{2502}", style);
-        }
-    }
+pub fn render_detail_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let Some(loaded) = app.loaded_config.as_ref() else {
+        return;
+    };
+    let groups = build_display_rows(app);
+    let Some(group) = selected_group(&groups, app) else {
+        return;
+    };
+    let height = area.height.saturating_sub(2).min(30);
+    let inner = modal_form::render_chrome_in(f, area, 72, height, "", T.text_primary, true);
+    render_detail_content(f, inner, app, &groups, &loaded.config.devices, true);
+    detail_panel::prepare(app, Leaf::Groups, group.id.as_str());
 }
 
 fn render_no_config(f: &mut Frame, area: Rect) {
-    let content = render_section_chrome(f, area, "Groups", T.text_secondary);
+    let content = theme::filled_card(
+        f.buffer_mut(),
+        area,
+        "GROUPS",
+        "Configuration Unavailable",
+        CardRole::Analytics,
+    );
     f.render_widget(
         Paragraph::new(Span::styled(
             "  could not load config — fix it and press r to retry",
@@ -473,6 +654,25 @@ mod tests {
         }
     }
 
+    fn loaded_with(
+        groups: Vec<Group>,
+        devices: Vec<Device>,
+    ) -> crate::config::loader::LoadedConfig {
+        let config = crate::config::schema::ConfigV1 {
+            groups,
+            devices,
+            ..Default::default()
+        };
+        crate::config::loader::LoadedConfig {
+            config,
+            master_path: std::path::PathBuf::from("/tmp/groups-sort.toml"),
+            files_loaded: Vec::new(),
+            total_bytes: 0,
+            provenance: Default::default(),
+            custom_lists: Default::default(),
+        }
+    }
+
     #[test]
     fn selection_resolves_by_id_not_by_index() {
         let groups = vec![group("a", "p", 0, &[]), group("b", "p", 0, &[])];
@@ -498,6 +698,58 @@ mod tests {
             Some("a"),
             "detail must describe what master highlights"
         );
+    }
+
+    #[test]
+    fn an_editing_group_form_is_inline_only_at_the_master_detail_floor() {
+        let mut app = App::new();
+        app.active_leaf = Leaf::Groups;
+        app.groups.modal = Some(group_modal::GroupModal::open_add(vec!["p".into()], 0));
+
+        assert!(!inline_editor_visible(NARROW_THRESHOLD - 1, &app));
+        assert!(inline_editor_visible(NARROW_THRESHOLD, &app));
+    }
+
+    #[test]
+    fn priority_sort_is_numeric_and_selection_stays_with_its_id() {
+        let mut app = App::new();
+        app.loaded_config = Some(loaded_with(
+            vec![
+                group("ten", "p", 10, &[]),
+                group("two", "p", 2, &[]),
+                group("also-two", "p", 2, &[]),
+            ],
+            Vec::new(),
+        ));
+        app.mouse.toggle_sort(Leaf::Groups, 3);
+        let ascending = build_display_rows(&app);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            ["also-two", "two", "ten"],
+            "numeric priorities sort before the deterministic ID tie key"
+        );
+
+        app.groups.selected_id = Some("ten".to_string());
+        app.mouse.toggle_sort(Leaf::Groups, 3);
+        let descending = build_display_rows(&app);
+        assert_eq!(
+            resolve_selected_index(&descending, app.groups.selected_id.as_deref()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn solved_group_headers_have_exact_click_gutters() {
+        let body = Rect::new(4, 8, 80, 1);
+        let columns = solved_columns(body, &group_constraints());
+        assert_eq!(columns.first().unwrap().x, body.x);
+        assert!(columns.last().unwrap().right() <= body.right());
+        assert!(columns
+            .windows(2)
+            .all(|pair| pair[0].right().saturating_add(COLUMN_SPACING) == pair[1].x));
     }
 
     /// Rendered-buffer test at the layout floor: a line-vector assertion
@@ -539,8 +791,9 @@ mod tests {
         term.draw(|f| render_detail(f, f.area(), &app, &groups, &devices))
             .unwrap();
         let dump = term.backend().to_string();
+        let normalized = dump.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            dump.contains("priority 10"),
+            normalized.contains("priority 10"),
             "priority belongs beside the profile it selects; got:\n{dump}"
         );
         // `plp-s5a` deleted `Group.tags`, and this asserted "UNION" —
@@ -652,19 +905,12 @@ mod tests {
 
         let groups = vec![group("phones", "p", 0, &[])];
         let devices = vec![device("edo-laptop", &["phones"]), device("tv", &["phones"])];
-        let mut app = App::default();
-        let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
-        term.draw(|f| {
-            render_master(
-                f,
-                f.area(),
-                &groups,
-                &devices,
-                app.groups.selected_id.as_deref(),
-                &mut app.groups.table_state,
-            )
-        })
-        .unwrap();
+        let mut app = App::new();
+        // Responsive narrow mode omits low-priority columns; exercise the
+        // real devices union with enough width for that column.
+        let mut term = Terminal::new(TestBackend::new(100, 6)).unwrap();
+        term.draw(|f| render_master(f, f.area(), &mut app, &groups, &devices))
+            .unwrap();
         let dump = term.backend().to_string();
         // Read the cell by the header's column offset. A substring probe
         // is not usable here: `PRI` is 0 in this fixture, so `" 0 "`
@@ -673,7 +919,11 @@ mod tests {
         // strip them or the column offsets are off by one and the cell
         // carries a trailing `"`.
         let rows: Vec<&str> = dump.lines().map(|l| l.trim_matches('"')).collect();
-        let col = rows[0]
+        let header = rows
+            .iter()
+            .find(|row| row.contains("DEVICES") && row.contains("PROFILE"))
+            .expect("the header must name the column this test reads");
+        let col = header
             .find("DEVICES")
             .expect("the header must name the column this test reads");
         // Find the row by its id, not by index: a spacer row or a chrome

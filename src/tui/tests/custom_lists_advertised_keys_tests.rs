@@ -2,7 +2,7 @@ use super::*;
 use crate::config::schema::{ConfigV1, CustomList, Id};
 
 fn app_with_one_list() -> App {
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::CustomLists;
     app.loaded_config = Some(crate::config::loader::LoadedConfig {
         config: ConfigV1 {
@@ -117,7 +117,7 @@ fn every_key_the_custom_lists_footer_advertises_is_bound() {
     // by hand.
     let mut checked = 0usize;
     for focus in [CustomListsFocus::Lists, CustomListsFocus::Rules] {
-        let mut app = App::new();
+        let mut app = App::known_standalone_for_test();
         app.active_leaf = Leaf::CustomLists;
         app.custom_lists.focus = focus;
         let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
@@ -129,19 +129,19 @@ fn every_key_the_custom_lists_footer_advertises_is_bound() {
             line.push_str(buf[(x, 0)].symbol());
         }
 
-        // `[k] label` is the footer's only key vocabulary (`key_span`).
-        // The token is read WHOLE rather than as one character: a
-        // single-char scan silently skips `[Esc]`, and skipping is how
-        // a guard develops a blind spot exactly where a longer key name
-        // lives.
-        for token in line
-            .split('[')
-            .skip(1)
-            .filter_map(|rest| rest.split_once(']').map(|(k, _)| k))
-        {
-            // The global cluster (r/p/s/?/q) is handled outside the
-            // leaf, so it is out of scope here.
-            if token.len() == 1 && "rps?q".contains(token) {
+        // Read highlighted key cells from the actual rendered footer. The
+        // accepted design uses background cells instead of bracket glyphs.
+        let mut key_cells = String::new();
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, 0)];
+            if cell.bg == crate::tui::theme::T.bg_highlight {
+                key_cells.push_str(cell.symbol());
+            } else {
+                key_cells.push(' ');
+            }
+        }
+        for token in key_cells.split_whitespace() {
+            if ["Tab", "T", "r", "p", "s", "?", "q"].contains(&token) {
                 continue;
             }
             let Some(code) = key_for(token) else { continue };
@@ -171,7 +171,7 @@ fn the_rule_pane_legend_fits_eighty_columns() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::CustomLists;
     app.custom_lists.focus = CustomListsFocus::Rules;
     let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
@@ -183,12 +183,7 @@ fn the_rule_pane_legend_fits_eighty_columns() {
         line.push_str(buf[(x, 0)].symbol());
     }
 
-    for token in [
-        "[a] add rule",
-        "[e] edit rule",
-        "[d] remove rule",
-        "[Esc] lists",
-    ] {
+    for token in ["a add", "e edit", "d remove", "v lists"] {
         assert!(
             line.contains(token),
             "{token} is clipped or missing at 80 columns:\n{line}"

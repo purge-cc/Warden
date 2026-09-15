@@ -5,6 +5,7 @@ pub mod cache;
 pub mod cluster;
 pub mod completion;
 pub mod config;
+pub mod custom_list;
 pub mod devices;
 pub mod entity_tags;
 pub mod firewall_rules;
@@ -15,6 +16,7 @@ pub mod labels;
 pub mod lists;
 pub mod lists_knobs;
 pub mod local_dns;
+pub mod node;
 
 #[cfg(test)]
 pub(crate) mod hr2_test_support;
@@ -37,7 +39,7 @@ pub mod stop;
 pub mod subnets;
 pub mod target;
 pub mod token;
-pub mod toml_write;
+pub use crate::config::toml_write;
 pub mod update;
 
 /// Collapse the loader's `Vec<ConfigError>` into a bulleted `anyhow::Error`.
