@@ -7,6 +7,12 @@ prints at `/stable`. This tree's crate version is in `Cargo.toml`.
 
 - No user-visible changes recorded yet.
 
+## [0.42.0](docs/releases/0.42.0.md)
+
+- Warden Nodes policy and list synchronization (beta), a reworked
+  Dashboard and Query Log, transactional operator rules with automatic
+  configuration migration, and a round of TUI fixes.
+
 ## [0.41.0](docs/releases/0.41.0.md)
 
 - Safer list refreshes, cache publication, recovery, and bounded-memory
