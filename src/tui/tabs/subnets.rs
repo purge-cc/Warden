@@ -472,6 +472,7 @@ pub fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
     let height = area.height.saturating_sub(2).min(34);
     let mut inner =
         crate::tui::modal_form::render_chrome_in(f, area, 88, height, "", T.text_primary, true);
+    crate::tui::mouse::close_on_outside_click();
     if inner.is_empty() {
         return;
     }

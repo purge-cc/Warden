@@ -104,6 +104,7 @@ pub fn render_information(f: &mut Frame, area: Rect, app: &mut App) {
             (),
         )
     });
+    crate::tui::mouse::close_on_outside_click();
     info.scroll = rendered.view.offset;
     if rendered.inner.height > 0 {
         mouse::register_overlay(

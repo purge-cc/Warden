@@ -1488,31 +1488,30 @@ pub(super) async fn orphan_remove(app: &mut App, source: String, poller: &IpcPol
 pub(super) async fn query_rules(
     app: &mut App,
     modal: query_log_rule_modal::QueryLogRuleModal,
-    poller: &IpcPoller,
+    _poller: &IpcPoller,
     _path: &Path,
 ) {
-    let domain = modal.domain.clone();
     let action = if matches!(modal.action, crate::cli::commands::rules::Action::Allow) {
         crate::operator_rules::RuleAction::Allow
     } else {
         crate::operator_rules::RuleAction::Deny
     };
-    let ids = modal.selected_ids();
-    app.query_log_rule_modal = Some(modal);
-    crate::tui::operator_policy::open(
-        app,
-        poller,
-        crate::tui::operator_policy::PolicyOrigin::QueryRules {
-            ids: ids.clone(),
-            already_present: Vec::new(),
-        },
-        crate::tui::operator_policy::PolicyChange::QueryRules {
-            ids,
-            domain,
-            action,
-        },
-    )
-    .await;
+    match query_rule_batch::hold(app, &modal.domain, action, modal.selected_ids()) {
+        Ok(added) => {
+            app.query_log_rule_modal = None;
+            app.status_info(format!(
+                "{} held · {} total · not active yet · v to review and apply",
+                query_rule_batch::rule_count(added),
+                app.query_log.held.targets.len()
+            ));
+        }
+        Err(error) => {
+            let mut modal = modal;
+            modal.error = Some(error.clone());
+            app.query_log_rule_modal = Some(modal);
+            app.status_err(error);
+        }
+    }
 }
 
 pub(super) async fn query_new_list(

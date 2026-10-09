@@ -34,6 +34,10 @@ mod node_modal;
 #[cfg(feature = "cluster")]
 mod nodes;
 mod operator_policy;
+pub(crate) use operator_policy::relocate_recovery_settled;
+#[cfg(test)]
+#[path = "tests/outside_click_tests.rs"]
+mod outside_click_tests;
 mod overlay;
 mod reads;
 #[cfg(test)]
@@ -55,6 +59,7 @@ mod tui_port_interaction_tests;
 pub mod profile_modal;
 pub mod query_log_filter_modal;
 mod query_log_rule_modal;
+mod query_rule_batch;
 // Promoted to `pub mod` so the integration test
 // `tests/resolver_modal_global_hotkey.rs` can reach `ResolverModal` to
 // pin the open/close lifecycle that the global `s` hotkey relies on.
@@ -620,7 +625,11 @@ async fn handle_mouse(
     config_path: &Path,
 ) -> bool {
     let Some(action) = mouse::action(app, event) else {
-        app.mouse.clear_row_click();
+        // Mouse capture also reports releases and motion. Only another press
+        // ends a pending first click, or no double click could ever land.
+        if matches!(event.kind, crossterm::event::MouseEventKind::Down(_)) {
+            app.mouse.clear_row_click();
+        }
         return false;
     };
     if !matches!(
@@ -681,6 +690,10 @@ async fn handle_mouse(
         }
         mouse::MouseAction::OverlayField(index) => mouse_focus::field(app, index),
         mouse::MouseAction::OverlayChoice(index) => {
+            if app.query_log.held.review.is_some() {
+                query_rule_batch::pointer_row(app, index);
+                return false;
+            }
             if let Some(DeviceModal::Form(form)) = app.devices.modal.as_mut() {
                 if let Some(picker) = form.picker.as_mut() {
                     if index < picker.options.len() {
@@ -704,8 +717,12 @@ async fn handle_mouse(
             }
         }
         mouse::MouseAction::OverlayKey(key) => {
-            if let Some(modal) = app.query_log_rule_modal.as_mut() {
-                modal.focus_pointer_action(key.code);
+            query_rule_batch::pointer_key(app, key.code);
+            // The picker is hidden while the batch review or a policy dialog owns input.
+            if app.query_log.held.review.is_none() && app.operator_policy.is_none() {
+                if let Some(modal) = app.query_log_rule_modal.as_mut() {
+                    modal.focus_pointer_action(key.code);
+                }
             }
             return handle_key(app, key, poller, config_path).await;
         }
@@ -726,10 +743,12 @@ async fn handle_mouse(
                         Some((list.id, tabs::custom_lists::rule_row_key(row).to_owned()));
                     app.custom_lists.rules_table_state.select(Some(index));
                     let identity = format!("rule:{:?}", app.custom_lists.selected_row_ref);
-                    if app
-                        .mouse
-                        .row_click(Leaf::CustomLists, identity, std::time::Instant::now())
-                    {
+                    if app.mouse.row_click(
+                        Leaf::CustomLists,
+                        identity,
+                        event.row,
+                        std::time::Instant::now(),
+                    ) {
                         return handle_key(app, KeyCode::Enter.into(), poller, config_path).await;
                     }
                 }
@@ -773,12 +792,24 @@ async fn handle_mouse(
             }
         }
         mouse::MouseAction::Row(leaf, index) if leaf == app.active_leaf => {
-            select_mouse_row(app, leaf, index);
+            let now = std::time::Instant::now();
+            // New queries are prepended on every poll, so a refresh between
+            // the two presses slides another entry under a still pointer. A
+            // second press on the same screen row keeps the entry the first
+            // one chose while it is still listed.
+            let keep = leaf == Leaf::QueryLog
+                && app.mouse.repeats_row_click(leaf, event.row, now)
+                && app::resolve_row_index(
+                    &app.query_log.entries,
+                    app.query_log.selected_key.as_ref(),
+                    |entry| Some(tabs::query_log::entry_key(entry)),
+                )
+                .is_some();
+            if !keep {
+                select_mouse_row(app, leaf, index);
+            }
             if let Some(identity) = selected_mouse_identity(app, leaf) {
-                if app
-                    .mouse
-                    .row_click(leaf, identity, std::time::Instant::now())
-                {
+                if app.mouse.row_click(leaf, identity, event.row, now) {
                     return handle_key(app, KeyCode::Enter.into(), poller, config_path).await;
                 }
             }
@@ -931,8 +962,11 @@ fn is_save_key(key: KeyEvent) -> bool {
 
 /// Returns true if the app should quit.
 async fn handle_key(app: &mut App, key: KeyEvent, poller: &IpcPoller, config_path: &Path) -> bool {
+    if app.query_log.held.review == Some(query_rule_batch::Review::Quit) {
+        return query_rule_batch::handle_key(app, key, poller).await;
+    }
     if let Some(quit) = actions::handle_busy_key(app, key) {
-        return quit;
+        return quit && query_rule_batch::request_quit(app);
     }
     let socket = poller.socket_path().to_owned();
     handle_key_with_reload(app, key, poller, config_path, async move {
@@ -999,11 +1033,15 @@ async fn handle_key_with_reload(
         return false;
     }
 
+    if app.query_log.held.review.is_some() {
+        return query_rule_batch::handle_key(app, key, poller).await;
+    }
+
     if app.operator_policy.is_some()
         && (key.code == KeyCode::Char('q')
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
     {
-        return true;
+        return query_rule_batch::request_quit(app);
     }
     // Keep the accepted request and its underlying draft intact while moving
     // between screens. A navigation key must never edit the hidden form.
@@ -1199,6 +1237,17 @@ async fn handle_key_with_reload(
 
     // Read-only detail overlays are modal surfaces too: global navigation
     // must not move them onto another leaf or let an underlying action fire.
+    // One whose row is gone draws nothing and the mouse already treats it as
+    // closed, so drop it first and let the key reach the tab.
+    if app.active_leaf == Leaf::Profiles && tabs::profiles::info_row(app).is_none() {
+        app.profiles.info_open = false;
+    }
+    if app.active_leaf == Leaf::Lists && tabs::lists::detail_row(app).is_none() {
+        app.lists.detail_id = None;
+    }
+    if app.active_leaf == Leaf::CustomLists && !tabs::custom_lists::info_drawn(app) {
+        app.custom_lists.info = None;
+    }
     if app.active_leaf == Leaf::Profiles && app.profiles.info_open {
         handle_profiles_key(app, key);
         return false;
@@ -1384,7 +1433,9 @@ async fn handle_key_with_reload(
                 app.show_help = false;
                 return false;
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return query_rule_batch::request_quit(app)
+            }
             _ => {
                 app.show_help = false;
                 true
@@ -1440,8 +1491,10 @@ async fn handle_key_with_reload(
     }
     if !mnemonic_dispatched {
         match key.code {
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Char('q') => return query_rule_batch::request_quit(app),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return query_rule_batch::request_quit(app)
+            }
             // Numeric 1-5 jumps to the
             // section's default leaf. 6-9 are dropped (no handler).
             // Dashboard and Query Log are their own
@@ -3350,6 +3403,13 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
         // explaining why.
         KeyCode::Enter => {
             if let Some(modal) = build_query_log_rule_modal(app) {
+                // A paused poller would otherwise never load a missing catalog.
+                if let (None, Some(read_jobs)) = (&app.operator_catalog, &mut app.read_jobs) {
+                    read_jobs.request(
+                        jobs::ReadRequest::OperatorCatalog,
+                        jobs::ReadReason::Explicit,
+                    );
+                }
                 app.query_log_rule_modal = Some(modal);
             } else {
                 app.status_info(footer_message_for_neutral_row(app).to_string());
@@ -3357,6 +3417,7 @@ fn handle_query_log_key(app: &mut App, key: KeyEvent) {
         }
         // Detail intentionally uses a free key. Enter stays the established
         // allow/block action for the focused row.
+        KeyCode::Char('v') => query_rule_batch::open_review(app),
         KeyCode::Char('i') => {
             if let Some(entry) = selected_query_log_entry(app).cloned() {
                 app.query_log.detail =
@@ -7708,7 +7769,11 @@ const MAX_PASTE: usize = 256;
 /// property: a pasted `y` can never confirm a destructive Remove, a pasted `q`
 /// can never quit.
 fn handle_paste(app: &mut App, pasted: String) {
-    if app.pending_action.is_some() {
+    // A dialog that owns input must not let a paste edit a hidden form behind it.
+    if app.pending_action.is_some()
+        || app.query_log.held.review.is_some()
+        || app.operator_policy.is_some()
+    {
         return;
     }
     let cleaned: String = pasted
@@ -7933,7 +7998,7 @@ fn focused_text_buffer(app: &mut App) -> Option<&mut String> {
     }
 
     // Devices form. Text only when not submitting, no picker is open, and the
-    // focused field accepts typing (Profile / Group are select-only).
+    // focused field accepts typing (select-only fields do not).
     if app.active_leaf == Leaf::Devices && app.devices.modal.is_some() {
         if let Some(DeviceModal::Form(form)) = app.devices.modal.as_mut() {
             // Focus on Cancel / Save has no buffer to paste into.
@@ -8815,8 +8880,8 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
                     app.devices.modal = Some(DeviceModal::Form(form));
                 }
                 KeyCode::Char(c) => {
-                    // Profile / Group are select-only — typing does nothing;
-                    // Enter opens their picker instead. Buttons ignore it.
+                    // Select-only fields ignore typing; Enter opens their
+                    // picker instead. Buttons ignore it.
                     if let Some(focused) = form.focused.field() {
                         if field_accepts_typing(&form, focused) {
                             form.field_buf(focused).push(c);
@@ -8832,7 +8897,7 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent, poller: &IpcPoller) {
                     // and decides whether to put the modal back (with an
                     // error message) or close it (success).
                     DeviceFormFocus::Save => submit_form(app, form, poller).await,
-                    // Profile / Group → open the popup picker instead of
+                    // A select-only field opens the popup picker instead of
                     // submitting.
                     DeviceFormFocus::Field(f) if is_select_only_field(&form, f) => {
                         open_field_picker(&mut form);
@@ -10269,6 +10334,12 @@ fn build_query_log_rule_modal(app: &App) -> Option<query_log_rule_modal::QueryLo
         custom_list_rows(app),
     )?;
     if app.operator_catalog.is_none() {
+        modal.catalog_state = if app.operator_catalog_error.is_some() {
+            query_log_rule_modal::CatalogState::Unavailable
+        } else {
+            query_log_rule_modal::CatalogState::Loading
+        };
+        modal.focus = 1;
         modal.error = Some(app.operator_catalog_error.clone().unwrap_or_else(|| {
             "Custom List catalog is loading. Close and reopen after it becomes available.".into()
         }));
@@ -10325,8 +10396,8 @@ fn footer_message_for_neutral_row(app: &App) -> &'static str {
     }
 }
 
-/// Drive the picker's state machine on each keypress. On confirm writes
-/// every marked pack, then `attempt_reload` to push the change live.
+/// Drive the picker's state machine. Enter holds the marked rules in the
+/// session batch; New List keeps its separate policy workflow.
 async fn handle_query_log_rule_modal_key(
     app: &mut App,
     key: KeyEvent,
@@ -10340,8 +10411,13 @@ async fn handle_query_log_rule_modal_key(
     use query_log_rule_modal::Stage;
 
     match &modal.stage {
-        Stage::Done(_) => match key.code {
-            KeyCode::Esc | KeyCode::Enter => {}
+        Stage::Done(_) | Stage::ErrorDetails => match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                if matches!(modal.stage, Stage::ErrorDetails) {
+                    modal.stage = Stage::Picking;
+                    app.query_log_rule_modal = Some(modal);
+                }
+            }
             KeyCode::Up
             | KeyCode::Down
             | KeyCode::PageUp
@@ -10365,6 +10441,19 @@ async fn handle_query_log_rule_modal_key(
             handle_query_log_new_list_key(app, modal, key, poller, config_path).await;
         }
         Stage::Picking => match key.code {
+            KeyCode::Char('e') if modal.error.is_some() => {
+                modal.stage = Stage::ErrorDetails;
+                modal.report_scroll = 0;
+                app.query_log_rule_modal = Some(modal);
+            }
+            KeyCode::Enter
+                if modal.long_error()
+                    && modal.focus == if modal.rows.is_empty() { 2 } else { 4 } =>
+            {
+                modal.stage = Stage::ErrorDetails;
+                modal.report_scroll = 0;
+                app.query_log_rule_modal = Some(modal);
+            }
             KeyCode::Esc => {}
             KeyCode::Tab => {
                 modal.focus_next();
@@ -10555,8 +10644,8 @@ async fn submit_query_log_new_list(
     action_handlers::query_new_list(app, resolved, poller, config_path).await;
 }
 
-/// Submit one versioned operator batch for all marked lists. The policy dialog
-/// owns planning, receipt display and exact-request recovery.
+/// Hold the picked rule for every marked list. Nothing is applied here: the
+/// held rules are reviewed with `v` and applied together as one batch.
 async fn submit_query_log_rule_modal(
     app: &mut App,
     modal: query_log_rule_modal::QueryLogRuleModal,
@@ -10855,10 +10944,10 @@ async fn handle_local_dns_modal_key(
                 KeyCode::Char('y') | KeyCode::Char('Y') if !typed => {
                     submit_local_dns_modal(app, modal, poller, config_path).await;
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    // Drop the modal — handler returned without
-                    // re-stashing closes it.
-                }
+                // Drop the modal — handler returned without re-stashing
+                // closes it. In the typed tier `n` is a letter of the phrase.
+                KeyCode::Char('n' | 'N') if !typed => {}
+                KeyCode::Esc => {}
                 KeyCode::Enter if rc.focus == cancel => {}
                 // Typed-phrase tier: collect chars; Enter submits when
                 // the buffer matches the domain.
@@ -11448,8 +11537,9 @@ fn device_form_option_lists(app: &App) -> (Vec<String>, Vec<String>) {
 }
 
 /// True for the device-form fields chosen from a popup picker rather than
-/// typed (Profile / Group). Selection-only fields ignore Char / Backspace
-/// and open the picker on Enter.
+/// typed: Profile and Group always, the metadata fields once their kind has
+/// labels. Selection-only fields ignore Char / Backspace and open the picker
+/// on Enter or a click.
 fn is_select_only_field(form: &DeviceFormState, field: DeviceFormField) -> bool {
     match field {
         // Always picker-driven: their option lists come from entities that
@@ -11473,8 +11563,7 @@ fn is_select_only_field(form: &DeviceFormState, field: DeviceFormField) -> bool 
 }
 
 /// Whether the focused field accepts typed characters (Backspace / Char).
-/// False for select-only fields (Profile / Group) and for a Promote form's
-/// ARP-locked IP.
+/// False for select-only fields and for a Promote form's ARP-locked IP.
 fn field_accepts_typing(form: &DeviceFormState, field: DeviceFormField) -> bool {
     !(is_select_only_field(form, field) || form.is_locked(field))
 }

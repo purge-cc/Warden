@@ -518,6 +518,7 @@ struct CapturingHandler {
     /// TTL, and its owner name. Kept on this handler rather than in a
     /// second recorder so every existing assertion keeps working.
     captured_answers: Arc<Mutex<Vec<Record>>>,
+    captured_authorities: Arc<Mutex<Vec<Record>>>,
     /// §4.10-4b — the AD (authentic-data) bit, captured so the DNSSEC wire
     /// tests can assert it lands on (and only on) the answers we validated.
     #[cfg(feature = "dnssec")]
@@ -532,6 +533,7 @@ impl CapturingHandler {
             captured_aa: Arc::new(Mutex::new(None)),
             captured_name_server_count: Arc::new(Mutex::new(0)),
             captured_answers: Arc::new(Mutex::new(Vec::new())),
+            captured_authorities: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "dnssec")]
             captured_ad: Arc::new(Mutex::new(None)),
         }
@@ -550,6 +552,9 @@ impl CapturingHandler {
     }
     fn answers(&self) -> Vec<Record> {
         self.captured_answers.lock().unwrap().clone()
+    }
+    fn authorities(&self) -> Vec<Record> {
+        self.captured_authorities.lock().unwrap().clone()
     }
     #[cfg(feature = "dnssec")]
     fn ad(&self) -> Option<bool> {
@@ -586,6 +591,7 @@ impl ResponseHandler for CapturingHandler {
         *self.captured_rcode.lock().unwrap() = Some(parsed.metadata.response_code);
         *self.captured_answer_count.lock().unwrap() = parsed.answers.len() as u16;
         *self.captured_answers.lock().unwrap() = parsed.answers.clone();
+        *self.captured_authorities.lock().unwrap() = parsed.authorities.clone();
         *self.captured_aa.lock().unwrap() = Some(parsed.metadata.authoritative);
         *self.captured_name_server_count.lock().unwrap() = parsed.authorities.len() as u16;
         #[cfg(feature = "dnssec")]
@@ -648,7 +654,7 @@ async fn send_cached_sets_ad_when_authentic() {
     let req = test_request();
     let entry = one_a_entry();
     let mut h = CapturingHandler::new();
-    send_cached(&req, &entry, true, false, &mut h).await;
+    send_cached(&req, &entry, true, None, &mut h).await;
     assert_eq!(h.ad(), Some(true), "authentic=true must set the AD bit");
     assert_eq!(h.rcode(), Some(ResponseCode::NoError));
     assert_eq!(h.answer_count(), 1);
@@ -660,7 +666,7 @@ async fn send_cached_clears_ad_when_not_authentic() {
     let req = test_request();
     let entry = one_a_entry();
     let mut h = CapturingHandler::new();
-    send_cached(&req, &entry, false, false, &mut h).await;
+    send_cached(&req, &entry, false, None, &mut h).await;
     assert_eq!(h.ad(), Some(false), "authentic=false must leave AD clear");
     assert_eq!(h.rcode(), Some(ResponseCode::NoError));
 }
@@ -674,13 +680,53 @@ async fn send_cached_rewritten_never_sets_ad() {
     let req = test_request();
     let entry = one_a_entry();
     let mut h = CapturingHandler::new();
-    send_cached(&req, &entry, true, true, &mut h).await;
+    send_cached(
+        &req,
+        &entry,
+        true,
+        Some(&Name::from_ascii("a.example.com.").unwrap()),
+        &mut h,
+    )
+    .await;
     assert_eq!(
         h.ad(),
         Some(false),
         "a rewritten answer is fronted by an unsigned synthesized CNAME — \
          it must never carry AD, even when the validator said Secure"
     );
+}
+
+#[cfg(feature = "dnssec")]
+#[tokio::test]
+async fn negative_cname_ad_only_on_authenticated_nonrewrite_answer() {
+    let req = net_name_request("original.example", RecordType::A);
+    let entry = crate::dns::cache::CacheEntry::for_test(
+        vec![cname_record("target.example.", "clean.example.", 20)],
+        ResponseCode::NXDomain,
+    );
+    let mut nonrewrite = CapturingHandler::new();
+    send_cached(&req, &entry, true, None, &mut nonrewrite).await;
+    assert_eq!(nonrewrite.ad(), Some(true));
+    assert_eq!(nonrewrite.rcode(), Some(ResponseCode::NXDomain));
+    assert_eq!(nonrewrite.answers().len(), 1);
+
+    let mut rewrite = CapturingHandler::new();
+    send_cached(
+        &req,
+        &entry,
+        true,
+        Some(&Name::from_ascii("target.example.").unwrap()),
+        &mut rewrite,
+    )
+    .await;
+    assert_eq!(rewrite.ad(), Some(false));
+    assert_eq!(rewrite.rcode(), Some(ResponseCode::NXDomain));
+    assert_eq!(rewrite.answers().len(), 2);
+    assert_eq!(
+        rewrite.answers()[0].data,
+        RData::CNAME(CNAME(Name::from_ascii("target.example.").unwrap()))
+    );
+    assert_eq!(rewrite.authorities().len(), 1);
 }
 
 #[tokio::test]
@@ -910,7 +956,7 @@ async fn cached_nxdomain_response_includes_soa_in_authority() {
 
     let req = test_request();
     let mut handler = CapturingHandler::new();
-    send_cached(&req, &entry, false, false, &mut handler).await;
+    send_cached(&req, &entry, false, None, &mut handler).await;
 
     assert_eq!(handler.rcode(), Some(ResponseCode::NXDomain));
     assert_eq!(
@@ -1047,7 +1093,7 @@ async fn cached_nodata_response_includes_soa_in_authority() {
 
     let req = test_request();
     let mut handler = CapturingHandler::new();
-    send_cached(&req, &entry, false, false, &mut handler).await;
+    send_cached(&req, &entry, false, None, &mut handler).await;
 
     assert_eq!(handler.rcode(), Some(ResponseCode::NoError));
     assert_eq!(
@@ -2481,11 +2527,21 @@ fn operator_rules_handler(
     cache: DnsCache,
     pack: &str,
 ) -> ForwardHandler {
-    operator_rules_handler_with_rewrite_and_filter(
+    operator_rules_handler_with_depth(upstream, cache, pack, 16)
+}
+
+fn operator_rules_handler_with_depth(
+    upstream: Arc<FixedResponseUpstream>,
+    cache: DnsCache,
+    pack: &str,
+    depth: usize,
+) -> ForwardHandler {
+    operator_rules_handler_with_rewrite_and_filter_depth(
         upstream,
         cache,
         pack,
         Arc::new(FilterEngine::new()),
+        depth,
     )
 }
 
@@ -2494,6 +2550,16 @@ fn operator_rules_handler_with_rewrite_and_filter(
     cache: DnsCache,
     pack: &str,
     filter: Arc<FilterEngine>,
+) -> ForwardHandler {
+    operator_rules_handler_with_rewrite_and_filter_depth(upstream, cache, pack, filter, 16)
+}
+
+fn operator_rules_handler_with_rewrite_and_filter_depth(
+    upstream: Arc<FixedResponseUpstream>,
+    cache: DnsCache,
+    pack: &str,
+    filter: Arc<FilterEngine>,
+    depth: usize,
 ) -> ForwardHandler {
     ForwardHandler::new(
         upstream,
@@ -2515,8 +2581,475 @@ fn operator_rules_handler_with_rewrite_and_filter(
         60,
         None,
         0.0,
-        16,
+        depth,
     )
+}
+
+fn assert_rewrite_wire_answers(sink: &CapturingHandler, upstream_answers: &[Record]) {
+    assert_eq!(sink.rcode(), Some(ResponseCode::NoError));
+    let answers = sink.answers();
+    if upstream_answers.is_empty() {
+        assert!(
+            answers.is_empty(),
+            "empty upstream answer must not gain a bridge"
+        );
+        return;
+    }
+    assert_eq!(answers.len(), upstream_answers.len() + 1, "{answers:?}");
+    assert_eq!(
+        answers[0].name,
+        Name::from_ascii("original.example.").unwrap()
+    );
+    assert_eq!(
+        answers[0].data,
+        RData::CNAME(CNAME(Name::from_ascii("target.example.").unwrap())),
+        "the bridge must point to the checked rewrite destination, not an upstream owner",
+    );
+    assert!(answers[0].ttl <= answers[1].ttl);
+    for (served, upstream) in answers[1..].iter().zip(upstream_answers) {
+        assert_eq!(served.name, upstream.name);
+        assert_eq!(served.data, upstream.data);
+        assert!(served.ttl <= upstream.ttl);
+    }
+}
+
+#[tokio::test]
+async fn rewrite_bridge_ignores_unchecked_first_owner_on_fetch_and_warm_cache() {
+    let scenarios = [
+        (
+            "unrelated first owner",
+            vec![
+                a_record("unrelated.example.", 60),
+                rewritten_target_record(RecordType::A),
+            ],
+            "",
+        ),
+        (
+            "denied first owner",
+            vec![
+                a_record("denied.example.", 60),
+                rewritten_target_record(RecordType::A),
+            ],
+            "denied.example",
+        ),
+        (
+            "reordered chain",
+            vec![
+                a_record("hop.example.", 60),
+                cname_record("target.example.", "hop.example.", 60),
+            ],
+            "",
+        ),
+        (
+            "multi-hop chain",
+            vec![
+                a_record("last.example.", 60),
+                cname_record("middle.example.", "last.example.", 60),
+                cname_record("target.example.", "middle.example.", 60),
+            ],
+            "",
+        ),
+        ("empty answer", Vec::new(), ""),
+    ];
+    for (label, records, pack) in scenarios {
+        let upstream = Arc::new(FixedResponseUpstream::new(
+            records.clone(),
+            ResponseCode::NoError,
+        ));
+        let handler = operator_rules_handler(
+            Arc::clone(&upstream),
+            DnsCache::new(&cache_test_config()),
+            pack,
+        );
+        let fresh = query_handler(&handler, "original.example", RecordType::A).await;
+        assert_eq!(upstream.calls(), 1, "{label}: fresh fetch");
+        assert_rewrite_wire_answers(&fresh, &records);
+        let warm = query_handler(&handler, "original.example", RecordType::A).await;
+        assert_eq!(
+            upstream.calls(),
+            1,
+            "{label}: warm cache must avoid upstream"
+        );
+        assert_rewrite_wire_answers(&warm, &records);
+    }
+}
+
+#[tokio::test]
+async fn rewrite_composed_chain_rejects_return_to_original_on_fetch_and_cache() {
+    for (label, records, pack, depth, blocked) in [
+        (
+            "direct cycle",
+            vec![cname_record("target.example.", "original.example.", 60)],
+            "",
+            16,
+            true,
+        ),
+        (
+            "reordered mixed-case multihop cycle with original grant",
+            vec![
+                cname_record("MiDdLe.example.", "OrIgInAl.ExAmPlE.", 60),
+                cname_record("TaRgEt.ExAmPlE.", "middle.example.", 60),
+            ],
+            "@@original.example",
+            16,
+            true,
+        ),
+        (
+            "single upstream hop at effective depth one",
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            "",
+            1,
+            true,
+        ),
+        (
+            "single upstream hop at effective depth two",
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            "",
+            2,
+            false,
+        ),
+        (
+            "disjoint return-to-original decoy",
+            vec![
+                cname_record("decoy.example.", "ORIGINAL.example.", 60),
+                cname_record("target.example.", "clean.example.", 60),
+                a_record("clean.example.", 60),
+            ],
+            "",
+            16,
+            false,
+        ),
+        (
+            "benign chain",
+            vec![
+                cname_record("target.example.", "middle.example.", 60),
+                a_record("middle.example.", 60),
+            ],
+            "",
+            16,
+            false,
+        ),
+    ] {
+        let upstream = Arc::new(FixedResponseUpstream::new(
+            records.clone(),
+            ResponseCode::NoError,
+        ));
+        let handler = operator_rules_handler_with_depth(
+            Arc::clone(&upstream),
+            DnsCache::new(&cache_test_config()),
+            pack,
+            depth,
+        );
+        for attempt in 0..2 {
+            let response = query_handler(&handler, "original.example", RecordType::A).await;
+            assert_eq!(response.rcode(), Some(ResponseCode::NoError), "{label}");
+            if blocked {
+                assert_eq!(
+                    response.answer_count(),
+                    1,
+                    "{label}: no cyclic bridge may be sent"
+                );
+                assert_eq!(
+                    response.answers()[0].data,
+                    RData::A(A(Ipv4Addr::UNSPECIFIED)),
+                    "{label}: the only answer must be the canned 0.0.0.0, not a CNAME"
+                );
+            } else {
+                assert_rewrite_wire_answers(&response, &records);
+            }
+            assert_eq!(
+                upstream.calls(),
+                if blocked { attempt + 1 } else { 1 },
+                "{label}: blocked entries are invalidated, benign entries cached"
+            );
+        }
+    }
+}
+
+struct FailingResponseUpstream {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Upstream for FailingResponseUpstream {
+    async fn lookup(
+        &self,
+        _name: &Name,
+        _record_type: RecordType,
+        _ecs: Option<crate::dns::edns::EdnsClientSubnet>,
+    ) -> Result<crate::upstream::UpstreamResponse, DnsError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(DnsError::UpstreamRequestFailed("fixture failure".into()))
+    }
+}
+
+#[tokio::test]
+async fn rewrite_bridge_ignores_unchecked_first_owner_on_stale_fallback() {
+    for (records, pack) in [
+        (
+            vec![
+                a_record("unrelated.example.", 60),
+                rewritten_target_record(RecordType::A),
+            ],
+            "",
+        ),
+        (
+            vec![
+                a_record("denied.example.", 60),
+                rewritten_target_record(RecordType::A),
+            ],
+            "denied.example",
+        ),
+        (
+            vec![
+                a_record("hop.example.", 60),
+                cname_record("target.example.", "hop.example.", 60),
+            ],
+            "",
+        ),
+        (Vec::new(), ""),
+    ] {
+        let mut cfg = cache_test_config();
+        cfg.min_ttl_secs = 1;
+        cfg.max_ttl_secs = 1;
+        let cache = DnsCache::new(&cfg);
+        cache
+            .insert(
+                "target.example",
+                RecordType::A,
+                DNSClass::IN,
+                records.clone(),
+                ResponseCode::NoError,
+                None,
+                None,
+            )
+            .await;
+        let upstream = Arc::new(FailingResponseUpstream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = ForwardHandler::new(
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::new(FilterEngine::new()),
+            cache.clone(),
+            Some(resolver_with_pack_and_rewrite(
+                pack,
+                vec![crate::config::settings::RewriteRule {
+                    from: "original.example".into(),
+                    to: "target.example".into(),
+                    match_subdomains: false,
+                }],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            None,
+            0.0,
+            16,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            matches!(
+                cache
+                    .lookup("target.example", RecordType::A, DNSClass::IN, None)
+                    .await,
+                CacheLookup::Stale(_)
+            ),
+            "fixture must be stale"
+        );
+        let stale = query_handler(&handler, "original.example", RecordType::A).await;
+        assert_eq!(
+            upstream.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stale path must attempt upstream"
+        );
+        assert_rewrite_wire_answers(&stale, &records);
+    }
+}
+
+#[tokio::test]
+async fn rewrite_composed_chain_rejects_warm_cached_cycle_and_counts_bridge_depth() {
+    for (records, depth, blocked) in [
+        (
+            vec![cname_record("target.example.", "ORIGINAL.example.", 60)],
+            16,
+            true,
+        ),
+        (
+            vec![
+                cname_record("MiDdLe.example.", "OrIgInAl.ExAmPlE.", 60),
+                cname_record("TaRgEt.ExAmPlE.", "middle.example.", 60),
+            ],
+            16,
+            true,
+        ),
+        (
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            1,
+            true,
+        ),
+        (
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            2,
+            false,
+        ),
+    ] {
+        let cache = DnsCache::new(&cache_test_config());
+        cache
+            .insert(
+                "target.example",
+                RecordType::A,
+                DNSClass::IN,
+                records.clone(),
+                ResponseCode::NoError,
+                None,
+                None,
+            )
+            .await;
+        let upstream = Arc::new(FixedResponseUpstream::new(vec![], ResponseCode::NoError));
+        let handler = ForwardHandler::new(
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::new(FilterEngine::new()),
+            cache,
+            Some(resolver_with_pack_and_rewrite(
+                "@@original.example",
+                vec![crate::config::settings::RewriteRule {
+                    from: "original.example".into(),
+                    to: "target.example".into(),
+                    match_subdomains: false,
+                }],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            None,
+            0.0,
+            depth,
+        );
+        let response = query_handler(&handler, "original.example", RecordType::A).await;
+        assert_eq!(upstream.calls(), 0, "fixture must be a warm cache hit");
+        assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+        if blocked {
+            assert_eq!(
+                response.answer_count(),
+                1,
+                "cycle or effective depth excess must block"
+            );
+            assert_eq!(
+                response.answers()[0].data,
+                RData::A(A(Ipv4Addr::UNSPECIFIED)),
+                "the only answer must be the canned 0.0.0.0, not a CNAME"
+            );
+        } else {
+            assert_rewrite_wire_answers(&response, &records);
+        }
+    }
+}
+
+#[tokio::test]
+async fn rewrite_composed_chain_rejects_return_to_original_on_stale_fallback() {
+    for (records, pack, depth, blocked) in [
+        (
+            vec![cname_record("target.example.", "ORIGINAL.example.", 60)],
+            "",
+            16,
+            true,
+        ),
+        (
+            vec![
+                cname_record("middle.example.", "original.example.", 60),
+                cname_record("target.example.", "MIDDLE.example.", 60),
+            ],
+            "@@original.example",
+            16,
+            true,
+        ),
+        (
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            "",
+            1,
+            true,
+        ),
+        (
+            vec![cname_record("target.example.", "clean.example.", 60)],
+            "",
+            2,
+            false,
+        ),
+        (
+            vec![
+                cname_record("decoy.example.", "original.example.", 60),
+                cname_record("target.example.", "clean.example.", 60),
+            ],
+            "",
+            16,
+            false,
+        ),
+    ] {
+        let mut cfg = cache_test_config();
+        cfg.min_ttl_secs = 1;
+        cfg.max_ttl_secs = 1;
+        let cache = DnsCache::new(&cfg);
+        cache
+            .insert(
+                "target.example",
+                RecordType::A,
+                DNSClass::IN,
+                records.clone(),
+                ResponseCode::NoError,
+                None,
+                None,
+            )
+            .await;
+        let upstream = Arc::new(FailingResponseUpstream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = ForwardHandler::new(
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::new(FilterEngine::new()),
+            cache,
+            Some(resolver_with_pack_and_rewrite(
+                pack,
+                vec![crate::config::settings::RewriteRule {
+                    from: "original.example".into(),
+                    to: "target.example".into(),
+                    match_subdomains: false,
+                }],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            None,
+            0.0,
+            depth,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let response = query_handler(&handler, "original.example", RecordType::A).await;
+        assert_eq!(upstream.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+        if blocked {
+            assert_eq!(
+                response.answer_count(),
+                1,
+                "cyclic stale response must be blocked"
+            );
+            assert_eq!(
+                response.answers()[0].data,
+                RData::A(A(Ipv4Addr::UNSPECIFIED)),
+                "the only answer must be the canned 0.0.0.0, not a CNAME"
+            );
+        } else {
+            assert_rewrite_wire_answers(&response, &records);
+        }
+    }
 }
 
 #[test]
@@ -2798,6 +3331,14 @@ async fn cached_nxdomain_cname_target_blocks_before_serving_the_entry() {
         1,
         "the cached entry must be blocked"
     );
+    assert_eq!(
+        response.answers()[0].data,
+        RData::A(A(Ipv4Addr::UNSPECIFIED))
+    );
+    assert!(
+        response.authorities().is_empty(),
+        "no negative SOA on canned block"
+    );
     assert!(matches!(
         cache
             .lookup("alias.example", RecordType::A, DNSClass::IN, None)
@@ -2806,28 +3347,365 @@ async fn cached_nxdomain_cname_target_blocks_before_serving_the_entry() {
     ));
 }
 
+fn assert_negative_wire(
+    sink: &CapturingHandler,
+    rcode: ResponseCode,
+    expected: &[Record],
+    max_ttl: u32,
+) {
+    assert_eq!(sink.rcode(), Some(rcode));
+    assert_eq!(sink.aa(), Some(false));
+    let answers = sink.answers();
+    assert_eq!(answers.len(), expected.len(), "answer section: {answers:?}");
+    for (actual, original) in answers.iter().zip(expected) {
+        assert_eq!(actual.name, original.name);
+        assert_eq!(actual.data, original.data);
+        assert!(
+            (1..=max_ttl).contains(&actual.ttl),
+            "answer TTL: {actual:?}"
+        );
+    }
+    let authority = sink.authorities();
+    assert_eq!(
+        authority.len(),
+        1,
+        "negative response needs one SOA: {authority:?}"
+    );
+    let soa = &authority[0];
+    assert_eq!(soa.name, *blocked_soa_zone());
+    let RData::SOA(data) = &soa.data else {
+        panic!("expected synthesized SOA: {soa:?}");
+    };
+    assert!((1..=max_ttl).contains(&soa.ttl), "SOA TTL: {soa:?}");
+    assert_eq!(data.minimum, soa.ttl, "SOA negative-cache TTL");
+    for answer in &answers {
+        assert_eq!(
+            answer.ttl, soa.ttl,
+            "cached answers use remaining entry TTL"
+        );
+    }
+    #[cfg(feature = "dnssec")]
+    assert_eq!(
+        sink.ad(),
+        Some(false),
+        "unchecked upstream answers cannot claim AD"
+    );
+}
+
 #[tokio::test]
 async fn cached_nxdomain_cname_without_policy_hit_preserves_its_rcode() {
+    // A nonempty NXDOMAIN takes the existing positive-record TTL selection:
+    // this 20s CNAME wins over the 60s configured negative floor. The
+    // synthesized SOA and retained answer share that remaining cache TTL.
+    let cname = cname_record("alias.example.", "clean.example.", 20);
     let upstream = Arc::new(FixedResponseUpstream::new(
-        vec![cname_record("alias.example.", "clean.example.", 60)],
+        vec![cname.clone()],
         ResponseCode::NXDomain,
     ));
     let handler = operator_rules_handler(
         Arc::clone(&upstream),
-        DnsCache::new(&crate::config::settings::CacheConfig::default()),
+        DnsCache::new(&cache_test_config()),
         "",
     );
 
     let first = query_handler(&handler, "alias.example", RecordType::A).await;
-    let second = query_handler(&handler, "alias.example", RecordType::A).await;
-
-    assert_eq!(
-        upstream.calls(),
-        1,
-        "the clean negative response must cache"
+    assert_eq!(upstream.calls(), 1, "fresh fetch");
+    assert_negative_wire(
+        &first,
+        ResponseCode::NXDomain,
+        std::slice::from_ref(&cname),
+        20,
     );
-    assert_eq!(first.rcode(), Some(ResponseCode::NXDomain));
-    assert_eq!(second.rcode(), Some(ResponseCode::NXDomain));
+    let second = query_handler(&handler, "alias.example", RecordType::A).await;
+    assert_eq!(upstream.calls(), 1, "warm hit must not fetch again");
+    assert_negative_wire(&second, ResponseCode::NXDomain, &[cname], 20);
+}
+
+#[tokio::test]
+async fn seeded_warm_negative_cname_preserves_rewrite_bridge_and_nodata_shape() {
+    for (rewrite, rcode, records, key, query) in [
+        (
+            false,
+            ResponseCode::NXDomain,
+            vec![cname_record("alias.example.", "clean.example.", 20)],
+            "alias.example",
+            "alias.example",
+        ),
+        (
+            true,
+            ResponseCode::NXDomain,
+            vec![cname_record("target.example.", "clean.example.", 20)],
+            "target.example",
+            "original.example",
+        ),
+        (
+            false,
+            ResponseCode::NXDomain,
+            vec![],
+            "alias.example",
+            "alias.example",
+        ),
+        (
+            true,
+            ResponseCode::NXDomain,
+            vec![],
+            "target.example",
+            "original.example",
+        ),
+        (
+            false,
+            ResponseCode::NoError,
+            vec![],
+            "alias.example",
+            "alias.example",
+        ),
+        (
+            true,
+            ResponseCode::NoError,
+            vec![],
+            "target.example",
+            "original.example",
+        ),
+    ] {
+        let cache = DnsCache::new(&cache_test_config());
+        cache
+            .insert(
+                key,
+                RecordType::A,
+                DNSClass::IN,
+                records.clone(),
+                rcode,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(
+            cache.lookup(key, RecordType::A, DNSClass::IN, None).await,
+            CacheLookup::Fresh(_)
+        ));
+        let upstream = Arc::new(FixedResponseUpstream::new(vec![], ResponseCode::ServFail));
+        let handler = operator_rules_handler(Arc::clone(&upstream), cache, "");
+        let response = query_handler(&handler, query, RecordType::A).await;
+        assert_eq!(upstream.calls(), 0, "seeded warm hit must not fetch");
+        let mut expected = records;
+        if rewrite && !expected.is_empty() {
+            expected.insert(0, cname_record("original.example.", "target.example.", 20));
+        }
+        assert_negative_wire(
+            &response,
+            rcode,
+            &expected,
+            if expected.is_empty() { 60 } else { 20 },
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_negative_cname_retains_answers_after_upstream_failure() {
+    for rewrite in [false, true] {
+        let mut config = cache_test_config();
+        config.negative_ttl_secs = 1;
+        config.max_ttl_secs = 1;
+        let cache = DnsCache::new(&config);
+        let key = if rewrite {
+            "target.example"
+        } else {
+            "alias.example"
+        };
+        let query = if rewrite {
+            "original.example"
+        } else {
+            "alias.example"
+        };
+        let cname = cname_record(&format!("{key}."), "clean.example.", 20);
+        cache
+            .insert(
+                key,
+                RecordType::A,
+                DNSClass::IN,
+                vec![cname.clone()],
+                ResponseCode::NXDomain,
+                None,
+                None,
+            )
+            .await;
+        let upstream = Arc::new(FailingResponseUpstream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = ForwardHandler::new(
+            Arc::clone(&upstream) as Arc<dyn Upstream>,
+            Arc::new(FilterEngine::new()),
+            cache.clone(),
+            Some(resolver_with_pack_and_rewrite(
+                "",
+                vec![crate::config::settings::RewriteRule {
+                    from: "original.example".into(),
+                    to: "target.example".into(),
+                    match_subdomains: false,
+                }],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            None,
+            0.0,
+            16,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            matches!(
+                cache.lookup(key, RecordType::A, DNSClass::IN, None).await,
+                CacheLookup::Stale(_)
+            ),
+            "fixture must be stale"
+        );
+        let response = query_handler(&handler, query, RecordType::A).await;
+        assert_eq!(
+            upstream.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stale route retries upstream"
+        );
+        let expected = if rewrite {
+            vec![
+                cname_record("original.example.", "target.example.", 20),
+                cname,
+            ]
+        } else {
+            vec![cname]
+        };
+        assert_negative_wire(&response, ResponseCode::NXDomain, &expected, 1);
+    }
+}
+
+#[tokio::test]
+async fn stale_negative_cname_denied_on_recheck_even_with_original_grant() {
+    let mut config = cache_test_config();
+    config.negative_ttl_secs = 1;
+    config.max_ttl_secs = 1;
+    let cache = DnsCache::new(&config);
+    cache
+        .insert(
+            "target.example",
+            RecordType::A,
+            DNSClass::IN,
+            vec![cname_record("target.example.", "denied.example.", 20)],
+            ResponseCode::NXDomain,
+            None,
+            None,
+        )
+        .await;
+    let upstream = Arc::new(FailingResponseUpstream {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let handler = ForwardHandler::new(
+        Arc::clone(&upstream) as Arc<dyn Upstream>,
+        Arc::new(FilterEngine::new()),
+        cache.clone(),
+        Some(resolver_with_pack_and_rewrite(
+            "@@original.example\ndenied.example$important",
+            vec![crate::config::settings::RewriteRule {
+                from: "original.example".into(),
+                to: "target.example".into(),
+                match_subdomains: false,
+            }],
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        60,
+        None,
+        0.0,
+        16,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert!(matches!(
+        cache
+            .lookup("target.example", RecordType::A, DNSClass::IN, None)
+            .await,
+        CacheLookup::Stale(_)
+    ));
+    let response = query_handler(&handler, "original.example", RecordType::A).await;
+    assert_eq!(upstream.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+    assert_eq!(response.answers().len(), 1);
+    assert_eq!(
+        response.answers()[0].data,
+        RData::A(A(Ipv4Addr::UNSPECIFIED))
+    );
+    assert!(matches!(
+        cache
+            .lookup("target.example", RecordType::A, DNSClass::IN, None)
+            .await,
+        CacheLookup::Miss
+    ));
+}
+
+#[tokio::test]
+async fn negative_cname_block_and_grant_still_inspect_before_send() {
+    for (pack, query, records, blocked) in [
+        (
+            "clean.example",
+            "alias.example",
+            vec![cname_record("alias.example.", "clean.example.", 20)],
+            true,
+        ),
+        (
+            "@@alias.example\nclean.example",
+            "alias.example",
+            vec![cname_record("alias.example.", "clean.example.", 20)],
+            false,
+        ),
+        (
+            "@@original.example",
+            "original.example",
+            vec![cname_record("target.example.", "original.example.", 20)],
+            true,
+        ),
+        (
+            "",
+            "original.example",
+            vec![cname_record("target.example.", "clean.example.", 20)],
+            false,
+        ),
+    ] {
+        let upstream = Arc::new(FixedResponseUpstream::new(
+            records.clone(),
+            ResponseCode::NXDomain,
+        ));
+        let handler = operator_rules_handler(
+            Arc::clone(&upstream),
+            DnsCache::new(&cache_test_config()),
+            pack,
+        );
+        for attempt in 1..=2 {
+            let response = query_handler(&handler, query, RecordType::A).await;
+            assert_eq!(
+                upstream.calls(),
+                if blocked { attempt } else { 1 },
+                "blocked entry evicted; accepted entry warm"
+            );
+            if blocked {
+                assert_eq!(response.rcode(), Some(ResponseCode::NoError));
+                assert_eq!(response.answers().len(), 1);
+                assert_eq!(
+                    response.answers()[0].data,
+                    RData::A(A(Ipv4Addr::UNSPECIFIED)),
+                    "no CNAME must escape"
+                );
+            } else {
+                let mut expected = records.clone();
+                if query == "original.example" {
+                    expected.insert(0, cname_record("original.example.", "target.example.", 20));
+                }
+                assert_negative_wire(&response, ResponseCode::NXDomain, &expected, 20);
+            }
+        }
+    }
 }
 
 /// A closed gate refuses every query with SERVFAIL, before the

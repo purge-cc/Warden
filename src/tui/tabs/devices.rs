@@ -1217,7 +1217,7 @@ pub(super) fn render_modal_overlay(f: &mut Frame, area: Rect, app: &App) {
     match modal {
         DeviceModal::Form(form) => {
             let anchor = render_form_modal(f, area, form);
-            // Popup radio picker (Profile / Group) drawn on top of the form
+            // Popup picker for a select-only field drawn on top of the form
             // while the operator is choosing a value.
             if let Some(picker) = form.picker.as_ref() {
                 render_field_picker_at(f, area, anchor, picker, form.picker_focus);
@@ -1263,6 +1263,7 @@ fn render_inspect_overlay(f: &mut Frame, area: Rect, app: &App) {
     };
     let height = area.height.saturating_sub(2).min(28);
     let inner = modal_form::render_chrome_in(f, area, 68, height, "", T.text_primary, true);
+    crate::tui::mouse::close_on_outside_click();
     let content = modal_form::render_header(f, inner, "DEVICE DETAILS", &subtitle);
     let content = modal_form::close_footer(f, content);
     detail_panel::render(
@@ -1285,7 +1286,7 @@ const MODAL_W: u16 = 68;
 /// actions already describe the available operation.
 const FORM_KEYS: &str = "";
 
-/// Placeholder for the two select-only rows. Carries the affordance the
+/// Placeholder for the select-only rows. Carries the affordance the
 /// retired grid drew as a right-aligned muted `[Enter]`: the ecosystem row
 /// vocabulary has no picker variant, and a suffix span appended after
 /// [`modal_form::value_row`] would overflow the value highlight. The focused
@@ -1398,9 +1399,9 @@ fn field_value(form: &DeviceFormState, field: DeviceFormField) -> &str {
 }
 
 /// Push one field's row, with its shape resolved from the form's mode and
-/// lock flags: locked (Promote's ip / mac) renders inert, the two
-/// select-only fields take focus but no caret, everything else is an
-/// editable text row that does take one.
+/// lock flags: locked (Promote's ip / mac) renders inert, select-only
+/// fields take focus but no caret, everything else is an editable text row
+/// that does take one.
 ///
 /// One call per field instead of the four parallel `if focused { … }`
 /// blocks the flat body needed — [`modal_form::FormRows`] cannot be handed
@@ -1449,11 +1450,11 @@ fn push_field(
         return;
     }
 
-    match field {
-        // Select-only: `Enter` opens a popup rather than accepting
+    if crate::tui::is_select_only_field(form, field) {
+        // Select-only: Enter or a click opens a popup rather than accepting
         // keystrokes, so the row takes focus but NOT the hardware cursor
         // — there is no insertion point to put it on.
-        DeviceFormField::Profile | DeviceFormField::Group => rows.field(
+        rows.field(
             modal_form::value_row_with_layout(
                 label,
                 value,
@@ -1465,8 +1466,9 @@ fn push_field(
             ),
             focused,
             hint,
-        ),
-        _ => rows.text_field(
+        )
+    } else {
+        rows.text_field(
             modal_form::value_row_with_layout(
                 label,
                 value,
@@ -1479,7 +1481,7 @@ fn push_field(
             focused,
             hint,
             crate::tui::text::width(value) as u16,
-        ),
+        )
     }
 }
 
@@ -1761,6 +1763,7 @@ fn render_delete_confirm(f: &mut Frame, area: Rect, name: &str, focus: usize) {
     modal_form::render_modal(f, area, MODAL_W, |w| {
         (modal_form::notice_body(&spec, w), ())
     });
+    crate::tui::mouse::close_on_outside_click();
 }
 
 fn delete_notice(name: &str, focus: usize) -> modal_form::NoticeSpec {

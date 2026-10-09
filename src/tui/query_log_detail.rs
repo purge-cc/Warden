@@ -131,6 +131,7 @@ pub(crate) fn render(f: &mut Frame, anchor: Rect, detail: &mut QueryLogDetail) {
     let rendered = modal_form::render_modal(f, anchor, W, |width| {
         detail_body(detail, width, scroll, visible_rows)
     });
+    crate::tui::mouse::close_on_outside_click();
     detail.visible_rows = u16::try_from(rendered.view.view_h.max(1)).unwrap_or(u16::MAX);
 }
 

@@ -451,6 +451,83 @@ async fn wait_pair(node: &Node, stage: &str) -> LifecycleStatus {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn primary_pack_only_reload_rebinds_without_fetching_sources() {
+    let (upstream, upstream_task) = upstream().await;
+    let primary = Node::new("primary", upstream);
+    let origin = Origin::new(&primary);
+    let mut config: ConfigV5 =
+        toml::from_str(&std::fs::read_to_string(&primary.master).unwrap()).unwrap();
+    config.blocklists.push(
+        toml::from_str("id=\"fixture\"\ndisplay_name=\"Isolated origin\"\nurl=\"https://imported.local/fixture.txt\"\ntrust=\"local\"\n")
+            .unwrap(),
+    );
+    write(
+        &primary.master,
+        toml::to_string_pretty(&config).unwrap().as_bytes(),
+    );
+    let creation = lifecycle::preview(
+        &primary.master,
+        LifecycleRequest::Create {
+            san: vec!["127.0.0.1".into()],
+            api_listen: Some(free_tcp()),
+            migrate_legacy: false,
+        },
+    )
+    .await
+    .unwrap();
+    lifecycle::apply(&primary.master, &creation.id)
+        .await
+        .unwrap();
+    let mut daemon = Daemon::spawn(&primary);
+    daemon.ready(&primary).await;
+    wait_dns(&primary, "list-initial.example.test", true).await;
+    wait_pair(&primary, "before pack-only reload").await;
+    let reads_before = origin.acquisitions();
+    let cycle_before = list_cycle(&primary).await.seq;
+    write(
+        &primary.root.path().join("packs/local.txt"),
+        b"||old-local.example.test^\n||policy-later.example.test^\n",
+    );
+    daemon.hup();
+    wait_dns(&primary, "policy-later.example.test", true).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let cycle = list_cycle(&primary).await;
+        if cycle.seq > cycle_before {
+            assert_eq!(
+                cycle.outcome,
+                Some(purge_warden::lists::status::CycleOutcome::SkippedUnchanged),
+                "pack-only reload rebuilt the external list corpus"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "primary reload did not complete");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        origin.acquisitions(),
+        reads_before,
+        "origin was fetched again"
+    );
+    daemon.stop().await;
+    upstream_task.abort();
+}
+
+async fn list_cycle(node: &Node) -> purge_warden::lists::status::CycleMark {
+    let response =
+        purge_warden::ipc::socket_client::send_command(&node.socket, &IpcCommand::Status)
+            .await
+            .unwrap();
+    match response {
+        IpcResponse::Status {
+            lists_cycle: Some(cycle),
+            ..
+        } => cycle,
+        response => panic!("primary list cycle unavailable: {response:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_nodes_pair_over_tls_replicate_policy_and_corpus_and_keep_dns_after_revocation_outage(
 ) {
     let (upstream, upstream_task) = upstream().await;

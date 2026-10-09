@@ -222,3 +222,61 @@ fn percentage_bars_keep_a_track_and_fractional_endpoint() {
         assert_eq!(buffer[(x, 0)].bg, T.border_default);
     }
 }
+
+#[test]
+fn block_rate_bars_follow_the_low_mid_high_legend() {
+    let anchor = 100 * HOUR_SECS + 1_800;
+    let render = |blocked: u64| {
+        let mut app = App::new();
+        app.tracking.hourly = (0..25)
+            .map(|i| bucket(anchor - i * HOUR_SECS, 100, blocked))
+            .collect();
+        let area = Rect::new(0, 0, 44, 13);
+        let mut buf = Buffer::empty(area);
+        render_block_rate(&mut buf, area, &app, anchor);
+        buf
+    };
+
+    let full = render(100);
+    let caption = line_text(&full, 2);
+    assert!(
+        caption.trim_end().ends_with("●low ●mid ●high"),
+        "legend must close the caption row: {caption}"
+    );
+    let marks: Vec<Color> = (0..44)
+        .filter(|x| full[(*x, 2)].symbol() == "●")
+        .map(|x| full[(x, 2)].fg)
+        .collect();
+    assert_eq!(marks, [T.gauge_low, T.gauge_mid, T.gauge_high]);
+
+    // The 1h bar sits on row 4, from x=3, 38 cells wide; the legend ends over
+    // its last cell.
+    assert_eq!(full[(40, 2)].symbol(), "h");
+    // The legend sits on the Summary subtitle band in the band's text colour.
+    assert_eq!(
+        full[(40, 2)].bg,
+        T.card_subtitle_bg(theme::CardRole::Summary)
+    );
+    assert_eq!(full[(40, 2)].fg, T.text_primary);
+    for (x, color) in [
+        (3, T.gauge_low),
+        (22, T.gauge_mid),
+        (33, T.gauge_high),
+        (40, T.gauge_critical),
+    ] {
+        assert_eq!(full[(x, 4)].symbol(), "█", "x={x}");
+        assert_eq!(full[(x, 4)].fg, color, "x={x}");
+    }
+
+    let half = render(50);
+    assert_eq!(half[(21, 4)].symbol(), "█");
+    assert_eq!(half[(21, 4)].fg, T.gauge_mid);
+    assert_eq!(half[(22, 4)].symbol(), "▒");
+    assert_eq!(half[(22, 4)].fg, T.border_default);
+
+    // The 24h bar (row 10) at 1.0% rounds to zero of 38 cells, but blocked
+    // queries still show one cell.
+    let tiny = render(1);
+    assert_eq!(tiny[(3, 10)].symbol(), "█");
+    assert_eq!(tiny[(4, 10)].symbol(), "▒");
+}

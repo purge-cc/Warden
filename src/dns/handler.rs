@@ -29,7 +29,7 @@ use crate::config::audit::{AuditEvent, AuditRecord, AuditResult, AuditWriter};
 use crate::config::cidr::{any_contains, Cidr};
 use crate::config::settings::SecurityConfig;
 use crate::filter::cname::{
-    evaluate_synthetic_cname_hop, walk_response_with_grant, BlockSource, Verdict,
+    evaluate_synthetic_cname_hop, walk_response_with_rewrite, BlockSource, Verdict,
 };
 use crate::filter::ip_filter::IpFilter;
 use crate::filter::FilterEngine;
@@ -547,19 +547,19 @@ impl ForwardHandler {
     /// out. A DNSSEC build in `mode = Off` leaves the response bytes
     /// byte-identical to baseline.
     ///
-    /// `rewrote` is `true` when a rewrite fired on this query; it
-    /// both suppresses the DNSSEC verdict (see below) and tells `send_cached` to
-    /// synthesize the CNAME bridge back to the original qname.
+    /// `rewrite_target` is the policy-checked destination when a rewrite fired;
+    /// it suppresses the DNSSEC verdict and anchors the synthesized CNAME bridge.
     #[cfg_attr(not(feature = "dnssec"), allow(clippy::unused_self))]
     async fn send_cached_validated(
         &self,
         request: &Request,
         entry: &super::cache::CacheEntry,
-        rewrote: bool,
+        rewrite_target: Option<&Name>,
         response_handle: &mut impl ResponseHandler,
     ) -> ResponseInfo {
         #[cfg(feature = "dnssec")]
         {
+            let rewrote = rewrite_target.is_some();
             let runtime_validator = entry.upstream_dnssec_validator();
             if let Some(validator) = runtime_validator
                 .as_deref()
@@ -599,13 +599,14 @@ impl ForwardHandler {
                         return send_servfail(request, response_handle).await
                     }
                     DnssecDecision::SetAd => {
-                        return send_cached(request, entry, true, rewrote, response_handle).await
+                        return send_cached(request, entry, true, rewrite_target, response_handle)
+                            .await
                     }
                     DnssecDecision::Serve => {}
                 }
             }
         }
-        send_cached(request, entry, false, rewrote, response_handle).await
+        send_cached(request, entry, false, rewrite_target, response_handle).await
     }
 
     /// Append a `cname_block` audit record off the hot path. The
@@ -1729,6 +1730,12 @@ impl ForwardHandler {
             }
         }
 
+        // Retain the checked destination across fresh, cached, and stale sends.
+        // Upstream answer owners and their ordering are not policy authority.
+        let rewrite_target = rewrote_from
+            .as_ref()
+            .map(|_| fwd_name_for(domain, true, name));
+
         // (The RRL check formerly here moved up next to the pre-query
         // security gate so blocked / local / unmapped-REFUSED responses
         // are rate-limited too. ACL and security refusals exit before it
@@ -1769,9 +1776,10 @@ impl ForwardHandler {
             // reach this site with `resolved_profile = Some(profile)`;
             // the `if let` is defensive.
             if let Some(profile_arc) = resolved_profile.as_ref() {
-                if let Verdict::Block { offending, source } = walk_response_with_grant(
+                if let Verdict::Block { offending, source } = walk_response_with_rewrite(
                     entry.records(),
                     domain,
+                    rewrote_from.as_deref(),
                     filter,
                     profile_arc.as_ref(),
                     runtime_grant.as_ref(),
@@ -1970,7 +1978,7 @@ impl ForwardHandler {
             }
 
             return Ok(self
-                .send_cached_validated(request, entry, rewrote_from.is_some(), response_handle)
+                .send_cached_validated(request, entry, rewrite_target.as_ref(), response_handle)
                 .await);
         }
 
@@ -2188,9 +2196,10 @@ impl ForwardHandler {
                     // `if let Some(profile)` for parity (the REFUSED
                     // early-return above guarantees `Some` at this site).
                     if let Some(profile_arc) = resolved_profile.as_ref() {
-                        if let Verdict::Block { offending, source } = walk_response_with_grant(
+                        if let Verdict::Block { offending, source } = walk_response_with_rewrite(
                             entry.records(),
                             domain,
+                            rewrote_from.as_deref(),
                             filter,
                             profile_arc.as_ref(),
                             runtime_grant.as_ref(),
@@ -2260,7 +2269,12 @@ impl ForwardHandler {
                 }
 
                 Ok(self
-                    .send_cached_validated(request, &entry, rewrote_from.is_some(), response_handle)
+                    .send_cached_validated(
+                        request,
+                        &entry,
+                        rewrite_target.as_ref(),
+                        response_handle,
+                    )
                     .await)
             }
             Err(FetchFailure { stale, error }) => match error.as_ref() {
@@ -2300,9 +2314,10 @@ impl ForwardHandler {
                         // across both guards; no clone.
                         let qname = Name::from(name.clone());
                         if let Some(profile_arc) = resolved_profile.as_ref() {
-                            if let Verdict::Block { offending, source } = walk_response_with_grant(
+                            if let Verdict::Block { offending, source } = walk_response_with_rewrite(
                                 entry.records(),
                                 domain,
+                                rewrote_from.as_deref(),
                                 filter,
                                 profile_arc.as_ref(),
                                 runtime_grant.as_ref(),
@@ -2394,7 +2409,7 @@ impl ForwardHandler {
                             .send_cached_validated(
                                 request,
                                 &entry,
-                                rewrote_from.is_some(),
+                                rewrite_target.as_ref(),
                                 response_handle,
                             )
                             .await);
@@ -2573,19 +2588,18 @@ const REWRITE_CNAME_TTL_SECS: u32 = 300;
 /// - a DNSSEC RRSIG covers the owner name, so relabelling an RRset invalidates
 ///   its signature.
 ///
-/// The target is read off the first cached record rather than rebuilt from the
-/// rewritten domain string: it is already a parsed `Name`, so the bridge costs
-/// one small-buffer `Name` clone instead of the `format!` + `Name::from_ascii`
-/// label re-parse that `fwd_name_for` exists to keep off the cache-hit path.
-///
-/// Cost is confined to the rewrite branch — `rewrote == false` never calls this,
-/// so a passthrough query allocates and copies exactly what it did before.
-fn prepend_rewrite_cname(request: &Request, remaining_ttl_secs: u32, records: &mut Vec<Record>) {
-    // Positive answers only: `send_cached`'s negative branch serves an authority
-    // SOA and zero answer RRs, so there is no owner name to mislabel there.
-    let Some(target) = records.first().map(|r| r.name.clone()) else {
+/// The checked destination, not any upstream answer owner, anchors this edge.
+/// Cost is confined to the rewrite branch; passthrough sends do not call this.
+fn prepend_rewrite_cname(
+    request: &Request,
+    target: &Name,
+    remaining_ttl_secs: u32,
+    records: &mut Vec<Record>,
+) {
+    // Preserve the existing empty-answer shape.
+    if records.is_empty() {
         return;
-    };
+    }
     let Some(query) = request.queries.queries().first() else {
         return;
     };
@@ -2594,13 +2608,13 @@ fn prepend_rewrite_cname(request: &Request, remaining_ttl_secs: u32, records: &m
     // self-loop that costs a resolver a chain walk. `ProfileRewriteRules::apply`
     // returns `None` on a no-op today, so this is unreachable. `Name`'s `PartialEq`
     // is case-insensitive (RFC 4343), which is what we want.
-    if original == target {
+    if original == *target {
         return;
     }
     let ttl = remaining_ttl_secs.min(REWRITE_CNAME_TTL_SECS);
     records.insert(
         0,
-        Record::from_rdata(original, ttl, RData::CNAME(CNAME(target))),
+        Record::from_rdata(original, ttl, RData::CNAME(CNAME(target.clone()))),
     );
 }
 
@@ -2614,13 +2628,15 @@ fn prepend_rewrite_cname(request: &Request, remaining_ttl_secs: u32, records: &m
 /// `negative_ttl` floor. The SOA is synthesized via
 /// `blocked_soa(remaining_ttl)` because the upstream's authority section
 /// is not preserved in `CacheEntry` — sufficient for negative-cache TTL
-/// signaling; carrying the original SOA verbatim would be a future
-/// improvement.
+/// signaling. Nonempty NXDOMAIN entries retain their accepted CNAME answers;
+/// their cache TTL follows the existing minimum-answer-record selection, not
+/// the empty-negative `negative_ttl` floor. Both served CNAMEs and synthesized
+/// SOA use the entry's remaining TTL.
 async fn send_cached(
     request: &Request,
     entry: &super::cache::CacheEntry,
     authentic: bool,
-    rewrote: bool,
+    rewrite_target: Option<&Name>,
     response_handle: &mut impl ResponseHandler,
 ) -> ResponseInfo {
     let builder = MessageResponseBuilder::from_message_request(request);
@@ -2635,22 +2651,29 @@ async fn send_cached(
     // AD clear. The write only exists on the `dnssec` build, so the default
     // binary's response bytes are unchanged.
     //
-    // `!rewrote` is the second half of the rewrite suppression documented in
+    // The absent rewrite target is the second half of the suppression documented in
     // `send_cached_validated`: an answer fronted by our unsigned synthesized
     // CNAME can never honestly assert authenticated data, whatever the validator
     // decided about the original name.
     #[cfg(feature = "dnssec")]
     {
-        metadata.authentic_data = authentic && !rewrote;
+        metadata.authentic_data = authentic && rewrite_target.is_none();
     }
     #[cfg(not(feature = "dnssec"))]
     let _ = authentic;
 
+    let mut records = entry.records_with_remaining_ttl();
+    if let Some(target) = rewrite_target {
+        // Empty negative answers still gain no bridge; accepted CNAME chains
+        // get the same checked rewrite destination as positive answers.
+        let remaining = entry.remaining_ttl().as_secs().max(1) as u32;
+        prepend_rewrite_cname(request, target, remaining, &mut records);
+    }
     if entry.is_negative() {
         metadata.response_code = entry.response_code();
         let ttl = entry.remaining_ttl().as_secs().max(1) as u32;
         let soa = blocked_soa(ttl);
-        let response = builder.build(metadata, &[], std::iter::once(&soa), &[], &[]);
+        let response = builder.build(metadata, records.iter(), std::iter::once(&soa), &[], &[]);
         match response_handle.send_response(response).await {
             Ok(info) => info,
             Err(e) => {
@@ -2659,13 +2682,6 @@ async fn send_cached(
             }
         }
     } else {
-        let mut records = entry.records_with_remaining_ttl();
-        if rewrote {
-            // Same `remaining` the records above were stamped with, so the
-            // bridge is provably never longer-lived than what it fronts.
-            let remaining = entry.remaining_ttl().as_secs().max(1) as u32;
-            prepend_rewrite_cname(request, remaining, &mut records);
-        }
         let response = builder.build(metadata, records.iter(), &[], &[], &[]);
         match response_handle.send_response(response).await {
             Ok(info) => info,

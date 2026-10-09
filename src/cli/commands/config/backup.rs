@@ -20,7 +20,9 @@
 //! declared roots while the former keeps undeclared operator files.
 //!
 //! Inventory is descriptor-relative and rejects aliases, hard links, special
-//! files, and unsupported names instead of asking `tar` to recurse.
+//! files, and unsupported names instead of asking `tar` to recurse. A member
+//! may keep extra hard links only inside the node corpus (see
+//! `refuse_foreign_links`).
 //!
 //! **`backup` and `restore` deliberately bias in opposite directions.**
 //! For a backup the failure is losing bytes, so the set is a superset.
@@ -37,6 +39,7 @@
 //! where `<ts>` is the current UTC timestamp (`YYYYMMDDThhmmssZ`). The
 //! parent directory is created with mode 0750 if missing.
 
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -628,6 +631,7 @@ fn inventory_directory(
     tree: TreeIo<'_>,
     directory: &PinnedDirectory<'_>,
     members: &mut Vec<String>,
+    linked: &mut Vec<(String, std::fs::Metadata)>,
 ) -> anyhow::Result<()> {
     let mut names = Vec::new();
     for_each_dir_name(directory, |name| {
@@ -655,19 +659,18 @@ fn inventory_directory(
         if meta.is_dir() {
             members.push(relative.to_string_lossy().into_owned());
             let child = tree.backup_child_directory(directory, name_os)?;
-            inventory_directory(tree, &child, members)?;
+            inventory_directory(tree, &child, members, linked)?;
         } else {
             anyhow::ensure!(
                 meta.is_file(),
                 "backup refuses special member {}",
                 relative.display()
             );
-            anyhow::ensure!(
-                meta.nlink() == 1,
-                "backup refuses hard-linked member {}",
-                relative.display()
-            );
-            members.push(relative.to_string_lossy().into_owned());
+            let relative = relative.to_string_lossy().into_owned();
+            if meta.nlink() != 1 {
+                linked.push((relative.clone(), meta));
+            }
+            members.push(relative);
         }
     }
     Ok(())
@@ -741,6 +744,7 @@ fn inventory_members(
     roots.dedup();
 
     let mut members = Vec::new();
+    let mut linked = Vec::new();
     for name in &roots {
         let (_, meta) = tree.backup_inspect_child(&root, OsStr::new(name))?;
         anyhow::ensure!(
@@ -750,16 +754,16 @@ fn inventory_members(
         if meta.is_dir() {
             members.push(name.clone());
             let child = tree.backup_child_directory(&root, OsStr::new(name))?;
-            inventory_directory(tree, &child, &mut members)?;
+            inventory_directory(tree, &child, &mut members, &mut linked)?;
         } else {
             anyhow::ensure!(meta.is_file(), "backup refuses special member {name}");
-            anyhow::ensure!(
-                meta.nlink() == 1,
-                "backup refuses hard-linked member {name}"
-            );
+            if meta.nlink() != 1 {
+                linked.push((name.clone(), meta));
+            }
             members.push(name.clone());
         }
     }
+    refuse_foreign_links(tree, &root, &linked)?;
     members.sort();
     for required in required_members {
         anyhow::ensure!(
@@ -768,6 +772,88 @@ fn inventory_members(
         );
     }
     Ok((roots, members))
+}
+
+const NODE_CORPUS: &str = ".warden-node-corpus";
+
+/// Cluster nodes hard-link verified list cache bodies into parser workspaces
+/// under `.warden-node-corpus`, which backup never archives, so tar stores
+/// such a member as a regular file. A member may carry extra links only when
+/// every one of them is inside that corpus. The corpus is walked only when
+/// some member has extra links, so other trees never depend on it.
+fn refuse_foreign_links(
+    tree: TreeIo<'_>,
+    root: &PinnedDirectory<'_>,
+    linked: &[(String, std::fs::Metadata)],
+) -> anyhow::Result<()> {
+    if linked.is_empty() {
+        return Ok(());
+    }
+    let mut corpus = HashMap::new();
+    if tree
+        .backup_inspect_optional_child(root, OsStr::new(NODE_CORPUS))?
+        .is_some()
+    {
+        let context = || {
+            format!(
+                "cannot count node corpus links for hard-linked member {}",
+                linked[0].0
+            )
+        };
+        let directory = tree
+            .backup_child_directory(root, OsStr::new(NODE_CORPUS))
+            .with_context(context)?;
+        count_corpus_links(tree, &directory, &mut corpus).with_context(context)?;
+    }
+    for (name, meta) in linked {
+        let corpus_links = corpus.get(&(meta.dev(), meta.ino())).copied();
+        anyhow::ensure!(
+            meta.nlink() == 1 + corpus_links.unwrap_or(0),
+            "backup refuses hard-linked member {name}"
+        );
+    }
+    Ok(())
+}
+
+/// Count multi-link regular files under the corpus by `(st_dev, st_ino)`,
+/// refusing aliases and special files the same way the inventory does.
+fn count_corpus_links(
+    tree: TreeIo<'_>,
+    directory: &PinnedDirectory<'_>,
+    links: &mut HashMap<(u64, u64), u64>,
+) -> anyhow::Result<()> {
+    let mut names = Vec::new();
+    for_each_dir_name(directory, |name| {
+        names.push(name.to_os_string());
+        Ok(())
+    })?;
+    for name in names {
+        // The daemon retires parser workspaces concurrently. A vanished
+        // entry stays uncounted, which can only refuse more members.
+        let Some((_, meta)) = tree.backup_inspect_optional_child(directory, &name)? else {
+            continue;
+        };
+        let relative = directory.backup_relative().join(&name);
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "backup refuses symlink in the node corpus {}",
+            relative.display()
+        );
+        if meta.is_dir() {
+            let child = tree.backup_child_directory(directory, &name)?;
+            count_corpus_links(tree, &child, links)?;
+        } else {
+            anyhow::ensure!(
+                meta.is_file(),
+                "backup refuses special file in the node corpus {}",
+                relative.display()
+            );
+            if meta.nlink() != 1 {
+                *links.entry((meta.dev(), meta.ino())).or_default() += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Structured result of a backup, for callers that render their own
@@ -2653,6 +2739,87 @@ mod tests {
     }
 
     #[test]
+    fn backup_admits_hard_links_only_into_the_node_corpus() {
+        let fixture = |corpus_link: bool| {
+            let outer = tempfile::tempdir().unwrap();
+            let root = outer.path().join("root");
+            std::fs::create_dir_all(root.join("lists")).unwrap();
+            std::fs::create_dir_all(root.join(".warden-node-corpus/parser-a")).unwrap();
+            std::fs::create_dir_all(root.join(".warden-node-control")).unwrap();
+            let config = root.join("config.toml");
+            std::fs::write(
+                &config,
+                b"schema_version = 5\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("lists/x.body"), b"body\n").unwrap();
+            if corpus_link {
+                std::fs::hard_link(
+                    root.join("lists/x.body"),
+                    root.join(".warden-node-corpus/parser-a/x.body"),
+                )
+                .unwrap();
+            }
+            (outer, root, config)
+        };
+
+        // A body still linked into the previous parser workspace has nlink 3.
+        let (_outer, root, config) = fixture(true);
+        std::fs::create_dir(root.join(".warden-node-corpus/parser-b")).unwrap();
+        std::fs::hard_link(
+            root.join("lists/x.body"),
+            root.join(".warden-node-corpus/parser-b/x.body"),
+        )
+        .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let archive = create_backup(&config, Some(output.path())).unwrap().archive;
+        let listing = Command::new("tar")
+            .arg("-tvzf")
+            .arg(&archive)
+            .output()
+            .unwrap();
+        let listing = String::from_utf8(listing.stdout).unwrap();
+        let body = listing
+            .lines()
+            .find(|line| line.ends_with(" lists/x.body"))
+            .unwrap_or_else(|| panic!("missing lists/x.body:\n{listing}"));
+        assert!(body.starts_with('-'), "not a regular entry:\n{listing}");
+        assert!(!listing.contains(".warden-node-corpus"), "{listing}");
+
+        for (corpus_link, extra) in [
+            (false, "lists/y.body"),
+            (false, "../outside.body"),
+            (true, "lists/y.body"),
+            (true, "../outside.body"),
+            (true, ".warden-node-control/x.body"),
+        ] {
+            let (_outer, root, config) = fixture(corpus_link);
+            std::fs::hard_link(root.join("lists/x.body"), root.join(extra)).unwrap();
+            let output = tempfile::tempdir().unwrap();
+            let error = create_backup(&config, Some(output.path())).err().unwrap();
+            assert!(
+                format!("{error:#}").contains("backup refuses hard-linked member lists/x.body"),
+                "{corpus_link} {extra}: {error:#}"
+            );
+            assert_no_archive_or_private(output.path());
+        }
+
+        let (_outer, root, config) = fixture(true);
+        std::os::unix::fs::symlink(
+            "../../lists/x.body",
+            root.join(".warden-node-corpus/parser-a/alias"),
+        )
+        .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let error = create_backup(&config, Some(output.path())).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("symlink in the node corpus"),
+            "{error:#}"
+        );
+        assert_no_archive_or_private(output.path());
+    }
+
+    #[test]
     fn backup_rejects_non_utf8_and_special_source_members() {
         let (dir, config) = make_single_file_config();
         let non_utf8 = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
@@ -2881,6 +3048,24 @@ mod tests {
         assert!(listing.contains(".private/include.toml"));
         assert!(listing.contains(".private/.policy.incoming-1.toml"));
         assert!(!listing.contains(".include.toml.incoming-123-1"));
+    }
+
+    #[test]
+    fn relocate_receipts_in_the_root_are_not_archived() {
+        use crate::config::relocate_receipt::{ACTIVE, DONE};
+        let (dir, config) = make_single_file_config();
+        for name in [DONE.to_string(), format!("{ACTIVE}.next")] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let archive = run_backup(&config, None).unwrap();
+        assert!(!archive_listing(&archive).contains(".warden-relocate"));
+        assert_eq!(
+            super::super::run_restore(&config, &archive, None).unwrap(),
+            0
+        );
+        assert!(dir.path().join(DONE).exists());
     }
 
     #[test]

@@ -1152,3 +1152,44 @@ async fn token_refused_for_an_active_peer_preserves_saved_endpoint() {
     );
     assert!(restored.bootstrap.is_none());
 }
+
+#[test]
+fn an_open_node_operation_refuses_relocate_until_it_is_terminal() {
+    use crate::cli::commands::config::relocate::{self, tests::layout_for_test, Options};
+    let directory = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(directory.path()).unwrap();
+    let (layout, _mapping) = layout_for_test(&base);
+    let master = layout.legacy.join("config.toml");
+    std::fs::write(
+        &master,
+        format!(
+            "schema_version = 5\n[backup]\ndir = {:?}\n[server]\ndefault_profile = \"default\"\n[profiles.default]\ndisplay_name = \"Default\"\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            layout.legacy.join("backups").display().to_string()
+        ),
+    )
+    .unwrap();
+    let record = operation(NodeOperationPhase::ApplyingPrimary, 10);
+    let id = record.preview.id.clone();
+    let mut state = ControlState::default();
+    state.operations.insert(id.clone(), record);
+    save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+    let options = Options {
+        dry_run: false,
+        reverse: false,
+    };
+
+    let outcome = relocate::relocate(&layout, options).unwrap();
+    assert_ne!(outcome.code, 0, "{outcome:?}");
+    assert!(
+        outcome.err[0].starts_with("refused (recovery-required): .warden-node-control")
+            && outcome.err[0].contains(&id)
+            && outcome.err[0].contains("`warden node status`"),
+        "{outcome:?}"
+    );
+    assert!(master.is_file());
+
+    state.operations.get_mut(&id).unwrap().phase = NodeOperationPhase::Complete;
+    save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+    let outcome = relocate::relocate(&layout, options).unwrap();
+    assert_eq!(outcome.code, 0, "{outcome:?}");
+}

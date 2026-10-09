@@ -589,30 +589,142 @@ async fn submitted_journal_survives_quit_with_the_exact_request_and_plan() {
 
 #[tokio::test]
 async fn startup_capability_failure_retains_exact_retry_and_forbids_close() {
-    let root = tempfile::tempdir().unwrap();
-    let config_path = root.path().join("config.toml");
-    let socket = root.path().join("missing.sock");
-    let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
-    let planned = workflow.begin_plan().unwrap();
-    recovery::begin_submitted(
-        config_path.clone(),
+    // Includes the 0.42.0 `query_rules` origin a journal may still carry.
+    for origin in [
         PolicyOrigin::Mount,
-        planned.request.clone(),
-        retained_plan(&planned.request),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+        PolicyOrigin::QueryBatch {
+            targets: vec![crate::tui::query_rule_batch::HeldTarget {
+                domain: "ciao.it".into(),
+                action: RuleAction::Deny,
+                list_id: "local".into(),
+            }],
+        },
+        PolicyOrigin::QueryRules {
+            ids: vec!["local".into()],
+            already_present: vec![false],
+        },
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let socket = root.path().join("missing.sock");
+        let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+        let planned = workflow.begin_plan().unwrap();
+        recovery::begin_submitted(
+            config_path.clone(),
+            origin.clone(),
+            planned.request.clone(),
+            retained_plan(&planned.request),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-    let (connected, action, error, close_allowed) =
-        super::controller::startup_resume_probe(socket, config_path)
+        let (connected, action, error, close_allowed, resumed) =
+            super::controller::startup_resume_probe(socket, config_path)
+                .await
+                .unwrap();
+        assert!(!connected);
+        assert_eq!(action, RecoveryAction::RetryExactApply, "{origin:?}");
+        assert_eq!(error, Some(ErrorCode::StorageUnavailable));
+        assert!(!close_allowed);
+        assert_eq!(resumed, origin);
+    }
+}
+
+/// Quitting while a held-rule batch Apply is pending must not claim the
+/// rules were not applied: the batch may still commit and resumes on start.
+#[tokio::test]
+async fn quit_during_pending_query_batch_apply_never_claims_not_applied() {
+    use crate::tui::query_rule_batch::{HeldTarget, Review};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let targets = vec![HeldTarget {
+        domain: "ciao.it".into(),
+        action: RuleAction::Deny,
+        list_id: "local".into(),
+    }];
+    let mut planned = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+    let attempt = planned.begin_plan().unwrap();
+    assert!(planned.finish_plan(attempt.ticket, Ok(retained_plan(&attempt.request))));
+    let mut applying = planned.clone();
+    let apply = applying.begin_apply().unwrap();
+    let mut unresolved = applying.clone();
+    assert!(unresolved.finish_apply(
+        apply.ticket,
+        Err(transport_error("daemon closed connection without response"))
+    ));
+    for (workflow, pending, busy) in [
+        (planned, false, false),
+        (applying, true, true),
+        (unresolved, true, false),
+    ] {
+        let mut app = crate::tui::App::known_standalone_for_test();
+        app.query_log.held.targets = targets.clone();
+        if busy {
+            // A running Apply holds the busy footer, so q takes the busy route.
+            app.pending_action = Some(crate::tui::actions::PendingAction {
+                id: 1,
+                surface: crate::tui::actions::Surface::Global,
+                label: "Applying policy change".into(),
+                detached: false,
+                written: None,
+            });
+        }
+        app.operator_policy = Some(PolicyDialog {
+            id: 1,
+            origin: PolicyOrigin::QueryBatch {
+                targets: targets.clone(),
+            },
+            workflow: Some(workflow),
+            adapter: None,
+            preparing: false,
+            preparation_error: None,
+            prefix_outcome: None,
+            discard_operations: None,
+        });
+        assert!(
+            !crate::tui::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &crate::tui::IpcPoller::new(Path::new("/tmp/qrb-no.sock")),
+                Path::new("/tmp/qrb-config.toml"),
+            )
             .await
+        );
+        assert_eq!(app.query_log.held.review, Some(Review::Quit));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::tui::ui::render(frame, &mut app);
+                crate::tui::actions::render_saving(frame, &app);
+            })
             .unwrap();
-    assert!(!connected);
-    assert_eq!(action, RecoveryAction::RetryExactApply);
-    assert_eq!(error, Some(ErrorCode::StorageUnavailable));
-    assert!(!close_allowed);
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(text.contains("QUIT AND DISCARD HELD RULES?"), "{text}");
+        if busy {
+            // The confirmation owns the keys: the busy footer keeps only its label.
+            let footer = text.lines().nth(23).unwrap_or_default();
+            assert!(footer.contains("Applying policy change"), "{footer}");
+            assert!(!footer.contains("quit"), "{footer}");
+        }
+        assert_eq!(text.contains("not applied"), !pending, "{text}");
+        assert_eq!(
+            text.contains("1 rule held · Apply submitted, outcome unresolved"),
+            pending,
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Quitting may not stop it; the next start resolves the outcome."),
+            pending,
+            "{text}"
+        );
+    }
 }
 
 #[tokio::test]

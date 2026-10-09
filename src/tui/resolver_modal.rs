@@ -215,6 +215,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ResolverModal) {
     let spec = notice(modal);
     let render =
         modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+    crate::tui::mouse::close_on_outside_click();
     // The query row is the sole editable resolver target. `notice_body`
     // intentionally treats this read-only result surface as prose, so
     // register its exact first field row explicitly for pointer focus.

@@ -2,15 +2,19 @@
 //!
 //! Uses `flock(LOCK_EX|LOCK_NB)` to coordinate between instances. The OS
 //! kernel enforces mutual exclusion — no TOCTOU race. The lock is held for
-//! the process lifetime via the returned `File` handle, and automatically
-//! released on exit or crash (the kernel clears advisory locks when the
-//! last fd referencing the open-file-description is closed).
+//! as long as the returned [`Flocked`] guard lives. Dropping it unlocks with
+//! `LOCK_UN`, because a child forked by another thread shares the open file
+//! description until it execs, so a plain close would leave the lock held.
+//! On exit or crash the kernel clears the lock once the last descriptor
+//! closes.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+use crate::config::write_lock::Flocked;
 
 /// Error from [`acquire_pid_lock`].
 #[derive(Debug)]
@@ -43,13 +47,13 @@ impl std::error::Error for PidLockError {}
 
 /// Acquire an exclusive `flock` on the PID file and write our PID.
 ///
-/// Returns the open `File` handle — **the caller must keep it alive** for
+/// Returns the locked handle — **the caller must keep it alive** for
 /// the entire server lifetime. Dropping the handle releases the lock.
 ///
 /// If another instance already holds the lock, returns
 /// [`PidLockError::AlreadyRunning`] with the PID read from the file (if
 /// readable).
-pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
+pub fn acquire_pid_lock(path: &Path) -> Result<Flocked, PidLockError> {
     acquire_pid_lock_with_retry(path, true)
 }
 
@@ -58,14 +62,14 @@ pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
 /// A foreground refresh uses this to make its daemon-or-foreground choice
 /// atomically. Waiting here would add the start retry's one-second delay to
 /// the normal live-daemon IPC path.
-pub(crate) fn try_acquire_pid_lock(path: &Path) -> Result<std::fs::File, PidLockError> {
+pub(crate) fn try_acquire_pid_lock(path: &Path) -> Result<Flocked, PidLockError> {
     acquire_pid_lock_with_retry(path, false)
 }
 
 fn acquire_pid_lock_with_retry(
     path: &Path,
     retry_transient_contention: bool,
-) -> Result<std::fs::File, PidLockError> {
+) -> Result<Flocked, PidLockError> {
     for _ in 0..8 {
         match acquire_linked_pid_lock(path, retry_transient_contention) {
             Err(PidLockError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {}
@@ -80,7 +84,7 @@ fn acquire_pid_lock_with_retry(
 fn acquire_linked_pid_lock(
     path: &Path,
     retry_transient_contention: bool,
-) -> Result<std::fs::File, PidLockError> {
+) -> Result<Flocked, PidLockError> {
     // Ensure the parent directory exists. In production systemd creates
     // /run/purge-warden/ via `RuntimeDirectory=`, but a foreground/dev
     // invocation (`warden start` after a `systemctl stop` wiped the
@@ -185,6 +189,7 @@ fn acquire_linked_pid_lock(
         }
         return Err(PidLockError::Io(err));
     }
+    let file = Flocked(file);
 
     // Never start on a detached inode if the PID pathname was replaced while
     // we waited for flock.
@@ -222,7 +227,7 @@ fn acquire_linked_pid_lock(
 /// detached lock. New files inherit the deployment owner and readable PID mode.
 #[derive(Debug)]
 pub(crate) struct OfflinePidLease {
-    _file: std::fs::File,
+    _file: Flocked,
 }
 
 pub(crate) fn acquire_offline_pid_lease(
@@ -284,6 +289,7 @@ pub(crate) fn acquire_offline_pid_lease(
         }
         return Err(error.into());
     }
+    let file = Flocked(file);
     let linked = tree_io::inspect_at(&parent, &name)?
         .ok_or_else(|| anyhow::anyhow!("NodeOfflineUnproven: PID lease disappeared"))?;
     let ours = file.metadata()?;
@@ -330,7 +336,13 @@ fn offline_pid_parent(
                 if !created {
                     let error = std::io::Error::last_os_error();
                     if error.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(error.into());
+                        // systemd removes RuntimeDirectory when the daemon
+                        // stops, so offline commands recreate it themselves.
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "cannot create PID directory {}: run this command as root \
+                             with the daemon stopped",
+                            absolute.display()
+                        )));
                     }
                 }
                 let next =
@@ -684,6 +696,26 @@ mod tests {
         std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(outcome.unwrap());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn offline_pid_parent_creation_failure_says_how_to_run() {
+        // Root bypasses directory permissions, so only a user run can fail here.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = acquire_offline_pid_lease(&locked.join("runtime/daemon.pid"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let message = format!("{:#}", outcome.expect_err("an unwritable parent must fail"));
+        assert!(
+            message.contains("run this command as root with the daemon stopped"),
+            "{message}"
+        );
+        assert!(message.contains("runtime"), "{message}");
     }
 
     #[test]

@@ -3176,6 +3176,32 @@ fn runtime_schema5_loader_rejects_schema4_and_every_legacy_rule_seat() {
 }
 
 #[test]
+fn runtime_schema5_loader_names_the_upgrade_path_for_a_schema4_tree() {
+    // Legacy fields must not hide the version refusal, and the refusal must
+    // say how a schema-4 host gets to schema 5.
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    fs::write(
+        &master,
+        "schema_version = 4\nadmin_rules = []\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let errors = load_config_v5(&master, now()).expect_err("schema 4 must be refused");
+    assert_eq!(errors.len(), 1, "{}", join_errs(&errors));
+    assert!(matches!(errors[0], ConfigError::VersionMismatch(_)));
+    let suggestion = errors[0]
+        .context()
+        .suggestion
+        .as_deref()
+        .unwrap_or_default();
+    assert!(
+        suggestion.contains("warden migrate v4-to-v5 --check"),
+        "{suggestion}"
+    );
+    assert!(suggestion.contains("install.sh --upgrade"), "{suggestion}");
+}
+
+#[test]
 fn the_pack_path_is_anchored_to_the_master_not_to_the_declaring_fragment() {
     // `includes` is live, so a fragment is a legitimate declaration site.
     // Two readings of "the config parent" are each internally coherent and

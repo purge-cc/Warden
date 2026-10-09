@@ -65,7 +65,17 @@ NoNewPrivileges=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID=no, unlike purge-warden.service. Its seccomp
+# filter cannot inspect openat2's struct open_how, so it answers openat2 with
+# ENOSYS. Fedora 44's tar opens a nested member's parent directory via openat2,
+# has no openat fallback, and fails with "Cannot stat: Function not
+# implemented" (exit 2). Set it explicitly: without the line the unit takes
+# the host's DefaultRestrictSUIDSGID= (systemd 258+), which a hardened host
+# may set to yes. The cost is small: the unit is not root, so it can only
+# create files setuid or setgid to purge-warden, and ProtectSystem=strict
+# with ReadWritePaths= limits its lasting writes to /etc/purge-warden and
+# /var/lib/purge-warden.
+RestrictSUIDSGID=no
 RemoveIPC=yes
 RestrictNamespaces=yes
 UMask=0077

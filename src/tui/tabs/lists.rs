@@ -605,9 +605,18 @@ fn alert_band_height(para: &Paragraph<'static>, width: u16) -> u16 {
     touched.max(1)
 }
 
+/// The row the subscription detail shows. `None` once the row is gone or
+/// filtered out; the detail then draws nothing.
+pub(crate) fn detail_row(app: &App) -> Option<ListRowMeta> {
+    let id = app.lists.detail_id.as_deref()?;
+    build_grouped_rows(app)
+        .into_iter()
+        .find(|row| row_key(row).as_deref() == Some(id))
+}
+
 fn render_overlays(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(id) = app.lists.detail_id.as_deref() {
-        render_subscription_detail(f, area, app, id);
+    if let Some(meta) = detail_row(app) {
+        render_subscription_detail(f, area, app, meta);
     }
     if let Some(selected) = app.lists.import_source {
         render_import_source(f, area, selected, app.lists.import_source_focus);
@@ -663,13 +672,7 @@ fn render_overlays(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_subscription_detail(f: &mut Frame, area: Rect, app: &App, id: &str) {
-    let Some(meta) = build_grouped_rows(app)
-        .into_iter()
-        .find(|row| row_key(row).as_deref() == Some(id))
-    else {
-        return;
-    };
+fn render_subscription_detail(f: &mut Frame, area: Rect, app: &App, meta: ListRowMeta) {
     let name = if meta.display_name.is_empty() {
         "—"
     } else {
@@ -754,6 +757,7 @@ fn render_subscription_detail(f: &mut Frame, area: Rect, app: &App, id: &str) {
     modal_form::render_modal(f, area, 78, |width| {
         (modal_form::notice_body(&spec, width), ())
     });
+    crate::tui::mouse::close_on_outside_click();
 }
 
 /// Source choice shown by `a` before either import contract is opened.
@@ -808,6 +812,7 @@ pub fn render_import_source(f: &mut Frame, area: Rect, selected: usize, focus: u
         body.fields.extend([Line::default(), Line::default()]);
         (body, ())
     });
+    crate::tui::mouse::close_on_outside_click();
 }
 
 /// Client-side Lists filter: kind chip AND case-insensitive text search

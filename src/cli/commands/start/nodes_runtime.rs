@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,7 @@ impl NodeCorpusRuntime {
         Arc::new(RuntimeActivePairProvider {
             store: Some(Arc::clone(&self.store)),
             enrolled,
+            proof_available: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -138,6 +140,7 @@ impl NodeCorpusRuntime {
 pub(super) struct RuntimeActivePairProvider {
     store: Option<Arc<CorpusStore>>,
     enrolled: bool,
+    proof_available: Arc<AtomicBool>,
 }
 
 impl RuntimeActivePairProvider {
@@ -145,10 +148,19 @@ impl RuntimeActivePairProvider {
         Arc::new(Self {
             store: None,
             enrolled: false,
+            proof_available: Arc::new(AtomicBool::new(false)),
         })
     }
 
+    pub fn set_proof_available(&self, available: bool) {
+        self.proof_available.store(available, Ordering::Release);
+    }
+
     fn read_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
+        ensure!(
+            self.proof_available.load(Ordering::Acquire),
+            "active pair is transitioning"
+        );
         let store = self
             .store
             .as_ref()
@@ -162,6 +174,10 @@ impl RuntimeActivePairProvider {
         ensure!(
             manifest.generation == generation,
             "active corpus generation changed during inspection"
+        );
+        ensure!(
+            self.proof_available.load(Ordering::Acquire),
+            "active pair is transitioning"
         );
         Ok(ActivePolicyCorpus {
             policy: manifest.artifact,
@@ -187,10 +203,12 @@ impl ActivePairProvider for RuntimeActivePairProvider {
 
     async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
         let store = self.store.clone();
+        let proof_available = Arc::clone(&self.proof_available);
         tokio::task::spawn_blocking(move || {
             RuntimeActivePairProvider {
                 store,
                 enrolled: false,
+                proof_available,
             }
             .read_pair()
         })
@@ -509,6 +527,7 @@ mod tests {
         let standalone = RuntimeActivePairProvider {
             store: Some(store.clone()),
             enrolled: false,
+            proof_available: Arc::new(AtomicBool::new(true)),
         };
         assert_eq!(standalone.active_pair(), None);
         assert_eq!(
@@ -521,7 +540,12 @@ mod tests {
         let enrolled = RuntimeActivePairProvider {
             store: Some(store),
             enrolled: true,
+            proof_available: Arc::new(AtomicBool::new(true)),
         };
+        enrolled.set_proof_available(false);
+        assert!(enrolled.active_pair().is_none());
+        assert!(enrolled.enrollment_pair().await.is_err());
+        enrolled.set_proof_available(true);
         assert_eq!(
             enrolled.active_pair(),
             Some(ActivePolicyCorpus {

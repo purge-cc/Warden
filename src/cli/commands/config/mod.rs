@@ -8,11 +8,13 @@
 //! - [`backup`] — timestamped tar.gz snapshot of the config tree.
 //! - [`restore`] — staged replace of the live config from a tar.gz.
 //! - [`render_default`] — print the built-in scaffold config (packaging seed).
+//! - [`relocate`] — move the config set between /var/lib and /etc by rename.
 
 pub mod backup;
 pub mod diff;
 pub mod edit;
 pub mod lint;
+pub mod relocate;
 pub mod render_default;
 pub mod restore;
 pub mod show;
@@ -24,6 +26,7 @@ pub use backup::{
 pub use diff::run_diff;
 pub use edit::run_edit;
 pub use lint::run_lint;
+pub use relocate::run_relocate;
 pub use render_default::run_render_default;
 pub use restore::{restore_archive, run_restore, RestoreOutcome};
 pub use show::run_show;

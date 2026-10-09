@@ -1843,3 +1843,331 @@ fn prune_map_decays_saturated_map_keeping_popular() {
         "popular count is halved by one decay pass, still dominant"
     );
 }
+
+#[test]
+fn exact_cap_lifetime_maintenance_admits_new_domains() {
+    for blocked in [false, true] {
+        for rare_count in [1, 2, 8] {
+            let engine = StatsEngine::new(&test_config());
+            let (map, size) = if blocked {
+                (&engine.domain_blocked, &engine.domain_blocked_len)
+            } else {
+                (&engine.domain_queries, &engine.domain_queries_len)
+            };
+            for i in 0..MAX_DOMAIN_FREQ_ENTRIES - 2 {
+                let domain = format!("rare-{i}.example");
+                for _ in 0..rare_count {
+                    engine.increment_domain_freq(map, size, &domain);
+                }
+            }
+            for _ in 0..100 {
+                engine.increment_domain_freq(map, size, "popular.example");
+            }
+            for _ in 0..64 {
+                engine.increment_domain_freq(map, size, "second.example");
+            }
+            assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+            assert_eq!(size.load(Ordering::Relaxed), MAX_DOMAIN_FREQ_ENTRIES);
+            engine.increment_domain_freq(map, size, "new.example");
+            assert!(
+                !map.contains_key("new.example"),
+                "full map refuses newcomers"
+            );
+
+            for pass in 0..(match rare_count {
+                1 | 2 => 1,
+                _ => 3,
+            }) {
+                engine.prune_domain_freq();
+                assert_eq!(size.load(Ordering::Relaxed), map.len());
+                if rare_count == 8 && pass < 2 {
+                    assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+                    engine.increment_domain_freq(map, size, "new.example");
+                    assert!(!map.contains_key("new.example"));
+                }
+            }
+            assert_eq!(map.len(), 2, "both popular entries survive maintenance");
+            let (popular, second) = match rare_count {
+                1 => (100, 64),
+                2 => (50, 32),
+                _ => (12, 8),
+            };
+            let ranked = crate::tracking::top_n::extract_top_n(map, 2);
+            assert_eq!(
+                ranked,
+                vec![
+                    ("popular.example".into(), popular),
+                    ("second.example".into(), second)
+                ]
+            );
+            engine.prune_domain_freq();
+            assert_eq!(
+                crate::tracking::top_n::extract_top_n(map, 2),
+                ranked,
+                "survivors below cap must not decay or reverse order"
+            );
+            engine.increment_domain_freq(map, size, "new.example");
+            assert_eq!(map.get("new.example").unwrap().load(Ordering::Relaxed), 1);
+            assert_eq!(map.len(), 3);
+            assert_eq!(size.load(Ordering::Relaxed), 3);
+        }
+    }
+}
+
+#[test]
+fn exact_cap_hourly_maintenance_reaps_expired_without_evicting_active() {
+    let old = 100 * 3600;
+    let now = old + 24 * 3600;
+    for blocked in [false, true] {
+        for expired in [true, false] {
+            let engine = StatsEngine::new(&test_config());
+            let (map, size) = if blocked {
+                (
+                    &engine.domain_blocked_hourly,
+                    &engine.domain_blocked_hourly_len,
+                )
+            } else {
+                (
+                    &engine.domain_queries_hourly,
+                    &engine.domain_queries_hourly_len,
+                )
+            };
+            for i in 0..MAX_DOMAIN_FREQ_ENTRIES - 1 {
+                StatsEngine::record_hourly(
+                    map,
+                    size,
+                    &format!("rare-{i}.example"),
+                    if expired { old } else { now },
+                );
+            }
+            StatsEngine::record_hourly(map, size, "active.example", old);
+            StatsEngine::record_hourly(map, size, "active.example", now);
+            assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+            assert_eq!(size.load(Ordering::Relaxed), MAX_DOMAIN_FREQ_ENTRIES);
+            StatsEngine::record_hourly(map, size, "new.example", now);
+            assert!(!map.contains_key("new.example"));
+            engine.prune_hourly_domain_freq(now);
+            assert_eq!(map.len(), if expired { 1 } else { MAX_DOMAIN_FREQ_ENTRIES });
+            assert_eq!(size.load(Ordering::Relaxed), map.len());
+            assert_eq!(map.get("active.example").unwrap().sum_last_24h(now), 1);
+            StatsEngine::record_hourly(map, size, "new.example", now);
+            assert_eq!(map.contains_key("new.example"), expired);
+            assert_eq!(size.load(Ordering::Relaxed), map.len());
+            if expired {
+                assert_eq!(map.get("new.example").unwrap().sum_last_24h(now), 1);
+            }
+        }
+        let engine = StatsEngine::new(&test_config());
+        let (map, size) = if blocked {
+            (
+                &engine.domain_blocked_hourly,
+                &engine.domain_blocked_hourly_len,
+            )
+        } else {
+            (
+                &engine.domain_queries_hourly,
+                &engine.domain_queries_hourly_len,
+            )
+        };
+        StatsEngine::record_hourly(map, size, "idle.example", old);
+        engine.prune_hourly_domain_freq(now);
+        assert_eq!(map.len(), 1, "below-cap maintenance remains a no-op");
+        assert_eq!(size.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn concurrent_lifetime_admission_and_maintenance_resync() {
+    use std::sync::Barrier;
+
+    const WORKERS: usize = 2;
+    const ATTEMPTS: usize = 32;
+    for blocked in [false, true] {
+        let engine = StatsEngine::new(&test_config());
+        let (map, size) = if blocked {
+            (&engine.domain_blocked, &engine.domain_blocked_len)
+        } else {
+            (&engine.domain_queries, &engine.domain_queries_len)
+        };
+        for i in 0..MAX_DOMAIN_FREQ_ENTRIES - 1 {
+            engine.increment_domain_freq(map, size, &format!("rare-{i}.example"));
+        }
+        for _ in 0..100 {
+            engine.increment_domain_freq(map, size, "active.example");
+        }
+        assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+
+        // Both producers start at a full map; updates to existing keys
+        // still work even though their fresh-key attempts cannot enter.
+        let start = Barrier::new(WORKERS + 1);
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            for worker in 0..WORKERS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..ATTEMPTS {
+                        engine.increment_domain_freq(map, size, "active.example");
+                        engine.increment_domain_freq(
+                            map,
+                            size,
+                            &format!("full-{worker}-{i}.example"),
+                        );
+                    }
+                });
+            }
+            start.wait();
+        });
+        assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+        assert!(!map.contains_key("full-0-0.example"));
+        assert_eq!(
+            map.get("active.example").unwrap().load(Ordering::Relaxed),
+            100 + (WORKERS * ATTEMPTS) as u64
+        );
+
+        // Start a prune and finite admission producers together. The
+        // approximate counter need not equal map.len() during this race.
+        let start = Barrier::new(WORKERS + 2);
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            for worker in 0..WORKERS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..ATTEMPTS {
+                        engine.increment_domain_freq(map, size, "active.example");
+                        engine.increment_domain_freq(
+                            map,
+                            size,
+                            &format!("race-{worker}-{i}.example"),
+                        );
+                    }
+                });
+            }
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                engine.prune_domain_freq();
+            });
+            start.wait();
+        });
+        assert!(
+            map.len() <= MAX_DOMAIN_FREQ_ENTRIES + WORKERS * ATTEMPTS,
+            "finite producers cannot introduce more keys than they attempt"
+        );
+        engine.prune_domain_freq(); // quiescent re-sync, not a concurrent equality claim
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+        assert!(map.len() < MAX_DOMAIN_FREQ_ENTRIES);
+        let before = map.get("active.example").unwrap().load(Ordering::Relaxed);
+        engine.increment_domain_freq(map, size, "active.example");
+        assert_eq!(
+            map.get("active.example").unwrap().load(Ordering::Relaxed),
+            before + 1
+        );
+        engine.increment_domain_freq(map, size, "new.example");
+        assert_eq!(map.get("new.example").unwrap().load(Ordering::Relaxed), 1);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+    }
+}
+
+#[test]
+fn concurrent_hourly_admission_and_maintenance_resync() {
+    use std::sync::Barrier;
+
+    const WORKERS: usize = 2;
+    const ATTEMPTS: usize = 32;
+    let old = 100 * 3600;
+    let now = old + 24 * 3600;
+    for blocked in [false, true] {
+        let engine = StatsEngine::new(&test_config());
+        let (map, size) = if blocked {
+            (
+                &engine.domain_blocked_hourly,
+                &engine.domain_blocked_hourly_len,
+            )
+        } else {
+            (
+                &engine.domain_queries_hourly,
+                &engine.domain_queries_hourly_len,
+            )
+        };
+        for i in 0..MAX_DOMAIN_FREQ_ENTRIES - 1 {
+            StatsEngine::record_hourly(map, size, &format!("rare-{i}.example"), old);
+        }
+        StatsEngine::record_hourly(map, size, "active.example", old);
+        StatsEngine::record_hourly(map, size, "active.example", now);
+        assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+
+        let start = Barrier::new(WORKERS + 1);
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..ATTEMPTS {
+                        StatsEngine::record_hourly(map, size, "active.example", now);
+                        StatsEngine::record_hourly(
+                            map,
+                            size,
+                            &format!("full-{worker}-{i}.example"),
+                            now,
+                        );
+                    }
+                });
+            }
+            start.wait();
+        });
+        assert_eq!(map.len(), MAX_DOMAIN_FREQ_ENTRIES);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+        assert!(!map.contains_key("full-0-0.example"));
+        assert_eq!(
+            map.get("active.example").unwrap().sum_last_24h(now),
+            1 + (WORKERS * ATTEMPTS) as u64
+        );
+
+        let start = Barrier::new(WORKERS + 2);
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            for worker in 0..WORKERS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for i in 0..ATTEMPTS {
+                        StatsEngine::record_hourly(map, size, "active.example", now);
+                        StatsEngine::record_hourly(
+                            map,
+                            size,
+                            &format!("race-{worker}-{i}.example"),
+                            now,
+                        );
+                    }
+                });
+            }
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                engine.prune_hourly_domain_freq(now);
+            });
+            start.wait();
+        });
+        assert!(
+            map.len() <= MAX_DOMAIN_FREQ_ENTRIES + WORKERS * ATTEMPTS,
+            "finite producers cannot introduce more keys than they attempt"
+        );
+        engine.prune_hourly_domain_freq(now); // quiescent re-sync
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+        assert!(map.len() < MAX_DOMAIN_FREQ_ENTRIES);
+        let before = map.get("active.example").unwrap().sum_last_24h(now);
+        StatsEngine::record_hourly(map, size, "active.example", now);
+        assert_eq!(
+            map.get("active.example").unwrap().sum_last_24h(now),
+            before + 1
+        );
+        StatsEngine::record_hourly(map, size, "new.example", now);
+        assert_eq!(map.get("new.example").unwrap().sum_last_24h(now), 1);
+        assert_eq!(size.load(Ordering::Relaxed), map.len());
+    }
+}

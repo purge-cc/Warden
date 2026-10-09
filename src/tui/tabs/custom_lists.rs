@@ -984,6 +984,35 @@ fn render_catalog_unavailable(f: &mut Frame, area: Rect, error: Option<&str>) {
     render_muted(f, content, &text);
 }
 
+/// The list the info overlay shows, while it still exists.
+fn info_list(app: &App, id: &str) -> Option<CustomListRow> {
+    build_display_rows(app).into_iter().find(|row| row.id == id)
+}
+
+/// The rule the info overlay shows, while it is still loaded.
+fn info_rule<'a>(
+    app: &'a App,
+    list_id: &str,
+    row_ref: &str,
+) -> Option<&'a crate::operator_rules::RuleRow> {
+    app.operator_rules.as_ref().and_then(|rules| {
+        (rules.id == list_id)
+            .then(|| rules.rows.iter().find(|row| row.row_ref == row_ref))
+            .flatten()
+    })
+}
+
+/// Whether the info overlay draws: its list or rule still exists.
+pub(crate) fn info_drawn(app: &App) -> bool {
+    match app.custom_lists.info.as_ref().map(|info| &info.target) {
+        Some(CustomListInfoTarget::List(id)) => info_list(app, id).is_some(),
+        Some(CustomListInfoTarget::Rule { list_id, row_ref }) => {
+            info_rule(app, list_id, row_ref).is_some()
+        }
+        None => false,
+    }
+}
+
 pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
     use crate::tui::modal_form::{self, Action, ActionKind, NoticeSpec, ProseRow, ValueKind};
 
@@ -993,10 +1022,7 @@ pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
     let mut prose = Vec::new();
     let (title, desc, attention) = match &info.target {
         CustomListInfoTarget::List(id) => {
-            let Some(row) = build_display_rows(app)
-                .into_iter()
-                .find(|row| &row.id == id)
-            else {
+            let Some(row) = info_list(app, id) else {
                 return;
             };
             prose.extend([
@@ -1041,11 +1067,7 @@ pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
             )
         }
         CustomListInfoTarget::Rule { list_id, row_ref } => {
-            let Some(rule) = app.operator_rules.as_ref().and_then(|rules| {
-                (rules.id == *list_id)
-                    .then(|| rules.rows.iter().find(|row| row.row_ref == *row_ref))
-                    .flatten()
-            }) else {
+            let Some(rule) = info_rule(app, list_id, row_ref) else {
                 return;
             };
             let projected = CustomListRuleRow {
@@ -1118,6 +1140,7 @@ pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
     modal_form::render_modal(f, area, 76, |width| {
         (modal_form::notice_body(&spec, width), ())
     });
+    crate::tui::mouse::close_on_outside_click();
 }
 
 #[cfg(test)]

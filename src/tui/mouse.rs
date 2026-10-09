@@ -37,10 +37,23 @@ struct Target {
 // do not borrow App; their hit regions live only until the next frame reset.
 thread_local! {
     static OVERLAY_TARGETS: RefCell<Vec<Target>> = const { RefCell::new(Vec::new()) };
+    // Outer rect of the overlay begun last this frame, and whether it closes
+    // on an outside click.
+    static OVERLAY_FRAME: Cell<Option<(Rect, bool)>> = const { Cell::new(None) };
 }
 
-pub fn begin_overlay() {
+/// Start the overlay drawn at `frame`. It owns the clicks from now on and is
+/// hard (outside clicks do nothing) until it opts in.
+pub fn begin_overlay(frame: Rect) {
     OVERLAY_TARGETS.with(|targets| targets.borrow_mut().clear());
+    OVERLAY_FRAME.set(Some((frame, false)));
+}
+
+/// Mark the overlay begun last as soft: a menu or a modal whose close loses
+/// nothing. A left click outside it then acts as Esc. Overlays holding
+/// unsaved or staged work never call this.
+pub fn close_on_outside_click() {
+    OVERLAY_FRAME.set(OVERLAY_FRAME.get().map(|(frame, _)| (frame, true)));
 }
 
 pub fn register_overlay(area: Rect, key: KeyEvent) {
@@ -63,7 +76,7 @@ pub struct MouseState {
     pub subnet_clients_max_scroll: Cell<usize>,
     details: RefCell<Vec<DetailPanelState>>,
     sort_focus: Option<(Leaf, MouseAction)>,
-    last_row_click: Option<(Leaf, String, std::time::Instant)>,
+    last_row_click: Option<(Leaf, String, u16, std::time::Instant)>,
 }
 
 /// Per-leaf read-only detail viewport.  This intentionally sits beside the
@@ -84,22 +97,42 @@ pub struct SortOrder {
     pub descending: bool,
 }
 
+/// Two presses on one row within this window act as Enter.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
 impl MouseState {
     pub fn blur_sort(&mut self) {
         self.sort_focus = None;
     }
 
-    pub fn row_click(&mut self, leaf: Leaf, identity: String, now: std::time::Instant) -> bool {
+    pub fn row_click(
+        &mut self,
+        leaf: Leaf,
+        identity: String,
+        row: u16,
+        now: std::time::Instant,
+    ) -> bool {
         let previous = self.last_row_click.take();
-        if previous.is_some_and(|(old_leaf, old_id, at)| {
+        if previous.is_some_and(|(old_leaf, old_id, _, at)| {
             old_leaf == leaf
                 && old_id == identity
-                && now.saturating_duration_since(at) <= std::time::Duration::from_millis(400)
+                && now.saturating_duration_since(at) <= DOUBLE_CLICK
         }) {
             return true;
         }
-        self.last_row_click = Some((leaf, identity, now));
+        self.last_row_click = Some((leaf, identity, row, now));
         false
+    }
+
+    /// Whether a press on screen `row` repeats the pending first click there.
+    pub fn repeats_row_click(&self, leaf: Leaf, row: u16, now: std::time::Instant) -> bool {
+        self.last_row_click
+            .as_ref()
+            .is_some_and(|(old_leaf, _, old_row, at)| {
+                *old_leaf == leaf
+                    && *old_row == row
+                    && now.saturating_duration_since(*at) <= DOUBLE_CLICK
+            })
     }
 
     pub fn clear_row_click(&mut self) {
@@ -343,7 +376,8 @@ pub fn render_sort_focus(frame: &mut ratatui::Frame, app: &App) {
 
 pub fn reset(app: &App) {
     app.mouse.targets.borrow_mut().clear();
-    begin_overlay();
+    OVERLAY_TARGETS.with(|targets| targets.borrow_mut().clear());
+    OVERLAY_FRAME.set(None);
 }
 
 pub fn register(app: &App, area: Rect, action: MouseAction) {
@@ -353,7 +387,12 @@ pub fn register(app: &App, area: Rect, action: MouseAction) {
 }
 
 pub fn overlay_open(app: &App) -> bool {
-    app.show_help
+    app.show_help || modal_open(app)
+}
+
+/// Every overlay but help. Help gets keys only while none of these is open.
+pub fn modal_open(app: &App) -> bool {
+    app.query_log.held.review.is_some()
         || app.information.is_some()
         || super::filter_chips::text_editor_open(app)
         || super::filter_chips::choice_editor_open(app)
@@ -385,6 +424,11 @@ pub fn overlay_open(app: &App) -> bool {
         || app.rules.edit_modal.is_some()
         || app.rules.add_modal.is_some()
         || app.file.section_jump.is_some()
+        // Leaf-gated exactly like their key routing in `handle_key`, and open
+        // only while they draw: a missing row leaves no frame to click off.
+        || (app.active_leaf == Leaf::Profiles && super::tabs::profiles::info_row(app).is_some())
+        || (app.active_leaf == Leaf::Lists && super::tabs::lists::detail_row(app).is_some())
+        || (app.active_leaf == Leaf::CustomLists && super::tabs::custom_lists::info_drawn(app))
         || {
             #[cfg(feature = "cluster")]
             {
@@ -480,14 +524,24 @@ pub fn action(app: &App, event: MouseEvent) -> Option<MouseAction> {
         MouseEventKind::ScrollUp => Some(MouseAction::Key(KeyCode::Up)),
         MouseEventKind::ScrollDown => Some(MouseAction::Key(KeyCode::Down)),
         MouseEventKind::Down(MouseButton::Left) if overlay_open(app) => {
-            OVERLAY_TARGETS.with(|targets| {
-                targets
-                    .borrow()
-                    .iter()
-                    .rev()
-                    .find(|target| target.area.contains(Position::new(event.column, event.row)))
-                    .map(|target| target.action)
-            })
+            let pos = Position::new(event.column, event.row);
+            OVERLAY_TARGETS
+                .with(|targets| {
+                    targets
+                        .borrow()
+                        .iter()
+                        .rev()
+                        .find(|target| target.area.contains(pos))
+                        .map(|target| target.action)
+                })
+                .or_else(|| match OVERLAY_FRAME.get() {
+                    // A pending action sends Esc to `handle_busy_key`, which
+                    // closes the in-flight card, not the overlay clicked off.
+                    Some((frame, true)) if !frame.contains(pos) && app.pending_action.is_none() => {
+                        Some(MouseAction::OverlayKey(KeyCode::Esc.into()))
+                    }
+                    _ => None,
+                })
         }
         MouseEventKind::Down(MouseButton::Left) if !overlay_open(app) => app
             .mouse
@@ -537,38 +591,58 @@ mod tests {
     fn double_click_requires_same_leaf_and_stable_identity_within_threshold() {
         let mut state = MouseState::default();
         let start = std::time::Instant::now();
-        assert!(!state.row_click(Leaf::Labels, "owner:a".into(), start));
+        assert!(!state.row_click(Leaf::Labels, "owner:a".into(), 5, start));
         assert!(state.row_click(
             Leaf::Labels,
             "owner:a".into(),
+            5,
             start + std::time::Duration::from_millis(400)
         ));
         assert!(!state.row_click(
             Leaf::Labels,
             "owner:a".into(),
+            5,
             start + std::time::Duration::from_millis(500)
         ));
         assert!(!state.row_click(
             Leaf::Labels,
             "owner:b".into(),
+            5,
             start + std::time::Duration::from_millis(510)
         ));
         assert!(!state.row_click(
             Leaf::Groups,
             "owner:b".into(),
+            5,
             start + std::time::Duration::from_millis(520)
         ));
         state.clear_row_click();
         assert!(!state.row_click(
             Leaf::Groups,
             "owner:b".into(),
+            5,
             start + std::time::Duration::from_millis(530)
         ));
         assert!(!state.row_click(
             Leaf::Groups,
             "owner:b".into(),
+            5,
             start + std::time::Duration::from_millis(931)
         ));
+    }
+
+    #[test]
+    fn a_repeat_click_needs_the_same_leaf_and_screen_row_within_threshold() {
+        let mut state = MouseState::default();
+        let start = std::time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        assert!(!state.row_click(Leaf::Labels, "a".into(), 5, start));
+        assert!(state.repeats_row_click(Leaf::Labels, 5, at(400)));
+        assert!(!state.repeats_row_click(Leaf::Labels, 6, at(100)));
+        assert!(!state.repeats_row_click(Leaf::Groups, 5, at(100)));
+        assert!(!state.repeats_row_click(Leaf::Labels, 5, at(401)));
+        state.clear_row_click();
+        assert!(!state.repeats_row_click(Leaf::Labels, 5, at(100)));
     }
 
     #[test]
@@ -620,6 +694,7 @@ mod tests {
     #[test]
     fn modal_prevents_clicking_the_underlying_navigation() {
         let mut app = App::new();
+        reset(&app);
         register(
             &app,
             Rect::new(0, 0, 10, 1),
@@ -645,5 +720,101 @@ mod tests {
             action(&app, wheel(MouseEventKind::ScrollUp, 1, 1)),
             Some(MouseAction::Key(KeyCode::Up))
         );
+    }
+
+    #[test]
+    fn outside_click_closes_only_overlays_that_opt_in() {
+        let mut app = App::new();
+        reset(&app);
+        app.show_help = true;
+        begin_overlay(Rect::new(10, 5, 20, 8));
+        assert_eq!(action(&app, click(0, 0)), None);
+        close_on_outside_click();
+        let esc = Some(MouseAction::OverlayKey(KeyCode::Esc.into()));
+        assert_eq!(action(&app, click(0, 0)), esc);
+        assert_eq!(action(&app, click(12, 7)), None);
+        assert_eq!(action(&app, click(10, 5)), None);
+        register_overlay(Rect::new(12, 7, 4, 1), KeyCode::Enter.into());
+        assert_eq!(
+            action(&app, click(12, 7)),
+            Some(MouseAction::OverlayKey(KeyCode::Enter.into()))
+        );
+    }
+
+    #[test]
+    fn outside_click_belongs_to_the_overlay_begun_last() {
+        let mut app = App::new();
+        reset(&app);
+        app.show_help = true;
+        let (big, small) = (Rect::new(0, 0, 40, 20), Rect::new(5, 5, 10, 4));
+        begin_overlay(big);
+        close_on_outside_click();
+        begin_overlay(small);
+        assert_eq!(action(&app, click(20, 15)), None);
+        begin_overlay(big);
+        begin_overlay(small);
+        close_on_outside_click();
+        assert_eq!(
+            action(&app, click(20, 15)),
+            Some(MouseAction::OverlayKey(KeyCode::Esc.into()))
+        );
+    }
+
+    #[test]
+    fn outside_click_needs_an_open_overlay_and_a_current_frame() {
+        let mut app = App::new();
+        reset(&app);
+        register(
+            &app,
+            Rect::new(0, 0, 10, 1),
+            MouseAction::Leaf(Leaf::Devices),
+        );
+        begin_overlay(Rect::new(10, 5, 20, 8));
+        close_on_outside_click();
+        assert_eq!(
+            action(&app, click(0, 0)),
+            Some(MouseAction::Leaf(Leaf::Devices))
+        );
+        app.show_help = true;
+        reset(&app);
+        assert_eq!(action(&app, click(0, 0)), None);
+    }
+
+    #[test]
+    fn info_overlays_block_clicks_only_on_their_leaf() {
+        let mut app = App::new();
+        reset(&app);
+        app.lists.entries = vec![crate::lists::status::BlocklistStatusDto {
+            id: Some("x".into()),
+            ..Default::default()
+        }];
+        app.lists.detail_id = Some("id:x".into());
+        app.active_leaf = Leaf::Lists;
+        assert!(overlay_open(&app));
+        app.active_leaf = Leaf::Devices;
+        assert!(!overlay_open(&app));
+        app.lists.detail_id = None;
+        app.profiles.info_open = true;
+        app.active_leaf = Leaf::Profiles;
+        assert!(!overlay_open(&app), "no profile to show, so nothing draws");
+        let mut config = crate::config::schema::ConfigV1::default();
+        config.profiles.insert("home".into(), Default::default());
+        app.loaded_config = Some(crate::config::loader::LoadedConfig {
+            config,
+            master_path: Default::default(),
+            files_loaded: Vec::new(),
+            total_bytes: 0,
+            provenance: Default::default(),
+            custom_lists: Default::default(),
+        });
+        assert!(overlay_open(&app));
+        app.active_leaf = Leaf::Devices;
+        assert!(!overlay_open(&app));
+        app.active_leaf = Leaf::CustomLists;
+        app.custom_lists.info = Some(crate::tui::app::CustomListInfo {
+            target: crate::tui::app::CustomListInfoTarget::List("gone".into()),
+            advanced_expanded: false,
+        });
+        assert!(!overlay_open(&app), "no such list, so nothing draws");
     }
 }

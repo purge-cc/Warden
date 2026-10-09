@@ -219,8 +219,8 @@ fn enter_with_nothing_marked_says_why() {
 
 #[test]
 fn header_names_the_action() {
-    assert_eq!(header(&open_picker(Action::Allow)), "Add ALLOW Rule");
-    assert_eq!(header(&open_picker(Action::Deny)), "Add DENY Rule");
+    assert_eq!(header(&open_picker(Action::Allow)), "Hold ALLOW Rule");
+    assert_eq!(header(&open_picker(Action::Deny)), "Hold DENY Rule");
 }
 
 #[test]
@@ -400,7 +400,7 @@ fn modal_rows(dump: &str) -> Vec<String> {
 fn picker_uses_the_compact_reference_structure() {
     let dump = render_overlay_in(&open_picker(Action::Allow), 80, 40);
     for text in [
-        "ADD ALLOW RULE",
+        "HOLD ALLOW RULE",
         "Choose Custom Lists for This Rule",
         "Domain",
         "dl.flathub.org",
@@ -411,7 +411,7 @@ fn picker_uses_the_compact_reference_structure() {
         "1–3 of 3 Lists",
         "Cancel",
         "New List",
-        "Confirm",
+        "Hold rule",
     ] {
         assert!(dump.contains(text), "missing {text:?}:\n{dump}");
     }
@@ -699,7 +699,7 @@ fn floor_keeps_the_action_row_and_the_focused_row_on_screen_together() {
         "the focused row must be in the viewport:\n{dump}"
     );
     assert!(
-        dump.contains("Confirm"),
+        dump.contains("Hold rule"),
         "the action row must survive the clamp:\n{dump}"
     );
 }

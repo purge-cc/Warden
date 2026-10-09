@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context};
 
-use super::migration_journal;
+use super::{migration_journal, relocate_receipt};
 
-const WRITE_LOCK_FILE: &str = ".warden-config.lock";
+pub(crate) const WRITE_LOCK_FILE: &str = ".warden-config.lock";
 pub(crate) const WRITE_STAGE_PREFIX: &str = ".warden-write-";
 pub(crate) const POLICY_TRANSACTION_STORE_DIR: &str = ".warden-policy-transactions";
 pub(crate) const POLICY_RECEIPT_STORE_DIR: &str = ".warden-policy-receipts";
@@ -27,6 +27,11 @@ const LOCK_DEADLINE: Duration = Duration::from_secs(30);
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) fn reserved_component(name: &OsStr) -> bool {
+    // Relocate receipts are staged as `<name>.next` before their rename.
+    let receipt = name
+        .as_bytes()
+        .strip_suffix(b".next")
+        .unwrap_or(name.as_bytes());
     name == WRITE_LOCK_FILE
         || name.as_bytes().starts_with(WRITE_STAGE_PREFIX.as_bytes())
         || name == OsStr::new(POLICY_TRANSACTION_STORE_DIR)
@@ -45,6 +50,8 @@ pub(crate) fn reserved_component(name: &OsStr) -> bool {
         || name
             .as_bytes()
             .starts_with(migration_journal::FINALIZED_DIR_PREFIX.as_bytes())
+        || receipt == relocate_receipt::ACTIVE.as_bytes()
+        || receipt == relocate_receipt::DONE.as_bytes()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -247,7 +254,13 @@ impl ConfigTreeIdentity {
 }
 
 pub(crate) fn resolve_path(requested: &Path) -> anyhow::Result<PathBuf> {
-    super::tree_io::resolve_global_from(requested, &std::env::current_dir()?)
+    // An absolute path needs no cwd, so a deleted cwd cannot fail it.
+    let cwd = if requested.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir()?
+    };
+    super::tree_io::resolve_global_from(requested, &cwd)
 }
 
 pub(crate) fn open_at(dir: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
@@ -277,6 +290,34 @@ pub(crate) fn preserve_owner(file: &File, owner: &Metadata) -> anyhow::Result<()
     Ok(())
 }
 
+/// A file whose `flock` is released by `LOCK_UN` on drop, not by close.
+///
+/// A child forked by another thread shares the open file description until
+/// close-on-exec runs, so closing our descriptor alone can leave the lock
+/// held. `LOCK_UN` releases it for every descriptor sharing the description.
+#[derive(Debug)]
+pub struct Flocked(pub(crate) File);
+
+impl std::ops::Deref for Flocked {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Flocked {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for Flocked {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor stays open until the field drops after this.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn inode(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
@@ -284,9 +325,9 @@ fn inode(meta: &Metadata) -> (u64, u64) {
 #[must_use = "dropping the guard releases the config tree lock"]
 #[derive(Debug)]
 pub struct ConfigWriteLock {
-    _side_file: File,
+    _side_file: Flocked,
     side_lock_owner: (u32, u32),
-    _root: File,
+    _root: Flocked,
     identity: ConfigTreeIdentity,
     cwd: PathBuf,
     requested: PathBuf,
@@ -297,7 +338,7 @@ pub struct ConfigWriteLock {
 #[must_use = "dropping the guard releases the config tree lock"]
 #[derive(Debug)]
 pub(crate) struct ConfigReadLock {
-    _root: File,
+    _root: Flocked,
     identity: ConfigTreeIdentity,
     cwd: PathBuf,
     requested: PathBuf,
@@ -529,6 +570,7 @@ fn acquire_read_with_deadline(master: &Path, wait: Duration) -> anyhow::Result<C
         requested: cwd.join(master),
         cwd,
     };
+    refuse_relocate_fence(&guard.identity)?;
     migration_journal::refuse_normal_access(guard.tree_io())?;
     #[cfg(test)]
     test_event(TestEvent::RootLocked);
@@ -541,6 +583,73 @@ pub(crate) fn acquire_for_migration(master: &Path) -> anyhow::Result<MigrationWr
         master,
         LOCK_DEADLINE,
     )?))
+}
+
+/// Take the write lock of a tree that an active relocate receipt fences.
+/// Only `config relocate` may pass the fence.
+pub(crate) fn acquire_for_relocate(master: &Path) -> anyhow::Result<MigrationWriteLock> {
+    Ok(MigrationWriteLock(acquire_write(
+        master,
+        LOCK_DEADLINE,
+        false,
+    )?))
+}
+
+/// Flocks that `config relocate` holds on an existing target root before it
+/// may create anything there.
+#[must_use = "dropping the probe releases the target root"]
+#[derive(Debug)]
+pub(crate) struct RelocateProbe {
+    _root: Flocked,
+    _lock: Option<Flocked>,
+}
+
+/// Hold the root flock and, when present, the side lock of the tree of
+/// `master` without creating either. `None` means the root is absent.
+pub(crate) fn probe_for_relocate(master: &Path) -> anyhow::Result<Option<RelocateProbe>> {
+    let identity = ConfigTreeIdentity::resolve(master)?;
+    match std::fs::symlink_metadata(&identity.root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let root = identity.open_root(false)?;
+    let held = |file: &File, what: &Path| -> anyhow::Result<()> {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!(
+                "NodeNotOffline: another warden process holds {}; stop it first",
+                what.display()
+            );
+        }
+        Err(error).with_context(|| format!("lock {}", what.display()))
+    };
+    held(&root, &identity.root)?;
+    let root = Flocked(root);
+    let lock = match super::tree_io::inspect_at(&root, OsStr::new(WRITE_LOCK_FILE))? {
+        Some(file) => {
+            validate_lock(
+                &file.metadata()?,
+                &identity.owner_metadata(&root)?,
+                &identity.lock_path,
+            )?;
+            let file = reopen_inspected(&file, libc::O_RDONLY)?;
+            held(&file, &identity.lock_path)?;
+            Some(Flocked(file))
+        }
+        None => None,
+    };
+    Ok(Some(RelocateProbe {
+        _root: root,
+        _lock: lock,
+    }))
+}
+
+fn refuse_relocate_fence(identity: &ConfigTreeIdentity) -> anyhow::Result<()> {
+    super::relocate_receipt::refuse_if_active(&super::state_dir::for_config_parent(&identity.root))
 }
 
 fn admitted_parent_alias(
@@ -561,7 +670,7 @@ fn lock_root(
     cwd: &Path,
     exclusive: bool,
     wait: Duration,
-) -> anyhow::Result<(ConfigTreeIdentity, File, Option<File>)> {
+) -> anyhow::Result<(ConfigTreeIdentity, Flocked, Option<File>)> {
     let initial = ConfigTreeIdentity::resolve_from(master, cwd)?;
     if std::fs::metadata(&initial.canonical_master).is_ok() {
         std::fs::metadata(cwd.join(master))
@@ -583,16 +692,25 @@ fn lock_root(
             identity.root.display()
         )
     })?;
+    let root = Flocked(root);
     let verified = identity.verify_master_from(master, cwd)?;
     let captured = capture_master(&identity, &root, verified.as_ref())?;
     Ok((identity, root, captured))
 }
 
 fn acquire_write_with_deadline(master: &Path, wait: Duration) -> anyhow::Result<ConfigWriteLock> {
+    acquire_write(master, wait, true)
+}
+
+fn acquire_write(master: &Path, wait: Duration, fenced: bool) -> anyhow::Result<ConfigWriteLock> {
     let started = Instant::now();
     // Directory-first ordering lets readers synchronize without side-file access.
     let cwd = std::env::current_dir()?;
     let (identity, root, captured) = lock_root(master, &cwd, true, wait)?;
+    // Refuse before the side lock is created, so a fenced writer leaves no lock file.
+    if fenced {
+        refuse_relocate_fence(&identity)?;
+    }
     let owner = captured
         .as_ref()
         .map(File::metadata)
@@ -633,6 +751,7 @@ fn acquire_write_with_deadline(master: &Path, wait: Duration) -> anyhow::Result<
             identity.lock_path.display()
         )
     })?;
+    let file = Flocked(file);
     let verified = identity.verify_master_from(master, &cwd)?;
     ensure!(
         super::tree_io::same_optional_inode(captured.as_ref(), verified.as_ref())?,

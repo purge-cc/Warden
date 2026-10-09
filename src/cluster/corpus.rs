@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::dto::ArtifactIdentity;
 use super::manifest::{digest, is_hash, ObjectRef};
+use crate::config::write_lock::Flocked;
 use crate::lists::catalog::{Catalog, CatalogEntry};
 use crate::lists::source_key::ResolvedSourcePlan;
 
@@ -21,6 +22,7 @@ pub(crate) const MAX_STAGING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_MANIFESTS: usize = 4096;
 const PRIVATE_PINS: &str = "private-pins";
+const CORPUS_DIR: &str = ".warden-node-corpus";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,15 +277,12 @@ struct PrivateManifestPin {
 pub(crate) struct CorpusStore {
     root: PathBuf,
     directory: File,
-    pins: Mutex<BTreeMap<String, File>>,
+    pins: Mutex<BTreeMap<String, Flocked>>,
 }
 
 impl CorpusStore {
     pub(crate) fn open(config_path: &Path) -> anyhow::Result<Self> {
-        let root = config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".warden-node-corpus");
+        let root = corpus_root(config_path)?;
         for dir in [
             &root,
             &root.join("objects"),
@@ -307,10 +306,7 @@ impl CorpusStore {
     }
 
     pub(crate) fn open_existing(config_path: &Path) -> anyhow::Result<Option<Self>> {
-        let root = config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".warden-node-corpus");
+        let root = corpus_root(config_path)?;
         if !root.try_exists()? {
             return Ok(None);
         }
@@ -388,7 +384,7 @@ impl CorpusStore {
         Ok(())
     }
 
-    pub(crate) fn lease_primary_cache(&self) -> anyhow::Result<Option<(PathBuf, File)>> {
+    pub(crate) fn lease_primary_cache(&self) -> anyhow::Result<Option<(PathBuf, Flocked)>> {
         let _guard = self.write_lock()?;
         let Some(path) = self.primary_cache_dir()? else {
             return Ok(None);
@@ -401,7 +397,7 @@ impl CorpusStore {
         Ok(Some((path, lease)))
     }
 
-    pub(crate) fn lease_cache_directory(&self, directory: &Path) -> anyhow::Result<File> {
+    pub(crate) fn lease_cache_directory(&self, directory: &Path) -> anyhow::Result<Flocked> {
         ensure!(
             directory.parent() == Some(self.root.as_path()),
             "CorpusUnownedCacheDirectory"
@@ -416,7 +412,7 @@ impl CorpusStore {
                 "CorpusCacheLeaseFailed"
             );
         }
-        Ok(lease)
+        Ok(Flocked(lease))
     }
 
     fn record_owned_cache(&self, directory: &Path) -> anyhow::Result<()> {
@@ -486,7 +482,7 @@ impl CorpusStore {
         Ok(())
     }
 
-    pub(crate) fn parser_workspace(&self) -> anyhow::Result<(tempfile::TempDir, File)> {
+    pub(crate) fn parser_workspace(&self) -> anyhow::Result<(tempfile::TempDir, Flocked)> {
         use std::os::unix::fs::PermissionsExt;
         let _guard = self.write_lock()?;
         let workspace = tempfile::Builder::new()
@@ -586,7 +582,7 @@ impl CorpusStore {
         read_json(&path)
     }
 
-    pub(crate) fn record_desired(&self, manifest: &CorpusManifest) -> anyhow::Result<File> {
+    pub(crate) fn record_desired(&self, manifest: &CorpusManifest) -> anyhow::Result<Flocked> {
         manifest.validate()?;
         let _guard = self.write_lock()?;
         self.prune_abandoned_candidates()?;
@@ -610,6 +606,7 @@ impl CorpusStore {
                 "CorpusCandidateLeaseFailed"
             );
         }
+        let lease = Flocked(lease);
         self.prune_abandoned_candidates()?;
         Ok(lease)
     }
@@ -840,7 +837,7 @@ impl CorpusStore {
         self.pins
             .lock()
             .map_err(|_| anyhow::anyhow!("CorpusPinsPoisoned"))?
-            .insert(object.sha256.clone(), file);
+            .insert(object.sha256.clone(), Flocked(file));
         Ok(())
     }
 
@@ -1349,6 +1346,40 @@ impl Drop for DirectoryLock {
     }
 }
 
+/// The node corpus is state: an `/etc/<pkg>` master keeps it under
+/// `/var/lib/<pkg>`. A corpus already beside the master stays in use.
+fn corpus_root(config_path: &Path) -> anyhow::Result<PathBuf> {
+    let master_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    // Callers pass both the discovered and the resolved master path; resolve
+    // here so every spelling of one master picks the same corpus.
+    let master_dir = match std::fs::canonicalize(master_dir) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => master_dir.to_path_buf(),
+        Err(error) => return Err(error.into()),
+    };
+    let master_dir = master_dir.as_path();
+    // Corpus opens take no config guard, so they check the relocate fence here.
+    crate::config::relocate_receipt::refuse_if_active(
+        &crate::config::state_dir::for_config_parent(master_dir),
+    )?;
+    // A symlink counts as present, so verify_directory refuses it instead of
+    // the corpus silently moving to the state directory.
+    let legacy_exists = match std::fs::symlink_metadata(master_dir.join(CORPUS_DIR)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(choose_corpus_root(master_dir, legacy_exists))
+}
+
+fn choose_corpus_root(master_dir: &Path, legacy_exists: bool) -> PathBuf {
+    if legacy_exists {
+        master_dir.join(CORPUS_DIR)
+    } else {
+        crate::config::state_dir::for_config_parent(master_dir).join(CORPUS_DIR)
+    }
+}
+
 fn ensure_directory_durable(path: &Path) -> anyhow::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -1359,7 +1390,9 @@ fn ensure_directory_durable(path: &Path) -> anyhow::Result<()> {
     let created = match builder.create(path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {}", path.display()));
+        }
     };
     verify_directory(path)?;
     if created {

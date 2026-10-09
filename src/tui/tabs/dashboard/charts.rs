@@ -221,11 +221,11 @@ pub(super) fn render_qtypes(buf: &mut Buffer, area: Rect, app: &App) {
 /// oldest overlapping bucket is weighted by its overlap with the window;
 /// the current bucket contributes the observations collected so far.
 pub(super) fn render_block_rate(buf: &mut Buffer, area: Rect, app: &App, anchor: u64) {
-    let inner = theme::filled_card(
+    let inner = theme::filled_card_with_subtitle(
         buf,
         area,
         "BLOCK RATE",
-        "Hourly Estimates",
+        theme::card_subtitle_with_legend(area, "Hourly Estimates", block_rate_legend()),
         theme::CardRole::Summary,
     );
     if inner.is_empty() {
@@ -246,6 +246,7 @@ pub(super) fn render_block_rate(buf: &mut Buffer, area: Rect, app: &App, anchor:
         .map(|value| width(&value))
         .max()
         .unwrap_or(3);
+    let bar_width = body.width as usize;
     for (index, window) in windows.iter().enumerate() {
         let header_row = index as u16 * 2;
         if header_row >= body.height {
@@ -258,25 +259,7 @@ pub(super) fn render_block_rate(buf: &mut Buffer, area: Rect, app: &App, anchor:
             block_window_header(window, ratio_width, body.width as usize),
         );
         if header_row + 1 < body.height {
-            let bar = Rect::new(body.x, body.y + header_row + 1, body.width, 1);
-            if window.present_buckets == 0 {
-                render_line(
-                    buf,
-                    bar,
-                    0,
-                    Line::styled(
-                        "·".repeat(bar.width as usize),
-                        Style::default().fg(T.text_disabled),
-                    ),
-                );
-            } else {
-                let ratio = if window.queries == 0 {
-                    0.0
-                } else {
-                    window.blocked as f64 / window.queries as f64
-                };
-                percentage_bar(buf, bar, ratio, T.brand_red);
-            }
+            render_line(buf, body, header_row + 1, block_rate_bar(window, bar_width));
         }
     }
     if body.height > 9 {
@@ -369,6 +352,21 @@ fn rolling_block_window(
     }
 }
 
+fn block_rate_legend() -> Line<'static> {
+    let mut spans = Vec::with_capacity(6);
+    // "high " keeps one trailing cell so the legend ends over the bars, which
+    // are inset one cell inside the caption row.
+    for (mark, label, color) in [
+        ("●", "low ", T.gauge_low),
+        ("●", "mid ", T.gauge_mid),
+        ("●", "high ", T.gauge_high),
+    ] {
+        spans.push(Span::styled(mark, Style::default().fg(color)));
+        spans.push(Span::raw(label));
+    }
+    Line::from(spans)
+}
+
 fn block_ratio_text(window: &BlockWindow) -> String {
     if window.present_buckets == 0 {
         "—/—".to_owned()
@@ -425,6 +423,51 @@ fn block_window_header(window: &BlockWindow, ratio_width: usize, cells: usize) -
         Span::raw(spacer),
         Span::styled(coverage, Style::default().fg(T.warning)),
     ])
+}
+
+/// Each filled cell takes the colour of its position on the 0-100% scale, so
+/// the bar's end colour reads against the low/mid/high legend.
+fn block_rate_bar(window: &BlockWindow, bar_width: usize) -> Line<'static> {
+    if window.present_buckets == 0 {
+        return Line::styled("·".repeat(bar_width), Style::default().fg(T.text_disabled));
+    }
+    let ratio = if window.queries == 0 {
+        0.0
+    } else {
+        (window.blocked as f64 / window.queries as f64).clamp(0.0, 1.0)
+    };
+    // Any blocked query keeps at least one filled cell, so a small rate never
+    // draws as an empty track.
+    let filled = ((ratio * bar_width as f64).round() as usize)
+        .max(usize::from(ratio > 0.0))
+        .min(bar_width);
+    let mut spans = Vec::with_capacity(filled.saturating_add(1));
+    for index in 0..filled {
+        spans.push(Span::styled(
+            "█",
+            Style::default().fg(block_bar_color(index, bar_width)),
+        ));
+    }
+    if filled < bar_width {
+        spans.push(Span::styled(
+            "▒".repeat(bar_width - filled),
+            Style::default().fg(T.border_default),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn block_bar_color(index: usize, width: usize) -> Color {
+    let position = index as f64 / width.max(1) as f64;
+    if position < 0.33 {
+        T.gauge_low
+    } else if position < 0.66 {
+        T.gauge_mid
+    } else if position < 0.9 {
+        T.gauge_high
+    } else {
+        T.gauge_critical
+    }
 }
 
 fn percentage_bar(buf: &mut Buffer, area: Rect, ratio: f64, color: Color) {

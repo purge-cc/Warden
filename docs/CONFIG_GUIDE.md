@@ -5,9 +5,13 @@ The operator contract for this tree. If a sentence here disagrees with
 
 ## Where it lives
 
-One TOML tree. After `scripts/install.sh` / `warden init` that is
-`/etc/purge-warden/` (v1 layout). A git checkout used with `--config`
-can point at a file anywhere.
+One TOML tree. A fresh install (`scripts/install.sh`, or `warden init`
+without `--config`) puts it in `/etc/purge-warden/`. A host installed
+before 0.43.0 keeps it in `/var/lib/purge-warden/` after an upgrade;
+`warden config relocate` moves it to `/etc/purge-warden/` offline (see
+`warden config relocate --help`). Downloaded list caches, node state and
+backup archives stay in `/var/lib/purge-warden/` either way. A git
+checkout used with `--config` can point at a file anywhere.
 
 Every mutating CLI command writes that tree and asks the daemon to
 reload. There is no second live database.

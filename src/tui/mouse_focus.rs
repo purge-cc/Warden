@@ -82,13 +82,19 @@ pub(super) fn field(app: &mut App, index: usize) {
         }
         Leaf::Devices => {
             if let Some(DeviceModal::Form(form)) = app.devices.modal.as_mut() {
-                if form.picker.is_none() {
-                    let fields: Vec<_> = DeviceFormState::FIELDS
+                // While a save is in flight the keyboard takes only Esc.
+                if form.picker.is_none() && !form.submitting {
+                    let field = DeviceFormState::FIELDS
                         .into_iter()
                         .filter(|field| !form.is_locked(*field))
-                        .map(DeviceFormFocus::Field)
-                        .collect();
-                    assign(&mut form.focused, fields, index);
+                        .nth(index);
+                    if let Some(field) = field {
+                        form.focused = DeviceFormFocus::Field(field);
+                        // A picker field opens its list on click, as Enter does.
+                        if super::is_select_only_field(form, field) {
+                            super::open_field_picker(form);
+                        }
+                    }
                 }
             }
         }

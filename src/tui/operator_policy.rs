@@ -18,7 +18,7 @@ pub(crate) use controller::{
     spawn_startup_resume, PolicyCatalog, PolicyChange, PolicyDialog, PolicyOrigin,
     PolicyRuleCounts, PolicyRules,
 };
-pub(crate) use recovery::ProfilePrefix;
+pub(crate) use recovery::{relocate_recovery_settled, ProfilePrefix};
 pub(crate) use render::render;
 #[cfg(test)]
 pub(crate) use workflow::{

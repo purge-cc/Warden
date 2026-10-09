@@ -407,8 +407,10 @@ mod tests {
     #[test]
     fn dnssec_config_participates_in_equality() {
         let cfg = config("127.0.0.1:5301".parse().unwrap());
-        let mut dnssec = DnssecConfig::default();
-        dnssec.mode = DnssecMode::LogOnly;
+        let dnssec = DnssecConfig {
+            mode: DnssecMode::LogOnly,
+            ..DnssecConfig::default()
+        };
         let client = reqwest::Client::new();
         let upstream = ReloadableUpstream::from_config(&cfg, &[], &client, &dnssec).unwrap();
         let first_generation = upstream.generation.load_full();

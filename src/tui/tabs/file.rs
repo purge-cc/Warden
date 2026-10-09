@@ -149,6 +149,7 @@ fn render_section_jump_popup(f: &mut Frame, area: Rect, app: &App, filter: &str)
     let render = modal_form::render_modal(f, area, SECTION_JUMP_W, |w| {
         (modal_form::notice_body(&spec, w), ())
     });
+    crate::tui::mouse::close_on_outside_click();
 
     // The filter is field-region row 0, so the caret target is
     // unconditional; `place_cursor` no-ops if that row is ever scrolled

@@ -510,7 +510,7 @@ fn render_resources(buf: &mut Buffer, area: Rect, app: &App) {
             mib(sample.map(|s| s.rss_mb)),
             sample.map_or(T.text_primary, |s| rss_color(s.rss_mb, s.rss_warn_mb)),
         ),
-        field(inner, "List RAM", estimate, T.text_primary),
+        field(inner, "Lists RAM", estimate, T.text_primary),
         field(
             inner,
             "Warden swap",

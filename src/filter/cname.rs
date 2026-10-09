@@ -648,6 +648,22 @@ pub fn walk_response_with_grant(
     grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
     max_depth: usize,
 ) -> Verdict {
+    walk_response_with_rewrite(records, qname, None, engine, profile, grant, max_depth)
+}
+
+/// Inspect the branch rooted at `qname` as served to `original` through a
+/// synthetic rewrite edge. The edge consumes one hop and its original name
+/// participates in cycle detection, independently of policy grants.
+#[must_use]
+pub(crate) fn walk_response_with_rewrite(
+    records: &[Record],
+    qname: &str,
+    original: Option<&str>,
+    engine: &FilterEngine,
+    profile: &ResolvedProfile,
+    grant: Option<&crate::filter::operator_rules::RequestGrant<'_>>,
+    max_depth: usize,
+) -> Verdict {
     if profile.operator_rules.is_none() {
         return Verdict::Block {
             offending: CompactString::new("runtime-policy-missing"),
@@ -655,6 +671,13 @@ pub fn walk_response_with_grant(
         };
     }
     let cap = max_depth.min(MAX_HOPS);
+    if original.is_some() && cap == 0 {
+        return Verdict::Block {
+            offending: CompactString::new(qname),
+            source: BlockSource::CnameDepthExceeded,
+        };
+    }
+    let cap = cap - usize::from(original.is_some());
     // References point into `records`, whose lifetime encloses this walk. This
     // avoids copying long targets to the heap only to detect a bounded cycle.
     let mut visited: [Option<&Name>; VISITED_CAPACITY] = std::array::from_fn(|_| None);
@@ -700,6 +723,7 @@ pub fn walk_response_with_grant(
         // directly catches `A → B → A`, while the wire-name references still
         // catch cycles wholly among response targets.
         if owner_matches(target_name, qname)
+            || original.is_some_and(|name| owner_matches(target_name, name))
             || visited
                 .iter()
                 .take(slots_used)
@@ -1050,6 +1074,68 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn synthetic_edge_counts_toward_bounded_chain_depth() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("");
+        let records: Vec<_> = (0..16)
+            .map(|i| cname_record(&format!("hop{i}.test"), &format!("hop{}.test", i + 1)))
+            .collect();
+        assert_eq!(
+            walk_response_with_grant(&records[..1], "hop0.test", &engine, &profile, None, 1),
+            Verdict::Allow,
+            "the upstream-only walk fits one hop without the synthetic edge",
+        );
+        assert_eq!(
+            walk_response_with_rewrite(
+                &records[..1],
+                "hop0.test",
+                Some("original.test"),
+                &engine,
+                &profile,
+                None,
+                1
+            ),
+            Verdict::Block {
+                offending: CompactString::new("hop1.test"),
+                source: BlockSource::CnameDepthExceeded,
+            },
+            "the effective two-hop answer exceeds a one-hop budget",
+        );
+        assert_eq!(
+            walk_response_with_rewrite(
+                &records[..15],
+                "hop0.test",
+                Some("original.test"),
+                &engine,
+                &profile,
+                None,
+                16
+            ),
+            Verdict::Allow,
+        );
+        assert_eq!(
+            walk_response_with_rewrite(
+                &records,
+                "hop0.test",
+                Some("original.test"),
+                &engine,
+                &profile,
+                None,
+                16
+            ),
+            Verdict::Block {
+                offending: CompactString::new("hop16.test"),
+                source: BlockSource::CnameDepthExceeded,
+            },
+        );
+        assert_eq!(
+            walk_response_with_grant(&records, "hop0.test", &engine, &profile, None, 16),
+            Verdict::Allow,
+            "non-rewrite chain keeps its full sixteen-hop budget",
+        );
     }
 
     #[test]

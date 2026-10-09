@@ -2,7 +2,8 @@
 //!
 //! The editor opens the config file as-is, and post-edit schema-5
 //! validation runs through the held write capability. For fresh files it is
-//! given the init scaffold via [`crate::cli::commands::init::default_config`].
+//! given the init scaffold via [`crate::cli::commands::init::default_config`]
+//! plus the `[backup]` block from [`crate::cli::commands::init::backup_config_for`].
 //!
 //! The editor invocation is a direct
 //! `Command::new(binary).args(extra).arg(config_path)` so shell metacharacters
@@ -13,7 +14,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::cli::commands::init::default_config;
+use crate::cli::commands::init::{backup_config_for, default_config};
 use crate::cli::exit_codes::{CONFIG, SUCCESS};
 use crate::config::atomic_write::{hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts};
 use crate::config::loader::{
@@ -72,7 +73,7 @@ fn run_edit_with_runner(
             false
         } else {
             let target = plan.materialize()?;
-            let scaffold = default_config();
+            let scaffold = missing_master_scaffold(&canonical_master);
             let mut spool = tempfile::tempfile()
                 .map_err(|e| anyhow::anyhow!("cannot spool default config: {e}"))?;
             spool
@@ -139,6 +140,12 @@ fn run_edit_with_runner(
     }
 }
 
+/// The `/etc` master gets the package seed's `[backup] dir` under `/var/lib`:
+/// the `<config-parent>/backups` fallback would land in read-only `/etc`.
+fn missing_master_scaffold(canonical_master: &Path) -> String {
+    default_config() + backup_config_for(canonical_master)
+}
+
 fn verify_post_editor_integrity(guard: &write_lock::ConfigWriteLock) -> anyhow::Result<()> {
     guard.tree_io().plan_master_target()?;
     migration_journal::refuse_normal_access(guard.tree_io())?;
@@ -164,6 +171,7 @@ pub(crate) fn split_editor_invocation(raw: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::commands::init::{fresh_default_config, DEFAULT_CONFIG_PATH};
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -184,11 +192,12 @@ mod tests {
     }
 
     fn successful_status() -> std::process::ExitStatus {
-        std::process::Command::new("/bin/true").status().unwrap()
+        std::os::unix::process::ExitStatusExt::from_raw(0)
     }
 
     fn failing_status() -> std::process::ExitStatus {
-        std::process::Command::new("/bin/false").status().unwrap()
+        // Wait status for exit code 1: the code sits in bits 8..16.
+        std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
     }
 
     #[allow(dead_code, reason = "the contender reports while this guard is live")]
@@ -832,7 +841,7 @@ mod tests {
     /// cli-h1 regression: a config_path containing shell metacharacters
     /// must not be interpreted by a shell. Pre-fix the `sh -c "$EDITOR
     /// \"$config_path\""` invocation would expand `$(touch …)`. We use
-    /// `/bin/true` as EDITOR so the spawn succeeds without depending on
+    /// `true` (found on PATH) as EDITOR so the spawn succeeds without depending on
     /// any user-side editor, and the assertion is "the sentinel file
     /// never appears" — meaning `$(touch sentinel)` was not evaluated.
     #[test]
@@ -849,7 +858,7 @@ mod tests {
         let config_path = tmp.path().join(&crafted_name);
 
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("EDITOR", "/bin/true");
+        std::env::set_var("EDITOR", "true");
         let _ = run_edit(&config_path);
 
         assert!(
@@ -880,7 +889,7 @@ mod tests {
 
     /// The headline fix: an unedited-but-invalid config must not exit 0.
     ///
-    /// `EDITOR=/bin/true` leaves the file exactly as written, so the config
+    /// `EDITOR=true` leaves the file exactly as written, so the config
     /// the validator sees is the broken one below. Before this the errors
     /// were printed and the command still returned success, so
     /// `warden config edit && systemctl reload purge-warden` reloaded a
@@ -900,7 +909,7 @@ mod tests {
         .unwrap();
 
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("EDITOR", "/bin/true");
+        std::env::set_var("EDITOR", "true");
         let code = run_edit(&config_path).expect("editor launched fine");
         assert_eq!(
             code, CONFIG,
@@ -957,9 +966,41 @@ servers = ["192.0.2.1:53"]
         .unwrap();
 
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("EDITOR", "/bin/true");
+        std::env::set_var("EDITOR", "true");
         let code = run_edit(&config_path).expect("editor launched fine");
         assert_eq!(code, SUCCESS, "a valid saved config must exit 0");
+    }
+
+    #[test]
+    fn missing_file_scaffold_keeps_custom_layout_backup_fallback() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let master = tmp.path().join("config.toml");
+        let code = run_edit_with_runner(&master, "unused-editor", &[], |_, _, target| {
+            let cfg: crate::config::schema::ConfigV5 =
+                toml::from_str(&fs::read_to_string(target).unwrap()).unwrap();
+            assert!(cfg.backup.dir.is_none());
+            assert_eq!(cfg.backup.resolve_dir(target), tmp.path().join("backups"));
+            Ok(std::process::ExitStatus::from_raw(0))
+        })
+        .unwrap();
+        assert_eq!(
+            code, CONFIG,
+            "the scaffold still requires an operator upstream"
+        );
+    }
+
+    #[test]
+    fn missing_etc_master_scaffold_is_the_package_seed() {
+        let master = Path::new(DEFAULT_CONFIG_PATH);
+        let scaffold = missing_master_scaffold(master);
+        assert_eq!(scaffold, fresh_default_config());
+        let cfg: crate::config::schema::ConfigV5 = toml::from_str(&scaffold).unwrap();
+        assert_eq!(
+            cfg.backup.resolve_dir(master),
+            Path::new("/var/lib/purge-warden/backups")
+        );
     }
 
     /// DISC-1 regression: the first-boot scaffold lands via
@@ -974,7 +1015,7 @@ servers = ["192.0.2.1:53"]
         assert!(!config_path.exists());
 
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("EDITOR", "/bin/true");
+        std::env::set_var("EDITOR", "true");
         let result = run_edit(&config_path);
         // The loader may complain about the scaffold's profile shape vs
         // the schema; we only care about the create path landing with

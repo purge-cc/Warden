@@ -2,8 +2,8 @@
 //! a single `Enter` press (auto-flips Allow vs Deny based on the focused
 //! row's `result` status).
 //!
-//! Renders a multi-select list of the operator's custom lists and sends the
-//! marked rules as one atomic policy operation. The profiles that mount a
+//! Renders a multi-select list of the operator's custom lists and holds the
+//! marked rules in the session draft. The profiles that mount a
 //! list decide who it filters.
 //!
 //! ## State machine
@@ -12,7 +12,7 @@
 //! Picking ──[space]──▶ Picking (toggle)
 //!     │   ──[n]──▶ NewList ──create──▶ Picking (new list selected)
 //!     │                    ──[Esc]──▶ Picking
-//!     ├──[Enter], ≥1 marked──▶ Done(per-list report)
+//!     ├──[Enter], ≥1 marked──▶ held locally; closed
 //!     └──[Esc]──▶ closed
 //! ```
 //!
@@ -139,7 +139,7 @@ pub struct RuleReport {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Stage {
-    /// Mark zero or more lists. `space` toggles, Enter writes.
+    /// Mark zero or more lists. `space` toggles, Enter holds locally.
     Picking,
     /// The Custom Lists leaf's own add-list form, reached with `n`.
     ///
@@ -150,6 +150,15 @@ pub enum Stage {
     /// The per-list report. Stays on screen until Enter or Escape closes it
     /// so the operator can inspect and scroll every outcome.
     Done(Vec<RuleReport>),
+    /// Scrollable cause retained by the picker; Back preserves its capture and selection.
+    ErrorDetails,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogState {
+    Ready,
+    Loading,
+    Unavailable,
 }
 
 /// State bag for the modal lifecycle. Cleared (`= None`) when the
@@ -164,8 +173,9 @@ pub struct QueryLogRuleModal {
     /// Surfaced in the modal for operator orientation.
     pub captured_client: String,
     pub rows: Vec<ListRow>,
+    pub(crate) catalog_state: CatalogState,
     pub cursor: usize,
-    /// Focus ring: list, Cancel, New List, Confirm.
+    /// Focus ring: list, Cancel, New List, Hold rule.
     pub focus: usize,
     pub stage: Stage,
     /// First rendered result row shown by the fixed-height report viewport.
@@ -198,6 +208,7 @@ impl QueryLogRuleModal {
             domain,
             captured_client,
             rows,
+            catalog_state: CatalogState::Ready,
             cursor: 0,
             focus: 0,
             stage: Stage::Picking,
@@ -271,12 +282,12 @@ impl QueryLogRuleModal {
     }
 
     pub fn focus_next(&mut self) {
-        let count = if self.rows.is_empty() { 2 } else { 4 };
+        let count = if self.rows.is_empty() { 2 } else { 4 } + usize::from(self.long_error());
         self.focus = (self.focus + 1) % count;
     }
 
     pub fn focus_prev(&mut self) {
-        let count = if self.rows.is_empty() { 2 } else { 4 };
+        let count = if self.rows.is_empty() { 2 } else { 4 } + usize::from(self.long_error());
         self.focus = (self.focus + count - 1) % count;
     }
 
@@ -291,6 +302,13 @@ impl QueryLogRuleModal {
             KeyCode::Char('n' | 'N') if self.rows.is_empty() => 0,
             KeyCode::Char('n' | 'N') => 2,
             KeyCode::Enter if !self.rows.is_empty() => 3,
+            KeyCode::Char('e') => {
+                if self.rows.is_empty() {
+                    2
+                } else {
+                    4
+                }
+            }
             _ => return,
         };
     }
@@ -313,6 +331,7 @@ impl QueryLogRuleModal {
     pub fn adopt_lists(&mut self, rows: Vec<ListRow>, select: Option<&str>) {
         let marked: Vec<String> = self.selected_ids();
         self.rows = rows;
+        self.catalog_state = CatalogState::Ready;
         for row in &mut self.rows {
             if marked.iter().any(|m| m == &row.id) || select == Some(row.id.as_str()) {
                 row.selected = true;
@@ -329,7 +348,7 @@ impl QueryLogRuleModal {
         self.error = None;
     }
 
-    /// Record why an Enter did not write.
+    /// Record why an Enter did not hold a rule.
     pub fn note_no_selection(&mut self) {
         self.error = Some(NO_SELECTION.to_string());
     }
@@ -342,9 +361,16 @@ impl QueryLogRuleModal {
         self.report_scroll = 0;
     }
 
+    pub(crate) fn long_error(&self) -> bool {
+        // ponytail: threshold assumes the 80-column floor; narrower support needs layout-derived width.
+        self.error
+            .as_ref()
+            .is_some_and(|error| crate::tui::text::wrap(error, 60).len() > 2)
+    }
+
     /// Move the result viewport by rendered rows, clamped to its last page.
     pub fn scroll_report(&mut self, delta: i32) {
-        if !matches!(self.stage, Stage::Done(_)) {
+        if !matches!(self.stage, Stage::Done(_) | Stage::ErrorDetails) {
             return;
         }
         let last = self.report_max_scroll.get();
@@ -357,13 +383,13 @@ impl QueryLogRuleModal {
     }
 
     pub fn report_home(&mut self) {
-        if matches!(self.stage, Stage::Done(_)) {
+        if matches!(self.stage, Stage::Done(_) | Stage::ErrorDetails) {
             self.report_scroll = 0;
         }
     }
 
     pub fn report_end(&mut self) {
-        if matches!(self.stage, Stage::Done(_)) {
+        if matches!(self.stage, Stage::Done(_) | Stage::ErrorDetails) {
             self.report_scroll = self.report_max_scroll.get();
         }
     }
@@ -375,7 +401,7 @@ pub fn header(modal: &QueryLogRuleModal) -> String {
         Action::Allow => "ALLOW",
         Action::Deny => "DENY",
     };
-    format!("Add {verb} Rule")
+    format!("Hold {verb} Rule")
 }
 
 /// Fit complete graphemes into the modal's display-cell budget.
@@ -390,7 +416,7 @@ const PICKER_HEAD_ROWS: usize = 4;
 const PICKER_TAIL_ROWS: usize = 4;
 const REPORT_VIEW_ROWS: usize = 12;
 const REPORT_WRAP_WIDTH: usize = 62;
-const MOUNT_FALLBACK: &str = "Lists Apply Only to Their Assigned Profiles";
+const MOUNT_FALLBACK: &str = "Hold is local only · New List saves separately";
 
 /// Draw the fixed-size rule picker inside the Query Log content area.
 pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &QueryLogRuleModal) {
@@ -402,11 +428,17 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &QueryLogRuleModal) {
     let width = MODAL_WIDTH.min(anchor.width.saturating_sub(4));
     let height = MODAL_HEIGHT.min(anchor.height.saturating_sub(2));
     let surface = modal_form::render_chrome_in(f, anchor, width, height, "", T.text_primary, true);
+    // Picking holds staged toggles that Esc throws away; reports are read-only.
+    if !matches!(modal.stage, Stage::Picking) {
+        crate::tui::mouse::close_on_outside_click();
+    }
     if surface.is_empty() {
         return;
     }
 
-    let description = if matches!(modal.stage, Stage::Done(_)) {
+    let description = if matches!(modal.stage, Stage::ErrorDetails) {
+        "Captured Picker Error"
+    } else if matches!(modal.stage, Stage::Done(_)) {
         "Custom List Results"
     } else {
         "Choose Custom Lists for This Rule"
@@ -440,6 +472,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &QueryLogRuleModal) {
             report_body(modal, reports, content.width, content.height),
             Vec::new(),
         ),
+        Stage::ErrorDetails => (error_body(modal, content.width, content.height), Vec::new()),
         Stage::NewList(_) => unreachable!("new-list stage returns before picker rendering"),
     };
     let view = modal_form::render_scroll_body(f, content, &body);
@@ -474,7 +507,7 @@ fn picker_actions(modal: &QueryLogRuleModal) -> Vec<modal_form::Action> {
         modal_form::Action::new("Cancel", modal.focus == 1, ActionKind::Neutral, "")
             .on_key(KeyCode::Esc),
         modal_form::Action::new(
-            "New List",
+            "New List (separate)",
             modal.focus == if modal.rows.is_empty() { 0 } else { 2 },
             ActionKind::Neutral,
             "",
@@ -483,8 +516,19 @@ fn picker_actions(modal: &QueryLogRuleModal) -> Vec<modal_form::Action> {
     ];
     if !modal.rows.is_empty() {
         actions.push(
-            modal_form::Action::new("Confirm", modal.focus == 3, ActionKind::Primary, "")
+            modal_form::Action::new("Hold rule", modal.focus == 3, ActionKind::Primary, "")
                 .on_key(KeyCode::Enter),
+        );
+    }
+    if modal.long_error() {
+        actions.push(
+            modal_form::Action::new(
+                "Details",
+                modal.focus == if modal.rows.is_empty() { 2 } else { 4 },
+                ActionKind::Neutral,
+                "",
+            )
+            .on_key(KeyCode::Char('e')),
         );
     }
     actions
@@ -533,7 +577,13 @@ fn picker_body(
     let mut choice_hits = Vec::new();
     if modal.rows.is_empty() {
         body.fields.push(Line::styled(
-            "No Custom Lists · Press n to Create One",
+            match modal.catalog_state {
+                CatalogState::Ready => "No Custom Lists · Press n to Create One",
+                CatalogState::Loading => "Custom List catalog loading · close/reopen to retry",
+                CatalogState::Unavailable => {
+                    "Custom List inventory unavailable · close/reopen to retry"
+                }
+            },
             modal_form::text_style(TextTone::Secondary),
         ));
     } else {
@@ -575,15 +625,27 @@ fn picker_body(
     }
 
     if let Some(error) = modal.error.as_deref() {
-        body.tail
-            .extend(modal_form::hint_or_error_rows(Some(error), "", width, 2));
+        body.tail.extend(modal_form::hint_or_error_rows(
+            Some(if modal.long_error() {
+                "e: full error details · Esc close; reopen to retry."
+            } else {
+                error
+            }),
+            "",
+            width,
+            2,
+        ));
     } else {
         let description = modal
             .rows
             .get(modal.cursor)
             .map(|row| row.description.as_str())
             .filter(|description| !description.is_empty())
-            .unwrap_or(MOUNT_FALLBACK);
+            .unwrap_or(if modal.catalog_state == CatalogState::Ready {
+                MOUNT_FALLBACK
+            } else {
+                "Close/reopen to retry inventory · New List is separate"
+            });
         body.tail.push(Line::styled(
             fit(description, width as usize),
             modal_form::text_style(TextTone::Muted),
@@ -613,6 +675,32 @@ fn picker_body(
     }
     body.tail.push(modal_form::action_row(&actions, width));
     (body, choice_hits)
+}
+
+fn error_body(modal: &QueryLogRuleModal, width: u16, height: u16) -> ScrollBody {
+    let actions =
+        vec![modal_form::Action::new("Back", true, ActionKind::Neutral, "").on_key(KeyCode::Esc)];
+    let mut body = action_body(actions.clone(), width);
+    body.head = vec![
+        context_row("Domain", &modal.domain, width),
+        context_row("Client", &modal.captured_client, width),
+    ];
+    let rows = crate::tui::text::wrap(modal.error.as_deref().unwrap_or_default(), width as usize);
+    let budget = (height as usize).saturating_sub(body.head.len() + 2).max(1);
+    modal
+        .report_max_scroll
+        .set(rows.len().saturating_sub(budget));
+    body.fields = rows
+        .into_iter()
+        .skip(modal.report_scroll.min(modal.report_max_scroll.get()))
+        .take(budget)
+        .map(|row| Line::styled(row, modal_form::text_style(TextTone::Error)))
+        .collect();
+    body.tail = vec![
+        Line::from("↑↓/PgUp/PgDn scroll · Esc back; close/reopen to retry"),
+        modal_form::action_row(&actions, width),
+    ];
+    body
 }
 
 fn report_body(

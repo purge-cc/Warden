@@ -274,6 +274,7 @@ fn render_fixed_height(
     let body = build(nominal_w, expected_inner_h);
     let surface =
         modal_form::render_chrome_in(f, anchor, MODAL_W, height, "", T.text_primary, true);
+    crate::tui::mouse::close_on_outside_click();
     let inner = modal_form::content_rect(surface);
     let scrolls = body.scrollable
         && modal_form::will_scroll(

@@ -906,6 +906,7 @@ pub fn render_detail_overlay(f: &mut Frame, area: Rect, app: &App) {
     };
     let height = area.height.saturating_sub(2).min(30);
     let inner = modal_form::render_chrome_in(f, area, 74, height, "", T.text_primary, true);
+    crate::tui::mouse::close_on_outside_click();
     if let Some(view) = app.local_dns.audit_view.as_ref() {
         render_audit_content(f, inner, app, loaded, view, true);
     } else {

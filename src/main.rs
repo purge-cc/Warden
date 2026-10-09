@@ -56,20 +56,37 @@ fn command_needs_socket(command: &cli::Commands) -> bool {
     )
 }
 
+/// Commands that do not read a config have no use for the discovery warning.
+/// `init` is itself the remedy the fresh-install warning names, so it drops
+/// only that one: a blocked config still warns, because `init` there would
+/// write a second config beside the live one.
+fn drops_discovery_warning(
+    command: &cli::Commands,
+    warning: &cli::config_discovery::DiscoveryWarning,
+) -> bool {
+    match command {
+        cli::Commands::Completion { .. }
+        | cli::Commands::Config {
+            action: cli::ConfigAction::RenderDefault,
+        } => true,
+        cli::Commands::Init { .. } => warning.no_config,
+        _ => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
-    // `init` needs to know whether `--config` was actually *given*, not just
-    // what discovery settled on: discovery's no-config fallback is
-    // `/etc/purge-warden/config.toml` under root, while `init`'s unflagged
-    // default must stay `/var/lib/purge-warden/config.toml` for
-    // `scripts/install.sh`. Captured before the resolve consumes it.
+    // `init` distinguishes an explicit path from its /etc default so an
+    // unflagged fresh init can refuse to shadow an existing legacy master.
+    // Capture the flag before discovery consumes it.
     let explicit_config = cli.config.clone();
 
     // Resolve the config path: honor --config if given, otherwise walk the
     // standard search list (dev → user → system). A discovery warning is
-    // produced only when none of the candidates exist.
+    // produced when no candidate exists, when one exists but cannot be read,
+    // or when root skips a config in the working directory.
     let (config_path, discovery_warning) = cli::config_discovery::resolve_config_path(cli.config);
 
     // Derive the PID file: explicit --pid-file wins; otherwise track
@@ -80,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let pid_file = cli::config_discovery::resolve_pid_file(cli.pid_file, &config_path);
 
     let command = cli.command.unwrap_or(cli::Commands::Dashboard);
+    let discovery_warning = discovery_warning.filter(|w| !drops_discovery_warning(&command, w));
 
     // Load the socket path from the current config (needed by commands that connect to
     // the running daemon via IPC). main-01: only IPC-bound commands need it, so
@@ -100,6 +118,9 @@ async fn main() -> anyhow::Result<()> {
                     config_path.display(),
                     errs.len(),
                 );
+                for err in &errs {
+                    eprintln!("  - {err}");
+                }
                 PathBuf::from("./control.sock")
             }
         }
@@ -404,6 +425,14 @@ async fn main() -> anyhow::Result<()> {
             }
             cli::ConfigAction::RenderDefault => {
                 cli::commands::config::run_render_default();
+            }
+            cli::ConfigAction::Relocate { dry_run, reverse } => {
+                let code = cli::commands::config::run_relocate(
+                    explicit_config.is_some(),
+                    dry_run,
+                    reverse,
+                )?;
+                cli::exit_codes::exit_with(code);
             }
         },
 
@@ -1795,6 +1824,50 @@ mod tests {
             }),
             "cluster status queries the daemon and DOES need the real socket path"
         );
+    }
+
+    /// The fresh-install warning names `warden init` as its remedy, so
+    /// printing it during that very `init` (the installer's Phase 5 runs one)
+    /// only confuses. A blocked config must still reach `init`, and every
+    /// command that reads a config keeps the warning.
+    #[test]
+    fn discovery_warning_is_dropped_only_where_it_cannot_help() {
+        let warning = |no_config| cli::config_discovery::DiscoveryWarning {
+            headline: String::new(),
+            detail: String::new(),
+            no_config,
+        };
+        let command = |argv: &[&str]| {
+            cli::Cli::try_parse_from(argv)
+                .expect("argv parses")
+                .command
+                .expect("a subcommand")
+        };
+        let (fresh, blocked) = (warning(true), warning(false));
+        for argv in [
+            &["warden", "init"][..],
+            &["warden", "config", "render-default"],
+            &["warden", "completion", "bash"],
+        ] {
+            assert!(
+                drops_discovery_warning(&command(argv), &fresh),
+                "{argv:?} must not tell the operator to run init"
+            );
+        }
+        assert!(
+            !drops_discovery_warning(&command(&["warden", "init"]), &blocked),
+            "init must still hear that a config exists but is blocked"
+        );
+        for argv in [
+            &["warden", "status"][..],
+            &["warden", "config", "lint"],
+            &["warden", "start"],
+        ] {
+            assert!(
+                !drops_discovery_warning(&command(argv), &fresh),
+                "{argv:?} reads a config and must keep the warning"
+            );
+        }
     }
 
     /// The skip must not leak to unrelated verbs: a config that fails to load

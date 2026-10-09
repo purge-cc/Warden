@@ -1372,6 +1372,7 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ProfileModal) {
                 let total = body.fields.len();
                 (body, total)
             });
+            crate::tui::mouse::close_on_outside_click();
             review.scroll.set(render.view.offset);
             review
                 .max_scroll
@@ -1382,12 +1383,14 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &ProfileModal) {
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&spec, w), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
         Stage::Submitted(outcome) => {
             let spec = outcome_notice(outcome);
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&spec, w), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
     }
 }

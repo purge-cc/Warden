@@ -931,8 +931,8 @@ pub enum ConfigAction {
     },
     /// Create a timestamped tar.gz backup of the config file(s).
     Backup {
-        /// Output directory for the archive. Defaults to
-        /// `<config-parent>/backups/`.
+        /// Output directory for the archive. Defaults to `[backup] dir` when
+        /// configured, otherwise `<config-parent>/backups/`.
         #[arg(long, conflicts_with = "auto")]
         out: Option<PathBuf>,
         /// Scheduled-backup mode used by the `purge-warden-backup.timer`
@@ -970,6 +970,30 @@ pub enum ConfigAction {
     /// Used by the packaging build to freeze the seed config; also handy
     /// for diffing a live config against the shipped default.
     RenderDefault,
+    /// Move the config set from /var/lib/purge-warden to /etc/purge-warden.
+    ///
+    /// Offline and root only: stop the daemon and the backup timer first,
+    /// and call the real binary, not the `warden` wrapper. `--config` is
+    /// refused; the two paths are fixed. Every entry moves by rename on
+    /// one filesystem, so file identities, owners and modes stay. Mutable
+    /// state stays in /var/lib/purge-warden. After the move it runs
+    /// `restorecon -RF` on the new root when restorecon is installed.
+    ///
+    /// A run that stops part way keeps the node fenced and prints the one
+    /// command that rolls it back. Run `warden config backup` first.
+    ///
+    /// Exit code: 0 moved, rolled back, or the dry run found nothing to
+    /// refuse · 1 refused, stopped, or the relabel failed · 2 the config
+    /// does not load.
+    Relocate {
+        /// Run every check and print the plan. Moves nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Move the set back from /etc/purge-warden to
+        /// /var/lib/purge-warden, or roll back an incomplete forward run.
+        #[arg(long)]
+        reverse: bool,
+    },
 }
 
 #[derive(Subcommand)]

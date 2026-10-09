@@ -14176,3 +14176,322 @@ async fn decompressed_size_is_bounded_even_when_the_wire_is_tiny() {
         "the wire payload was not small — this did not model a bomb"
     );
 }
+
+#[cfg(feature = "cluster")]
+async fn policy_rebind_manager() -> (
+    ListManager,
+    Arc<crate::cluster::corpus::CorpusStore>,
+    crate::cluster::dto::ArtifactIdentity,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("lists")).unwrap();
+    std::fs::write(dir.path().join("lists/poison.txt"), "old.example\n").unwrap();
+    let url = "https://imported.local/poison.txt";
+    let bl = bridge_blocklist(url, BlocklistTrust::Local);
+    let plan = ResolvedSourcePlan::build_for_schema(
+        &Catalog::fallback(),
+        &[],
+        std::slice::from_ref(&bl),
+        &Default::default(),
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: DEFAULT_MAX_LIST_ENTRIES,
+            update_interval_secs: 3600,
+        },
+        5,
+    )
+    .unwrap();
+    let bits = SourceBitMap::from_plan(&plan).unwrap();
+    let store = Arc::new(
+        crate::cluster::corpus::CorpusStore::open(&dir.path().join("config.toml")).unwrap(),
+    );
+    let mut manager = ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        plan,
+        Duration::from_secs(3600),
+        bits,
+        SourceTokenMap::default(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().join("cache")),
+    );
+    manager.set_local_bridge(SourceTrustMap::build(&[bl]), dir.path().to_path_buf());
+    manager.refresh_with_mode(RefreshMode::Force).await;
+    let artifact = crate::cluster::dto::ArtifactIdentity {
+        primary_lineage: "a".repeat(64),
+        policy_epoch: 1,
+        artifact_hash: "b".repeat(64),
+        config_revision: "c".repeat(64),
+        operator_policy_hash: "d".repeat(64),
+    };
+    manager
+        .set_node_corpus_primary(store.clone(), artifact.clone(), Vec::new())
+        .unwrap();
+    (manager, store, artifact, dir)
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn policy_rebind_barrier_keeps_exact_bodies_and_queues_force_until_commit() {
+    let (mut manager, store, old_artifact, dir) = policy_rebind_manager().await;
+    let old_generation = store.pair_state().unwrap().active.unwrap();
+    let old = store.manifest(&old_generation).unwrap();
+    let filter = manager.filter.clone();
+    let shards = filter.filter_gen_ids();
+    let (tx, rx) = mpsc::channel(8);
+    manager.set_command_channel(rx);
+    let task = manager.spawn_refresh_loop_after_refresh();
+    let mut next = old_artifact.clone();
+    next.artifact_hash = "e".repeat(64);
+    next.config_revision = "f".repeat(64);
+    next.operator_policy_hash = "1".repeat(64);
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: next.clone(),
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), prepared_rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let state = store.pair_state().unwrap();
+    assert_eq!(state.persisted.as_deref(), Some(old_generation.as_str()));
+    assert_eq!(state.active.as_deref(), Some(old_generation.as_str()));
+    let desired = store.manifest(state.desired.as_deref().unwrap()).unwrap();
+    assert_eq!(desired.artifact, next);
+    assert_eq!(desired.sources, old.sources);
+    assert_eq!(desired.auxiliary, old.auxiliary);
+    assert_eq!(filter.filter_gen_ids(), shards);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (force_tx, mut force_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: force_tx,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted_rx.await.unwrap(),
+        ListManagerCommandDisposition::Queued
+    );
+    assert!(matches!(
+        force_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    commit_tx.send(true).unwrap();
+    completed_rx.await.unwrap().unwrap();
+    assert_eq!(
+        store.pair_state().unwrap().active.as_deref(),
+        Some(desired.generation.as_str())
+    );
+    assert_eq!(filter.filter_gen_ids(), shards);
+    tokio::time::timeout(Duration::from_secs(5), force_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    task.retire().await.unwrap();
+    let reopened =
+        crate::cluster::corpus::CorpusStore::open(&dir.path().join("config.toml")).unwrap();
+    let active = reopened.pair_state().unwrap().active.unwrap();
+    let manifest = reopened.manifest(&active).unwrap();
+    assert_eq!(manifest.artifact, next);
+    reopened.verify_manifest_objects(&manifest).unwrap();
+    assert_eq!(manifest.sources[0].body, old.sources[0].body);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn policy_rebind_prepare_failure_and_cancel_resume_old_manager() {
+    let (mut manager, store, old_artifact, _dir) = policy_rebind_manager().await;
+    let old_generation = store.pair_state().unwrap().active.unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    manager.set_command_channel(rx);
+    let task = manager.spawn_refresh_loop_after_refresh();
+    let mut invalid = old_artifact.clone();
+    invalid.artifact_hash.clear();
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, _completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: invalid,
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    assert!(prepared_rx.await.unwrap().is_err());
+    drop(commit_tx);
+    assert_eq!(
+        store.pair_state().unwrap().active.as_deref(),
+        Some(old_generation.as_str())
+    );
+
+    let mut next = old_artifact.clone();
+    next.artifact_hash = "e".repeat(64);
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, _completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: next,
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    prepared_rx.await.unwrap().unwrap();
+    drop(commit_tx);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (force_tx, force_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: force_tx,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        accepted_rx.await.unwrap(),
+        ListManagerCommandDisposition::Started | ListManagerCommandDisposition::Queued
+    ));
+    tokio::time::timeout(Duration::from_secs(5), force_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let serving = store.pair_state().unwrap().active.unwrap();
+    assert_eq!(store.manifest(&serving).unwrap().artifact, old_artifact);
+    task.retire().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn policy_rebind_post_prepare_install_failure_kills_actor_before_old_refresh() {
+    let (mut manager, store, old_artifact, _dir) = policy_rebind_manager().await;
+    let old_generation = store.pair_state().unwrap().active.unwrap();
+    let old = store.manifest(&old_generation).unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    manager.set_command_channel(rx);
+    let task = manager.spawn_refresh_loop_after_refresh();
+    let mut next = old_artifact;
+    next.artifact_hash = "e".repeat(64);
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: next,
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    prepared_rx.await.unwrap().unwrap();
+    // Simulate an object disappearing after prepare but before the post-swap commit.
+    std::fs::remove_file(store.object_path(&old.sources[0].body.sha256).unwrap()).unwrap();
+    commit_tx.send(true).unwrap();
+    assert!(completed_rx.await.unwrap().is_err());
+    assert_eq!(
+        store.pair_state().unwrap().active.as_deref(),
+        Some(old_generation.as_str())
+    );
+    tokio::time::timeout(Duration::from_secs(5), tx.closed())
+        .await
+        .unwrap();
+    task.retire().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn policy_rebind_barrier_defers_elapsed_scheduled_deadline() {
+    let (mut manager, store, artifact, _dir) = policy_rebind_manager().await;
+    let registry = manager.status_registry();
+    let seq = registry.cycle().seq;
+    let old_generation = store.pair_state().unwrap().active.unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    manager.set_command_channel(rx);
+    let task = manager.spawn_refresh_loop_after_refresh();
+    let mut next = artifact;
+    next.artifact_hash = "e".repeat(64);
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: next,
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    prepared_rx.await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_secs(7200)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(registry.cycle().seq, seq);
+    assert_eq!(
+        store.pair_state().unwrap().active.as_deref(),
+        Some(old_generation.as_str())
+    );
+    commit_tx.send(true).unwrap();
+    completed_rx.await.unwrap().unwrap();
+    assert_ne!(
+        store.pair_state().unwrap().active.as_deref(),
+        Some(old_generation.as_str())
+    );
+    task.retire().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn policy_rebind_retirement_discards_prepared_decision_and_queued_force() {
+    let (mut manager, store, artifact, _dir) = policy_rebind_manager().await;
+    let old_generation = store.pair_state().unwrap().active.unwrap();
+    let (tx, rx) = mpsc::channel(8);
+    manager.set_command_channel(rx);
+    let task = manager.spawn_refresh_loop_after_refresh();
+    let mut next = artifact.clone();
+    next.artifact_hash = "e".repeat(64);
+    let (prepared_tx, prepared_rx) = oneshot::channel();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    let (completed_tx, completed_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::PreparePolicyRebind {
+        artifact: next,
+        prepared: prepared_tx,
+        commit: commit_rx,
+        completed: completed_tx,
+    })
+    .await
+    .unwrap();
+    prepared_rx.await.unwrap().unwrap();
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (force_tx, force_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: force_tx,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted_rx.await.unwrap(),
+        ListManagerCommandDisposition::Queued
+    );
+    tokio::time::timeout(Duration::from_secs(5), task.retire())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(commit_tx.send(true).is_err());
+    assert!(completed_rx.await.is_err());
+    assert!(force_rx.await.is_err());
+    assert!(tx.is_closed());
+    let state = store.pair_state().unwrap();
+    assert_eq!(state.active.as_deref(), Some(old_generation.as_str()));
+    assert_eq!(store.manifest(&old_generation).unwrap().artifact, artifact);
+}

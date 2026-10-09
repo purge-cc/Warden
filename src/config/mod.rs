@@ -10,6 +10,7 @@ pub mod migration;
 pub(crate) mod migration_journal;
 pub mod policy_revision;
 pub(crate) mod policy_transaction;
+pub(crate) mod relocate_receipt;
 pub mod runtime_lease;
 pub mod schema;
 pub mod secrets;

@@ -1509,18 +1509,30 @@ fn load_config_v5_inner(
     validate_semantics: bool,
 ) -> Result<LoadedConfigV5, Vec<ConfigError>> {
     let (master_path, ctx) = load_merged_ctx(tree, now, overlay, warns)?;
+    // Check the version before deserialising: an older tree carries fields
+    // that ConfigV5 refuses, and those errors would hide the one that matters.
+    let declared = ctx
+        .merged
+        .get("schema_version")
+        .and_then(toml::Value::as_integer);
+    if let Some(version) = declared.filter(|v| *v != i64::from(TARGET_SCHEMA_VERSION_V5)) {
+        let mut error = ErrorContext::new(format!(
+            "schema_version = {version} but this candidate requires {TARGET_SCHEMA_VERSION_V5}"
+        ))
+        .with_file(master_path)
+        .with_entity("schema_version");
+        if version == 4 {
+            error = error.with_suggestion(
+                "`install.sh --upgrade` migrates a schema-4 config in the same transaction; \
+                 to review the changes first, run `warden migrate v4-to-v5 --check` as root \
+                 with the candidate binary",
+            );
+        }
+        return Err(vec![ConfigError::VersionMismatch(error)]);
+    }
     let config: ConfigV5 = toml::Value::Table(ctx.merged.clone())
         .try_into()
         .map_err(|error: toml::de::Error| vec![classify_merged_error(error, &ctx.provenance)])?;
-    if config.schema_version != TARGET_SCHEMA_VERSION_V5 {
-        return Err(vec![ConfigError::VersionMismatch(
-            ErrorContext::new(format!(
-                "schema_version = {} but this candidate requires {}",
-                config.schema_version, TARGET_SCHEMA_VERSION_V5
-            ))
-            .with_file(master_path),
-        )]);
-    }
     let limits =
         crate::filter::operator_rules::RuleCompileLimits::try_from(&config.custom_list_limits)
             .map_err(|error| {

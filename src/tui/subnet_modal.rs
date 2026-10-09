@@ -486,12 +486,14 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &SubnetModal) {
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&spec, w), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
         Stage::Submitted(outcome) => {
             let spec = outcome_notice(outcome);
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&spec, w), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
     }
 }

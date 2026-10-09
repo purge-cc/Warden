@@ -394,7 +394,7 @@ fn run_leaf(leaf: &Leaf, config: &Path, pid_file: &Path) -> Run {
         .arg(pid_file)
         .args(&leaf.args)
         .stdin(Stdio::null())
-        .env("EDITOR", "/bin/false")
+        .env("EDITOR", "false")
         .current_dir(config_parent)
         .output()
         .unwrap_or_else(|e| panic!("could not spawn `warden {}`: {e}", leaf.path));
@@ -560,8 +560,7 @@ fn the_named_regressions_stay_fixed() {
     let broken = write_broken_config(dir.path());
     let pid_file = dir.path().join("absent.pid");
 
-    // `config edit` rewrites nothing (EDITOR=/bin/false in run_leaf makes
-    // the launch fail) so each case gets its own valid config to be safe.
+    // The valid config sits in its own directory, apart from the broken one.
     let valid_dir = tempfile::tempdir().unwrap();
     let valid = write_valid_config(valid_dir.path());
 
@@ -605,8 +604,29 @@ fn the_named_regressions_stay_fixed() {
     }
 }
 
-/// `config edit` gets its own test: `run_leaf` sets `EDITOR=/bin/false` so
-/// the shared harness would always see the editor-launch failure (exit 1)
+/// A command that falls back to the default socket prints why the config did
+/// not load, so a relocate fence is named instead of hidden behind the
+/// socket error that follows.
+#[test]
+fn the_socket_fallback_names_why_the_config_did_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid = write_valid_config(dir.path());
+    std::fs::write(dir.path().join(".warden-relocate.json"), "{}").unwrap();
+    let leaf = Leaf {
+        path: "node status".into(),
+        args: vec!["node".into(), "status".into()],
+    };
+    let run = run_leaf(&leaf, &valid, &dir.path().join("absent.pid"));
+    assert!(
+        run.stderr.contains("fallback socket path"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("RelocateInProgress"), "{}", run.stderr);
+}
+
+/// `config edit` gets its own test: `run_leaf` sets `EDITOR=false` so
+/// the shared harness would always see the editor failure (exit 1)
 /// rather than the post-edit validation this sprint changed.
 #[test]
 fn config_edit_reports_an_invalid_saved_config() {
@@ -619,7 +639,7 @@ fn config_edit_reports_an_invalid_saved_config() {
         .args(["config", "edit"])
         // A no-op editor: the file is saved exactly as written, so the
         // validator sees the broken config.
-        .env("EDITOR", "/bin/true")
+        .env("EDITOR", "true")
         .stdin(Stdio::null())
         .output()
         .expect("spawn warden config edit");
@@ -638,7 +658,7 @@ fn config_edit_reports_an_invalid_saved_config() {
         .arg("--config")
         .arg(&valid)
         .args(["config", "edit"])
-        .env("EDITOR", "/bin/true")
+        .env("EDITOR", "true")
         .stdin(Stdio::null())
         .output()
         .expect("spawn warden config edit");

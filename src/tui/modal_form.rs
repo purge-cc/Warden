@@ -133,10 +133,10 @@ pub fn render_chrome_in(
     accent: Color,
     title_in_band: bool,
 ) -> Rect {
-    crate::tui::mouse::begin_overlay();
     let mut area = centered_rect(anchor, w, h);
     let centered_y = f.area().y + f.area().height.saturating_sub(area.height) / 2;
     area.y = centered_y.clamp(anchor.y, anchor.bottom().saturating_sub(area.height));
+    crate::tui::mouse::begin_overlay(area);
     f.render_widget(Clear, area);
     let mut block = Block::default()
         .borders(Borders::ALL)

@@ -95,7 +95,37 @@ pub fn pick_empty_state_message(
 }
 
 pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
-    let table_area = crate::tui::filter_chips::render_card(f, area, app);
+    let mut table_area = crate::tui::filter_chips::render_card(f, area, app);
+    if !app.query_log.held.targets.is_empty() {
+        let [card, rest] = theme::split_card_rows(table_area, 5);
+        let held = &app.query_log.held;
+        let title = "HELD RULES — NOT ACTIVE YET";
+        let subtitle = format!(
+            "{} held · [v] review and apply",
+            crate::tui::query_rule_batch::rule_count(held.targets.len())
+        );
+        let body =
+            super::super::ui::render_card(f, card, title, &subtitle, theme::CardRole::History);
+        let summary = held
+            .error
+            .clone()
+            .or_else(|| {
+                held.targets.first().map(|target| {
+                    format!("{} {} → {}", target.verb(), target.domain, target.list_id)
+                })
+            })
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(crate::tui::text::fit(&summary, body.width as usize)),
+            body,
+        );
+        crate::tui::mouse::register(
+            app,
+            card,
+            crate::tui::mouse::MouseAction::Key(crossterm::event::KeyCode::Char('v')),
+        );
+        table_area = rest;
+    }
     let body = super::super::ui::render_card(
         f,
         table_area,
@@ -209,7 +239,7 @@ pub(crate) fn footer_hint(app: &App) -> &'static str {
     } else if app.filter_focus.is_some() {
         "Tab/Shift+Tab chip · Enter edit · Del clear · Esc table"
     } else {
-        "f filters · Enter allow/deny · i details · ↑/↓ select"
+        "f filters · Enter hold rule · v review · i details"
     }
 }
 

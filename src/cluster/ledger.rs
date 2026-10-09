@@ -846,6 +846,64 @@ fn validate_rollback_proofs(ledger: &OwnershipLedger) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse relocation while the ownership store of `guard`'s master holds a
+/// pending apply intent or does not pin `guard`'s root. Reads only.
+pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()> {
+    let Some((_, state)) = existing_state(guard)? else {
+        return Ok(());
+    };
+    let root = guard.tree_io().root.metadata()?;
+    ensure!(
+        (state.root_device, state.root_inode) == (root.dev(), root.ino()),
+        "ArtifactOwnershipConflict: ownership ledger pins another configuration root"
+    );
+    ensure!(
+        state.pending.is_none(),
+        "ArtifactRecoveryRequired: pending ownership intent"
+    );
+    Ok(())
+}
+
+/// Rewrite the root pin of the ownership ledger from `from` to `to`. A pin
+/// already equal to `to` stays, any other refuses. Returns whether it wrote.
+pub(crate) fn rebind_root(
+    guard: &MigrationWriteLock,
+    from: (u64, u64),
+    to: (u64, u64),
+) -> anyhow::Result<bool> {
+    let Some((files, mut state)) = existing_state(guard)? else {
+        return Ok(false);
+    };
+    let pin = (state.root_device, state.root_inode);
+    if pin == to {
+        return Ok(false);
+    }
+    ensure!(
+        pin == from,
+        "ArtifactOwnershipConflict: ownership ledger pins another configuration root"
+    );
+    (state.root_device, state.root_inode) = to;
+    files.write(STATE, &serde_json::to_vec(&state)?)?;
+    Ok(true)
+}
+
+fn existing_state(guard: &MigrationWriteLock) -> anyhow::Result<Option<(PrivateStore<'_>, State)>> {
+    let Some(files) = PrivateStore::open_existing(guard, STORE_DIR)? else {
+        return Ok(None);
+    };
+    ensure!(
+        files.names(2)?.iter().all(|name| name == STATE),
+        "ArtifactOwnershipConflict: unexpected ownership store entry"
+    );
+    let Some(bytes) = files.read(STATE, MAX_STATE_BYTES)? else {
+        return Ok(None);
+    };
+    let state: State =
+        serde_json::from_slice(&bytes).context("ArtifactOwnershipConflict: invalid ledger")?;
+    validate_state(&state)?;
+    Ok(Some((files, state)))
+}
+
 fn validate_state(state: &State) -> anyhow::Result<()> {
     ensure!(
         state.format == 1,

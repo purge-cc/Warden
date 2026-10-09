@@ -333,7 +333,7 @@ validate_bundle_archive() {
 		./scripts/uninstall.sh | ./scripts/upgrade_config_gate.sh | \
 		./scripts/migrate-shield-to-warden.sh | ./systemd/ | \
 		./systemd/purge-warden.service | ./systemd/purge-warden-backup.service | \
-		./systemd/purge-warden-backup.timer) ;;
+		./systemd/purge-warden-backup.timer | ./docs/ | ./docs/UPGRADE_RECOVERY.md) ;;
 		*) die "the bundle contains an unexpected path: $member" ;;
 		esac
 	done <"$listing"

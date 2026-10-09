@@ -304,11 +304,10 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
     let listener = UnixListener::bind(&socket).unwrap();
     let catalog = custom_list_catalog();
     let server_catalog = catalog.clone();
-    let server_rules = custom_list_rules();
     let server = tokio::spawn(async move {
         let mut commands = Vec::new();
         let mut request_id = None;
-        for _ in 0..6 {
+        for _ in 0..5 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut line = String::new();
             BufReader::new(&mut stream)
@@ -340,24 +339,6 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
                         ),
                     }
                 }
-                IpcCommand::CustomListsRead {
-                    request: crate::ipc::protocol::CustomListsReadRequest::Rules { id, .. },
-                    token: Some(token),
-                } => {
-                    assert_eq!(token, "test-token");
-                    IpcResponse::CustomListsRead {
-                        response: crate::ipc::protocol::CustomListsReadResponse::Rules(
-                            crate::operator_rules::RulePage {
-                                contract_version: crate::operator_rules::CONTRACT_VERSION,
-                                id: id.clone(),
-                                config_revision: server_rules.config_revision.clone(),
-                                pack_revision: server_rules.pack_revision.clone(),
-                                rows: server_rules.rows.clone(),
-                                next_cursor: None,
-                            },
-                        ),
-                    }
-                }
                 IpcCommand::OperatorRulesPlan {
                     request: Some(request),
                     token: Some(token),
@@ -365,6 +346,24 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
                 } => {
                     assert_eq!(token, "test-token");
                     request_id = Some(request.request_id.clone());
+                    assert_eq!(request.expected_config_revision, "config-r1");
+                    assert_eq!(request.operations.len(), 2);
+                    assert_eq!(
+                        request.operations[0],
+                        crate::operator_rules::Operation::AddDomainRule {
+                            id: "local".into(),
+                            domain: "new.example".into(),
+                            action: RuleAction::Deny
+                        }
+                    );
+                    assert_eq!(
+                        request.operations[1],
+                        crate::operator_rules::Operation::AddDomainRule {
+                            id: "local".into(),
+                            domain: "another.example".into(),
+                            action: RuleAction::Allow
+                        }
+                    );
                     let summary = crate::operator_rules::PlanSummary {
                         contract_version: crate::operator_rules::CONTRACT_VERSION,
                         plan_hash: "b".repeat(64),
@@ -434,7 +433,7 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
         }
         commands
     });
-    let mut app = App::new();
+    let mut app = App::known_standalone_for_test();
     app.active_leaf = Leaf::QueryLog;
     refresh_config_caches(&mut app, &path);
     app.operator_catalog = Some(catalog);
@@ -447,6 +446,20 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
     modal.toggle();
     let poller = IpcPoller::new(&socket);
     action_handlers::query_rules(&mut app, modal, &poller, &path).await;
+    assert!(app.operator_policy.is_none());
+    query_rule_batch::hold(
+        &mut app,
+        "another.example",
+        RuleAction::Allow,
+        vec!["local".into()],
+    )
+    .unwrap();
+    assert_eq!(app.query_log.held.targets.len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("packs/local.txt")).unwrap(),
+        "||old.example^\n"
+    );
+    query_rule_batch::review_all(&mut app, &poller).await;
     assert!(matches!(
         app.operator_policy
             .as_ref()
@@ -479,6 +492,15 @@ async fn query_log_rule_submit_uses_one_uor_batch_identity_and_no_reload() {
         crate::operator_rules::PersistenceState::Committed
     );
     assert_eq!(receipt.activation.state, "failed");
+    assert!(app.query_log.held.targets.is_empty());
+    assert!(app
+        .query_log
+        .held
+        .receipt
+        .as_deref()
+        .unwrap()
+        .contains("policy committed; activation failed"));
+    assert!(app.query_log_rule_modal.is_none());
 }
 
 #[test]

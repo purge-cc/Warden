@@ -174,6 +174,7 @@ fn all_card_titles_use_filled_role_bands_and_page_gutters() {
         "CPU & Memory Usage",
         "BLOCK RATE",
         "Hourly Estimates",
+        "●low ●mid ●high",
         "DNS TRAFFIC",
         "24H Queries · Total 0 · Blocked 0",
         "Total",
@@ -209,6 +210,15 @@ fn all_card_titles_use_filled_role_bands_and_page_gutters() {
             T.card_subtitle_bg(role)
         );
     }
+    // Stacked at the 80-column floor, the subtitle still closes with the legend.
+    let stacked = draw(&mut app, 80, 50);
+    assert!(
+        stacked
+            .lines()
+            .any(|line| line.trim_start().starts_with("Hourly Estimates")
+                && line.trim_end().ends_with("●low ●mid ●high")),
+        "{stacked}"
+    );
 }
 
 fn resources(app: &App) -> Buffer {
@@ -238,13 +248,14 @@ fn ram_values_distinguish_missing_zero_and_list_allocations_from_resident_memory
         "2.0 GiB / 8.0 GiB",
         "Warden RAM:",
         "25 MiB",
-        "List RAM:",
+        "Lists RAM:",
         "600.0 MiB",
         "Warden swap:",
         "0 MiB",
     ] {
         assert!(rendered.contains(value), "{rendered}");
     }
+    assert!(!rendered.contains("List RAM"));
     assert!(!rendered.contains("part of Warden"));
     assert_eq!(buffer[(2, 4)].fg, T.text_muted);
     assert!(

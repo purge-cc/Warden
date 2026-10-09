@@ -583,6 +583,7 @@ pub fn render_detail_overlay(f: &mut Frame, area: Rect, app: &App) {
     };
     let height = area.height.saturating_sub(2).min(30);
     let inner = modal_form::render_chrome_in(f, area, 72, height, "", T.text_primary, true);
+    crate::tui::mouse::close_on_outside_click();
     render_detail_content(f, inner, app, &groups, &loaded.config.devices, true);
     detail_panel::prepare(app, Leaf::Groups, group.id.as_str());
 }

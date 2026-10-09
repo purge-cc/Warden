@@ -6141,6 +6141,34 @@ fn load_state(guard: &MigrationWriteLock) -> anyhow::Result<ControlState> {
     Ok(state)
 }
 
+/// Refuse relocation while a node-control operation is not terminal or a
+/// primary transition is pending. Reads only.
+pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()> {
+    let Some(files) = PrivateStore::open_existing(guard, STORE)? else {
+        return Ok(());
+    };
+    let Some(bytes) = files.read(STATE, MAX_STATE_BYTES)? else {
+        return Ok(());
+    };
+    let state: ControlState = serde_json::from_slice(&bytes)?;
+    validate_state(&state)?;
+    ensure!(
+        state.pending_primary_transition.is_none(),
+        "NodeOperationPending: a primary transition is pending"
+    );
+    if let Some((id, record)) = state
+        .operations
+        .iter()
+        .find(|(_, record)| !record.phase.terminal())
+    {
+        anyhow::bail!(
+            "NodeOperationPending: node operation {id} is {:?}",
+            record.phase
+        );
+    }
+    Ok(())
+}
+
 fn save_state(guard: &MigrationWriteLock, state: &ControlState) -> anyhow::Result<()> {
     validate_state(state)?;
     PrivateStore::open(guard, STORE)?.write(STATE, &serde_json::to_vec(state)?)

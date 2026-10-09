@@ -57,7 +57,7 @@ async fn query_picker_mouse_actions_override_the_previous_button_focus() {
     app.query_log_rule_modal = Some(modal);
     let mut terminal = Terminal::new(TestBackend::new(125, 36)).unwrap();
     terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
-    let confirm = click_text(terminal.backend().buffer(), "Confirm");
+    let confirm = click_text(terminal.backend().buffer(), "Hold rule");
     handle_mouse(&mut app, confirm, &poller, &path).await;
     let modal = app
         .query_log_rule_modal
@@ -77,6 +77,49 @@ async fn query_picker_mouse_actions_override_the_previous_button_focus() {
         .expect("picker stays open");
     assert_eq!(modal.focus, 0);
     assert!(modal.rows[0].selected);
+    // The clicked Hold action must also work after list-row keyboard focus.
+    app.operator_catalog = Some(operator_policy::PolicyCatalog {
+        capabilities: crate::operator_rules::Capabilities {
+            contract_version: crate::operator_rules::CONTRACT_VERSION,
+            schema_version: 5,
+            operator_rule_grammar: 1,
+            operations: vec!["add_domain_rule".into()],
+            semantic_hash: true,
+            activation_ack: true,
+            cluster_artifact: false,
+            limits: crate::operator_rules::TransportLimits::IPC,
+        },
+        metadata: crate::operator_rules::Metadata {
+            contract_version: crate::operator_rules::CONTRACT_VERSION,
+            schema_version: 5,
+            config_revision: "a".repeat(64),
+            desired_operator_policy_hash: "b".repeat(64),
+            active_policy: None,
+            activation_in_sync: false,
+            lists: 1,
+            mounted_lists: 1,
+            orphan_packs: 0,
+        },
+        lists: vec![crate::operator_rules::ListDetail {
+            id: "test".into(),
+            display_name: "Test list".into(),
+            description: String::new(),
+            config_revision: "a".repeat(64),
+            pack_revision: "b".repeat(64),
+            bytes: 0,
+            rule_count: 0,
+            invalid_rows: 0,
+            profiles: vec!["default".into()],
+        }],
+        orphan_packs: vec![],
+    });
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let hold = click_text(terminal.backend().buffer(), "Hold rule");
+    handle_mouse(&mut app, hold, &poller, &path).await;
+    assert!(app.query_log_rule_modal.is_none());
+    assert_eq!(app.query_log.held.targets.len(), 1);
+    assert_eq!(app.query_log.held.targets[0].domain, "example.test");
+    assert!(app.operator_policy.is_none() && app.pending_action.is_none());
 }
 
 #[tokio::test]
@@ -134,7 +177,7 @@ async fn lowercase_s_sorts_and_shift_s_opens_resolver_through_the_dispatcher() {
     assert_eq!(app.active_leaf, Leaf::Labels);
 }
 
-fn click_text(buffer: &Buffer, text: &str) -> MouseEvent {
+pub(super) fn click_text(buffer: &Buffer, text: &str) -> MouseEvent {
     let needle: Vec<char> = text.chars().collect();
     for y in (buffer.area.y..buffer.area.bottom()).rev() {
         let row: Vec<char> = (buffer.area.x..buffer.area.right())
@@ -295,6 +338,222 @@ async fn clicking_a_device_picker_option_uses_the_captured_option() {
     assert!(!form.submitting);
     assert!(form.picker.is_none());
     assert_eq!(form.profile, "second");
+}
+
+#[tokio::test]
+async fn clicking_a_device_picker_field_opens_its_dropdown() {
+    fn form(app: &App) -> &DeviceFormState {
+        match app.devices.modal.as_ref() {
+            Some(DeviceModal::Form(form)) => form,
+            _ => panic!("form remains open"),
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let poller = IpcPoller::new(&temp.path().join("absent.sock"));
+    let path = temp.path().join("config.toml");
+    let mut app = App::known_standalone_for_test();
+    app.active_leaf = Leaf::Devices;
+    let mut draft = DeviceFormState::new_add()
+        .with_options(vec!["home-net".into(), "kids".into()], vec![])
+        .with_label_vocab(vec!["Dweller".into()], vec![], vec![]);
+    draft.profile = "home-net".into();
+    draft.owner = "Dweller".into();
+    draft.department = "Studio-9".into();
+    app.devices.modal = Some(DeviceModal::Form(draft));
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let click = click_text(terminal.backend().buffer(), "Dweller");
+    handle_mouse(&mut app, click, &poller, &path).await;
+    assert_eq!(
+        form(&app).focused,
+        DeviceFormFocus::Field(DeviceFormField::Owner)
+    );
+    let picker = form(&app).picker.as_ref().expect("a click opens the list");
+    assert_eq!(picker.target, DeviceFormField::Owner);
+    assert_eq!(picker.options, ["", "Dweller"]);
+    assert_eq!(picker.options[picker.cursor], "Dweller");
+    for text in ["(none)", "Apply"] {
+        terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+        let click = click_text(terminal.backend().buffer(), text);
+        handle_mouse(&mut app, click, &poller, &path).await;
+    }
+    assert!(form(&app).picker.is_none());
+    assert_eq!(form(&app).owner, "", "the clear option empties the field");
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let click = click_text(terminal.backend().buffer(), "home-net");
+    handle_mouse(&mut app, click, &poller, &path).await;
+    assert_eq!(
+        form(&app).picker.as_ref().map(|picker| picker.target),
+        Some(DeviceFormField::Profile)
+    );
+    handle_key(&mut app, KeyCode::Esc.into(), &poller, &path).await;
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let click = click_text(terminal.backend().buffer(), "Studio-9");
+    handle_mouse(&mut app, click, &poller, &path).await;
+    assert_eq!(
+        form(&app).focused,
+        DeviceFormFocus::Field(DeviceFormField::Department)
+    );
+    assert!(
+        form(&app).picker.is_none(),
+        "a kind without labels stays free text"
+    );
+    if let Some(DeviceModal::Form(draft)) = app.devices.modal.as_mut() {
+        draft.submitting = true;
+    }
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let click = click_text(terminal.backend().buffer(), "home-net");
+    handle_mouse(&mut app, click, &poller, &path).await;
+    assert_eq!(
+        form(&app).focused,
+        DeviceFormFocus::Field(DeviceFormField::Department)
+    );
+    assert!(
+        form(&app).picker.is_none(),
+        "a save in flight ignores field clicks"
+    );
+}
+
+#[tokio::test]
+async fn a_press_release_press_on_a_device_row_opens_the_form() {
+    let temp = tempfile::tempdir().unwrap();
+    let poller = IpcPoller::new(&temp.path().join("absent.sock"));
+    let path = temp.path().join("config.toml");
+    let mut app = App::known_standalone_for_test();
+    app.active_leaf = Leaf::Devices;
+    app.device_view = Some(
+        serde_json::from_value(serde_json::json!({
+            "mapped": [{
+                "ip": "10.0.0.2", "name": "Kitchen TV", "profile": "default",
+                "queries": 0, "blocked": 0, "cache_hits": 0, "last_seen": 0, "online": false,
+            }],
+            "unmapped": [],
+        }))
+        .unwrap(),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let press = click_text(terminal.backend().buffer(), "Kitchen TV");
+    // A terminal in mouse mode also reports the release and any motion.
+    for kind in [
+        press.kind,
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Moved,
+        press.kind,
+    ] {
+        handle_mouse(&mut app, MouseEvent { kind, ..press }, &poller, &path).await;
+    }
+    assert!(matches!(app.devices.modal, Some(DeviceModal::Form(_))));
+}
+
+fn query(domain: &str) -> crate::ipc::protocol::QueryLogDto {
+    crate::ipc::protocol::QueryLogDto {
+        timestamp: "2026-10-08T10:00:00Z".into(),
+        client_ip: "10.0.0.2".into(),
+        client_name: None,
+        domain: domain.into(),
+        query_type: "A".into(),
+        result: "ALLOWED".into(),
+        response_time_us: 900,
+        cname_chain_via: None,
+    }
+}
+
+fn query_page(domains: &[&str]) -> ipc_poller::QueryLogPollResult {
+    ipc_poller::QueryLogPollResult {
+        entries: domains.iter().map(|domain| query(domain)).collect(),
+        logging_enabled: true,
+        file_state: crate::ipc::protocol::QueryLogFileState::Ok,
+        next_cursor: None,
+        cursor_stale: false,
+    }
+}
+
+/// Click "first.example" twice on the same screen row while a poll lands
+/// `refreshed` in between, with the release and motion a real terminal
+/// reports. No redraw: the second press still hits the first row's target.
+async fn double_click_first_query_across(refreshed: &[&str]) -> App {
+    let temp = tempfile::tempdir().unwrap();
+    let poller = IpcPoller::new(&temp.path().join("absent.sock"));
+    let path = temp.path().join("config.toml");
+    let mut app = App::known_standalone_for_test();
+    app.active_leaf = Leaf::QueryLog;
+    apply_query_log_page(&mut app, query_page(&["first.example", "second.example"]));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let press = click_text(terminal.backend().buffer(), "first.example");
+    handle_mouse(&mut app, press, &poller, &path).await;
+    assert_eq!(
+        app.query_log.selected_key,
+        Some(tabs::query_log::entry_key(&query("first.example")))
+    );
+    apply_query_log_page(&mut app, query_page(refreshed));
+    for kind in [
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Moved,
+        press.kind,
+    ] {
+        handle_mouse(&mut app, MouseEvent { kind, ..press }, &poller, &path).await;
+    }
+    app
+}
+
+#[tokio::test]
+async fn query_log_double_click_survives_a_refresh_between_the_clicks() {
+    let app =
+        double_click_first_query_across(&["newer.example", "first.example", "second.example"])
+            .await;
+    let modal = app
+        .query_log_rule_modal
+        .as_ref()
+        .expect("the double click opens the rule picker");
+    assert_eq!(modal.domain, "first.example");
+}
+
+#[tokio::test]
+async fn query_log_second_click_never_opens_an_entry_that_left_the_list() {
+    let app = double_click_first_query_across(&["newer.example", "second.example"]).await;
+    assert!(app.query_log_rule_modal.is_none());
+    assert_eq!(
+        app.query_log.selected_key,
+        Some(tabs::query_log::entry_key(&query("newer.example")))
+    );
+}
+
+#[tokio::test]
+async fn query_log_quick_press_on_another_row_moves_the_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let poller = IpcPoller::new(&temp.path().join("absent.sock"));
+    let path = temp.path().join("config.toml");
+    // Once as is, and once with a poll and its redraw between the presses.
+    for refreshed in [
+        None,
+        Some(["newer.example", "first.example", "second.example"]),
+    ] {
+        let mut app = App::known_standalone_for_test();
+        app.active_leaf = Leaf::QueryLog;
+        apply_query_log_page(&mut app, query_page(&["first.example", "second.example"]));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+        let first = click_text(terminal.backend().buffer(), "first.example");
+        handle_mouse(&mut app, first, &poller, &path).await;
+        if let Some(page) = refreshed {
+            apply_query_log_page(&mut app, query_page(&page));
+            terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+        }
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..first
+        };
+        handle_mouse(&mut app, release, &poller, &path).await;
+        let second = click_text(terminal.backend().buffer(), "second.example");
+        handle_mouse(&mut app, second, &poller, &path).await;
+        assert_eq!(
+            app.query_log.selected_key,
+            Some(tabs::query_log::entry_key(&query("second.example")))
+        );
+        assert!(app.query_log_rule_modal.is_none());
+    }
 }
 
 #[tokio::test]

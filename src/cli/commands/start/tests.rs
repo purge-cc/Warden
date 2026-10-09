@@ -2727,3 +2727,134 @@ fn shutdown_unpublishes_list_manager_immediately_after_signal_loop() {
 
     assert!(signal_loop < unpublish && unpublish < shutdown_audit);
 }
+
+#[cfg(feature = "cluster")]
+#[test]
+fn node_rebind_gate_requires_primary_disabled_ip_and_unchanged_live_sources() {
+    let mut config = ConfigV1::test_scaffold();
+    config.cluster.enabled = true;
+    config.cluster.membership_version = Some(1);
+    config.cluster.role = crate::config::schema::ClusterRole::Primary;
+    config.ip_blocklists.enabled = false;
+    let secrets = crate::config::secrets::Secrets::default();
+    let live = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
+    assert!(should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &live
+    ));
+    assert!(!should_rebind_node_policy(
+        &config,
+        false,
+        true,
+        Some(&live),
+        &live
+    ));
+    assert!(!should_rebind_node_policy(
+        &config,
+        true,
+        false,
+        Some(&live),
+        &live
+    ));
+    config.ip_blocklists.enabled = true;
+    assert!(!should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &live
+    ));
+    config.ip_blocklists.enabled = false;
+    config.cluster.role = crate::config::schema::ClusterRole::Secondary;
+    assert!(!should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &live
+    ));
+    config.cluster.role = crate::config::schema::ClusterRole::Primary;
+    config.lists.max_entries += 1;
+    let changed = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
+    assert!(!should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &changed
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn node_rebind_rejects_enabled_to_disabled_ip_transition() {
+    let mut config = ConfigV1::test_scaffold();
+    config.cluster.enabled = true;
+    config.cluster.membership_version = Some(1);
+    config.cluster.role = crate::config::schema::ClusterRole::Primary;
+    config.ip_blocklists.enabled = true;
+    config.ip_blocklists.inline.push("192.0.2.1".into());
+    config
+        .ip_blocklists
+        .sources
+        .push("https://lists.example.test/ips.txt".into());
+    let secrets = crate::config::secrets::Secrets::default();
+    let live = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
+    config.ip_blocklists.enabled = false;
+    let next = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
+    assert!(!should_reuse_live_lists(true, Some(&live), &next));
+    assert!(!should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &next,
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn post_swap_commit_error_never_classifies_activation_as_applied() {
+    let identity = ActivePolicyIdentity {
+        daemon_instance_id: "daemon".into(),
+        config_revision: "revision".into(),
+        operator_policy_hash: "policy".into(),
+        resolver_generation: 2,
+    };
+    let (completion, _rx) = tokio::sync::oneshot::channel();
+    let request = ActivationRequest {
+        operation_id: "operation".into(),
+        request_id: "request".into(),
+        actor: "test".into(),
+        correlation_id: "correlation".into(),
+        expected_config_revision: identity.config_revision.clone(),
+        expected_policy_hash: identity.operator_policy_hash.clone(),
+        completion,
+    };
+    assert!(matches!(
+        classify_activation(&request, Some(identity), Err("corpus commit failed".into())),
+        ActivationResult::Unknown { .. }
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn schema4_node_bootstrap_refusal_reads_as_plain_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "schema_version = 4\n[server]\ndefault_profile = \"default\"\n[profiles.default]\ndisplay_name = \"Default\"\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let message = prepare_nodes_before_load(&path)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("this candidate requires 5"), "{message}");
+    assert!(message.contains("suggestion: "), "{message}");
+    assert!(!message.contains("VersionMismatch"), "{message}");
+}

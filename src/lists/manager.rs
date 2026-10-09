@@ -155,6 +155,13 @@ pub enum ListManagerCommand {
         accepted: oneshot::Sender<ListManagerCommandDisposition>,
         completion: oneshot::Sender<ForceRefreshCompletion>,
     },
+    #[cfg(feature = "cluster")]
+    PreparePolicyRebind {
+        artifact: crate::cluster::dto::ArtifactIdentity,
+        prepared: oneshot::Sender<anyhow::Result<()>>,
+        commit: oneshot::Receiver<bool>,
+        completed: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Immutable completion payload for an operator-forced cycle.
@@ -420,7 +427,7 @@ pub struct ListManager {
     #[cfg(feature = "cluster")]
     node_candidate_cache: Option<tempfile::TempDir>,
     #[cfg(feature = "cluster")]
-    node_cache_lease: Option<std::fs::File>,
+    node_cache_lease: Option<crate::config::write_lock::Flocked>,
     #[cfg(feature = "cluster")]
     node_cache_unpublished: bool,
     #[cfg(feature = "cluster")]
@@ -1283,6 +1290,100 @@ impl ListManager {
 
     pub(crate) fn install_prepared_filter(&mut self, live: Arc<FilterEngine>) {
         self.filter = live;
+    }
+
+    /// Stage an exact policy rebind from the manager's currently active, verified
+    /// objects. Only the desired manifest changes; neither runtime nor manager
+    /// artifact is advertised until the controller receives a commit decision.
+    #[cfg(feature = "cluster")]
+    fn prepare_policy_rebind(
+        &self,
+        artifact: crate::cluster::dto::ArtifactIdentity,
+    ) -> anyhow::Result<crate::cluster::corpus::CorpusManifest> {
+        use crate::cluster::corpus::CorpusManifest;
+        let Some(NodeCorpusProvider::Primary {
+            store,
+            artifact: old_artifact,
+            generation: Some(generation),
+            ..
+        }) = &self.node_corpus
+        else {
+            anyhow::bail!("CorpusLivePrimaryRequired");
+        };
+        self.verify_node_corpus()?;
+        anyhow::ensure!(
+            self.node_candidate_cache.is_none() && !self.node_cache_unpublished,
+            "CorpusLiveCacheRequired"
+        );
+        let cache_dir = self
+            .cache_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("CorpusDurableCacheRequired"))?;
+        anyhow::ensure!(
+            !rollback_journal_path(cache_dir).try_exists()?,
+            "CorpusCacheRecoveryRequired"
+        );
+        let state = store.pair_state()?;
+        anyhow::ensure!(
+            state.active.as_deref() == Some(generation),
+            "CorpusActiveGenerationMismatch"
+        );
+        let old = store.manifest(generation)?;
+        anyhow::ensure!(
+            &old.artifact == old_artifact,
+            "CorpusActiveArtifactMismatch"
+        );
+        old.verify_plan(
+            self.source_plan
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("CorpusSourcePlanRequired"))?,
+        )?;
+        store.verify_manifest_objects(&old)?;
+        for source in &old.sources {
+            let stem = source_to_cache_stem(&source.source.representative);
+            let meta = load_meta_file(&cache_dir.join(format!("{stem}.meta")));
+            let selected = manifest_from_meta(&stem, &meta)
+                .ok_or_else(|| anyhow::anyhow!("CorpusLiveCacheSelectionMissing"))?;
+            anyhow::ensure!(
+                cache_identity_matches(
+                    &source.source.representative,
+                    &source.source.fetch_url,
+                    &meta
+                ) && selected.sha256 == source.body.sha256
+                    && meta.size == usize::try_from(source.body.bytes).ok()
+                    && meta.fetched_at.map(OffsetDateTime::unix_timestamp)
+                        == Some(source.fetched_at),
+                "CorpusLiveCacheDoesNotMatchActivePair"
+            );
+        }
+        let manifest = CorpusManifest::new(artifact, old.sources, old.auxiliary)?;
+        store.prepare_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_policy_rebind(
+        &mut self,
+        manifest: &crate::cluster::corpus::CorpusManifest,
+    ) -> anyhow::Result<()> {
+        let Some(NodeCorpusProvider::Primary { store, .. }) = &self.node_corpus else {
+            anyhow::bail!("CorpusLivePrimaryRequired");
+        };
+        store.install_manifest(manifest)?;
+        store.mark_active(&manifest.generation, &manifest.artifact)?;
+        if let Some(NodeCorpusProvider::Primary {
+            artifact,
+            generation,
+            ..
+        }) = &mut self.node_corpus
+        {
+            *artifact = manifest.artifact.clone();
+            *generation = Some(manifest.generation.clone());
+        }
+        if let Some(hook) = &self.node_active_pair_hook {
+            hook(manifest.artifact.clone(), manifest.generation.clone());
+        }
+        Ok(())
     }
 
     fn publish_node_corpus(&mut self) -> anyhow::Result<()> {
@@ -7885,6 +7986,13 @@ enum QueuedManagerWork {
         source: String,
         completion: oneshot::Sender<bool>,
     },
+    #[cfg(feature = "cluster")]
+    PreparePolicyRebind {
+        artifact: crate::cluster::dto::ArtifactIdentity,
+        prepared: oneshot::Sender<anyhow::Result<()>>,
+        commit: oneshot::Receiver<bool>,
+        completed: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 enum ActiveManagerWork {
@@ -7978,6 +8086,20 @@ fn accept_while_active(
             let _ = accepted.send(ListManagerCommandDisposition::Queued);
             queued.push_back(QueuedManagerWork::Forget { source, completion });
         }
+        #[cfg(feature = "cluster")]
+        ListManagerCommand::PreparePolicyRebind {
+            artifact,
+            prepared,
+            commit,
+            completed,
+        } => {
+            queued.push_back(QueuedManagerWork::PreparePolicyRebind {
+                artifact,
+                prepared,
+                commit,
+                completed,
+            });
+        }
         ListManagerCommand::ForceRefresh {
             accepted,
             completion,
@@ -8018,6 +8140,18 @@ fn accept_when_idle(
             let _ = completion.send(manager.forget_source(&source));
             None
         }
+        #[cfg(feature = "cluster")]
+        ListManagerCommand::PreparePolicyRebind {
+            artifact,
+            prepared,
+            commit,
+            completed,
+        } => Some(QueuedManagerWork::PreparePolicyRebind {
+            artifact,
+            prepared,
+            commit,
+            completed,
+        }),
         ListManagerCommand::ForceRefresh {
             accepted,
             completion,
@@ -8026,6 +8160,95 @@ fn accept_when_idle(
             Some(QueuedManagerWork::Force {
                 completions: vec![completion],
             })
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[allow(clippy::too_many_arguments)]
+async fn run_policy_rebind(
+    manager: &mut Option<ListManager>,
+    artifact: crate::cluster::dto::ArtifactIdentity,
+    prepared: oneshot::Sender<anyhow::Result<()>>,
+    mut commit: oneshot::Receiver<bool>,
+    completed: oneshot::Sender<anyhow::Result<()>>,
+    cmd_rx: &mut Option<mpsc::Receiver<ListManagerCommand>>,
+    retire_rx: &mut oneshot::Receiver<()>,
+    queued: &mut std::collections::VecDeque<QueuedManagerWork>,
+) -> bool {
+    // The controller owns the manager across BOTH phases. No refresh can
+    // republish its old artifact between candidate preparation and commit.
+    let owned = manager.take().expect("idle manager");
+    let prepared_work = tokio::task::spawn_blocking(move || {
+        let result = owned.prepare_policy_rebind(artifact);
+        (owned, result)
+    })
+    .await;
+    let (returned, result) = match prepared_work {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "policy rebind worker lost manager");
+            // Drop the prepared sender: the caller MUST return fatal Err,
+            // not fall through to a rebuild after losing the actor.
+            return false;
+        }
+    };
+    *manager = Some(returned);
+    let manifest = match result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = prepared.send(Err(error));
+            return true;
+        }
+    };
+    if prepared.send(Ok(())).is_err() {
+        return true; // Reload canceled before swap; desired is not active.
+    }
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *retire_rx => return false,
+            decision = &mut commit => {
+                if !matches!(decision, Ok(true)) { return true; }
+                let owned = manager.take().expect("idle manager");
+                let committed = tokio::task::spawn_blocking(move || {
+                    let mut owned = owned;
+                    let result = owned.commit_policy_rebind(&manifest);
+                    (owned, result)
+                }).await;
+                let (returned, result) = match committed {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        tracing::error!(%error, "policy rebind commit worker lost manager");
+                        return false;
+                    }
+                };
+                *manager = Some(returned);
+                let failed = result.is_err();
+                let _ = completed.send(result);
+                return !failed; // A failed post-swap commit may never run an old refresh.
+            }
+            command = recv_or_pending(cmd_rx) => {
+                match command {
+                    Some(ListManagerCommand::Forget { source, accepted, completion }) => {
+                        let _ = accepted.send(ListManagerCommandDisposition::Queued);
+                        queued.push_back(QueuedManagerWork::Forget { source, completion });
+                    }
+                    Some(ListManagerCommand::ForceRefresh { accepted, completion }) => {
+                        if let Some(QueuedManagerWork::Force { completions }) = queued.back_mut() {
+                            let _ = accepted.send(ListManagerCommandDisposition::CoalescedQueued);
+                            completions.push(completion);
+                        } else {
+                            let _ = accepted.send(ListManagerCommandDisposition::Queued);
+                            queued.push_back(QueuedManagerWork::Force { completions: vec![completion] });
+                        }
+                    }
+                    Some(ListManagerCommand::PreparePolicyRebind { artifact, prepared, commit, completed }) => {
+                        queued.push_back(QueuedManagerWork::PreparePolicyRebind { artifact, prepared, commit, completed });
+                    }
+                    None => *cmd_rx = None,
+                }
+            }
         }
     }
 }
@@ -8149,6 +8372,28 @@ async fn list_manager_controller(
                         .forget_source(&source);
                     let _ = completion.send(was_cached);
                 }
+                #[cfg(feature = "cluster")]
+                QueuedManagerWork::PreparePolicyRebind {
+                    artifact,
+                    prepared,
+                    commit,
+                    completed,
+                } => {
+                    if !run_policy_rebind(
+                        &mut manager,
+                        artifact,
+                        prepared,
+                        commit,
+                        completed,
+                        &mut cmd_rx,
+                        &mut retire_rx,
+                        &mut queued,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
                 QueuedManagerWork::Force { completions } => {
                     let mut worker = start_refresh_worker(
                         manager.take().expect("idle manager"),
@@ -8181,14 +8426,23 @@ async fn list_manager_controller(
                 match command {
                     Some(command) => {
                         if let Some(work) = accept_when_idle(command, manager.as_mut().expect("idle manager")) {
-                            let QueuedManagerWork::Force { completions } = work else { unreachable!(); };
-                            let mut worker = start_refresh_worker(
-                                manager.take().expect("idle manager"),
-                                RefreshMode::Force,
-                            );
-                            let ActiveManagerWork::Force { completions: worker_completions } = &mut worker.work else { unreachable!(); };
-                            worker_completions.extend(completions);
-                            active = Some(worker);
+                            match work {
+                                #[cfg(feature = "cluster")]
+                                QueuedManagerWork::PreparePolicyRebind { artifact, prepared, commit, completed } => {
+                                    if !run_policy_rebind(&mut manager, artifact, prepared, commit, completed,
+                                        &mut cmd_rx, &mut retire_rx, &mut queued).await {
+                                        return;
+                                    }
+                                }
+                                QueuedManagerWork::Force { completions } => {
+                                    let mut worker = start_refresh_worker(
+                                        manager.take().expect("idle manager"), RefreshMode::Force);
+                                    let ActiveManagerWork::Force { completions: worker_completions } = &mut worker.work else { unreachable!(); };
+                                    worker_completions.extend(completions);
+                                    active = Some(worker);
+                                }
+                                QueuedManagerWork::Forget { .. } => unreachable!(),
+                            }
                         }
                     }
                     None => cmd_rx = None,

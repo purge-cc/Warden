@@ -28,7 +28,7 @@ struct RuntimeCapability {
 
 #[derive(Debug)]
 pub struct RuntimeLease {
-    _file: File,
+    _file: super::write_lock::Flocked,
     directory: File,
     capability: RuntimeCapability,
     attested: Cell<bool>,
@@ -130,59 +130,17 @@ fn acquire(
         super::tree_io::plan_external_directory_from(&state, Path::new("/"))?.open_or_create()?
     };
     let owner = directory.metadata()?;
-    let name = std::ffi::OsStr::new(LEASE_NAME);
-    let flags = libc::O_RDWR | libc::O_NONBLOCK;
-    let (file, created) = match super::write_lock::open_at(
-        &directory,
-        name,
-        flags | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    ) {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
-            super::write_lock::open_at(&directory, name, libc::O_PATH, 0)?,
-            false,
-        ),
-        Err(error) => return Err(error.into()),
-    };
-    if created {
-        super::write_lock::preserve_owner(&file, &owner)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.file_type().is_file(),
-        "runtime lease is not a regular file"
-    );
-    ensure!(
-        metadata.nlink() == 1,
-        "runtime lease has multiple hard links"
-    );
-    ensure!(
-        metadata.uid() == owner.uid() && metadata.gid() == owner.gid(),
-        "runtime lease owner differs from its state directory"
-    );
-    ensure!(
-        metadata.permissions().mode() & 0o777 == 0o600,
-        "runtime lease mode is not 0600"
-    );
-    let mut file = if created {
-        file
-    } else {
-        super::write_lock::reopen_inspected(&file, flags)?
-    };
-    // SAFETY: `file` owns a live descriptor for the validated regular lease file.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            bail!(
-                "NodeNotOffline: {operation} cannot acquire the runtime lease for {}",
-                identity.canonical_master.display()
-            );
-        }
-        return Err(error).context("cannot lock the tree-bound runtime lease");
-    }
+    let (file, _) = open_lease(&directory, &owner, true, libc::O_RDWR | libc::O_NONBLOCK)?
+        .context("runtime lease disappeared")?;
+    let mut file = lock_lease(file, || {
+        format!(
+            "NodeNotOffline: {operation} cannot acquire the runtime lease for {}",
+            identity.canonical_master.display()
+        )
+    })?;
+    // The lease flock is held, so no relocate run can start or be in progress
+    // unless it left its receipt behind.
+    super::relocate_receipt::refuse_if_active(&state)?;
     file.set_len(0)?;
     file.rewind()?;
     write!(file, "{}", std::process::id())?;
@@ -209,6 +167,121 @@ fn acquire(
         #[cfg(test)]
         path,
     })
+}
+
+/// Hold the runtime lease of the state directory `state` for `config relocate`.
+///
+/// Unlike [`acquire`] this writes no PID, creates no directory, checks no
+/// capability and ignores the relocate fence. With `create` false an absent
+/// lease returns `None`: no daemon ever started there.
+pub(crate) fn hold_for_relocate(
+    state: &File,
+    create: bool,
+) -> anyhow::Result<Option<super::write_lock::Flocked>> {
+    let owner = state.metadata()?;
+    let Some((file, created)) = open_lease(state, &owner, create, libc::O_RDONLY)? else {
+        return Ok(None);
+    };
+    let file = lock_lease(file, || {
+        "NodeNotOffline: config relocate cannot acquire the runtime lease; stop the daemon and every warden command first".into()
+    })?;
+    if created {
+        state.sync_all()?;
+    }
+    Ok(Some(file))
+}
+
+/// Delete the runtime capability of the state directory `state`. A missing
+/// file counts as deleted. Returns whether a file was removed.
+pub(crate) fn delete_capability(state: &File) -> anyhow::Result<bool> {
+    match super::tree_io::unlink_at(state, std::ffi::OsStr::new(CAPABILITY_NAME)) {
+        Ok(()) => {
+            state.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("delete the runtime capability"),
+    }
+}
+
+/// Open, or with `create` create, the lease file and check it. Returns the
+/// file reopened with `flags` and whether this call created it.
+fn open_lease(
+    directory: &File,
+    owner: &std::fs::Metadata,
+    create: bool,
+    flags: i32,
+) -> anyhow::Result<Option<(File, bool)>> {
+    let name = std::ffi::OsStr::new(LEASE_NAME);
+    let fresh = if create {
+        match super::write_lock::open_at(
+            directory,
+            name,
+            flags | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let created = fresh.is_some();
+    let file = match fresh {
+        Some(file) => {
+            super::write_lock::preserve_owner(&file, owner)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        None => match super::write_lock::open_at(directory, name, libc::O_PATH, 0) {
+            Ok(file) => file,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        },
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "runtime lease is not a regular file"
+    );
+    ensure!(
+        metadata.nlink() == 1,
+        "runtime lease has multiple hard links"
+    );
+    ensure!(
+        metadata.uid() == owner.uid() && metadata.gid() == owner.gid(),
+        "runtime lease owner differs from its state directory"
+    );
+    ensure!(
+        metadata.permissions().mode() & 0o777 == 0o600,
+        "runtime lease mode is not 0600"
+    );
+    let file = if created {
+        file
+    } else {
+        super::write_lock::reopen_inspected(&file, flags)?
+    };
+    Ok(Some((file, created)))
+}
+
+/// Lock the lease so that dropping the returned guard unlocks it with `LOCK_UN`.
+fn lock_lease(
+    file: File,
+    refusal: impl FnOnce() -> String,
+) -> anyhow::Result<super::write_lock::Flocked> {
+    // SAFETY: `file` owns a live descriptor for the validated regular lease file.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(super::write_lock::Flocked(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        bail!(refusal());
+    }
+    Err(error).context("cannot lock the tree-bound runtime lease")
 }
 
 fn capability(
@@ -361,6 +434,42 @@ mod tests {
     }
 
     #[test]
+    fn relocate_fence_refuses_runtime_starts_and_relocate_holds_the_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let master = master(&root);
+        let state = File::open(root.path()).unwrap();
+        assert!(hold_for_relocate(&state, false).unwrap().is_none());
+        assert!(!root.path().join(LEASE_NAME).exists());
+
+        let active = root.path().join(super::super::relocate_receipt::ACTIVE);
+        std::fs::write(&active, b"").unwrap();
+        for error in [
+            acquire_for_daemon(&master).err().unwrap(),
+            acquire_for_migration(&master).err().unwrap(),
+        ] {
+            assert!(
+                error.to_string().contains("RelocateInProgress"),
+                "{error:#}"
+            );
+        }
+        assert!(!master.with_extension("test.pid").exists());
+        let held = hold_for_relocate(&state, false).unwrap().unwrap();
+        let error = acquire_for_daemon(&master).err().unwrap().to_string();
+        assert!(error.contains("NodeNotOffline"), "{error}");
+        drop(held);
+        std::fs::remove_file(&active).unwrap();
+
+        let daemon = acquire_for_daemon(&master).unwrap();
+        let error = hold_for_relocate(&state, true).err().unwrap().to_string();
+        assert!(error.contains("NodeNotOffline"), "{error}");
+        daemon.attest_schema5_runtime(5).unwrap();
+        drop(daemon);
+        assert!(delete_capability(&state).unwrap());
+        assert!(!root.path().join(CAPABILITY_NAME).exists());
+        assert!(!delete_capability(&state).unwrap());
+    }
+
+    #[test]
     fn one_tree_has_one_runtime_lease_independent_of_pid_paths() {
         let root = tempfile::tempdir().unwrap();
         let master = master(&root);
@@ -372,6 +481,36 @@ mod tests {
         let offline = acquire_for_offline_operation(&master).unwrap();
         assert_eq!(offline.path(), root.path().join(LEASE_NAME));
         assert!(acquire_for_daemon(&master).is_err());
+    }
+
+    #[test]
+    fn dropped_lease_unlocks_while_a_forked_child_shares_its_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let master = master(&root);
+        let lease = acquire_for_daemon(&master).unwrap();
+        let fd = lease._file.as_raw_fd() as libc::c_uint;
+        // Models another thread's Command::spawn between fork and exec: the
+        // child shares the lease's open file description until close-on-exec.
+        // SAFETY: the child calls only async-signal-safe functions.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "{}", std::io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                // Keep only the lease so sibling tests' locks are not held.
+                libc::syscall(libc::SYS_close_range, 3, fd - 1, 0);
+                libc::syscall(libc::SYS_close_range, fd + 1, libc::c_uint::MAX, 0);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        drop(lease);
+        let next = acquire_for_daemon(&master);
+        // SAFETY: `child` is our own unreaped child process.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        next.unwrap();
     }
 
     #[test]

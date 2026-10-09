@@ -364,6 +364,8 @@ struct RuntimeReloadContext<'a> {
     node_ip_filter: Option<&'a Arc<crate::filter::ip_filter::IpFilter>>,
     #[cfg(feature = "cluster")]
     node_observe: Option<&'a Arc<crate::cluster::ClusterObserve>>,
+    #[cfg(feature = "cluster")]
+    node_pair_provider: &'a Arc<nodes_runtime::RuntimeActivePairProvider>,
 }
 
 fn modern_primary_auxiliary(config: &crate::config::schema::ConfigV1) -> bool {
@@ -942,13 +944,15 @@ async fn run_server(
     };
 
     #[cfg(feature = "cluster")]
+    let node_pair_provider = match &node_corpus {
+        Some(context) => context.active_pair_provider(
+            config.cluster.enabled && config.cluster.membership_version == Some(1),
+        ),
+        None => nodes_runtime::RuntimeActivePairProvider::unavailable(),
+    };
+    #[cfg(feature = "cluster")]
     let node_active_provider: Arc<dyn crate::cluster::node_control::ActivePairProvider> =
-        match &node_corpus {
-            Some(context) => context.active_pair_provider(
-                config.cluster.enabled && config.cluster.membership_version == Some(1),
-            ),
-            None => nodes_runtime::RuntimeActivePairProvider::unavailable(),
-        };
+        node_pair_provider.clone();
 
     // Build the shared cluster observability handle ONCE, before
     // DaemonState, so the same `Arc` can be cloned into the IPC state (the
@@ -1919,6 +1923,8 @@ async fn run_server(
             node_ip_filter: node_ip_filter.as_ref(),
             #[cfg(feature = "cluster")]
             node_observe: cluster_observe.as_ref(),
+            #[cfg(feature = "cluster")]
+            node_pair_provider: &node_pair_provider,
         }),
         &filter,
         profiles.as_ref(),
@@ -2613,7 +2619,12 @@ pub async fn prepare_nodes_before_load(config_path: &Path) -> anyhow::Result<()>
         .context("node recovery worker failed")??;
     let loaded =
         crate::config::loader::load_config_v5(config_path, time::OffsetDateTime::now_utc())
-            .map_err(|errors| anyhow::anyhow!("node bootstrap config rejected: {errors:?}"))?;
+            .map_err(|errors| {
+                anyhow::anyhow!(
+                    "node bootstrap config rejected: {}",
+                    format_config_errors(&errors)
+                )
+            })?;
     if loaded.config.cluster.enabled
         && loaded.config.cluster.membership_version == Some(1)
         && loaded.config.cluster.role == crate::config::schema::ClusterRole::Secondary
@@ -2868,7 +2879,7 @@ fn format_guarded_load_error(error: crate::config::loader::GuardedLoadFailure) -
     }
 }
 
-fn format_config_errors(errors: &[crate::config::error::ConfigError]) -> String {
+pub(crate) fn format_config_errors(errors: &[crate::config::error::ConfigError]) -> String {
     errors
         .iter()
         .map(ToString::to_string)
@@ -3097,6 +3108,10 @@ pub(crate) struct ListsFingerprint {
     /// the OLD ceiling until the next full daemon restart — a reload
     /// reporting success while the live process keeps the old intent.
     max_total_domains: usize,
+    // A node's auxiliary refresh hook is bound to this setting. Reusing a
+    // manager across an enabled/disabled transition keeps the old IP filter.
+    #[cfg(feature = "cluster")]
+    ip_blocklists_enabled: bool,
     shrink_guard_enabled: bool,
     shrink_guard_max_drop_pct: u8,
     /// Only first-owner fields reach the live manager. Alias-only fields
@@ -3206,6 +3221,8 @@ impl ListsFingerprint {
                 .collect(),
             cache_dir: config.lists.cache_dir.clone(),
             max_total_domains: config.lists.max_total_domains,
+            #[cfg(feature = "cluster")]
+            ip_blocklists_enabled: config.ip_blocklists.enabled,
             shrink_guard_enabled: config.lists.shrink_guard_enabled,
             shrink_guard_max_drop_pct: config.lists.shrink_guard_max_drop_pct,
             source_owners: plan
@@ -3291,6 +3308,22 @@ fn should_reuse_live_lists(
 
 fn has_live_list_manager(task: Option<&ListManagerTask>) -> bool {
     task.is_some_and(|task| !task.is_finished())
+}
+
+#[cfg(feature = "cluster")]
+fn should_rebind_node_policy(
+    config: &crate::config::schema::ConfigV1,
+    runtime_available: bool,
+    live_manager: bool,
+    live: Option<&ListsFingerprint>,
+    next: &ListsFingerprint,
+) -> bool {
+    runtime_available
+        && config.cluster.enabled
+        && config.cluster.membership_version == Some(1)
+        && config.cluster.role == crate::config::schema::ClusterRole::Primary
+        && !config.ip_blocklists.enabled
+        && should_reuse_live_lists(live_manager, live, next)
 }
 
 #[cfg(test)]
@@ -3832,6 +3865,95 @@ async fn handle_reload(
         &source_tokens,
         &bridge_config_dir_for_fingerprint,
     );
+    #[cfg(feature = "cluster")]
+    if node_corpus
+        .as_ref()
+        .is_some_and(|context| context.secondary.is_none())
+        && should_rebind_node_policy(
+            config,
+            runtime_reload.is_some(),
+            has_live_list_manager(refresh_handle.as_ref()),
+            lists_fingerprint.as_ref(),
+            &fingerprint,
+        )
+    {
+        if let (Some(artifact), ListManagerEndpoint::Running { sender, .. }) =
+            (enrollment_artifact.as_ref(), &**list_cmd_tx_swap.load())
+        {
+            let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+            let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(
+                    crate::lists::manager::ListManagerCommand::PreparePolicyRebind {
+                        artifact: artifact.clone(),
+                        prepared: prepared_tx,
+                        commit: commit_rx,
+                        completed: completed_tx,
+                    },
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("live list manager lost before policy rebind"))?;
+            match prepared_rx.await {
+                Ok(Ok(())) => {
+                    // Hide store-backed enrollment and serve proofs until both
+                    // runtime and persisted corpus have the new identity.
+                    if let Some(runtime) = runtime_reload {
+                        runtime.node_pair_provider.set_proof_available(false);
+                    }
+                    nodes_runtime::clear_active(
+                        runtime_reload.and_then(|runtime| runtime.node_observe),
+                        cluster_state,
+                    );
+                    install_runtime_reload(
+                        runtime_reload,
+                        &mut prepared_upstream,
+                        &prepared_acl,
+                        stats,
+                        security,
+                        config,
+                        config_path,
+                        api_token_hash,
+                        acl_handle,
+                    )
+                    .await;
+                    publish_active_policy(profiles, config, compiled, identity, cluster_state);
+                    commit_tx.send(true).map_err(|_| {
+                        anyhow::anyhow!(
+                            "fatal policy rebind: manager barrier lost after runtime swap"
+                        )
+                    })?;
+                    completed_rx.await.map_err(|_| {
+                        anyhow::anyhow!("fatal policy rebind: manager lost after runtime swap")
+                    })??;
+                    install_cluster_policy(cluster_state, prepared_cluster);
+                    if let Some(runtime) = runtime_reload {
+                        runtime.node_pair_provider.set_proof_available(true);
+                    }
+                    if let Some(reg) = list_status_registry {
+                        reg.sync_plan(&source_plan);
+                        reg.record_cycle(CycleOutcome::SkippedUnchanged);
+                    }
+                    let rec = AuditRecord::new(AuditEvent::Reload, AuditResult::Ok)
+                        .with_uid(invoker_uid)
+                        .with_files(new_files.iter())
+                        .with_pre_hash(pre_hash)
+                        .with_post_hash(new_hash.clone());
+                    if let Err(error) = audit_writer.append(&rec) {
+                        tracing::warn!(%error, "failed to write audit record");
+                    }
+                    *current_files = new_files;
+                    *current_hash = new_hash;
+                    return Ok(Some(reload_has_schedules));
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "policy rebind preparation failed; rebuilding lists");
+                    drop(commit_tx);
+                }
+                Err(_) => anyhow::bail!("live list manager lost during policy rebind preparation"),
+            }
+        }
+    }
     #[cfg(feature = "cluster")]
     let node_requires_preparation = node_corpus.is_some();
     #[cfg(not(feature = "cluster"))]

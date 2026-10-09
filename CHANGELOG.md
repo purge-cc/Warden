@@ -7,6 +7,14 @@ prints at `/stable`. This tree's crate version is in `Cargo.toml`.
 
 - No user-visible changes recorded yet.
 
+## [0.43.0](docs/releases/0.43.0.md)
+
+- Query Log rules held and applied as one batch, fresh installs with the
+  configuration under `/etc/purge-warden` and `warden config relocate` for
+  existing hosts, an upgrade from 0.41.0 that migrates the configuration
+  inside `install.sh --upgrade`, changes to rewrite and negative answers
+  and to Nodes policy reloads, and fixes to backups and the TUI.
+
 ## [0.42.0](docs/releases/0.42.0.md)
 
 - Warden Nodes policy and list synchronization (beta), a reworked

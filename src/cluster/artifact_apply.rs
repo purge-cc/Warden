@@ -727,6 +727,93 @@ mod tests {
     }
 
     #[test]
+    fn relocated_receiver_keeps_a_valid_ownership_ledger() {
+        use crate::cli::commands::config::relocate::{self, tests::layout_for_test, Options};
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let (layout, _mapping) = layout_for_test(&base);
+        let path = layout.legacy.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "{MASTER}[backup]\ndir = {:?}\n",
+                layout.legacy.join("backups").display().to_string()
+            ),
+        )
+        .unwrap();
+        let (manifest, objects) = mounted_artifact("||one.example^\n");
+        let resolver = FixtureResolver::new(&manifest);
+        let ledger = apply_with_resolver(&path, &manifest, &objects, &resolver).unwrap();
+        let bundle = identity(&layout.legacy.join(BUNDLE_PATH));
+
+        let options = Options {
+            dry_run: false,
+            reverse: false,
+        };
+        let outcome = relocate::relocate(&layout, options).unwrap();
+        assert_eq!(outcome.code, 0, "{outcome:?}");
+        let moved = layout.etc.join("config.toml");
+        assert_eq!(identity(&layout.etc.join(BUNDLE_PATH)), bundle);
+        assert_eq!(load_persisted(&moved).unwrap(), Some(ledger.clone()));
+
+        let outcome = relocate::relocate(
+            &layout,
+            Options {
+                reverse: true,
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.code, 0, "{outcome:?}");
+        assert_eq!(load_persisted(&path).unwrap(), Some(ledger));
+    }
+
+    #[test]
+    fn a_pending_ownership_intent_refuses_relocate_until_it_is_recovered() {
+        use crate::cli::commands::config::relocate::{self, tests::layout_for_test, Options};
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let (layout, _mapping) = layout_for_test(&base);
+        let path = layout.legacy.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "{MASTER}[backup]\ndir = {:?}\n",
+                layout.legacy.join("backups").display().to_string()
+            ),
+        )
+        .unwrap();
+        let (manifest, objects) = mounted_artifact("||one.example^\n");
+        let resolver = FixtureResolver::new(&manifest);
+        resolver.hide_once.set(true);
+        assert!(apply_with_resolver(&path, &manifest, &objects, &resolver).is_err());
+        let options = Options {
+            dry_run: false,
+            reverse: false,
+        };
+
+        let outcome = relocate::relocate(&layout, options).unwrap();
+        assert_ne!(outcome.code, 0, "{outcome:?}");
+        assert!(
+            outcome.err[0].starts_with(
+                "refused (recovery-required): .warden-cluster-ownership: ArtifactRecoveryRequired"
+            ),
+            "{outcome:?}"
+        );
+        assert!(path.is_file());
+
+        load_with_resolver(&path, &resolver).unwrap().unwrap();
+        let outcome = relocate::relocate(&layout, options).unwrap();
+        assert_eq!(outcome.code, 0, "{outcome:?}");
+    }
+
+    fn identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    #[test]
     fn receiver_preserves_local_server_identity_fields() {
         let (root, path) = receiver();
         let (manifest, objects) = mounted_artifact("||one.example^\n");

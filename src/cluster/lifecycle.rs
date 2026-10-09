@@ -1984,6 +1984,33 @@ fn write_index(files: &PrivateStore<'_>, index: &PlanIndex) -> anyhow::Result<()
     );
     files.write(INDEX, &bytes)
 }
+/// Refuse relocation while the lifecycle store of `guard`'s master holds a
+/// lock marker, a full plan or an unresolved history entry. Reads only.
+pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()> {
+    let Some(files) = PrivateStore::open_existing(guard, PLANS)? else {
+        return Ok(());
+    };
+    let names = files.names(32 * 1024)?;
+    // A full plan names the preview the operator has to apply or cancel.
+    if let Some(id) = names.iter().find_map(|name| name.strip_suffix(".json")) {
+        anyhow::bail!(
+            "NodeOperationPending: lifecycle preview {id} is open; cancel it with `warden cluster cancel --preview-id {id}` or apply it with `warden cluster apply --preview-id {id}`"
+        );
+    }
+    for name in names {
+        ensure!(
+            name != "pending.lockdata" && name != "runtime.lockdata",
+            "NodeOperationPending: lifecycle marker {name} exists"
+        );
+    }
+    if let Some(bytes) = files.read(INDEX, MAX_INDEX_BYTES)? {
+        let index: PlanIndex = serde_json::from_slice(&bytes)?;
+        if let Some((id, _)) = index.entries.iter().find(|(_, entry)| entry.unresolved()) {
+            anyhow::bail!("NodeOperationPending: lifecycle plan {id} is unresolved");
+        }
+    }
+    Ok(())
+}
 fn read_index(files: &PrivateStore<'_>) -> anyhow::Result<PlanIndex> {
     if let Some(bytes) = files.read(INDEX, MAX_INDEX_BYTES)? {
         let index: PlanIndex = serde_json::from_slice(&bytes)?;
@@ -2499,23 +2526,10 @@ fn pending_marker_allows(
     use crate::config::write_lock::open_at;
     use std::ffi::OsStr;
     use std::io::Read;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    let state = crate::config::state_dir::for_config_parent(root);
-    let mut dir = if state == root {
-        root_file.try_clone()?
-    } else {
-        let mut dir = std::fs::File::open("/")?;
-        for component in state.components() {
-            if let std::path::Component::Normal(part) = component {
-                dir = open_at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            }
-        }
-        dir
-    };
+    let mut dir = crate::config::state_dir::open_for_root(root, root_file)?;
     let owner = dir.metadata()?;
-    use sha2::{Digest, Sha256};
-    let namespace = hex::encode(Sha256::digest(master.as_os_str().as_bytes()));
+    let namespace = crate::private_store::plain_namespace(master);
     for name in [PLANS, &namespace] {
         dir = match open_at(
             &dir,

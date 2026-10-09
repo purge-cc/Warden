@@ -687,6 +687,10 @@ pub fn render_mount_picker(f: &mut Frame, anchor: Rect, picker: &MountPicker) {
     const W: u16 = 64;
     let spec = mount_spec(picker);
     modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+    // Before the outcome the picker holds staged toggles that Esc throws away.
+    if picker.is_done() {
+        crate::tui::mouse::close_on_outside_click();
+    }
 }
 
 fn mount_spec(picker: &MountPicker) -> NoticeSpec {
@@ -823,7 +827,10 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
             let idx = modal_form::prose_field_row(&spec.prose, TYPED_PROSE_IDX);
             let render =
                 modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
-            if !rc.is_refused() {
+            // Only the refused gate is soft; the typed gate holds the operator's input.
+            if rc.is_refused() {
+                crate::tui::mouse::close_on_outside_click();
+            } else {
                 render.place_cursor(f, idx, rc.typed.chars().count() as u16);
             }
         }
@@ -836,10 +843,12 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &CustomListModal) {
         Stage::ConfirmingRuleRemove(rc) => {
             let spec = rule_remove_notice(rc);
             modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+            crate::tui::mouse::close_on_outside_click();
         }
         Stage::Submitted(outcome) => {
             let spec = outcome_notice(outcome);
             modal_form::render_modal(f, anchor, W, |w| (modal_form::notice_body(&spec, w), ()));
+            crate::tui::mouse::close_on_outside_click();
         }
     }
 }

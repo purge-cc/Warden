@@ -269,9 +269,12 @@ pub(super) fn render_saving(frame: &mut ratatui::Frame, app: &App) {
     let version = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
     let version_width = version.len() as u16;
     let mut hints = Vec::new();
-    for (key, description) in [("Esc", "close"), ("Tab", "screen"), ("q", "quit")] {
-        hints.extend(super::ui::key_span(key, description));
-        hints.push(ratatui::text::Span::raw(" "));
+    // The held-rule confirmation owns these keys while it is open.
+    if app.query_log.held.review.is_none() {
+        for (key, description) in [("Esc", "close"), ("Tab", "screen"), ("q", "quit")] {
+            hints.extend(super::ui::key_span(key, description));
+            hints.push(ratatui::text::Span::raw(" "));
+        }
     }
     let hints_width = ratatui::text::Line::from(hints.clone()).width() as u16;
     let cols = ratatui::layout::Layout::horizontal([

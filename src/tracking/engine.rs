@@ -448,8 +448,8 @@ pub struct StatsEngine {
     /// `domain_queries`; the lifetime path stays byte-identical. Drives
     /// the Dashboard Top Domains (24h) narrow-fallback card and the
     /// `top_queried_24h` Top-N projection. Pruned by `prune_hourly_map`
-    /// (entries with `sum_last_24h == 0` are dropped when the map
-    /// exceeds capacity) so it doesn't diverge from the lifetime map.
+    /// (entries with `sum_last_24h == 0` are dropped at capacity)
+    /// so it doesn't diverge from the lifetime map.
     pub domain_queries_hourly: DashMap<CompactString, HourlyRing>,
     /// Per-domain 24h-rolling ring of BLOCK counts. Parallel to
     /// `domain_blocked`. Drives the Dashboard Top Blocked Domains
@@ -1211,11 +1211,11 @@ fn sample_allowed(rate: f32) -> bool {
 /// while still saturated, so it is self-limiting and cadence-independent
 /// (steady-state pruning keeps its original single-pass cost).
 pub fn prune_map(map: &DashMap<CompactString, AtomicU64>) {
-    if map.len() <= MAX_DOMAIN_FREQ_ENTRIES {
+    if map.len() < MAX_DOMAIN_FREQ_ENTRIES {
         return;
     }
     map.retain(|_, count| count.load(Ordering::Relaxed) > 1);
-    if map.len() > MAX_DOMAIN_FREQ_ENTRIES {
+    if map.len() >= MAX_DOMAIN_FREQ_ENTRIES {
         map.retain(|_, count| {
             let decayed = count.load(Ordering::Relaxed) / 2;
             count.store(decayed, Ordering::Relaxed);
@@ -1225,12 +1225,12 @@ pub fn prune_map(map: &DashMap<CompactString, AtomicU64>) {
 }
 
 /// Drop ring entries that have summed to zero over the last 24h when
-/// the map exceeds capacity. Keeps the per-entity 24h ring from
+/// the map reaches capacity. Keeps the per-entity 24h ring from
 /// outliving its lifetime-map twin: a domain pruned from the lifetime
 /// map but still holding ring entries would otherwise leak memory and
 /// rank in Top-N 24h after its traffic genuinely aged out.
 pub fn prune_hourly_map(map: &DashMap<CompactString, HourlyRing>, now_secs: u64) {
-    if map.len() <= MAX_DOMAIN_FREQ_ENTRIES {
+    if map.len() < MAX_DOMAIN_FREQ_ENTRIES {
         return;
     }
     map.retain(|_, ring| ring.sum_last_24h(now_secs) > 0);

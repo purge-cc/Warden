@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use crate::config::tree_io::{
     check_basename, inspect_at, rename_at, rename_noreplace_at, same_inode, unlink_at,
 };
-use crate::config::write_lock::{open_at, preserve_owner, reopen_inspected, MigrationWriteLock};
+use crate::config::write_lock::{
+    open_at, preserve_owner, reopen_inspected, Flocked, MigrationWriteLock,
+};
 
 const LOCK: &str = ".lock";
 const STAGE: &str = ".write.next";
@@ -32,7 +34,7 @@ pub(crate) struct PrivateStore<'g> {
     namespace: String,
     directory: File,
     owner: Metadata,
-    lock: File,
+    lock: Flocked,
 }
 
 impl<'g> PrivateStore<'g> {
@@ -47,9 +49,7 @@ impl<'g> PrivateStore<'g> {
         let owner = parent.metadata()?;
         ensure!(owner.is_dir(), "cluster state parent is not a directory");
         let base = private_directory(&parent, base_name, &owner)?;
-        let namespace = hex::encode(Sha256::digest(
-            guard.canonical_master().as_os_str().as_bytes(),
-        ));
+        let namespace = plain_namespace(guard.canonical_master());
         let directory = private_directory(&base, &namespace, &owner)?;
         let lock = match checked_file(&directory, LOCK, &owner)? {
             Some(file) => reopen_inspected(&file, libc::O_RDWR)?,
@@ -73,22 +73,7 @@ impl<'g> PrivateStore<'g> {
                 Err(error) => return Err(error),
             },
         };
-        let started = Instant::now();
-        loop {
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            ensure!(
-                matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EINTR)),
-                "cannot lock cluster store: {error}"
-            );
-            ensure!(
-                started.elapsed() < Duration::from_secs(30),
-                "cluster store lock timeout"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        lock_store(&lock)?;
         let store = Self {
             guard,
             parent,
@@ -97,7 +82,7 @@ impl<'g> PrivateStore<'g> {
             namespace,
             directory,
             owner,
-            lock,
+            lock: Flocked(lock),
         };
         store.check()?;
         // A staging inode is never authoritative, even after its file fsync.
@@ -106,6 +91,48 @@ impl<'g> PrivateStore<'g> {
             store.directory.sync_all()?;
         }
         Ok(store)
+    }
+
+    /// Open a store that already exists without creating, unlinking or
+    /// rewriting anything. `None` means the base or this master's namespace
+    /// directory is absent.
+    pub(crate) fn open_existing(
+        guard: &'g MigrationWriteLock,
+        base_name: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        guard.verify_root_linked()?;
+        check_basename(OsStr::new(base_name))?;
+        ensure!(
+            base_name.starts_with(".warden-"),
+            "invalid cluster store namespace"
+        );
+        let parent = crate::config::state_dir::open_for_migration(guard)?;
+        let owner = parent.metadata()?;
+        ensure!(owner.is_dir(), "cluster state parent is not a directory");
+        let namespace = plain_namespace(guard.canonical_master());
+        let Some(base) = existing_directory(&parent, base_name, &owner)? else {
+            return Ok(None);
+        };
+        let Some(directory) = existing_directory(&base, &namespace, &owner)? else {
+            return Ok(None);
+        };
+        let lock = checked_file(&directory, LOCK, &owner)?.with_context(|| {
+            format!("recovery required: store {base_name}/{namespace} has no lock file")
+        })?;
+        let lock = reopen_inspected(&lock, libc::O_RDONLY)?;
+        lock_store(&lock)?;
+        let store = Self {
+            guard,
+            parent,
+            base_name: base_name.to_owned(),
+            base,
+            namespace,
+            directory,
+            owner,
+            lock: Flocked(lock),
+        };
+        store.check()?;
+        Ok(Some(store))
     }
 
     pub(crate) fn check(&self) -> anyhow::Result<()> {
@@ -286,6 +313,47 @@ impl<'g> PrivateStore<'g> {
         self.check()?;
         Ok(names)
     }
+}
+
+/// Namespace directory name of one canonical master below every private store base.
+pub(crate) fn plain_namespace(canonical_master: &std::path::Path) -> String {
+    hex::encode(Sha256::digest(canonical_master.as_os_str().as_bytes()))
+}
+
+fn lock_store(lock: &File) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        ensure!(
+            matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EINTR)),
+            "cannot lock cluster store: {error}"
+        );
+        ensure!(
+            started.elapsed() < Duration::from_secs(30),
+            "cluster store lock timeout"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn existing_directory(parent: &File, name: &str, owner: &Metadata) -> anyhow::Result<Option<File>> {
+    let file = match open_at(
+        parent,
+        OsStr::new(name),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot open cluster store {name}"))
+        }
+    };
+    check_directory(&file.metadata()?, owner)?;
+    Ok(Some(file))
 }
 
 fn payload_name(name: &str) -> anyhow::Result<()> {
@@ -540,6 +608,61 @@ mod tests {
         assert!(store.write("../escape", b"bad").is_err());
         assert!(store.write(LOCK, b"bad").is_err());
         assert!(store.names(0).is_err());
+    }
+
+    #[test]
+    fn plain_namespace_names_the_store_directory_with_fixed_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&root.path().join("config.toml")).unwrap();
+        let store = PrivateStore::open(&guard, BASE).unwrap();
+        assert_eq!(store.namespace, plain_namespace(guard.canonical_master()));
+        assert!(root.path().join(BASE).join(&store.namespace).is_dir());
+        for (master, expected) in [
+            (
+                "/var/lib/purge-warden/config.toml",
+                "4d3f9acb9b292fdbcfda6947aab51220c99bf0f9ee1f82125143fe84b2c397a6",
+            ),
+            (
+                "/etc/purge-warden/config.toml",
+                "ed706e56a0cb145f23ca512e082f23116f88f31acf4ed4cb4689fb91e1905745",
+            ),
+        ] {
+            assert_eq!(plain_namespace(std::path::Path::new(master)), expected);
+        }
+    }
+
+    #[test]
+    fn open_existing_creates_nothing_and_keeps_a_stale_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&root.path().join("config.toml")).unwrap();
+        assert!(PrivateStore::open_existing(&guard, BASE).unwrap().is_none());
+        assert!(!root.path().join(BASE).exists());
+        std::fs::create_dir(root.path().join(BASE)).unwrap();
+        std::fs::set_permissions(root.path().join(BASE), Permissions::from_mode(0o700)).unwrap();
+        assert!(PrivateStore::open_existing(&guard, BASE).unwrap().is_none());
+        assert_eq!(
+            std::fs::read_dir(root.path().join(BASE)).unwrap().count(),
+            0
+        );
+
+        let store = PrivateStore::open(&guard, BASE).unwrap();
+        store.write("state.json", b"kept").unwrap();
+        let namespace = root.path().join(BASE).join(&store.namespace);
+        drop(store);
+        std::fs::write(namespace.join(STAGE), b"stale").unwrap();
+        std::fs::set_permissions(namespace.join(STAGE), Permissions::from_mode(0o600)).unwrap();
+        let existing = PrivateStore::open_existing(&guard, BASE).unwrap().unwrap();
+        assert_eq!(existing.read("state.json", 100).unwrap().unwrap(), b"kept");
+        drop(existing);
+        assert!(namespace.join(STAGE).exists());
+
+        std::fs::remove_file(namespace.join(LOCK)).unwrap();
+        let error = PrivateStore::open_existing(&guard, BASE)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("recovery required"), "{error}");
+        assert!(!namespace.join(LOCK).exists());
     }
 
     #[test]

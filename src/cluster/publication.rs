@@ -87,6 +87,33 @@ struct Commit {
     available_until: u64,
 }
 
+/// A bound publication that is not committed yet: recovery must decide it.
+fn is_pending_intent(record: &Record) -> bool {
+    record.committed.is_none() && record.operation_manifest.is_some()
+}
+
+/// Refuse relocation while the publication store of `guard`'s master holds a
+/// pending publication intent. Reads only; collects no orphans.
+pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()> {
+    let Some(files) = PrivateStore::open_existing(guard, STORE_DIR)? else {
+        return Ok(());
+    };
+    let Some(bytes) = files.read(STATE, MAX_STATE_BYTES)? else {
+        return Ok(());
+    };
+    let state: State =
+        serde_json::from_slice(&bytes).context("invalid cluster publication state")?;
+    validate_state(&state)?;
+    if let Some((epoch, _)) = state
+        .records
+        .iter()
+        .find(|(_, record)| is_pending_intent(record))
+    {
+        anyhow::bail!("ArtifactRecoveryRequired: pending publication intent at epoch {epoch}");
+    }
+    Ok(())
+}
+
 pub(crate) struct PublicationStore<'g> {
     files: PrivateStore<'g>,
     state: State,
@@ -323,7 +350,7 @@ impl<'g> PublicationStore<'g> {
             .state
             .records
             .values()
-            .filter(|record| record.committed.is_none())
+            .filter(|record| is_pending_intent(record))
             .filter_map(|record| {
                 record
                     .operation_manifest

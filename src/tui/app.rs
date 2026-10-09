@@ -593,6 +593,7 @@ pub struct QueryLogEntryKey(
 
 #[derive(Debug, Clone)]
 pub struct QueryLogState {
+    pub(crate) held: super::query_rule_batch::QueryRuleBatch,
     pub table_state: TableState,
     /// Stable per-entry selection key. The Query Log is refreshed every 3s,
     /// so a bare `TableState` index slides onto a different row when the
@@ -735,6 +736,7 @@ impl QueryLogState {
 impl Default for QueryLogState {
     fn default() -> Self {
         Self {
+            held: Default::default(),
             table_state: TableState::default(),
             selected_key: None,
             entries: Vec::new(),

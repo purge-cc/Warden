@@ -185,7 +185,7 @@ rewrite_config_file() {
 		if [[ $n -gt 0 ]]; then
 			# Carry the original mode across before the rename, so the
 			# published file never exists with the wrong permissions.
-			# Ownership self-heals: step 4's `chown -R` runs straight after.
+			# Ownership self-heals: step 4's re-own runs straight after.
 			chmod --reference="$file" "$tmpf"
 			mv "$tmpf" "$file"
 		else
@@ -282,6 +282,33 @@ migrate_config_paths() {
 	done
 }
 
+# Re-own one moved tree to $NEW (step 4). `-h` (`--no-dereference`) so a
+# symlink met during the walk has ITS OWN ownership changed, never the
+# target's: these trees hold daemon-written `lists/` and `data/`, where a
+# compromised daemon user can plant links. GNU coreutils already defaults to
+# no-follow, but busybox/BSD differ, so it is forced explicitly.
+#
+# `-h` does not cover a HARD link. Where fs.protected_hardlinks=0, the old
+# daemon user can hardlink a root-owned file into the tree, and re-owning
+# that inode hands the original to $NEW. A non-directory with more than one
+# link is therefore skipped and named, never re-owned.
+# `-execdir` runs chown on `./name` from the directory find holds open, so a
+# parent swapped for a symlink after the walk cannot steer it elsewhere; an
+# absolute path would be resolved again at chown time.
+# ponytail: find checks the link count and chown then acts on the entry, so a
+# process still running as the old user (outside the stopped units, the case
+# where usermod -l failed above) can swap that one entry in between for a
+# hardlink to a root file on a protected_hardlinks=0 host. Closing it needs
+# each entry opened with O_PATH|O_NOFOLLOW, fstat'ed for nlink == 1, then
+# chowned through /proc/self/fd/N.
+reown_tree() {
+	local dir="$1" f
+	while IFS= read -r -d '' f; do
+		warn "not re-owned (hardlinked, may alias a file outside $dir): $(printf '%q' "$f")"
+	done < <(find "$dir" ! -type d -links +1 -print0)
+	run find "$dir" \( -type d -o -links 1 \) -execdir chown -h "$NEW:$NEW" {} +
+}
+
 # Sourcing hook for scripts/check_migrate_config_paths.sh: loads the helpers
 # above without running a migration. Nothing below this line is a pure
 # function definition.
@@ -358,18 +385,11 @@ migrate_config_paths /etc /var/lib
 ok "config path values rewritten"
 
 # ── 4. Re-own the moved trees to the (renamed or fresh) user/group ────
-# `-h` (`--no-dereference`) so a symlink met during the recursive walk has
-# ITS OWN ownership changed, never the target's. These trees hold
-# daemon-written `lists/` and `data/`, so a symlink planted there by a
-# compromised daemon user must not let `chown -R` follow it and hand an
-# arbitrary file to the service account. GNU coreutils already defaults to
-# no-follow (`-P`), but busybox/BSD differ, so force it explicitly.
-#
-# src/cli/commands/init/mod.rs:967 does the identical operation and has
-# carried this defence since roundup-01; this site did not, which is the
-# only reason it is written out twice.
+# See reown_tree above for why links are never followed or re-owned.
 for dir in /etc/$NEW /var/lib/$NEW /run/$NEW; do
-	[[ -e $dir ]] && run chown -R -h "$NEW:$NEW" "$dir" || true
+	# A failed re-own aborts the migration: GNU find refuses -execdir when PATH
+	# holds a relative entry, and that must not be reported as re-owned.
+	if [[ -e $dir ]]; then reown_tree "$dir"; fi
 done
 ok "re-owned config/state/runtime trees to $NEW"
 

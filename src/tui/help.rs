@@ -63,6 +63,11 @@ fn render_with_app(
         body.focus_row = view.checked_sub(1).map(|last| page + last);
         (body, ())
     });
+    // Help owns the keys only when it is the sole overlay; over another one,
+    // an outside click's Esc would reach that overlay instead.
+    if app.is_none_or(|app| !crate::tui::mouse::modal_open(app)) {
+        crate::tui::mouse::close_on_outside_click();
+    }
     *offset = rendered.view.offset;
 }
 
@@ -438,6 +443,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
         ],
         Leaf::QueryLog => vec![
+            HelpRow { key: "v", desc: "Review held rules; Enter reviews all, ←→ and e edit a cell, Delete removes; then Apply in the plan" },
             HelpRow {
                 key: "Up/Down",
                 desc: "Scroll table",
@@ -494,7 +500,7 @@ pub(crate) fn per_leaf_rows(leaf: Leaf) -> Vec<HelpRow> {
             },
             HelpRow {
                 key: "Enter",
-                desc: "Allowlist / blocklist focused row (auto-flip on status)",
+                desc: "Hold allowlist/blocklist rule for focused row (local only; auto-flip)",
             },
         ],
         Leaf::Devices => vec![

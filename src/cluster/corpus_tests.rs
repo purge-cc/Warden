@@ -433,3 +433,58 @@ fn authoritative_policy_retirement_preserves_runtime_and_pending_ownership() {
         .manifest_for_artifact(&next.artifact.artifact_hash)
         .is_ok());
 }
+
+#[test]
+fn etc_master_without_legacy_corpus_uses_the_var_lib_state_dir() {
+    assert_eq!(
+        choose_corpus_root(Path::new("/etc/purge-warden"), false),
+        Path::new("/var/lib/purge-warden/.warden-node-corpus")
+    );
+}
+
+#[test]
+fn etc_master_keeps_an_existing_legacy_corpus() {
+    assert_eq!(
+        choose_corpus_root(Path::new("/etc/purge-warden"), true),
+        Path::new("/etc/purge-warden/.warden-node-corpus")
+    );
+}
+
+#[test]
+fn var_lib_and_self_contained_masters_keep_the_corpus_beside_the_config() {
+    for master_dir in ["/var/lib/purge-warden", "/tmp/warden", ""] {
+        for legacy_exists in [false, true] {
+            assert_eq!(
+                choose_corpus_root(Path::new(master_dir), legacy_exists),
+                Path::new(master_dir).join(".warden-node-corpus")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_master_dir_shares_the_corpus_of_its_target() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert_eq!(
+        corpus_root(&alias.join("config.toml")).unwrap(),
+        corpus_root(&real.join("config.toml")).unwrap()
+    );
+}
+
+#[test]
+fn relocate_fence_refuses_a_corpus_open() {
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    let active = root.path().join(crate::config::relocate_receipt::ACTIVE);
+    std::fs::write(&active, b"").unwrap();
+    let error = CorpusStore::open(&master).err().unwrap().to_string();
+    assert!(error.contains("RelocateInProgress"), "{error}");
+    assert!(!root.path().join(CORPUS_DIR).exists());
+    std::fs::remove_file(&active).unwrap();
+    drop(CorpusStore::open(&master).unwrap());
+}

@@ -322,3 +322,53 @@ fn local_dns_edit_uses_one_guard_and_restores_with_that_guard() {
     assert_eq!(loaded.config.local_dns.records.len(), 1);
     assert_eq!(loaded.config.local_dns.records[0].domain, "old.home");
 }
+
+fn remove_modal(domain: &str, match_subdomains: bool) -> LocalDnsModal {
+    let record = LocalDnsRecord {
+        domain: domain.into(),
+        record_type: LocalDnsRecordType::A,
+        value: "10.9.9.9".into(),
+        match_subdomains,
+        ttl_secs: None,
+    };
+    LocalDnsModal::open_remove(LocalRecordScope::Global, &record)
+}
+
+/// `n` is a letter of the phrase in the typed tier, not a cancel.
+#[tokio::test]
+async fn a_typed_phrase_takes_the_letter_n() {
+    let mut app = App::new();
+    app.local_dns.modal = Some(remove_modal("nas.lan", true));
+
+    for c in "nas.lan".chars() {
+        handle_local_dns_modal_key(&mut app, k(KeyCode::Char(c)), &poller(), cfg()).await;
+    }
+    let Some(Stage::ConfirmingRemove(rc)) = app.local_dns.modal.as_ref().map(|m| &m.stage) else {
+        panic!("typing `n` cancelled the typed-phrase confirmation");
+    };
+    assert_eq!(rc.tier, ConfirmTier::TypedPhrase);
+    assert_eq!(rc.buffer, "nas.lan");
+
+    handle_local_dns_modal_key(&mut app, k(KeyCode::Enter), &poller(), cfg()).await;
+    assert!(
+        matches!(
+            app.local_dns.modal.as_ref().map(|m| &m.stage),
+            Some(Stage::Submitted(_))
+        ),
+        "the matching phrase did not submit"
+    );
+}
+
+#[tokio::test]
+async fn n_still_cancels_the_single_keypress_confirmation() {
+    let mut app = App::new();
+    let modal = remove_modal("nas.lan", false);
+    assert!(matches!(
+        &modal.stage,
+        Stage::ConfirmingRemove(rc) if rc.tier == ConfirmTier::SingleKeypress
+    ));
+    app.local_dns.modal = Some(modal);
+
+    handle_local_dns_modal_key(&mut app, k(KeyCode::Char('n')), &poller(), cfg()).await;
+    assert!(app.local_dns.modal.is_none());
+}

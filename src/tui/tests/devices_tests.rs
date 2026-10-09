@@ -1433,6 +1433,40 @@ fn picker_field_does_not_take_the_cursor() {
 }
 
 #[test]
+fn label_backed_fields_render_as_pickers_only_when_their_kind_has_labels() {
+    let mut form =
+        DeviceFormState::new_add().with_label_vocab(vec!["Dweller".into()], vec![], vec![]);
+    let row = |form: &DeviceFormState, label: &str| -> String {
+        form_body(form, 58)
+            .0
+            .fields
+            .iter()
+            .find(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content.trim_end() == label)
+            })
+            .expect("field is rendered")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    };
+    assert!(row(&form, "Owner").contains(PICK_PLACEHOLDER));
+    assert!(!row(&form, "Department").contains(PICK_PLACEHOLDER));
+    form.focused = DeviceFormFocus::Field(DeviceFormField::Owner);
+    assert!(
+        form_body(&form, 58).1.is_none(),
+        "a labelled kind is picked, so it takes no caret"
+    );
+    form.focused = DeviceFormFocus::Field(DeviceFormField::Department);
+    assert!(
+        form_body(&form, 58).1.is_some(),
+        "a kind without labels stays typeable"
+    );
+}
+
+#[test]
 fn form_with_open_picker_renders_overlay_without_panic() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

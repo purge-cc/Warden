@@ -315,6 +315,27 @@ pub(super) async fn observe_receipt(
     .await
 }
 
+/// Refuse relocation while the TUI policy recovery journal of `guard`'s
+/// master is not empty. Reads only.
+pub(crate) fn relocate_recovery_settled(
+    guard: &crate::config::write_lock::MigrationWriteLock,
+) -> anyhow::Result<()> {
+    let Some(store) = PrivateStore::open_existing(guard, STORE)? else {
+        return Ok(());
+    };
+    let Some(bytes) = store.read(ENTRY, MAX_BYTES)? else {
+        return Ok(());
+    };
+    let state = decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .state;
+    anyhow::ensure!(
+        state == JournalState::Empty,
+        "RecoveryConflict: the TUI operator-policy recovery journal is not empty"
+    );
+    Ok(())
+}
+
 async fn run_store<T: Send + 'static>(
     config_path: PathBuf,
     work: impl FnOnce(&PrivateStore<'_>) -> Result<T, AdapterError> + Send + 'static,

@@ -625,3 +625,55 @@ fn master_capture_rejects_regular_replacement_and_unexpected_creation() {
         }
     }
 }
+
+#[test]
+fn relocate_fence_refuses_normal_access_and_passes_relocate_locks() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("config.toml");
+    fs::write(&master, "").unwrap();
+    let active = dir.path().join(crate::config::relocate_receipt::ACTIVE);
+    fs::write(&active, b"").unwrap();
+    let lock = dir.path().join(WRITE_LOCK_FILE);
+    for error in [
+        acquire_for_write(&master).err().unwrap(),
+        acquire_for_migration(&master).err().unwrap(),
+        acquire_for_read(&master).err().unwrap(),
+    ] {
+        assert!(
+            error.to_string().contains("RelocateInProgress"),
+            "{error:#}"
+        );
+    }
+    // A fenced writer leaves no side lock behind.
+    assert!(!lock.exists());
+
+    assert!(probe_for_relocate(&master).unwrap().is_some());
+    let guard = acquire_for_relocate(&master).unwrap();
+    assert!(lock.exists());
+    drop(guard);
+    fs::remove_file(&active).unwrap();
+    drop(acquire_for_write(&master).unwrap());
+    drop(acquire_for_read(&master).unwrap());
+}
+
+#[test]
+fn relocate_probe_holds_existing_locks_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent").join("config.toml");
+    assert!(probe_for_relocate(&missing).unwrap().is_none());
+    assert!(!dir.path().join("absent").exists());
+
+    let master = dir.path().join("config.toml");
+    let probe = probe_for_relocate(&master).unwrap().unwrap();
+    assert!(!dir.path().join(WRITE_LOCK_FILE).exists());
+    assert!(acquire_write_with_deadline(&master, Duration::ZERO).is_err());
+    drop(probe);
+
+    let guard = acquire_for_write(&master).unwrap();
+    let error = probe_for_relocate(&master).err().unwrap().to_string();
+    assert!(error.contains("NodeNotOffline"), "{error}");
+    drop(guard);
+    let probe = probe_for_relocate(&master).unwrap().unwrap();
+    assert!(acquire_write_with_deadline(&master, Duration::ZERO).is_err());
+    drop(probe);
+}

@@ -55,6 +55,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &App) {
             modal_form::render_modal(f, area, MODAL_W, |width| {
                 (modal_form::notice_body(&spec, width), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
         NodesDialog::Recovery { progress, error } => {
             let cancelled = progress.phase == NodeOperationPhase::Cancelled;
@@ -142,6 +143,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &App) {
             modal_form::render_modal(f, area, MODAL_W, |width| {
                 (modal_form::notice_body(&spec, width), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
         NodesDialog::Outcome { message } => {
             let spec = NoticeSpec {
@@ -161,6 +163,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &App) {
             modal_form::render_modal(f, area, MODAL_W, |width| {
                 (modal_form::notice_body(&spec, width), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
     }
 }

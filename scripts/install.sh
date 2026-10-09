@@ -45,7 +45,8 @@ WRAPPER_DEST="/usr/local/bin/warden"
 # executable, so the operator keeps running the old routing while believing
 # they run the new one.
 LEGACY_PROFILED_WRAPPER="/etc/profile.d/purge-warden-wrapper.sh"
-CONFIG_PATH="/var/lib/purge-warden/config.toml"
+CONFIG_PATH="/etc/purge-warden/config.toml"
+LEGACY_CONFIG_PATH="/var/lib/purge-warden/config.toml"
 RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/purge-warden-no-stub.conf"
 # systemd-resolved publishes two resolv.conf files. `stub-resolv.conf`
 # names only the 127.0.0.53 stub; `resolv.conf` names the real uplink
@@ -174,15 +175,48 @@ YES="false"
 # the master again after the transaction boundary.
 UPGRADE_CONFIG=""
 UPGRADE_TRANSACTION_FINALIZED="false"
+UPGRADE_GATE_RUNNING="false"
 
 LOG_FILE=""
 LOG_TEE_PID=""
 
 # ── Traps ─────────────────────────────────────────────────────────────
-# ERR: surface the failing line + what command ran.
-# INT/QUIT/TERM: clean Ctrl-C without a bash stack trace.
-trap 'rc=$?; err "installer failed at line ${BASH_LINENO[0]} (exit $rc)"; if [[ $UPGRADE_TRANSACTION_FINALIZED == "true" ]]; then printf "  The S6 candidate transaction already finalized; the candidate remains installed/running. Do not attempt config rollback or an old-daemon restart; repair this post-commit failure directly.\n" >&2; fi; printf "\n  Last command: %s\n" "${BASH_COMMAND}" >&2; [[ -n $LOG_FILE ]] && printf "  Full log: %s\n" "$LOG_FILE" >&2; printf "  If reproducible, run with --dry-run first and share:\n    journalctl -u purge-warden -n 50 --no-pager\n\n" >&2; exit $rc' ERR
-trap 'err "interrupted by user (signal)"; exit 130' INT QUIT TERM
+# ERR: surface the failing line + what command ran. Its reports are
+# non-fatal: with the log tee gone (see PIPE below), a failed write must not
+# replace the failing status, such as the gate's 75.
+# HUP/INT/QUIT/TERM: clean Ctrl-C without a bash stack trace. Bash acts on a
+# signal only after the foreground command returns, so when the upgrade gate
+# was running, $? is the gate's status: 75 keeps its RECOVERY REQUIRED meaning,
+# and 0 means the transaction completed before the signal was acted on. A
+# signal just before the gate started also leaves $? at 0, so 0 counts only
+# with evidence: the candidate ELF installed and no .s6-old file left.
+trap 'rc=$?; set +e; err "installer failed at line ${BASH_LINENO[0]} (exit $rc)"; if [[ $UPGRADE_TRANSACTION_FINALIZED == "true" ]]; then printf "  The S6 candidate transaction already finalized; the candidate remains installed/running. Do not attempt config rollback or an old-daemon restart; repair this post-commit failure directly.\n" >&2; fi; printf "\n  Last command: %s\n" "${BASH_COMMAND}" >&2; [[ -n $LOG_FILE ]] && printf "  Full log: %s\n" "$LOG_FILE" >&2; printf "  If reproducible, run with --dry-run first and share:\n    journalctl -u purge-warden -n 50 --no-pager\n\n" >&2; exit $rc' ERR
+on_signal() {
+	local rc=$?
+	if [[ $UPGRADE_GATE_RUNNING == "true" && $UPGRADE_TRANSACTION_FINALIZED != "true" ]]; then
+		case $rc in
+		0)
+			if cmp -s "$BINARY_PATH" "$BINARY_DEST" && [[ ! -e $BINARY_DEST.s6-old && ! -L $BINARY_DEST.s6-old && ! -e $UNIT_DEST.s6-old && ! -L $UNIT_DEST.s6-old ]]; then
+				UPGRADE_TRANSACTION_FINALIZED="true"
+			else
+				err "interrupted by user (signal); the state of the upgrade is unknown. Check it with: cmp $BINARY_PATH $BINARY_DEST (no output: the new version is installed), ls -l $BINARY_DEST.s6-old $UNIT_DEST.s6-old (any file: follow the --upgrade refusal), systemctl is-active purge-warden.service. Then run the same install.sh --upgrade command again." || :
+				exit 130
+			fi ;;
+		75) err "interrupted by user (signal); the upgrade needs manual recovery: follow the gate message above" || :; exit 75 ;;
+		esac
+	fi
+	if [[ $UPGRADE_TRANSACTION_FINALIZED == "true" ]]; then
+		err "upgrade transaction completed, then a signal stopped the installer: the new version is installed and running, but the post-upgrade steps were skipped. Run the same install.sh --upgrade command again to finish them." || :
+		exit 4
+	fi
+	err "interrupted by user (signal)" || :
+	exit 130
+}
+trap on_signal HUP INT QUIT TERM
+# A dead log reader (see the tee below) turns a write into a failed command,
+# not a SIGPIPE death, and on_signal's reports are non-fatal: its exit status
+# still tells the caller what the upgrade gate left.
+trap '' PIPE
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -668,6 +702,25 @@ preflight() {
 
 	# Detect + resolve port 53 conflict
 	if [[ $UPGRADE != "true" ]]; then
+		# The LAN CIDR only feeds `warden init --allow-from`, so an upgrade
+		# never needs it. Resolve and validate it before the stub listener is
+		# touched: a refused install must leave systemd-resolved as it was.
+		if [[ -z $LAN_CIDR ]]; then
+			local detected
+			detected=$(detect_lan_cidr || true)
+			if [[ -n $detected ]]; then
+				LAN_CIDR="$detected"
+				ok "LAN CIDR auto-detected from default route: $LAN_CIDR"
+			else
+				err "could not auto-detect LAN CIDR"
+				printf '\n  Pass --lan-cidr <cidr>, e.g. --lan-cidr 10.0.0.0/24\n'
+				printf '  You can find your LAN with: ip -4 route show\n\n'
+				exit 1
+			fi
+		fi
+		validate_cidr_list "$LAN_CIDR" ||
+			die "invalid CIDR: $LAN_CIDR (expected a.b.c.d/prefix, or several comma-separated)"
+
 		local p53
 		p53=$(port_53_holder)
 		if [[ -n $p53 ]]; then
@@ -703,20 +756,6 @@ preflight() {
 		fi
 	fi
 
-	# Resolve LAN CIDR
-	if [[ -z $LAN_CIDR ]]; then
-		local detected
-		detected=$(detect_lan_cidr || true)
-		if [[ -n $detected ]]; then
-			LAN_CIDR="$detected"
-			ok "LAN CIDR auto-detected from default route: $LAN_CIDR"
-		else
-			err "could not auto-detect LAN CIDR"
-			printf '\n  Pass --lan-cidr <cidr>, e.g. --lan-cidr 10.0.0.0/24\n'
-			printf '  You can find your LAN with: ip -4 route show\n\n'
-			exit 1
-		fi
-	fi
 	# `warden init --upstream` takes plain-DNS addr:port and nothing else; DoH
 	# and DoT are configured afterwards, by setting [upstream].mode and
 	# rewriting [upstream].servers. An operator mirroring a working config
@@ -742,9 +781,6 @@ preflight() {
 		printf '  `warden init` only ever writes plain-DNS upstreams.\n\n'
 		exit 1
 	fi
-
-	validate_cidr_list "$LAN_CIDR" ||
-		die "invalid CIDR: $LAN_CIDR (expected a.b.c.d/prefix, or several comma-separated)"
 
 	# Resolve binary source
 	if [[ -z $MODE ]]; then
@@ -866,7 +902,7 @@ check_existing_install() {
 		warn "half-installed box: the binary is present, but nothing else is"
 		printf '\n  Binary:  %s\n' "$(installed_binary_path)"
 		printf '  Unit:    (missing)\n'
-		printf '  Config:  (missing at both /etc and %s)\n' "$CONFIG_PATH"
+		printf '  Config:  (missing at %s and %s)\n' "$CONFIG_PATH" "$LEGACY_CONFIG_PATH"
 		printf '  User:    (missing)\n'
 		printf '\n  A previous install almost certainly died partway through.\n'
 		printf '  Continuing as a FRESH install — that is what repairs this state.\n'
@@ -964,6 +1000,11 @@ show_plan() {
 		plan_cfg=$(resolve_installed_config) || plan_cfg="$CONFIG_PATH"
 	fi
 	printf '  Config file: %s\n' "$plan_cfg"
+	# The rest only feeds `warden init`; an upgrade keeps the existing config.
+	if [[ $UPGRADE == "true" ]]; then
+		printf '\n'
+		return 0
+	fi
 	printf '  LAN CIDR:    %s (→ server.allow_from)\n' "$LAN_CIDR"
 	printf '  Listen on:   %s\n' "$LISTEN"
 	# An empty field here reads as "none", and the truth is the opposite: with
@@ -1163,12 +1204,17 @@ run_warden_init() {
 	# No config VISIBLE — which is not the same as no config. Say which,
 	# rather than previewing an init the real run would never perform.
 	if [[ $DRY_RUN == "true" ]] && config_may_be_hidden; then
-		printf '  %s[dry]%s cannot read %s as uid %s — a config may be present\n' \
-			"$C_Y" "$C_R" "$(dirname "$CONFIG_PATH")" "$EUID"
-		printf '        and this preview cannot see it. The real run is root and\n'
+		printf '  %s[dry]%s cannot read config directories for %s and %s as uid %s\n' \
+			"$C_Y" "$C_R" "$CONFIG_PATH" "$LEGACY_CONFIG_PATH" "$EUID"
+		printf '        A config may be present that this preview cannot see. The real run is root and\n'
 		printf '        WOULD keep it. Re-run with sudo for a preview that can tell.\n'
 		return
 	fi
+	# Unsupported path entries must not be overwritten or shadowed by a seed.
+	local path
+	for path in "$CONFIG_PATH" "$LEGACY_CONFIG_PATH"; do
+		[[ ! -e $path && ! -L $path ]] || die "refusing to seed while a config path exists at $path; inspect or repair it first"
+	done
 	# Fresh install: init runs fully specified — the installer already
 	# collected every answer (flags or defaults), so init never prompts
 	# regardless of TTY (rev-2606 install-01/install-02). allow_from =
@@ -1182,6 +1228,8 @@ run_warden_init() {
 	if [[ -n $UPSTREAM ]]; then
 		upstream_arg=(--upstream "$UPSTREAM")
 	fi
+	# Unflagged init selects /etc and repeats the legacy-master guard at
+	# publication; passing --config would turn this into an explicit override.
 	if [[ $DRY_RUN == "true" ]]; then
 		printf '  %s[dry]%s %s init --yes --listen %s %s--lists %s --allow-from %s,127.0.0.0/8\n' \
 			"$C_Y" "$C_R" "$BINARY_DEST" "$LISTEN" \
@@ -1224,15 +1272,25 @@ migrate_admin_token_to_fhs() {
 	fi
 
 	if [[ $DRY_RUN == "true" ]]; then
-		printf '  %s[dry]%s copy %s → %s, chown purge-warden, chmod 0600, unlink legacy\n' \
+		printf '  %s[dry]%s as purge-warden: copy %s → %s via a temporary name (umask 077), chmod 0600, unlink legacy\n' \
 			"$C_Y" "$C_R" "$XDG_TOKEN" "$FHS_TOKEN"
 		return
 	fi
 
-	cp -p "$XDG_TOKEN" "$FHS_TOKEN"
-	chown purge-warden:purge-warden "$FHS_TOKEN"
-	chmod 0600 "$FHS_TOKEN"
-	rm -f "$XDG_TOKEN"
+	# Both paths sit in directories purge-warden owns, where a planted
+	# symlink would steer a root cp/chown/chmod/rm anywhere. Run as that user.
+	# Copy to a temporary name and rename, so a failed copy never leaves a
+	# partial token that the "already present" test above would keep.
+	local src dst tmp
+	src=$(printf '%q' "$XDG_TOKEN") dst=$(printf '%q' "$FHS_TOKEN") tmp=$(printf '%q' "$FHS_TOKEN.tmp")
+	if ! su -s /bin/bash purge-warden -c "umask 077 && cp -T $src $tmp && chmod 0600 $tmp && mv -T $tmp $dst"; then
+		warn "could not migrate $XDG_TOKEN as purge-warden — legacy token left in place"
+		return 0
+	fi
+	if ! su -s /bin/bash purge-warden -c "rm -f $src"; then
+		warn "admin token migrated to $FHS_TOKEN, but the legacy copy $XDG_TOKEN could not be removed"
+		return 0
+	fi
 	ok "migrated admin token: $XDG_TOKEN → $FHS_TOKEN (mode 0600, owner purge-warden)"
 }
 
@@ -1300,13 +1358,11 @@ ensure_daemon_home() {
 
 # ── Phase 5.7: Admin token ────────────────────────────────────────────
 
-# Resolve the config the daemon will actually load, in the daemon's own
-# discovery order (/etc first, /var/lib second — see
-# src/cli/config_discovery.rs). Phase 5's own probe checks $CONFIG_PATH
-# first; that order is wrong for anything that must agree with the binary.
+# Resolve the config in daemon discovery order: canonical /etc, then legacy
+# /var/lib. Fresh installs write only the canonical path.
 resolve_installed_config() {
 	local candidate
-	for candidate in /etc/purge-warden/config.toml "$CONFIG_PATH"; do
+	for candidate in "$CONFIG_PATH" "$LEGACY_CONFIG_PATH"; do
 		if [[ -f $candidate ]]; then
 			printf '%s' "$candidate"
 			return 0
@@ -1320,7 +1376,7 @@ resolve_installed_config() {
 # its historical `-f` behavior above so it can still identify repairable state.
 resolve_upgrade_config() {
 	local dir candidate
-	for candidate in /etc/purge-warden/config.toml "$CONFIG_PATH"; do
+	for candidate in "$CONFIG_PATH" "$LEGACY_CONFIG_PATH"; do
 		dir=$(dirname "$candidate")
 		if [[ $EUID -ne 0 && $DRY_RUN == "true" && -d $dir && ! -x $dir ]]; then
 			return 3
@@ -1362,16 +1418,23 @@ legacy_purge_shield_present() {
 }
 
 check_upgrade_prerequisites() {
+	# An interrupted upgrade transaction keeps the old ELF and unit as .s6-old.
+	local hint=""
+	if [[ -e $BINARY_DEST.s6-old || -L $BINARY_DEST.s6-old || -e $UNIT_DEST.s6-old || -L $UNIT_DEST.s6-old ]]; then
+		local recovery_doc="$REPO_ROOT/docs/UPGRADE_RECOVERY.md"
+		hint=". A .s6-old file remains from an upgrade that was killed (SIGKILL, power loss or crash) or failed. First look for a non-empty receipt.json in the newest /var/tmp/purge-warden-v4-to-v5.* directory, created by that upgrade: if one exists, follow \"Manual schema-4 recovery\" in $recovery_doc. Otherwise, if $BINARY_DEST.s6-old --config <master> config lint passes, stop purge-warden-backup.timer, purge-warden-backup.service and purge-warden.service, move $BINARY_DEST.s6-old back to $BINARY_DEST and $UNIT_DEST.s6-old back to $UNIT_DEST (each that exists), run systemctl daemon-reload, start purge-warden.service and, if systemctl is-enabled reports it enabled, purge-warden-backup.timer, then rerun --upgrade. If lint fails, follow \"End states after exit 75\" in $recovery_doc"
+	fi
 	if [[ ! -f $BINARY_DEST || -L $BINARY_DEST || ! -x $BINARY_DEST ]] || ! is_elf_binary "$BINARY_DEST"; then
 		if [[ -f $WRAPPER_DEST && ! -L $WRAPPER_DEST ]] && is_elf_binary "$WRAPPER_DEST"; then
 			die "--upgrade refuses the pre-libexec raw-ELF layout at $WRAPPER_DEST; perform the separately reviewed legacy layout conversion first"
 		fi
-		die "--upgrade requires the current executable libexec ELF at $BINARY_DEST; this is a binary-only or partial installation requiring inspection (use a fresh install only to repair a true half-install)"
+		die "--upgrade requires the current executable libexec ELF at $BINARY_DEST; this is a binary-only or partial installation requiring inspection (use a fresh install only to repair a true half-install)$hint"
 	fi
 	local required
 	for required in "$UNIT_DEST" "$BACKUP_UNIT_DEST" "$BACKUP_TIMER_DEST"; do
-		[[ -f $required && ! -L $required ]] || die "--upgrade requires the installed regular unit $required; this partial installation requires inspection"
+		[[ -f $required && ! -L $required ]] || die "--upgrade requires the installed regular unit $required; this partial installation requires inspection$hint"
 	done
+	[[ -z $hint ]] || die "--upgrade refuses pre-existing .s6-old recovery evidence; nothing was changed$hint"
 	local resolve_rc=0
 	UPGRADE_CONFIG=$(resolve_upgrade_config) || resolve_rc=$?
 	if [[ $resolve_rc -eq 3 ]]; then
@@ -1382,7 +1445,7 @@ check_upgrade_prerequisites() {
 		if [[ $DRY_RUN == "true" ]] && config_may_be_hidden; then
 			die "cannot determine the installed master; rerun the preview with sudo"
 		fi
-		die "--upgrade requires one installed regular master config in /etc/purge-warden or $CONFIG_PATH; this partial installation requires inspection"
+		die "--upgrade requires one installed regular master config at $CONFIG_PATH or $LEGACY_CONFIG_PATH; this partial installation requires inspection"
 	fi
 	if legacy_purge_shield_present; then
 		die "--upgrade refuses purge-shield artifacts or stale paths; complete the separately reviewed legacy product/layout conversion first"
@@ -1414,7 +1477,7 @@ check_upgrade_prerequisites() {
 config_may_be_hidden() {
 	[[ $EUID -eq 0 ]] && return 1
 	local dir
-	for dir in /etc/purge-warden "$(dirname "$CONFIG_PATH")"; do
+	for dir in "$(dirname "$CONFIG_PATH")" "$(dirname "$LEGACY_CONFIG_PATH")"; do
 		[[ -d $dir && ! -x $dir ]] && return 0
 	done
 	return 1
@@ -1498,50 +1561,57 @@ ensure_admin_token() {
 prepare_backup_dir() {
 	step "Phase 6: Prepare backup directory"
 
-	# Resolved like the daemon does, NOT from $CONFIG_PATH. On an
-	# /etc-master host $CONFIG_PATH does not exist, so the old guard
-	# `die`d here — AFTER install_binary stopped the service and BEFORE
-	# install_unit restarts it, i.e. the installer aborted leaving LAN DNS
-	# down. The die survives for the genuine "no config anywhere" case,
-	# which after Phase 5 is a real error.
-	#
-	# Resolved before the --dry-run branch: the preview must name the same
-	# directory the real run would create. The dry branch must NOT die when
-	# nothing resolves — a preview of a fresh install runs before Phase 5
-	# has written any config, and `--dry-run` on a clean machine has to
-	# work. There the real run would create $CONFIG_PATH, so that is the
-	# parent to show.
+	# Resolve before the dry-run branch: no master after init is a real
+	# failure, but a fresh preview has not created one yet.
 	local cfg="${1:-}"
 	if [[ -z $cfg ]] && ! cfg=$(resolve_installed_config); then
 		if [[ $DRY_RUN == "true" ]]; then
 			cfg="$CONFIG_PATH"
 		else
-			die "config.toml not found at /etc/purge-warden/ or $CONFIG_PATH (warden init should have created it)"
+			die "config.toml not found at $CONFIG_PATH or $LEGACY_CONFIG_PATH (warden init should have created it)"
 		fi
 	fi
 
-	if [[ $DRY_RUN == "true" ]]; then
-		printf '  %s[dry]%s mkdir -p %s/backups (owner purge-warden, mode 0750)\n' \
-			"$C_Y" "$C_R" "$(dirname "$cfg")"
+	# Configs under /etc may have an explicit archive destination. Do not
+	# parse TOML in shell or reown an operator's archive tree on upgrades.
+	# Fresh scaffolds point at /var/lib; the backup engine creates that
+	# directory as the daemon user on first use.
+	if [[ $cfg == "$CONFIG_PATH" ]]; then
+		if [[ $DRY_RUN == "true" ]]; then
+			printf '  %s[dry]%s leave backup directories unchanged (fresh default: %s/backups)\n' \
+				"$C_Y" "$C_R" "$(dirname "$LEGACY_CONFIG_PATH")"
+		else
+			ok "backup directory left unchanged — configured path is managed by the backup engine or operator"
+		fi
 		return
 	fi
 
-	# §backup-restore-tui: ensure <config-parent>/backups/ exists owned by
-	# purge-warden so the TUI Settings `b` action and the `warden config
-	# backup` CLI can write archives without root. Default per
-	# `BackupConfig::resolve_dir` is `<config-parent>/backups`. If the
-	# operator points `[backup] dir` elsewhere via TOML they own that
-	# path's perms (see CONFIG_GUIDE §15.13). chown is idempotent so a
-	# pre-existing root-owned dir from earlier root-run testing is fixed.
-	# Mode 0750, NOT 0755 — backup archives capture the master config
-	# (api.token_hash) plus the device inventory; the engine creates
-	# this dir 0750 on purpose (src/cli/commands/config/backup.rs) and
-	# the installer must not re-loosen it (rev-2606 backup-01).
+	# purge-warden owns this parent and can swap `backups` for a
+	# symlink at any moment. Root therefore never touches the path: the work
+	# below runs AS purge-warden, so following a link reaches only what that
+	# user could already change, and a swap after this -L test gains nothing.
+	# The test exists for the operator, not for safety.
 	local BACKUP_DIR
 	BACKUP_DIR="$(dirname "$cfg")/backups"
-	mkdir -p "$BACKUP_DIR"
-	chown purge-warden:purge-warden "$BACKUP_DIR"
-	chmod 0750 "$BACKUP_DIR"
+	if [[ -L $BACKUP_DIR ]]; then
+		warn "$BACKUP_DIR is a symlink — refused, left unchanged (the installer never follows it)"
+		return 0
+	fi
+	if [[ $DRY_RUN == "true" ]]; then
+		printf '  %s[dry]%s mkdir -p %s (as purge-warden, mode 0750)\n' \
+			"$C_Y" "$C_R" "$BACKUP_DIR"
+		return
+	fi
+
+	# Archives contain private config and device inventory, so never widen
+	# the engine's 0750 directory mode to world-readable. A failure is not
+	# fatal: this runs after the upgrade commit, and only archives depend on it.
+	local q
+	q=$(printf '%q' "$BACKUP_DIR")
+	if ! su -s /bin/bash purge-warden -c "umask 027 && mkdir -p $q && chmod 0750 $q"; then
+		warn "could not prepare $BACKUP_DIR as purge-warden (not a directory, or not owned by purge-warden) — scheduled backups fail until fixed"
+		return 0
+	fi
 	ok "backup dir prepared: $BACKUP_DIR (owner purge-warden, mode 0750)"
 }
 
@@ -2285,12 +2355,14 @@ migrate_existing_install() {
 run_upgrade_transaction() {
 	local args=(--binary "$BINARY_PATH" --config "$UPGRADE_CONFIG")
 	[[ $DRY_RUN == "true" ]] && args+=(--dry-run)
+	# on_signal reads the status of a real transaction, never of a preview.
+	[[ $DRY_RUN == "true" ]] || UPGRADE_GATE_RUNNING="true"
 	"$SCRIPT_DIR/upgrade_config_gate.sh" "${args[@]}"
 }
 
 refuse_unsafe_fresh_legacy_conversion() {
 	if [[ $DRY_RUN != "true" ]] && legacy_purge_shield_present; then
-		die "fresh install refuses to combine purge-shield conversion with the S6 v3-only transaction; complete the separately reviewed legacy conversion/migration prerequisite before installing warden"
+		die "fresh install refuses while purge-shield artifacts or stale paths remain; complete the separately reviewed purge-shield conversion first, then install warden"
 	fi
 }
 
@@ -2418,7 +2490,14 @@ main() {
 		# so the install runs to completion with every byte after the first
 		# prompt invisible — on screen AND in this log. tee never reads the
 		# terminal, so ignoring both signals costs it nothing.
-		exec > >(trap '' TTIN TTOU; exec tee -a "$LOG_FILE") 2>&1
+		#
+		# tee also ignores HUP, TERM and PIPE. A terminal signal reaches the
+		# whole group while the upgrade gate may still have to restore the old
+		# version and report it. A dead tee would lose that report, on screen
+		# and in this log. tee exits at end of input. INT and QUIT are not
+		# listed: bash already ignores them for this asynchronous command, and
+		# naming them in the trap would undo that at exec. Measured.
+		exec > >(trap '' TTIN TTOU HUP TERM PIPE; exec tee -a "$LOG_FILE") 2>&1
 		LOG_TEE_PID=$!
 		log "logging to $LOG_FILE"
 	else
@@ -2456,7 +2535,7 @@ main() {
 	if [[ $UPGRADE == "true" ]]; then
 		if [[ $DRY_RUN == "true" ]]; then
 			step "S6 upgrade preview"
-			log "previewing transaction order only; no v3-readiness, health, or finalization claim is made"
+			log "previewing transaction order only; no schema, health, or finalization claim is made"
 			run_upgrade_transaction
 			log "[dry] after a successful transaction, would repair daemon home/token/backup directory, refresh backup unit files, and refresh the operator wrapper"
 		else

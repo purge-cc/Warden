@@ -97,6 +97,8 @@ SystemCallFilter=~@privileged @resources
 # ── Restart policy ───────────────────────────────────────────────
 Restart=on-failure
 RestartSec=5
+SuccessExitStatus=75
+RestartForceExitStatus=75
 
 [Install]
 WantedBy=multi-user.target

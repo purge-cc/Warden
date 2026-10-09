@@ -2,21 +2,16 @@
 //!
 //! Requires root (euid 0). Every path it touches is derived from ONE
 //! input — the config path — through `InitLayout`. With no `--config`
-//! that input is `DEFAULT_CONFIG_PATH` and the layout is the historical
-//! one:
+//! that input is `DEFAULT_CONFIG_PATH` and the layout is FHS-compliant:
 //!
 //! - System user `purge-warden` (no login shell, no home directory)
-//! - /var/lib/purge-warden/            (config, lists, data)
-//! - /var/lib/purge-warden/lists/      (downloaded blocklists)
-//! - /var/lib/purge-warden/data/       (stats snapshots)
-//! - /run/purge-warden/                (control socket, PID file)
-//! - /var/lib/purge-warden/config.toml (default config, only if missing)
+//! - /etc/purge-warden/config.toml    (config master)
+//! - /var/lib/purge-warden/lists/     (downloaded blocklists)
+//! - /var/lib/purge-warden/data/      (stats snapshots)
+//! - /run/purge-warden/               (control socket, PID file)
 //!
-//! With `--config <path>` every one of those moves with it. Historically
-//! the flag was parsed, accepted, and discarded: `run_init` took
-//! no path at all and wrote to the constant regardless, so
-//! `warden --config /tmp/x/config.toml init` provisioned
-//! `/var/lib/purge-warden` and reported success.
+//! With `--config <path>` the layout follows that path. Unflagged init
+//! refuses an existing legacy master rather than shadowing its policy.
 
 use std::ffi::{CString, OsStr};
 use std::fmt::Write as _;
@@ -43,16 +38,36 @@ pub(crate) mod upstream;
 const USER: &str = "purge-warden";
 
 /// Config master `warden init` provisions when no `--config` is given.
-///
-/// **Deliberately NOT `config_discovery::resolve_config_path`.** That
-/// helper's no-config fallback is `/etc/purge-warden/config.toml` under
-/// root, and `scripts/install.sh` hardcodes
-/// `CONFIG_PATH="/var/lib/purge-warden/config.toml"`, calls `init --yes`
-/// with no `--config`, and then dies if that exact file is absent.
-/// Routing the unflagged path through discovery would relocate the master
-/// out from under every existing provisioning script. So: an explicit
-/// `--config` is honoured, and the unflagged default stays put.
-pub(crate) const DEFAULT_CONFIG_PATH: &str = "/var/lib/purge-warden/config.toml";
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/purge-warden/config.toml";
+const LEGACY_CONFIG_PATH: &str = "/var/lib/purge-warden/config.toml";
+
+fn init_layout(explicit_config: Option<&Path>, legacy_master: &Path) -> anyhow::Result<InitLayout> {
+    if let Some(path) = explicit_config {
+        return Ok(InitLayout::for_config(path));
+    }
+    refuse_legacy_master(legacy_master)?;
+    Ok(InitLayout::for_config(Path::new(DEFAULT_CONFIG_PATH)))
+}
+
+fn refuse_legacy_master(legacy_master: &Path) -> anyhow::Result<()> {
+    // Include dangling symlinks: an existing legacy entry is not a fresh install.
+    match std::fs::symlink_metadata(legacy_master) {
+        Ok(_) => anyhow::bail!(
+            "legacy config already exists: {}. Refusing to create {} and shadow existing policy. \
+             Keep using the existing master; Warden does not move it. To explicitly reinitialize \
+             the legacy master, run `warden --config {} init --force`.",
+            legacy_master.display(),
+            DEFAULT_CONFIG_PATH,
+            legacy_master.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => anyhow::bail!(
+            "cannot inspect legacy config {}: {error}",
+            legacy_master.display()
+        ),
+    }
+    Ok(())
+}
 
 /// The whole message an operator sees when they run
 /// `warden init` without `--upstream`. It is the ONLY thing standing
@@ -90,14 +105,29 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:53";
 /// silently inheriting our preference.
 const NO_DEFAULT_UPSTREAMS: &[&str] = &[];
 
-/// The config body `warden init --yes` writes with no overrides.
-///
-/// Delegates to [`render_default_config`] so there is exactly ONE
-/// template in the tree — the former `DEFAULT_CONFIG` const drifted
-/// from the render path (the const once shipped dual-channel
-/// list wiring with 404 entity URLs while tests exercised the const,
-/// not the render). Consumers: `config edit`'s missing-file seed and
-/// the tests below.
+/// Archive directory appended to scaffolds written for the fresh /etc master.
+const FRESH_BACKUP_CONFIG: &str = "\n[backup]\ndir = \"/var/lib/purge-warden/backups\"\n";
+
+/// The fresh system scaffold shared by unflagged init and package seeds.
+pub(crate) fn fresh_default_config() -> String {
+    default_config() + FRESH_BACKUP_CONFIG
+}
+
+/// The `[backup]` block a new master at `config_path` needs. The `/etc` master
+/// archives under `/var/lib`, with or without `--config` naming it; every other
+/// master keeps the `<config-parent>/backups` default. The path is compared as
+/// given, like the rest of `InitLayout`, so a relative or `..` spelling is not
+/// the `/etc` master here.
+pub(crate) fn backup_config_for(config_path: &Path) -> &'static str {
+    if config_path == Path::new(DEFAULT_CONFIG_PATH) {
+        FRESH_BACKUP_CONFIG
+    } else {
+        ""
+    }
+}
+
+/// Generic missing-file scaffold. Backup archives follow the config parent;
+/// only fresh system provisioning opts into an explicit FHS archive directory.
 pub(crate) fn default_config() -> String {
     let sources: Vec<String> = DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect();
     let lists = resolve_scaffold_lists(&sources)
@@ -201,6 +231,32 @@ impl InitLayout {
         dirs
     }
 
+    /// `dir` with only the components root alone can change resolved.
+    ///
+    /// The state directory's own entry and its ancestors live in root-owned
+    /// directories such as `/var/lib`, so root-made symlinks there are
+    /// followed. Entries below the state directory are daemon-owned: they stay
+    /// unresolved for a no-follow walk, so the daemon user can never redirect
+    /// root's mkdir, chmod or chown. A directory outside the state directory
+    /// (the run dir, the config dir) is itself a root-owned entry. This holds
+    /// for the split `/etc` + `/var/lib` layout only, and assumes root points
+    /// such links only into root-controlled trees.
+    fn anchored(&self, dir: &Path) -> anyhow::Result<PathBuf> {
+        use anyhow::Context as _;
+
+        let (anchor, rest) = match dir.strip_prefix(&self.state_dir) {
+            Ok(rest) => (self.state_dir.as_path(), rest),
+            Err(_) => (dir, Path::new("")),
+        };
+        let resolved = write_lock::resolve_path(anchor)
+            .with_context(|| format!("cannot resolve {}", anchor.display()))?;
+        Ok(if rest.as_os_str().is_empty() {
+            resolved
+        } else {
+            resolved.join(rest)
+        })
+    }
+
     /// Path-based ownership work outside the held canonical config tree.
     fn chown_targets(&self) -> Vec<(PathBuf, bool)> {
         let mut targets = vec![
@@ -249,9 +305,8 @@ pub struct InitOverrides {
 ///
 /// `explicit_config` — the operator's `--config <path>`, if they passed
 ///   one. Every directory init creates is derived from it via
-///   `InitLayout`. `None` keeps the historical
-///   `DEFAULT_CONFIG_PATH` layout byte-for-byte, which
-///   `scripts/install.sh` depends on.
+///   `InitLayout`. `None` uses `DEFAULT_CONFIG_PATH`, refusing an existing
+///   legacy master even with `--force` so its policy is not shadowed.
 ///
 /// `force` — overwrite the target config if it already exists (the
 ///   existing file is renamed aside with a `.pre-init-<ts>` suffix so
@@ -275,8 +330,7 @@ pub fn run_init(
         anyhow::bail!("warden init requires root. Run with sudo.");
     }
 
-    let layout =
-        InitLayout::for_config(explicit_config.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH)));
+    let layout = init_layout(explicit_config, Path::new(LEGACY_CONFIG_PATH))?;
 
     // Gather + validate every answer BEFORE mutating the system, so a
     // bad flag value or a typo'd list id fails fast with nothing
@@ -293,7 +347,14 @@ pub fn run_init(
     // `[[blocklists]]`) is policy the primary supplies, and a secondary's
     // master carrying its own is refused at load and at `join`.
     if let Some(peer) = overrides.cluster_secondary_peer.as_deref() {
-        return run_init_cluster_secondary(&layout, force, &listen, peer, overrides);
+        return run_init_cluster_secondary(
+            &layout,
+            force,
+            &listen,
+            peer,
+            overrides,
+            (explicit_config.is_none()).then_some(Path::new(LEGACY_CONFIG_PATH)),
+        );
     }
 
     // No vendor fallback, and warden still picks
@@ -342,8 +403,15 @@ pub fn run_init(
         &layout.socket_path,
     );
 
+    body.push_str(backup_config_for(&layout.config_path));
     append_node_identity(&mut body, overrides.node_name.as_deref())?;
-    let outcome = init_locked(&layout, force, &body, &system_init_ops())?;
+    let outcome = init_locked(
+        &layout,
+        force,
+        &body,
+        &system_init_ops(),
+        (explicit_config.is_none()).then_some(Path::new(LEGACY_CONFIG_PATH)),
+    )?;
     if let Some(backup) = outcome.pre_init_copy {
         println!("saved previous config to {}", backup.display());
     }
@@ -410,6 +478,7 @@ fn run_init_cluster_secondary(
     listen: &str,
     peer: &str,
     overrides: &InitOverrides,
+    legacy_master: Option<&Path>,
 ) -> anyhow::Result<()> {
     if let Err(reason) = crate::config::schema::cluster::validate_peer_url(peer.trim()) {
         anyhow::bail!("--peer {reason}");
@@ -425,9 +494,10 @@ fn run_init_cluster_secondary(
     let allow_from = validated_allow_from(&allow_from_inputs)?;
 
     let mut body = render_cluster_secondary_config(listen, &allow_from, &layout.socket_path, peer);
+    body.push_str(backup_config_for(&layout.config_path));
     append_node_identity(&mut body, overrides.node_name.as_deref())?;
 
-    let outcome = init_locked(layout, force, &body, &system_init_ops())?;
+    let outcome = init_locked(layout, force, &body, &system_init_ops(), legacy_master)?;
     if let Some(backup) = outcome.pre_init_copy {
         println!("saved previous config to {}", backup.display());
     }
@@ -513,8 +583,7 @@ fn render_cluster_secondary_config(
     out.push_str("\n[tracking]\n");
     out.push_str("enabled = true\n");
 
-    out.push_str("\n[backup]\n");
-    out.push_str("# auto_interval = \"24h\"\n");
+    out.push_str("\n# [backup]\n# auto_interval = \"24h\"\n");
 
     out
 }
@@ -691,7 +760,11 @@ where
                 continue;
             }
         }
-        create_dir(&dir, mode)?;
+        if layout.config_dir != layout.state_dir && dir != layout.config_dir {
+            create_dir_no_follow(&layout.anchored(&dir)?, mode)?;
+        } else {
+            create_dir(&dir, mode)?;
+        }
     }
 
     // Idempotent — skips if the user already exists.
@@ -705,6 +778,12 @@ where
             continue;
         }
         let recursive = recursive && !canonical_root.starts_with(&resolved);
+        // `chown -h` on a root-made state-dir symlink would reown only the link.
+        let target = if layout.config_dir != layout.state_dir {
+            layout.anchored(&target)?
+        } else {
+            target
+        };
         (ops.chown_path)(&target, recursive)?;
     }
     Ok(owner)
@@ -798,6 +877,7 @@ fn init_locked<CreateUser, ResolveOwner, ChownPath>(
     force: bool,
     body: &str,
     ops: &InitOps<CreateUser, ResolveOwner, ChownPath>,
+    legacy_master: Option<&Path>,
 ) -> anyhow::Result<InitOutcome>
 where
     CreateUser: Fn() -> anyhow::Result<()>,
@@ -818,9 +898,15 @@ where
         "config master alias changed while acquiring its write guard"
     );
 
+    if let Some(legacy) = legacy_master {
+        refuse_legacy_master(legacy)?;
+    }
     let precondition = check_preconditions_locked(&guard, &layout.config_path, force)?;
     let config_dir_is_held_root = requested_config_dir == guard.identity().root;
     let owner = provision_locked(&guard, layout, &precondition, config_dir_is_held_root, ops)?;
+    if let Some(legacy) = legacy_master {
+        refuse_legacy_master(legacy)?;
+    }
     let outcome = publish_scaffold_locked(&guard, precondition, body)?;
 
     let ownership_scope = match (config_dir_is_held_root, leaf_alias) {
@@ -1677,6 +1763,21 @@ fn resolve_daemon_owner() -> anyhow::Result<(u32, u32)> {
     Ok((id("-u")?, id("-g")?))
 }
 
+fn create_dir_no_follow(path: &Path, mode: u32) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    // Pin every parent without following symlinks; a daemon-owned state entry
+    // must never redirect root's chmod, even if it is swapped during provisioning.
+    // Callers resolve the root-controlled prefix first (`InitLayout::anchored`).
+    let (root, relative) = if path.is_absolute() {
+        (File::open("/")?, path.strip_prefix("/")?)
+    } else {
+        (File::open(".")?, path)
+    };
+    create_dir_under_held_root(&root, relative, path, mode)
+        .with_context(|| format!("cannot create {} (mode {mode:o})", path.display()))
+}
+
 fn create_dir(path: &Path, mode: u32) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::os::unix::fs::DirBuilderExt;
@@ -1821,26 +1922,14 @@ mod tests {
         assert_eq!(mode, 0o750);
     }
 
-    // ── `--config` was accepted and discarded ──────────
-
-    /// A high-value regression test. `scripts/install.sh`
-    /// hardcodes `CONFIG_PATH="/var/lib/purge-warden/config.toml"`, runs
-    /// `init --yes` with no `--config`, and then dies if that
-    /// exact file is missing. The installer is not ours to edit, so the
-    /// unflagged layout must stay byte-for-byte what it was —
-    /// every field, not just the config path.
     #[test]
-    fn unflagged_layout_is_unchanged_from_the_pre_h9_constants() {
-        let l = InitLayout::for_config(Path::new(DEFAULT_CONFIG_PATH));
+    fn fresh_unflagged_layout_uses_etc_master_and_var_lib_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = init_layout(None, &dir.path().join("legacy/config.toml")).unwrap();
 
-        // The four pre-h9 constants, verbatim.
-        assert_eq!(
-            l.config_path,
-            Path::new("/var/lib/purge-warden/config.toml"),
-            "install.sh dies if init stops writing exactly here"
-        );
-        assert_eq!(l.state_dir, Path::new("/var/lib/purge-warden"), "BASE_DIR");
-        assert_eq!(l.config_dir, Path::new("/var/lib/purge-warden"));
+        assert_eq!(l.config_path, Path::new("/etc/purge-warden/config.toml"));
+        assert_eq!(l.state_dir, Path::new("/var/lib/purge-warden"));
+        assert_eq!(l.config_dir, Path::new("/etc/purge-warden"));
         assert_eq!(l.run_dir.as_deref(), Some(Path::new("/run/purge-warden")));
         assert_eq!(
             l.socket_path,
@@ -1856,6 +1945,7 @@ mod tests {
                 (PathBuf::from("/var/lib/purge-warden"), 0o750),
                 (PathBuf::from("/var/lib/purge-warden/lists"), 0o750),
                 (PathBuf::from("/var/lib/purge-warden/data"), 0o750),
+                (PathBuf::from("/etc/purge-warden"), 0o750),
                 (PathBuf::from("/run/purge-warden"), 0o755),
             ],
         );
@@ -1865,9 +1955,390 @@ mod tests {
                 (PathBuf::from("/var/lib/purge-warden"), false),
                 (PathBuf::from("/var/lib/purge-warden/lists"), true),
                 (PathBuf::from("/var/lib/purge-warden/data"), true),
+                (PathBuf::from("/etc/purge-warden"), false),
                 (PathBuf::from("/run/purge-warden"), true),
             ],
         );
+    }
+
+    #[test]
+    fn unflagged_init_refuses_legacy_master_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("config.toml");
+        let old = b"existing operator policy\n";
+        std::fs::write(&legacy, old).unwrap();
+        let before = std::fs::metadata(&legacy).unwrap();
+
+        let error = init_layout(None, &legacy).unwrap_err().to_string();
+
+        assert!(error.contains("legacy config already exists"), "{error}");
+        assert!(error.contains("Warden does not move it"), "{error}");
+        assert!(error.contains(DEFAULT_CONFIG_PATH), "{error}");
+        assert!(
+            error.contains(&format!(
+                "warden --config {} init --force",
+                legacy.display()
+            )),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), old);
+        let after = std::fs::metadata(&legacy).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unflagged_init_refuses_a_dangling_legacy_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("missing.toml", &legacy).unwrap();
+
+        let error = init_layout(None, &legacy).unwrap_err().to_string();
+
+        assert!(error.contains("legacy config already exists"), "{error}");
+        assert_eq!(
+            std::fs::read_link(&legacy).unwrap(),
+            Path::new("missing.toml")
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_config_wins_even_when_a_legacy_master_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("config.toml");
+        std::fs::write(&legacy, "existing operator policy").unwrap();
+
+        assert_eq!(LEGACY_CONFIG_PATH, "/var/lib/purge-warden/config.toml");
+        for path in [
+            Path::new(LEGACY_CONFIG_PATH),
+            Path::new(DEFAULT_CONFIG_PATH),
+            Path::new("/tmp/custom/config.toml"),
+            Path::new("config.toml"),
+        ] {
+            assert_eq!(
+                init_layout(Some(path), &legacy).unwrap(),
+                InitLayout::for_config(path)
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "existing operator policy"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unflagged_init_refuses_legacy_master_created_during_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("etc/purge-warden/config.toml");
+        let legacy = dir.path().join("var/lib/purge-warden/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let layout = InitLayout::for_config(&config);
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> {
+                std::fs::write(&legacy, "existing operator policy")?;
+                Ok(())
+            },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+
+        let error = init_locked(&layout, false, "new scaffold", &ops, Some(&legacy))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("legacy config already exists"), "{error}");
+        assert!(!config.exists(), "late legacy master must not be shadowed");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "existing operator policy"
+        );
+    }
+
+    #[test]
+    fn split_layout_refuses_retained_state_symlinks_without_changing_targets() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for force in [false, true] {
+            for name in ["lists", "data"] {
+                let dir = tempfile::tempdir().unwrap();
+                let config_dir = dir.path().join("etc/purge-warden");
+                let state_dir = dir.path().join("var/lib/purge-warden");
+                let layout = InitLayout {
+                    config_path: config_dir.join("config.toml"),
+                    config_dir,
+                    socket_path: state_dir.join("control.sock"),
+                    state_dir,
+                    run_dir: None,
+                };
+                let legacy = layout.state_dir.join("config.toml");
+                let target = dir.path().join("private-target");
+                std::fs::create_dir(&target).unwrap();
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let payload = target.join("private.bin");
+                std::fs::write(&payload, b"private bytes").unwrap();
+                std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let target_before = std::fs::metadata(&target).unwrap();
+                let payload_before = std::fs::metadata(&payload).unwrap();
+                let entry = layout.state_dir.join(name);
+                std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+                symlink(&target, &entry).unwrap();
+                let entry_before = std::fs::symlink_metadata(&entry).unwrap();
+                if force {
+                    std::fs::create_dir_all(&layout.config_dir).unwrap();
+                    std::fs::write(&layout.config_path, b"old policy").unwrap();
+                }
+                assert!(!legacy.exists());
+                let master_before = force.then(|| std::fs::metadata(&layout.config_path).unwrap());
+                let ops = InitOps {
+                    create_system_user: || -> anyhow::Result<()> {
+                        panic!("symlink refusal must precede user creation")
+                    },
+                    resolve_daemon_owner: current_owner,
+                    chown_path: no_op_external_chown,
+                };
+
+                let error =
+                    init_locked(&layout, force, "new policy", &ops, Some(&legacy)).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(&entry.display().to_string()),
+                    "{error:#}"
+                );
+                for (path, before) in [(&target, target_before), (&payload, payload_before)] {
+                    let after = std::fs::metadata(path).unwrap();
+                    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                    assert_eq!(after.mode(), before.mode(), "{}", path.display());
+                }
+                assert_eq!(std::fs::read(&payload).unwrap(), b"private bytes");
+                assert_eq!(std::fs::read_link(&entry).unwrap(), target);
+                assert_eq!(
+                    std::fs::symlink_metadata(&entry).unwrap().ino(),
+                    entry_before.ino()
+                );
+                if let Some(before) = master_before {
+                    let after = std::fs::metadata(&layout.config_path).unwrap();
+                    assert_eq!(after.ino(), before.ino());
+                    assert_eq!(after.mode(), before.mode());
+                    assert_eq!(std::fs::read(&layout.config_path).unwrap(), b"old policy");
+                } else {
+                    assert!(!layout.config_path.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_layout_refuses_a_state_entry_swapped_to_a_symlink_after_admission() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("etc/purge-warden");
+        let state_dir = dir.path().join("var/lib/purge-warden");
+        let lists = state_dir.join("lists");
+        std::fs::create_dir_all(&lists).unwrap();
+        let layout = InitLayout {
+            config_path: config_dir.join("config.toml"),
+            config_dir,
+            socket_path: state_dir.join("control.sock"),
+            state_dir,
+            run_dir: None,
+        };
+        let target = dir.path().join("private-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = target.join("private.bin");
+        std::fs::write(&payload, b"private bytes").unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let moved = dir.path().join("held-lists");
+        let swapped_target = target.clone();
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> {
+                panic!("state entry symlink refusal must precede user creation")
+            },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+
+        let error = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::WriteRootLocked {
+                    std::fs::rename(&lists, &moved).unwrap();
+                    symlink(&swapped_target, &lists).unwrap();
+                }
+            },
+            || init_locked(&layout, false, "new policy", &ops, None),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot create"), "{error:#}");
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(std::fs::read(&payload).unwrap(), b"private bytes");
+        assert!(!layout.config_path.exists());
+    }
+
+    /// A root-made symlink above the daemon-owned part — an ancestor such as
+    /// `/var/lib`, or the state directory entry itself — is followed: the
+    /// directories land in its target and ownership goes to the target, not to
+    /// the link.
+    #[test]
+    fn split_layout_follows_root_owned_symlinks_down_to_the_state_dir() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::symlink;
+
+        for linked in ["var/lib", "var/lib/purge-warden"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("etc/purge-warden");
+            let state_dir = dir.path().join("var/lib/purge-warden");
+            let real = dir.path().join("mnt/data");
+            std::fs::create_dir_all(&real).unwrap();
+            let link = dir.path().join(linked);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&real, &link).unwrap();
+            let real_state = real.join(state_dir.strip_prefix(&link).unwrap());
+            let layout = InitLayout {
+                config_path: config_dir.join("config.toml"),
+                config_dir,
+                socket_path: state_dir.join("control.sock"),
+                state_dir,
+                run_dir: None,
+            };
+            let chowns = RefCell::new(Vec::new());
+            let ops = InitOps {
+                create_system_user: || -> anyhow::Result<()> { Ok(()) },
+                resolve_daemon_owner: current_owner,
+                chown_path: |path: &Path, recursive: bool| -> anyhow::Result<()> {
+                    chowns.borrow_mut().push((path.to_path_buf(), recursive));
+                    Ok(())
+                },
+            };
+
+            init_locked(&layout, false, "new policy", &ops, None).unwrap();
+
+            for path in [
+                real_state.clone(),
+                real_state.join("lists"),
+                real_state.join("data"),
+            ] {
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                assert!(metadata.is_dir(), "{linked}: {}", path.display());
+                assert_eq!(metadata.mode() & 0o777, 0o750, "{linked}");
+            }
+            assert_eq!(std::fs::read_link(&link).unwrap(), real, "{linked}");
+            assert_eq!(
+                *chowns.borrow(),
+                vec![
+                    (real_state.clone(), false),
+                    (real_state.join("lists"), true),
+                    (real_state.join("data"), true),
+                ],
+                "{linked}"
+            );
+            assert_eq!(std::fs::read(&layout.config_path).unwrap(), b"new policy");
+        }
+    }
+
+    #[test]
+    fn explicit_config_preserves_combined_parent_and_master_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let front = dir.path().join("front");
+        let canonical = dir.path().join("canonical");
+        std::fs::create_dir(&front).unwrap();
+        std::fs::create_dir(&canonical).unwrap();
+        let master = canonical.join("config.toml");
+        std::fs::write(&master, b"old policy").unwrap();
+        symlink(&master, front.join("active.toml")).unwrap();
+        let alias = dir.path().join("front-alias");
+        symlink(&front, &alias).unwrap();
+        let layout = InitLayout::for_config(&alias.join("active.toml"));
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: no_op_external_chown,
+        };
+
+        init_locked(&layout, true, "new policy", &ops, None).unwrap();
+
+        assert_eq!(std::fs::read(&master).unwrap(), b"new policy");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), front);
+        assert_eq!(
+            std::fs::read_link(alias.join("active.toml")).unwrap(),
+            master
+        );
+        assert!(alias.join("lists").is_dir());
+        assert!(alias.join("data").is_dir());
+    }
+
+    #[test]
+    fn split_layout_provisions_modes_and_master_lock_ownership() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Remap the system roots into a fixture; no host paths are provisioned.
+        let config_dir = dir.path().join("etc/purge-warden");
+        let state_dir = dir.path().join("var/lib/purge-warden");
+        let run_dir = dir.path().join("run/purge-warden");
+        let layout = InitLayout {
+            config_path: config_dir.join("config.toml"),
+            config_dir,
+            state_dir,
+            socket_path: run_dir.join("control.sock"),
+            run_dir: Some(run_dir),
+        };
+        let chowns = RefCell::new(Vec::new());
+        let ops = InitOps {
+            create_system_user: || -> anyhow::Result<()> { Ok(()) },
+            resolve_daemon_owner: current_owner,
+            chown_path: |path: &Path, recursive: bool| -> anyhow::Result<()> {
+                chowns.borrow_mut().push((path.to_path_buf(), recursive));
+                Ok(())
+            },
+        };
+        let body = render_default_config(
+            "default",
+            &[],
+            "127.0.0.1:15353",
+            &["192.0.2.53:53".to_string()],
+            &["127.0.0.0/8".to_string()],
+            &layout.socket_path,
+        );
+
+        let outcome = init_locked(&layout, false, &body, &ops, None).unwrap();
+
+        assert!(outcome.pre_init_copy.is_none());
+        for (path, mode) in layout.dirs_to_create() {
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, mode);
+        }
+        let master = std::fs::metadata(&layout.config_path).unwrap();
+        assert_eq!(master.permissions().mode() & 0o777, 0o640);
+        let owner = current_owner().unwrap();
+        for path in [
+            layout.config_path.clone(),
+            layout.config_dir.join(".warden-config.lock"),
+            layout.config_dir.clone(),
+        ] {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), owner);
+        }
+        assert_eq!(
+            *chowns.borrow(),
+            layout
+                .chown_targets()
+                .into_iter()
+                .filter(|(path, _)| path != &layout.config_dir)
+                .collect::<Vec<_>>()
+        );
+        let cfg: ConfigV5 =
+            toml::from_str(&std::fs::read_to_string(&layout.config_path).unwrap()).unwrap();
+        assert_eq!(cfg.socket.path, layout.socket_path);
+        assert!(!layout.state_dir.join("config.toml").exists());
+        assert!(!layout.config_dir.join("lists").exists());
+        assert!(!layout.config_dir.join("data").exists());
     }
 
     /// An explicit `--config` under a temp dir must move EVERYTHING. The
@@ -2025,7 +2496,7 @@ mod tests {
                     seen.set(seen.get() + 1);
                 }
             },
-            || init_locked(&layout, false, &secondary_scaffold(dir.path()), &ops),
+            || init_locked(&layout, false, &secondary_scaffold(dir.path()), &ops, None),
         )
         .unwrap();
 
@@ -2068,6 +2539,7 @@ mod tests {
                     "0.0.0.0:53",
                     "http://10.10.1.94:8053",
                     &overrides,
+                    None,
                 )
             },
         )
@@ -2120,6 +2592,7 @@ mod tests {
                 "0.0.0.0:53",
                 "https://10.10.1.94:8053",
                 &overrides,
+                None,
             )
             .expect_err("this ACL must be refused");
 
@@ -2407,7 +2880,7 @@ mod tests {
                     seen.set(seen.get() + 1);
                 }
             },
-            || init_locked(&layout, false, "new", &ops),
+            || init_locked(&layout, false, "new", &ops, None),
         )
         .expect_err("an existing config without --force must refuse")
         .to_string();
@@ -2445,7 +2918,7 @@ mod tests {
                     seen.set(seen.get() + 1);
                 }
             },
-            || init_locked(&layout, true, "new config\n", &ops),
+            || init_locked(&layout, true, "new config\n", &ops, None),
         )
         .expect("--force must be allowed");
         let backup = outcome.pre_init_copy.expect("old config is retained");
@@ -2546,7 +3019,7 @@ mod tests {
                     std::fs::create_dir(&fence).unwrap();
                 }
             },
-            || init_locked(&layout, false, "new", &ops),
+            || init_locked(&layout, false, "new", &ops, None),
         )
         .unwrap_err();
         assert!(err.to_string().contains("unfinished v3-to-v4 migration"));
@@ -2588,7 +3061,7 @@ mod tests {
             },
         };
 
-        let outcome = init_locked(&layout, true, "new", &ops).unwrap();
+        let outcome = init_locked(&layout, true, "new", &ops, None).unwrap();
         let backup = outcome.pre_init_copy.unwrap();
         assert!(std::fs::symlink_metadata(&alias)
             .unwrap()
@@ -2647,7 +3120,7 @@ mod tests {
             chown_path: no_op_external_chown,
         };
 
-        init_locked(&layout, true, "new", &ops).unwrap();
+        init_locked(&layout, true, "new", &ops, None).unwrap();
 
         assert_eq!(std::fs::read_to_string(&canonical).unwrap(), "new");
         assert!(std::fs::symlink_metadata(&alias)
@@ -2697,7 +3170,7 @@ mod tests {
                         .unwrap();
                 }
             },
-            || init_locked(&layout, false, "new", &ops),
+            || init_locked(&layout, false, "new", &ops, None),
         )
         .unwrap();
 
@@ -2738,7 +3211,7 @@ mod tests {
             resolve_daemon_owner: current_owner,
             chown_path: no_op_external_chown,
         };
-        init_locked(&layout, false, "new", &ops).unwrap();
+        init_locked(&layout, false, "new", &ops, None).unwrap();
 
         let probe = write_lock::acquire_for_write_with_timeout(&config, Duration::from_millis(50))
             .expect("the init guard must be gone before its caller continues");
@@ -2949,18 +3422,70 @@ mod tests {
 
     #[test]
     fn default_config_uses_production_paths() {
-        let cfg: ConfigV1 = toml::from_str(&default_config()).unwrap();
+        let cfg: ConfigV1 = toml::from_str(&fresh_default_config()).unwrap();
         assert_eq!(
             cfg.socket.path,
             std::path::Path::new("/run/purge-warden/control.sock")
         );
         assert_eq!(cfg.server.listen, "0.0.0.0:53".parse().unwrap());
+        assert_eq!(
+            cfg.backup.resolve_dir(Path::new(DEFAULT_CONFIG_PATH)),
+            Path::new("/var/lib/purge-warden/backups")
+        );
+    }
+
+    #[test]
+    fn base_scaffolds_back_up_beside_the_config_until_the_fhs_block_is_added() {
+        for mut body in [
+            default_config(),
+            secondary_scaffold(Path::new("/tmp/custom")),
+        ] {
+            let cfg: ConfigV5 = toml::from_str(&body).unwrap();
+            for master in [
+                DEFAULT_CONFIG_PATH,
+                LEGACY_CONFIG_PATH,
+                "/tmp/custom/config.toml",
+            ] {
+                assert_eq!(
+                    cfg.backup.resolve_dir(Path::new(master)),
+                    Path::new(master).parent().unwrap().join("backups")
+                );
+            }
+            body.push_str(FRESH_BACKUP_CONFIG);
+            let cfg: ConfigV5 = toml::from_str(&body).unwrap();
+            assert_eq!(
+                cfg.backup.resolve_dir(Path::new(DEFAULT_CONFIG_PATH)),
+                Path::new("/var/lib/purge-warden/backups")
+            );
+        }
+    }
+
+    // Covers the helper on each layout; `run_init` itself needs root.
+    #[test]
+    fn the_etc_master_archives_under_var_lib_with_or_without_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_legacy = dir.path().join("config.toml");
+        for (explicit, block) in [
+            (None, FRESH_BACKUP_CONFIG),
+            (Some(DEFAULT_CONFIG_PATH), FRESH_BACKUP_CONFIG),
+            (Some("/etc/purge-warden/./config.toml"), FRESH_BACKUP_CONFIG),
+            (Some(LEGACY_CONFIG_PATH), ""),
+            (Some("/tmp/custom/config.toml"), ""),
+            (Some("config.toml"), ""),
+        ] {
+            let layout = init_layout(explicit.map(Path::new), &no_legacy).unwrap();
+            assert_eq!(
+                backup_config_for(&layout.config_path),
+                block,
+                "{explicit:?}"
+            );
+        }
     }
 
     /// Helper shared by the template round-trip tests: render the
     /// scaffold exactly as `warden init --yes` (no overrides) would.
     fn render_yes_defaults() -> String {
-        default_config()
+        fresh_default_config()
     }
 
     #[test]

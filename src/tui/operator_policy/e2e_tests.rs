@@ -206,3 +206,118 @@ async fn real_socket_adapter_applies_one_revision_bound_batch_and_reads_it_back(
     let _ = supervisor_shutdown.send(());
     supervisor_task.await.unwrap();
 }
+
+/// The Query Log batch: rules held for different domains on different lists
+/// reach the real daemon as ONE revision-bound request and ONE receipt.
+#[tokio::test]
+async fn held_rules_on_different_lists_apply_as_one_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    let packs = temp.path().join("packs");
+    let socket_path = temp.path().join("warden.sock");
+    std::fs::create_dir(&packs).unwrap();
+    std::fs::write(
+        &config_path,
+        concat!(
+            "schema_version = 5\n",
+            "[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "[server]\ndefault_profile = \"household\"\n",
+            "[profiles.household]\ndisplay_name = \"Whole household\"\nlists = {}\n",
+            "[[custom_lists]]\nid = \"abc\"\ndisplay_name = \"ABC\"\n",
+            "[[custom_lists]]\nid = \"fgh\"\ndisplay_name = \"FGH\"\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(packs.join("abc.txt"), b"").unwrap();
+    std::fs::write(packs.join("fgh.txt"), b"").unwrap();
+
+    let service = Arc::new(OperatorRulesService::new(config_path.clone()));
+    let (supervisor, jobs) = OperatorRuleJobSupervisor::new(
+        service,
+        OperatorRuleJobConfig::default(),
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (supervisor_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+    let token = "test-tui-query-batch";
+    let state = Arc::new(daemon_state(token, config_path.clone(), jobs));
+    let server_task = spawn_ipc_server(socket_path.clone(), state).await.unwrap();
+    register_test_token(&socket_path, token);
+
+    // Hold the two rules exactly as the Query Log picker does.
+    let catalog = read_catalog(socket_path.clone()).await.unwrap();
+    let base_revision = catalog.metadata.config_revision.clone();
+    let mut app = crate::tui::App::known_standalone_for_test();
+    app.operator_catalog = Some(catalog);
+    use crate::tui::query_rule_batch::hold;
+    assert_eq!(
+        hold(&mut app, "ciao.it", RuleAction::Deny, vec!["abc".into()]).unwrap(),
+        1
+    );
+    assert_eq!(
+        hold(
+            &mut app,
+            "saluto.com",
+            RuleAction::Allow,
+            vec!["fgh".into()]
+        )
+        .unwrap(),
+        1
+    );
+    let held = app.query_log.held.targets.clone();
+    let operations: Vec<Operation> = held.iter().map(|target| target.operation()).collect();
+    assert_eq!(operations.len(), 2);
+
+    let adapter = OperatorPolicyAdapter::connect(socket_path.clone())
+        .await
+        .unwrap();
+    let mut workflow = OperatorPolicyWorkflow::new(base_revision.clone(), operations).unwrap();
+    let planning = workflow.begin_plan().unwrap();
+    let plan = adapter
+        .create_plan(planning.request.clone(), planning.page)
+        .await
+        .unwrap();
+    assert!(workflow.finish_plan(planning.ticket, Ok(plan)));
+    let applying = workflow.begin_apply().unwrap();
+    assert_eq!(
+        applying.request.operations.len(),
+        2,
+        "one request, both rules"
+    );
+    let receipt = adapter.apply(&applying.plan).await.unwrap();
+    assert_eq!(receipt.persistence, PersistenceState::Committed);
+
+    // One revision change covers both lists.
+    let after = read_catalog(socket_path.clone()).await.unwrap();
+    assert_ne!(after.metadata.config_revision, base_revision);
+    assert_eq!(after.metadata.config_revision, receipt.config_revision);
+    for (id, raw, action) in [
+        ("abc", "||ciao.it^", RuleAction::Deny),
+        ("fgh", "@@||saluto.com^", RuleAction::Allow),
+    ] {
+        let list = after.lists.iter().find(|list| list.id == id).unwrap();
+        let rules = read_rules(
+            socket_path.clone(),
+            list.id.clone(),
+            list.config_revision.clone(),
+            list.pack_revision.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rules.rows.len(), 1, "{id}");
+        assert_eq!(rules.rows[0].raw, raw, "{id}");
+        assert_eq!(rules.rows[0].action, Some(action), "{id}");
+    }
+
+    // The committed receipt clears exactly the submitted targets.
+    crate::tui::query_rule_batch::finish_committed(&mut app, &held, "saved".into());
+    assert!(app.query_log.held.targets.is_empty());
+    assert_eq!(app.query_log.held.receipt.as_deref(), Some("saved"));
+
+    server_task.abort();
+    let _ = server_task.await;
+    let _ = supervisor_shutdown.send(());
+    supervisor_task.await.unwrap();
+}

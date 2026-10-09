@@ -32,19 +32,20 @@ pub(crate) enum PolicyChange {
         expected_pack_revision: String,
         row_refs: Vec<String>,
     },
-    QueryRules {
-        ids: Vec<String>,
-        domain: String,
-        action: RuleAction,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "origin", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PolicyOrigin {
     Recovery,
+    QueryBatch {
+        targets: Vec<crate::tui::query_rule_batch::HeldTarget>,
+    },
     CustomList,
     Mount,
+    /// No longer created: Query Log rules are held and applied as one
+    /// [`PolicyOrigin::QueryBatch`]. Kept so a recovery journal written by
+    /// 0.42.0 (`"origin":"query_rules"`) still decodes and resumes.
     QueryRules {
         ids: Vec<String>,
         already_present: Vec<bool>,
@@ -63,6 +64,7 @@ impl PolicyOrigin {
     fn resource(&self) -> String {
         match self {
             Self::Recovery => "Operator policy recovery".into(),
+            Self::QueryBatch { targets } => format!("Query Log rules · {} held", targets.len()),
             Self::CustomList => "Custom List".into(),
             Self::Mount => "Custom List mounts".into(),
             Self::QueryRules { ids, .. } => format!("Query Log rule · {} list(s)", ids.len()),
@@ -109,6 +111,11 @@ impl PolicyDialog {
 
     pub(crate) fn resource(&self) -> String {
         self.origin.resource()
+    }
+
+    /// An Apply was submitted and its outcome is not yet terminal.
+    pub(crate) fn apply_unresolved(&self) -> bool {
+        !self.preparing && !dialog_can_close(self)
     }
 }
 
@@ -541,7 +548,7 @@ async fn startup_resume(
 pub(super) async fn startup_resume_probe(
     socket: PathBuf,
     config_path: PathBuf,
-) -> Option<(bool, RecoveryAction, Option<ErrorCode>, bool)> {
+) -> Option<(bool, RecoveryAction, Option<ErrorCode>, bool, PolicyOrigin)> {
     let prepared = startup_resume(socket, config_path).await?.ok()?;
     let WorkflowState::Recovery(state) = &prepared.workflow.state else {
         return None;
@@ -550,7 +557,7 @@ pub(super) async fn startup_resume_probe(
     let error = state.error.as_ref().map(AdapterError::code);
     let dialog = PolicyDialog {
         id: 1,
-        origin: prepared.origin,
+        origin: prepared.origin.clone(),
         workflow: Some(prepared.workflow.clone()),
         adapter: prepared.adapter.clone(),
         preparing: false,
@@ -563,6 +570,7 @@ pub(super) async fn startup_resume_probe(
         action,
         error,
         dialog_can_close(&dialog),
+        prepared.origin,
     ))
 }
 
@@ -722,7 +730,7 @@ async fn prepare(
         }
     };
     let expected_config_revision = catalog.metadata.config_revision.clone();
-    let operations = match resolve_change(&adapter, &catalog, &mut origin, change).await {
+    let operations = match resolve_change(&catalog, change).await {
         Ok(operations) => operations,
         Err(error) => {
             return Err(policy_preparation_failure(
@@ -869,9 +877,7 @@ fn apply_prepared(
 }
 
 async fn resolve_change(
-    adapter: &OperatorPolicyAdapter,
     catalog: &PolicyCatalog,
-    origin: &mut PolicyOrigin,
     change: PolicyChange,
 ) -> Result<Vec<Operation>, AdapterError> {
     match change {
@@ -916,40 +922,6 @@ async fn resolve_change(
             }
             Ok(operations)
         }
-        PolicyChange::QueryRules {
-            ids,
-            domain,
-            action,
-        } => {
-            let mut already_present = Vec::with_capacity(ids.len());
-            for id in &ids {
-                let list = catalog
-                    .lists
-                    .iter()
-                    .find(|list| list.id == *id)
-                    .ok_or_else(|| {
-                        protocol_error(ErrorCode::NotFound, "selected Custom List no longer exists")
-                    })?;
-                already_present.push(
-                    all_rules(adapter, list)
-                        .await?
-                        .iter()
-                        .any(|row| row.action == Some(action) && row_matches_domain(row, &domain)),
-                );
-            }
-            *origin = PolicyOrigin::QueryRules {
-                ids: ids.clone(),
-                already_present,
-            };
-            Ok(ids
-                .into_iter()
-                .map(|id| Operation::AddDomainRule {
-                    id,
-                    domain: domain.clone(),
-                    action,
-                })
-                .collect())
-        }
     }
 }
 
@@ -976,49 +948,6 @@ fn verify_captured_list(
         ));
     }
     Ok(())
-}
-
-async fn all_rules(
-    adapter: &OperatorPolicyAdapter,
-    list: &ListDetail,
-) -> Result<Vec<RuleRow>, AdapterError> {
-    let mut page = adapter
-        .rules(list.id.clone(), PageRequest::default())
-        .await?;
-    if page.config_revision != list.config_revision || page.pack_revision != list.pack_revision {
-        return Err(protocol_error(
-            ErrorCode::StaleCursor,
-            "Custom List changed while checking its rules",
-        ));
-    }
-    let mut rows = std::mem::take(&mut page.rows);
-    while let Some(mut next) = adapter.next_rules(&page).await? {
-        if next.config_revision != list.config_revision || next.pack_revision != list.pack_revision
-        {
-            return Err(protocol_error(
-                ErrorCode::StaleCursor,
-                "Custom List changed while paging its rules",
-            ));
-        }
-        rows.append(&mut next.rows);
-        page = next;
-    }
-    Ok(rows)
-}
-
-fn row_matches_domain(row: &RuleRow, domain: &str) -> bool {
-    let Ok(expected) =
-        crate::config::custom_list::compose_line(domain, row.action == Some(RuleAction::Allow))
-    else {
-        return false;
-    };
-    match (
-        crate::config::custom_list::parse_pack_line(&row.raw),
-        crate::config::custom_list::parse_pack_line(&expected),
-    ) {
-        (Ok(actual), Ok(expected)) => actual == expected,
-        _ => false,
-    }
 }
 
 fn profile_matches_prefix(
@@ -1804,6 +1733,9 @@ fn apply_origin_success(app: &mut App, origin: &PolicyOrigin, receipt: &Receipt)
     let message = receipt_message(receipt);
     match origin {
         PolicyOrigin::Recovery => {}
+        PolicyOrigin::QueryBatch { targets } => {
+            crate::tui::query_rule_batch::finish_committed(app, targets, message)
+        }
         PolicyOrigin::CustomList => {
             if let Some(modal) = app.custom_lists.modal.as_mut() {
                 modal.finish(crate::tui::custom_list_modal::SubmitOutcome::Ok(message));
@@ -1866,6 +1798,9 @@ fn apply_origin_success(app: &mut App, origin: &PolicyOrigin, receipt: &Receipt)
 fn apply_origin_error(app: &mut App, origin: &PolicyOrigin, message: &str) {
     match origin {
         PolicyOrigin::Recovery => {}
+        PolicyOrigin::QueryBatch { .. } => {
+            crate::tui::query_rule_batch::finish_failed(app, message)
+        }
         PolicyOrigin::CustomList => {
             if let Some(modal) = app.custom_lists.modal.as_mut() {
                 match &mut modal.stage {

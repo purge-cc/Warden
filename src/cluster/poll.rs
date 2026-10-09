@@ -739,7 +739,10 @@ async fn poll_once_v2_observed(
                 let loaded =
                     crate::config::loader::load_config_v5(&master, time::OffsetDateTime::now_utc())
                         .map_err(|errors| {
-                            anyhow::anyhow!("candidate configuration invalid: {errors:?}")
+                            anyhow::anyhow!(
+                                "candidate configuration invalid: {}",
+                                crate::cli::commands::start::format_config_errors(&errors)
+                            )
                         })?;
                 crate::cli::commands::start::preflight_received_corpus(
                     &master,

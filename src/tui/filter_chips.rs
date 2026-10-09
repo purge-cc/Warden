@@ -709,8 +709,10 @@ pub(super) fn popup(
     size: (u16, u16),
     title: &str,
 ) -> Rect {
-    mouse::begin_overlay();
     let rect = popup_rect(bounds, anchor, size.0, size.1);
+    // Every popup is a menu anchored on a field or chip; closing it is cheap.
+    mouse::begin_overlay(rect);
+    mouse::close_on_outside_click();
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)

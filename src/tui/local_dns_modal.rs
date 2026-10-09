@@ -551,12 +551,17 @@ pub fn render_overlay(f: &mut Frame, anchor: Rect, modal: &LocalDnsModal) {
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&remove_notice(rc, w), w), ())
             });
+            // The typed tier holds the operator's typed phrase.
+            if rc.tier == ConfirmTier::SingleKeypress {
+                crate::tui::mouse::close_on_outside_click();
+            }
         }
         Stage::Submitted(outcome) => {
             let spec = submitted_notice(outcome);
             modal_form::render_modal(f, anchor, MODAL_W, |w| {
                 (modal_form::notice_body(&spec, w), ())
             });
+            crate::tui::mouse::close_on_outside_click();
         }
     }
 }

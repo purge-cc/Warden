@@ -969,18 +969,22 @@ fn render_no_config(f: &mut Frame, area: Rect) {
     );
 }
 
+/// The profile the info overlay shows: the selected one, else the first.
+/// `None` when there is none; the overlay then draws nothing.
+pub(crate) fn info_row(app: &App) -> Option<ProfileRow> {
+    if !app.profiles.info_open {
+        return None;
+    }
+    let rows = build_display_rows(app);
+    let index = index_of_display_key(&rows, app.profiles.selected_id.as_deref()).unwrap_or(0);
+    rows.into_iter().nth(index)
+}
+
 pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
     let Some(loaded) = app.loaded_config.as_ref() else {
         return;
     };
-    if !app.profiles.info_open {
-        return;
-    }
-    let rows = build_display_rows(app);
-    let Some(selected) = index_of_display_key(&rows, app.profiles.selected_id.as_deref())
-        .and_then(|index| rows.get(index))
-        .or_else(|| rows.first())
-    else {
+    let Some(selected) = info_row(app) else {
         return;
     };
     let profile = &selected.profile;
@@ -1051,6 +1055,7 @@ pub fn render_info_overlay(f: &mut Frame, area: Rect, app: &App) {
     modal_form::render_modal(f, area, 78, |width| {
         (modal_form::notice_body(&spec, width), ())
     });
+    crate::tui::mouse::close_on_outside_click();
 }
 
 fn render_empty(f: &mut Frame, area: Rect) {

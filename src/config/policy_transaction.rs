@@ -84,6 +84,34 @@ impl ReceiptStore {
         Ok(store)
     }
 
+    /// Open this master's receipt namespace only when it already exists.
+    pub(crate) fn open_existing(
+        data_directory: &File,
+        guard: &MigrationWriteLock,
+    ) -> anyhow::Result<Option<Self>> {
+        guard.verify_root_linked()?;
+        let owner = data_directory.metadata()?;
+        ensure!(owner.is_dir(), "receipt data directory is not a directory");
+        if inspect_at(data_directory, OsStr::new(RECEIPT_DIR))?.is_none() {
+            return Ok(None);
+        }
+        let base = private_dir(data_directory, RECEIPT_DIR, &owner, false)?;
+        let namespace = master_namespace(guard.canonical_master());
+        if inspect_at(&base, OsStr::new(&namespace))?.is_none() {
+            return Ok(None);
+        }
+        let directory = private_dir(&base, &namespace, &owner, false)?;
+        let store = Self {
+            parent: data_directory.try_clone()?,
+            base,
+            namespace,
+            directory,
+            owner,
+        };
+        store.check()?;
+        Ok(Some(store))
+    }
+
     fn duplicate(&self) -> anyhow::Result<Self> {
         self.check()?;
         Ok(Self {
@@ -1513,6 +1541,159 @@ pub(crate) fn pending_completion_receipts(
             .cmp(&(right.created_unix_seconds, &right.transaction_id))
     });
     Ok(pending)
+}
+
+/// Refuse when a stored receipt of this master would still need recovery,
+/// audit delivery or activation completion at the next daemon start.
+/// Reads only; never recovers.
+pub(crate) fn relocate_receipts_settled(
+    guard: &MigrationWriteLock,
+    data_directory: &File,
+) -> anyhow::Result<()> {
+    let Some(receipts) = ReceiptStore::open_existing(data_directory, guard)? else {
+        return Ok(());
+    };
+    let tree = guard.tree_io();
+    for name in directory_names(&receipts.directory, MAX_RECEIPTS * 2)? {
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+        ensure!(is_hash(key), "invalid receipt store key");
+        let record = receipts.read(key, tree)?.context("receipt disappeared")?;
+        ensure!(
+            matches!(
+                record.receipt.persistence,
+                Persistence::Committed | Persistence::Aborted
+            ),
+            "receipt {} ({}) is {:?}",
+            record.receipt.request_id,
+            record.receipt.transaction_id,
+            record.receipt.persistence
+        );
+        ensure!(
+            receipt_completion_settled(&record.receipt),
+            "receipt {} ({}) still awaits audit delivery or activation completion",
+            record.receipt.request_id,
+            record.receipt.transaction_id
+        );
+    }
+    Ok(())
+}
+
+/// Refuse when a retained transaction of this tree is not terminal or still
+/// records staging files. Reads only; never recovers.
+pub(crate) fn relocate_transactions_settled(guard: &MigrationWriteLock) -> anyhow::Result<()> {
+    let tree = guard.tree_io();
+    let owner = tree.identity.owner_metadata(tree.root)?;
+    let Some(store) = open_store(tree, &owner, false)? else {
+        return Ok(());
+    };
+    for name in directory_names(&store, MAX_RECEIPTS * 2)? {
+        if retired_key(&name) {
+            continue;
+        }
+        ensure!(is_hash(&name), "unexpected transaction store member {name}");
+        let journal = read_journal(&private_dir(&store, &name, &owner, false)?, &owner, tree)?;
+        ensure!(
+            matches!(
+                journal.phase,
+                Phase::Committed | Phase::Aborted | Phase::RolledBack
+            ),
+            "transaction {} is {:?}",
+            journal.receipt.transaction_id,
+            journal.phase
+        );
+        ensure!(
+            journal.members.iter().all(|member| member.staging.is_none()
+                && member.linked_staging.is_none()
+                && member.rollback_staging.is_none()),
+            "transaction {} still records staging files",
+            journal.receipt.transaction_id
+        );
+    }
+    Ok(())
+}
+
+/// Rewrite the root pin of every stored receipt and retained transaction of
+/// the master `guard` holds, from the root `from` to the root `to`. Values
+/// already equal to `to` stay; any other value refuses. Rerunning after a
+/// crash is therefore safe. The receipt and transaction namespaces must
+/// already carry the names of `guard`'s master.
+pub(crate) fn rebind_root(
+    guard: &MigrationWriteLock,
+    data_directory: &File,
+    from: (u64, u64),
+    to: (u64, u64),
+) -> anyhow::Result<usize> {
+    let (from, to) = (
+        Inode {
+            device: from.0,
+            inode: from.1,
+        },
+        Inode {
+            device: to.0,
+            inode: to.1,
+        },
+    );
+    let mut rewritten = 0;
+    if let Some(receipts) = ReceiptStore::open_existing(data_directory, guard)? {
+        for name in directory_names(&receipts.directory, MAX_RECEIPTS * 2)? {
+            let Some(key) = name.strip_suffix(".json") else {
+                continue;
+            };
+            ensure!(is_hash(key), "invalid receipt store key");
+            let bytes = read_optional_private(
+                &receipts.directory,
+                &name,
+                &receipts.owner,
+                MAX_MANIFEST_BYTES,
+            )?
+            .context("receipt disappeared")?;
+            let mut stored: StoredReceipt =
+                serde_json::from_slice(&bytes).context("invalid receipt record")?;
+            if stored.tree == to {
+                continue;
+            }
+            ensure!(
+                stored.tree == from,
+                "receipt {key} pins another configuration root"
+            );
+            stored.tree = to.clone();
+            receipts.write_record(key, &stored)?;
+            rewritten += 1;
+        }
+    }
+    let tree = guard.tree_io();
+    let owner = tree.identity.owner_metadata(tree.root)?;
+    if let Some(store) = open_store(tree, &owner, false)? {
+        for name in directory_names(&store, MAX_RECEIPTS * 2)? {
+            if retired_key(&name) {
+                continue;
+            }
+            ensure!(is_hash(&name), "unexpected transaction store member {name}");
+            let dir = private_dir(&store, &name, &owner, false)?;
+            let bytes = read_optional_private(&dir, JOURNAL_NAME, &owner, MAX_MANIFEST_BYTES)?
+                .context("missing transaction journal")?;
+            let mut journal: Journal =
+                serde_json::from_slice(&bytes).context("invalid strict format2 manifest")?;
+            if journal.root == to {
+                continue;
+            }
+            ensure!(
+                journal.root == from,
+                "transaction {name} pins another configuration root"
+            );
+            journal.root = to.clone();
+            write_journal(&dir, &owner, &journal)?;
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
+}
+
+/// Undo data whose expiry was interrupted; only its deletion remains.
+fn retired_key(name: &str) -> bool {
+    name.strip_prefix("retired-").is_some_and(is_hash)
 }
 
 fn receipt_completion_settled(receipt: &BaseReceipt) -> bool {
@@ -3860,7 +4041,8 @@ fn request_key(actor: &str, request_id: &str) -> String {
     hex(&digest.finalize())
 }
 
-fn master_namespace(canonical_master: &Path) -> String {
+/// Receipt and transaction namespace name of one canonical master.
+pub(crate) fn master_namespace(canonical_master: &Path) -> String {
     let mut digest = Sha256::new();
     digest.update(b"purge-warden.policy-master\0\x01");
     let bytes = canonical_master.as_os_str().as_bytes();
@@ -5020,6 +5202,89 @@ mod tests {
                 PrepareOutcome::Replay(_) => panic!("unexpected replay"),
             }
         }
+    }
+
+    #[test]
+    fn master_namespace_keeps_fixed_vectors() {
+        for (master, expected) in [
+            (
+                "/var/lib/purge-warden/config.toml",
+                "592595b4fa0bc4a675f2c818662983f0d7bf3a80d0244a5f838985488e29824c",
+            ),
+            (
+                "/etc/purge-warden/config.toml",
+                "ca438020c8b77b9dfd9f37933bf966d91d96ce2e6b24093f31f9002a9ba87aaf",
+            ),
+        ] {
+            assert_eq!(master_namespace(Path::new(master)), expected);
+        }
+    }
+
+    #[test]
+    fn relocate_inspectors_read_only_and_rebind_is_idempotent() {
+        let fixture = Fixture::new();
+        let guard = fixture.guard();
+        let data_path = fixture.root.path().join("node-data");
+        fs::create_dir(&data_path).unwrap();
+        let data = File::open(&data_path).unwrap();
+        relocate_receipts_settled(&guard, &data).unwrap();
+        relocate_transactions_settled(&guard).unwrap();
+        assert!(ReceiptStore::open_existing(&data, &guard)
+            .unwrap()
+            .is_none());
+        assert!(!data_path.join(RECEIPT_DIR).exists());
+
+        fixture.prepare(&guard).commit().unwrap();
+        relocate_receipts_settled(&guard, &data).unwrap();
+        relocate_transactions_settled(&guard).unwrap();
+
+        let key = request_key("operator-1", "request-1");
+        let journal = fixture
+            .root
+            .path()
+            .join(STORE_DIR_NAME)
+            .join(master_namespace(guard.canonical_master()))
+            .join(&key)
+            .join(JOURNAL_NAME);
+        let receipt = data_path
+            .join(RECEIPT_DIR)
+            .join(master_namespace(guard.canonical_master()))
+            .join(format!("{key}.json"));
+        let edit = |path: &Path, field: &str, value: &str| -> Vec<u8> {
+            let original = fs::read(path).unwrap();
+            let mut json: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            let target = match field {
+                "phase" => &mut json["phase"],
+                _ => &mut json["receipt"]["persistence"],
+            };
+            *target = value.into();
+            fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+            original
+        };
+        let original = edit(&journal, "phase", "committing");
+        assert!(relocate_transactions_settled(&guard).is_err());
+        fs::write(&journal, original).unwrap();
+        for persistence in ["prepared", "durability_uncertain"] {
+            let original = edit(&receipt, "persistence", persistence);
+            assert!(relocate_receipts_settled(&guard, &data).is_err());
+            fs::write(&receipt, original).unwrap();
+        }
+        relocate_receipts_settled(&guard, &data).unwrap();
+        relocate_transactions_settled(&guard).unwrap();
+
+        let root = guard.tree_io().root.metadata().unwrap();
+        let here = (root.dev(), root.ino());
+        let elsewhere = (u64::MAX, 7);
+        assert!(rebind_root(&guard, &data, (1, 1), elsewhere).is_err());
+        assert_eq!(rebind_root(&guard, &data, here, elsewhere).unwrap(), 2);
+        assert_eq!(rebind_root(&guard, &data, here, elsewhere).unwrap(), 0);
+        assert!(lookup_receipt(&guard, "operator-1", "request-1").is_err());
+        assert_eq!(rebind_root(&guard, &data, elsewhere, here).unwrap(), 2);
+        let receipt = lookup_receipt(&guard, "operator-1", "request-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.persistence, Persistence::Committed);
+        relocate_transactions_settled(&guard).unwrap();
     }
 
     fn assert_no_write_stages(root: &Path) {

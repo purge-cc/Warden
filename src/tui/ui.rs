@@ -231,6 +231,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     crate::tui::operator_policy::render(f, chunks[2], app);
 
+    crate::tui::query_rule_batch::render(f, chunks[2], app);
+
     crate::tui::detail_panel::render_information(f, chunks[2], app);
 
     // Welcome banner overlay — drawn last so it lands on
@@ -239,7 +241,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // to consume the event, so this draw order also matches the input
     // priority (top z-index ↔ first handler wins).
     if let Some(banner) = app.welcome_banner.as_ref() {
-        mouse::begin_overlay();
         crate::tui::welcome_banner::render_overlay(f, banner, area);
     }
 }
@@ -1163,6 +1164,9 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
     if app.welcome_banner.is_some() {
         return compact_hint_spans("Any-key continue");
     }
+    if app.query_log.held.review.is_some() {
+        return compact_hint_spans(crate::tui::query_rule_batch::footer_hint(app));
+    }
     if app.operator_policy.is_some() {
         return compact_hint_spans("↑↓ scroll · r recover/refresh · Tab screen · q quit");
     }
@@ -1185,10 +1189,11 @@ fn tab_hints_for(app: &App) -> Vec<Span<'static>> {
         use crate::tui::query_log_rule_modal::Stage;
         return match &modal.stage {
             Stage::Picking => {
-                compact_hint_spans("↑↓ move · Space select · Enter review · n new list · Esc close")
+                compact_hint_spans("↑↓ move · Space select · Enter hold · n new list · Esc close")
             }
             Stage::NewList(_) => modal_form_hints(),
             Stage::Done(_) => compact_hint_spans("↑↓ scroll   Enter close   Esc close"),
+            Stage::ErrorDetails => compact_hint_spans("↑↓ scroll · PgUp/PgDn page · Esc back"),
         };
     }
     // Every modal overlay is drawn into `chunks[2]`, so the
@@ -2086,6 +2091,7 @@ mod tests {
             // tail to the column edge and the assertion below catches it.
             detail: "Searched: ./config.toml, /etc/purge-warden/config.toml. Run                      `warden init` to create one."
                 .to_string(),
+            no_config: true,
         });
         let warned = footer_text(&app);
         assert!(warned.contains("no config file found"));

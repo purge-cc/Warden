@@ -93,6 +93,10 @@ pub struct DiscoveryWarning {
     pub headline: String,
     /// The full explanation, including every path and the remedy.
     pub detail: String,
+    /// True only when no candidate exists: the fresh-install case, whose
+    /// remedy is `warden init`. False for a blocked config or a standalone
+    /// root-skip notice, where running `init` would be wrong.
+    pub no_config: bool,
 }
 
 impl DiscoveryWarning {
@@ -218,6 +222,7 @@ fn resolve_with(
                      /etc/purge-warden/ or /var/lib/purge-warden/. Pass \
                      `--config ./config.toml` to load it explicitly."
                 .to_string(),
+            no_config: false,
         })
     } else {
         None
@@ -266,6 +271,7 @@ fn resolve_with(
                  purge-warden`, or `warden start` for a foreground run. Already have a \
                  config elsewhere? Pass `--config <path>`."
             ),
+            no_config: true,
         }
     } else {
         let list = blocked
@@ -283,6 +289,7 @@ fn resolve_with(
                  `sudo -u purge-warden warden status` always works. Do NOT run \
                  `warden init` — it would write a second config beside the existing one."
             ),
+            no_config: false,
         }
     };
     // Surface both facts when we ALSO skipped a CWD config because we're root.
@@ -293,6 +300,7 @@ fn resolve_with(
         Some(notice) => DiscoveryWarning {
             headline: warning.headline,
             detail: format!("{} {} {}", notice.headline, notice.detail, warning.detail),
+            no_config: warning.no_config,
         },
         None => warning,
     };
@@ -404,9 +412,12 @@ mod tests {
 
         let (path, warning) = resolve_with(None, candidates, false, |_| CandidateProbe::Absent);
         assert_eq!(path, PathBuf::from("./config.toml"));
-        let w = warning
-            .expect("warning should be present when nothing exists")
-            .one_line();
+        let w = warning.expect("warning should be present when nothing exists");
+        assert!(
+            w.no_config,
+            "nothing exists: this is the fresh-install case"
+        );
+        let w = w.one_line();
         assert!(w.contains("no config file found"));
         assert!(w.contains("./config.toml"));
         assert!(w.contains("/etc/purge-warden/config.toml"));
@@ -440,9 +451,9 @@ mod tests {
 
         // The fallback path is deliberately unchanged — only the diagnosis moves.
         assert_eq!(path, PathBuf::from("./config.toml"));
-        let w = warning
-            .expect("a blocked candidate must still warn")
-            .one_line();
+        let w = warning.expect("a blocked candidate must still warn");
+        assert!(!w.no_config, "a blocked config is not a fresh install");
+        let w = w.one_line();
         assert!(
             !w.contains("no config file found"),
             "the config was found — saying otherwise is the bug: {w}"
@@ -550,9 +561,9 @@ mod tests {
 
         let (path, warning) = resolve_with(None, candidates, true, present_set(present));
         assert_eq!(path, PathBuf::from("/etc/purge-warden/config.toml"));
-        let w = warning
-            .expect("root must be told its CWD config was ignored")
-            .one_line();
+        let w = warning.expect("root must be told its CWD config was ignored");
+        assert!(!w.no_config, "the /etc master exists");
+        let w = w.one_line();
         assert!(w.contains("ignoring ./config.toml"), "notice text: {w}");
     }
 
@@ -569,7 +580,12 @@ mod tests {
 
         let (path, warning) = resolve_with(None, candidates, true, present_set(present));
         assert_eq!(path, PathBuf::from("/etc/purge-warden/config.toml"));
-        let w = warning.expect("warning expected").one_line();
+        let w = warning.expect("warning expected");
+        assert!(
+            w.no_config,
+            "no system config: still the fresh-install case"
+        );
+        let w = w.one_line();
         assert!(w.contains("ignoring ./config.toml"), "notice text: {w}");
         assert!(w.contains("no config file found"), "fallback text: {w}");
     }
