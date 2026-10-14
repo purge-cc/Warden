@@ -4,7 +4,6 @@
 //! filter evaluate → cache (with stampede protection) → forward or block.
 //! All operations are zero-lock; the filter engine and profile resolver use ArcSwap for reads.
 
-use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, OnceLock};
@@ -144,11 +143,9 @@ impl SecurityLayer {
             //
             // The drop is the right call for the hot path, but it is not
             // silent. `enabled = true` with an empty set is reported by
-            // `config::schema::validator::check_anti_bypass` (every
-            // `load_config`, so `warden config lint` and hot reload) and
-            // re-emitted at boot by
-            // `cli::commands::start::toothless_anti_bypass_warning`, which
-            // exists because the boot load runs before `init_tracing`.
+            // `config::schema::validator::check_anti_bypass` on every
+            // `load_config`: `warden config lint`, hot reload, and the
+            // boot-time audit load, which runs after `init_tracing`.
             // Do not "fix" this by keeping a `Some(_)` around an empty
             // set: that would charge every query for a walk that cannot
             // match, and it would still protect nothing.
@@ -1039,21 +1036,16 @@ impl ForwardHandler {
         let name = query.name();
 
         if let Err(e) = validate_query(name) {
-            tracing::debug!(domain = %name, "query validation failed: {e}");
+            tracing::debug!(domain = %name.to_ascii(), "query validation failed: {e}");
             return Ok(send_servfail(request, response_handle).await);
         }
 
         let record_type = query.query_type();
         let dns_class = query.query_class();
 
-        // Extract domain string. LowerName is already lowercase; strip trailing root dot.
-        // Write directly into CompactString to avoid an intermediate String allocation —
-        // domains ≤24 bytes (most of them) stay inline on the stack.
-        let mut domain_buf = CompactString::default();
-        let _ = write!(domain_buf, "{}", name);
-        if domain_buf.ends_with('.') {
-            domain_buf.pop();
-        }
+        // Extract domain string. LowerName is already lowercase. One String
+        // allocation, escaped ASCII, no IDN decoding: see `ascii_domain`.
+        let mut domain_buf = ascii_domain(name);
         let domain = domain_buf.as_str();
         // Set to `Some(original)` when the rewrite hook fires (between
         // blocked-check and cache lookup). Declared up-front so
@@ -2949,6 +2941,20 @@ fn evaluate_with_overlay(
     }
 }
 
+/// A wire name as the escaped ASCII text that filtering, the Query Log and
+/// logging use, without the trailing root dot. `xn--` labels stay `xn--`:
+/// hickory's `Display` decodes them to Unicode with no deny list, so a crafted
+/// label could carry control characters. Other unsafe bytes are escaped as
+/// `\DDD`, which the default security checks refuse. The local-records
+/// tables key on this form too (config names are ASCII).
+pub(super) fn ascii_domain(name: &Name) -> CompactString {
+    let mut domain = CompactString::from(name.to_ascii());
+    if domain.ends_with('.') {
+        domain.pop();
+    }
+    domain
+}
+
 /// Walk the CNAME records in a response, applying `is_blocked` to each
 /// target. Shared by the request path and the background prefetch
 /// worker (`prefetch_worker::refresh_one`), which reuses it to mirror
@@ -2979,11 +2985,7 @@ pub(crate) fn cname_chain_blocked(
         let RData::CNAME(ref cname) = record.data else {
             continue;
         };
-        let mut target = CompactString::default();
-        let _ = write!(target, "{}", **cname);
-        if target.ends_with('.') {
-            target.pop();
-        }
+        let mut target = ascii_domain(cname);
         target.make_ascii_lowercase();
         if checked >= cap {
             // Fail CLOSED: a chain past the cap counts as blocked, the same

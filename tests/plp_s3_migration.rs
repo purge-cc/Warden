@@ -3,8 +3,8 @@
 //! `_docs/features/profile_list_policy.md` §5 asks for the migration to be
 //! proved on the real shapes, not on a fixture written to make it pass. Both
 //! live hosts were read on 2026-08-24 and committed here sanitised:
-//! `tests/fixtures/plp_v2_{zima,proxmox}.toml` — 14 and 15 blocklists, 2 and
-//! 1 profiles, 6 devices each, one disabled list on proxmox. Counts verified
+//! `tests/fixtures/plp_v2_{node_a,node_b}.toml` — 14 and 15 blocklists, 2 and
+//! 1 profiles, 6 devices each, one disabled list on node_b. Counts verified
 //! identical to the originals, so this is the *shape* the migration touches.
 //!
 //! # The two properties that go wrong in silence
@@ -12,11 +12,11 @@
 //! Both are asserted below rather than eyeballed, because neither produces a
 //! failure anyone would notice on a live box:
 //!
-//! 1. **The disabled list.** `privacy-ads` is `enabled = false` on proxmox.
+//! 1. **The disabled list.** `privacy-ads` is `enabled = false` on node_b.
 //!    A migration that special-cased it — writing `ignore`, or skipping it —
 //!    would look correct until the operator re-enabled the list, at which
 //!    point it would come back with a direction nobody chose.
-//! 2. **The synthesised tag.** 11 of zima's 14 lists and 12 of proxmox's 15
+//! 2. **The synthesised tag.** 11 of node_a's 14 lists and 12 of node_b's 15
 //!    carry no `tags` in the file; `auto_promote_blocklists` gives them
 //!    `uncategorized` at load. The migration must *use* that promotion and
 //!    must not *write* it: a value the loader synthesises turning into a
@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use purge_warden::cli::commands::migrate::migrate_v2_to_v3;
 use purge_warden::config::loader::load_config_for_schema;
 
-const ZIMA: &str = include_str!("fixtures/plp_v2_node_a.toml");
-const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
+const NODE_A: &str = include_str!("fixtures/plp_v2_node_a.toml");
+const NODE_B: &str = include_str!("fixtures/plp_v2_node_b.toml");
 
 // ── raw-TOML helpers: the oracle, and the anti-promotion check ─────────
 
@@ -193,7 +193,7 @@ fn migrate(body: &str) -> Migrated {
 /// profile, so an omitted `ignore` is a list silently starting to apply.
 #[test]
 fn both_live_shapes_migrate_to_exactly_what_the_tag_model_resolved() {
-    for (label, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
+    for (label, body) in [("node_a", NODE_A), ("node_b", NODE_B)] {
         let m = migrate(body);
         let want = v2_association(&raw(&m.before));
         let got = v3_policy(&raw(&m.after));
@@ -235,7 +235,7 @@ fn both_live_shapes_migrate_to_exactly_what_the_tag_model_resolved() {
 /// replay in `tests/plp_s1_verdict_golden.rs`, which runs this same verb.
 #[test]
 fn the_migrated_config_loads_and_every_profile_states_its_policy() {
-    for (label, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
+    for (label, body) in [("node_a", NODE_A), ("node_b", NODE_B)] {
         let m = migrate(body);
         let loaded = load_config_for_schema(&m.after, 3, time::OffsetDateTime::now_utc())
             .unwrap_or_else(|e| panic!("{label}: migrated config must load: {e:?}"));
@@ -254,7 +254,7 @@ fn the_migrated_config_loads_and_every_profile_states_its_policy() {
     }
 }
 
-/// **The disabled list.** `privacy-ads` is `enabled = false` on proxmox.
+/// **The disabled list.** `privacy-ads` is `enabled = false` on node_b.
 ///
 /// It keeps the direction its tags gave it, exactly like an enabled list. The
 /// alternatives both fail silently: writing `ignore` (or omitting it) looks
@@ -264,7 +264,7 @@ fn the_migrated_config_loads_and_every_profile_states_its_policy() {
 /// with it.
 #[test]
 fn a_disabled_list_keeps_the_direction_its_tags_gave_it() {
-    let m = migrate(PROXMOX);
+    let m = migrate(NODE_B);
     let before = raw(&m.before);
 
     let disabled: Vec<String> = match before.get("blocklists") {
@@ -284,7 +284,7 @@ fn a_disabled_list_keeps_the_direction_its_tags_gave_it() {
     assert_eq!(
         disabled,
         vec!["privacy-ads".to_string()],
-        "fixture drift: proxmox is the shape with exactly one disabled list, and \
+        "fixture drift: node_b is the shape with exactly one disabled list, and \
          without it this test asserts nothing"
     );
 
@@ -302,7 +302,7 @@ fn a_disabled_list_keeps_the_direction_its_tags_gave_it() {
 
 /// **The synthesised tag must not round-trip.**
 ///
-/// 12 of proxmox's 15 lists and 11 of zima's 14 carry no `tags` key.
+/// 12 of node_b's 15 lists and 11 of node_a's 14 carry no `tags` key.
 /// `auto_promote_blocklists` gives them `uncategorized` at load, and the
 /// migration uses that — but writing it back would promote a loader default
 /// to a value on disk, which is a defect this repo has already had.
@@ -311,7 +311,7 @@ fn a_disabled_list_keeps_the_direction_its_tags_gave_it() {
 /// catches the migration inventing tags anywhere else.
 #[test]
 fn the_migration_never_writes_a_tag_the_file_did_not_have() {
-    for (label, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
+    for (label, body) in [("node_a", NODE_A), ("node_b", NODE_B)] {
         let m = migrate(body);
         let before = all_raw_tags(&raw(&m.before));
         let after = all_raw_tags(&raw(&m.after));
@@ -367,7 +367,7 @@ fn the_migration_never_writes_a_tag_the_file_did_not_have() {
 /// Running it twice gives the same file.
 #[test]
 fn the_migration_is_idempotent() {
-    for (label, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
+    for (label, body) in [("node_a", NODE_A), ("node_b", NODE_B)] {
         let dir = tempfile::tempdir().unwrap();
         let v2 = dir.path().join("v2.toml");
         let once = dir.path().join("once.toml");
@@ -401,7 +401,7 @@ fn a_device_carrying_its_own_tags_is_refused_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let v2 = dir.path().join("v2.toml");
     let target = dir.path().join("v3.toml");
-    let body = ZIMA.replace("[[devices]]", "[[devices]]\ntags = [\"kids\"]\n#");
+    let body = NODE_A.replace("[[devices]]", "[[devices]]\ntags = [\"kids\"]\n#");
     // The replace above tags the FIRST device row and comments out its next
     // line; guard that it produced something that still parses, so a failure
     // here is the refusal and not a broken fixture.
@@ -446,7 +446,7 @@ fn a_tagged_group_or_subnet_is_refused_too() {
         let dir = tempfile::tempdir().unwrap();
         let v2 = dir.path().join("v2.toml");
         let target = dir.path().join("v3.toml");
-        std::fs::write(&v2, format!("{PROXMOX}{extra}")).unwrap();
+        std::fs::write(&v2, format!("{NODE_B}{extra}")).unwrap();
 
         let err = migrate_v2_to_v3(&v2, &target, false)
             .err()

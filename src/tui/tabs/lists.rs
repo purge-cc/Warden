@@ -1212,6 +1212,8 @@ fn status_of(s: &BlocklistStatusDto) -> (String, ratatui::style::Color) {
     let raw = s.last_outcome.as_str();
     if raw == "ok" {
         ("ok".to_string(), T.success)
+    } else if raw == "never_fetched" && s.cache_loaded {
+        ("cached".to_string(), T.text_muted)
     } else if raw == "never_fetched" {
         ("never".to_string(), T.text_muted)
     } else if raw.starts_with("failed: ") {

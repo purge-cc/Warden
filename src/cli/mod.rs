@@ -503,7 +503,7 @@ pub enum MigrateAction {
         #[arg(long, value_name = "OUTPUT_PLAN", conflicts_with_all = ["check", "re_plan", "apply_plan", "rollback", "finalize"])]
         plan: Option<PathBuf>,
         /// Read granular, revision-bound planning choices from JSON.
-        #[arg(long, value_name = "CHOICES", requires = "re_plan")]
+        #[arg(long, value_name = "CHOICES", conflicts_with_all = ["apply_plan", "rollback", "finalize"])]
         choices: Option<PathBuf>,
         /// Recompute the plan with choices and write it to a new JSON file.
         #[arg(long, value_name = "REVISED_PLAN", conflicts_with_all = ["check", "plan", "apply_plan", "rollback", "finalize"])]
@@ -770,6 +770,23 @@ mod migrate_v3_to_v4_cli_tests {
                 "warden",
                 "migrate",
                 "v4-to-v5",
+                "--check",
+                "--choices",
+                "c.json",
+            ],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
+                "--plan",
+                "p.json",
+                "--choices",
+                "c.json",
+            ],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
                 "--apply-plan",
                 "plan.json",
                 "--expect-plan-hash",
@@ -793,6 +810,18 @@ mod migrate_v3_to_v4_cli_tests {
             vec!["warden", "migrate", "v4-to-v5", "--apply-plan", "plan.json"],
             vec!["warden", "migrate", "v4-to-v5", "--rollback", "receipt"],
             vec!["warden", "migrate", "v4-to-v5", "--check", "--force"],
+            vec!["warden", "migrate", "v4-to-v5", "--choices", "c.json"],
+            vec![
+                "warden",
+                "migrate",
+                "v4-to-v5",
+                "--apply-plan",
+                "p",
+                "--expect-plan-hash",
+                "h",
+                "--choices",
+                "c.json",
+            ],
         ] {
             assert!(Cli::try_parse_from(argv).is_err());
         }
@@ -895,12 +924,21 @@ pub enum ConfigAction {
         #[arg(long)]
         section: Option<String>,
     },
-    /// Open config in $EDITOR, then validate what was saved.
+    /// Edit a copy of the config in $EDITOR; apply it only if it validates.
     ///
-    /// Exit code: 0 the saved config is valid · 1 the editor could not be
-    /// launched or exited non-zero · 2 the saved config does not validate
-    /// (the errors are printed). Safe to chain: `warden config edit &&
-    /// systemctl reload purge-warden`.
+    /// The editor opens a private copy, never the live file. When the
+    /// editor exits, the saved copy is validated, and the live config
+    /// changes only if the copy is valid. If the copy is refused or the
+    /// editor exits non-zero, the live config stays unchanged and the copy
+    /// is kept; the command prints its path. On a cluster secondary, a
+    /// change to the policy that the primary sends is refused: make it on
+    /// the primary. This command does not reload the daemon.
+    ///
+    /// Exit code: 0 the saved config is valid · 1 the edit could not be
+    /// made or written (editor, read, write or lock failure) · 2 the saved
+    /// config does not validate, or a secondary refuses it (the errors are
+    /// printed). Safe to chain: `warden config edit && systemctl reload
+    /// purge-warden`.
     Edit,
     /// Load + validate the v1 config without touching the running daemon.
     ///
@@ -1653,7 +1691,7 @@ pub enum BlocklistAction {
         id: String,
         #[arg(long)]
         display_name: Option<String>,
-        /// Source URL (http:// or https://).
+        /// Source URL (https://).
         #[arg(long)]
         url: String,
         /// Parser format (domains, adguard, hosts). Defaults to
@@ -1853,6 +1891,15 @@ pub enum NodeAction {
         #[arg(long, value_name = "ID")]
         operation_id: String,
         /// Confirm that only this target-local pending enrollment is abandoned.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Cancel one Add this node started, until its destination applies it.
+    Cancel {
+        /// Exact operation ID shown by `warden node status`.
+        #[arg(long, value_name = "ID")]
+        operation_id: String,
+        /// Confirm the cancel; an admitted destination is revoked.
         #[arg(long, required = true)]
         confirm: bool,
     },

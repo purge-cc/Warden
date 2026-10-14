@@ -59,6 +59,7 @@ fn response_status_roundtrip() {
         cache_cap: 0,
         lists_active: 0,
         lists_total: 0,
+        lists_loaded: 0,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: None,
@@ -142,6 +143,7 @@ fn status_cycle_qualifiers_remain_wire_compatible() {
         cache_weighted_size: 0,
         lists_active: 0,
         lists_total: 0,
+        lists_loaded: 0,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: Some(crate::lists::status::CycleMark {
@@ -217,6 +219,7 @@ fn status_cycle_qualifiers_remain_wire_compatible() {
     match serde_json::from_str::<IpcResponse>(HISTORICAL_STATUS_PAYLOAD).unwrap() {
         IpcResponse::Status {
             pid,
+            lists_loaded,
             lists_cycle:
                 Some(crate::lists::status::CycleMark {
                     seq,
@@ -228,6 +231,9 @@ fn status_cycle_qualifiers_remain_wire_compatible() {
             ..
         } => {
             assert_eq!(pid, 5678);
+            // Older daemons never counted cache loads: the CLI then prints
+            // exactly the line it printed before the field existed.
+            assert_eq!(lists_loaded, 0);
             assert_eq!(seq, 8);
             assert_eq!(outcome, Some(crate::lists::status::CycleOutcome::Installed));
             assert!(!source_coverage_incomplete);
@@ -283,6 +289,7 @@ fn response_status_with_drop_counters_roundtrip() {
         cache_cap: 0,
         lists_active: 0,
         lists_total: 0,
+        lists_loaded: 0,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: None,
@@ -351,6 +358,7 @@ fn response_status_s419_fields_roundtrip() {
         cache_cap: 10_000,
         lists_active: 7,
         lists_total: 8,
+        lists_loaded: 7,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: None,
@@ -425,6 +433,7 @@ fn response_status_with_resource_budget_roundtrip() {
         cache_cap: 5_000,
         lists_active: 1,
         lists_total: 1,
+        lists_loaded: 1,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: None,
@@ -1621,6 +1630,7 @@ fn response_status_upstream_servers_roundtrip() {
         cache_cap: 10_000,
         lists_active: 3,
         lists_total: 3,
+        lists_loaded: 3,
         lists_truncated: 0,
         lists_corpus_refusal: None,
         lists_cycle: None,

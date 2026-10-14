@@ -2779,9 +2779,9 @@ fn network_name_wildcard_without_name_format_helper_substitutes() {
 // ── rev-2606 §05 schema-validator-03 ──────────────────────────────
 //
 // The lint and the fetcher must agree on which list URLs can ever be
-// downloaded. They cannot share code — the fetcher owns `url`/`reqwest`
-// and the config layer is deliberately free of both — so the guard
-// against drift is this cross-check rather than a shared call.
+// downloaded. The host verdict is the fetcher's own `validate_list_url`;
+// the scheme and userinfo checks are plain string scans, and this
+// cross-check guards them against drift.
 
 /// What `check_blocklists` would accept without any diagnostic,
 /// composed from the same predicates the emit sites use.
@@ -2789,16 +2789,16 @@ fn lint_accepts_silently(url: &str) -> bool {
     (url.starts_with("http://") || url.starts_with("https://"))
         && !url.starts_with("http://")
         && !url_has_embedded_userinfo(url)
-        && !host_is_unfetchable(url_host_of(url))
+        && !url_host_is_unfetchable(url)
 }
 
 #[test]
 fn blocklist_url_policy_agrees_with_the_fetcher() {
     // Compared on the three axes this rule aligns: scheme, embedded
     // userinfo, and the host-address policy. URL *well-formedness* is
-    // deliberately NOT compared — `Url::parse` owns that and the config
-    // layer has no parser, so every case below is syntactically valid
-    // for both sides.
+    // deliberately NOT compared — `[[blocklists]]` has no parse
+    // diagnostic, so every case below is syntactically valid for both
+    // sides.
     let cases = [
         "https://lists.purge.cc/privacy/ads.txt",
         "http://lists.purge.cc/privacy/ads.txt",
@@ -2808,6 +2808,9 @@ fn blocklist_url_policy_agrees_with_the_fetcher() {
         "https://192.168.1.1/ads.txt",
         "https://172.16.0.1/ads.txt",
         "https://127.0.0.1/ads.txt",
+        // IPv4 shorthands `Url::parse` reads as 127.0.0.1.
+        "https://127.1/ads.txt",
+        "https://2130706433/ads.txt",
         "https://169.254.1.1/ads.txt",
         "https://100.64.0.9/ads.txt",
         "https://0.0.0.0/ads.txt",
@@ -4409,13 +4412,13 @@ fn resource_budget_defaults_pass() {
 
 // ── N1 — `[anti_bypass] enabled = true` with no domain source ──
 //
-// `AntiBypassConfig::default()` is `enabled = true, extra_domains =
-// []`, and `warden init` never writes the section — so this is the
-// state of essentially every install, including both live CTs. The
-// set is empty, `SecurityLayer::from_config` drops the checker to
-// `None`, and the operator's config asserts a protection that does
-// not exist. Dropping it is correct (see the handler); being silent
-// about it is not.
+// `AntiBypassConfig::default()` is off, and `warden init` never writes
+// the section, so a stock config raises nothing here. An explicit
+// `enabled = true` with an empty `extra_domains` is different: the set
+// is empty, `SecurityLayer::from_config` drops the checker to `None`,
+// and the operator's config asserts a protection that does not exist.
+// Dropping it is correct (see the handler); being silent about it is
+// not.
 
 /// Collect the audit WARNs a config raises, without touching the
 /// process-global tracing dispatcher (see [`AuditWarnings::silent`]).
@@ -4427,10 +4430,11 @@ fn warns_for(c: &ConfigV1) -> Vec<String> {
 
 #[test]
 fn n1_anti_bypass_enabled_with_no_domains_warns() {
-    let c = basic_config();
+    let mut c = basic_config();
+    c.anti_bypass.enabled = true;
     assert!(
-        c.anti_bypass.enabled && c.anti_bypass.extra_domains.is_empty(),
-        "precondition: the default shape is enabled-with-no-domains"
+        c.anti_bypass.extra_domains.is_empty(),
+        "precondition: enabled with no domains"
     );
     let warns = warns_for(&c);
     assert!(
@@ -4571,6 +4575,7 @@ fn no_default_profile_const_is_pinned() {
 #[test]
 fn n1_anti_bypass_with_an_operator_domain_is_silent() {
     let mut c = basic_config();
+    c.anti_bypass.enabled = true;
     c.anti_bypass.extra_domains = vec!["doh.example.net".to_string()];
     let warns = warns_for(&c);
     assert!(
@@ -4623,9 +4628,10 @@ fn master_switch_off_with_anti_bypass_on_warns() {
 fn master_switch_warn_does_not_depend_on_a_populated_list() {
     let mut c = basic_config();
     c.security.enabled = false;
+    c.anti_bypass.enabled = true;
     assert!(
         c.anti_bypass.extra_domains.is_empty(),
-        "precondition: default shape has no domains"
+        "precondition: enabled with no domains"
     );
     let warns = warns_for(&c);
     assert!(
@@ -4752,12 +4758,13 @@ fn neutrality04_safe_search_off_is_silent() {
 }
 
 /// The guard rail on the whole lane: this config is **valid**. Both
-/// live CTs carry it, and the daemon load path aborts on any
+/// test hosts carry it, and the daemon load path aborts on any
 /// `ConfigError` — turning this diagnostic fatal would take the
 /// house off DNS at the next restart.
 #[test]
 fn n1_anti_bypass_toothless_config_is_a_warning_never_an_error() {
-    let c = basic_config();
+    let mut c = basic_config();
+    c.anti_bypass.enabled = true;
     assert!(
         validate(&c, now()).is_ok(),
         "enabled-with-no-domains must never block the load"
@@ -4770,7 +4777,9 @@ fn n1_anti_bypass_toothless_config_is_a_warning_never_an_error() {
 /// verb — so a list is a filter-engine path, not a checker source.
 #[test]
 fn n1_anti_bypass_warning_points_at_extra_domains_only() {
-    let warns = warns_for(&basic_config());
+    let mut c = basic_config();
+    c.anti_bypass.enabled = true;
+    let warns = warns_for(&c);
     let w = warns
         .iter()
         .find(|w| w.contains("has no domains to block"))
@@ -4912,4 +4921,68 @@ fn a_zero_file_cap_is_refused() {
             .any(|e| e.to_string().contains("max_file_bytes")),
         "a zero cap makes every list unreadable at the next load, got {errs:?}"
     );
+}
+
+/// A stock config — no `[anti_bypass]` section — raises neither
+/// anti-bypass warning, with the security layer on or off.
+#[test]
+fn default_config_raises_no_anti_bypass_warning() {
+    let mut off = basic_config();
+    off.security.enabled = false;
+    for c in [basic_config(), off] {
+        let warns = warns_for(&c);
+        assert!(
+            !warns.iter().any(|w| w.contains("has no domains to block")
+                || w.contains("switches off every security sub-checker")),
+            "a stock config must not warn about anti-bypass: {warns:?}"
+        );
+    }
+}
+
+/// An enabled `[ip_blocklists]` source the fetcher would skip is refused,
+/// with the same verdict as `validate_list_url`; a disabled section is not
+/// checked.
+#[test]
+fn ip_blocklist_sources_follow_the_fetcher_rule() {
+    let verdict = |enabled: bool, url: &str| {
+        let mut cfg = basic_config();
+        cfg.ip_blocklists.enabled = enabled;
+        cfg.ip_blocklists.sources = vec![url.to_string()];
+        validate(&cfg, now()).map_err(|errs| {
+            errs.iter()
+                .any(|e| e.to_string().contains("ip_blocklists.sources[0]"))
+        })
+    };
+    for (url, accepted) in [
+        ("http://lists.example/x", false),
+        ("https://user:pw@lists.example/x", false),
+        ("https://127.0.0.1/x", false),
+        // IPv4 shorthands `Url::parse` reads as 127.0.0.1.
+        ("https://127.1/x", false),
+        ("https://2130706433/x", false),
+        ("https://lists.example/x", true),
+        ("HTTPS://lists.example/x", true),
+        // Authorities `Url::parse` refuses: the fetcher would skip them.
+        ("https://lists.example:abc/x", false),
+        ("https://lists.example:99999/x", false),
+        ("https://lists.example:+1/x", false),
+        ("https://lists example/x", false),
+        ("https://lists|example/x", false),
+        ("https://[zz]/x", false),
+        ("https://[2001:db8::1]x/x", false),
+        ("https://lists.example:8443/x", true),
+        ("https://lists.example:/x", true),
+        ("https://[2001:db8::1]:8443/x", true),
+    ] {
+        let fetcher_ok = crate::lists::http_client::validate_list_url(url).is_ok();
+        assert_eq!(fetcher_ok, accepted, "fetcher verdict on {url}");
+        let lint = verdict(true, url);
+        assert_eq!(
+            lint.is_ok(),
+            fetcher_ok,
+            "lint and fetcher disagree on {url}"
+        );
+        assert!(lint.is_ok() || lint == Err(true), "{url}: {lint:?}");
+    }
+    assert!(verdict(false, "http://lists.example/x").is_ok());
 }

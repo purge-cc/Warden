@@ -6,8 +6,8 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::io::{BufRead, Read, Seek};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -23,7 +23,10 @@ use crate::config::policy_transaction::{
     self, Persistence, ReceiptStore, RecoveryOutcome, RepairDestinationSet, RepairRequest,
     TransactionRequest,
 };
-use crate::config::schema::{Id, TARGET_SCHEMA_VERSION_V5 as SCHEMA_VERSION};
+use crate::config::schema::{
+    ClusterConfig, ClusterRole, Id, NodeConfig, TARGET_SCHEMA_VERSION_V5 as SCHEMA_VERSION,
+};
+use crate::config::tree_io::CappedRead;
 use crate::config::write_lock::{self, MigrationWriteLock};
 
 /// Persistence result returned without requesting daemon activation.
@@ -42,13 +45,42 @@ pub enum RestoreOutcome {
     ValidationFailed(Vec<String>),
 }
 
+/// Largest archive copied into staging.
+#[cfg(not(test))]
+const MAX_ARCHIVE_BYTES: u64 = 1 << 30;
+#[cfg(test)]
+const MAX_ARCHIVE_BYTES: u64 = 1 << 20;
+/// Largest sum of member sizes the archive listing may announce.
+#[cfg(not(test))]
+const MAX_EXTRACTED_BYTES: u64 = 1 << 30;
+#[cfg(test)]
+const MAX_EXTRACTED_BYTES: u64 = 1 << 20;
+/// Most members one archive may list.
+#[cfg(not(test))]
+const MAX_ARCHIVE_MEMBERS: usize = 10_000;
+#[cfg(test)]
+const MAX_ARCHIVE_MEMBERS: usize = 64;
+/// Most bytes read from one tar listing.
+#[cfg(not(test))]
+const MAX_LISTING_BYTES: u64 = 8 << 20;
+#[cfg(test)]
+const MAX_LISTING_BYTES: u64 = 8 << 10;
+/// Most bytes of tar's stderr quoted in an error.
+const MAX_TAR_STDERR_BYTES: u64 = 4096;
+
 /// Restore declared policy files without printing or signalling the daemon.
 /// The CLI wrapper [`run_restore`] requests reload after this function returns.
 pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<RestoreOutcome> {
-    anyhow::ensure!(archive.exists(), "archive not found: {}", archive.display());
     let staging = StagingDir::create()?;
-    extract_archive(archive, staging.path())?;
-    let staged_master = locate_staged_master(staging.path(), live_config)?;
+    // The archive's directory may be writable by the daemon user. Every tar
+    // run reads a private copy, so the bytes checked are the bytes extracted.
+    let pinned = pin_archive(archive, staging.path())?;
+    #[cfg(test)]
+    write_lock::test_event(write_lock::TestEvent::AfterArchivePinned);
+    let tree = staging.path().join("tree");
+    std::fs::DirBuilder::new().mode(0o700).create(&tree)?;
+    extract_archive(&pinned, &tree, staging.path())?;
+    let staged_master = locate_staged_master(&tree, live_config)?;
     let staged_root = staged_master
         .parent()
         .context("staged master has no parent")?;
@@ -58,15 +90,183 @@ pub fn restore_archive(live_config: &Path, archive: &Path) -> anyhow::Result<Res
     let staged = match loader::load_config_v5_executable(&staged_master, now) {
         Ok(loaded) => loaded,
         Err(errors) => {
+            // The loader's hint assumes a live older install; an archive
+            // needs another route. Key words first: the TUI shows one band.
+            if let Some(version) = older_archived_schema(&staged_master) {
+                anyhow::bail!(
+                    "schema-{version} archive (Warden 0.41 or earlier); live config untouched. \
+                     This Warden restores schema-{SCHEMA_VERSION} archives only. To reuse its \
+                     settings, extract it into a new empty directory with `tar --no-same-owner \
+                     --no-same-permissions -xzf {} -C DIR` and copy them into the current \
+                     config with `warden config edit`.",
+                    archive.display()
+                );
+            }
             return Ok(RestoreOutcome::ValidationFailed(
                 errors.iter().map(ToString::to_string).collect(),
             ));
         }
     };
     let staged_inventory = staged_inventory(&staged)?;
+    let archived = membership(&staged.config.cluster, &staged.config.node);
 
     let guard = write_lock::acquire_for_migration(live_config)?;
-    restore_staged_locked(&guard, live_config, &staged_inventory, now)
+    restore_staged_locked(&guard, live_config, &staged_inventory, archived, now)
+}
+
+/// What ties a node to its cluster; `None` is standalone. A disabled
+/// `[cluster]` is standalone whatever its role, as in `warden cluster
+/// status`. The identity must keep matching the node credential and the
+/// primary's roster, which live outside the archive.
+#[derive(PartialEq)]
+struct Membership {
+    role: ClusterRole,
+    identity: [(&'static str, Option<String>); 6],
+}
+
+fn membership(cluster: &ClusterConfig, node: &NodeConfig) -> Option<Membership> {
+    // A primary ignores `peer`.
+    let peer = cluster
+        .peer
+        .clone()
+        .filter(|_| cluster.role == ClusterRole::Secondary);
+    cluster.enabled.then(|| Membership {
+        role: cluster.role,
+        identity: [
+            (
+                "cluster.membership_version",
+                cluster
+                    .membership_version
+                    .map(|version| version.to_string()),
+            ),
+            ("cluster.cluster_id", cluster.cluster_id.clone()),
+            ("cluster.primary_node_id", cluster.primary_node_id.clone()),
+            (
+                "cluster.primary_cert_fingerprint",
+                cluster.primary_cert_fingerprint.clone(),
+            ),
+            ("cluster.peer", peer),
+            ("node.id", node.id.clone()),
+        ],
+    })
+}
+
+/// The membership the live master declares, for a repair whose live config
+/// does not load. Only the master's own `[cluster]` and `[node]` are read
+/// (`warden cluster` writes them there). `None` (unknown) when the master is
+/// absent, it or one of these sections does not parse, or a section is
+/// absent while the master has `includes` (the loader may take it from an
+/// include).
+fn raw_live_membership(guard: &MigrationWriteLock) -> anyhow::Result<Option<Option<Membership>>> {
+    fn section<T: serde::de::DeserializeOwned + Default>(
+        table: &mut toml::Table,
+        key: &str,
+    ) -> Option<T> {
+        match table.remove(key) {
+            Some(value) => value.try_into().ok(),
+            None => (!table.contains_key("includes")).then(T::default),
+        }
+    }
+    let CappedRead::Contents(bytes) = guard
+        .tree_io()
+        .plan_master_target()?
+        .read_original_capped(loader::MAX_TOTAL_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let Some(mut table) = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+    else {
+        return Ok(None);
+    };
+    Ok(section::<ClusterConfig>(&mut table, "cluster")
+        .zip(section::<NodeConfig>(&mut table, "node"))
+        .map(|(cluster, node)| membership(&cluster, &node)))
+}
+
+/// Restore never changes cluster membership: the node credential, the
+/// ownership ledger and the primary's roster live outside the archive, and a
+/// node whose `[cluster]` no longer matches them cannot start or is cut off.
+/// An unknown live membership (`None`) admits only a standalone archive, and
+/// no archive when node-local state shows the node is a member.
+fn refuse_membership_change(
+    guard: &MigrationWriteLock,
+    live: Option<Option<Membership>>,
+    archived: Option<Membership>,
+) -> anyhow::Result<()> {
+    let role = |membership: &Option<Membership>| match membership.as_ref().map(|m| m.role) {
+        None => "standalone",
+        Some(ClusterRole::Primary) => "primary",
+        Some(ClusterRole::Secondary) => "secondary",
+    };
+    let Some(live) = live else {
+        anyhow::ensure!(
+            !member_evidence(guard)?,
+            "refusing restore: this node's cluster membership is unknown (the live config does \
+             not load) and node-local cluster state shows it is a member; live config unchanged. \
+             Run `warden config lint` to see the error, fix it by hand, then restore again."
+        );
+        anyhow::ensure!(
+            archived.is_none(),
+            "refusing restore: this node's cluster membership is unknown and the archive's is \
+             {}; live config unchanged. The live master is missing or does not parse, or it \
+             leaves `[cluster]` or `[node]` to an include: fix the master and restore again, or \
+             restore an archive taken while the node was standalone.",
+            role(&archived)
+        );
+        return Ok(());
+    };
+    let change = match (&live, &archived) {
+        _ if live == archived => return Ok(()),
+        (Some(now), Some(then)) if now.role == then.role => format!(
+            "{} membership: the archive's {} differs",
+            role(&live),
+            now.identity
+                .iter()
+                .zip(&then.identity)
+                .find(|(now, then)| now != then)
+                .map_or("identity", |((field, _), _)| *field)
+        ),
+        _ => format!(
+            "cluster membership from {} to {}",
+            role(&live),
+            role(&archived)
+        ),
+    };
+    anyhow::bail!(
+        "refusing restore: it would change this node's {change}; live config unchanged. \
+         Membership changes go through `warden cluster` (leave, join or create); restore an \
+         archive taken with the current membership instead."
+    )
+}
+
+/// Whether node-local state shows this node is a cluster member: the
+/// secondary credential `warden cluster join` saves or the roster
+/// `warden cluster create` starts. `warden cluster leave` removes both.
+fn member_evidence(guard: &MigrationWriteLock) -> anyhow::Result<bool> {
+    #[cfg(feature = "cluster")]
+    if let Some(files) =
+        crate::private_store::PrivateStore::open_existing(guard, crate::cluster::membership::STORE)?
+    {
+        return Ok(files.read("secondary.json", 8192)?.is_some()
+            || files.read("roster.json", 256 * 1024)?.is_some());
+    }
+    #[cfg(not(feature = "cluster"))]
+    let _ = guard;
+    Ok(false)
+}
+
+/// The `schema_version` a staged master declares when it is older than this
+/// Warden's. An unreadable or unparsable master gives `None`, so the
+/// loader's diagnostics stand.
+fn older_archived_schema(staged_master: &Path) -> Option<i64> {
+    let bytes = read_staged_file(staged_master, loader::MAX_TOTAL_BYTES).ok()?;
+    let table: toml::Table = std::str::from_utf8(&bytes).ok()?.parse().ok()?;
+    table
+        .get("schema_version")?
+        .as_integer()
+        .filter(|version| *version < i64::from(SCHEMA_VERSION))
 }
 
 fn staged_inventory(loaded: &loader::LoadedConfigV5) -> anyhow::Result<PolicyRevisionInventory> {
@@ -137,39 +337,95 @@ fn staged_inventory_with_budget(
     Ok(PolicyRevisionInventory::new(members)?)
 }
 
-fn read_staged_file(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+/// Open a regular file with one link and at most `cap` bytes, without
+/// following a final symlink. `what` names the file in the refusal.
+fn open_capped(
+    path: &Path,
+    cap: u64,
+    what: &str,
+) -> anyhow::Result<(std::fs::File, std::fs::Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
-    let before = file.metadata()?;
+    let metadata = file.metadata()?;
     anyhow::ensure!(
-        before.is_file() && before.nlink() == 1 && before.len() <= cap,
-        "unsafe or oversized staged file: {}",
+        metadata.is_file() && metadata.nlink() == 1 && metadata.len() <= cap,
+        "unsafe or oversized {what}: {} (it must be a regular file with one link and at most {cap} bytes)",
         path.display()
     );
+    Ok((file, metadata))
+}
+
+/// True when exactly `read` bytes came from `file` and its size and times
+/// still match `before`.
+fn same_capture(
+    file: &std::fs::File,
+    before: &std::fs::Metadata,
+    read: u64,
+) -> anyhow::Result<bool> {
+    let after = file.metadata()?;
+    Ok(read == before.len()
+        && after.len() == before.len()
+        && after.mtime() == before.mtime()
+        && after.mtime_nsec() == before.mtime_nsec()
+        && after.ctime() == before.ctime()
+        && after.ctime_nsec() == before.ctime_nsec())
+}
+
+fn read_staged_file(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let (file, before) = open_capped(path, cap, "staged file")?;
     let mut bytes = Vec::new();
     (&file)
         .take(cap.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
     anyhow::ensure!(
-        bytes.len() as u64 == before.len()
-            && after.len() == before.len()
-            && after.mtime() == before.mtime()
-            && after.mtime_nsec() == before.mtime_nsec()
-            && after.ctime() == before.ctime()
-            && after.ctime_nsec() == before.ctime_nsec(),
+        same_capture(&file, &before, bytes.len() as u64)?,
         "staged file changed during capture: {}",
         path.display()
     );
     Ok(bytes)
 }
 
+/// Copy `archive` into `staging` and return the copy's path. The copy is
+/// created new with mode 0600, and the source must not change while it is
+/// read.
+fn pin_archive(archive: &Path, staging: &Path) -> anyhow::Result<PathBuf> {
+    let (file, before) = open_capped(archive, MAX_ARCHIVE_BYTES, "archive").map_err(|error| {
+        let errno = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+        match errno {
+            Some(libc::ENOENT) => anyhow::anyhow!("archive not found: {}", archive.display()),
+            Some(libc::ELOOP) => anyhow::anyhow!(
+                "refusing archive {}: it is a symbolic link",
+                archive.display()
+            ),
+            Some(_) => anyhow::anyhow!("cannot open archive {}: {error}", archive.display()),
+            None => error,
+        }
+    })?;
+    let pinned = staging.join("archive.tar.gz");
+    let mut copy = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&pinned)?;
+    let copied = std::io::copy(&mut (&file).take(MAX_ARCHIVE_BYTES + 1), &mut copy)?;
+    anyhow::ensure!(
+        same_capture(&file, &before, copied)?,
+        "archive changed while it was copied: {}",
+        archive.display()
+    );
+    Ok(pinned)
+}
+
 fn restore_staged_locked(
     guard: &MigrationWriteLock,
     requested_master: &Path,
     staged: &PolicyRevisionInventory,
+    archived: Option<Membership>,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<RestoreOutcome> {
     guard.verify_master(requested_master)?;
@@ -202,15 +458,20 @@ fn restore_staged_locked(
             ReceiptStore::open(&data, guard)?
         }
     };
-    let before = match loader::load_config_v5_for_repair_under_migration_guard(
+    let (before, live_membership) = match loader::load_config_v5_for_repair_under_migration_guard(
         guard,
         guard.canonical_master(),
         now,
     ) {
-        Ok(live) => Some(capture_coherent_loaded_v5_under_migration_guard(
-            guard, &live, now,
-        )?),
-        Err(loader::EditorGuardedLoadFailure::Diagnostics(_)) => None,
+        Ok(live) => (
+            Some(capture_coherent_loaded_v5_under_migration_guard(
+                guard, &live, now,
+            )?),
+            Some(membership(&live.config.cluster, &live.config.node)),
+        ),
+        Err(loader::EditorGuardedLoadFailure::Diagnostics(_)) => {
+            (None, raw_live_membership(guard)?)
+        }
         Err(loader::EditorGuardedLoadFailure::Operational(error)) => return Err(error),
     };
     let repair = before.is_none();
@@ -239,6 +500,11 @@ fn restore_staged_locked(
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
     )?;
+    refuse_membership_change(guard, live_membership, archived)?;
+    // On a secondary the replicated files belong to the ownership ledger;
+    // replacing them would fail every later artifact apply.
+    #[cfg(feature = "cluster")]
+    crate::cluster::ledger::refuse_owned_changes(guard, &after, !repair)?;
     let destinations = if repair {
         Some(RepairDestinationSet::capture(guard, &after)?)
     } else {
@@ -288,6 +554,7 @@ fn restore_staged_locked(
     );
     // SAFETY: geteuid has no preconditions and cannot fail.
     let actor = format!("uid:{}", unsafe { libc::geteuid() });
+    let (lookup_actor, lookup_request) = (actor.clone(), request_id.clone());
     let mut candidate_errors = None;
     let validate = || {
         custom_list::validate_flat_pack_tree_under_tree(guard.tree_io())?;
@@ -383,23 +650,60 @@ fn restore_staged_locked(
     if let Some(errors) = candidate_errors {
         return Ok(RestoreOutcome::ValidationFailed(errors));
     }
-    let receipt = result?;
-    match receipt.persistence {
-        Persistence::Committed => Ok(RestoreOutcome::Restored {
-            pre_restore: None,
-            changed: receipt.changed_members != 0,
-            repair,
-        }),
-        Persistence::DurabilityUncertain => anyhow::bail!(
-            "restore durability_uncertain (transaction {}, request {}); recovery is required before another write; daemon activation was not requested: {}",
-            receipt.transaction_id, receipt.request_id,
-            receipt.failure.as_deref().unwrap_or("inspect the retained transaction receipt")
+    let restored = |receipt: &policy_transaction::BaseReceipt| RestoreOutcome::Restored {
+        pre_restore: None,
+        changed: receipt.changed_members != 0,
+        repair,
+    };
+    // `commit` never errs, so an Err comes from prepare, which leaves live
+    // members alone.
+    let (stage, transaction, failure) = match result {
+        Ok(receipt) if receipt.persistence == Persistence::Committed => {
+            return Ok(restored(&receipt))
+        }
+        Ok(receipt) => (
+            "commit",
+            receipt.transaction_id,
+            receipt
+                .failure
+                .unwrap_or_else(|| format!("persistence {:?}", receipt.persistence)),
         ),
-        status => anyhow::bail!(
-            "restore did not commit (transaction {}, persistence {status:?}); daemon activation was not requested",
+        Err(error) => ("prepare", String::new(), format!("{error:#}")),
+    };
+    // Settle the failure while this guard still holds the tree: recovery
+    // rolls the transaction back or finishes it, and the terminal receipt
+    // says which. Only `Aborted` or a prepare failure proves "unchanged".
+    match policy_transaction::lookup_receipt(guard, &receipts, &lookup_actor, &lookup_request) {
+        Ok(Some(receipt)) if receipt.persistence == Persistence::Committed => {
+            Ok(restored(&receipt))
+        }
+        Ok(Some(receipt)) if receipt.persistence == Persistence::Aborted => anyhow::bail!(
+            "restore rolled back after a {stage} failure (transaction {}): live config \
+             unchanged; daemon activation was not requested: {failure}",
             receipt.transaction_id
         ),
+        Ok(None) if stage == "prepare" => {
+            anyhow::bail!("{failure}; live config unchanged")
+        }
+        Ok(_) => Err(uncertain_restore(&transaction, &lookup_request, &failure)),
+        Err(error) => Err(uncertain_restore(
+            &transaction,
+            &lookup_request,
+            &format!("{failure}; recovery: {error:#}"),
+        )),
     }
+}
+
+/// A failed commit that recovery could not settle. It never says
+/// "unchanged": only boot recovery can tell.
+fn uncertain_restore(transaction: &str, request: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "restore state is uncertain (transaction {transaction}, request {request}): run \
+         `systemctl restart purge-warden` so boot recovery settles it before another write; \
+         daemon activation was not requested. See \"{}\" in docs/UPGRADE_RECOVERY.md \
+         ({detail})",
+        crate::config::migration_journal::POLICY_RECOVERY_SECTION
+    )
 }
 
 fn pack_id(path: &Path) -> anyhow::Result<Id> {
@@ -465,14 +769,8 @@ pub fn run_restore(
     }
 }
 
-/// Self-cleaning staging directory. Mirrors the subset of
-/// `tempfile::tempdir` we use here so the production build doesn't
-/// need the `tempfile` crate as a runtime dependency (it stays a
-/// dev-dep used only by the test suite).
-///
-/// `pub(crate)` so the cluster apply path (`crate::cluster::apply`)
-/// reuses the exact hardened CSPRNG-named 0o700 staging dir rather than
-/// re-implementing the TOCTOU-safe creation.
+/// Self-cleaning, CSPRNG-named `0o700` staging directory. Only restore uses
+/// it: it holds the pinned archive copy and the extracted tree.
 pub(crate) struct StagingDir {
     path: PathBuf,
 }
@@ -539,7 +837,7 @@ impl Drop for StagingDir {
     }
 }
 
-fn extract_archive(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+fn extract_archive(archive: &Path, dest: &Path, scratch: &Path) -> anyhow::Result<()> {
     // Defend against a hostile backup archive. Before extracting,
     // list the members and reject any that could write outside `dest`:
     // absolute paths, `..` traversal, or symlink/hardlink members (a crafted
@@ -549,17 +847,11 @@ fn extract_archive(archive: &Path, dest: &Path) -> anyhow::Result<()> {
     // GNU tar strips leading `/` and refuses `..` by default, but BSD/busybox
     // tar are weaker — so we enforce it ourselves rather than trust the
     // extractor.
-    reject_hostile_members(archive)?;
+    reject_hostile_members(archive, scratch)?;
 
-    // `-C <dest>` must precede `-f <archive>` so it targets the extraction
-    // destination rather than further positional args. No extra extract flag
-    // is needed: `reject_hostile_members` above is the portable enforcement,
-    // and GNU tar additionally strips leading `/` and refuses `..` by default.
-    let status = std::process::Command::new("tar")
-        .arg("-C")
-        .arg(dest)
-        .arg("-xzf")
-        .arg(archive)
+    // `reject_hostile_members` above is the portable path enforcement, and
+    // GNU tar additionally strips leading `/` and refuses `..` by default.
+    let status = tar_command(archive, TarRun::Extract(dest))
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run tar: {}", e))?;
     if !status.success() {
@@ -572,20 +864,30 @@ fn extract_archive(archive: &Path, dest: &Path) -> anyhow::Result<()> {
 /// extraction: absolute paths, `..` traversal, or symlink/hardlink members.
 /// Two passes so neither check is fooled by member names containing spaces:
 /// `-tzf` yields one exact member path per line (path-safety check), `-tvzf`
-/// adds the leading type column (`l` symlink, `h` hardlink).
-fn reject_hostile_members(archive: &Path) -> anyhow::Result<()> {
-    for name in run_tar_list(archive, &["-tzf"])?.lines() {
-        let name = name.trim_end_matches('/'); // dir entries list with a trailing '/'
-        if name.is_empty() {
-            continue;
-        }
-        if is_unsafe_member_path(name) {
-            anyhow::bail!(
-                "refusing archive: member '{name}' is absolute or contains '..' \
-                 (path traversal) — a backup must not write outside the staging dir"
+/// adds the leading type column (`l` symlink, `h` hardlink) and the size.
+/// The passes also cap the member count and the announced extracted bytes.
+fn reject_hostile_members(archive: &Path, scratch: &Path) -> anyhow::Result<()> {
+    let mut members = 0_usize;
+    run_tar_list(
+        tar_command(archive, TarRun::Names),
+        archive,
+        scratch,
+        |name| {
+            members += 1;
+            anyhow::ensure!(
+                members <= MAX_ARCHIVE_MEMBERS,
+                "refusing archive: more than {MAX_ARCHIVE_MEMBERS} members"
             );
-        }
-    }
+            let name = name.trim_end_matches('/'); // dir entries list with a trailing '/'
+            if !name.is_empty() && is_unsafe_member_path(name) {
+                anyhow::bail!(
+                    "refusing archive: member '{name}' is absolute or contains '..' \
+                 (path traversal) — a backup must not write outside the staging dir"
+                );
+            }
+            Ok(())
+        },
+    )?;
     // Second pass: the leading type column of `-tvzf` classifies each member.
     // Whitelist regular files (`-`) and directories (`d`); reject everything
     // else — symlink (`l`), hardlink (`h`), char/block device (`c`/`b`), FIFO
@@ -594,37 +896,148 @@ fn reject_hostile_members(archive: &Path) -> anyhow::Result<()> {
     // (`tar -czf` of the config dir) holds only files and dirs, so this is a
     // fail-fast on obviously-hostile archives; the descriptor-rooted copy
     // re-checks extracted entries before they enter the live tree.
-    for line in run_tar_list(archive, &["-tvzf"])?.lines() {
-        match line.as_bytes().first() {
-            None => {}                    // blank line
-            Some(b'-') | Some(b'd') => {} // regular file or directory — allowed
-            Some(_) => anyhow::bail!(
-                "refusing archive: member is not a regular file or directory \
+    let mut total = 0_u64;
+    run_tar_list(
+        tar_command(archive, TarRun::Long),
+        archive,
+        scratch,
+        |line| {
+            match line.as_bytes().first() {
+                None => return Ok(()),        // blank line
+                Some(b'-') | Some(b'd') => {} // regular file or directory — allowed
+                Some(_) => anyhow::bail!(
+                    "refusing archive: member is not a regular file or directory \
                  — symlink/hardlink/device/fifo/socket members can escape the \
                  staging directory ({})",
-                line.trim()
-            ),
-        }
+                    line.trim()
+                ),
+            }
+            let size = listed_member_size(line).with_context(|| {
+                format!(
+                    "refusing archive: unexpected listing line ({})",
+                    line.trim()
+                )
+            })?;
+            total = total.saturating_add(size);
+            anyhow::ensure!(
+                total <= MAX_EXTRACTED_BYTES,
+                "refusing archive: its members hold more than {MAX_EXTRACTED_BYTES} bytes"
+            );
+            Ok(())
+        },
+    )
+}
+
+/// The size column of a `tar --numeric-owner -tv` line for a regular file or
+/// a directory, or `None` unless the mode, `UID/GID` and size columns have
+/// exactly that shape. Numeric owners keep a group name with a space and a
+/// digit from shifting the size column.
+fn listed_member_size(line: &str) -> Option<u64> {
+    let mut fields = line.split_whitespace();
+    let (mode, owner, size) = (fields.next()?, fields.next()?, fields.next()?);
+    let digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    let mode_ok = mode.len() == 10
+        && mode.starts_with(['-', 'd'])
+        && mode.bytes().skip(1).all(|b| b"rwxsStT-".contains(&b));
+    let owner_ok = owner
+        .split_once('/')
+        .is_some_and(|(uid, gid)| digits(uid) && digits(gid));
+    if mode_ok && owner_ok && digits(size) {
+        size.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// What one tar run does.
+enum TarRun<'a> {
+    /// `-t`: one member path per line.
+    Names,
+    /// `-tv` with numeric owners.
+    Long,
+    /// `-x` into the given directory, without the archive's owners or
+    /// set-id bits (GNU tar restores both by default when run as root).
+    Extract(&'a Path),
+}
+
+/// One tar run on `archive`. `TAR_OPTIONS` from the caller's environment
+/// could add flags, so it is removed.
+fn tar_command(archive: &Path, run: TarRun<'_>) -> std::process::Command {
+    let mut command = std::process::Command::new("tar");
+    command.env_remove("TAR_OPTIONS");
+    match run {
+        TarRun::Names => command.arg("-tzf"),
+        TarRun::Long => command.args(["--numeric-owner", "-tvzf"]),
+        // `-C <dest>` must precede `-f <archive>` so it names the destination.
+        TarRun::Extract(dest) => command
+            .args(["--no-same-owner", "--no-same-permissions", "-C"])
+            .arg(dest)
+            .arg("-xzf"),
+    };
+    command.arg(archive);
+    command
+}
+
+/// Run a tar listing and pass each stdout line to `each_line`. At most
+/// [`MAX_LISTING_BYTES`] are read; past that, or when `each_line` refuses,
+/// tar is killed and reaped. Stderr goes to an unnamed file in `scratch`, so
+/// no pipe can block tar, and at most its first 4 KiB are quoted.
+fn run_tar_list(
+    mut command: std::process::Command,
+    archive: &Path,
+    scratch: &Path,
+    mut each_line: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut stderr = tempfile::tempfile_in(scratch)?;
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr.try_clone()?)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to list archive {}: {}", archive.display(), e))?;
+    let stdout = child.stdout.take().context("tar listing has no stdout")?;
+    let scanned = scan_listing(stdout, &mut each_line);
+    if scanned.is_err() {
+        // Stop tar at once rather than reap it after a full listing.
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    scanned?;
+    if !status.success() {
+        let mut quoted = Vec::new();
+        stderr.rewind()?;
+        (&stderr)
+            .take(MAX_TAR_STDERR_BYTES)
+            .read_to_end(&mut quoted)?;
+        anyhow::bail!(
+            "cannot list archive {} ({}): {}",
+            archive.display(),
+            status,
+            String::from_utf8_lossy(&quoted).trim()
+        );
     }
     Ok(())
 }
 
-/// Run `tar <args> <archive>` and return stdout, erroring on non-zero exit.
-fn run_tar_list(archive: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("tar")
-        .args(args)
-        .arg(archive)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to list archive {}: {}", archive.display(), e))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "cannot list archive {} ({}): {}",
-            archive.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+fn scan_listing(
+    stdout: std::process::ChildStdout,
+    each_line: &mut impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut reader = std::io::BufReader::new(stdout.take(MAX_LISTING_BYTES + 1));
+    let mut seen = 0_u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(());
+        }
+        seen += read as u64;
+        anyhow::ensure!(
+            seen <= MAX_LISTING_BYTES,
+            "refusing archive: its listing is longer than {MAX_LISTING_BYTES} bytes"
         );
+        each_line(String::from_utf8_lossy(&line).trim_end_matches('\n'))?;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// True if `name` is an absolute path or contains a `..` / root component —
@@ -708,43 +1121,9 @@ fn locate_staged_master(staging: &Path, live_config: &Path) -> anyhow::Result<Pa
 }
 
 fn send_sighup_from_pid(pid_file: &Path) -> anyhow::Result<()> {
-    // Reuse the shared `u32` reader: it rejects a leading '-' at parse (so
-    // `-1`/`-N` can never reach `kill`), as well as empty/garbage content,
-    // and renders a clear operator error. A PID file of `-1` parsed as
-    // `i32` would turn `libc::kill(pid, SIGHUP)` into a host-wide broadcast
-    // when restore runs as root.
-    let pid = crate::cli::commands::pid::read_pid_file(pid_file)?;
-    // POSIX kill() overloads non-positive PIDs into broadcasts. Route the range
-    // check through the shared `pid::checked_pid` seam (the same guard
-    // stop/status/update use) so there is ONE validator; keep the PID-file path
-    // in the operator-facing error.
-    let pid = crate::cli::commands::pid::checked_pid(pid)
-        .map_err(|e| anyhow::anyhow!("{e} (from PID file {})", pid_file.display()))?;
-    // Liveness/identity gate: only signal a PID whose file is still `flock`-held
-    // by a live daemon (`acquire_pid_lock` holds `LOCK_EX` for the process
-    // lifetime). An unlocked file means the daemon exited and the kernel
-    // released the lock — the numeric PID may now belong to an unrelated
-    // process, and SIGHUP's default disposition terminates most processes, so
-    // signalling it could kill an innocent victim. Skip with a clear error
-    // instead; the caller prints the manual-reload hint.
-    if !crate::cli::commands::pid::pid_file_is_locked(pid_file) {
-        anyhow::bail!(
-            "PID file {} is not held by a running daemon (stale, or the daemon \
-             is stopped) — not sending SIGHUP",
-            pid_file.display()
-        );
-    }
-    // SAFETY: libc::kill with SIGHUP only wakes the target's signal handler;
-    // the kernel's permission check prevents delivery to processes the caller
-    // cannot signal. `pid` is validated `> 0` above, so this never broadcasts.
-    let rc = unsafe { libc::kill(pid, libc::SIGHUP) };
-    if rc != 0 {
-        anyhow::bail!(
-            "kill({pid}, SIGHUP) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
+    // The shared sender signals only the process that holds the PID-file lock
+    // and runs as the file's owner; each refusal names the PID file.
+    crate::cli::commands::pid::send_signal(pid_file, "HUP").map(drop)
 }
 
 #[cfg(test)]
@@ -2093,6 +2472,378 @@ servers = ["192.0.2.1:53"]
         assert_ne!(name, ".staging", "must not use the old predictable name");
     }
 
+    // ── pinned archive, tar flags and caps ─────────────────
+
+    /// A live tree at `BASE` and a source tree whose valid master differs
+    /// from it, so a restore that wrongly succeeds changes the live bytes.
+    fn live_and_source() -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+        let live_dir = tempfile::tempdir().unwrap();
+        let live = live_dir.path().join("config.toml");
+        std::fs::write(&live, BASE).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.toml"),
+            format!("{BASE}\n# archived\n"),
+        )
+        .unwrap();
+        (live_dir, live, source)
+    }
+
+    /// The refusal text of a restore that must fail before live effects.
+    fn refused(live: &Path, archive: &Path) -> String {
+        let error = match restore_archive(live, archive) {
+            Ok(_) => panic!("restore must refuse {}", archive.display()),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(std::fs::read_to_string(live).unwrap(), BASE);
+        assert_no_restore_artifacts(live.parent().unwrap());
+        error
+    }
+
+    #[test]
+    fn restore_refuses_a_symlinked_archive() {
+        let (_live_dir, live, source) = live_and_source();
+        let (output, archive) = raw_archive(source.path());
+        let link = output.path().join("link.tar.gz");
+        std::os::unix::fs::symlink(&archive, &link).unwrap();
+        let error = refused(&live, &link);
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn restore_refuses_an_archive_with_two_links() {
+        let (_live_dir, live, source) = live_and_source();
+        let (output, archive) = raw_archive(source.path());
+        std::fs::hard_link(&archive, output.path().join("second.tar.gz")).unwrap();
+        let error = refused(&live, &archive);
+        assert!(error.contains("unsafe or oversized archive"), "{error}");
+    }
+
+    #[test]
+    fn restore_uses_the_pinned_archive_bytes() {
+        let (_live_dir, live, source) = live_and_source();
+        let (_output, archive) = raw_archive(source.path());
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("config.toml"),
+            format!("{BASE}\n# swapped\n"),
+        )
+        .unwrap();
+        let (_other_output, swapped) = raw_archive(other.path());
+        let swapped_bytes = std::fs::read(&swapped).unwrap();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = std::rc::Rc::clone(&fired);
+        let target = archive.clone();
+        let outcome = write_lock::with_test_hook(
+            move |event| {
+                if event == write_lock::TestEvent::AfterArchivePinned {
+                    seen.set(seen.get() + 1);
+                    std::fs::rename(&swapped, &target).unwrap();
+                }
+            },
+            || restore_archive(&live, &archive),
+        );
+        assert!(matches!(
+            outcome.unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        assert_eq!(fired.get(), 1);
+        assert_eq!(std::fs::read(&archive).unwrap(), swapped_bytes);
+        assert_eq!(
+            std::fs::read_to_string(&live).unwrap(),
+            format!("{BASE}\n# archived\n")
+        );
+    }
+
+    #[test]
+    fn restore_refuses_an_oversized_archive() {
+        let (_live_dir, live, source) = live_and_source();
+        // Xorshift bytes do not compress, so the archive outgrows the cap.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let noise: Vec<u8> = (0..MAX_ARCHIVE_BYTES + 4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        std::fs::write(source.path().join("noise.bin"), noise).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let error = refused(&live, &archive);
+        assert!(error.contains("unsafe or oversized archive"), "{error}");
+    }
+
+    #[test]
+    fn restore_refuses_members_larger_than_the_extraction_cap() {
+        let (_live_dir, live, source) = live_and_source();
+        let zeros = vec![0_u8; usize::try_from(MAX_EXTRACTED_BYTES).unwrap() + 1];
+        std::fs::write(source.path().join("zeros.bin"), zeros).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+        let error = refused(&live, &archive);
+        assert!(
+            error.contains(&format!("more than {MAX_EXTRACTED_BYTES} bytes")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_too_many_members() {
+        let (_live_dir, live, source) = live_and_source();
+        for index in 0..MAX_ARCHIVE_MEMBERS {
+            std::fs::write(source.path().join(format!("extra-{index}.txt")), "").unwrap();
+        }
+        let (_output, archive) = raw_archive(source.path());
+        let error = refused(&live, &archive);
+        assert!(
+            error.contains(&format!("more than {MAX_ARCHIVE_MEMBERS} members")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_an_oversized_listing() {
+        let (_live_dir, live, source) = live_and_source();
+        // Few members with long names: under the member cap, over the
+        // listing cap.
+        let name = "n".repeat(200);
+        let count = usize::try_from(MAX_LISTING_BYTES).unwrap() / name.len() + 1;
+        assert!(count + 2 <= MAX_ARCHIVE_MEMBERS);
+        for index in 0..count {
+            std::fs::write(source.path().join(format!("{index}-{name}")), "").unwrap();
+        }
+        let (_output, archive) = raw_archive(source.path());
+        let error = refused(&live, &archive);
+        assert!(error.contains("listing is longer than"), "{error}");
+    }
+
+    #[test]
+    fn listing_parser_accepts_only_numeric_file_and_directory_lines() {
+        let date = "2026-10-13 06:00";
+        assert_eq!(
+            listed_member_size(&format!("-rw-r--r-- 0/0 12 {date} ./config.toml")),
+            Some(12)
+        );
+        assert_eq!(
+            listed_member_size(&format!("drwx------ 990/990 0 {date} ./packs/")),
+            Some(0)
+        );
+        assert_eq!(
+            listed_member_size(&format!("-rwsr-xr-T 65534/65534 7 {date} ./tool")),
+            Some(7)
+        );
+        for line in [
+            // A group name with a space and a digit would shift the size.
+            format!("-rw-r--r-- a/b 7 {date} ./spoof"),
+            format!("-rw-r--r-- user/group 7 {date} ./named"),
+            format!("-rw-r--r-- 0 7 {date} ./no-group"),
+            format!("-rw-r--r-- 0/0 7x {date} ./size"),
+            format!("-rw-r--r-- 0/0 1,3 {date} ./device-size"),
+            format!("-rw-r--r--- 0/0 7 {date} ./long-mode"),
+            format!("-rw-r--r-? 0/0 7 {date} ./odd-mode"),
+            format!("lrwxrwxrwx 0/0 0 {date} ./link -> target"),
+            "-rw-r--r-- 0/0".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(listed_member_size(&line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn tar_commands_use_safe_flags_and_drop_tar_options() {
+        let archive = Path::new("/staging/archive.tar.gz");
+        let tree = Path::new("/staging/tree");
+        for (run, expected) in [
+            (TarRun::Names, vec!["-tzf"]),
+            (TarRun::Long, vec!["--numeric-owner", "-tvzf"]),
+            (
+                TarRun::Extract(tree),
+                vec![
+                    "--no-same-owner",
+                    "--no-same-permissions",
+                    "-C",
+                    "/staging/tree",
+                    "-xzf",
+                ],
+            ),
+        ] {
+            let command = tar_command(archive, run);
+            let mut expected = expected;
+            expected.push("/staging/archive.tar.gz");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| key == "TAR_OPTIONS" && value.is_none()));
+        }
+    }
+
+    /// Root only: GNU tar run by any other user already drops archive owners
+    /// and set-id bits.
+    #[test]
+    fn restore_strips_setuid_and_archive_owners() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let source = tempfile::tempdir().unwrap();
+        let tool = source.path().join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::chown(&tool, Some(65534), Some(65534)).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let (_output, archive) = raw_archive(source.path());
+
+        let staging = tempfile::tempdir().unwrap();
+        let tree = staging.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        extract_archive(&archive, &tree, staging.path()).unwrap();
+        let meta = std::fs::metadata(tree.join("tool")).unwrap();
+        assert_eq!(meta.mode() & 0o7000, 0, "set-id bits must be dropped");
+        assert_ne!(meta.uid(), 65534, "the archive owner must not be kept");
+    }
+
+    // ── older schema archives ───────────────────────────────
+
+    #[test]
+    fn restore_refuses_a_schema_four_archive_with_a_next_step() {
+        let live_dir = tempfile::tempdir().unwrap();
+        let live = live_dir.path().join("config.toml");
+        std::fs::write(&live, BASE).unwrap();
+        let snapshot = |root: &Path| {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    (path, bytes)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot(live_dir.path());
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("config.toml"),
+            "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        )
+        .unwrap();
+        let (_output, archive) = raw_archive(source.path());
+
+        let error = match restore_archive(&live, &archive) {
+            Ok(_) => panic!("a schema-4 archive must be refused"),
+            Err(error) => error.to_string(),
+        };
+        for needle in [
+            "schema-4 archive",
+            "live config untouched",
+            "warden config edit",
+            &archive.display().to_string(),
+        ] {
+            assert!(error.contains(needle), "{needle}: {error}");
+        }
+        // The TUI prefixes "restore failed: " and shows about 105 characters.
+        let shown = &format!("restore failed: {error}")[..105];
+        assert!(shown.contains("live config untouched"), "{shown}");
+        assert_no_restore_artifacts(live_dir.path());
+        assert_eq!(snapshot(live_dir.path()), before);
+    }
+
+    // ── failed commits settle before return ─────────────────
+
+    /// An archive of `BASE` and a live master that differs from it.
+    fn edited_live_and_archive() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let source = tempfile::tempdir().unwrap();
+        let source_config = source.path().join("config.toml");
+        std::fs::write(&source_config, BASE).unwrap();
+        let archive = run_backup(&source_config, None).unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let live_config = live.path().join("config.toml");
+        std::fs::write(&live_config, format!("{BASE}\n# edited\n")).unwrap();
+        (source, live, live_config, archive)
+    }
+
+    #[test]
+    fn restore_rolls_back_at_once_when_promotion_fails() {
+        let (_source, live, live_config, archive) = edited_live_and_archive();
+        let before = std::fs::read(&live_config).unwrap();
+
+        policy_transaction::fail_at_promotion_for_test();
+        let error = restore_archive(&live_config, &archive)
+            .expect_err("a failed promotion must not report success")
+            .to_string();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(error.contains("live config unchanged"), "{error}");
+        assert_eq!(std::fs::read(&live_config).unwrap(), before);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+
+        assert!(matches!(
+            restore_archive(&live_config, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&live_config).unwrap(), BASE);
+    }
+
+    #[test]
+    fn restore_reports_applied_when_the_final_fsync_fails() {
+        let (_source, live, live_config, archive) = edited_live_and_archive();
+
+        policy_transaction::fail_at_root_fsync_for_test();
+        assert!(matches!(
+            restore_archive(&live_config, &archive).unwrap(),
+            RestoreOutcome::Restored {
+                changed: true,
+                repair: false,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(&live_config).unwrap(), BASE);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+    }
+
+    /// Restore is an operator write, so the undo cap applies: prepare
+    /// refuses before any member changes.
+    #[test]
+    fn restore_refuses_a_full_undo_store_and_says_unchanged() {
+        let (_source, live, live_config, archive) = edited_live_and_archive();
+        let before = std::fs::read(&live_config).unwrap();
+
+        policy_transaction::set_undo_cap_for_test(Some(1));
+        let error = restore_archive(&live_config, &archive)
+            .expect_err("a full undo store must refuse the restore")
+            .to_string();
+        policy_transaction::set_undo_cap_for_test(None);
+        assert!(error.starts_with("UndoStoreFull:"), "{error}");
+        assert!(error.ends_with("; live config unchanged"), "{error}");
+        assert_eq!(std::fs::read(&live_config).unwrap(), before);
+        assert!(!live.path().join(migration_journal::TXN_DIR_NAME).exists());
+
+        assert!(matches!(
+            restore_archive(&live_config, &archive).unwrap(),
+            RestoreOutcome::Restored { changed: true, .. }
+        ));
+    }
+
+    #[test]
+    fn uncertain_restore_names_the_recovery_section_and_never_unchanged() {
+        let message = uncertain_restore("txn-1", "req-1", "ENOSPC").to_string();
+        assert!(
+            message.contains("systemctl restart purge-warden"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "See \"{}\" in docs/UPGRADE_RECOVERY.md",
+                migration_journal::POLICY_RECOVERY_SECTION
+            )),
+            "{message}"
+        );
+        assert!(message.ends_with("(ENOSPC)"), "{message}");
+        assert!(!message.contains("unchanged"), "{message}");
+    }
+
     // ── PID validation before SIGHUP ────────────────────────
     //
     // A corrupt/hostile PID file must never reach `libc::kill` with a value
@@ -2100,7 +2851,7 @@ servers = ["192.0.2.1:53"]
     // negative through `as i32`). These drive the private helper directly with
     // a temp PID file and assert it errors *without* signalling. The
     // happy-path delivery (valid + flock-held → real SIGHUP) is covered by the
-    // `pid::pid_file_is_locked` unit tests and by CT-smoke against a live
+    // `pid::verified_daemon_pid` unit tests and by CT-smoke against a live
     // daemon — signalling self in-process would terminate the test runner.
 
     fn write_pidfile(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -2172,6 +2923,35 @@ servers = ["192.0.2.1:53"]
         );
     }
 
+    /// The lock holder is not the PID in the file: the daemon user rewrote
+    /// it. Root must not signal the named process.
+    #[test]
+    fn send_sighup_refuses_a_pid_that_does_not_hold_the_lock() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let _lock = crate::cli::commands::pid::acquire_pid_lock(&path).unwrap();
+        std::fs::write(&path, child.id().to_string()).unwrap();
+
+        let outcome = send_sighup_from_pid(&path);
+        // Give a delivered SIGHUP time to end the child before checking.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let err = outcome.expect_err("a PID that does not hold the lock must not be signalled");
+        assert!(
+            err.to_string()
+                .contains(&format!("held by PID {}", std::process::id())),
+            "the refusal must name the lock holder: {err}"
+        );
+        assert!(alive, "the named process must not be signalled");
+    }
+
     // ── staged-master selection ─────────────────────────────────────
 
     /// `backup.rs`'s sweep captures every non-dot top-level entry, so a
@@ -2236,5 +3016,145 @@ servers = ["192.0.2.1:53"]
 
         let picked = locate_staged_master(staging.path(), &live).unwrap();
         assert_eq!(picked.file_name().unwrap(), "warden.conf");
+    }
+
+    /// An archive taken while the node was a member, restored after
+    /// `cluster leave`, wrote `[cluster]` back and the node crash-looped.
+    #[test]
+    fn restore_never_changes_cluster_membership() {
+        let secondary = "schema_version = 5\n\n[server]\nlisten = \"127.0.0.1:15353\"\n\n\
+                         [cluster]\nenabled = true\nrole = \"secondary\"\n\
+                         peer = \"https://192.0.2.1\"\ntoken_hash = \"fixture-token-hash\"\n";
+        let primary =
+            format!("{BASE}\n[cluster]\nenabled = true\ntoken_hash = \"fixture-token-hash\"\n");
+        // The same node after `cluster create --migrate-legacy`.
+        let node = "00000000-0000-4000-8000-000000000001";
+        let v1 = format!(
+            "{BASE}\n[node]\nid = \"{node}\"\n\n[cluster]\nenabled = true\n\
+             membership_version = 1\ncluster_id = \"00000000-0000-4000-8000-000000000002\"\n\
+             primary_node_id = \"{node}\"\nprimary_cert_fingerprint = \"{}\"\n",
+            "ab".repeat(32)
+        );
+        let archive = |master: &str| {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::write(source.path().join("config.toml"), master).unwrap();
+            raw_archive(source.path())
+        };
+        let restore = |live: &str, archive: &Path| {
+            let root = tempfile::tempdir().unwrap();
+            let master = root.path().join("config.toml");
+            std::fs::write(&master, live).unwrap();
+            let result = restore_archive(&master, archive);
+            assert!(!root.path().join(migration_journal::TXN_DIR_NAME).exists());
+            (result, std::fs::read_to_string(&master).unwrap())
+        };
+        let (_member_dir, member) = archive(secondary);
+        let (_standalone_dir, standalone) = archive(BASE);
+        let (_own_dir, own) = archive(&primary);
+        let (_v1_dir, v1_own) = archive(&v1);
+
+        for (live, archive, expected) in [
+            (BASE, &member, "from standalone to secondary"),
+            (primary.as_str(), &standalone, "from primary to standalone"),
+            (
+                v1.as_str(),
+                &own,
+                "primary membership: the archive's cluster.membership_version differs",
+            ),
+            (
+                "[broken",
+                &member,
+                "membership is unknown and the archive's is secondary",
+            ),
+        ] {
+            let (result, after) = restore(live, archive);
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(expected) && error.contains("live config unchanged"),
+                "{error}"
+            );
+            assert_eq!(after, live);
+        }
+
+        let edited = |master: &str| format!("{master}# edited\n");
+        for (live, archive, master) in [
+            (edited(BASE), &standalone, BASE),
+            (edited(&primary), &own, primary.as_str()),
+            (edited(&v1), &v1_own, v1.as_str()),
+            ("[broken".to_owned(), &standalone, BASE),
+            (
+                secondary.replace("[server]", "damaged = true\n[server]"),
+                &member,
+                secondary,
+            ),
+        ] {
+            let (result, after) = restore(&live, archive);
+            assert!(
+                matches!(
+                    result.unwrap(),
+                    RestoreOutcome::Restored { changed: true, .. }
+                ),
+                "{live}"
+            );
+            assert_eq!(after, master);
+        }
+    }
+
+    /// A member whose live config does not load: even a standalone archive
+    /// would make it standalone, so node-local membership state refuses every
+    /// archive. A `[cluster]` the master leaves to an include is unknown too,
+    /// not standalone. Without that state the standalone archive restores.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn unknown_membership_of_a_member_refuses_every_archive() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("config.toml"), BASE).unwrap();
+        let (_archive_dir, standalone) = raw_archive(source.path());
+        let included = format!("damaged = true\nincludes = [\"conf.d/*.toml\"]\n{BASE}");
+        for (live, evidence) in [
+            ("[broken", "secondary.json"),
+            ("[broken", "roster.json"),
+            (included.as_str(), "secondary.json"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let master = root.path().join("config.toml");
+            std::fs::write(&master, live).unwrap();
+            let include = root.path().join("conf.d/cluster.toml");
+            let member = "[cluster]\nenabled = true\nrole = \"secondary\"\n";
+            std::fs::create_dir(root.path().join("conf.d")).unwrap();
+            std::fs::write(&include, member).unwrap();
+            let store = |write: bool| {
+                let guard = write_lock::acquire_for_migration(&master).unwrap();
+                let files = crate::private_store::PrivateStore::open(
+                    &guard,
+                    crate::cluster::membership::STORE,
+                )
+                .unwrap();
+                if write {
+                    files.create(evidence, b"{}").unwrap();
+                } else {
+                    files.remove(evidence).unwrap();
+                }
+            };
+            store(true);
+            let error = restore_archive(&master, &standalone)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("node-local cluster state shows it is a member")
+                    && error.contains("live config unchanged"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&master).unwrap(), live);
+            assert_eq!(std::fs::read_to_string(&include).unwrap(), member);
+            assert!(!root.path().join(migration_journal::TXN_DIR_NAME).exists());
+
+            store(false);
+            assert!(matches!(
+                restore_archive(&master, &standalone).unwrap(),
+                RestoreOutcome::Restored { changed: true, .. }
+            ));
+            assert_eq!(std::fs::read_to_string(&master).unwrap(), BASE);
+        }
     }
 }

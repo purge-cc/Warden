@@ -648,6 +648,7 @@ mod tests {
 
     #[test]
     fn welcome_uses_a_fixed_seen_key_not_the_build_version() {
+        let _env = crate::cli::commands::hr2_test_support::ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var("XDG_CONFIG_HOME").ok();
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
@@ -671,6 +672,7 @@ mod tests {
 
     #[test]
     fn welcome_resolves_persist_path_when_xdg_or_home_is_set() {
+        let _env = crate::cli::commands::hr2_test_support::ENV_LOCK.blocking_lock();
         // Force XDG_CONFIG_HOME so we don't depend on ambient $HOME.
         let dir = tempfile::tempdir().unwrap();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();

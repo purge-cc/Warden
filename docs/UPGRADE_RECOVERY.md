@@ -21,10 +21,15 @@ cutover to
 candidate reads the installed tree and decides its schema before anything changes.
 An unknown or unreadable schema is refused with nothing changed. The gate then
 quiesces the daemon and backup service/timer, refuses while any process still
-executes the old ELF, and preserves that ELF and its unit. Next it runs the
+executes the old ELF, and preserves that ELF, its unit and the publication
+store (see [Publication store snapshot](#publication-store-snapshot)). Next it runs the
 forward steps for that schema and lints. It then installs one candidate
 generation, starts it, proves listener/allow/block health, and only then
 finalizes. Do not restart any old or new reader between migration phases.
+
+The commands in this reference run `install.sh --upgrade` from a source tree
+after `cargo build --release`. From an unpacked release bundle, add
+`--binary ./warden`. `get.sh --upgrade` adds it for you.
 
 | Installed schema | Forward steps | Finalize |
 |------------------|---------------|----------|
@@ -33,9 +38,9 @@ finalizes. Do not restart any old or new reader between migration phases.
 | 5 | none | none; health alone commits the swap |
 
 For schema 4, the gate refuses before quiescing when `--check` fails or reports
-`apply blocked: true`. Review those findings with
-`<candidate-elf> --config <master> migrate v4-to-v5 --check --json`, resolve them,
-and run the upgrade again. The plan and the apply receipt are written to a new
+`apply blocked: true`. [Migration findings](#migration-findings) shows how to
+review those findings, accept the ones that allow it, and run the upgrade
+again. The plan and the apply receipt are written to a new
 root-only directory, `/var/tmp/purge-warden-v4-to-v5.XXXXXX`, whose path the gate
 prints. `/var/tmp` survives a reboot, so the receipt is still there for a manual
 rollback. `WARDEN_UPGRADE_WORK_ROOT` replaces `/var/tmp`; `TMPDIR` is ignored. Before
@@ -57,13 +62,175 @@ the positive allow proof and still requires both the listener and the exact
 configured block response. Empty probe names and unknown contracts are refused
 before maintenance begins.
 
-Forward work and post-health finalization each have a finite 300-second window
-by default (`WARDEN_UPGRADE_FORWARD_TIMEOUT_SECS`). Health has its own
+The probes go to `127.0.0.1`. If the daemon's `listen` holds only a
+non-loopback address, set `WARDEN_UPGRADE_DNS_SERVER` to that address, for
+example `sudo WARDEN_UPGRADE_DNS_SERVER=192.0.2.10 ./scripts/install.sh --upgrade`.
+Without it the health window runs out and the upgrade rolls back. The fresh
+install's checks always query `127.0.0.1`: with such a `--listen` it leaves a
+running daemon but exits with status 5.
+
+Forward work, post-health finalization and, in a rollback, the copy of the
+publication store back each have a finite 300-second window by default
+(`WARDEN_UPGRADE_FORWARD_TIMEOUT_SECS`). Health has its own
 300-second window (`WARDEN_UPGRADE_HEALTH_TIMEOUT_SECS`). Each recovery phase is
 bounded independently by `WARDEN_UPGRADE_RECOVERY_TIMEOUT_SECS`, 15 seconds by
 default, so a hung rollback cannot consume the opportunity to restore the exact
 old ELF and unit from inode-verified backups. These values may be raised for a
-known slow host, but must remain positive integers.
+known slow host, but must remain positive integers. A daemon that fails at boot
+reads active for a moment after each start, and a daemon binds its DNS listener
+only once its lists are loaded. So recovery reports the old daemon restored only
+once it answers the listener probe and is still active, within the health
+window (at least the recovery window).
+
+## Migration findings
+
+Schema 5 reads some schema-4 rules differently, for example wildcard, regex or
+`$important` rules. The candidate reports each such case as a finding, and the
+upgrade stops with nothing changed while any finding blocks apply. Run every
+command below as root. `--check` takes the configuration read lock and changes
+nothing.
+
+1. List the findings:
+
+   ```bash
+   <candidate-elf> --config <master> migrate v4-to-v5 --check --json
+   ```
+
+   For each entry in `findings`, read `code`, `scope` (where it applies, for
+   example `profile:default:admin:<rule id>`), `cause` and `allowed_remedies`,
+   plus `witness`, `before` and `after` when present.
+2. Accept only the findings whose `allowed_remedies` include
+   `accept_v5_semantics`. A finding that allows only `defer`, such as
+   `cluster_local_policy_conflict` or `target_budget_exceeded`, cannot be
+   accepted and keeps the upgrade refused. For `cluster_local_policy_conflict`,
+   see [Cluster secondaries](#cluster-secondaries).
+3. Write a choices file with the `source_config_revision` of the same output and
+   one entry for each accepted finding:
+
+   ```json
+   {"choices_version": 1, "planner_version": 1,
+    "source_config_revision": "<source_config_revision from --check --json>",
+    "finding_decisions": [{"finding_id": "<finding_id>", "decision": "accept_v5_semantics"}]}
+   ```
+
+   Store it owned by root and not group or world writable, for example
+   `/root/choices.json`. Its directory and each parent must be a real directory
+   owned by root and, if group or others can write it, sticky. The gate refuses
+   any other file with nothing changed.
+4. Run the upgrade again with the file:
+
+   ```bash
+   sudo WARDEN_UPGRADE_MIGRATION_CHOICES=/root/choices.json ./scripts/install.sh --upgrade
+   ```
+
+   With `get.sh`, put the same variable after `sudo`. Write it as
+   `sudo VAR=value command`: `VAR=value sudo command` loses the variable.
+
+`<candidate-elf> --config <master> migrate v4-to-v5 --check --choices /root/choices.json`
+shows the result without upgrading: it prints `apply blocked: false` when the
+file accepts every blocking finding. Any configuration change after the check
+makes the file stale, and the check then fails with `StaleChoices`: list the
+findings and write the file again.
+
+## Cluster secondaries
+
+A schema-4 (v0.41) cluster secondary cannot be upgraded in place: its check
+reports `cluster_local_policy_conflict`, which allows only `defer`. Take it out
+of the cluster first, upgrade both nodes, then join it again with an
+invitation:
+
+1. On the secondary, still on v0.41, run `warden cluster leave`. If it asks for
+   a resolver, run `warden cluster leave --upstream <addr:port>`.
+2. Upgrade the secondary as a standalone node.
+3. Upgrade the primary.
+4. On the primary, run
+   `warden cluster create --migrate-legacy --san <primary address>`, then
+   `warden cluster apply --preview-id <id>`, then restart it with
+   `systemctl restart purge-warden`. `--san` is the address the secondary uses
+   to reach the primary; without it the create is refused. The create turns
+   the API on and keeps its listen address (`127.0.0.1:8053` unless
+   `[api] listen` sets another). If the API is off or listens on loopback, add
+   `--api-listen <addr:port>` with an address the secondary can reach;
+   otherwise it is optional.
+5. On the primary, run `warden cluster invite`.
+6. On the secondary, run
+   `warden cluster join --peer <primary https origin> --invitation-file <file>`,
+   then `warden cluster apply --preview-id <id>`, then restart it with
+   `systemctl restart purge-warden`.
+
+`warden config restore` never changes cluster membership. It refuses an archive
+taken with another membership than the node has now: as standalone, primary or
+secondary when the node is something else now, or, for a member, with another
+cluster ID, node ID, primary node ID, membership version, primary certificate
+fingerprint or (on a secondary) primary address. On a secondary it also
+refuses to replace the files the primary replicates. When the live master
+does not parse, restore cannot read the node's membership: if the node's
+cluster state shows it is a member, restore refuses every archive (run
+`warden config lint` to see the error, fix it by hand, then restore); a
+standalone node still restores a standalone archive. Every refusal leaves the
+live configuration unchanged.
+
+`warden cluster create`, `warden cluster join`, a primary recovery
+(`warden node recover-primary`) and a secondary that follows its primary to a
+new address or certificate each change the role or one of these fields, so
+every archive taken before the change is refused afterwards: run
+`warden config backup` once the change is applied. For example, after
+`warden cluster create --migrate-legacy` the newest archive may be one taken
+before the create or one taken after it. Pick the archive by its time:
+`--latest` is refused when the newest archive predates the create.
+
+To restore a backup on a secondary, take the node out of the cluster, restore
+an archive taken while it was standalone (after it left, or before it joined),
+and join again:
+
+1. On the secondary, run `warden cluster leave`, then
+   `warden cluster apply --preview-id <id>`, then restart it with
+   `systemctl restart purge-warden`.
+2. Restore an archive taken while the node was standalone:
+   `warden config restore <archive>`. An archive taken while it was a member is
+   refused.
+3. On the primary, run `warden cluster revoke <node-id>`, then
+   `warden cluster invite`. The primary still lists the node after it leaves
+   and refuses its new join until it is revoked. `warden cluster status` shows
+   the node ID: on the secondary as `node_id`, on the primary in `roster`.
+4. On the secondary, run
+   `warden cluster join --peer <primary https origin> --invitation-file <file>`,
+   then `warden cluster apply --preview-id <id>`, then restart it.
+
+## Upgrading a failed daemon
+
+The gate needs the old daemon active, with one exception: for a schema-5 master
+it also accepts a `purge-warden.service` that systemd reports as `failed`. This
+recovers a host whose installed version no longer starts, such as a 0.42.0 or
+0.43.0 host that refuses to start with `receipt identity mismatch` after a
+reboot. The schema-5 swap changes no configuration, so the upgrade runs as
+usual and the candidate's health proof decides the result. Schemas 3 and 4
+still require an active daemon. If an earlier upgrade ended with
+`RECOVERY REQUIRED`, follow [End states after exit 75](#end-states-after-exit-75)
+first: a v4-to-v5 upgrade that exits 75 can leave a schema-5 master with the
+schema-4 ELF, which fails after a reboot, and upgrading that host would leave
+the v4-to-v5 receipt unfinalized.
+
+If the upgrade fails after it stops the daemon, the gate restores the exact old
+ELF and unit and the publication store, starts the old daemon once without
+waiting for it, restarts the
+backup timer if it was active, and exits non-zero with
+`the exact old ELF and unit were restored`. An old version that cannot start
+fails again within about 30 seconds, as it did before the upgrade, and DNS
+stays down; after a transient failure it may run again instead. Nothing is
+left to undo: the gate output and `journalctl -u purge-warden.service` show
+why the upgrade failed.
+
+Any other state is refused with nothing changed, and the message names the
+state. `activating` means systemd is still retrying the start: wait until
+`systemctl is-active purge-warden.service` prints `active` or `failed`, then run
+the upgrade again. `inactive` means the daemon was stopped: start it, then run
+the upgrade again; if it fails to start, the upgrade accepts it.
+
+While the daemon is down, a host that resolves names through its own Warden
+resolves nothing, so the bundle download and the installer's network check
+fail. Give the host another resolver for the upgrade, for example a temporary
+`nameserver` line in `/etc/resolv.conf`, and restore it afterwards.
 
 ## Schema 3
 
@@ -96,10 +263,11 @@ migration rollback snapshot with:
 Finalization is the rollback cliff: after it, the migration CLI has no retained
 schema-3 snapshot to restore. A finalize failure after health is not permission to
 start the old daemon; keep the healthy candidate running, inspect the retained
-evidence, and retry `--finalize`. Never delete `.warden-migration` or
-`.warden-migration.cleanup-*` by hand. Directory flock and directory fsync require
-supported local Linux filesystem semantics; network filesystem behavior is not
-certified.
+evidence, and retry `--finalize`. Once it succeeds, delete the
+`publication store snapshot: <dir>` directory, if the upgrade printed one.
+Never delete `.warden-migration` or `.warden-migration.cleanup-*` by hand.
+Directory flock and directory fsync require supported local Linux filesystem
+semantics; network filesystem behavior is not certified.
 
 ## Schema 4 and exit 75
 
@@ -131,14 +299,16 @@ operator recovery; retained migration evidence must not be discarded.
 ## Manual schema-4 recovery
 
 Use these commands only to recover from exit 75 or from a killed upgrade, never
-as a replacement for `install.sh --upgrade`. Run them as root, with the daemon,
-the backup service and the backup timer stopped. Use the unpacked candidate ELF
+as a replacement for `install.sh --upgrade`. To accept findings, pass the
+choices file to `install.sh --upgrade` as
+[Migration findings](#migration-findings) shows. Run these commands as root,
+with the daemon, the backup service and the backup timer stopped. Use the unpacked candidate ELF
 from the release bundle, not `/usr/local/bin/warden`, and give the installed
 master with `--config`:
 
 ```bash
-<candidate-elf> --config <master> migrate v4-to-v5 --check
-<candidate-elf> --config <master> migrate v4-to-v5 --plan <new-file>
+<candidate-elf> --config <master> migrate v4-to-v5 --check [--choices <file>]
+<candidate-elf> --config <master> migrate v4-to-v5 --plan <new-file> [--choices <file>]
 <candidate-elf> --config <master> migrate v4-to-v5 --apply-plan <plan> --expect-plan-hash <hash>
 <candidate-elf> --config <master> migrate v4-to-v5 --rollback <receipt_id> --expect-revision <candidate_config_revision>
 <candidate-elf> --config <master> migrate v4-to-v5 --finalize <receipt_id>
@@ -161,7 +331,9 @@ it returns.
 `"already_restored"`. After `"not_found"` (finalize had committed) or
 `"not_applicable"` (the configuration changed after apply), follow end state b
 in [End states after exit 75](#end-states-after-exit-75) instead. After a
-confirmed `--rollback`, move each of
+confirmed `--rollback`, if the upgrade printed
+`publication store snapshot: <dir>`, put the store back as in
+[Publication store snapshot](#publication-store-snapshot). Then move each of
 `/usr/local/libexec/purge-warden/warden.s6-old` and
 `/etc/systemd/system/purge-warden.service.s6-old` that exists back over the
 installed binary or unit, run `systemctl daemon-reload` and
@@ -187,17 +359,22 @@ file exists, and otherwise the installed `/usr/local/libexec/purge-warden/warden
   running, run `systemctl daemon-reload` and
   `systemctl reset-failed purge-warden.service`, and start it (its journal
   shows why it did not restart). Once it runs, start the backup timer if it
-  is enabled and delete the `.s6-old` files that remain.
+  is enabled and delete the `.s6-old` files that remain, then the
+  `publication store snapshot: <dir>` directory if the upgrade printed one.
   `install.sh` skipped its post-upgrade steps; run the same
   `install.sh --upgrade` again to finish them.
 - `v4-to-v5 cannot roll back`: end state b.
+- `newer cluster policy epoch`: end state c.
 - `old daemon recovered but backup timer could not be restored`: the old
   version runs on the configuration it had before the upgrade. Start the backup
   timer if it is enabled.
+- `exact old ELF and unit were restored, but backup timer could not be
+  restored`: the old version is installed, as in
+  [Upgrading a failed daemon](#upgrading-a-failed-daemon). Start the backup
+  timer if it is enabled.
 - Any other message, any schema: end state a. These messages can follow a
   failure at any point of the upgrade, so its checks find the state instead of
-  the message. A `.s6-old` refusal whose lint fails, and the refusal to
-  upgrade a schema-5 master while the old daemon is inactive, also lead here.
+  the message. A `.s6-old` refusal whose lint fails also leads here.
 
 a. Restore the old version:
    1. Stop `purge-warden-backup.timer`, `purge-warden-backup.service` and
@@ -226,12 +403,17 @@ a. Restore the old version:
         the configuration as it is. Go on.
       - Otherwise start neither version: keep every file as it is and find out
         why the old ELF fails lint.
-   3. Move each `.s6-old` file that remains back over the installed binary or
+   3. If the failed upgrade printed `publication store snapshot: <dir>`, put
+      the store back as in
+      [Publication store snapshot](#publication-store-snapshot), after its
+      cluster epoch check. Move each
+      `.s6-old` file that remains back over the installed binary or
       unit, run `systemctl daemon-reload` even if no file moved (the gate may
       have loaded the candidate unit) and
       `systemctl reset-failed purge-warden.service`, and start
       `purge-warden.service`.
-   4. Start the backup timer if it is enabled.
+   4. Start the backup timer if it is enabled. Then delete the snapshot
+      directory, if the upgrade printed one.
 
 b. Keep the candidate: the configuration is schema 5, which the old binary
    cannot read, and `--rollback` answered `"not_found"` (finalize had committed)
@@ -276,7 +458,27 @@ b. Keep the candidate: the configuration is schema 5, which the old binary
       check that `systemctl is-active` reports it active.
    6. Start the backup timer if it is enabled, delete the two `.s6-old` files,
       and run the same `install.sh --upgrade` again to finish the post-upgrade
-      steps.
+      steps. Then delete the `publication store snapshot: <dir>` directory, if
+      the upgrade printed one.
+
+c. Keep the candidate on a cluster primary: it published a newer cluster policy
+   epoch than the publication store saved before the upgrade, and a secondary
+   that fetched that epoch refuses a lower one. Nothing was rolled back: the
+   candidate ELF, unit and configuration are installed, the old ELF and unit
+   remain as `.s6-old`, and the message names the snapshot directory.
+   1. Run `systemctl reset-failed purge-warden.service`, start
+      `purge-warden.service`, and find in its journal why it failed the health
+      probes described in [How the upgrade runs](#how-the-upgrade-runs).
+   2. Once it passes them, finish the upgrade. Schema 4: follow steps 5 and 6
+      of b, with the `receipt_id` in `receipt.json` in the plan and receipt
+      directory. Schema 3: first run
+      `<candidate-elf> migrate v3-to-v4 --from-config <master> --finalize`.
+      Schema 3 and 5: start the backup timer if it is enabled, delete the two
+      `.s6-old` files, and run the same `install.sh --upgrade` again to finish
+      the post-upgrade steps. Then delete the snapshot directory.
+   3. Go back instead only on a node that no secondary polls, for example one
+      whose `warden node status` lists no other node: stop the candidate and
+      follow a, which puts the saved store back.
 
 ## Signals
 
@@ -332,29 +534,135 @@ It can stop the gate at any point. The old ELF and unit can then remain only as
 `install.sh --upgrade` refuse to start while a `.s6-old` file exists, and their
 refusals give the manual recovery steps: with a v4-to-v5 receipt from that
 upgrade, use [Manual schema-4 recovery](#manual-schema-4-recovery); otherwise
-move the old files back if the old ELF still lints the master. If the gate was
+move the old files back and put the publication store back if the old ELF still
+lints the master. If the gate was
 killed after the health gate passed for schema 3 or 5, the candidate is already
 running and can be kept instead: for schema 3 first run
 `<candidate-elf> migrate v3-to-v4 --from-config <master> --finalize`; then start
 the backup timer if it is enabled, delete the two `.s6-old` files and run the
 same `install.sh --upgrade` again to finish the post-upgrade steps.
 
+## Publication store snapshot
+
+A candidate that starts commits its own records to the publication store,
+`.warden-cluster-publications` in the node state directory
+(`/var/lib/purge-warden` on a standard install). An older version may not start
+on them: 0.43.0 restart-loops with
+`enrollment policy snapshot changed during publication`. Before the candidate
+runs, the gate copies the whole store, with owners and modes, to a new
+root-only directory, `/var/tmp/purge-warden-store.XXXXXX` (under
+`WARDEN_UPGRADE_WORK_ROOT` if set), and prints it as
+`publication store snapshot: <dir>`. The copy is named
+`<dir>/.warden-cluster-publications` only once it is complete and on disk. A
+rollback replaces the store with that copy before it puts back the old ELF and
+unit, which also removes every file the candidate added: it copies the snapshot
+to a new root-only directory beside the store and renames that into place. If
+the host had no store before the upgrade, the gate prints no snapshot, and a
+rollback removes the store the candidate created. The gate
+deletes the snapshot after a completed transaction, and once it has started the
+old daemon on the restored store, also when the backup timer then does not
+start. After any other `RECOVERY REQUIRED` or a killed upgrade it stays until
+you delete it.
+
+Before you put the store back on a node where
+`warden config show --section cluster` shows `enabled = true`, compare the
+policy epochs of the live store and the snapshot:
+
+```sh
+grep -o '"high_water":[0-9]*' /var/lib/purge-warden/.warden-cluster-publications/*/state.json <dir>/.warden-cluster-publications/*/state.json
+```
+
+If a namespace has a higher value in the live store than in the snapshot (a
+namespace missing from the snapshot counts as 0), the candidate published a
+newer epoch that a secondary may have fetched. Then put the store back only on
+a node that no secondary polls (step 3 of end state c); otherwise follow end
+state c in [End states after exit 75](#end-states-after-exit-75).
+
+To put the store back by hand, stop `purge-warden.service` and run as root,
+with the snapshot the failed upgrade printed or, if its output is lost, the
+newest `/var/tmp/purge-warden-store.*` directory created by that upgrade. Any
+user can create directories in `/var/tmp`: use one only if `ls -ld <dir>` shows
+`drwx------` owned by `root root`. The copy goes to `/var/lib` first, where only
+root can write, and is renamed into the state directory:
+
+```sh
+rm -rf /var/lib/.purge-warden-store-restore
+cp -aT <dir>/.warden-cluster-publications /var/lib/.purge-warden-store-restore
+rm -rf /var/lib/purge-warden/.warden-cluster-publications
+mv -T /var/lib/.purge-warden-store-restore /var/lib/purge-warden/.warden-cluster-publications
+```
+
+`mv -T` is a rename only within one filesystem. If `/var/lib/purge-warden` is
+a symlink or a separate mount, use `<parent>/.purge-warden-store-restore` in
+place of `/var/lib/.purge-warden-store-restore`, where `<parent>` is the parent
+of `realpath /var/lib/purge-warden` if `stat -c %d` prints the same number for
+both, and otherwise `realpath /var/lib/purge-warden` itself.
+
+If the upgrade printed no snapshot, or `<dir>` holds no
+`.warden-cluster-publications` because the copy did not finish, the candidate
+did not run on the store the host had: put nothing back. If the old daemon then
+fails with `enrollment policy snapshot changed during publication`, the host
+had no store before the upgrade: stop the daemon and run only
+`rm -rf /var/lib/purge-warden/.warden-cluster-publications`.
+
+A rollback that failed while it swapped the store can leave
+`.warden-cluster-publications.XXXXXX` and `.warden-cluster-publications.XXXXXX.old`
+directories in the state directory. Delete them once the store is back.
+
+## Interrupted policy transactions
+
+`.warden-migration` in the config directory is the fence of an interrupted
+policy write or v4-to-v5 migration. Config commands refuse while it exists.
+
+- The daemon finishes or removes the fence at every start, so restart it with
+  `systemctl restart purge-warden`. Until then config commands may refuse.
+- For a v4-to-v5 fence, follow
+  [Manual schema-4 recovery](#manual-schema-4-recovery).
+- Never delete `.warden-migration`.
+
+If recovery fails at start, the daemon stops with "policy-transaction recovery
+failed before start", and systemd marks the unit failed after repeated
+restarts. To recover:
+
+1. Read the cause with `journalctl -u purge-warden -b`.
+2. Fix the cause. Common causes:
+   - a config file that the transaction writes changed after the crash; an
+     editor save replaces the file even when the bytes are identical;
+   - unsafe ownership or modes: the fence must be 0700 and its files 0600;
+   - `ReceiptStoreMismatch`: the receipts belong to another config tree.
+3. Run `systemctl reset-failed purge-warden`, then start the service.
+
+Safe mode does not serve DNS. To keep name resolution while you fix the cause,
+point clients at another resolver. If recovery still refuses, keep
+`.warden-migration` and the receipts and report the problem. Never delete them.
+
+If recovery fails while the daemon runs, operator-rule plans and changes
+through the daemon return 503 `storage_unavailable` with the cause. Reads keep
+working unless the cause is a `.warden-migration` fence, which also blocks
+reads. The daemon retries recovery in the background, first after 5 seconds,
+then at doubling intervals up to 1 minute. Fix the cause and the next retry
+makes changes available again. In safe mode the daemon does not retry: restart
+it once the cause is fixed.
+
 ## Evidence kept after a rollback
 
-A v4-to-v5 rollback keeps evidence for later inspection. The first two
-directories are in the node state directory, `/var/lib/purge-warden` on a
-standard install:
+A v4-to-v5 rollback keeps evidence for later inspection:
 
 - `.warden-policy-receipts/<namespace>/<key>.json` is the receipt of the rolled
-  back transaction.
+  back transaction. It is in the node state directory, `/var/lib/purge-warden`
+  on a standard install.
 - `.warden-policy-transactions/<namespace>/<key>` is its finished journal and
-  undo data.
+  undo data. It is in the config directory, `/etc/purge-warden` on a standard
+  install, or `/var/lib/purge-warden` on a host installed before the `/etc`
+  split that has not run `warden config relocate`.
 - `/var/tmp/purge-warden-v4-to-v5.*` holds the plan and the apply receipt.
 
 The receipt and its journal are kept for at least 24 hours. A later policy
-transaction then removes them. The gate removes the `/var/tmp` directory only
-after a completed transaction; after a rollback, remove it by hand once you no
-longer need it.
+transaction then removes them. Retained undo data is capped at 2 GiB per
+config: an operator policy write that would pass the cap refuses with
+`UndoStoreFull`, and the space frees as receipts expire 24 hours after each
+write. The gate removes the `/var/tmp` directory only after a completed
+transaction; after a rollback, remove it by hand once you no longer need it.
 
 A candidate that refuses to start, for example on a schema-4 master, first runs
 its startup recovery. That creates lock files and private state directories such

@@ -188,3 +188,132 @@ lists = {}
     )
     .unwrap();
 }
+
+#[test]
+fn real_cli_accepts_a_wildcard_finding_through_choices() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    let choices_path = root.path().join("choices.json");
+    let plan_path = root.path().join("migration-plan.json");
+    std::fs::write(
+        &config,
+        r#"schema_version = 4
+[server]
+default_profile = "base"
+[profiles.base]
+admin_rules = ["allow-advanced"]
+[[admin_rules]]
+id = "allow-advanced"
+rule = "@@||*.advanced.test^"
+[upstream]
+servers = ["192.0.2.1:53"]
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let choices = choices_path.to_str().unwrap();
+
+    let blocked = run(&config, &["migrate", "v4-to-v5", "--check"]);
+    assert_eq!(blocked.status.code(), Some(1));
+    let check = json(&run(&config, &["migrate", "v4-to-v5", "--check", "--json"]));
+    assert_eq!(check["blocked"], true);
+    let decisions: Vec<Value> = check["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| {
+            serde_json::json!({
+                "finding_id": finding["finding_id"],
+                "decision": "accept_v5_semantics",
+            })
+        })
+        .collect();
+    assert!(!decisions.is_empty());
+    let mut file = serde_json::json!({
+        "choices_version": 1,
+        "planner_version": 1,
+        "source_config_revision": check["source_config_revision"],
+        "finding_decisions": decisions,
+    });
+    std::fs::write(&choices_path, serde_json::to_vec(&file).unwrap()).unwrap();
+    std::fs::set_permissions(&choices_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let accepted = run(
+        &config,
+        &["migrate", "v4-to-v5", "--check", "--choices", choices],
+    );
+    assert!(
+        accepted.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let accepted = json(&run(
+        &config,
+        &[
+            "migrate",
+            "v4-to-v5",
+            "--check",
+            "--json",
+            "--choices",
+            choices,
+        ],
+    ));
+    assert_eq!(accepted["blocked"], false);
+    assert!(accepted["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|finding| finding["blocking"] == false));
+
+    file["finding_decisions"][0]["extra"] = Value::Bool(true);
+    let tampered_path = root.path().join("tampered.json");
+    std::fs::write(&tampered_path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let tampered = run(
+        &config,
+        &[
+            "migrate",
+            "v4-to-v5",
+            "--check",
+            "--choices",
+            tampered_path.to_str().unwrap(),
+        ],
+    );
+    assert!(!tampered.status.success());
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("unknown field `extra`"));
+
+    let planned = run(
+        &config,
+        &[
+            "migrate",
+            "v4-to-v5",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--choices",
+            choices,
+        ],
+    );
+    assert!(
+        planned.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(plan["blocked"], false);
+    let applied = run(
+        &config,
+        &[
+            "migrate",
+            "v4-to-v5",
+            "--apply-plan",
+            plan_path.to_str().unwrap(),
+            "--expect-plan-hash",
+            plan["plan_hash"].as_str().unwrap(),
+        ],
+    );
+    assert!(
+        applied.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(json(&applied)["persistence"], "committed");
+}

@@ -35,6 +35,9 @@ pub struct OperatorRuleJobConfig {
     pub blocking_concurrency: usize,
     pub plan_ttl: Duration,
     pub terminal_job_ttl: Duration,
+    /// First delay before a failed recovery runs again; it doubles up to
+    /// 60 s. `None` leaves recovery to a restart.
+    pub recovery_retry: Option<Duration>,
 }
 
 impl Default for OperatorRuleJobConfig {
@@ -48,6 +51,7 @@ impl Default for OperatorRuleJobConfig {
             blocking_concurrency: 8,
             plan_ttl: Duration::from_secs(15 * 60),
             terminal_job_ttl: Duration::from_secs(24 * 60 * 60),
+            recovery_retry: Some(Duration::from_secs(5)),
         }
     }
 }
@@ -107,6 +111,8 @@ struct Inner {
     profile_resolver: Mutex<Option<Arc<ProfileResolver>>>,
     on_durable_intent: DurableIntentCallback,
     recovered: AtomicBool,
+    last_recovery_error: Mutex<Option<String>>,
+    recovery_in_flight: AtomicBool,
     accepting: AtomicBool,
 }
 
@@ -213,6 +219,8 @@ impl OperatorRuleJobSupervisor {
             profile_resolver: Mutex::new(None),
             on_durable_intent,
             recovered: AtomicBool::new(false),
+            last_recovery_error: Mutex::new(None),
+            recovery_in_flight: AtomicBool::new(false),
             accepting: AtomicBool::new(true),
         });
         (
@@ -228,6 +236,8 @@ impl OperatorRuleJobSupervisor {
         let mut tasks = JoinSet::new();
         let concurrency = self.inner.config.concurrency;
         let mut stopping = false;
+        let mut delay = self.inner.config.recovery_retry;
+        let mut next_retry = tokio::time::Instant::now() + delay.unwrap_or_default();
         loop {
             if stopping {
                 while let Ok(job) = self.receiver.try_recv() {
@@ -292,6 +302,23 @@ impl OperatorRuleJobSupervisor {
                         tracing::error!(error = %error, "operator-rule job task failed");
                     }
                 }
+                // The stop drain above waits for a retry in flight. It holds
+                // at most the 30 s write-lock deadline, below the 90 s systemd
+                // stop timeout. A success fills recovery_backlog, which the
+                // loop top drains once join_next wakes it.
+                _ = tokio::time::sleep_until(next_retry), if delay.is_some()
+                    && !self.inner.recovered.load(Ordering::Acquire)
+                    && !self.inner.recovery_in_flight.load(Ordering::Acquire) =>
+                {
+                    self.inner.recovery_in_flight.store(true, Ordering::Release);
+                    let client = OperatorRuleJobClient { inner: self.inner.clone() };
+                    tasks.spawn(async move {
+                        let _ = client.recover().await;
+                        client.inner.recovery_in_flight.store(false, Ordering::Release);
+                    });
+                    delay = delay.map(|delay| (delay * 2).min(Duration::from_secs(60)));
+                    next_retry = tokio::time::Instant::now() + delay.unwrap_or_default();
+                }
                 else => break,
             }
         }
@@ -301,6 +328,44 @@ impl OperatorRuleJobSupervisor {
 
 impl OperatorRuleJobClient {
     pub async fn recover(&self) -> Result<RecoverySummary, OperatorRulesError> {
+        let result = self.recover_once().await;
+        let mut last = self
+            .inner
+            .last_recovery_error
+            .lock()
+            .expect("recovery error poisoned");
+        // Boot and background retries log here; a repeated failure stays quiet.
+        match &result {
+            Ok(summary) => {
+                tracing::info!(
+                    state = %summary.state,
+                    operation_id = ?summary.operation_id,
+                    "operator-rule transaction recovery complete"
+                );
+                *last = None;
+            }
+            Err(error) if last.as_deref() != Some(error.message.as_str()) => {
+                tracing::error!(
+                    error = %error,
+                    "operator-rule transaction recovery failed and mutations stay unavailable; {}",
+                    self.recovery_next_step()
+                );
+                *last = Some(error.message.clone());
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn recovery_next_step(&self) -> &'static str {
+        if self.inner.config.recovery_retry.is_some() {
+            "the daemon retries it in the background"
+        } else {
+            "restart the daemon once the cause is fixed"
+        }
+    }
+
+    async fn recover_once(&self) -> Result<RecoverySummary, OperatorRulesError> {
         let service = self.inner.service.clone();
         let result = tokio::task::spawn_blocking(move || {
             let guard = write_lock::acquire_for_migration(&service.master)
@@ -339,7 +404,7 @@ impl OperatorRuleJobClient {
             }
         };
         let service = self.inner.service.clone();
-        let pending = blocking(self.inner.blocking_slots.clone(), move || {
+        let pending = blocking_wait(self.inner.blocking_slots.clone(), move || {
             service.pending_completions()
         })
         .await?;
@@ -968,12 +1033,21 @@ impl OperatorRuleJobClient {
 
     fn ensure_ready(&self) -> Result<(), OperatorRulesError> {
         if self.inner.recovered.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(unavailable(
-                "operator-rule recovery has not completed successfully",
-            ))
+            return Ok(());
         }
+        let cause = self
+            .inner
+            .last_recovery_error
+            .lock()
+            .expect("recovery error poisoned")
+            .as_ref()
+            .map(|cause| format!(": {cause}"))
+            .unwrap_or_default();
+        Err(unavailable(format!(
+            "operator-rule recovery has not completed successfully{cause}; {}. See \"{}\" in docs/UPGRADE_RECOVERY.md",
+            self.recovery_next_step(),
+            crate::config::migration_journal::POLICY_RECOVERY_SECTION
+        )))
     }
 
     fn existing_submission(
@@ -1264,7 +1338,7 @@ async fn run_resumption(inner: Arc<Inner>, job: ResumeJobRequest) {
     let service = inner.service.clone();
     let lookup_actor = job.actor.clone();
     let operation_id = job.receipt.operation_id.clone();
-    let current = blocking(inner.blocking_slots.clone(), move || {
+    let current = blocking_wait(inner.blocking_slots.clone(), move || {
         service.operation(&lookup_actor, &operation_id)
     })
     .await;
@@ -1333,7 +1407,7 @@ async fn activate_committed(inner: Arc<Inner>, actor: &Actor, receipt: Receipt) 
     let queued_request_id = request_id.clone();
     let queued_operation_id = operation_id.clone();
     let queued_correlation_id = correlation_id.clone();
-    let queued = blocking(inner.blocking_slots.clone(), move || {
+    let queued = blocking_wait(inner.blocking_slots.clone(), move || {
         service.record_activation_queued(
             &queued_actor,
             &queued_request_id,
@@ -1485,7 +1559,7 @@ async fn complete_activation(
     let actor = actor.clone();
     let request_id = request_id.to_owned();
     let operation_id = operation_id.to_owned();
-    match blocking(inner.blocking_slots.clone(), move || {
+    match blocking_wait(inner.blocking_slots.clone(), move || {
         service.complete_activation(&actor, &request_id, &operation_id, completion)
     })
     .await
@@ -1506,7 +1580,7 @@ async fn record_receipt_audit(inner: Arc<Inner>, actor: &Actor, mut fallback: Re
     let actor = actor.clone();
     let request_id = fallback.request_id.clone();
     let operation_id = fallback.operation_id.clone();
-    match blocking(inner.blocking_slots.clone(), move || {
+    match blocking_wait(inner.blocking_slots.clone(), move || {
         service.record_receipt_audit(&actor, &request_id, &operation_id)
     })
     .await
@@ -1533,6 +1607,27 @@ async fn blocking<T: Send + 'static>(
             "operator-rule blocking-work capacity reached",
         )
     })?;
+    run_with_permit(permit, operation).await
+}
+
+/// Wait for a blocking slot instead of rejecting. Steps that finish an
+/// already durable commit use it, so busy reads delay them rather than leave
+/// the commit inactive. The caller must not hold a slot.
+async fn blocking_wait<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    operation: impl FnOnce() -> Result<T, OperatorRulesError> + Send + 'static,
+) -> Result<T, OperatorRulesError> {
+    let permit = slots
+        .acquire_owned()
+        .await
+        .map_err(|_| unavailable("operator-rule blocking-work slots closed"))?;
+    run_with_permit(permit, operation).await
+}
+
+async fn run_with_permit<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    operation: impl FnOnce() -> Result<T, OperatorRulesError> + Send + 'static,
+) -> Result<T, OperatorRulesError> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         operation()
@@ -2792,5 +2887,205 @@ lists = {}
         );
         let _ = shutdown.send(());
         supervisor.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_commit_steps_wait_for_blocking_slots() {
+        // Busy reads hold every blocking slot while the transaction commits.
+        let slots: Arc<std::sync::OnceLock<Arc<Semaphore>>> = Arc::default();
+        let held: Arc<Mutex<Option<OwnedSemaphorePermit>>> = Arc::default();
+        let (callback_slots, callback_held) = (slots.clone(), held.clone());
+        let callback: DurableIntentCallback = Arc::new(move |_| {
+            let slots = callback_slots.get().expect("slots are set before submit");
+            let permits = slots.clone().try_acquire_many_owned(8).unwrap();
+            *callback_held.lock().unwrap() = Some(permits);
+        });
+        let (_temp, client, mut activation_rx, shutdown, supervisor) =
+            fixture_with_activation(callback).await;
+        slots.set(client.inner.blocking_slots.clone()).unwrap();
+        let plan = create_plan(&client, "busy-slots").await;
+        let submitted = client
+            .submit(
+                actor(),
+                plan.plan_id,
+                plan.summary.plan_hash,
+                "busy-slots".into(),
+            )
+            .await
+            .unwrap();
+        let SubmitOutcome::Accepted { operation_id, .. } = submitted else {
+            panic!("first submission must be accepted");
+        };
+        let key = JobKey {
+            actor: actor().identity,
+            request_id: "busy-slots".into(),
+        };
+        tokio::time::timeout(ASYNC_IO_WATCHDOG, async {
+            loop {
+                if matches!(
+                    client.inner.jobs.lock().unwrap().get(&key).map(|job| &job.state),
+                    Some(JobState::Prepared(receipt))
+                        if receipt.persistence == PersistenceState::Committed
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // run_job swallows a callback panic, so prove the callback held the slots.
+        let permits = held
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the durable-intent callback holds every blocking slot");
+        assert_eq!(slots.get().unwrap().available_permits(), 0);
+        drop(permits);
+
+        let activation = tokio::time::timeout(ASYNC_IO_WATCHDOG, activation_rx.recv())
+            .await
+            .expect("the committed change must still be activated")
+            .unwrap();
+        activation
+            .completion
+            .send(ActivationResult::Applied(ActivePolicyIdentity {
+                daemon_instance_id: "d".repeat(32),
+                config_revision: activation.expected_config_revision.clone(),
+                operator_policy_hash: activation.expected_policy_hash.clone(),
+                resolver_generation: 1,
+            }))
+            .unwrap();
+        let terminal = tokio::time::timeout(
+            ASYNC_IO_WATCHDOG,
+            client.wait_terminal(&actor(), &operation_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(terminal.activation.state, "applied");
+        assert_eq!(terminal.audit, "recorded");
+        assert!(
+            !terminal
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("could not be recorded")),
+            "{:?}",
+            terminal.diagnostics
+        );
+
+        let _ = shutdown.send(());
+        supervisor.await.unwrap();
+    }
+
+    /// An empty 0700 fence is a legacy journal: recovery refuses it.
+    async fn blocked_recovery(
+        retry: Option<Duration>,
+    ) -> (
+        tempfile::TempDir,
+        OperatorRuleJobSupervisor,
+        OperatorRuleJobClient,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("config.toml"), CONFIG).unwrap();
+        let fence = temp
+            .path()
+            .join(crate::config::migration_journal::TXN_DIR_NAME);
+        std::fs::create_dir(&fence).unwrap();
+        std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service = Arc::new(OperatorRulesService::new(temp.path().join("config.toml")));
+        let (supervisor, client) = OperatorRuleJobSupervisor::new(
+            service,
+            OperatorRuleJobConfig {
+                recovery_retry: retry,
+                ..OperatorRuleJobConfig::default()
+            },
+            None,
+            Arc::new(|_| {}),
+        );
+        assert!(client.recover().await.is_err());
+        (temp, supervisor, client)
+    }
+
+    async fn plan_error(client: &OperatorRuleJobClient) -> OperatorRulesError {
+        client
+            .plan(
+                actor(),
+                BatchRequest {
+                    contract_version: 1,
+                    request_id: "blocked".into(),
+                    expected_config_revision: "unknown".into(),
+                    operations: Vec::new(),
+                    expected_plan_hash: None,
+                },
+                PageRequest::default(),
+                TransportLimits::REST,
+            )
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_is_retried_and_mutations_resume() {
+        let (temp, supervisor, client) = blocked_recovery(Some(Duration::from_millis(10))).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(supervisor.run(shutdown_rx));
+
+        let error = plan_error(&client).await;
+        assert_eq!(error.code, ErrorCode::StorageUnavailable);
+        assert!(
+            error
+                .message
+                .contains("a legacy migration journal requires its own recovery path"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("retries it in the background"),
+            "{}",
+            error.message
+        );
+
+        std::fs::remove_dir(
+            temp.path()
+                .join(crate::config::migration_journal::TXN_DIR_NAME),
+        )
+        .unwrap();
+        tokio::time::timeout(ASYNC_IO_WATCHDOG, async {
+            while !client.inner.recovered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a background retry must recover once the fence is gone");
+        let plan = create_plan(&client, "after-retry").await;
+        client
+            .submit(
+                actor(),
+                plan.plan_id,
+                plan.summary.plan_hash,
+                "after-retry".into(),
+            )
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_mode_recovery_error_says_restart() {
+        let (_temp, _supervisor, client) = blocked_recovery(None).await;
+
+        let error = plan_error(&client).await;
+        assert!(
+            error
+                .message
+                .contains("restart the daemon once the cause is fixed"),
+            "{}",
+            error.message
+        );
     }
 }

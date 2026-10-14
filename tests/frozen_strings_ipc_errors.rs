@@ -557,6 +557,10 @@ fn ipc_error_wire_payload_carries_no_path() {
         IpcError::ListRefreshCompletionTimeout,
         IpcError::ListRefreshAcceptanceDropped,
         IpcError::ListRefreshCompletionDropped,
+        IpcError::ListForgetBusy,
+        IpcError::ListForgetEnqueueTimeout,
+        IpcError::ListForgetAcceptanceTimeout,
+        IpcError::ListForgetCompletionTimeout,
         IpcError::ReloadChannelClosed,
         IpcError::ReloadNotAvailable,
         IpcError::ShutdownChannelClosed,
@@ -764,5 +768,27 @@ fn socket_server_audit_emits_carry_uid_field() {
          allow up to 2 audit emits without uid (e.g. the ipc.peer_uid.refused gate emit \
          which carries `peer_uid = ?other` for the rejected uid, and notify_reload's \
          `uid = ?peer_uid` which is in a separate macro form)"
+    );
+}
+
+#[test]
+fn ipc_error_list_forget_wait_errors_are_frozen() {
+    use purge_warden::ipc::errors::{
+        IPC_ERROR_LIST_FORGET_ACCEPTANCE_TIMEOUT, IPC_ERROR_LIST_FORGET_BUSY,
+        IPC_ERROR_LIST_FORGET_COMPLETION_TIMEOUT, IPC_ERROR_LIST_FORGET_ENQUEUE_TIMEOUT,
+    };
+    assert_eq!(
+        IPC_ERROR_LIST_FORGET_BUSY,
+        "too many list refresh or forget requests are already waiting; retry after one completes"
+    );
+    assert_eq!(
+        IPC_ERROR_LIST_FORGET_ENQUEUE_TIMEOUT,
+        "list forget could not be queued within 1 second; it was not accepted"
+    );
+    assert_eq!(IPC_ERROR_LIST_FORGET_ACCEPTANCE_TIMEOUT, "list forget was queued but the manager did not acknowledge it within 5 seconds; work may still complete. Do not retry automatically.");
+    assert_eq!(IPC_ERROR_LIST_FORGET_COMPLETION_TIMEOUT, "list forget is still running after 15 minutes; work may still complete. Do not retry automatically.");
+    assert_eq!(
+        IpcError::ListForgetCompletionTimeout.operator_message(),
+        IPC_ERROR_LIST_FORGET_COMPLETION_TIMEOUT
     );
 }

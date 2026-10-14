@@ -650,9 +650,25 @@ fn recovery_after_impact(error: &AdapterError) -> RecoveryAction {
     }
 }
 
+/// The daemon returns these only before it records an intent for the
+/// request (operator_rule_jobs.rs submit order; service.rs:443-452).
+/// PolicyOwnedByPrimary proves it only on the first send: the IPC
+/// secondary gate (socket_server.rs:840) refuses a retry before lookup.
+pub(super) fn refused_before_intent(error: &AdapterError, first_send: bool) -> bool {
+    error.kind == AdapterErrorKind::Remote
+        && (matches!(
+            error.code(),
+            ErrorCode::PlanConflict | ErrorCode::RevisionConflict
+        ) || (first_send && error.code() == ErrorCode::PolicyOwnedByPrimary))
+}
+
 fn recovery_after_apply(error: &AdapterError) -> RecoveryAction {
     match error.code() {
-        ErrorCode::PlanConflict => RecoveryAction::ReplayRequest,
+        ErrorCode::PlanConflict | ErrorCode::RevisionConflict
+            if error.kind == AdapterErrorKind::Remote =>
+        {
+            RecoveryAction::RefreshAndRedraft
+        }
         _ if matches!(
             error.kind,
             AdapterErrorKind::Transport | AdapterErrorKind::Protocol
@@ -665,10 +681,13 @@ fn recovery_after_apply(error: &AdapterError) -> RecoveryAction {
 }
 
 fn recovery_after_exact_apply(error: &AdapterError) -> RecoveryAction {
-    if error.code() == ErrorCode::PlanConflict {
-        RecoveryAction::ReplayRequest
-    } else {
-        RecoveryAction::RetryExactApply
+    if error.kind != AdapterErrorKind::Remote {
+        return RecoveryAction::RetryExactApply;
+    }
+    match error.code() {
+        ErrorCode::PlanConflict | ErrorCode::RevisionConflict => RecoveryAction::RefreshAndRedraft,
+        ErrorCode::PolicyOwnedByPrimary => RecoveryAction::ReplayRequest,
+        _ => RecoveryAction::RetryExactApply,
     }
 }
 

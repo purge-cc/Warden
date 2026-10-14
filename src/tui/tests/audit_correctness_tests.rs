@@ -866,3 +866,40 @@ async fn cancelling_text_filters_keeps_rows_and_does_not_request_fetch() {
         );
     }
 }
+
+#[tokio::test]
+async fn schema_four_restore_fails_with_the_archive_route_and_never_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = master(&dir);
+    let before = std::fs::read(&path).unwrap();
+    let source = dir.path().join("old");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(
+        source.join("config.toml"),
+        "schema_version = 4\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+    )
+    .unwrap();
+    let archive = dir.path().join("old.tar.gz");
+    assert!(std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&source)
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+
+    let (outcome, config, reload_error) =
+        execute_restore_with_reload(archive, path.clone(), async {
+            panic!("a refused restore must not reload")
+        })
+        .await;
+    assert!(
+        matches!(&outcome, backup_restore_modal::SubmitOutcome::Failed(message) if message.contains("schema-4")),
+        "{outcome:?}"
+    );
+    assert!(config.is_none());
+    assert!(reload_error.is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

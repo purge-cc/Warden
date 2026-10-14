@@ -485,3 +485,161 @@ async fn failed_primary_refresh_clears_live_pair_proof_until_successful_publicat
     );
     assert_eq!(manager.filter.domain_count(), 1);
 }
+
+/// Boot binds a primary that serves `Partial`; nothing may publish or
+/// claim a pair until a cycle covers every source.
+#[tokio::test]
+async fn cold_partial_primary_boot_never_publishes_or_claims_a_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store = Arc::new(CorpusStore::open(&root.path().join("config.toml")).unwrap());
+    let first = "https://origin.example.test/a";
+    let second = "https://origin.example.test/b";
+    write_cache_to_disk(
+        cache.path(),
+        first,
+        first,
+        "first.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut manager = manager(plan(&[first, second]), Arc::new(FilterEngine::new()));
+    manager.cache_dir = Some(cache.path().to_owned());
+    manager
+        .set_node_corpus_primary(Arc::clone(&store), artifact(), vec![])
+        .unwrap();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let unknown = Arc::clone(&events);
+    manager
+        .set_node_pair_unconfirmed_hook(Arc::new(move || unknown.lock().unwrap().push("unknown")));
+    let confirmed = Arc::clone(&events);
+    manager.set_node_active_pair_hook(Arc::new(move |_, _| {
+        confirmed.lock().unwrap().push("active")
+    }));
+    manager.load_disk_cache();
+    manager.refresh_with_mode(RefreshMode::CacheOnly).await;
+    assert_eq!(manager.served_state(), ServedState::Partial);
+    assert_eq!(manager.filter.domain_count(), 1);
+    assert!(store
+        .manifest_for_artifact(&artifact().artifact_hash)
+        .is_err());
+    assert_eq!(store.pair_state().unwrap().active, None);
+    assert!(manager.verify_node_corpus().is_err());
+    assert_eq!(*events.lock().unwrap(), vec!["unknown"]);
+
+    write_cache_to_disk(
+        cache.path(),
+        second,
+        second,
+        "second.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    manager.load_disk_cache();
+    manager.refresh_with_mode(RefreshMode::CacheOnly).await;
+    let published = store
+        .manifest_for_artifact(&artifact().artifact_hash)
+        .unwrap();
+    assert_eq!(published.sources.len(), 2);
+    assert_eq!(
+        store.pair_state().unwrap().active,
+        Some(published.generation)
+    );
+    manager.verify_node_corpus().unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["unknown", "unknown", "active"]
+    );
+}
+
+#[test]
+fn corrupt_primary_cache_record_keeps_lists_dir_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let lists = tempfile::tempdir().unwrap();
+    let store = Arc::new(CorpusStore::open(&root.path().join("config.toml")).unwrap());
+    std::fs::write(
+        root.path().join(".warden-node-corpus/primary-cache.json"),
+        b"not json",
+    )
+    .unwrap();
+    let mut primary = manager(
+        plan(&["https://origin.example.test/a"]),
+        Arc::new(FilterEngine::new()),
+    );
+    primary.cache_dir = Some(lists.path().to_owned());
+    primary
+        .set_node_corpus_primary(store, artifact(), vec![])
+        .unwrap();
+    assert_eq!(primary.cache_dir.as_deref(), Some(lists.path()));
+    assert!(primary.node_cache_lease.is_none());
+}
+
+#[tokio::test]
+async fn isolate_copies_body_across_filesystems() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let Ok(cache) = tempfile::tempdir_in("/dev/shm") else {
+        eprintln!("skipped: /dev/shm unavailable");
+        return;
+    };
+    let device = |path: &std::path::Path| std::fs::metadata(path).unwrap().dev();
+    if device(cache.path()) == device(root.path()) {
+        eprintln!("skipped: /dev/shm shares the corpus filesystem");
+        return;
+    }
+    let store = Arc::new(CorpusStore::open(&root.path().join("config.toml")).unwrap());
+    let url = "https://origin.example.test/a";
+    write_cache_to_disk(
+        cache.path(),
+        url,
+        url,
+        "blocked.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut candidate = manager(plan(&[url]), Arc::new(FilterEngine::new()));
+    candidate.cache_dir = Some(cache.path().to_owned());
+    candidate.isolate_candidate_cache(&store).unwrap();
+    let private = candidate.cache_dir.clone().unwrap();
+    let stem = source_to_cache_stem(url);
+    let meta = load_meta_file(&private.join(format!("{stem}.meta")));
+    let body = manifest_from_meta(&stem, &meta).unwrap().body;
+    assert!(private.join(body).is_file());
+    candidate.load_disk_cache();
+    candidate.refresh_with_mode(RefreshMode::CacheOnly).await;
+    candidate.verify_node_corpus().unwrap();
+}
+
+#[test]
+fn primary_does_not_publish_an_unverified_corpus() {
+    let root = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store = Arc::new(CorpusStore::open(&root.path().join("config.toml")).unwrap());
+    let url = "https://origin.example.test/a";
+    write_cache_to_disk(
+        cache.path(),
+        url,
+        url,
+        "blocked.example\n",
+        None,
+        None,
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut manager = manager(plan(&[url]), Arc::new(FilterEngine::new()));
+    manager.cache_dir = Some(cache.path().to_owned());
+    // A digest that no Complete cycle vouches for.
+    manager.installed_corpus_digest = Some([0; 32]);
+    manager
+        .set_node_corpus_primary(Arc::clone(&store), artifact(), vec![])
+        .unwrap();
+    assert!(store
+        .manifest_for_artifact(&artifact().artifact_hash)
+        .is_err());
+}

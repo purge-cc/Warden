@@ -899,7 +899,7 @@ fn plain_step(number: u8, action: Action) -> Step {
 }
 
 /// The file name of an `imported.local` blocklist body under `<root>/lists`.
-fn imported_local_name(url: &str) -> Option<String> {
+pub(crate) fn imported_local_name(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     if parsed.host_str() != Some(IMPORTED_LOCAL_HOST) {
         return None;
@@ -1278,7 +1278,7 @@ fn inspect_stores(guard: &MigrationWriteLock, state: &File, refusals: &mut Vec<R
     // The TUI resumes its journal when it opens, not the daemon.
     check(
         ".warden-tui-uor",
-        "start the daemon, open `warden tui` so it resumes or discards the pending policy change, quit it and stop the daemon, then rerun",
+        "start the daemon, open `warden dashboard` so it resumes or discards the pending policy change, quit it and stop the daemon, then rerun",
         crate::tui::relocate_recovery_settled(guard),
     );
     #[cfg(feature = "cluster")]
@@ -1292,7 +1292,7 @@ fn inspect_stores(guard: &MigrationWriteLock, state: &File, refusals: &mut Vec<R
         // Node operations advance only through the running daemon.
         check(
             ".warden-node-control",
-            "start the daemon, resume or cancel the operation in the Configuration / Nodes screen of `warden tui` until `warden node status` shows it complete or cancelled, stop the daemon, then rerun",
+            "start the daemon, resume or cancel the operation in the Configuration / Nodes screen of `warden dashboard` until `warden node status` shows it complete or cancelled, stop the daemon, then rerun",
             crate::cluster::node_control::relocate_settled(guard),
         );
         check(

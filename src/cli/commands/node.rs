@@ -35,6 +35,22 @@ pub async fn run_node(master: &Path, socket: &Path, action: NodeAction) -> anyho
                 false,
             )
         }
+        NodeAction::Cancel {
+            operation_id,
+            confirm,
+        } => {
+            anyhow::ensure!(
+                confirm,
+                "pass --confirm after checking `warden node status`"
+            );
+            (
+                NodeControlCommand::Cancel {
+                    preview_id: operation_id,
+                },
+                false,
+                false,
+            )
+        }
         NodeAction::RecoverPrimary {
             listen,
             apply_preview,
@@ -71,6 +87,9 @@ pub async fn run_node(master: &Path, socket: &Path, action: NodeAction) -> anyho
         println!("Role: {:?}", reply.status.membership.saved_role);
         if let Some(endpoint) = reply.status.control_endpoint {
             println!("Nodes address: {endpoint}");
+        }
+        for problem in &reply.status.runtime_problems {
+            println!("Problem: {problem}");
         }
         for peer in &reply.status.peers {
             println!(
@@ -207,5 +226,31 @@ mod tests {
             "review-id"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn add_cancel_requires_an_explicit_confirmation_flag() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "warden",
+                "node",
+                "cancel",
+                "--operation-id",
+                "review-id",
+                "--confirm"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Node {
+                action: NodeAction::Cancel {
+                    operation_id,
+                    confirm: true
+                }
+            }) if operation_id == "review-id"
+        ));
+        assert!(
+            Cli::try_parse_from(["warden", "node", "cancel", "--operation-id", "review-id"])
+                .is_err()
+        );
     }
 }

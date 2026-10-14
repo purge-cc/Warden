@@ -276,9 +276,12 @@ schema_version = 5
 [anti_bypass]
 # Block queries for the resolver domains listed explicitly below.
 # Requires security.enabled too; cannot stop direct IP or external VPN traffic.
-# enabled = true
+# Off by default. Listing extra_domains turns it on unless enabled = false is set.
+# enabled = false
 
 # Entire domain set for this checker. No built-in resolver list is supplied.
+# For a maintained list that your allow rules can override instead, run
+# `warden lists add services/resolvers`.
 # extra_domains = []
 
 # ── Local DNS ────────────────────────────────────────────────────

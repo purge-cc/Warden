@@ -1156,10 +1156,24 @@ impl ListManager {
                 if crate::cluster::corpus::verify_file(&mut file, &object).is_err() {
                     continue;
                 }
-                std::fs::hard_link(
-                    previous.join(manifest.body),
-                    workspace.path().join(manifest.body),
-                )?;
+                let body = previous.join(manifest.body);
+                let copy = workspace.path().join(manifest.body);
+                match std::fs::hard_link(&body, &copy) {
+                    Ok(()) => {}
+                    // A live refresh retired the body; the candidate fetches it again.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::warn!(%error, body = %body.display(), "cached list body vanished; fetching it again");
+                        continue;
+                    }
+                    // The lists cache is on another filesystem than the corpus.
+                    Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                        std::fs::copy(&body, &copy)?;
+                        let mut copied = std::fs::File::open(&copy)?;
+                        crate::cluster::corpus::verify_file(&mut copied, &object)?;
+                        copied.sync_all()?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 let raw = read_small_cache_file(&meta_path)?;
                 anyhow::ensure!(
                     write_cache_manifest(&workspace.path().join(format!("{stem}.meta")), &raw)?
@@ -1233,9 +1247,18 @@ impl ListManager {
         artifact.validate()?;
         anyhow::ensure!(self.source_plan.is_some(), "CorpusSourcePlanRequired");
         if self.node_candidate_cache.is_none() && self.installed_corpus_digest.is_none() {
-            if let Some((path, lease)) = store.lease_primary_cache()? {
-                self.cache_dir = Some(path);
-                self.node_cache_lease = Some(lease);
+            // An unusable record must not stop a host that can serve from
+            // its lists directory; the record stays as it is.
+            match store.lease_primary_cache() {
+                Ok(Some((path, lease))) => {
+                    self.cache_dir = Some(path);
+                    self.node_cache_lease = Some(lease);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    "recorded node list cache unusable; using the lists directory"
+                ),
             }
         }
         self.node_corpus = Some(NodeCorpusProvider::Primary {
@@ -1244,7 +1267,8 @@ impl ListManager {
             auxiliary,
             generation: None,
         });
-        if self.installed_corpus_digest.is_some() {
+        // Same rule as the refresh gate: never publish a Partial corpus.
+        if self.installed_corpus_digest.is_some() && self.verify_node_corpus().is_ok() {
             self.publish_node_corpus()?;
         }
         Ok(())
@@ -1380,9 +1404,8 @@ impl ListManager {
             *artifact = manifest.artifact.clone();
             *generation = Some(manifest.generation.clone());
         }
-        if let Some(hook) = &self.node_active_pair_hook {
-            hook(manifest.artifact.clone(), manifest.generation.clone());
-        }
+        // No active-pair hook: the commit precedes the runtime swap, and the
+        // reload records the pair once the new policy is installed.
         Ok(())
     }
 
@@ -1702,6 +1725,34 @@ impl ListManager {
     ) {
         *self.list_state.lock().unwrap_or_else(|e| e.into_inner()) = state;
         self.list_state_path = path;
+    }
+
+    /// Once this generation is live, move its retry state into the
+    /// daemon-owned handle IPC reads, take over both on-disk ledgers, and
+    /// write them once, so every later transition writes through. The
+    /// schedule ledger goes first: once IPC shows the new state, both
+    /// files hold it.
+    pub(crate) fn install_prepared_list_state(
+        &mut self,
+        live: Arc<std::sync::Mutex<crate::config::list_state::ListState>>,
+        list_state_path: PathBuf,
+        schedule_state_path: PathBuf,
+    ) {
+        self.schedule_state_path = Some(schedule_state_path);
+        self.persist_schedule_state();
+        let prepared = self
+            .list_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+        *state = prepared;
+        if let Err(error) = state.write_atomic(&list_state_path) {
+            tracing::warn!(path = %list_state_path.display(), %error, "failed to persist list_state.toml after reload");
+        }
+        drop(state);
+        self.list_state = live;
+        self.list_state_path = Some(list_state_path);
     }
 
     /// Install the canonical scheduler ledger read by the process owner.
@@ -4485,6 +4536,9 @@ impl ListManager {
             // `fetched_at`. Leaving the registry untouched carries the
             // prior status forward verbatim; the source's domains still
             // reached the map via `added` above regardless of this branch.
+            // The one exception is the runtime `cache_loaded` flag on a row
+            // that has never refreshed: it records the cache load as what
+            // it is, and leaves the outcome and every timestamp alone.
             let cache_admission_ready = !cache_admission_sources.contains(&p.source)
                 || cache_admission_committed.contains(&p.source);
             if p.verified_fresh
@@ -4501,6 +4555,16 @@ impl ListManager {
                     now,
                 );
                 publish_list_stats_updated(&self.notification_tx, &p.source);
+            } else if !spill_poisoned && (installed || unchanged) && cache_admission_ready {
+                if let Some(prior) = self.status_registry.status_for_url(&p.source) {
+                    if matches!(prior.last_outcome, LastOutcome::NeverFetched)
+                        && !prior.cache_loaded
+                    {
+                        let mut loaded = (*prior).clone();
+                        loaded.cache_loaded = true;
+                        self.status_registry.update_for_url(&p.source, loaded);
+                    }
+                }
             }
             match p.age_secs {
                 Some(age_secs) => tracing::info!(
@@ -5138,7 +5202,7 @@ impl ListManager {
 
     /// Remove legacy files and exact generation bodies for removed sources;
     /// also reclaim active-stem generation orphans selected by no valid manifest.
-    pub fn cleanup_stale_caches(&self) {
+    pub fn cleanup_stale_caches(&self, spool_min_age: Duration) {
         #[cfg(feature = "cluster")]
         if self.is_node_secondary() {
             return;
@@ -5160,6 +5224,7 @@ impl ListManager {
                 return;
             }
         }
+        remove_download_spools(cache_dir, spool_min_age);
 
         let active_stems: HashSet<String> = self
             .sources
@@ -5196,6 +5261,43 @@ impl ListManager {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Remove the download spools a killed process left in `dir`: regular
+/// files named `.<stem>.download-*` at least `min_age` old. A future
+/// modification time counts as fresh.
+pub(crate) fn remove_download_spools(dir: &Path, min_age: Duration) {
+    // ponytail: name and age match without a lock; add a lock if a foreground refresh ever runs beside the daemon.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with('.') && name.contains(".download-")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if !meta.is_file() || age < min_age {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file = %name, "removed dead list download spool"),
+            Err(error) => tracing::warn!(
+                file = %path.display(),
+                %error,
+                "failed to remove list download spool"
+            ),
         }
     }
 }
@@ -8224,9 +8326,10 @@ async fn run_policy_rebind(
                     }
                 };
                 *manager = Some(returned);
-                let failed = result.is_err();
                 let _ = completed.send(result);
-                return !failed; // A failed post-swap commit may never run an old refresh.
+                // A failed commit is a rejection: the old pair stays and this
+                // actor keeps refreshing it.
+                return true;
             }
             command = recv_or_pending(cmd_rx) => {
                 match command {

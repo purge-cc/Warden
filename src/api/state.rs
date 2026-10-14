@@ -20,8 +20,9 @@ pub struct ApiState {
     pub stats: Option<Arc<StatsEngine>>,
     /// Path to config.toml (for mutation endpoints).
     pub config_path: PathBuf,
-    /// SHA-256 hash of the valid API token.
-    pub token_hash: String,
+    /// SHA-256 hash of the valid API token. Shared with
+    /// `DaemonState.api_token_hash`; a reload swaps it.
+    pub token_hash: Arc<arc_swap::ArcSwap<Option<String>>>,
     /// Auth failure rate limiter.
     pub rate_limiter: AuthRateLimiter,
     /// Per-IP request-rate limiter for authed `/api/*` routes (wires

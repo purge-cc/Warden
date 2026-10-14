@@ -308,6 +308,58 @@ fn absent_receipt_with_before_drift_or_occupied_new_target_preserves_the_intent(
 }
 
 #[test]
+fn absent_receipt_with_an_unchanged_tree_retires_the_intent_after_a_device_number_change() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = Candidate::new();
+    candidate.initialize(root.path());
+    let guard = acquire_for_migration(&root.path().join("config.toml")).unwrap();
+    let receipts = receipts_for(&guard);
+    let intent = reserve(
+        &guard,
+        &receipts,
+        &candidate.snapshot,
+        &candidate.request(),
+        &candidate.before,
+        &candidate.after,
+    )
+    .unwrap();
+    assert!(crate::config::policy_transaction::shift_devices_for_test(root.path()) > 0);
+    let state = root
+        .path()
+        .join(crate::cluster::publication::STORE_DIR)
+        .join(crate::private_store::plain_namespace(
+            guard.canonical_master(),
+        ))
+        .join("state.json");
+    let shifted = fs::read(&state).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&shifted).unwrap();
+    let record = json["records"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    let inode = &mut record["preparation_proof"]["parents"][""]["inode"];
+    *inode = inode.as_u64().unwrap().wrapping_add(1).into();
+    fs::write(&state, serde_json::to_vec(&json).unwrap()).unwrap();
+    for _ in 0..2 {
+        let mut store = PublicationStore::open(&guard).unwrap();
+        assert!(recover(&guard, &receipts, &mut store).is_err());
+        assert_eq!(store.pending_intents().unwrap()[0].0, intent.reservation);
+    }
+
+    fs::write(&state, shifted).unwrap();
+    let mut store = PublicationStore::open(&guard).unwrap();
+    recover(&guard, &receipts, &mut store).unwrap();
+    assert!(store.pending_intents().unwrap().is_empty());
+    assert!(store.current().unwrap().is_none());
+    assert_eq!(
+        fs::read(root.path().join("packs/policy.txt")).unwrap(),
+        b"||before.example^\n"
+    );
+}
+
+#[test]
 fn legacy_binding_without_a_preparation_proof_is_not_cancellation_evidence() {
     let root = tempfile::tempdir().unwrap();
     let candidate = Candidate::new();

@@ -1385,6 +1385,13 @@ pub enum IpcResponse {
         /// client whether these registry counters are supported.
         #[serde(default)]
         lists_total: u32,
+        /// Sources whose domains are being served on their own verified
+        /// evidence: the `lists_active` rows plus never-refreshed rows
+        /// loaded from a verified cache, as after a restart before each
+        /// source's next due fetch. Always at least `lists_active`. 0 when
+        /// decoded from an older daemon.
+        #[serde(default)]
+        lists_loaded: u32,
         /// Number of blocklist sources with an uncleared `max_entries` cap
         /// refusal since this daemon started. The last attempted refresh can
         /// be a different failure; a successful refresh clears the per-source

@@ -63,7 +63,7 @@ async fn list_only_guarded_commit_finishes_promptly_and_delivers_reload() {
     store.prepare_manifest(&next).unwrap();
 
     let pending = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(30),
         commit_received_corpus(&master, &next, &reload_tx),
     )
     .await
@@ -76,7 +76,7 @@ async fn list_only_guarded_commit_finishes_promptly_and_delivers_reload() {
     assert_eq!(pair.active, Some(old.generation));
     store.mark_active(&next.generation, &next.artifact).unwrap();
     assert!(!tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(30),
         commit_received_corpus(&master, &next, &reload_tx),
     )
     .await

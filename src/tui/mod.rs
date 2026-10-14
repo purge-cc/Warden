@@ -471,11 +471,7 @@ async fn run_app(
                 clamp_custom_lists_focus_to_layout(&mut app, size.width);
             }
             reconcile_active_leaf_selection(&mut app);
-            terminal.draw(|f| {
-                ui::render(f, &mut app);
-                reads::render_loading(f, &app);
-                actions::render_saving(f, &app);
-            })?;
+            terminal.draw(|f| ui::draw_frame(f, &mut app))?;
             dirty = false;
         }
 
@@ -610,6 +606,7 @@ async fn run_app(
             }
             Event::Resize => {
                 app.mouse.clear_row_click();
+                app.mouse.clear_last_press();
                 dirty = true;
             }
         }
@@ -632,6 +629,18 @@ async fn handle_mouse(
         }
         return false;
     };
+    if matches!(
+        event.kind,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) && !app.mouse.press_allowed(
+        event.column,
+        event.row,
+        action,
+        Instant::now(),
+        mouse::overlay_open(app),
+    ) {
+        return false;
+    }
     if !matches!(
         action,
         mouse::MouseAction::Row(..) | mouse::MouseAction::CustomRuleRow(_)
@@ -1806,7 +1815,10 @@ async fn handle_nodes_dialog_key(app: &mut App, key: KeyEvent, poller: &IpcPolle
                 }
             }
             KeyCode::Char(ch)
-                if key.modifiers.is_empty() && draft.focus < draft.visible_fields() =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && draft.focus < draft.visible_fields() =>
             {
                 if let Some(field) = (draft.focus < draft.visible_fields())
                     .then(|| draft.field_value_mut(draft.focus))
@@ -1834,15 +1846,7 @@ async fn handle_nodes_dialog_key(app: &mut App, key: KeyEvent, poller: &IpcPolle
             {
                 resume = true;
             }
-            KeyCode::Char('c')
-                if progress.kind == crate::cluster::node_control::NodeOperationKind::Add
-                    && matches!(
-                        progress.phase,
-                        crate::cluster::node_control::NodeOperationPhase::PreparingTarget
-                            | crate::cluster::node_control::NodeOperationPhase::Prepared
-                            | crate::cluster::node_control::NodeOperationPhase::Paused
-                    ) =>
-            {
+            KeyCode::Char('c') if nodes::can_cancel(progress) => {
                 cancel_preview = true;
             }
             KeyCode::Esc => close = true,
@@ -9742,9 +9746,7 @@ fn build_blocklist_value(modal: &app::EditListModal) -> Result<toml::Value, Stri
     }
     let url = modal.url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!(
-            "URL must start with http:// or https:// (got '{url}')"
-        ));
+        return Err(format!("URL must start with https:// (got '{url}')"));
     }
 
     let interval_hours: Option<u32> = match modal.interval {
@@ -10097,6 +10099,8 @@ fn apply_list_edit(
     let url_was_edited = creates_new_entry || modal.url != modal.original.url;
     if url_was_edited {
         let candidate_url = rebased_modal.url.trim();
+        crate::cli::commands::blocklists::ensure_fetchable_list_url(candidate_url)
+            .map_err(|error| error.to_string())?;
         if let Some(existing) = loaded.config.blocklists.iter().find(|blocklist| {
             blocklist.id.as_str() != blocklist_id
                 && canonical_url_key(&blocklist.url) == canonical_url_key(candidate_url)

@@ -77,6 +77,7 @@ pub struct MouseState {
     details: RefCell<Vec<DetailPanelState>>,
     sort_focus: Option<(Leaf, MouseAction)>,
     last_row_click: Option<(Leaf, String, u16, std::time::Instant)>,
+    last_press: Option<(u16, u16, MouseAction, std::time::Instant)>,
 }
 
 /// Per-leaf read-only detail viewport.  This intentionally sits beside the
@@ -137,6 +138,38 @@ impl MouseState {
 
     pub fn clear_row_click(&mut self) {
         self.last_row_click = None;
+    }
+
+    /// Whether a left press may act. A press on the cell of the previous
+    /// press, within the double-click window, whose action differs, is the
+    /// second half of a double click: the first press redrew what sits under
+    /// the pointer (Choose became Restore, an opener became a dialog). It is
+    /// dropped while an overlay is open, and a dropped press extends the
+    /// window so the rest of the burst is dropped too.
+    pub fn press_allowed(
+        &mut self,
+        column: u16,
+        row: u16,
+        action: MouseAction,
+        now: std::time::Instant,
+        overlay_open: bool,
+    ) -> bool {
+        if let Some((old_column, old_row, old_action, at)) = self.last_press.as_mut() {
+            if overlay_open
+                && (*old_column, *old_row) == (column, row)
+                && *old_action != action
+                && now.saturating_duration_since(*at) <= DOUBLE_CLICK
+            {
+                *at = now;
+                return false;
+            }
+        }
+        self.last_press = Some((column, row, action, now));
+        true
+    }
+
+    pub fn clear_last_press(&mut self) {
+        self.last_press = None;
     }
 
     pub fn sort(&self, leaf: Leaf) -> Option<SortOrder> {
@@ -816,5 +849,61 @@ mod tests {
             advanced_expanded: false,
         });
         assert!(!overlay_open(&app), "no such list, so nothing draws");
+    }
+
+    #[test]
+    fn a_press_whose_action_changed_under_the_pointer_is_dropped_in_overlays() {
+        use std::time::{Duration, Instant};
+        let choose = MouseAction::OverlayKey(KeyCode::Enter.into());
+        let restore = MouseAction::OverlayKey(KeyCode::Char('y').into());
+        let start = Instant::now();
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, choose, start, true));
+        assert!(
+            !state.press_allowed(10, 5, restore, start + Duration::from_millis(150), true),
+            "the second half of a double click is dropped"
+        );
+        assert!(
+            !state.press_allowed(10, 5, restore, start + Duration::from_millis(500), true),
+            "a dropped press extends the window, so the burst stays dropped"
+        );
+        assert!(
+            state.press_allowed(11, 5, restore, start + Duration::from_millis(600), true),
+            "another cell"
+        );
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, choose, start, true));
+        assert!(
+            state.press_allowed(10, 5, choose, start + Duration::from_millis(100), true),
+            "the same action"
+        );
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, choose, start, true));
+        assert!(
+            state.press_allowed(10, 5, restore, start + Duration::from_millis(401), true),
+            "after the window"
+        );
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, MouseAction::Key(KeyCode::Char('R')), start, false));
+        assert!(
+            state.press_allowed(10, 5, restore, start + Duration::from_millis(100), false),
+            "no overlay open"
+        );
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, MouseAction::Key(KeyCode::Char('R')), start, false));
+        assert!(
+            !state.press_allowed(10, 5, restore, start + Duration::from_millis(100), true),
+            "a press outside overlays is remembered, so the opener's second half is dropped"
+        );
+
+        let mut state = MouseState::default();
+        assert!(state.press_allowed(10, 5, choose, start, false));
+        state.clear_last_press();
+        assert!(state.press_allowed(10, 5, restore, start + Duration::from_millis(100), true));
     }
 }

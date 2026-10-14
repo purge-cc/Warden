@@ -56,7 +56,6 @@ pub(crate) fn recover(
     Ok(())
 }
 
-#[allow(dead_code, reason = "precommit publication coordinator entry point")]
 pub(crate) fn reserve(
     guard: &MigrationWriteLock,
     receipts: &ReceiptStore,

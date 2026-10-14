@@ -1,13 +1,4 @@
 use super::*;
-use std::sync::Mutex;
-
-/// Serialises the EDITOR-mutating test below. `std::env::set_var` is
-/// process-global — without this lock it races any other test in this
-/// binary that touches `EDITOR` under `cargo test`'s default thread
-/// parallelism. Mirrors the `ENV_LOCK` pattern in
-/// `cli/commands/config/edit.rs` / `hr2_test_support.rs`. Poison is
-/// recovered — a panicking test must not wedge the rest.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn mk_master(dir: &tempfile::TempDir) -> PathBuf {
     let master = dir.path().join("config.toml");
@@ -68,15 +59,8 @@ display_name = "Edited By Operator"
         "fixture sanity check before the edit"
     );
 
-    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let prior_editor = std::env::var_os("EDITOR");
     let editor = format!("cp {}", edited.display());
-    std::env::set_var("EDITOR", &editor);
     let outcome = run_file_editor_guarded(&mut app, &master, &editor);
-    match prior_editor {
-        Some(value) => std::env::set_var("EDITOR", value),
-        None => std::env::remove_var("EDITOR"),
-    }
     assert!(outcome.edit_error.is_none(), "{:?}", outcome.step_error);
 
     assert_eq!(

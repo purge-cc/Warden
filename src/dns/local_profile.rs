@@ -18,7 +18,6 @@
 //! reverse DNS) and then to the upstream forward path.
 
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
@@ -330,11 +329,7 @@ fn filter_or_cname_follow(
         return None;
     };
 
-    let mut target_str = CompactString::default();
-    let _ = write!(target_str, "{}", **target);
-    if target_str.ends_with('.') {
-        target_str.pop();
-    }
+    let target_str = super::handler::ascii_domain(target);
 
     // The wildcard CNAME RR itself is re-owned by the QNAME; the followed
     // target's A/AAAA records keep their own concrete name (the target is a
@@ -1009,5 +1004,29 @@ mod tests {
         );
         assert_eq!(hits.key_count(), 3);
         assert_eq!(hits.count_for(&scope, "a.lan"), 500);
+    }
+
+    #[test]
+    fn punycode_cname_target_follows_the_ascii_forward_key() {
+        // hickory's `Display` decodes `xn--` labels to Unicode; the forward
+        // keys are ASCII, so the CNAME follow must use the ASCII form.
+        let recs = vec![
+            rec(
+                "xn--mnchen-3ya.example",
+                LocalDnsRecordType::A,
+                "192.0.2.10",
+                false,
+            ),
+            rec(
+                "alias.example",
+                LocalDnsRecordType::CNAME,
+                "xn--mnchen-3ya.example",
+                false,
+            ),
+        ];
+        let plr = ProfileLocalRecords::build(&recs, 60);
+        let res = plr.lookup("alias.example", RecordType::A).unwrap();
+        assert_eq!(res.len(), 2, "CNAME plus the followed local A record");
+        assert_eq!(res[1].record_type(), RecordType::A);
     }
 }

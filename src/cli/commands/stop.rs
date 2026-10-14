@@ -82,7 +82,7 @@ pub async fn run_stop(pid_file: &Path, socket_path: &Path, force: bool) -> anyho
         );
     }
 
-    if !force {
+    let waited_pid = if !force {
         // `Shutdown` is Admin-tier, so `send_command` will look for a token
         // before it opens the socket. Check for one HERE so a missing token
         // is reported AS a missing token: send_command's own refusal is
@@ -103,6 +103,7 @@ pub async fn run_stop(pid_file: &Path, socket_path: &Path, force: bool) -> anyho
         match socket_client::send_command(socket_path, &cmd).await {
             Ok(IpcResponse::Ok { message }) => {
                 println!("{message}");
+                daemon_pid
             }
             Ok(IpcResponse::Error { message }) => {
                 anyhow::bail!(
@@ -129,14 +130,17 @@ pub async fn run_stop(pid_file: &Path, socket_path: &Path, force: bool) -> anyho
         eprintln!(
             "WARNING: --force skips the IPC auth gate and sends SIGTERM directly to PID {daemon_pid}"
         );
-        pid::send_signal(daemon_pid, "TERM")?;
-        println!("sent SIGTERM to purge-warden (PID {daemon_pid})");
-    }
+        // The PID file may have changed since it was read above; poll the
+        // PID that was actually signalled.
+        let signalled = pid::send_signal(pid_file, "TERM")?;
+        println!("sent SIGTERM to purge-warden (PID {signalled})");
+        signalled as u32
+    };
 
     // Wait briefly for process to exit, then clean up PID file.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
-        if !pid::is_process_alive(daemon_pid) {
+        if !pid::is_process_alive(waited_pid) {
             pid::remove_pid_file(pid_file);
             println!("purge-warden stopped");
             return Ok(());
@@ -148,7 +152,7 @@ pub async fn run_stop(pid_file: &Path, socket_path: &Path, force: bool) -> anyho
          The shutdown request was accepted but the daemon has not exited. \
          Do not assume the port is free. Re-check with `warden status`, and \
          if it is wedged use `warden stop --force` to send SIGTERM directly.",
-        daemon_pid
+        waited_pid
     );
 }
 

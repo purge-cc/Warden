@@ -475,7 +475,7 @@ fn esc_out_of_the_stage_declares_nothing() {
 async fn unsigned_add_consent_handler_keeps_mode_and_does_not_reprobe() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
-    let url = "http://127.0.0.1:1/already-probed.txt";
+    let url = "https://lists.example.invalid/already-probed.txt";
     let mut modal = crate::tui::tabs::lists::build_add_modal();
     modal.blocklist_id = "consent-add".into();
     modal.display_name = "Consent add".into();
@@ -520,7 +520,7 @@ async fn unsigned_add_consent_handler_keeps_mode_and_does_not_reprobe() {
 async fn unsigned_promote_consent_handler_keeps_source_and_operation() {
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
-    let url = "http://127.0.0.1:1/promoted-after-consent.txt";
+    let url = "https://lists.example.invalid/promoted-after-consent.txt";
     let mut text = std::fs::read_to_string(&master).unwrap();
     text.push_str(&format!("\n[lists]\nsources = [\"{url}\"]\n"));
     std::fs::write(&master, text).unwrap();
@@ -1274,6 +1274,54 @@ enabled = true
     let after = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert!(!after.config.blocklists[0].enabled);
     assert!(after.config.blocklists[1].enabled);
+}
+
+/// The modal refuses a URL the list downloader would refuse, like the CLI:
+/// before the probe, and on save of a new or edited URL. A legacy row whose
+/// URL is left alone still saves.
+#[tokio::test]
+async fn list_edit_refuses_urls_the_downloader_refuses() {
+    let refused = "http://lists.example.invalid/refused.txt";
+    let err = crate::cli::commands::blocklists::probe_url_for_tui(refused)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("import-local"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master_with_blocklist(
+        &dir,
+        r#"
+[[blocklists]]
+id = "privacy-ads"
+display_name = "Ads"
+url = "http://lists.example.invalid/ads.txt"
+enabled = true
+"#,
+    );
+    let mut add = crate::tui::tabs::lists::build_add_modal();
+    add.blocklist_id = "refused".into();
+    add.display_name = "Refused".into();
+    add.url = refused.into();
+    let err = apply_list_edit(&master, &add, "refused", true, None).unwrap_err();
+    assert!(err.contains("import-local"), "{err}");
+
+    let live = load_config(&master, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .config
+        .blocklists[0]
+        .clone();
+    let mut edit = modal_opened_for(live);
+    edit.url = refused.into();
+    let err = apply_list_edit(&master, &edit, "privacy-ads", false, None).unwrap_err();
+    assert!(err.contains("import-local"), "{err}");
+
+    edit.url = edit.original.url.clone();
+    edit.display_name = "Ads, renamed".into();
+    apply_list_edit(&master, &edit, "privacy-ads", false, None)
+        .expect("a legacy row with an unchanged URL must still save");
+    let after = load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(after.config.blocklists.len(), 1);
+    assert_eq!(after.config.blocklists[0].display_name, "Ads, renamed");
 }
 
 // Sprint A.5 (lc2_v2 foundation) dropped two save-flow tests:

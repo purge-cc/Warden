@@ -1693,6 +1693,12 @@ where
     Ok(())
 }
 
+/// A candidate the validator or the cluster-secondary policy refuses; nothing
+/// was written. Typed so `config edit` can exit 2 through any `?` chain.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CandidateInvalid(pub String);
+
 /// Validate staged config bytes while every destination remains unpromoted.
 fn validate_prepared_locked(
     lock: &crate::config::write_lock::ConfigWriteLock,
@@ -1735,28 +1741,57 @@ fn validate_prepared_locked_inner(
 
     // 2. Validate the would-be-merged tree once, before promoting anything.
     let now = time::OffsetDateTime::now_utc();
-    if let Err(errs) =
+    let loaded =
         load_config_v5_executable_with_overlay_under_guard(lock, master, now, Some(&overlay))
-    {
-        // Errors first, boilerplate last. The TUI renders this string in a
-        // fixed 2-row band (~105 usable cells after its own prefixes) and
-        // ellipsises the rest, so any preamble is paid for in operator
-        // diagnosis — a verbose lead-in can push the actual complaint
-        // (e.g. `unknown variant "block"`) past the visible cutoff.
-        let mut msg = if let [only] = errs.as_slice() {
-            format!("{only} — nothing written")
-        } else {
-            format!("{} errors, nothing written:", errs.len())
-        };
-        if errs.len() > 1 {
-            for e in &errs {
-                msg.push_str("\n  - ");
-                msg.push_str(&e.to_string());
+            .map_err(|errs| CandidateInvalid(nothing_written(&errs)))?;
+
+    // 3. A write that can change the source set also gets the source-plan
+    // preflight boot and reload run, so the daemon never meets a source set
+    // it rejects (unknown slug, too many sources, alias conflict). Legacy
+    // membership writes cannot replace policy and skip it.
+    let changes_sources = prepared.iter().any(|write| {
+        changed_top_level_keys(write.before_image.as_deref(), &write.content)
+            .iter()
+            .any(|key| ["lists", "blocklists", "profiles", "includes"].contains(&key.as_str()))
+    });
+    if changes_sources && !legacy_membership {
+        let projected = crate::config::loader::project_loaded_v5(loaded)
+            .map_err(|errs| CandidateInvalid(nothing_written(&errs)))?;
+        let (preflight, warnings) =
+            crate::cli::commands::config::lint::preflight_source_plan_collect(
+                lock.canonical_master(),
+                &projected.config,
+            );
+        if let Err(errs) = preflight {
+            let mut msg = nothing_written(&errs);
+            for warning in warnings {
+                msg.push_str("\n  note: ");
+                msg.push_str(&warning);
             }
+            return Err(CandidateInvalid(msg).into());
         }
-        bail!(msg);
     }
     Ok(())
+}
+
+/// Errors first, boilerplate last. The TUI renders this string in a
+/// fixed 2-row band (~105 usable cells after its own prefixes) and
+/// ellipsises the rest, so any preamble is paid for in operator
+/// diagnosis — a verbose lead-in can push the actual complaint
+/// (e.g. `unknown variant "block"`) past the visible cutoff.
+fn nothing_written(errs: &[impl std::fmt::Display]) -> String {
+    let mut msg = if let [only] = errs {
+        format!("{only} — nothing written")
+    } else {
+        format!("{} errors, nothing written:", errs.len())
+    };
+    if errs.len() > 1 {
+        for e in errs {
+            msg.push_str("\n  - ");
+            msg.push_str(&e.to_string());
+        }
+    }
+    msg
 }
 
 /// Validate a historical migration's exact final overlay.  New members are
@@ -1911,12 +1946,15 @@ fn refuse_policy_write_on_a_cluster_secondary(
         .as_deref()
         .filter(|p| !p.is_empty())
         .unwrap_or(CLUSTER_PEER_UNSET);
-    bail!(CLUSTER_SECONDARY_POLICY_READ_ONLY
-        .replace("{peer}", peer)
-        .replace(
-            "{sections}",
-            &sections.into_iter().collect::<Vec<_>>().join(", ")
-        ));
+    Err(CandidateInvalid(
+        CLUSTER_SECONDARY_POLICY_READ_ONLY
+            .replace("{peer}", peer)
+            .replace(
+                "{sections}",
+                &sections.into_iter().collect::<Vec<_>>().join(", "),
+            ),
+    )
+    .into())
 }
 
 fn changed_server_policy_fields(write: &PreparedWrite<'_>) -> Vec<String> {

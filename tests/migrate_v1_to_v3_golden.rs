@@ -4,7 +4,7 @@
 //! transformation layer surfaces immediately.
 //!
 //! The CT-known v1 fixture below mirrors `/etc/purge-warden/config.toml`
-//! on `the lab host` (10.10.1.94) post the 2026-05-07 incident manual
+//! on `the lab host` post the 2026-05-07 incident manual
 //! restore: `mycompany` allow-list, three deny lists pulled from
 //! `lists.purge.cc`, the default profile carrying a `blocklists = [...]`
 //! array, and one device. The expected v2 output mirrors the §7 mapping

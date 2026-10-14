@@ -52,12 +52,23 @@ pub(crate) fn content_area_for_test(area: Rect, app: &App) -> Rect {
     layout_chunks(area, app)[2]
 }
 
+/// One production frame: the page, the footer overlays, then the scrub that
+/// keeps control and bidi characters from query data off the terminal.
+pub(crate) fn draw_frame(f: &mut Frame, app: &mut App) {
+    render(f, app);
+    super::reads::render_loading(f, app);
+    super::actions::render_saving(f, app);
+    super::text::scrub_buffer(f.buffer_mut());
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
     theme::set_active(app.theme);
     // Hit regions are frame-local. Reset before the size guard so a resize
     // cannot leave stale menu clicks registered against the prior frame.
     mouse::reset(app);
     let area = f.area();
+    f.buffer_mut()
+        .set_style(area, Style::default().bg(T.bg_main));
 
     // Terminal too small guard
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -248,7 +259,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let notice = tabs::dashboard::health_notice(app);
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        Paragraph::new("").style(Style::default().bg(T.bg_main)),
         area,
     );
     if area.height <= 1 {
@@ -338,7 +349,7 @@ fn render_menu_card(f: &mut Frame, area: Rect, app: &App) {
         .filter(|leaf| leaf.is_menu_leaf())
         .collect();
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(Color::Black)),
+        Paragraph::new("").style(Style::default().bg(T.bg_main)),
         area,
     );
     let inner = Rect::new(
@@ -2532,7 +2543,7 @@ mod tests {
     // ── Unified menu card ────────────────────────────────────────────
 
     #[test]
-    fn header_is_black_and_has_no_node_metadata() {
+    fn header_uses_page_background_and_has_no_node_metadata() {
         for height in [1, 4] {
             let app = App::known_standalone_for_test();
             let mut terminal =
@@ -2542,7 +2553,7 @@ mod tests {
             let mut text = String::new();
             for y in 0..height {
                 for x in 0..164 {
-                    assert_eq!(buffer[(x, y)].bg, Color::Black);
+                    assert_eq!(buffer[(x, y)].bg, T.bg_main);
                     text.push_str(buffer[(x, y)].symbol());
                 }
             }
@@ -2571,7 +2582,7 @@ mod tests {
         assert_eq!(buffer[(11, 1)].bg, T.navigation_active_bg);
         for y in 0..2 {
             for x in [0, 163] {
-                assert_eq!(buffer[(x, y)].bg, Color::Black);
+                assert_eq!(buffer[(x, y)].bg, T.bg_main);
                 assert_eq!(
                     mouse::action(
                         &app,
@@ -2650,7 +2661,7 @@ mod tests {
                     assert_eq!(
                         cell.bg,
                         if x == 0 || x == width - 1 {
-                            Color::Black
+                            T.bg_main
                         } else {
                             T.navigation_submenu_bg
                         }
@@ -2901,5 +2912,55 @@ mod tests {
             !rendered.contains("[Enter]"),
             "Query Log with no selection must emit no Enter hint; got: {rendered}"
         );
+    }
+
+    #[test]
+    fn header_menu_gutters_and_footer_use_the_page_background() {
+        // Key chips keep their highlight; every other footer cell is page
+        // background, never the terminal default or ANSI black.
+        let footer_bg = |bg| bg == T.bg_main || bg == T.bg_highlight;
+        for height in [24u16, 32] {
+            let mut app = App::known_standalone_for_test();
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
+            term.draw(|f| render(f, &mut app)).unwrap();
+            let header_rows = if height < 32 { 1 } else { 4 };
+            let buffer = term.backend().buffer();
+            for y in 0..header_rows {
+                for x in 0..80 {
+                    assert_eq!(buffer[(x, y)].bg, T.bg_main, "header ({x}, {y})");
+                }
+            }
+            for y in header_rows..header_rows + 2 {
+                for x in [0, 79] {
+                    assert_eq!(buffer[(x, y)].bg, T.bg_main, "menu gutter ({x}, {y})");
+                }
+            }
+            for x in 0..80 {
+                let bg = buffer[(x, height - 1)].bg;
+                assert!(
+                    footer_bg(bg),
+                    "footer column {x} at height {height}: {bg:?}"
+                );
+            }
+
+            app.pending_action = Some(crate::tui::actions::PendingAction {
+                id: 1,
+                surface: crate::tui::actions::Surface::Global,
+                label: "Saving".into(),
+                detached: false,
+                written: None,
+            });
+            term.draw(|f| {
+                render(f, &mut app);
+                crate::tui::actions::render_saving(f, &app);
+            })
+            .unwrap();
+            let buffer = term.backend().buffer();
+            for x in 0..80 {
+                let bg = buffer[(x, height - 1)].bg;
+                assert!(footer_bg(bg), "saving footer column {x}: {bg:?}");
+            }
+        }
     }
 }

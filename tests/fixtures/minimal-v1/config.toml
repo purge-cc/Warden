@@ -122,16 +122,4 @@ rule = "||tiktok.com^"
 [upstream]
 servers = ["192.0.2.1:53"]
 
-# `[anti_bypass]` is OMITTED on purpose, and an edit that added it here was
-# reverted on 2026-08-16. Omitting the section is exactly what `warden init`
-# writes and what the live CTs carry, so this fixture keeps looking like a
-# real install — which is its whole value. Since `neutrality-01` deleted the
-# built-in resolver list, the section's defaults (`enabled = true`,
-# `extra_domains = []`) build no checker at all, and the validator warns on
-# every load. That warning is the finding, not fixture noise: it is pinned by
-# `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture` and
-# tracked as a product decision (`anti-bypass-default-on-protects-nothing`).
-#
-# So this file is NOT the warning-free control arm for `config lint --strict`
-# and must not be edited into one — `strict_leaves_a_clean_config_alone`
-# derives its own clean config from this text at test time.
+# [anti_bypass] is omitted: off by default, exactly as warden init writes it.

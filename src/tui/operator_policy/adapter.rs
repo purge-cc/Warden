@@ -463,7 +463,7 @@ pub(crate) fn register_test_token(socket_path: &Path, token: impl Into<String>) 
 }
 
 #[cfg(test)]
-fn test_token_for(socket_path: &Path) -> Option<String> {
+pub(crate) fn test_token_for(socket_path: &Path) -> Option<String> {
     // Kept in a function-local singleton so production has no alternate
     // credential path. Each test registers only its unique temporary socket.
     TEST_TOKENS

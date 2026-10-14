@@ -3550,13 +3550,14 @@ mod tests {
         // documentation address), then the rest of the invariant below is
         // exactly what it was before.
         target.upstream.servers = vec!["192.0.2.53:53".to_string()];
-        validate_v5_collect(
-            &target,
-            OffsetDateTime::now_utc(),
-            &mut AuditWarnings::silent(),
-            None,
-        )
-        .expect("with an upstream supplied, the template passes the full validator pass");
+        let mut warns = AuditWarnings::silent();
+        validate_v5_collect(&target, OffsetDateTime::now_utc(), &mut warns, None)
+            .expect("with an upstream supplied, the template passes the full validator pass");
+        let warns = warns.into_messages();
+        assert!(
+            !warns.iter().any(|w| w.contains("has no domains to block")),
+            "the scaffold must not claim an anti-bypass it cannot enforce: {warns:?}"
+        );
         let cfg = target.validation_projection().unwrap();
 
         let (merged_sources, _trust) =

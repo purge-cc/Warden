@@ -31,9 +31,12 @@ pub fn run(
         + usize::from(rollback_receipt.is_some())
         + usize::from(finalize_receipt.is_some());
     ensure!(modes == 1, "select exactly one v4-to-v5 operation");
+    let choices = choices_path
+        .map(read_json::<MigrationChoicesV1>)
+        .transpose()?;
 
     if check {
-        let plan = migration::check(master)?;
+        let plan = migration::plan(master, choices)?;
         if json {
             print_json(&plan)?;
         } else {
@@ -42,7 +45,7 @@ pub fn run(
         return Ok(i32::from(plan.blocked));
     }
     if let Some(output) = plan_output {
-        let plan = migration::plan(master, None)?;
+        let plan = migration::plan(master, choices)?;
         write_new_json(output, &plan)?;
         println!(
             "wrote migration plan {} ({})",
@@ -52,8 +55,7 @@ pub fn run(
         return Ok(i32::from(plan.blocked));
     }
     if let Some(output) = replan_output {
-        let path = choices_path.context("--re-plan requires --choices")?;
-        let choices: MigrationChoicesV1 = read_json(path)?;
+        let choices = choices.context("--re-plan requires --choices")?;
         let plan = migration::plan(master, Some(choices))?;
         write_new_json(output, &plan)?;
         println!(

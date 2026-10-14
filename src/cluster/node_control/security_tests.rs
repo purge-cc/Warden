@@ -9,6 +9,7 @@ async fn serve_node_controller(
     private_key: &str,
     controller: Arc<NodeController>,
 ) -> tokio::task::JoinHandle<()> {
+    crate::upstream::install_ring_crypto_provider_once();
     let certificate_path = directory.path().join("node-test.crt");
     let private_key_path = directory.path().join("node-test.key");
     std::fs::write(&certificate_path, certificate).unwrap();
@@ -21,7 +22,7 @@ async fn serve_node_controller(
     tokio::spawn(async move {
         let _ = axum_server::from_tcp_rustls(listener, tls)
             .unwrap()
-            .serve(node_router(controller).into_make_service())
+            .serve(node_router(controller).into_make_service_with_connect_info::<SocketAddr>())
             .await;
     })
 }
@@ -32,7 +33,9 @@ async fn serve_delayed_prepare_reply(
     certificate: &str,
     private_key: &str,
     reply: PeerManagementReply,
+    delay: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
+    crate::upstream::install_ring_crypto_provider_once();
     let certificate_path = directory.path().join("delayed-node-test.crt");
     let private_key_path = directory.path().join("delayed-node-test.key");
     std::fs::write(&certificate_path, certificate).unwrap();
@@ -47,7 +50,7 @@ async fn serve_delayed_prepare_reply(
         post(move || {
             let reply = reply.clone();
             async move {
-                tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+                tokio::time::sleep(delay).await;
                 (StatusCode::OK, Json(reply))
             }
         }),
@@ -70,6 +73,33 @@ impl ActivePairProvider for TestPairProvider {
 
     async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
         anyhow::bail!("test has no active enrollment pair")
+    }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        Ok(None)
+    }
+}
+
+/// Like the runtime provider, `active_pair` cannot tell an unreadable pair
+/// from none.
+struct UnreadablePair(AtomicBool);
+
+#[async_trait]
+impl ActivePairProvider for UnreadablePair {
+    fn active_pair(&self) -> Option<ActivePolicyCorpus> {
+        None
+    }
+
+    async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
+        anyhow::bail!("test has no active enrollment pair")
+    }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        ensure!(
+            !self.0.load(Ordering::SeqCst),
+            "active pair is transitioning"
+        );
+        Ok(None)
     }
 }
 
@@ -243,6 +273,7 @@ async fn prepare_add_uses_the_staging_transport_budget_without_extending_other_v
         &certificate.cert_pem,
         &certificate.key_pem,
         reply.clone(),
+        std::time::Duration::from_secs(31),
     )
     .await;
     let source_id = crate::cluster::membership::random_id();
@@ -470,7 +501,7 @@ fn completed_target_detach_outbox_survives_store_reopen_until_source_receipt() {
 
 #[tokio::test]
 async fn source_listener_reuses_transport_tls_and_does_not_persist_prepare_failure() {
-    let endpoint: SocketAddr = "127.0.0.1:18443".parse().unwrap();
+    let endpoint: SocketAddr = "192.0.2.31:18443".parse().unwrap();
     let certificate = crate::cluster::certgen::generate_self_signed(
         &[crate::cluster::certgen::San::Ip(endpoint.ip())],
         30,
@@ -728,12 +759,12 @@ async fn expired_prepared_edit_retires_its_unpromoted_listener() {
     save_state(&guard, &state).unwrap();
     drop(guard);
 
-    assert_eq!(controller.runtime_tick().await.unwrap(), 1);
+    assert_eq!(controller.runtime_tick().await.unwrap(), 2);
     assert_eq!(listeners.retired.lock().unwrap().as_slice(), &[endpoint]);
     let guard = acquire_for_migration(&controller.master).unwrap();
     let state = load_state(&guard).unwrap();
     let operation = &state.operations[&operation_id];
-    assert_eq!(operation.phase, NodeOperationPhase::Paused);
+    assert_eq!(operation.phase, NodeOperationPhase::Cancelled);
     assert!(operation.prepared_certificate.is_none());
     assert!(operation.prepared_private_key.is_none());
     assert!(operation.prepared_fingerprint.is_none());
@@ -1549,4 +1580,1035 @@ async fn acknowledged_outbox_receipt_retires_the_claimed_bootstrap() {
     );
     assert!(detached.detach_receipts.contains_key(&remove_operation_id));
     server.abort();
+}
+
+#[tokio::test]
+async fn unreadable_active_pair_never_restarts_an_applying_primary() {
+    crate::upstream::install_ring_crypto_provider_once();
+    let source_directory = tempfile::tempdir().unwrap();
+    let target_directory = tempfile::tempdir().unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = socket.local_addr().unwrap();
+    let certificate = crate::cluster::certgen::generate_self_signed(
+        &[crate::cluster::certgen::San::Ip(target_endpoint.ip())],
+        30,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let operation_id = crate::cluster::membership::random_id();
+    let source_id = crate::cluster::membership::random_id();
+    let target_id = crate::cluster::membership::random_id();
+    let armed = PeerManagementReply {
+        node_id: target_id.clone(),
+        status: LifecycleStatus::default(),
+        preview_id: Some(operation_id.clone()),
+        operation: Some(NodeOperationProgress {
+            operation_id: operation_id.clone(),
+            kind: NodeOperationKind::Add,
+            phase: NodeOperationPhase::Prepared,
+            target_node_id: target_id.clone(),
+            message: "Add recovery armed.".into(),
+            last_verified_at: None,
+            recover_until: None,
+            restart_steps: Vec::new(),
+        }),
+        capabilities: NodeCapabilities::current(),
+        backup_verified: true,
+        control_endpoint: None,
+        control_fingerprint: None,
+        transition_acknowledged: false,
+        message: "Add recovery armed.".into(),
+    };
+    let server = serve_delayed_prepare_reply(
+        socket,
+        &target_directory,
+        &certificate.cert_pem,
+        &certificate.key_pem,
+        armed,
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    let source_listeners = Arc::new(MaterialListener {
+        material: NodeListenerSpec {
+            endpoint: "127.0.0.1:19001".parse().unwrap(),
+            certificate_pem: certificate.cert_pem.clone(),
+            private_key_pem: SecretString(certificate.key_pem.clone()),
+            scope: ListenerScope::Management,
+        },
+        fail_prepare: AtomicBool::new(false),
+        prepared: Mutex::new(Vec::new()),
+        retired: Mutex::new(Vec::new()),
+    });
+    let master = controller_with_listener(
+        &source_directory,
+        &source_id,
+        source_listeners.clone(),
+        Some("127.0.0.1:19001".parse().unwrap()),
+    )
+    .master
+    .clone();
+    let create = super::super::lifecycle::preview(
+        &master,
+        super::super::lifecycle::LifecycleRequest::Create {
+            san: vec!["127.0.0.1".into()],
+            api_listen: Some("127.0.0.1:19001".parse().unwrap()),
+            migrate_legacy: false,
+        },
+    )
+    .await
+    .unwrap();
+    super::super::lifecycle::apply(&master, &create.id)
+        .await
+        .unwrap();
+    let active = load_config(&acquire_for_migration(&master).unwrap())
+        .unwrap()
+        .config
+        .validation_projection()
+        .unwrap();
+    super::super::lifecycle::acknowledge_runtime_start(&master, &active).unwrap();
+    assert!(
+        !super::super::lifecycle::status(&master)
+            .unwrap()
+            .restart_required
+    );
+
+    let mut operation = test_operation(
+        operation_id.clone(),
+        source_id,
+        target_id.clone(),
+        target_endpoint,
+        NodeOperationKind::Add,
+        NodeOperationPhase::ApplyingPrimary,
+    );
+    operation.preview.restart_steps.insert(
+        0,
+        NodeRestartStep {
+            step_id: "primary".into(),
+            target: NodeRestartTarget::Primary,
+            requested: false,
+            acknowledged: false,
+        },
+    );
+    operation.replication_credential = Some(SecretString(crate::auth::token::generate_token().0));
+    let credential = SecretString(crate::auth::token::generate_token().0);
+    let mut state = ControlState::default();
+    state.peers.insert(
+        target_id.clone(),
+        test_peer(
+            target_id,
+            "Secondary",
+            target_endpoint,
+            NodeRole::Secondary,
+            credential.clone(),
+            &credential,
+            certificate.fingerprint_sha256.clone(),
+        ),
+    );
+    state.operations.insert(operation_id.clone(), operation);
+    save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+
+    let pair = Arc::new(UnreadablePair(AtomicBool::new(true)));
+    let (restart, mut restart_rx) = crate::cluster::managed_restart::supervised_channel();
+    let source = NodeController::new(master, source_listeners, restart, pair.clone());
+    let phase = || {
+        load_state(&acquire_for_migration(&source.master).unwrap())
+            .unwrap()
+            .operations[&operation_id]
+            .phase
+    };
+
+    let advanced = source.runtime_tick().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), restart_rx.recv())
+            .await
+            .is_err(),
+        "an unreadable active pair requested a managed restart"
+    );
+    assert_eq!(phase(), NodeOperationPhase::ApplyingPrimary);
+    assert_eq!(advanced, 0);
+
+    pair.0.store(false, Ordering::SeqCst);
+    assert_eq!(source.runtime_tick().await.unwrap(), 1);
+    assert_eq!(restart_rx.recv().await.unwrap().step_id, "primary");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), restart_rx.recv())
+            .await
+            .is_err(),
+        "a definite no-pair requested more than one restart"
+    );
+    assert_eq!(phase(), NodeOperationPhase::RestartingPrimary);
+    server.abort();
+}
+
+#[tokio::test]
+async fn peer_cancel_of_a_remote_edit_or_remove_removes_its_plan() {
+    for kind in [NodeOperationKind::Edit, NodeOperationKind::Remove] {
+        let directory = tempfile::tempdir().unwrap();
+        let local_id = crate::cluster::membership::random_id();
+        let endpoint: SocketAddr = "192.0.2.11:8053".parse().unwrap();
+        let listeners = Arc::new(MaterialListener {
+            material: NodeListenerSpec {
+                endpoint,
+                certificate_pem: String::new(),
+                private_key_pem: SecretString(String::new()),
+                scope: ListenerScope::Management,
+            },
+            fail_prepare: AtomicBool::new(false),
+            prepared: Mutex::new(Vec::new()),
+            retired: Mutex::new(Vec::new()),
+        });
+        let master = controller_with_listener(&directory, &local_id, listeners.clone(), None)
+            .master
+            .clone();
+        let (restart, _restart_rx) = crate::cluster::managed_restart::supervised_channel();
+        let controller =
+            NodeController::new(master, listeners, restart, Arc::new(TestPairProvider));
+        let state = ControlState {
+            control_endpoint: Some(endpoint),
+            certificate_pem: Some("certificate".into()),
+            private_key_pem: Some(SecretString("key".into())),
+            ..ControlState::default()
+        };
+        save_state(&acquire_for_migration(&controller.master).unwrap(), &state).unwrap();
+        let credential = SecretString(crate::auth::token::generate_token().0);
+        let primary = test_peer(
+            crate::cluster::membership::random_id(),
+            "Primary",
+            "192.0.2.10:8053".parse().unwrap(),
+            NodeRole::Primary,
+            credential.clone(),
+            &credential,
+            "a".repeat(64),
+        );
+        let operation_id = crate::cluster::membership::random_id();
+        let prepared = match kind {
+            NodeOperationKind::Edit => controller
+                .accept_prepare_edit(&primary, operation_id.clone(), "Office".into(), None)
+                .await
+                .unwrap(),
+            _ => controller
+                .accept_prepare_remove(&primary, operation_id.clone())
+                .await
+                .unwrap(),
+        };
+        let plan_id = prepared.preview_id.unwrap();
+        assert!(
+            crate::cluster::lifecycle::preview_exists(&controller.master, &plan_id)
+                .await
+                .unwrap()
+        );
+
+        let cancelled = controller
+            .accept_peer_cancel(&primary, operation_id.clone(), Some(plan_id.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(cancelled.message, "Preview cancelled.");
+        assert_eq!(
+            cancelled
+                .operation
+                .as_ref()
+                .map(|operation| operation.phase),
+            Some(NodeOperationPhase::Cancelled)
+        );
+        assert!(
+            !crate::cluster::lifecycle::preview_exists(&controller.master, &plan_id)
+                .await
+                .unwrap()
+        );
+        controller.runtime_tick().await.unwrap();
+        let replay = controller
+            .accept_peer_cancel(&primary, operation_id, Some(plan_id))
+            .await
+            .unwrap();
+        assert_eq!(replay.message, cancelled.message);
+        assert_eq!(replay.preview_id, cancelled.preview_id);
+        assert_eq!(replay.operation, cancelled.operation);
+    }
+}
+
+/// A destination that answers the bootstrap claim with `claim` (403 when
+/// absent), replies `manage` to management requests (500 when absent) and
+/// counts Cancel requests.
+async fn serve_fake_destination(
+    listener: std::net::TcpListener,
+    directory: &tempfile::TempDir,
+    certificate: &str,
+    private_key: &str,
+    claim: Option<BootstrapClaimResponse>,
+    manage: Option<PeerManagementReply>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    crate::upstream::install_ring_crypto_provider_once();
+    let certificate_path = directory.path().join("fake-destination.crt");
+    let private_key_path = directory.path().join("fake-destination.key");
+    std::fs::write(&certificate_path, certificate).unwrap();
+    std::fs::write(&private_key_path, private_key).unwrap();
+    let tls =
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate_path, private_key_path)
+            .await
+            .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let router = Router::new()
+        .route(
+            "/api/nodes/v2/bootstrap/claim",
+            post(move || {
+                let claim = claim.clone();
+                async move {
+                    match claim {
+                        Some(claim) => Json(claim).into_response(),
+                        None => StatusCode::FORBIDDEN.into_response(),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/nodes/v2/manage",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let manage = manage.clone();
+                let cancels = cancels.clone();
+                async move {
+                    if request["request"] == "cancel" {
+                        cancels.fetch_add(1, Ordering::SeqCst);
+                    }
+                    match manage {
+                        Some(reply) => Json(reply).into_response(),
+                        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        let _ = axum_server::from_tcp_rustls(listener, tls)
+            .unwrap()
+            .serve(router.into_make_service())
+            .await;
+    })
+}
+
+fn source_listeners(certificate: &crate::cluster::certgen::GeneratedCert) -> Arc<MaterialListener> {
+    Arc::new(MaterialListener {
+        material: NodeListenerSpec {
+            endpoint: "127.0.0.1:19001".parse().unwrap(),
+            certificate_pem: certificate.cert_pem.clone(),
+            private_key_pem: SecretString(certificate.key_pem.clone()),
+            scope: ListenerScope::Management,
+        },
+        fail_prepare: AtomicBool::new(false),
+        prepared: Mutex::new(Vec::new()),
+        retired: Mutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn add_preview_pins_the_reviewed_corpus_until_the_record_owns_it() {
+    crate::upstream::install_ring_crypto_provider_once();
+    for claimed in [false, true] {
+        let source_directory = tempfile::tempdir().unwrap();
+        let target_directory = tempfile::tempdir().unwrap();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_endpoint = socket.local_addr().unwrap();
+        let certificate = crate::cluster::certgen::generate_self_signed(
+            &[crate::cluster::certgen::San::Ip(target_endpoint.ip())],
+            30,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let target_id = crate::cluster::membership::random_id();
+        let claim = claimed.then(|| BootstrapClaimResponse {
+            target_node_id: target_id.clone(),
+            target_name: "Office resolver".into(),
+            target_role: NodeRole::Standalone,
+            config_revision: "c".repeat(64),
+            capabilities: NodeCapabilities::current(),
+            target_credential: SecretString(crate::auth::token::generate_token().0),
+        });
+        let server = serve_fake_destination(
+            socket,
+            &target_directory,
+            &certificate.cert_pem,
+            &certificate.key_pem,
+            claim,
+            None,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .await;
+        let listeners = source_listeners(&certificate);
+        let master = controller_with_listener(
+            &source_directory,
+            &crate::cluster::membership::random_id(),
+            listeners.clone(),
+            Some("127.0.0.1:19001".parse().unwrap()),
+        )
+        .master
+        .clone();
+        let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+        let body = b"blocked.example.com\n";
+        let reviewed = super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_000);
+        let (restart, _restart_rx) = crate::cluster::managed_restart::supervised_channel();
+        let source = NodeController::new(
+            master.clone(),
+            listeners,
+            restart,
+            Arc::new(super::tests::MutableActivePair(Mutex::new(Some(
+                reviewed.clone(),
+            )))),
+        );
+        let token = BootstrapToken {
+            version: PROTOCOL_VERSION,
+            target_node_id: target_id,
+            endpoint: target_endpoint,
+            fingerprint: certificate.fingerprint_sha256.clone(),
+            expires_at: crate::cluster::membership::now().unwrap() + 600,
+            secret: SecretString(crate::auth::token::generate_token().0),
+        }
+        .encode()
+        .unwrap();
+
+        source
+            .handle(NodeControlCommand::PreviewAdd {
+                name: "Office resolver".into(),
+                endpoint: target_endpoint,
+                token,
+            })
+            .await
+            .unwrap_err();
+        // A later list refresh and collection drop every generation nothing pins.
+        super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_060);
+        store.collect_unreferenced().unwrap();
+
+        let state = load_state(&acquire_for_migration(&master).unwrap()).unwrap();
+        let kept = store.manifest_metadata(&reviewed.corpus_generation).is_ok();
+        if claimed {
+            let operation = state.operations.values().next().unwrap();
+            assert_eq!(state.operations.len(), 1);
+            assert_eq!(operation.phase, NodeOperationPhase::PreparingTarget);
+            assert_eq!(operation.message, PREPARE_ADD_FAILED_MESSAGE);
+            assert!(kept, "the retained Add lost its reviewed corpus");
+        } else {
+            assert!(state.operations.is_empty());
+            assert!(!kept, "a refused claim kept its corpus pin");
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn cancel_after_primary_admission_withdraws_it_and_restarts_once() {
+    crate::upstream::install_ring_crypto_provider_once();
+    // (primary config committed, plan saved by this Add): a standalone source
+    // after and before its commit, and a source that was already primary.
+    for (committed, own_plan) in [(true, true), (false, true), (true, false)] {
+        let source_directory = tempfile::tempdir().unwrap();
+        let target_directory = tempfile::tempdir().unwrap();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_endpoint = socket.local_addr().unwrap();
+        let certificate = crate::cluster::certgen::generate_self_signed(
+            &[crate::cluster::certgen::San::Ip(target_endpoint.ip())],
+            30,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let operation_id = crate::cluster::membership::random_id();
+        let source_id = crate::cluster::membership::random_id();
+        let target_id = crate::cluster::membership::random_id();
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acknowledged = PeerManagementReply {
+            node_id: target_id.clone(),
+            status: LifecycleStatus::default(),
+            preview_id: Some(operation_id.clone()),
+            operation: None,
+            capabilities: NodeCapabilities::current(),
+            backup_verified: true,
+            control_endpoint: None,
+            control_fingerprint: None,
+            transition_acknowledged: false,
+            message: "Preview cancelled.".into(),
+        };
+        let server = serve_fake_destination(
+            socket,
+            &target_directory,
+            &certificate.cert_pem,
+            &certificate.key_pem,
+            None,
+            Some(acknowledged),
+            cancels.clone(),
+        )
+        .await;
+        let listeners = source_listeners(&certificate);
+        let master = controller_with_listener(
+            &source_directory,
+            &source_id,
+            listeners.clone(),
+            Some("127.0.0.1:19001".parse().unwrap()),
+        )
+        .master
+        .clone();
+        let create = super::super::lifecycle::preview(
+            &master,
+            super::super::lifecycle::LifecycleRequest::Create {
+                san: vec!["127.0.0.1".into()],
+                api_listen: Some("127.0.0.1:19001".parse().unwrap()),
+                migrate_legacy: false,
+            },
+        )
+        .await
+        .unwrap();
+        if committed {
+            super::super::lifecycle::apply(&master, &create.id)
+                .await
+                .unwrap();
+        }
+        if !own_plan {
+            let active = load_config(&acquire_for_migration(&master).unwrap())
+                .unwrap()
+                .config
+                .validation_projection()
+                .unwrap();
+            super::super::lifecycle::acknowledge_runtime_start(&master, &active).unwrap();
+        }
+        let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+        let body = b"blocked.example.com\n";
+        let reviewed = super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_000);
+        let now = crate::cluster::membership::now().unwrap();
+        pin_reviewed_corpus(&master, &reviewed, &operation_id, now + RECOVERY_TTL).unwrap();
+        super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_060);
+
+        let mut operation = test_operation(
+            operation_id.clone(),
+            source_id,
+            target_id.clone(),
+            target_endpoint,
+            NodeOperationKind::Add,
+            NodeOperationPhase::ApplyingPrimary,
+        );
+        operation.preview.restart_steps.insert(
+            0,
+            NodeRestartStep {
+                step_id: "primary".into(),
+                target: NodeRestartTarget::Primary,
+                requested: false,
+                acknowledged: false,
+            },
+        );
+        operation.local_preview_id = own_plan.then(|| create.id.clone());
+        operation.staged_pair = Some(reviewed.clone());
+        operation.replication_credential =
+            Some(SecretString(crate::auth::token::generate_token().0));
+        let credential = SecretString(crate::auth::token::generate_token().0);
+        let mut peer = test_peer(
+            target_id.clone(),
+            "Office resolver",
+            target_endpoint,
+            NodeRole::Standalone,
+            credential.clone(),
+            &credential,
+            certificate.fingerprint_sha256.clone(),
+        );
+        peer.view.state = NodePeerState::Pending;
+        let mut state = ControlState::default();
+        state.peers.insert(target_id.clone(), peer);
+        state
+            .operations
+            .insert(operation_id.clone(), operation.clone());
+        save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+        let (restart, mut restart_rx) = crate::cluster::managed_restart::supervised_channel();
+        let source = NodeController::new(
+            master.clone(),
+            listeners,
+            restart,
+            Arc::new(TestPairProvider),
+        );
+        if committed {
+            source.admit_prepared_target(&operation).await.unwrap();
+        }
+
+        let reply = source
+            .handle(NodeControlCommand::Cancel {
+                preview_id: operation_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let stored = load_state(&acquire_for_migration(&master).unwrap())
+            .unwrap()
+            .operations[&operation_id]
+            .clone();
+        assert_eq!(stored.phase, NodeOperationPhase::Cancelled);
+        assert_eq!(
+            stored.message,
+            "Add cancelled after primary admission; the node was not added."
+        );
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .manifest_metadata(&reviewed.corpus_generation)
+                .is_err(),
+            "cancel kept the reviewed corpus pin"
+        );
+        if committed {
+            let guard = acquire_for_migration(&master).unwrap();
+            assert!(super::super::membership::MembershipStore::open(&guard)
+                .unwrap()
+                .views(now)
+                .iter()
+                .any(|member| member.node_id == target_id
+                    && member.state == super::super::membership::MemberState::Revoked));
+        }
+        if committed && own_plan {
+            assert_eq!(
+                reply.message,
+                "Add cancelled; restarting this node as a one-node primary."
+            );
+            assert_eq!(restart_rx.recv().await.unwrap().step_id, "primary");
+            let _ = source
+                .handle(NodeControlCommand::Cancel {
+                    preview_id: operation_id,
+                })
+                .await;
+        } else {
+            assert_eq!(reply.message, "Preview cancelled.");
+        }
+        if !committed {
+            assert_eq!(
+                super::super::lifecycle::status(&master).unwrap().saved_role,
+                NodeRole::Standalone
+            );
+            assert!(
+                !super::super::lifecycle::preview_exists(&master, &create.id)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), restart_rx.recv())
+                .await
+                .is_err(),
+            "cancel requested more than the one primary restart"
+        );
+        server.abort();
+    }
+}
+
+/// Like the runtime provider: a standalone source has no verified pair until
+/// its restart as primary, and serves its enrollment pair meanwhile.
+struct EnrollingPair {
+    enrolled: AtomicBool,
+    pair: ActivePolicyCorpus,
+}
+
+#[async_trait]
+impl ActivePairProvider for EnrollingPair {
+    fn active_pair(&self) -> Option<ActivePolicyCorpus> {
+        self.enrolled
+            .load(Ordering::SeqCst)
+            .then(|| self.pair.clone())
+    }
+
+    async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
+        Ok(self.pair.clone())
+    }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        Ok(self.active_pair())
+    }
+}
+
+#[tokio::test]
+async fn standalone_add_proceeds_across_a_list_refresh_with_unchanged_bodies() {
+    crate::upstream::install_ring_crypto_provider_once();
+    let source_directory = tempfile::tempdir().unwrap();
+    let target_directory = tempfile::tempdir().unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = socket.local_addr().unwrap();
+    let certificate = crate::cluster::certgen::generate_self_signed(
+        &[crate::cluster::certgen::San::Ip(target_endpoint.ip())],
+        30,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let operation_id = crate::cluster::membership::random_id();
+    let source_id = crate::cluster::membership::random_id();
+    let target_id = crate::cluster::membership::random_id();
+    let armed = PeerManagementReply {
+        node_id: target_id.clone(),
+        status: LifecycleStatus::default(),
+        preview_id: Some(operation_id.clone()),
+        operation: Some(NodeOperationProgress {
+            operation_id: operation_id.clone(),
+            kind: NodeOperationKind::Add,
+            phase: NodeOperationPhase::Prepared,
+            target_node_id: target_id.clone(),
+            message: "Add recovery armed.".into(),
+            last_verified_at: None,
+            recover_until: None,
+            restart_steps: Vec::new(),
+        }),
+        capabilities: NodeCapabilities::current(),
+        backup_verified: true,
+        control_endpoint: None,
+        control_fingerprint: None,
+        transition_acknowledged: false,
+        message: "Add recovery armed.".into(),
+    };
+    let server = serve_fake_destination(
+        socket,
+        &target_directory,
+        &certificate.cert_pem,
+        &certificate.key_pem,
+        None,
+        Some(armed),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+    .await;
+    let source_endpoint: SocketAddr = "127.0.0.1:19001".parse().unwrap();
+    let listeners = source_listeners(&certificate);
+    let master = controller_with_listener(
+        &source_directory,
+        &source_id,
+        listeners.clone(),
+        Some(source_endpoint),
+    )
+    .master
+    .clone();
+    let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+    let body = b"blocked.example.com\n";
+    let reviewed = super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_000);
+    let now = crate::cluster::membership::now().unwrap();
+    pin_reviewed_corpus(&master, &reviewed, &operation_id, now + RECOVERY_TTL).unwrap();
+    let refreshed = super::tests::refresh_corpus(&store, &identity('a'), body, 1_800_000_060);
+
+    let mut operation = test_operation(
+        operation_id.clone(),
+        source_id,
+        target_id.clone(),
+        target_endpoint,
+        NodeOperationKind::Add,
+        NodeOperationPhase::Prepared,
+    );
+    operation.preview.restart_steps = ["primary", "secondary"]
+        .into_iter()
+        .map(|step_id| NodeRestartStep {
+            step_id: step_id.into(),
+            target: if step_id == "primary" {
+                NodeRestartTarget::Primary
+            } else {
+                NodeRestartTarget::Secondary
+            },
+            requested: false,
+            acknowledged: false,
+        })
+        .collect();
+    operation.preview.expires_at = now + PREVIEW_TTL;
+    operation.preview.before_revision = local_revision(&master).await.unwrap();
+    operation.staged_pair = Some(reviewed);
+    operation.cluster_id = Some(crate::cluster::membership::random_id());
+    operation.replication_credential = Some(SecretString(crate::auth::token::generate_token().0));
+    let credential = SecretString(crate::auth::token::generate_token().0);
+    let mut peer = test_peer(
+        target_id.clone(),
+        "Office resolver",
+        target_endpoint,
+        NodeRole::Standalone,
+        credential.clone(),
+        &credential,
+        certificate.fingerprint_sha256.clone(),
+    );
+    peer.view.state = NodePeerState::Pending;
+    let mut state = ControlState {
+        control_endpoint: Some(source_endpoint),
+        certificate_pem: Some(certificate.cert_pem.clone()),
+        private_key_pem: Some(SecretString(certificate.key_pem.clone())),
+        certificate_fingerprint: Some(certificate.fingerprint_sha256.clone()),
+        ..ControlState::default()
+    };
+    state.peers.insert(target_id, peer);
+    state.operations.insert(operation_id.clone(), operation);
+    save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+    let pair = Arc::new(EnrollingPair {
+        enrolled: AtomicBool::new(false),
+        pair: refreshed,
+    });
+    let (restart, mut restart_rx) = crate::cluster::managed_restart::supervised_channel();
+    let source = NodeController::new(master.clone(), listeners, restart, pair.clone());
+    let phase = || {
+        load_state(&acquire_for_migration(&master).unwrap())
+            .unwrap()
+            .operations[&operation_id]
+            .phase
+    };
+
+    source
+        .handle(NodeControlCommand::Apply {
+            preview_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(restart_rx.recv().await.unwrap().step_id, "primary");
+    assert_eq!(phase(), NodeOperationPhase::RestartingPrimary);
+
+    // The restarted primary serves the refreshed generation.
+    pair.enrolled.store(true, Ordering::SeqCst);
+    source.runtime_ready(source_endpoint).await.unwrap();
+    source.runtime_tick().await.unwrap();
+    assert_eq!(phase(), NodeOperationPhase::RestartingTarget);
+    server.abort();
+}
+
+fn listener_with_certificate(endpoint: SocketAddr) -> Arc<MaterialListener> {
+    let certificate = crate::cluster::certgen::generate_self_signed(
+        &[crate::cluster::certgen::San::Ip(endpoint.ip())],
+        30,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    Arc::new(MaterialListener {
+        material: NodeListenerSpec {
+            endpoint,
+            certificate_pem: certificate.cert_pem,
+            private_key_pem: SecretString(certificate.key_pem),
+            scope: ListenerScope::Management,
+        },
+        fail_prepare: AtomicBool::new(false),
+        prepared: Mutex::new(Vec::new()),
+        retired: Mutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn unsupervised_destination_refuses_an_add_before_staging_and_accepts_its_cancel() {
+    crate::upstream::install_ring_crypto_provider_once();
+    let target_directory = tempfile::tempdir().unwrap();
+    let source_directory = tempfile::tempdir().unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_endpoint = socket.local_addr().unwrap();
+    let target_listeners = listener_with_certificate(target_endpoint);
+    let target_master = controller_with_listener(
+        &target_directory,
+        &crate::cluster::membership::random_id(),
+        target_listeners.clone(),
+        Some(target_endpoint),
+    )
+    .master
+    .clone();
+    let (restart, _restart_rx) = crate::cluster::managed_restart::unsupervised_channel();
+    let target = NodeController::new(
+        target_master.clone(),
+        target_listeners.clone(),
+        restart,
+        Arc::new(TestPairProvider),
+    );
+    let token = target
+        .handle(NodeControlCommand::TokenPrepare {
+            listen: Some(target_endpoint),
+        })
+        .await
+        .unwrap()
+        .token
+        .unwrap();
+    let server = serve_node_controller(
+        socket,
+        &target_directory,
+        &target_listeners.material.certificate_pem,
+        &target_listeners.material.private_key_pem.0,
+        target,
+    )
+    .await;
+
+    // The source's staging endpoint only counts the destination's fetches.
+    let staging = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_endpoint = staging.local_addr().unwrap();
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = tokio::spawn({
+        let fetches = fetches.clone();
+        async move {
+            while staging.accept().await.is_ok() {
+                fetches.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let source_listeners = listener_with_certificate(source_endpoint);
+    let source_master = controller_with_listener(
+        &source_directory,
+        &crate::cluster::membership::random_id(),
+        source_listeners.clone(),
+        Some(source_endpoint),
+    )
+    .master
+    .clone();
+    let store = super::super::corpus::CorpusStore::open(&source_master).unwrap();
+    let reviewed = super::tests::refresh_corpus(
+        &store,
+        &identity('a'),
+        b"blocked.example.com\n",
+        1_800_000_000,
+    );
+    let (restart, _restart_rx) = crate::cluster::managed_restart::supervised_channel();
+    let source = NodeController::new(
+        source_master.clone(),
+        source_listeners,
+        restart,
+        Arc::new(super::tests::MutableActivePair(Mutex::new(Some(reviewed)))),
+    );
+    let operations = |master: &Path| {
+        load_state(&acquire_for_migration(master).unwrap())
+            .unwrap()
+            .operations
+    };
+
+    source
+        .handle(NodeControlCommand::PreviewAdd {
+            name: "Office resolver".into(),
+            endpoint: target_endpoint,
+            token,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(fetches.load(Ordering::SeqCst), 0, "the destination staged");
+    let (operation_id, source_record) = operations(&source_master).pop_first().unwrap();
+    assert_eq!(source_record.phase, NodeOperationPhase::PreparingTarget);
+    assert_eq!(
+        operations(&target_master)[&operation_id].phase,
+        NodeOperationPhase::PreparingTarget
+    );
+
+    source
+        .handle(NodeControlCommand::Cancel {
+            preview_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    for master in [&source_master, &target_master] {
+        assert_eq!(
+            operations(master)[&operation_id].phase,
+            NodeOperationPhase::Cancelled
+        );
+    }
+    server.abort();
+    counter.abort();
+}
+
+#[tokio::test]
+async fn unsupervised_destination_refuses_a_detach_before_planning_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let listeners = listener_with_certificate("192.0.2.11:8053".parse().unwrap());
+    let master = controller_with_listener(
+        &directory,
+        &crate::cluster::membership::random_id(),
+        listeners.clone(),
+        None,
+    )
+    .master
+    .clone();
+    let (restart, _restart_rx) = crate::cluster::managed_restart::unsupervised_channel();
+    let controller = NodeController::new(
+        master.clone(),
+        listeners,
+        restart,
+        Arc::new(TestPairProvider),
+    );
+    let state = ControlState {
+        control_endpoint: Some("192.0.2.11:8053".parse().unwrap()),
+        certificate_pem: Some("certificate".into()),
+        private_key_pem: Some(SecretString("key".into())),
+        ..ControlState::default()
+    };
+    save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
+    let credential = SecretString(crate::auth::token::generate_token().0);
+    let primary = test_peer(
+        crate::cluster::membership::random_id(),
+        "Primary",
+        "192.0.2.10:8053".parse().unwrap(),
+        NodeRole::Primary,
+        credential.clone(),
+        &credential,
+        "a".repeat(64),
+    );
+
+    let error = controller
+        .accept_prepare_remove(&primary, crate::cluster::membership::random_id())
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.is::<crate::cluster::managed_restart::ManagedRestartError>(),
+        "{error:#}"
+    );
+    let guard = acquire_for_migration(&master).unwrap();
+    assert!(load_state(&guard).unwrap().operations.is_empty());
+    let plans = crate::private_store::PrivateStore::open(&guard, ".warden-node-lifecycle")
+        .unwrap()
+        .names(1024)
+        .unwrap();
+    assert!(
+        !plans.iter().any(|name| name.ends_with(".json")),
+        "{plans:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_after_admission_keeps_a_primary_plan_it_cannot_cancel() {
+    crate::upstream::install_ring_crypto_provider_once();
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = crate::cluster::certgen::generate_self_signed(
+        &[crate::cluster::certgen::San::Ip(
+            "127.0.0.1".parse().unwrap(),
+        )],
+        30,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let source_id = crate::cluster::membership::random_id();
+    let source = controller_with_listener(
+        &directory,
+        &source_id,
+        source_listeners(&certificate),
+        Some("127.0.0.1:19001".parse().unwrap()),
+    );
+    let create = super::super::lifecycle::preview(
+        &source.master,
+        super::super::lifecycle::LifecycleRequest::Create {
+            san: vec!["127.0.0.1".into()],
+            api_listen: Some("127.0.0.1:19001".parse().unwrap()),
+            migrate_legacy: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Foreign creation material: the plan's cancel refuses. That is no
+    // reason to commit the one-node primary the operator is cancelling.
+    std::fs::write(
+        directory.path().join(format!("nodes-{}.crt", create.id)),
+        "foreign certificate",
+    )
+    .unwrap();
+    let mut operation = test_operation(
+        crate::cluster::membership::random_id(),
+        source_id,
+        crate::cluster::membership::random_id(),
+        "192.0.2.20:8053".parse().unwrap(),
+        NodeOperationKind::Add,
+        NodeOperationPhase::ApplyingPrimary,
+    );
+    operation.local_preview_id = Some(create.id.clone());
+
+    let error = source.withdraw_add_admission(&operation).await.unwrap_err();
+
+    assert!(
+        error.to_string().starts_with("creation material changed"),
+        "{error:#}"
+    );
+    assert_eq!(
+        super::super::lifecycle::status(&source.master)
+            .unwrap()
+            .saved_role,
+        NodeRole::Standalone
+    );
+    assert!(
+        super::super::lifecycle::preview_exists(&source.master, &create.id)
+            .await
+            .unwrap()
+    );
 }

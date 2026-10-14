@@ -46,6 +46,30 @@ const BOOTSTRAP_TOKEN_IPV6_BYTES: usize = 115;
 const RECOVERY_TTL: u64 = 24 * 60 * 60;
 const DETACH_RECEIPT_TTL: u64 = 60 * 60;
 const OPERATION_RETENTION: u64 = 7 * 24 * 60 * 60;
+const REVIEW_EXPIRED_MESSAGE: &str =
+    "Review expired before apply; nothing changed. Prepare the operation again.";
+const REVIEWED_CORPUS_GONE: &str =
+    "reviewed corpus changed or was removed since review; cancel this Add and prepare it again";
+const REVIEWED_PAIR_CHANGED: &str =
+    "active policy or corpus changed since review; cancel this Add and prepare it again";
+const ADMITTED_PAIR_CHANGED_MESSAGE: &str =
+    "Reviewed policy or corpus changed after primary admission; cancel this Add and prepare it again.";
+const PREPARE_ADD_FAILED_MESSAGE: &str =
+    "Destination did not stage the review; fix the destination and Resume, or Cancel.";
+/// How `lifecycle::cancel` refuses a plan whose transaction already started.
+const PRIMARY_TRANSACTION_STARTED: &str = "transaction already started";
+/// Concurrent requests on the Nodes port. Claims have their own few permits
+/// so slow claims cannot starve peers; nothing queues for a permit.
+const CLAIM_PERMITS: usize = 4;
+const REQUEST_PERMITS: usize = 32;
+/// A claim body is a few hundred bytes sent with its headers.
+const CLAIM_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CLAIM_BODY_LIMIT: usize = 64 * 1024;
+
+/// A Nodes request whose bearer or association token matches nothing.
+#[derive(Debug, Error)]
+#[error("managed node credential refused")]
+struct CredentialRefused;
 
 /// Commands shared by local IPC, CLI and the Configuration / Nodes screen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -218,6 +242,10 @@ pub struct NodeControlStatus {
     pub control_endpoint: Option<SocketAddr>,
     pub peers: Vec<NodePeer>,
     pub operations: Vec<NodeOperationProgress>,
+    /// Runtime problems of this daemon, such as a stored Nodes listener
+    /// that could not be restored at start. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_problems: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -351,6 +379,13 @@ pub struct ManagementGrant {
 pub trait ActivePairProvider: Send + Sync {
     fn active_pair(&self) -> Option<ActivePolicyCorpus>;
     async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus>;
+    /// The active pair, `None` only when no verified pair is active. A read
+    /// that fails is an error, never `None`.
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>>;
+    /// The active pair for display, without re-hashing corpus bodies.
+    fn active_identity(&self) -> Option<ActivePolicyCorpus> {
+        self.active_pair()
+    }
 }
 
 /// Persist an exact verified policy snapshot for enrollment without advertising it.
@@ -363,8 +398,12 @@ pub(crate) fn capture_enrollment_policy(
     let now = super::membership::now()?;
     store.gc(now)?;
     let published = match store.find_committed_revision(snapshot.config_revision())? {
-        Some(published) => published,
-        None => {
+        Some(published)
+            if published.rebuilt_by(|lineage, epoch| snapshot.publication(lineage, epoch))? =>
+        {
+            published
+        }
+        _ => {
             ensure!(
                 !store
                     .pending_intents()?
@@ -868,6 +907,11 @@ pub struct NodeController {
     restart: super::managed_restart::ManagedRestartHandle,
     active: Arc<dyn ActivePairProvider>,
     transition_gate: Arc<tokio::sync::Mutex<()>>,
+    runtime_problems: std::sync::Mutex<Vec<String>>,
+    /// Per-address lockout after refused credentials on the Nodes port.
+    refused_credentials: crate::auth::middleware::AuthRateLimiter,
+    claim_permits: Arc<tokio::sync::Semaphore>,
+    request_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl NodeController {
@@ -894,7 +938,19 @@ impl NodeController {
             restart,
             active,
             transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+            runtime_problems: std::sync::Mutex::new(Vec::new()),
+            refused_credentials: crate::auth::middleware::AuthRateLimiter::new(),
+            claim_permits: Arc::new(tokio::sync::Semaphore::new(CLAIM_PERMITS)),
+            request_permits: Arc::new(tokio::sync::Semaphore::new(REQUEST_PERMITS)),
         })
+    }
+
+    /// Replace the runtime problems reported by `status`.
+    pub fn set_runtime_problems(&self, problems: Vec<String>) {
+        *self
+            .runtime_problems
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = problems;
     }
 
     pub async fn handle(
@@ -994,20 +1050,27 @@ impl NodeController {
             let guard = acquire_for_migration(&master)?;
             let mut state = load_state(&guard)?;
             let is_current_endpoint = state.control_endpoint == Some(endpoint);
-            ensure!(
-                is_current_endpoint
-                    || state
-                        .previous_listener
-                        .as_ref()
-                        .is_some_and(|listener| listener.endpoint == endpoint),
-                "ready endpoint does not match durable Nodes listener"
-            );
+            // A later operation may have retired the endpoint before a
+            // delayed readiness pass; only a durable listener acknowledges.
+            if !(is_current_endpoint
+                || state
+                    .previous_listener
+                    .as_ref()
+                    .is_some_and(|listener| listener.endpoint == endpoint))
+            {
+                tracing::debug!(
+                    %endpoint,
+                    "ready endpoint is no longer a durable Nodes listener; nothing to acknowledge"
+                );
+                return Ok(Vec::new());
+            }
             let now = super::membership::now()?;
             let mut completed_peer_states = Vec::new();
             let mut completed_pin_owners = Vec::new();
             for operation in state.operations.values_mut() {
                 let local_is_source = operation.preview.source_node_id == local_id;
                 let local_is_target = operation.preview.target_node_id == local_id;
+                let mut admitted_pair_changed = false;
                 for step in &mut operation.preview.restart_steps {
                     let belongs_here = match step.target {
                         NodeRestartTarget::Primary => local_is_source,
@@ -1025,15 +1088,19 @@ impl NodeController {
                         NodeOperationKind::Edit => true,
                         NodeOperationKind::Remove => lifecycle.saved_role == NodeRole::Standalone,
                     };
-                    if is_current_endpoint
-                        && step.requested
-                        && !step.acknowledged
-                        && belongs_here
-                        && pair_matches
-                    {
-                        step.acknowledged = true;
-                        operation.last_verified_at = Some(now);
+                    if is_current_endpoint && step.requested && !step.acknowledged && belongs_here {
+                        if pair_matches {
+                            step.acknowledged = true;
+                            operation.last_verified_at = Some(now);
+                        } else if operation.preview.kind == NodeOperationKind::Add
+                            && matches!(step.target, NodeRestartTarget::Primary)
+                        {
+                            admitted_pair_changed = true;
+                        }
                     }
+                }
+                if admitted_pair_changed && !operation.phase.terminal() {
+                    operation.message = ADMITTED_PAIR_CHANGED_MESSAGE.into();
                 }
                 if local_is_target
                     && operation.phase == NodeOperationPhase::RestartingTarget
@@ -1326,6 +1393,7 @@ impl NodeController {
 
     /// Advance a bounded batch of already-applied durable work.
     pub async fn runtime_tick(self: &Arc<Self>) -> anyhow::Result<usize> {
+        self.refused_credentials.cleanup();
         let local_node_id = {
             let master = self.master.clone();
             blocking(move || super::lifecycle::status(&master))
@@ -1393,13 +1461,17 @@ impl NodeController {
                         .operations
                         .values()
                         .filter(|operation| {
-                            operation.preview.kind == NodeOperationKind::Add
-                                && operation.phase == NodeOperationPhase::Cancelled
+                            operation.phase == NodeOperationPhase::Cancelled
                                 && operation.preview.target_node_id == local_id
                                 && operation.peer_preview_id.is_some()
                         })
                         .take(8)
-                        .map(|operation| operation.preview.id.clone())
+                        .map(|operation| {
+                            (
+                                operation.preview.id.clone(),
+                                operation.preview.kind == NodeOperationKind::Add,
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -1413,7 +1485,8 @@ impl NodeController {
                             .filter(|operation| {
                                 operation.preview.kind == NodeOperationKind::Add
                                     && operation.phase == NodeOperationPhase::Complete
-                                    && operation.preview.target_node_id == local_id
+                                    && (operation.preview.target_node_id == local_id
+                                        || operation.preview.source_node_id == local_id)
                                     && !state.released_corpus_pins.contains(&operation.preview.id)
                             })
                             .map(|operation| operation.preview.id.clone())
@@ -1451,7 +1524,17 @@ impl NodeController {
                 advanced += 1;
             }
         }
-        for operation_id in cancelled_joins {
+        for (operation_id, add) in cancelled_joins {
+            // Edit and Remove cleanup waits for the gate, so it never races a
+            // new operation for the same node.
+            let _transition = if add {
+                None
+            } else {
+                match self.transition_gate.clone().try_lock_owned() {
+                    Ok(transition) => Some(transition),
+                    Err(_) => continue,
+                }
+            };
             if self.cleanup_cancelled_join(&operation_id).await? {
                 advanced += 1;
             }
@@ -1738,6 +1821,7 @@ impl NodeController {
         .await?;
         let needs_metadata = existing.is_none();
         let endpoint = if let Some((endpoint, ..)) = existing.as_ref() {
+            ensure_source_reaches(*endpoint, destination)?;
             *endpoint
         } else {
             let master = self.master.clone();
@@ -1875,6 +1959,14 @@ impl NodeController {
         let (source_endpoint, source_fingerprint) = self.ensure_source_listener(endpoint).await?;
         let staged_pair = self.active.enrollment_pair().await?;
         let operation_id = super::membership::random_id();
+        let recover_until = now.checked_add(RECOVERY_TTL).context("clock overflow")?;
+        {
+            let master = self.master.clone();
+            let reviewed = staged_pair.clone();
+            let owner = operation_id.clone();
+            blocking(move || pin_reviewed_corpus(&master, &reviewed, &owner, recover_until))
+                .await?;
+        }
         let (source_secret, _) = generate_token();
         let source_credential = SecretString(source_secret);
         let request = BootstrapClaimRequest {
@@ -1886,28 +1978,35 @@ impl NodeController {
             source_fingerprint: source_fingerprint.clone(),
             source_credential: source_credential.clone(),
         };
-        let response: BootstrapClaimResponse = post_pinned(
-            endpoint,
-            &token.fingerprint,
-            "/api/nodes/v2/bootstrap/claim",
-            None,
-            &request,
-        )
-        .await
-        .context("destination TLS bootstrap failed before association")?;
-        ensure!(
-            response.target_node_id == token.target_node_id,
-            "destination identity differs from the token"
-        );
-        ensure!(
-            response.target_role == NodeRole::Standalone,
-            "destination already belongs to a cluster"
-        );
-        ensure!(
-            response.capabilities.supports_v2_management(),
-            "destination requires an upgrade before Add Node"
-        );
-        let before_revision = local_revision(&self.master).await?;
+        let claimed = async {
+            let response: BootstrapClaimResponse = post_pinned(
+                endpoint,
+                &token.fingerprint,
+                "/api/nodes/v2/bootstrap/claim",
+                None,
+                &request,
+            )
+            .await
+            .context("destination TLS bootstrap failed before association")?;
+            ensure!(
+                response.target_node_id == token.target_node_id,
+                "destination identity differs from the token"
+            );
+            ensure!(
+                response.target_role == NodeRole::Standalone,
+                "destination already belongs to a cluster"
+            );
+            ensure!(
+                response.capabilities.supports_v2_management(),
+                "destination requires an upgrade before Add Node"
+            );
+            Ok((response, local_revision(&self.master).await?))
+        }
+        .await;
+        let (response, before_revision) = match claimed {
+            Ok(claimed) => claimed,
+            Err(error) => return Err(self.unpin_reviewed_corpus(&operation_id, error).await),
+        };
         let preview = NodePreview {
             id: operation_id.clone(),
             kind: NodeOperationKind::Add,
@@ -1943,7 +2042,7 @@ impl NodeController {
             before_revision,
             // This is not reviewable until the target verifies its private
             // backup. `Prepared` receives a fresh, ordinary review deadline.
-            expires_at: now.checked_add(RECOVERY_TTL).context("clock overflow")?,
+            expires_at: recover_until,
         };
         let cluster_id = local
             .cluster_id
@@ -1956,7 +2055,7 @@ impl NodeController {
             paused_from: None,
             message: "Association prepared; no membership or policy has been applied.".into(),
             last_verified_at: Some(now),
-            recover_until: Some(now.checked_add(RECOVERY_TTL).context("clock overflow")?),
+            recover_until: Some(recover_until),
             peer_preview_id: None,
             local_preview_id: None,
             staged_pair: Some(staged_pair.clone()),
@@ -1986,7 +2085,8 @@ impl NodeController {
             source_fingerprint: token.fingerprint,
         };
         let master = self.master.clone();
-        blocking(move || {
+        let owner = operation_id.clone();
+        let recorded = blocking(move || {
             let guard = acquire_for_migration(&master)?;
             let mut state = load_state(&guard)?;
             ensure!(
@@ -2017,7 +2117,10 @@ impl NodeController {
             state.operations.insert(operation_id, record);
             save_state(&guard, &state)
         })
-        .await?;
+        .await;
+        if let Err(error) = recorded {
+            return Err(self.unpin_reviewed_corpus(&owner, error).await);
+        }
         let peer = self.peer(&response.target_node_id).await?;
         let staged = send_management(
             &peer,
@@ -2033,11 +2136,25 @@ impl NodeController {
             },
         )
         .await
-        .context("destination could not stage the reviewed policy and backup")?;
-        ensure!(
-            staged.backup_verified && staged.preview_id.is_some(),
-            "destination did not verify its replacement backup"
-        );
+        .context("destination could not stage the reviewed policy and backup")
+        .and_then(|staged| {
+            ensure!(
+                staged.backup_verified && staged.preview_id.is_some(),
+                "destination did not verify its replacement backup"
+            );
+            Ok(staged)
+        });
+        // The record stays PreparingTarget and keeps its corpus pin: the
+        // bootstrap token is spent, so Resume retries and Cancel cleans up.
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                let mut operation = self.operation(&preview.id).await?;
+                operation.message = PREPARE_ADD_FAILED_MESSAGE.into();
+                self.save_operation(operation).await?;
+                return Err(error);
+            }
+        };
         let mut operation = self.operation(&preview.id).await?;
         operation.peer_preview_id = staged.preview_id;
         operation.backup_verified = true;
@@ -2333,7 +2450,7 @@ impl NodeController {
             message: if peer_preview_id.is_some() {
                 "Online detach prepared; active policy is unchanged.".into()
             } else {
-                "Peer is offline; apply will revoke delivery and retain a pending detach.".into()
+                "Peer is offline or refused to prepare the detach; apply will revoke delivery and retain a pending detach.".into()
             },
             last_verified_at: peer_preview_id.as_ref().map(|_| now),
             recover_until: Some(recover_until),
@@ -2384,6 +2501,10 @@ impl NodeController {
     async fn apply(&self, operation_id: &str) -> anyhow::Result<NodeControlReply> {
         let operation = self.operation(operation_id).await?;
         ensure!(
+            operation.phase != NodeOperationPhase::Cancelled,
+            "review expired or was cancelled; prepare it again"
+        );
+        ensure!(
             operation.phase == NodeOperationPhase::Prepared,
             "operation was already applied; use Resume to continue its durable state"
         );
@@ -2399,6 +2520,22 @@ impl NodeController {
             operation.preview.before_revision == local_revision(&self.master).await?,
             "configuration changed since review; prepare it again"
         );
+        if operation.preview.kind == NodeOperationKind::Add {
+            // A standalone source has no verified pair yet; it serves its
+            // enrollment pair. Refuse here, while nothing is admitted.
+            let active = match self.active.verified_pair().await? {
+                Some(active) => active,
+                None => self.active.enrollment_pair().await?,
+            };
+            let reviewed = operation
+                .staged_pair
+                .as_ref()
+                .context("reviewed policy and corpus identity absent")?;
+            ensure!(
+                reviewed_pair_matches(&self.master, reviewed, &active)?,
+                REVIEWED_PAIR_CHANGED
+            );
+        }
         match operation.preview.kind {
             NodeOperationKind::Add => self.apply_add(operation).await?,
             NodeOperationKind::Edit => self.apply_edit(operation).await?,
@@ -2478,7 +2615,7 @@ impl NodeController {
             local.saved_role == NodeRole::Primary,
             "Add Node requires the primary"
         );
-        let needs_primary_restart = local.restart_required || self.active.active_pair().is_none();
+        let needs_primary_restart = self.primary_restart_needed(&local).await?;
         let restart_permit = if needs_primary_restart {
             Some(self.restart.preflight().await?)
         } else {
@@ -2527,12 +2664,16 @@ impl NodeController {
             .context("reviewed policy and corpus identity absent")?;
         let active = self
             .active
-            .active_pair()
+            .verified_pair()
+            .await?
             .context("primary has not activated a policy and corpus pair")?;
-        ensure!(
-            reviewed_pair_matches(&self.master, staged, &active)?,
-            "active policy or corpus changed since review; prepare Add Node again"
-        );
+        let matches = reviewed_pair_matches(&self.master, staged, &active);
+        if !matches.as_ref().is_ok_and(|matches| *matches) {
+            operation.message = ADMITTED_PAIR_CHANGED_MESSAGE.into();
+            self.save_operation(operation).await?;
+            matches?;
+            anyhow::bail!(REVIEWED_PAIR_CHANGED);
+        }
         ensure!(
             operation.backup_verified,
             "destination backup was not verified before apply"
@@ -2614,6 +2755,13 @@ impl NodeController {
             "destination did not durably arm the reviewed Add recovery"
         );
         Ok(phase)
+    }
+
+    /// Whether the primary must restart before it serves the reviewed pair.
+    /// Only a definite "no verified pair is active" counts: a read that
+    /// fails refuses instead, so a transient fault never costs a restart.
+    async fn primary_restart_needed(&self, local: &LifecycleStatus) -> anyhow::Result<bool> {
+        Ok(local.restart_required || self.active.verified_pair().await?.is_none())
     }
 
     async fn admit_prepared_target(&self, operation: &OperationRecord) -> anyhow::Result<()> {
@@ -2799,33 +2947,67 @@ impl NodeController {
     async fn cancel(&self, operation_id: &str) -> anyhow::Result<NodeControlReply> {
         let mut operation = self.operation(operation_id).await?;
         if operation.phase == NodeOperationPhase::Cancelled {
-            ensure!(
-                operation.preview.kind == NodeOperationKind::Add && operation.cancel_requested,
-                "an applied operation cannot be cancelled; use Resume for recovery"
-            );
-            self.finish_cancelled_add_source_cleanup(&operation).await?;
-            return self.reply(None, None, "Preview cancelled.").await;
+            if operation.preview.kind != NodeOperationKind::Add {
+                return self.reply(None, None, "Preview cancelled.").await;
+            }
+            if operation.cancel_requested {
+                self.finish_cancelled_add_source_cleanup(&operation).await?;
+            } else {
+                ensure!(
+                    self.cancelled_primary_restart_pending(&operation).await?,
+                    "an applied operation cannot be cancelled; use Resume for recovery"
+                );
+            }
+            return self.restart_cancelled_primary(operation_id).await;
         }
+        let local_id = {
+            let master = self.master.clone();
+            blocking(move || super::lifecycle::status(&master))
+                .await?
+                .node_id
+        };
+        // The destination has not applied yet, so the source can still
+        // withdraw the admission it saved.
+        let admitted = operation.preview.kind == NodeOperationKind::Add
+            && local_id.as_deref() == Some(&operation.preview.source_node_id)
+            && matches!(
+                if operation.phase == NodeOperationPhase::Paused {
+                    operation.paused_from
+                } else {
+                    Some(operation.phase)
+                },
+                Some(NodeOperationPhase::ApplyingPrimary | NodeOperationPhase::RestartingPrimary)
+            );
         ensure!(
-            matches!(
-                operation.phase,
-                NodeOperationPhase::PreparingTarget | NodeOperationPhase::Prepared
-            ) || (operation.phase == NodeOperationPhase::Paused
-                && matches!(
-                    operation.paused_from,
-                    Some(NodeOperationPhase::PreparingTarget | NodeOperationPhase::Prepared)
+            admitted
+                || matches!(
+                    operation.phase,
+                    NodeOperationPhase::PreparingTarget | NodeOperationPhase::Prepared
                 )
-                && operation.preview.kind == NodeOperationKind::Add),
+                || (operation.phase == NodeOperationPhase::Paused
+                    && matches!(
+                        operation.paused_from,
+                        Some(NodeOperationPhase::PreparingTarget | NodeOperationPhase::Prepared)
+                    )
+                    && operation.preview.kind == NodeOperationKind::Add),
             "an applied operation cannot be cancelled; use Resume for recovery"
         );
         operation.cancel_requested = true;
-        operation.message = "Cancellation requested; awaiting destination acknowledgement. Active policy is unchanged.".into();
+        operation.message = if admitted {
+            "Cancellation requested after primary admission; awaiting destination acknowledgement."
+        } else {
+            "Cancellation requested; awaiting destination acknowledgement. Active policy is unchanged."
+        }
+        .into();
         self.save_operation(operation.clone()).await?;
         if operation.preview.target_node_id == operation.preview.source_node_id {
             if let Some(preview_id) = operation.peer_preview_id.clone() {
                 super::lifecycle::cancel(&self.master, &preview_id).await?;
             }
-        } else {
+        } else if operation.preview.kind == NodeOperationKind::Add
+            || operation.peer_preview_id.is_some()
+        {
+            // An Edit or Remove the peer never prepared has nothing remote to cancel.
             let peer = match self.peer(&operation.preview.target_node_id).await {
                 Ok(peer) => peer,
                 Err(error) => {
@@ -2854,15 +3036,136 @@ impl NodeController {
                 )).await;
             }
         }
+        if admitted {
+            self.withdraw_add_admission(&operation).await?;
+        }
         operation.phase = NodeOperationPhase::Cancelled;
-        operation.message = "Preview cancelled; membership and active policy are unchanged.".into();
+        operation.message = if admitted {
+            "Add cancelled after primary admission; the node was not added."
+        } else {
+            "Preview cancelled; membership and active policy are unchanged."
+        }
+        .into();
         self.save_operation(operation.clone()).await?;
         if operation.preview.kind == NodeOperationKind::Add {
             self.finish_cancelled_add_source_cleanup(&operation).await?;
-        } else {
-            self.retire_prepared_listener(&operation.preview.id).await?;
+            return self.restart_cancelled_primary(operation_id).await;
         }
+        self.retire_prepared_listener(&operation.preview.id).await?;
         self.reply(None, None, "Preview cancelled.").await
+    }
+
+    /// Revoke the destination's Pending admission and drop an uncommitted
+    /// primary plan. Each step is a no-op once done, for the retry path.
+    async fn withdraw_add_admission(&self, operation: &OperationRecord) -> anyhow::Result<()> {
+        let local = {
+            let master = self.master.clone();
+            blocking(move || super::lifecycle::status(&master)).await?
+        };
+        if local.saved_role == NodeRole::Primary {
+            let master = self.master.clone();
+            let target_id = operation.preview.target_node_id.clone();
+            blocking(move || {
+                let guard = acquire_for_migration(&master)?;
+                let mut membership = super::membership::MembershipStore::open(&guard)?;
+                if membership
+                    .views(super::membership::now()?)
+                    .iter()
+                    .any(|member| {
+                        member.node_id == target_id
+                            && member.state != super::membership::MemberState::Revoked
+                    })
+                {
+                    membership.revoke(&target_id)?;
+                }
+                Ok(())
+            })
+            .await?;
+        } else if let Some(preview_id) = operation.local_preview_id.as_deref() {
+            if super::lifecycle::preview_exists(&self.master, preview_id).await? {
+                if let Err(error) = super::lifecycle::cancel(&self.master, preview_id).await {
+                    // Only a started transaction finishes forward; the host
+                    // then ends as a one-node primary with no admitted peer.
+                    // Any other refusal keeps the cancel pending for a retry.
+                    if !error
+                        .chain()
+                        .any(|cause| cause.to_string().starts_with(PRIMARY_TRANSACTION_STARTED))
+                    {
+                        return Err(error);
+                    }
+                    tracing::warn!(%error, "primary plan already started; finishing it");
+                    super::lifecycle::apply(&self.master, preview_id)
+                        .await
+                        .context("primary plan can be neither cancelled nor applied")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A standalone source that committed its primary plan but never
+    /// requested the restart that activates it.
+    async fn cancelled_primary_restart_pending(
+        &self,
+        operation: &OperationRecord,
+    ) -> anyhow::Result<bool> {
+        if operation.local_preview_id.is_none()
+            || operation
+                .preview
+                .restart_steps
+                .iter()
+                .any(|step| step.step_id == "primary" && step.requested)
+        {
+            return Ok(false);
+        }
+        let local = {
+            let master = self.master.clone();
+            blocking(move || super::lifecycle::status(&master)).await?
+        };
+        Ok(local.saved_role == NodeRole::Primary && local.restart_required)
+    }
+
+    /// After a cancelled Add the host ends as a one-node primary,
+    /// as after `cluster create`. The restart goes last: it ends this process.
+    async fn restart_cancelled_primary(
+        &self,
+        operation_id: &str,
+    ) -> anyhow::Result<NodeControlReply> {
+        let mut operation = self.operation(operation_id).await?;
+        if !self.cancelled_primary_restart_pending(&operation).await? {
+            return self.reply(None, None, "Preview cancelled.").await;
+        }
+        let permit = match self.restart.preflight().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return self
+                    .reply(
+                        None,
+                        None,
+                        format!(
+                            "Add cancelled; this node saved its one-node primary configuration. Restart the Warden service to activate it ({error})."
+                        ),
+                    )
+                    .await;
+            }
+        };
+        self.persist_restart_request(&mut operation, "primary")
+            .await?;
+        self.restart
+            .request(
+                permit,
+                super::managed_restart::ManagedRestartRequest {
+                    operation_id: operation.preview.id,
+                    step_id: "primary".into(),
+                },
+            )
+            .await?;
+        self.reply(
+            None,
+            None,
+            "Add cancelled; restarting this node as a one-node primary.",
+        )
+        .await
     }
 
     async fn abandon_preparing_add(&self, operation_id: &str) -> anyhow::Result<NodeControlReply> {
@@ -3010,12 +3313,37 @@ impl NodeController {
             );
             expired_add_review = previous == NodeOperationPhase::Prepared
                 && operation.preview.kind == NodeOperationKind::Add;
+            let recover_until = super::membership::now()?
+                .checked_add(RECOVERY_TTL)
+                .context("clock overflow")?;
+            let local_id = {
+                let master = self.master.clone();
+                blocking(move || super::lifecycle::status(&master))
+                    .await?
+                    .node_id
+            };
+            // The source checks the reviewed pair until the destination applies.
+            if operation.preview.kind == NodeOperationKind::Add
+                && local_id.as_deref() == Some(&operation.preview.source_node_id)
+                && matches!(
+                    previous,
+                    NodeOperationPhase::PreparingTarget
+                        | NodeOperationPhase::Prepared
+                        | NodeOperationPhase::ApplyingPrimary
+                        | NodeOperationPhase::RestartingPrimary
+                )
+            {
+                let master = self.master.clone();
+                let reviewed = operation
+                    .staged_pair
+                    .clone()
+                    .context("reviewed policy and corpus identity absent")?;
+                let owner = operation.preview.id.clone();
+                blocking(move || pin_reviewed_corpus(&master, &reviewed, &owner, recover_until))
+                    .await?;
+            }
             operation.phase = previous;
-            operation.recover_until = Some(
-                super::membership::now()?
-                    .checked_add(RECOVERY_TTL)
-                    .context("clock overflow")?,
-            );
+            operation.recover_until = Some(recover_until);
             operation.message = "Durable recovery authorization renewed by the operator.".into();
             self.save_operation(operation.clone()).await?;
         }
@@ -3170,7 +3498,7 @@ impl NodeController {
                 };
                 if local.saved_role == NodeRole::Primary {
                     self.admit_prepared_target(&operation).await?;
-                    if !local.restart_required && self.active.active_pair().is_some() {
+                    if !self.primary_restart_needed(&local).await? {
                         self.apply_prepared_target(operation).await?;
                         return self
                             .reply(None, None, "Recovered committed target admission.")
@@ -3869,9 +4197,7 @@ impl NodeController {
 
     async fn cleanup_cancelled_join(&self, operation_id: &str) -> anyhow::Result<bool> {
         let operation = self.operation(operation_id).await?;
-        if operation.preview.kind != NodeOperationKind::Add
-            || operation.phase != NodeOperationPhase::Cancelled
-        {
+        if operation.phase != NodeOperationPhase::Cancelled {
             return Ok(false);
         }
         let Some(preview_id) = operation.peer_preview_id.clone() else {
@@ -3903,6 +4229,33 @@ impl NodeController {
         Ok(true)
     }
 
+    async fn release_reviewed_corpus_pin(&self, operation_id: &str) -> anyhow::Result<()> {
+        let master = self.master.clone();
+        let owner = operation_id.to_owned();
+        blocking(move || {
+            if let Some(store) = super::corpus::CorpusStore::open_existing(&master)? {
+                store.release_private_manifest_pin(&owner)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Release a refused Add's corpus pin and hand back the refusal.
+    async fn unpin_reviewed_corpus(
+        &self,
+        operation_id: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if let Err(release) = self.release_reviewed_corpus_pin(operation_id).await {
+            tracing::warn!(
+                error = %format_args!("{release:#}"),
+                "reviewed corpus pin was not released; it expires on its own"
+            );
+        }
+        error
+    }
+
     async fn release_completed_corpus_pin(&self, operation_id: &str) -> anyhow::Result<bool> {
         let master = self.master.clone();
         let id = operation_id.to_owned();
@@ -3919,12 +4272,7 @@ impl NodeController {
         if !pending {
             return Ok(false);
         }
-        let master = self.master.clone();
-        let owner = operation_id.to_owned();
-        blocking(move || {
-            super::corpus::CorpusStore::open(&master)?.release_private_manifest_pin(&owner)
-        })
-        .await?;
+        self.release_reviewed_corpus_pin(operation_id).await?;
         let master = self.master.clone();
         let id = operation_id.to_owned();
         blocking(move || {
@@ -4008,6 +4356,8 @@ impl NodeController {
                 && operation.cancel_requested,
             "cancelled source cleanup does not match the exact enrollment"
         );
+        self.release_reviewed_corpus_pin(&operation.preview.id)
+            .await?;
         let master = self.master.clone();
         let cancelled_id = operation.preview.id.clone();
         let target_id = operation.preview.target_node_id.clone();
@@ -4118,6 +4468,19 @@ impl NodeController {
         let master = self.master.clone();
         let response = blocking(move || {
             let guard = acquire_for_migration(&master)?;
+            let mut state = load_state(&guard)?;
+            let now = super::membership::now()?;
+            // The token first: a refused claim never loads the configuration.
+            // Only a wrong token counts toward the lockout, not an expired one.
+            let authorization = state
+                .bootstrap
+                .as_mut()
+                .filter(|authorization| verify_token(&request.token.0, &authorization.token_hash))
+                .ok_or(CredentialRefused)?;
+            ensure!(
+                authorization.expires_at > now,
+                "association token expired; issue a new token on the destination"
+            );
             let loaded = load_config(&guard)?;
             let local = &loaded.config;
             let local_id = local
@@ -4127,16 +4490,8 @@ impl NodeController {
                 .context("destination node identity absent")?;
             let role = config_role(local);
             let revision = capture_revision(&guard, &loaded)?;
-            let mut state = load_state(&guard)?;
-            let now = super::membership::now()?;
-            let authorization = state
-                .bootstrap
-                .as_mut()
-                .context("association authorization is not active")?;
             ensure!(
-                authorization.expires_at > now
-                    && authorization.target_node_id == local_id
-                    && verify_token(&request.token.0, &authorization.token_hash),
+                authorization.target_node_id == local_id,
                 "association authorization expired, consumed or invalid"
             );
             ensure!(
@@ -4782,9 +5137,30 @@ impl NodeController {
                     principal = Some(peer.clone());
                 }
             }
-            let principal = principal.context("managed node credential refused")?;
+            let principal = principal.ok_or(CredentialRefused)?;
             save_state(&guard, &state)?;
             Ok(principal)
+        })
+        .await
+    }
+
+    /// Refuse a bearer that matches no peer, before the request body is read
+    /// or the transition gate is taken. Saves nothing; the handler still
+    /// authenticates in full.
+    async fn check_peer_credential(&self, credential: String) -> anyhow::Result<()> {
+        let master = self.master.clone();
+        blocking(move || {
+            let guard = acquire_for_migration(&master)?;
+            let state = load_state(&guard)?;
+            if state
+                .peers
+                .values()
+                .any(|peer| verify_token(&credential, &peer.incoming_credential_hash))
+            {
+                Ok(())
+            } else {
+                Err(CredentialRefused.into())
+            }
         })
         .await
     }
@@ -4967,6 +5343,8 @@ impl NodeController {
             cancel_requested: false,
         })
         .await?;
+        // After the record, so the source's Resume or Cancel still reaches it.
+        self.restart.preflight().await?;
         ensure!(
             primary_node_id == principal.view.node_id
                 && super::membership::valid_id(&cluster_id)
@@ -5154,6 +5532,8 @@ impl NodeController {
                 )
                 .await;
         }
+        // No record and no Leave plan: the source takes its offline path.
+        self.restart.preflight().await?;
         ensure!(
             principal.view.state == NodePeerState::Active,
             "a new detach may only be prepared for an active managed peer"
@@ -5373,6 +5753,36 @@ impl NodeController {
         preview_id: Option<String>,
     ) -> anyhow::Result<PeerManagementReply> {
         let mut operation = self.operation(&operation_id).await?;
+        if operation.preview.kind != NodeOperationKind::Add {
+            ensure!(
+                operation.preview.source_node_id == principal.view.node_id,
+                "peer cancel does not match the prepared operation"
+            );
+            if operation.phase != NodeOperationPhase::Cancelled {
+                ensure!(
+                    preview_id.is_none()
+                        || operation.peer_preview_id.as_deref() == preview_id.as_deref(),
+                    "peer cancel does not match the prepared operation"
+                );
+                ensure!(
+                    operation.phase == NodeOperationPhase::Prepared,
+                    "applied operation cannot be cancelled"
+                );
+                operation.cancel_requested = true;
+                if let Some(lifecycle_id) = operation.peer_preview_id.as_deref() {
+                    if super::lifecycle::preview_exists(&self.master, lifecycle_id).await? {
+                        super::lifecycle::cancel(&self.master, lifecycle_id).await?;
+                    }
+                }
+                operation.phase = NodeOperationPhase::Cancelled;
+                operation.message =
+                    "Preview cancelled; membership and active policy are unchanged.".into();
+                self.save_operation(operation).await?;
+            }
+            return self
+                .peer_reply(Some(&operation_id), None, "Preview cancelled.")
+                .await;
+        }
         if operation.phase == NodeOperationPhase::Cancelled
             && operation.preview.kind == NodeOperationKind::Add
             && operation.preview.source_node_id == principal.view.node_id
@@ -5690,26 +6100,41 @@ impl NodeController {
     }
 
     async fn status(&self) -> anyhow::Result<NodeControlStatus> {
+        let runtime_problems = self
+            .runtime_problems
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let master = self.master.clone();
-        let active = self.active.active_pair();
+        let provider = Arc::clone(&self.active);
         blocking(move || {
-            let mut membership = super::lifecycle::status(&master)?;
+            let started = std::time::Instant::now();
+            let active = provider.active_identity();
+            let pair_read = started.elapsed();
+            let guard = acquire_for_migration(&master)?;
+            tracing::debug!(
+                pair_read_ms = pair_read.as_millis(),
+                lock_wait_ms = (started.elapsed() - pair_read).as_millis(),
+                "Nodes status inputs read"
+            );
+            let loaded = load_config(&guard)?;
+            let mut membership = super::lifecycle::status_locked(&guard, &loaded)?;
             if let Some(active) = active {
                 membership.active_policy = Some(active.policy);
                 membership.active_corpus = Some(active.corpus_generation);
             }
             if membership.saved_role == NodeRole::Standalone
                 && membership.node_id.is_none()
-                && !has_configured_control_endpoint(&master)?
+                && loaded.config.node.control_listen.is_none()
             {
                 return Ok(NodeControlStatus {
                     membership,
                     control_endpoint: None,
                     peers: Vec::new(),
                     operations: Vec::new(),
+                    runtime_problems,
                 });
             }
-            let guard = acquire_for_migration(&master)?;
             let mut state = load_state(&guard)?;
             expire_state(&mut state, super::membership::now()?);
             let mut peers: Vec<_> = state.peers.values().map(|peer| peer.view.clone()).collect();
@@ -5752,6 +6177,7 @@ impl NodeController {
                 control_endpoint: state.control_endpoint,
                 peers,
                 operations,
+                runtime_problems,
             })
         })
         .await
@@ -5817,13 +6243,20 @@ fn config_role(config: &crate::config::schema::ConfigV5) -> NodeRole {
 fn preferred_endpoint(master: &Path, requested: Option<SocketAddr>) -> anyhow::Result<SocketAddr> {
     let guard = acquire_for_migration(master)?;
     let loaded = load_config(&guard)?;
-    let endpoint = requested
-        .or(loaded.config.node.control_listen)
-        .or_else(|| {
-            let api = loaded.config.api.listen;
-            (!api.ip().is_unspecified()).then_some(api)
-        })
-        .context("choose --listen IP:PORT for a reachable Nodes HTTPS endpoint")?;
+    let api = &loaded.config.api;
+    // An explicit --listen may be loopback; a guessed endpoint may not.
+    let endpoint = match (requested, loaded.config.node.control_listen) {
+        (Some(endpoint), _) => endpoint,
+        (None, Some(stored)) if stored.ip().to_canonical().is_loopback() => anyhow::bail!(
+            "choose --listen IP:PORT: the stored Nodes endpoint {stored} is loopback and no peer can reach it"
+        ),
+        (None, Some(stored)) => stored,
+        (None, None) => (api.enabled
+            && !api.listen.ip().to_canonical().is_loopback()
+            && !api.listen.ip().is_unspecified())
+        .then_some(api.listen)
+        .context("choose --listen IP:PORT for a reachable Nodes HTTPS endpoint")?,
+    };
     ensure!(
         endpoint.port() != 0 && !endpoint.ip().is_unspecified() && !endpoint.ip().is_multicast(),
         "choose a specific unicast IP and nonzero port for the Nodes endpoint"
@@ -5834,6 +6267,7 @@ fn preferred_endpoint(master: &Path, requested: Option<SocketAddr>) -> anyhow::R
 fn preferred_source_endpoint(master: &Path, destination: SocketAddr) -> anyhow::Result<SocketAddr> {
     let guard = acquire_for_migration(master)?;
     if let Some(endpoint) = load_config(&guard)?.config.node.control_listen {
+        ensure_source_reaches(endpoint, destination)?;
         return Ok(endpoint);
     }
     drop(guard);
@@ -5852,9 +6286,14 @@ fn preferred_source_endpoint(master: &Path, destination: SocketAddr) -> anyhow::
     Ok(SocketAddr::new(local.ip(), CONTROL_PORT))
 }
 
-fn has_configured_control_endpoint(master: &Path) -> anyhow::Result<bool> {
-    let guard = acquire_for_migration(master)?;
-    Ok(load_config(&guard)?.config.node.control_listen.is_some())
+/// A stored loopback source endpoint serves only a loopback destination.
+fn ensure_source_reaches(endpoint: SocketAddr, destination: SocketAddr) -> anyhow::Result<()> {
+    ensure!(
+        !endpoint.ip().to_canonical().is_loopback()
+            || destination.ip().to_canonical().is_loopback(),
+        "choose --listen IP:PORT: the stored Nodes endpoint {endpoint} is loopback and {destination} cannot reach it"
+    );
+    Ok(())
 }
 
 fn reviewed_pair_matches(
@@ -5868,13 +6307,46 @@ fn reviewed_pair_matches(
     let Some(store) = super::corpus::CorpusStore::open_existing(master)? else {
         return Ok(false);
     };
-    let reviewed_corpus = store.manifest_metadata(&reviewed.corpus_generation)?;
+    let reviewed_corpus = store
+        .manifest_metadata(&reviewed.corpus_generation)
+        .context(REVIEWED_CORPUS_GONE)?;
     let active_corpus = store.manifest_metadata(&active.corpus_generation)?;
+    // A list refresh that revalidates unchanged bodies rewrites only
+    // `fetched_at`, so the review still holds.
     Ok(
         reviewed_corpus.source_plan_hash == active_corpus.source_plan_hash
-            && reviewed_corpus.sources == active_corpus.sources
-            && reviewed_corpus.auxiliary == active_corpus.auxiliary,
+            && reviewed_corpus
+                .sources
+                .iter()
+                .map(|item| (&item.source, &item.body))
+                .eq(active_corpus
+                    .sources
+                    .iter()
+                    .map(|item| (&item.source, &item.body)))
+            && reviewed_corpus
+                .auxiliary
+                .iter()
+                .map(|item| (&item.url, &item.body))
+                .eq(active_corpus
+                    .auxiliary
+                    .iter()
+                    .map(|item| (&item.url, &item.body))),
     )
+}
+
+/// Keep the reviewed corpus generation readable until `until`, through
+/// list refreshes that publish newer generations and prune older ones.
+fn pin_reviewed_corpus(
+    master: &Path,
+    reviewed: &ActivePolicyCorpus,
+    owner: &str,
+    until: u64,
+) -> anyhow::Result<()> {
+    let store = super::corpus::CorpusStore::open(master)?;
+    let manifest = store
+        .manifest_metadata(&reviewed.corpus_generation)
+        .context(REVIEWED_CORPUS_GONE)?;
+    store.prepare_manifest_private_pinned(&manifest, owner, until)
 }
 
 async fn local_revision(master: &Path) -> anyhow::Result<String> {
@@ -6354,9 +6826,16 @@ fn expire_state(state: &mut ControlState, now: u64) {
                 operation.phase = NodeOperationPhase::Paused;
                 operation.message = "Review expired while the remote Add remains recoverable; cancel or resume the exact operation.".into();
             } else {
-                operation.phase = NodeOperationPhase::Paused;
-                operation.message = "Review expired; prepare the operation again.".into();
+                operation.phase = NodeOperationPhase::Cancelled;
+                operation.message = REVIEW_EXPIRED_MESSAGE.into();
             }
+        } else if operation.phase == NodeOperationPhase::Paused
+            && operation.paused_from.is_none()
+            && operation.preview.kind != NodeOperationKind::Add
+        {
+            // Records written before expiry cancelled Edit and Remove reviews.
+            operation.phase = NodeOperationPhase::Cancelled;
+            operation.message = REVIEW_EXPIRED_MESSAGE.into();
         } else if operation.recover_until.is_some_and(|deadline| {
             deadline <= now
                 && !operation.phase.terminal()
@@ -6566,8 +7045,78 @@ pub fn node_router(controller: Arc<NodeController>) -> Router {
             "/api/nodes/v2/staging/corpus/objects/{object}",
             get(staged_corpus_object),
         )
+        // Every route above; health stays unlimited.
+        .route_layer(axum::middleware::from_fn_with_state(
+            controller.clone(),
+            node_admission,
+        ))
         .route("/api/nodes/v2/health", get(node_health))
         .with_state(controller)
+}
+
+/// Lockout, concurrency caps and an early credential check for the Nodes port.
+async fn node_admission(
+    State(controller): State<Arc<NodeController>>,
+    axum::extract::ConnectInfo(client): axum::extract::ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let address = client.ip().to_canonical();
+    let limiter = &controller.refused_credentials;
+    if limiter.is_locked_out(&address) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "300")],
+            "Too many refused credentials. Try again later.",
+        )
+            .into_response();
+    }
+    let claim = request.uri().path() == "/api/nodes/v2/bootstrap/claim";
+    let permits = if claim {
+        &controller.claim_permits
+    } else {
+        &controller.request_permits
+    };
+    let Ok(_permit) = Arc::clone(permits).try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let response = if claim {
+        // Only the body read is bounded: a claim that starts runs to the end,
+        // so a 408 never follows a spent token.
+        let (parts, body) = request.into_parts();
+        match tokio::time::timeout(
+            CLAIM_BODY_TIMEOUT,
+            axum::body::to_bytes(body, CLAIM_BODY_LIMIT),
+        )
+        .await
+        {
+            Ok(Ok(body)) => {
+                next.run(axum::extract::Request::from_parts(parts, body.into()))
+                    .await
+            }
+            Ok(Err(_)) => StatusCode::BAD_REQUEST.into_response(),
+            Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+        }
+    } else {
+        let credential = bearer(request.headers()).map(str::to_owned);
+        match credential {
+            Some(credential) => match controller.check_peer_credential(credential).await {
+                Ok(()) => next.run(request).await,
+                Err(error) => refusal(error),
+            },
+            None => StatusCode::UNAUTHORIZED.into_response(),
+        }
+    };
+    // A stalled claim body counts like a refused credential.
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::REQUEST_TIMEOUT
+    ) {
+        limiter.record_failure(&address);
+    } else if response.status().is_success() {
+        limiter.record_success(&address);
+    }
+    response
 }
 
 async fn node_health() -> StatusCode {
@@ -6580,7 +7129,7 @@ async fn bootstrap_claim(
 ) -> Response {
     match controller.accept_bootstrap(request).await {
         Ok(reply) => (StatusCode::OK, Json(reply)).into_response(),
-        Err(error) => safe_error(error),
+        Err(error) => refusal(error),
     }
 }
 
@@ -6607,8 +7156,8 @@ async fn peer_manage(
     .await
     {
         Ok(Ok(reply)) => (StatusCode::OK, Json(reply)).into_response(),
-        Ok(Err(error)) => safe_error(error),
-        Err(error) => safe_error(anyhow::Error::new(error)),
+        Ok(Err(error)) => refusal(error),
+        Err(error) => refusal(anyhow::Error::new(error)),
     }
 }
 
@@ -6617,15 +7166,14 @@ async fn staged_artifact_manifest(
     headers: HeaderMap,
     RoutePath(artifact): RoutePath<String>,
 ) -> Response {
-    if authorize_staging(
+    if let Err(error) = authorize_staging(
         &controller,
         &headers,
         StagingResource::Artifact(artifact.clone()),
     )
     .await
-    .is_err()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return staging_refusal(error);
     }
     let master = controller.master.clone();
     match blocking(move || {
@@ -6640,7 +7188,7 @@ async fn staged_artifact_manifest(
     .await
     {
         Ok(manifest) => Json(manifest).into_response(),
-        Err(error) => safe_error(error),
+        Err(error) => refusal(error),
     }
 }
 
@@ -6649,7 +7197,7 @@ async fn staged_artifact_object(
     headers: HeaderMap,
     RoutePath((artifact, object)): RoutePath<(String, String)>,
 ) -> Response {
-    if authorize_staging(
+    if let Err(error) = authorize_staging(
         &controller,
         &headers,
         StagingResource::ArtifactObject {
@@ -6658,9 +7206,8 @@ async fn staged_artifact_object(
         },
     )
     .await
-    .is_err()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return staging_refusal(error);
     }
     let master = controller.master.clone();
     match blocking(move || {
@@ -6674,7 +7221,7 @@ async fn staged_artifact_object(
             axum::body::Bytes::from_owner(bytes),
         )
             .into_response(),
-        Err(error) => safe_error(error),
+        Err(error) => refusal(error),
     }
 }
 
@@ -6683,24 +7230,21 @@ async fn staged_corpus_manifest(
     headers: HeaderMap,
     RoutePath(artifact): RoutePath<String>,
 ) -> Response {
-    if authorize_staging(
-        &controller,
-        &headers,
-        StagingResource::Corpus(artifact.clone()),
-    )
-    .await
-    .is_err()
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let reviewed =
+        match authorize_staging(&controller, &headers, StagingResource::Corpus(artifact)).await {
+            Ok(reviewed) => reviewed,
+            Err(error) => return staging_refusal(error),
+        };
+    // By generation: a later refresh moves the `policy-` pointer, and the
+    // source pin keeps only the reviewed manifest.
     let master = controller.master.clone();
     match blocking(move || {
-        super::corpus::CorpusStore::open(&master)?.manifest_for_artifact(&artifact)
+        super::corpus::CorpusStore::open(&master)?.manifest_metadata(&reviewed.corpus_generation)
     })
     .await
     {
         Ok(manifest) => Json(manifest).into_response(),
-        Err(error) => safe_error(error),
+        Err(error) => refusal(error),
     }
 }
 
@@ -6709,15 +7253,14 @@ async fn staged_corpus_object(
     headers: HeaderMap,
     RoutePath(object): RoutePath<String>,
 ) -> Response {
-    if authorize_staging(
+    if let Err(error) = authorize_staging(
         &controller,
         &headers,
         StagingResource::CorpusObject(object.clone()),
     )
     .await
-    .is_err()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return staging_refusal(error);
     }
     let master = controller.master.clone();
     match blocking(move || super::corpus::CorpusStore::open(&master)?.authorized_object(&object))
@@ -6739,7 +7282,7 @@ async fn staged_corpus_object(
             )
                 .into_response()
         }
-        Err(error) => safe_error(error),
+        Err(error) => refusal(error),
     }
 }
 
@@ -6818,12 +7361,13 @@ fn authorize_reviewed_resource(
     Ok(())
 }
 
+/// Authorize one staging read and return the reviewed pair it belongs to.
 async fn authorize_staging(
     controller: &NodeController,
     headers: &HeaderMap,
     resource: StagingResource,
-) -> anyhow::Result<()> {
-    let credential = bearer(headers).context("missing managed node credential")?;
+) -> anyhow::Result<ActivePolicyCorpus> {
+    let credential = bearer(headers).ok_or(CredentialRefused)?;
     let peer = controller.authenticate_peer(credential).await?;
     ensure!(
         matches!(
@@ -6834,7 +7378,7 @@ async fn authorize_staging(
     );
     let master = controller.master.clone();
     let peer_node_id = peer.view.node_id.clone();
-    blocking(move || {
+    let reviewed = blocking(move || {
         let guard = acquire_for_migration(&master)?;
         let state = load_state(&guard)?;
         let now = super::membership::now()?;
@@ -6851,15 +7395,30 @@ async fn authorize_staging(
                 .flatten()
         });
         let reviewed = reviewed.context("no live staged enrollment for peer")?;
-        authorize_reviewed_resource(&guard, &master, reviewed, resource)
+        authorize_reviewed_resource(&guard, &master, reviewed, resource)?;
+        Ok(reviewed.clone())
     })
     .await?;
-    controller.touch_peer(&peer_node_id).await
+    controller.touch_peer(&peer_node_id).await?;
+    Ok(reviewed)
 }
 
-fn safe_error(error: anyhow::Error) -> Response {
+fn refusal(error: anyhow::Error) -> Response {
+    if error.is::<CredentialRefused>() {
+        tracing::debug!("Nodes credential refused");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     tracing::warn!(error = ?error, "Nodes control request refused");
     (StatusCode::BAD_REQUEST, "Nodes operation refused").into_response()
+}
+
+/// A staging read: a refused credential is 401, any other refusal 403.
+fn staging_refusal(error: anyhow::Error) -> Response {
+    if error.is::<CredentialRefused>() {
+        return refusal(error);
+    }
+    tracing::debug!(error = %format_args!("{error:#}"), "staged Nodes read refused");
+    StatusCode::FORBIDDEN.into_response()
 }
 
 #[cfg(test)]

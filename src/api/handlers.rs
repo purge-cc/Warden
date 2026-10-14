@@ -277,7 +277,10 @@ enum ListEditError {
     /// not-subscribed for remove). Handler maps to 409 / 404 with this
     /// operator-facing message.
     Precondition(String),
-    /// Read / write / validate failure — handler maps to 500.
+    /// The validator refused the result before anything was written —
+    /// handler maps to 400 with this message.
+    Invalid(String),
+    /// Read / write failure — handler maps to 500.
     Io(anyhow::Error),
 }
 
@@ -413,7 +416,12 @@ where
             &master_path,
             &doc,
         )
-        .map_err(ListEditError::Io)?;
+        .map_err(|error| {
+            match error.downcast_ref::<crate::cli::commands::target::CandidateInvalid>() {
+                Some(invalid) => ListEditError::Invalid(invalid.0.clone()),
+                None => ListEditError::Io(error),
+            }
+        })?;
         Ok(())
     })
     .await
@@ -902,6 +910,9 @@ pub async fn add_list(
         Err(ListEditError::Precondition(msg)) => {
             return (StatusCode::CONFLICT, Json(ErrorResponse { error: msg })).into_response();
         }
+        Err(ListEditError::Invalid(msg)) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response();
+        }
         Err(ListEditError::Io(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -952,6 +963,9 @@ pub async fn remove_list(
         Ok(()) => {}
         Err(ListEditError::Precondition(msg)) => {
             return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: msg })).into_response();
+        }
+        Err(ListEditError::Invalid(msg)) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: msg })).into_response();
         }
         Err(ListEditError::Io(e)) => {
             return (

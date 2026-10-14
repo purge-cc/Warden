@@ -644,19 +644,43 @@ impl IpcPoller {
     /// Submit a `ProfileUpdate` IPC mutation. The `patch`
     /// carries every changed MUTATE field — the daemon applies them in a
     /// single atomic TOML rewrite. Used by the Profiles tab Edit modal.
+    /// `Refused` means the daemon never applied the patch: it was not sent,
+    /// or the daemon answered with an error before writing.
     pub async fn send_profile_update(
         &self,
         id: String,
         patch: ProfileUpdatePatch,
-    ) -> Result<String> {
+    ) -> std::result::Result<String, ProfileCreateFailure> {
+        use crate::ipc::auth_token::NO_TOKEN_FILE_MSG;
+        #[cfg(test)]
+        let token: std::io::Result<Option<String>> = Ok(
+            crate::tui::operator_policy::test_token_for(&self.socket_path),
+        );
+        #[cfg(not(test))]
+        let token = crate::ipc::auth_token::load_token();
+        let token = token
+            .map_err(|error| {
+                ProfileCreateFailure::Refused(format!(
+                    "could not read the token file at /var/lib/purge-warden/token: {error}. \
+                     Run `warden token regenerate` to recreate it."
+                ))
+            })?
+            .ok_or_else(|| ProfileCreateFailure::Refused(NO_TOKEN_FILE_MSG.into()))?;
         let cmd = IpcCommand::ProfileUpdate {
             id,
             patch,
-            token: None,
+            token: Some(token),
         };
-        match send_command(&self.socket_path, &cmd).await? {
-            IpcResponse::Ok { message } => Ok(message),
-            other => Self::bail_unexpected("ProfileUpdate", other),
+        match send_command(&self.socket_path, &cmd).await {
+            Ok(IpcResponse::Ok { message }) => Ok(message),
+            Ok(IpcResponse::Error { message }) => Err(ProfileCreateFailure::Refused(message)),
+            Ok(other) => Err(ProfileCreateFailure::Unknown(format!(
+                "unexpected ProfileUpdate response: {other:?}"
+            ))),
+            Err(error) if never_sent(&error) => {
+                Err(ProfileCreateFailure::Refused(error.to_string()))
+            }
+            Err(error) => Err(ProfileCreateFailure::Unknown(error.to_string())),
         }
     }
 
@@ -672,6 +696,19 @@ impl IpcPoller {
             other => Self::bail_unexpected("ProfileDelete", other),
         }
     }
+}
+
+/// True when `send_command` failed to connect, so the daemon never read the
+/// command (a missing socket, no listener, or no permission).
+fn never_sent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::PermissionDenied
+        )
+    })
 }
 
 /// Fields the TUI form collects for a Promote action — mirrors the
@@ -721,6 +758,7 @@ mod tests {
             cache_cap: 0,
             lists_active: 8,
             lists_total: 8,
+            lists_loaded: 8,
             lists_truncated,
             lists_corpus_refusal,
             lists_cycle: None,
@@ -937,5 +975,17 @@ mod tests {
                 supported
             );
         }
+    }
+
+    #[test]
+    fn only_connect_failures_count_as_never_sent() {
+        use std::io::{Error, ErrorKind};
+        assert!(never_sent(&Error::from(ErrorKind::NotFound).into()));
+        assert!(never_sent(
+            &Error::from(ErrorKind::ConnectionRefused).into()
+        ));
+        assert!(never_sent(&Error::from(ErrorKind::PermissionDenied).into()));
+        assert!(!never_sent(&anyhow::anyhow!("response timeout")));
+        assert!(!never_sent(&Error::from(ErrorKind::BrokenPipe).into()));
     }
 }

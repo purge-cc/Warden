@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -360,6 +360,7 @@ struct RuntimeReloadContext<'a> {
     upstream: &'a Arc<ReloadableUpstream>,
     cache: &'a DnsCache,
     restart_only: &'a RestartOnlyRuntimeFingerprint,
+    list_state: &'a Arc<std::sync::Mutex<crate::config::list_state::ListState>>,
     #[cfg(feature = "cluster")]
     node_ip_filter: Option<&'a Arc<crate::filter::ip_filter::IpFilter>>,
     #[cfg(feature = "cluster")]
@@ -557,6 +558,10 @@ pub enum StartOutcome {
 }
 
 /// Start the DNS filtering server from a validated v1 [`ConfigV1`](crate::config::schema::ConfigV1).
+///
+/// `sighup` is the SIGHUP stream the caller takes before its own boot work;
+/// a SIGHUP received since then is applied as a reload once DNS serves.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_start(
     config: &crate::config::schema::ConfigV1,
     custom_lists: &CustomListStore,
@@ -565,6 +570,7 @@ pub async fn run_start(
     blocklist_path: Option<&str>,
     runtime_lease: crate::config::runtime_lease::RuntimeLease,
     runtime_attestation: RuntimeCapabilityAttestation,
+    sighup: Signal,
 ) -> anyhow::Result<StartOutcome> {
     // Refuse a DNSSEC mode the binary cannot honor before binding sockets.
     check_dnssec_build(config)?;
@@ -612,6 +618,7 @@ pub async fn run_start(
         blocklist_path,
         &runtime_lease,
         runtime_attestation,
+        sighup,
     )
     .await;
 
@@ -641,6 +648,7 @@ async fn run_server(
     blocklist_path: Option<&str>,
     runtime_lease: &crate::config::runtime_lease::RuntimeLease,
     runtime_attestation: RuntimeCapabilityAttestation,
+    mut sighup: Signal,
 ) -> anyhow::Result<StartOutcome> {
     let started_at = Instant::now();
     let daemon_instance_id = new_daemon_instance_id()?;
@@ -787,7 +795,15 @@ async fn run_server(
     )?;
     #[cfg(feature = "cluster")]
     let (node_ip_filter, node_auxiliary) = match &node_corpus {
-        Some(context) => nodes_runtime::prepare_ip_filter(config, &list_client, context).await?,
+        Some(context) => {
+            nodes_runtime::prepare_ip_filter(
+                config,
+                &bulk_list_client_or(&list_client),
+                context,
+                true,
+            )
+            .await?
+        }
         None => (None, Vec::new()),
     };
 
@@ -890,9 +906,11 @@ async fn run_server(
     let list_status_registry = Arc::new(ListStatusRegistry::from_plan(&source_plan));
     // Capture the list_state handle BEFORE `spawn_refresh_loop` consumes
     // the manager so `DaemonState` can plumb it into the
-    // `ListDiagnostics` walk that backs `warden status`.
-    let mut list_state_handle: Option<Arc<std::sync::Mutex<crate::config::list_state::ListState>>> =
-        None;
+    // `ListDiagnostics` walk that backs `warden status`. Like the registry
+    // above, it exists even for an empty boot: every rebuilt generation
+    // installs its state into this one handle.
+    let mut list_state_handle: Arc<std::sync::Mutex<crate::config::list_state::ListState>> =
+        Arc::default();
     // Broadcast channel for `IpcNotification::ListStatsUpdated`. Created
     // up-front so both the manager (publisher) and DaemonState
     // (future-subscriber-endpoint anchor) clone the same `Sender`. Capacity
@@ -1046,6 +1064,10 @@ async fn run_server(
             &bridge_config_dir,
         ));
 
+        // The recorded node cache may replace the lists directory below, and
+        // a killed download can have left spools in either.
+        let lists_dir = lists_dir.expect("enabled sources selected a cache directory");
+        crate::lists::manager::remove_download_spools(&lists_dir, Duration::ZERO);
         let mut mgr = ListManager::with_plan_and_tokens(
             list_client.clone(),
             filter.clone(),
@@ -1055,7 +1077,7 @@ async fn run_server(
             source_tokens.clone(),
             config.lists.max_body_bytes,
             config.lists.max_entries,
-            Some(lists_dir.expect("enabled sources selected a cache directory")),
+            Some(lists_dir),
         );
 
         // The daemon owns `list_state.json`, so this manager records its
@@ -1082,6 +1104,7 @@ async fn run_server(
                 node_ip_filter.as_ref(),
                 cluster_observe.as_ref(),
                 cluster_state.as_ref(),
+                Some(&node_pair_provider),
             );
             context.configure_secondary(&mut mgr)?;
             if context.secondary.is_none() {
@@ -1106,7 +1129,7 @@ async fn run_server(
         // spawn_refresh_loop. Same Arc backs the refresh loop's
         // transition writes AND the IPC handler's diagnostics walk —
         // single source of truth.
-        list_state_handle = Some(mgr.list_state_handle());
+        list_state_handle = mgr.list_state_handle();
 
         // Wire the out-of-band command channel so the IPC `ForgetList`
         // handler can reach the refresh loop. Channel
@@ -1127,32 +1150,63 @@ async fn run_server(
         // two calls this replaced are inside it, not dropped.
         let count = load_corpus_before_bind(&mut mgr, BIND_RETRY_INITIAL_BACKOFF).await;
         tracing::info!(count, "initial blocklist loaded");
+        // A primary that boots `Partial` serves its usable lists and leaves the
+        // node corpus to the first complete cycle, which publishes it and claims
+        // the pair through the active-pair hook. A secondary still refuses a
+        // partial pinned corpus. On any other host a bookkeeping error only
+        // withholds the node pair: the installed lists already serve DNS.
         #[cfg(feature = "cluster")]
         if let Some(context) = &node_corpus {
-            mgr.verify_node_corpus()?;
-            context.mark_secondary_active()?;
-            context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
+            if context.secondary.is_some() {
+                mgr.verify_node_corpus()?;
+                context.mark_secondary_active()?;
+                context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
+            } else if mgr.served_state() == crate::lists::status::ServedState::Partial {
+                tracing::warn!(
+                    "partial list corpus serving locally; until the first complete cycle \
+                     publishes, secondaries keep the previous complete node corpus"
+                );
+                node_pair_provider.set_proof_available(false);
+            } else if let Err(error) = mgr.verify_node_corpus().and_then(|()| {
+                context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())
+            }) {
+                // The provider reads the store directly; the active-pair hook
+                // shows the proof again on the next complete publication.
+                node_pair_provider.set_proof_available(false);
+                nodes_runtime::clear_active(cluster_observe.as_ref(), cluster_state.as_ref());
+                tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    "node corpus activation proof unavailable; DNS continues with installed policy"
+                );
+            }
         }
         refresh_handle = Some(mgr.spawn_refresh_loop());
     } else {
         tracing::info!("no lists configured, filtering disabled");
         #[cfg(feature = "cluster")]
         if let Some(context) = &node_corpus {
-            context.mark_secondary_active()?;
-            if context.secondary.is_none() {
-                context.publish_primary(
+            if context.secondary.is_some() {
+                context.mark_secondary_active()?;
+                context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
+            } else if let Err(error) = context
+                .publish_primary(
                     None,
                     enrollment_artifact
                         .as_ref()
                         .context("enrollment artifact unavailable")?,
                     node_auxiliary.clone(),
-                )?;
+                )
+                .and_then(|()| {
+                    context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())
+                })
+            {
+                nodes_runtime::clear_active(cluster_observe.as_ref(), cluster_state.as_ref());
+                tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    "node corpus activation proof unavailable; DNS continues with installed policy"
+                );
             }
         }
-    }
-    #[cfg(feature = "cluster")]
-    if let Some(context) = &node_corpus {
-        context.record_active(cluster_observe.as_ref(), cluster_state.as_ref())?;
     }
     // Build stats engine (if tracking enabled)
     let stats: Option<Arc<StatsEngine>> = if config.tracking.enabled {
@@ -1454,6 +1508,14 @@ async fn run_server(
         config.schema_version,
     )?;
 
+    // Take SIGTERM before DNS serves. Without a handler it ends the process
+    // with no cleanup, and systemd does not restart a daemon that a signal
+    // stopped. Before this point nothing serves, so its default action is
+    // the clean, fast stop an operator wants. SIGHUP is taken at the start
+    // of the boot (the caller of run_start); both stay pending until
+    // signal_loop reads them.
+    let mut sigterm = signal(SignalKind::terminate())?;
+
     // Shutdown channel: signal loop sends () to stop the DNS server
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
@@ -1512,17 +1574,26 @@ async fn run_server(
 
     // The plan registry and mutation queue are process-wide so every adapter
     // shares the same capacity and idempotency view. Recovery completes before
-    // an adapter can submit work; a failure leaves the control plane available
-    // for reads but makes plan/apply return an honest 503.
+    // an adapter can submit work; a failure makes plan/apply return an honest
+    // 503. Operator-rule reads keep working unless the cause is a
+    // .warden-migration fence, which refuses them too.
     let operator_rule_service =
         Arc::new(crate::operator_rules::OperatorRulesService::with_runtime(
             config_path.to_path_buf(),
             Arc::clone(&candidate_runtime),
         ));
+    // Safe mode does not retry recovery against the real tree in the
+    // background; the operator restarts once the cause is fixed.
+    let safe_mode = runtime_attestation == RuntimeCapabilityAttestation::Disabled;
+    let mut operator_rule_job_config =
+        crate::api::operator_rule_jobs::OperatorRuleJobConfig::default();
+    if safe_mode {
+        operator_rule_job_config.recovery_retry = None;
+    }
     let (operator_rule_supervisor, operator_rule_jobs) =
         crate::api::operator_rule_jobs::OperatorRuleJobSupervisor::new(
             operator_rule_service,
-            crate::api::operator_rule_jobs::OperatorRuleJobConfig::default(),
+            operator_rule_job_config,
             Some(activation_tx),
             Arc::new(|receipt| {
                 tracing::info!(
@@ -1535,17 +1606,8 @@ async fn run_server(
             }),
         );
     operator_rule_jobs.attach_profile_resolver(profiles.clone());
-    match operator_rule_jobs.recover().await {
-        Ok(summary) => tracing::info!(
-            state = %summary.state,
-            operation_id = ?summary.operation_id,
-            "operator-rule transaction recovery complete"
-        ),
-        Err(error) => tracing::error!(
-            error = %error,
-            "operator-rule transaction recovery failed; mutations remain unavailable"
-        ),
-    }
+    // recover() logs the outcome once.
+    let _ = operator_rule_jobs.recover().await;
     let (operator_jobs_shutdown_tx, operator_jobs_shutdown_rx) = oneshot::channel();
     let mut operator_jobs_shutdown_tx = Some(operator_jobs_shutdown_tx);
     let mut operator_jobs_handle = Some(tokio::spawn(
@@ -1576,10 +1638,18 @@ async fn run_server(
     #[cfg(feature = "cluster")]
     let node_runtime_enabled =
         runtime_attestation == RuntimeCapabilityAttestation::AuthoritativeSchema5Tree;
+    // An unreadable API certificate or key must not stop a daemon that
+    // already serves DNS: the REST API stays off and the error is reported
+    // where the API would start. Stored Nodes listeners carry their own
+    // material and are restored as usual.
     #[cfg(feature = "cluster")]
-    let node_transport = crate::api::node_transport::NodeTransport::new(
-        node_runtime_enabled.then_some(&config.api),
-    )?;
+    let (node_transport, api_transport_error) = {
+        use crate::api::node_transport::NodeTransport;
+        match NodeTransport::new(node_runtime_enabled.then_some(&config.api)) {
+            Ok(transport) => (transport, None),
+            Err(error) => (NodeTransport::new(None)?, Some(error)),
+        }
+    };
     #[cfg(feature = "cluster")]
     let node_controller = {
         let listener_control: Arc<dyn crate::cluster::node_control::NodeListenerControl> =
@@ -1590,15 +1660,6 @@ async fn run_server(
             managed_restart,
             node_active_provider,
         )
-    };
-    #[cfg(feature = "cluster")]
-    let node_runtime_plan = if node_runtime_enabled {
-        node_controller.runtime_start().await?
-    } else {
-        crate::cluster::node_control::NodeRuntimePlan {
-            listeners: Vec::new(),
-            operations_to_resume: Vec::new(),
-        }
     };
     let ipc_state = Arc::new(DaemonState {
         filter: filter.clone(),
@@ -1631,7 +1692,7 @@ async fn run_server(
         config_write_lock: config_write_lock.clone(),
         operator_rule_jobs: Some(operator_rule_jobs.clone()),
         list_statuses: Some(list_status_registry.clone()),
-        list_state: list_state_handle.clone(),
+        list_state: Some(list_state_handle.clone()),
         local_records_hits: Some(local_records_hits),
         // The same process-wide ring the capture layer
         // installed by `init_tracing` pushes into. Not a second buffer —
@@ -1660,7 +1721,7 @@ async fn run_server(
         profiles: profiles.clone(),
         stats: stats.clone(),
         config_path: config_path.to_path_buf(),
-        token_hash: config.api.token_hash.clone().unwrap_or_default(),
+        token_hash: Arc::clone(&api_token_hash),
         rate_limiter: crate::auth::middleware::AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(
             config.api.rate_limit_per_minute,
@@ -1743,7 +1804,7 @@ async fn run_server(
                 {
                     return Err(e).context("primary node API failed to become ready");
                 }
-                tracing::error!(error = %e, "failed to start REST API server");
+                tracing::error!(error = %format_args!("{e:#}"), "failed to start REST API server");
             }
         }
         #[cfg(feature = "cluster")]
@@ -1752,7 +1813,11 @@ async fn run_server(
                 api_state,
                 config.api.metrics_enabled,
             ))?;
-            match node_transport.start_api().await {
+            let started = match api_transport_error {
+                Some(error) => Err(error),
+                None => node_transport.start_api().await,
+            };
+            match started {
                 Ok(()) => {}
                 Err(error) => {
                     if let Some(handle) = api_cleanup_handle.take() {
@@ -1764,108 +1829,137 @@ async fn run_server(
                     {
                         return Err(error).context("primary node API failed to become ready");
                     }
-                    tracing::error!(%error, "failed to start REST API server");
+                    tracing::error!(
+                        error = %format_args!("{error:#}"),
+                        "failed to start REST API server"
+                    );
                 }
             }
         }
     }
 
+    // The Nodes bring-up runs after DNS is up, so a failure there must not
+    // stop the daemon: the supervisor reports it and retries in the
+    // background. Its first pass (runtime start, listener restore,
+    // acknowledgement, readiness) runs here, after the IPC server and the
+    // REST API, so the acknowledgement and readiness finish before the
+    // secondary poll loop can write the configuration. The cost: a slow
+    // first pass (config lock held, up to about 60 s) also delays the poll
+    // loop, the stats tasks and the signal loop; DNS keeps serving.
+    // A SIGTERM ends the first pass at once: its lock waits (30 s for each
+    // lock in each stage), plus the shutdown, can outlast the stop timeout
+    // (the unit sets none: 90 s by default, 45 s on Fedora). A lock wait
+    // already running ends on its own.
     #[cfg(feature = "cluster")]
-    let mut node_ready_endpoints = Vec::with_capacity(node_runtime_plan.listeners.len());
-    #[cfg(feature = "cluster")]
-    {
-        for listener in node_runtime_plan.listeners {
-            let endpoint = listener.endpoint;
-            crate::cluster::node_control::NodeListenerControl::prepare(
-                node_transport.as_ref(),
-                listener,
-            )
-            .await
-            .with_context(|| format!("failed to restore Nodes listener {endpoint}"))?;
-            node_ready_endpoints.push(endpoint);
-        }
-    }
-
-    // Spawn the secondary convergence poll loop — a NEW background
-    // task (NOT on `signal_loop`). Fires only for an enabled secondary (the
-    // `Some` from the boot-time clone above); identity (peer/token/interval) is
-    // read once here. An absent/empty token still polls → 401 → logged →
-    // last-good kept; the loop never panics the daemon.
-    #[cfg(feature = "cluster")]
-    if let (Some(cluster_reload_tx), Some(observe)) = (cluster_reload_tx, cluster_observe.clone()) {
-        let token = crate::cluster::secret::load_cluster_token(config_path)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let peer = config.cluster.peer.clone().unwrap_or_default();
-        // The validator rejects poll_interval_secs == 0, but clamp to
-        // >= 1 here too so a value that somehow bypassed validation can never
-        // panic `tokio::time::interval(0)` on the `panic = "abort"` profile.
-        let poll_interval = Duration::from_secs(config.cluster.poll_interval_secs.max(1));
-        tracing::info!(%peer, "cluster: starting secondary poll loop");
-        // Hand the poll loop the observe handle (write-through sync
-        // telemetry) + this node's name (advertised on every heartbeat).
-        tokio::spawn(crate::cluster::poll::run(
-            config_path.to_path_buf(),
-            cluster_reload_tx,
-            peer,
-            token,
-            poll_interval,
-            stats.clone(),
-            observe,
-            config
-                .node
-                .name
-                .clone()
-                .or_else(|| config.cluster.node_name.clone()),
-            profiles.clone(),
-            Arc::clone(&candidate_runtime),
+    let (node_supervisor, sigterm_received) = if node_runtime_enabled {
+        let mut supervisor = nodes_runtime::NodeRuntimeSupervisor::new(
             node_controller.clone(),
-        ));
-    }
-
-    // Spawn stats background tasks
-    let mut stats_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    if let Some(ref engine) = stats {
-        // Top-N computation task
-        let top_n_handle = crate::tracking::top_n::spawn_top_n_task(
-            engine.clone(),
-            engine.config.top_n_limit,
-            Duration::from_secs(engine.config.top_n_interval_secs),
+            node_transport.clone(),
+            config_path.to_owned(),
+            config.clone(),
         );
-        stats_handles.push(top_n_handle);
-
-        // Snapshot writer task
-        let snap_handle = crate::tracking::snapshot::spawn_snapshot_task(
-            engine.clone(),
-            snapshot_path(config_path),
-            Duration::from_secs(engine.config.snapshot_interval_secs),
-        );
-        stats_handles.push(snap_handle);
-    }
-
-    // Spawn security cleanup task (every 60s: evict stale rate limiter/RRL/tunneling entries)
-    if let Some(ref sec) = security {
-        let sec_clone = sec.clone();
-        stats_handles.push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                sec_clone.cleanup();
+        tokio::select! {
+            biased;
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received during the Nodes bring-up");
+                (None, true)
             }
-        }));
-    }
+            _ = supervisor.step() => (Some(supervisor), false),
+        }
+    } else {
+        (None, false)
+    };
+    #[cfg(not(feature = "cluster"))]
+    let sigterm_received = false;
 
-    // Resource Budget sampler. Reads `/proc/self/*` once per
-    // `tick_secs` and stores the latest snapshot into the shared
-    // `resource_budget_store`. On non-Linux targets this spawns an
-    // immediately-completing future (snapshot stays None).
-    let rb_handle = crate::resource_budget::spawn_sampler(
-        resource_budget_store.clone(),
-        Duration::from_secs(config.resource_budget.tick_secs),
-        config.resource_budget.rss_warn_mb,
-    );
-    stats_handles.push(rb_handle);
+    // After a SIGTERM in the Nodes bring-up, start none of these tasks and
+    // go straight to the shutdown: the secondary poll loop is never aborted
+    // and could write the configuration although the acknowledgement never
+    // ran.
+    let mut stats_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if !sigterm_received {
+        // Spawn the secondary convergence poll loop — a NEW background
+        // task (NOT on `signal_loop`). Fires only for an enabled secondary (the
+        // `Some` from the boot-time clone above); identity (peer/token/interval) is
+        // read once here. An absent/empty token still polls → 401 → logged →
+        // last-good kept; the loop never panics the daemon.
+        #[cfg(feature = "cluster")]
+        if let (Some(cluster_reload_tx), Some(observe)) =
+            (cluster_reload_tx, cluster_observe.clone())
+        {
+            let token = crate::cluster::secret::load_cluster_token(config_path)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let peer = config.cluster.peer.clone().unwrap_or_default();
+            // The validator rejects poll_interval_secs == 0, but clamp to
+            // >= 1 here too so a value that somehow bypassed validation can never
+            // panic `tokio::time::interval(0)` on the `panic = "abort"` profile.
+            let poll_interval = Duration::from_secs(config.cluster.poll_interval_secs.max(1));
+            tracing::info!(%peer, "cluster: starting secondary poll loop");
+            // Hand the poll loop the observe handle (write-through sync
+            // telemetry) + this node's name (advertised on every heartbeat).
+            tokio::spawn(crate::cluster::poll::run(
+                config_path.to_path_buf(),
+                cluster_reload_tx,
+                peer,
+                token,
+                poll_interval,
+                stats.clone(),
+                observe,
+                config
+                    .node
+                    .name
+                    .clone()
+                    .or_else(|| config.cluster.node_name.clone()),
+                profiles.clone(),
+                Arc::clone(&candidate_runtime),
+                node_controller.clone(),
+            ));
+        }
+
+        // Spawn stats background tasks
+        if let Some(ref engine) = stats {
+            // Top-N computation task
+            let top_n_handle = crate::tracking::top_n::spawn_top_n_task(
+                engine.clone(),
+                engine.config.top_n_limit,
+                Duration::from_secs(engine.config.top_n_interval_secs),
+            );
+            stats_handles.push(top_n_handle);
+
+            // Snapshot writer task
+            let snap_handle = crate::tracking::snapshot::spawn_snapshot_task(
+                engine.clone(),
+                snapshot_path(config_path),
+                Duration::from_secs(engine.config.snapshot_interval_secs),
+            );
+            stats_handles.push(snap_handle);
+        }
+
+        // Spawn security cleanup task (every 60s: evict stale rate limiter/RRL/tunneling entries)
+        if let Some(ref sec) = security {
+            let sec_clone = sec.clone();
+            stats_handles.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    sec_clone.cleanup();
+                }
+            }));
+        }
+
+        // Resource Budget sampler. Reads `/proc/self/*` once per
+        // `tick_secs` and stores the latest snapshot into the shared
+        // `resource_budget_store`. On non-Linux targets this spawns an
+        // immediately-completing future (snapshot stays None).
+        let rb_handle = crate::resource_budget::spawn_sampler(
+            resource_budget_store.clone(),
+            Duration::from_secs(config.resource_budget.tick_secs),
+            config.resource_budget.rss_warn_mb,
+        );
+        stats_handles.push(rb_handle);
+    }
 
     // Enter signal loop (now also listens for IPC-triggered events).
     let has_schedules = !config.schedules.is_empty();
@@ -1879,36 +1973,8 @@ async fn run_server(
     #[cfg(not(feature = "cluster"))]
     let cluster_reload_handle: ClusterReloadHandle = std::marker::PhantomData;
     #[cfg(feature = "cluster")]
-    {
-        let master = config_path.to_owned();
-        let active = config.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::cluster::lifecycle::acknowledge_runtime_start(&master, &active)
-        })
-        .await
-        .context("node readiness worker failed")??;
-        for endpoint in node_ready_endpoints {
-            node_controller.runtime_ready(endpoint).await?;
-        }
-        if node_runtime_enabled {
-            let controller = node_controller.clone();
-            stats_handles.push(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(2));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    interval.tick().await;
-                    match controller.runtime_tick().await {
-                        Ok(advanced) if advanced > 0 => {
-                            tracing::info!(advanced, "durable Nodes operation reconciled");
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "durable Nodes reconciliation failed");
-                        }
-                    }
-                }
-            }));
-        }
+    if let Some(supervisor) = node_supervisor {
+        stats_handles.push(tokio::spawn(supervisor.run()));
     }
     let restart_only = RestartOnlyRuntimeFingerprint::from_config(config)?;
     let exit_result = signal_loop(
@@ -1919,6 +1985,7 @@ async fn run_server(
             upstream: &upstream_runtime,
             cache: &cache,
             restart_only: &restart_only,
+            list_state: &list_state_handle,
             #[cfg(feature = "cluster")]
             node_ip_filter: node_ip_filter.as_ref(),
             #[cfg(feature = "cluster")]
@@ -1949,6 +2016,9 @@ async fn run_server(
         &mut api_handle,
         &mut operator_jobs_handle,
         &mut managed_restart_rx,
+        &mut sigterm,
+        &mut sighup,
+        sigterm_received,
     )
     .await;
 
@@ -2119,6 +2189,21 @@ fn install_bulk_download_client(mgr: &mut crate::lists::manager::ListManager) {
     }
 }
 
+/// The bulk client for IP-list bodies, so a dead source fails after its
+/// connect timeout instead of holding the boot or reload. Falls back to
+/// `fallback` rather than failing, for the reason given on
+/// [`install_bulk_download_client`].
+#[cfg(feature = "cluster")]
+fn bulk_list_client_or(fallback: &reqwest::Client) -> reqwest::Client {
+    crate::lists::http_client::build_bulk_list_client().unwrap_or_else(|error| {
+        tracing::warn!(
+            %error,
+            "could not build the bulk download client; IP lists use the boot client"
+        );
+        fallback.clone()
+    })
+}
+
 /// First delay before branch (c) retries a boot that could not build a map.
 ///
 /// Doubles per attempt up to [`BIND_RETRY_MAX_BACKOFF`]. Passed into
@@ -2159,7 +2244,8 @@ const BIND_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(300);
 async fn load_corpus_before_bind(mgr: &mut ListManager, initial_backoff: Duration) -> usize {
     install_bulk_download_client(mgr);
     mgr.load_disk_cache();
-    mgr.cleanup_stale_caches();
+    // The PID lock is held: no other daemon downloads into this cache.
+    mgr.cleanup_stale_caches(Duration::ZERO);
 
     // Branch (a): boot from disk. Zero HTTP, cache used at any age. This is
     // the change that takes the measured boot from ~199 s to ~35 s — 164 s of
@@ -2304,11 +2390,16 @@ async fn signal_loop(
     api_handle: &mut Option<JoinHandle<()>>,
     operator_jobs_handle: &mut Option<JoinHandle<()>>,
     managed_restart_rx: ManagedRestartLoop<'_>,
+    sigterm: &mut Signal,
+    sighup: &mut Signal,
+    sigterm_received: bool,
 ) -> anyhow::Result<SignalLoopExit> {
     #[cfg(not(feature = "cluster"))]
     let _ = cluster_state;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
+    // The Nodes bring-up already took a SIGTERM (see run_server).
+    if sigterm_received {
+        return Ok(SignalLoopExit::Stopped(None));
+    }
     // There is no SIGUSR1 handler: it would let any local user with kill
     // permission on the PID flush the DNS cache, bypassing the
     // token-gated IPC auth gate. Cache flushing is strictly a
@@ -2643,19 +2734,24 @@ pub async fn prepare_nodes_before_load(config_path: &Path) -> anyhow::Result<()>
 
 /// Recover an interrupted policy transaction before the daemon loads config.
 pub fn recover_policy_transaction_before_load(config_path: &Path) -> anyhow::Result<()> {
-    let recovery = {
+    let mut fence: Option<PathBuf> = None;
+    let recovery = (|| -> anyhow::Result<_> {
         let guard = crate::config::write_lock::acquire_for_migration(config_path)?;
+        fence = Some(guard.identity().txn_dir.clone());
         let state_directory = crate::config::state_dir::open_for_migration(&guard)?;
         let receipts =
             crate::config::policy_transaction::ReceiptStore::open(&state_directory, &guard)?;
         let recovered = crate::config::policy_transaction::recover_active(&guard, &receipts)?;
         #[cfg(feature = "cluster")]
         {
-            let mut publications = crate::cluster::publication::PublicationStore::open(&guard)?;
-            crate::cluster::publisher::recover(&guard, &receipts, &mut publications)?;
+            let mut publications = crate::cluster::publication::PublicationStore::open(&guard)
+                .context("cluster publication recovery failed in .warden-cluster-publications")?;
+            crate::cluster::publisher::recover(&guard, &receipts, &mut publications)
+                .context("cluster publication recovery failed in .warden-cluster-publications")?;
         }
-        recovered
-    };
+        Ok(recovered)
+    })();
+    let recovery = recovery.map_err(|error| boot_recovery_error(error, fence.as_deref()))?;
     match recovery {
         crate::config::policy_transaction::RecoveryOutcome::Absent => {}
         crate::config::policy_transaction::RecoveryOutcome::SetupRemoved => {
@@ -2674,6 +2770,24 @@ pub fn recover_policy_transaction_before_load(config_path: &Path) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+/// Name what the operator must keep and do next; the cause stays in the chain.
+fn boot_recovery_error(error: anyhow::Error, fence: Option<&Path>) -> anyhow::Error {
+    let mut text = String::from(
+        "policy-transaction recovery failed before start; the daemon does not start until it succeeds.",
+    );
+    if let Some(fence) = fence.filter(|fence| fence.symlink_metadata().is_ok()) {
+        text.push_str(&format!(
+            " The interrupted transaction is kept in {}. Do not delete it.",
+            fence.display()
+        ));
+    }
+    text.push_str(&format!(
+        " Fix the cause below, then run `systemctl reset-failed purge-warden` and start the service again. See \"{}\" in docs/UPGRADE_RECOVERY.md (in the release bundle).",
+        crate::config::migration_journal::POLICY_RECOVERY_SECTION
+    ));
+    error.context(text)
 }
 
 /// Enumerate every file the loader considered when parsing the current config:
@@ -3318,12 +3432,43 @@ fn should_rebind_node_policy(
     live: Option<&ListsFingerprint>,
     next: &ListsFingerprint,
 ) -> bool {
+    // Callers exclude secondaries, so this covers primaries, legacy cluster
+    // configs and standalone hosts alike.
     runtime_available
-        && config.cluster.enabled
-        && config.cluster.membership_version == Some(1)
-        && config.cluster.role == crate::config::schema::ClusterRole::Primary
         && !config.ip_blocklists.enabled
         && should_reuse_live_lists(live_manager, live, next)
+}
+
+/// After a failed rebind commit, show the activation proof again only when
+/// the store still names the pair that was active before the commit.
+#[cfg(feature = "cluster")]
+fn rebind_left_pair_unchanged(before: Option<&str>, after: anyhow::Result<Option<String>>) -> bool {
+    after.is_ok_and(|active| active.as_deref() == before)
+}
+
+/// Reject a reload on a node corpus error: one audit record and a closed
+/// cycle, with the previous policy still active.
+fn reject_node_reload(
+    audit_writer: &AuditWriter,
+    invoker_uid: Option<u32>,
+    current_files: &[PathBuf],
+    pre_hash: Option<String>,
+    registry: Option<&Arc<ListStatusRegistry>>,
+    error: impl std::fmt::Display,
+) -> anyhow::Result<Option<bool>> {
+    let record = AuditRecord::new(AuditEvent::Reload, AuditResult::Rejected)
+        .with_uid(invoker_uid)
+        .with_files(current_files.iter())
+        .with_pre_hash(pre_hash.clone())
+        .with_post_hash(pre_hash)
+        .with_errors([error.to_string()]);
+    if let Err(write_error) = audit_writer.append(&record) {
+        tracing::warn!(error = %write_error, "failed to write audit record");
+    }
+    if let Some(registry) = registry {
+        registry.record_cycle(CycleOutcome::ConfigRejected);
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -3520,23 +3665,37 @@ async fn handle_reload(
         Ok(context) => context,
         Err(error) => {
             tracing::error!(%error, "reload rejected: node corpus unavailable");
-            if let Some(registry) = list_status_registry {
-                registry.record_cycle(CycleOutcome::ConfigRejected);
-            }
-            return Ok(None);
+            return reject_node_reload(
+                audit_writer,
+                invoker_uid,
+                current_files,
+                pre_hash,
+                list_status_registry,
+                error,
+            );
         }
     };
     #[cfg(feature = "cluster")]
     let (prepared_node_ip, node_auxiliary) = match &node_corpus {
-        Some(context) => match nodes_runtime::prepare_ip_filter(config, list_client, context).await
+        Some(context) => match nodes_runtime::prepare_ip_filter(
+            config,
+            &bulk_list_client_or(list_client),
+            context,
+            false,
+        )
+        .await
         {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::error!(%error, "reload rejected: IP corpus preparation failed");
-                if let Some(registry) = list_status_registry {
-                    registry.record_cycle(CycleOutcome::ConfigRejected);
-                }
-                return Ok(None);
+                return reject_node_reload(
+                    audit_writer,
+                    invoker_uid,
+                    current_files,
+                    pre_hash,
+                    list_status_registry,
+                    error,
+                );
             }
         },
         None => (None, Vec::new()),
@@ -3553,18 +3712,26 @@ async fn handle_reload(
                     Ok(artifact) => Some(artifact),
                     Err(error) => {
                         tracing::error!(%error, "reload rejected: enrollment policy capture failed");
-                        if let Some(registry) = list_status_registry {
-                            registry.record_cycle(CycleOutcome::ConfigRejected);
-                        }
-                        return Ok(None);
+                        return reject_node_reload(
+                            audit_writer,
+                            invoker_uid,
+                            current_files,
+                            pre_hash,
+                            list_status_registry,
+                            error,
+                        );
                     }
                 },
                 None => {
                     tracing::error!("reload rejected: enrollment policy snapshot unavailable");
-                    if let Some(registry) = list_status_registry {
-                        registry.record_cycle(CycleOutcome::ConfigRejected);
-                    }
-                    return Ok(None);
+                    return reject_node_reload(
+                        audit_writer,
+                        invoker_uid,
+                        current_files,
+                        pre_hash,
+                        list_status_registry,
+                        "enrollment policy snapshot unavailable",
+                    );
                 }
             },
         },
@@ -3866,17 +4033,16 @@ async fn handle_reload(
         &bridge_config_dir_for_fingerprint,
     );
     #[cfg(feature = "cluster")]
-    if node_corpus
-        .as_ref()
-        .is_some_and(|context| context.secondary.is_none())
-        && should_rebind_node_policy(
-            config,
-            runtime_reload.is_some(),
-            has_live_list_manager(refresh_handle.as_ref()),
-            lists_fingerprint.as_ref(),
-            &fingerprint,
-        )
-    {
+    if let Some(context) = node_corpus.as_ref().filter(|context| {
+        context.secondary.is_none()
+            && should_rebind_node_policy(
+                config,
+                runtime_reload.is_some(),
+                has_live_list_manager(refresh_handle.as_ref()),
+                lists_fingerprint.as_ref(),
+                &fingerprint,
+            )
+    }) {
         if let (Some(artifact), ListManagerEndpoint::Running { sender, .. }) =
             (enrollment_artifact.as_ref(), &**list_cmd_tx_swap.load())
         {
@@ -3896,15 +4062,70 @@ async fn handle_reload(
                 .map_err(|_| anyhow::anyhow!("live list manager lost before policy rebind"))?;
             match prepared_rx.await {
                 Ok(Ok(())) => {
+                    let observe = runtime_reload.and_then(|runtime| runtime.node_observe);
+                    let before = match context.store.pair_state() {
+                        Ok(pair) => pair.active,
+                        Err(error) => {
+                            drop(commit_tx);
+                            tracing::error!(%error, "reload rejected: node pair unreadable before the policy rebind; previous policy remains active");
+                            return reject_node_reload(
+                                audit_writer,
+                                invoker_uid,
+                                current_files,
+                                pre_hash,
+                                list_status_registry,
+                                error,
+                            );
+                        }
+                    };
+                    let activate = || match context.record_active(observe, cluster_state) {
+                        Ok(()) => {
+                            if let Some(runtime) = runtime_reload {
+                                runtime.node_pair_provider.set_proof_available(true);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "node corpus activation proof unavailable; DNS continues with installed policy")
+                        }
+                    };
                     // Hide store-backed enrollment and serve proofs until both
                     // runtime and persisted corpus have the new identity.
                     if let Some(runtime) = runtime_reload {
                         runtime.node_pair_provider.set_proof_available(false);
                     }
-                    nodes_runtime::clear_active(
-                        runtime_reload.and_then(|runtime| runtime.node_observe),
-                        cluster_state,
-                    );
+                    nodes_runtime::clear_active(observe, cluster_state);
+                    // Commit before the runtime swap, so a failed commit is a
+                    // plain rejection while the previous policy still serves.
+                    // ponytail: the actor resumes once the commit completes, so
+                    // a queued refresh that publishes before the swap below
+                    // ends shows and claims the new pair early; a refresh
+                    // cycle takes seconds, the swap milliseconds. Hold the
+                    // actor until activate() if that window ever matters.
+                    commit_tx.send(true).map_err(|_| {
+                        anyhow::anyhow!("fatal policy rebind: manager barrier lost before commit")
+                    })?;
+                    let committed = completed_rx.await.map_err(|_| {
+                        anyhow::anyhow!("fatal policy rebind: manager lost during commit")
+                    })?;
+                    if let Err(error) = committed {
+                        if rebind_left_pair_unchanged(
+                            before.as_deref(),
+                            context.store.pair_state().map(|pair| pair.active),
+                        ) {
+                            activate();
+                        } else {
+                            tracing::error!("node corpus pair moved during the failed policy rebind; activation proof stays hidden until the next publication");
+                        }
+                        tracing::error!(%error, "reload rejected: policy rebind commit failed; previous policy remains active");
+                        return reject_node_reload(
+                            audit_writer,
+                            invoker_uid,
+                            current_files,
+                            pre_hash,
+                            list_status_registry,
+                            error,
+                        );
+                    }
                     install_runtime_reload(
                         runtime_reload,
                         &mut prepared_upstream,
@@ -3918,18 +4139,8 @@ async fn handle_reload(
                     )
                     .await;
                     publish_active_policy(profiles, config, compiled, identity, cluster_state);
-                    commit_tx.send(true).map_err(|_| {
-                        anyhow::anyhow!(
-                            "fatal policy rebind: manager barrier lost after runtime swap"
-                        )
-                    })?;
-                    completed_rx.await.map_err(|_| {
-                        anyhow::anyhow!("fatal policy rebind: manager lost after runtime swap")
-                    })??;
                     install_cluster_policy(cluster_state, prepared_cluster);
-                    if let Some(runtime) = runtime_reload {
-                        runtime.node_pair_provider.set_proof_available(true);
-                    }
+                    activate();
                     if let Some(reg) = list_status_registry {
                         reg.sync_plan(&source_plan);
                         reg.record_cycle(CycleOutcome::SkippedUnchanged);
@@ -4079,21 +4290,35 @@ async fn handle_reload(
     .apply(&mut mgr);
     #[cfg(feature = "cluster")]
     if let Some(context) = &node_corpus {
-        if context.secondary.is_some() {
-            context.configure_secondary(&mut mgr)?;
+        let isolated = if context.secondary.is_some() {
+            context.configure_secondary(&mut mgr)
         } else {
-            mgr.isolate_candidate_cache(&context.store)?;
+            mgr.isolate_candidate_cache(&context.store)
+        };
+        if let Err(error) = isolated {
+            tracing::error!(%error, "reload rejected: node corpus isolation failed; previous policy remains active");
+            return reject_node_reload(
+                audit_writer,
+                invoker_uid,
+                current_files,
+                pre_hash,
+                list_status_registry,
+                error,
+            );
         }
     }
 
     // Keep the registry handle DaemonState reads so stats switch with the
     // plan. `sync_plan` publishes aliases after slots exist, then retires
-    // obsolete slots.
+    // obsolete slots. A node preparation keeps its own registry until the
+    // install, seeded with the live refresh history.
     if !node_requires_preparation {
         if let Some(reg) = list_status_registry {
             reg.sync_plan(&source_plan);
             mgr.attach_status_registry(reg.clone());
         }
+    } else if let Some(reg) = list_status_registry {
+        mgr.status_registry().seed_from(reg);
     }
     // Re-attach the broadcast publisher so the post-reload
     // manager keeps emitting `ListStatsUpdated`. Same Sender clone
@@ -4112,7 +4337,9 @@ async fn handle_reload(
     mgr.set_command_channel(list_cmd_rx);
 
     mgr.load_disk_cache();
-    mgr.cleanup_stale_caches();
+    // The live manager may still be downloading into this cache; its bulk
+    // deadline is 600 s, so a spool older than 20 minutes is dead.
+    mgr.cleanup_stale_caches(Duration::from_secs(20 * 60));
     #[cfg(test)]
     if PANIC_RELOAD_WORKER
         .try_with(|enabled| *enabled)
@@ -4132,10 +4359,14 @@ async fn handle_reload(
         Err(error) => {
             if node_requires_preparation {
                 tracing::error!(%error, "node corpus preparation failed; previous manager remains active");
-                if let Some(registry) = list_status_registry {
-                    registry.record_cycle(CycleOutcome::ConfigRejected);
-                }
-                return Ok(None);
+                return reject_node_reload(
+                    audit_writer,
+                    invoker_uid,
+                    current_files,
+                    pre_hash,
+                    list_status_registry,
+                    error,
+                );
             }
             // Config consumers have changed and the old manager is gone.
             // Only daemon teardown can safely resolve this half-applied reload.
@@ -4161,16 +4392,38 @@ async fn handle_reload(
     };
     #[cfg(feature = "cluster")]
     if node_requires_preparation {
-        if let Err(error) = mgr.verify_node_corpus() {
+        // A non-secondary serves a Partial corpus with a warning, as at boot;
+        // the proof stays hidden until a complete cycle publishes.
+        let partial = node_corpus
+            .as_ref()
+            .is_some_and(|context| context.secondary.is_none())
+            && mgr.served_state() == crate::lists::status::ServedState::Partial;
+        if partial {
+            tracing::warn!(
+                "partial list corpus serving locally; until the first complete cycle \
+                 publishes, secondaries keep the previous complete node corpus"
+            );
+        } else if let Err(error) = mgr.verify_node_corpus() {
             tracing::error!(%error, "node corpus rejected; previous policy remains active");
-            if let Some(registry) = list_status_registry {
-                registry.record_cycle(CycleOutcome::ConfigRejected);
-            }
-            return Ok(None);
+            return reject_node_reload(
+                audit_writer,
+                invoker_uid,
+                current_files,
+                pre_hash,
+                list_status_registry,
+                error,
+            );
         }
         list_cmd_tx_swap.store(Arc::new(ListManagerEndpoint::Transitioning));
         if let Some(controller) = refresh_handle.take() {
             controller.retire().await?;
+        }
+        // Hide the proof only now: until the retire returns, the old
+        // manager's worker can still publish and show it through its hook.
+        if partial {
+            if let Some(runtime) = runtime_reload {
+                runtime.node_pair_provider.set_proof_available(false);
+            }
         }
         nodes_runtime::clear_active(
             runtime_reload.and_then(|runtime| runtime.node_observe),
@@ -4183,6 +4436,15 @@ async fn handle_reload(
         }
         mgr.set_notification_channel(notification_tx.clone());
         mgr.set_status_persistence_path(list_stats_path(config_path));
+    }
+    // The previous controller is retired on both paths, so this generation
+    // now owns the retry state IPC reads and the ledgers on disk.
+    if let Some(runtime) = runtime_reload {
+        mgr.install_prepared_list_state(
+            runtime.list_state.clone(),
+            list_state_path(config_path),
+            list_schedule_state_path(config_path),
+        );
     }
     tracing::info!(count, "lists reloaded");
     // The completed rebuild used the tight client above; only the background
@@ -4229,6 +4491,7 @@ async fn handle_reload(
             runtime_reload.and_then(|runtime| runtime.node_ip_filter),
             runtime_reload.and_then(|runtime| runtime.node_observe),
             cluster_state,
+            runtime_reload.map(|runtime| runtime.node_pair_provider),
         );
         if let Err(error) = context.finish_activation(
             Some(&mut mgr),
@@ -4590,7 +4853,8 @@ pub(crate) fn list_schedule_state_path(config_path: &Path) -> PathBuf {
 /// state. The daemon does, and records every transition into it. The
 /// foreground refresh reads the same state but never writes back, so a
 /// one-shot command cannot clobber counters the running daemon is
-/// maintaining.
+/// maintaining. A reload's node preparation is ReadOnly too, until the
+/// verified generation installs its state after the old one retires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ListStateWriteback {
     Persist,
@@ -4614,6 +4878,8 @@ pub(crate) enum ListStateWriteback {
 ///   manager can open it;
 /// - the status registry — boot *creates* it through the manager, and
 ///   only a rebuild has to re-attach the existing handle;
+/// - the daemon-owned list state handle — a rebuild installs its state
+///   into it once live, after node preparation ran ReadOnly;
 /// - the notification channel, command channel, status-persistence path
 ///   and bulk download client — daemon-only, absent by design from a
 ///   one-shot foreground refresh.
@@ -4977,6 +5243,8 @@ mod activation_tests {
         let id = Id::new("local").unwrap();
         let mut config = ConfigV5::default();
         config.upstream.servers = vec!["192.0.2.1:53".into()];
+        // Keeps a known audit warning for audit_warnings_emit_once_per_lifecycle_owner.
+        config.anti_bypass.enabled = true;
         config.custom_lists.push(CustomList {
             id: id.clone(),
             display_name: String::new(),
@@ -5009,65 +5277,31 @@ mod activation_tests {
 
     #[test]
     fn audit_warnings_emit_once_per_lifecycle_owner() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Messages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Visitor(String);
-                impl tracing::field::Visit for Visitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut visitor = Visitor(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap().push(visitor.0);
-            }
-        }
-
         let root = tempfile::tempdir().unwrap();
         let (master, _) = disk_policy(root.path());
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Messages(messages.clone()));
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
-                .unwrap();
-            crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
-                .unwrap();
-            collect_loaded_files(&master);
-            capture_operator_policy(
-                &master,
-                "daemon-test",
-                &candidate_runtime(),
-                AuditWarningEmission::Quiet,
-            )
+        crate::common::log_capture::arm_log_capture();
+        crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
             .unwrap();
-            capture_operator_policy(
-                &master,
-                "daemon-test",
-                &candidate_runtime(),
-                AuditWarningEmission::Emit,
-            )
+        crate::config::loader::load_current_config(&master, time::OffsetDateTime::now_utc())
             .unwrap();
-        }
-        let count = messages
-            .lock()
-            .unwrap()
+        collect_loaded_files(&master);
+        capture_operator_policy(
+            &master,
+            "daemon-test",
+            &candidate_runtime(),
+            AuditWarningEmission::Quiet,
+        )
+        .unwrap();
+        capture_operator_policy(
+            &master,
+            "daemon-test",
+            &candidate_runtime(),
+            AuditWarningEmission::Emit,
+        )
+        .unwrap();
+        let count = crate::common::log_capture::take_log_capture()
             .iter()
-            .filter(|message| message.contains("has no domains to block"))
+            .filter(|(_, message)| message.contains("has no domains to block"))
             .count();
         assert_eq!(
             count, 2,

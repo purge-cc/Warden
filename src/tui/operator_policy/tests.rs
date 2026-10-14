@@ -483,7 +483,7 @@ fn uncertain_apply_retries_exact_apply_without_changing_request_identity() {
 }
 
 #[test]
-fn replay_not_found_remains_unknown_and_returns_to_exact_apply() {
+fn expired_plan_on_apply_refreshes_the_draft_instead_of_looping_in_recovery() {
     let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
     let planned = workflow.begin_plan().unwrap();
     let request_id = planned.request.request_id.clone();
@@ -493,21 +493,19 @@ fn replay_not_found_remains_unknown_and_returns_to_exact_apply() {
         apply.ticket,
         Err(remote_error(
             ErrorCode::PlanConflict,
-            "retained plan expired"
+            "plan is unknown or expired"
         ))
     ));
-    let replay = workflow.begin_replay().unwrap();
-    assert_eq!(replay.request.request_id, request_id);
-    assert!(workflow.finish_replay(
-        replay.ticket,
-        Err(remote_error(
-            ErrorCode::NotFound,
-            "receipt is not durable yet"
-        ))
+    assert!(matches!(
+        &workflow.state,
+        WorkflowState::Recovery(RecoveryState {
+            action: RecoveryAction::RefreshAndRedraft,
+            draft: Some(draft),
+            ..
+        }) if draft.request.request_id == request_id
     ));
-    let exact = workflow.begin_exact_apply().unwrap();
-    assert_eq!(exact.request.request_id, request_id);
-    assert_eq!(exact.plan.request_id, request_id);
+    assert!(workflow.begin_replay().is_none());
+    assert!(workflow.begin_exact_apply().is_none());
 }
 
 #[test]
@@ -969,4 +967,408 @@ async fn corrupt_symlinked_and_over_permissive_journals_are_refused() {
         recovery::load(config_path).await.unwrap_err().code(),
         ErrorCode::StorageUnavailable
     );
+}
+
+fn exact_retry_after(error: AdapterError) -> OperatorPolicyWorkflow {
+    let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+    let planned = workflow.begin_plan().unwrap();
+    assert!(workflow.finish_plan(planned.ticket, Ok(retained_plan(&planned.request))));
+    let apply = workflow.begin_apply().unwrap();
+    assert!(workflow.finish_apply(
+        apply.ticket,
+        Err(transport_error("daemon closed connection without response"))
+    ));
+    let retry = workflow.begin_exact_apply().unwrap();
+    assert!(workflow.finish_exact_apply(retry.ticket, Err(error)));
+    workflow
+}
+
+#[test]
+fn exact_retry_routes_refusals_by_what_they_prove() {
+    for (error, expected) in [
+        (
+            remote_error(ErrorCode::PlanConflict, "plan is unknown or expired"),
+            RecoveryAction::RefreshAndRedraft,
+        ),
+        (
+            remote_error(ErrorCode::RevisionConflict, "precondition is stale"),
+            RecoveryAction::RefreshAndRedraft,
+        ),
+        (
+            remote_error(ErrorCode::PolicyOwnedByPrimary, "secondary node"),
+            RecoveryAction::ReplayRequest,
+        ),
+        (
+            transport_error("daemon closed connection without response"),
+            RecoveryAction::RetryExactApply,
+        ),
+    ] {
+        let code = error.code();
+        let workflow = exact_retry_after(error);
+        assert!(
+            matches!(
+                &workflow.state,
+                WorkflowState::Recovery(RecoveryState { action, draft: Some(_), .. })
+                    if *action == expected
+            ),
+            "{code:?}"
+        );
+    }
+}
+
+#[test]
+fn primary_owned_refusal_on_first_apply_returns_to_a_closable_draft() {
+    let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+    let planned = workflow.begin_plan().unwrap();
+    assert!(workflow.finish_plan(planned.ticket, Ok(retained_plan(&planned.request))));
+    let apply = workflow.begin_apply().unwrap();
+    assert!(workflow.finish_apply(
+        apply.ticket,
+        Err(remote_error(
+            ErrorCode::PolicyOwnedByPrimary,
+            "secondary node"
+        ))
+    ));
+    assert!(matches!(
+        &workflow.state,
+        WorkflowState::Recovery(RecoveryState {
+            action: RecoveryAction::ReturnToDraft,
+            ..
+        })
+    ));
+    let dialog = PolicyDialog {
+        id: 1,
+        origin: PolicyOrigin::Mount,
+        workflow: Some(workflow),
+        adapter: None,
+        preparing: false,
+        preparation_error: None,
+        prefix_outcome: None,
+        discard_operations: None,
+    };
+    assert!(super::controller::dialog_can_close(&dialog));
+}
+
+#[test]
+fn only_refusals_the_daemon_returns_before_intent_settle_the_journal() {
+    let local = |kind, code| AdapterError {
+        kind,
+        error: OperatorRulesError::new(code, "local"),
+    };
+    for (error, first_send, expected) in [
+        (
+            remote_error(ErrorCode::PolicyOwnedByPrimary, "secondary"),
+            true,
+            true,
+        ),
+        (
+            remote_error(ErrorCode::PolicyOwnedByPrimary, "secondary"),
+            false,
+            false,
+        ),
+        (remote_error(ErrorCode::PlanConflict, "expired"), true, true),
+        (
+            remote_error(ErrorCode::PlanConflict, "expired"),
+            false,
+            true,
+        ),
+        (
+            remote_error(ErrorCode::RevisionConflict, "stale"),
+            false,
+            true,
+        ),
+        (
+            remote_error(ErrorCode::AdmissionRejected, "capacity"),
+            true,
+            false,
+        ),
+        (
+            remote_error(ErrorCode::IdempotencyConflict, "reused"),
+            true,
+            false,
+        ),
+        (transport_error("closed"), true, false),
+        (
+            local(AdapterErrorKind::Transport, ErrorCode::PlanConflict),
+            true,
+            false,
+        ),
+        (
+            local(AdapterErrorKind::Protocol, ErrorCode::PlanConflict),
+            true,
+            false,
+        ),
+        (
+            local(AdapterErrorKind::Protocol, ErrorCode::RevisionConflict),
+            true,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            super::workflow::refused_before_intent(&error, first_send),
+            expected,
+            "{:?} {:?} first_send={first_send}",
+            error.kind,
+            error.code()
+        );
+    }
+}
+
+async fn submitted_with(
+    config_path: &Path,
+    prefix: Option<ProfilePrefix>,
+) -> crate::operator_rules::BatchRequest {
+    let origin = PolicyOrigin::ProfileMounts {
+        profile_id: "default".into(),
+        properties_committed: true,
+    };
+    if let Some(prefix) = &prefix {
+        recovery::begin_property(
+            config_path.to_path_buf(),
+            PolicyOrigin::ProfileMounts {
+                profile_id: "default".into(),
+                properties_committed: false,
+            },
+            vec![operation()],
+            prefix.clone(),
+        )
+        .await
+        .unwrap();
+        recovery::property_committed(
+            config_path.to_path_buf(),
+            prefix.clone(),
+            "properties saved".into(),
+        )
+        .await
+        .unwrap();
+    }
+    let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+    let planned = workflow.begin_plan().unwrap();
+    recovery::begin_submitted(
+        config_path.to_path_buf(),
+        origin,
+        planned.request.clone(),
+        retained_plan(&planned.request),
+        prefix,
+        Some("properties saved".into()),
+    )
+    .await
+    .unwrap();
+    planned.request
+}
+
+#[tokio::test]
+async fn refused_submission_settles_the_journal_for_a_fresh_plan() {
+    let prefix = ProfilePrefix {
+        profile_id: "default".into(),
+        patch: Default::default(),
+    };
+    for prefix in [None, Some(prefix)] {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        let request = submitted_with(&config_path, prefix.clone()).await;
+        recovery::settle_refused(config_path.clone(), request.request_id)
+            .await
+            .unwrap();
+        match &prefix {
+            None => assert!(recovery::load(config_path.clone()).await.unwrap().is_none()),
+            Some(_) => assert!(matches!(
+                recovery::load(config_path.clone()).await.unwrap(),
+                Some(recovery::JournalState::PropertyCommitted { message, .. })
+                    if message == "properties saved"
+            )),
+        }
+        // The re-planned request (new identity, same suffix) is accepted.
+        let mut workflow = OperatorPolicyWorkflow::new("b".repeat(64), vec![operation()]).unwrap();
+        let replanned = workflow.begin_plan().unwrap();
+        recovery::begin_submitted(
+            config_path,
+            PolicyOrigin::ProfileMounts {
+                profile_id: "default".into(),
+                properties_committed: true,
+            },
+            replanned.request.clone(),
+            retained_plan(&replanned.request),
+            prefix,
+            Some("properties saved".into()),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn refusal_settles_only_the_exact_unacknowledged_submission() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let request = submitted_with(&config_path, None).await;
+    assert_eq!(
+        recovery::settle_refused(config_path.clone(), "other-request".into())
+            .await
+            .unwrap_err()
+            .code(),
+        ErrorCode::IdempotencyConflict
+    );
+    assert!(matches!(
+        recovery::load(config_path.clone()).await.unwrap(),
+        Some(recovery::JournalState::Submitted {
+            operation_id: None,
+            ..
+        })
+    ));
+
+    recovery::observe_receipt(
+        config_path.clone(),
+        request.request_id.clone(),
+        "operation-queued".into(),
+        PersistenceState::Prepared,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovery::settle_refused(config_path.clone(), request.request_id)
+            .await
+            .unwrap_err()
+            .code(),
+        ErrorCode::RecoveryConflict
+    );
+    assert!(matches!(
+        recovery::load(config_path).await.unwrap(),
+        Some(recovery::JournalState::Submitted {
+            operation_id: Some(_),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn primary_owned_refusal_of_a_retry_keeps_the_submitted_intent() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let request = submitted_with(&config_path, None).await;
+    let refused = Err(remote_error(ErrorCode::PolicyOwnedByPrimary, "secondary"));
+    assert!(
+        super::controller::observe_submit(config_path.clone(), &request, &refused, false)
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        recovery::load(config_path.clone()).await.unwrap(),
+        Some(recovery::JournalState::Submitted {
+            operation_id: None,
+            ..
+        })
+    ));
+    assert!(
+        super::controller::observe_submit(config_path.clone(), &request, &refused, true)
+            .await
+            .is_none()
+    );
+    assert!(recovery::load(config_path).await.unwrap().is_none());
+}
+
+fn display_name_prefix() -> ProfilePrefix {
+    ProfilePrefix {
+        profile_id: "default".into(),
+        patch: crate::ipc::protocol::ProfileUpdatePatch {
+            display_name: Some("Renamed".into()),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn property_update_that_never_reached_the_daemon_clears_the_pending_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let socket = root.path().join("missing.sock");
+    register_test_token(&socket, "t");
+    let origin = PolicyOrigin::ProfileMounts {
+        profile_id: "default".into(),
+        properties_committed: false,
+    };
+    let (error, properties_committed) = super::controller::prepare_profile_probe(
+        socket,
+        config_path.clone(),
+        origin,
+        vec![operation()],
+        display_name_prefix(),
+    )
+    .await
+    .unwrap();
+    assert!(!properties_committed);
+    assert!(
+        error.starts_with("profile properties were not applied: "),
+        "{error}"
+    );
+    assert!(error.contains("os error 2"), "{error}");
+    assert!(
+        !error.contains(crate::ipc::auth_token::NO_TOKEN_FILE_MSG),
+        "{error}"
+    );
+    assert!(recovery::load(config_path.clone()).await.unwrap().is_none());
+
+    let mut workflow = OperatorPolicyWorkflow::new("a".repeat(64), vec![operation()]).unwrap();
+    let planned = workflow.begin_plan().unwrap();
+    recovery::begin_submitted(
+        config_path,
+        PolicyOrigin::Mount,
+        planned.request.clone(),
+        retained_plan(&planned.request),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn abandon_clears_only_the_exact_pending_property_intent() {
+    let origin = PolicyOrigin::ProfileMounts {
+        profile_id: "default".into(),
+        properties_committed: false,
+    };
+    let other_operation = Operation::AddDomainRule {
+        id: "local".into(),
+        domain: "different.invalid".into(),
+        action: RuleAction::Deny,
+    };
+    let mut other_prefix = display_name_prefix();
+    other_prefix.patch.display_name = Some("Other".into());
+    for (expected_origin, expected_operations, expected_prefix) in [
+        (
+            PolicyOrigin::Mount,
+            vec![operation()],
+            display_name_prefix(),
+        ),
+        (origin.clone(), vec![other_operation], display_name_prefix()),
+        (origin.clone(), vec![operation()], other_prefix),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        recovery::begin_property(
+            config_path.clone(),
+            origin.clone(),
+            vec![operation()],
+            display_name_prefix(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovery::abandon_property_pending(
+                config_path.clone(),
+                expected_origin,
+                expected_operations,
+                expected_prefix,
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            ErrorCode::RecoveryConflict
+        );
+        assert!(matches!(
+            recovery::load(config_path).await.unwrap(),
+            Some(recovery::JournalState::PropertyPending { .. })
+        ));
+    }
 }

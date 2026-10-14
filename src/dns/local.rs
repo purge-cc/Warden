@@ -369,11 +369,7 @@ fn resolve_forward(
             .find(|r| r.record_type() == RecordType::CNAME)
         {
             if let RData::CNAME(ref target) = cname_rec.data {
-                let mut target_str = CompactString::default();
-                let _ = write!(target_str, "{}", **target);
-                if target_str.ends_with('.') {
-                    target_str.pop();
-                }
+                let target_str = super::handler::ascii_domain(target);
 
                 // The wildcard CNAME RR itself is re-owned by the QNAME; the
                 // followed target's A/AAAA records keep their own concrete
@@ -420,8 +416,8 @@ fn reowned(mut record: Record, owner: Option<&Name>) -> Record {
 }
 
 /// The apex under which a PTR hit is counted: the owning forward record's
-/// name, read from the first PTR record's RDATA target and stripped of its
-/// trailing dot (so it matches the lowercased, dot-less forward apex key an
+/// name, read from the first PTR record's RDATA target as escaped ASCII
+/// (`xn--` labels kept) and stripped of its trailing dot (so it matches the lowercased, dot-less forward apex key an
 /// A/AAAA hit for the same host uses). Panic-free (`panic="abort"` ⇒ any
 /// panic is a full daemon outage): never indexes, and falls back to an empty
 /// key if a future build ever stored a non-PTR record in the reverse map.
@@ -432,12 +428,7 @@ fn ptr_apex(records: &[Record]) -> CompactString {
     let RData::PTR(ref target) = rec.data else {
         return CompactString::default();
     };
-    let mut apex = CompactString::default();
-    let _ = write!(apex, "{}", **target);
-    if apex.ends_with('.') {
-        apex.pop();
-    }
-    apex
+    super::handler::ascii_domain(target)
 }
 
 /// Count the labels in a domain (`"app.example.test"` → 3, `"it"` → 1, `""` → 0).
@@ -1049,6 +1040,37 @@ mod tests {
         let local = LocalRecords::build(&cfg);
         match local.lookup("50.1.168.192.in-addr.arpa", RecordType::PTR) {
             LocalLookup::Hit { apex, .. } => assert_eq!(apex.as_str(), "nas.home"),
+            _ => panic!("expected PTR Hit"),
+        }
+    }
+
+    #[test]
+    fn punycode_cname_target_and_ptr_apex_match_the_ascii_forward_key() {
+        // hickory's `Display` decodes `xn--` labels to Unicode; the forward
+        // keys are ASCII, so the CNAME follow and the PTR apex must use the
+        // ASCII form or they miss the configured record.
+        let cfg = config_with(vec![
+            (
+                "xn--mnchen-3ya.example",
+                LocalDnsRecordType::A,
+                "192.0.2.10",
+            ),
+            (
+                "alias.example",
+                LocalDnsRecordType::CNAME,
+                "xn--mnchen-3ya.example",
+            ),
+        ]);
+        let local = LocalRecords::build(&cfg);
+
+        let result = local.lookup("alias.example", RecordType::A).hit().unwrap();
+        assert_eq!(result.len(), 2, "CNAME plus the followed local A record");
+        assert_eq!(a_ip(&result[1..]), Ipv4Addr::new(192, 0, 2, 10));
+
+        match local.lookup("10.2.0.192.in-addr.arpa", RecordType::PTR) {
+            LocalLookup::Hit { apex, .. } => {
+                assert_eq!(apex.as_str(), "xn--mnchen-3ya.example");
+            }
             _ => panic!("expected PTR Hit"),
         }
     }

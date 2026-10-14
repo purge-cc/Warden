@@ -236,7 +236,7 @@ fn free_dns_addr() -> SocketAddr {
 fn assert_cli_receipt(output: &Output) -> Value {
     assert_eq!(
         output.status.code(),
-        Some(5),
+        Some(0),
         "CLI mutation failed; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -506,5 +506,170 @@ async fn real_daemon_cli_rest_reload_dns_and_restart_round_trip() {
     }
     assert_blocked(&fixture, REST_DOMAIN, RecordType::A).await;
     restarted.stop().await;
+    upstream_task.abort();
+}
+
+fn import_local_while_stopped(fixture: &Fixture, id: &str, domain: &str) {
+    let source = fixture.root.path().join(format!("{id}.source.txt"));
+    std::fs::write(&source, format!("{domain}\n")).unwrap();
+    let output = fixture.cli(&[
+        "blocklist",
+        "import-local",
+        source.to_str().unwrap(),
+        "--id",
+        id,
+        "--kind",
+        "deny",
+    ]);
+    assert!(
+        output.status.success(),
+        "import-local {id} failed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn wait_blocked(fixture: &Fixture, domain: &str, daemon: &Daemon) {
+    let blocked = RData::A(A(Ipv4Addr::UNSPECIFIED));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let message = dns_query(fixture.dns_addr, domain, RecordType::A).await;
+        if message.answers.first().map(|answer| &answer.data) == Some(&blocked) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{domain} was not blocked: {:?}; log:\n{}",
+            message.answers,
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A list added while stopped has no cached body, so the next boot
+/// serves `Partial` from the cached list. It must bind and complete on the
+/// first cycle instead of failing the node corpus check and exiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_import_local_boots_partial_then_completes_on_first_cycle() {
+    const FIRST: &str = "one.e2e-blocklist.test";
+    const SECOND: &str = "two.e2e-blocklist.test";
+    let (upstream_addr, upstream_task) = spawn_upstream().await;
+    let fixture = Fixture::new(upstream_addr);
+    // Boot reads the catalog from disk before it fetches; seed it to stay offline.
+    purge_warden::lists::catalog::Catalog::fallback()
+        .save_to_disk(&fixture.root.path().join("lists"))
+        .unwrap();
+
+    import_local_while_stopped(&fixture, "e2e-one", FIRST);
+    let mut daemon = Daemon::spawn(&fixture);
+    daemon.wait_ready(&fixture).await;
+    assert_blocked(&fixture, FIRST, RecordType::A).await;
+    daemon.stop().await;
+
+    import_local_while_stopped(&fixture, "e2e-two", SECOND);
+    let mut restarted = Daemon::spawn(&fixture);
+    restarted.wait_ready(&fixture).await;
+    assert_blocked(&fixture, FIRST, RecordType::A).await;
+    wait_blocked(&fixture, SECOND, &restarted).await;
+    assert!(
+        !restarted.log().contains("CorpusPreparationFailed"),
+        "log:\n{}",
+        restarted.log()
+    );
+    // Only the cluster build keeps a node corpus to warn about.
+    assert_eq!(
+        restarted
+            .log()
+            .contains("partial list corpus serving locally"),
+        cfg!(feature = "cluster"),
+        "log:\n{}",
+        restarted.log()
+    );
+    restarted.stop().await;
+    upstream_task.abort();
+}
+
+/// `warden token regenerate` reloads the daemon over IPC; REST must accept
+/// the new token and refuse the old one without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_regenerate_rotates_rest_auth_without_restart() {
+    let (upstream_addr, upstream_task) = spawn_upstream().await;
+    let fixture = Fixture::new(upstream_addr);
+    let mut daemon = Daemon::spawn(&fixture);
+    daemon.wait_ready(&fixture).await;
+    let client = reqwest::Client::new();
+    let status_url = format!("http://{}/api/status", fixture.api_addr);
+    let status = |token: String| {
+        let request = client.get(&status_url).bearer_auth(token);
+        async move { request.send().await.expect("GET /api/status").status() }
+    };
+    assert_eq!(status(TOKEN.into()).await, StatusCode::OK);
+
+    // Explicit paths only: the default token path may resolve to the
+    // host's global token file.
+    let token_path = fixture.xdg.join("purge-warden/token");
+    purge_warden::cli::commands::token::run_regenerate(
+        &fixture.config,
+        &fixture.socket,
+        &token_path,
+    )
+    .await
+    .unwrap();
+    let new_token = purge_warden::ipc::auth_token::load_token_at(&token_path)
+        .unwrap()
+        .unwrap();
+    assert_ne!(new_token, TOKEN);
+
+    // The reload goes through the IPC coalescer. Poll with the old token:
+    // it keeps succeeding until the swap lands, so the failure count stays
+    // at one, far from the auth lockout.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status(TOKEN.into()).await != StatusCode::UNAUTHORIZED {
+        assert!(
+            Instant::now() < deadline,
+            "REST still accepts the old token after regenerate; log:\n{}",
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status(new_token).await, StatusCode::OK);
+
+    daemon.stop().await;
+    upstream_task.abort();
+}
+
+/// A node-corpus bookkeeping error (here `pair.json` is a directory)
+/// withholds the node pair but must not stop a host that can serve its
+/// installed lists.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn primary_bookkeeping_failure_still_serves_dns() {
+    use std::os::unix::fs::DirBuilderExt;
+    const DOMAIN: &str = "bookkeeping.e2e-blocklist.test";
+    let (upstream_addr, upstream_task) = spawn_upstream().await;
+    let fixture = Fixture::new(upstream_addr);
+    // Boot reads the catalog from disk before it fetches; seed it to stay offline.
+    purge_warden::lists::catalog::Catalog::fallback()
+        .save_to_disk(&fixture.root.path().join("lists"))
+        .unwrap();
+    import_local_while_stopped(&fixture, "e2e-bookkeeping", DOMAIN);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(fixture.root.path().join(".warden-node-corpus/pair.json"))
+        .unwrap();
+
+    let mut daemon = Daemon::spawn(&fixture);
+    daemon.wait_ready(&fixture).await;
+    assert_blocked(&fixture, DOMAIN, RecordType::A).await;
+    let log = daemon.log();
+    assert!(
+        log.contains("node corpus activation proof unavailable")
+            && log.contains("CorpusNotRegularFile"),
+        "log:\n{log}"
+    );
+    assert!(!log.contains("CorpusUnprotectedDirectory"), "log:\n{log}");
+    daemon.stop().await;
     upstream_task.abort();
 }

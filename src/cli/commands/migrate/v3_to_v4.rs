@@ -145,6 +145,8 @@ fn check_tree_locked(guard: &ConfigReadLock, master: &Path) -> Result<TreeCheckS
                 source_plan_warnings: deduplicate_warnings(warnings),
             })
         }
+        // scripts/upgrade_config_gate.sh hides this refusal for schema 5 by its
+        // "cannot check schema_version = 5;" prefix; a test below pins it.
         version => bail!(
             "cannot check schema_version = {version}; this command only supports schema 3 or 4"
         ),
@@ -1067,6 +1069,24 @@ mod tests {
             }
             assert_eq!(recursive_snapshot(dir.path()), before);
         }
+    }
+
+    /// scripts/upgrade_config_gate.sh matches this prefix to drop the
+    /// expected schema-5 refusal from its lint-failure reason.
+    #[test]
+    fn check_refuses_schema_five_with_the_prefix_the_upgrade_gate_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = dir.path().join("config.toml");
+        fs::write(
+            &master,
+            "schema_version = 5\n[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+        )
+        .unwrap();
+        let message = check_tree(&master).unwrap_err().to_string();
+        assert!(
+            message.starts_with("cannot check schema_version = 5;"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -122,6 +122,8 @@ fn generic_import_restore_and_replica_validate_schema_five_before_persisting() {
             "pub fn run_edit(",
             "write_lock::acquire_for_write(config_path)",
             "load_config_v5_executable_under_editor_guard(&guard, &canonical_master, now)",
+            "prepare_raw_validated_single_locked(",
+            "commit_prevalidated_single_write(",
         ],
     );
 

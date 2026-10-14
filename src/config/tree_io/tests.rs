@@ -310,3 +310,28 @@ fn rename_noreplace_at_preserves_an_existing_sentinel() {
     assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
     assert_eq!(std::fs::read(&source).unwrap(), b"new");
 }
+
+#[test]
+fn external_directory_creation_takes_the_parent_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("owned");
+    std::fs::create_dir(&parent).unwrap();
+    std::os::unix::fs::chown(&parent, Some(65534), Some(65534)).unwrap();
+
+    let plan = super::plan_external_directory_from(&parent.join("a/b/"), root.path()).unwrap();
+    plan.open_or_create().unwrap();
+    for dir in [parent.join("a"), parent.join("a/b")] {
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+            (65534, 65534, 0o750),
+            "{}",
+            dir.display()
+        );
+    }
+}

@@ -122,6 +122,7 @@ fn print_live_status(
             cache_weighted_size,
             lists_active,
             lists_total,
+            lists_loaded,
             lists_truncated,
             lists_corpus_refusal,
             lists_corpus_freeze,
@@ -167,6 +168,7 @@ fn print_live_status(
             for line in format_reported_lists_lines(
                 list_count,
                 lists_active,
+                lists_loaded,
                 lists_total,
                 lists_truncated,
                 lists_corpus_refusal.as_ref(),
@@ -254,7 +256,7 @@ fn print_live_status(
                     println!();
                     println!("Top blocked:");
                     for (i, entry) in top_blocked.iter().take(5).enumerate() {
-                        println!("  {:>2}. {:<40} {} hits", i + 1, entry.domain, entry.count);
+                        println!("{}", super::stats::top_line(i + 1, entry));
                     }
                 }
             }
@@ -331,6 +333,7 @@ fn print_live_status_json(
         cache_weighted_size,
         lists_active,
         lists_total,
+        lists_loaded,
         lists_truncated,
         lists_corpus_refusal,
         lists_cycle,
@@ -369,6 +372,8 @@ fn print_live_status_json(
         map.insert("cache_weighted_size".into(), cache_weighted_size.into());
         map.insert("lists_active".into(), lists_active.into());
         map.insert("lists_total".into(), lists_total.into());
+        // An older daemon sends no count (0); loaded never falls below active.
+        map.insert("lists_loaded".into(), lists_loaded.max(lists_active).into());
         map.insert("lists_truncated".into(), lists_truncated.into());
         // Emitted unconditionally, `null` when the last cycle installed.
         // A JSON consumer that only ever saw per-source rows would read a
@@ -755,6 +760,7 @@ pub(crate) fn format_frozen_since(freeze: &crate::lists::status::CorpusFreeze) -
 /// free the most room.
 fn format_lists_lines(
     lists_active: u32,
+    lists_loaded: u32,
     lists_total: u32,
     lists_truncated: u32,
     refusal: Option<&crate::lists::status::CorpusRefusal>,
@@ -860,11 +866,20 @@ fn format_lists_lines(
         return lines;
     }
 
-    let headline = if coverage_incomplete || generation_degraded {
+    let mut headline = if coverage_incomplete || generation_degraded {
         "source rows"
     } else {
         "sources active"
-    };
+    }
+    .to_string();
+    // After a restart a source serves its verified cache but is not
+    // active until its next due fetch; say so instead of reading as down.
+    if lists_loaded > lists_active {
+        headline.push_str(&format!(
+            ", {} loaded from cache (next fetch pending)",
+            lists_loaded - lists_active
+        ));
+    }
     let mut lines = vec![if lists_truncated > 0 {
         format!(
             "lists:      {lists_active}/{lists_total} {headline}, \
@@ -923,9 +938,11 @@ fn format_degraded_served_state_line(state: ServedState) -> String {
 
 /// Select completed-registry counters only when the daemon reports a cycle.
 /// A reported 0/0 is an intentional empty registry; no marker is legacy.
+#[allow(clippy::too_many_arguments)]
 fn format_reported_lists_lines(
     list_count: usize,
     lists_active: u32,
+    lists_loaded: u32,
     lists_total: u32,
     lists_truncated: u32,
     refusal: Option<&crate::lists::status::CorpusRefusal>,
@@ -935,6 +952,7 @@ fn format_reported_lists_lines(
     match cycle {
         Some(cycle) => format_lists_lines(
             lists_active,
+            lists_loaded,
             lists_total,
             lists_truncated,
             refusal,
@@ -1231,7 +1249,8 @@ mod tests {
             generation_degraded: false,
             served_state: ServedState::Cleared,
         };
-        let lines = format_reported_lists_lines(9, 0, 0, 0, None, None, Some(&cleared)).join("\n");
+        let lines =
+            format_reported_lists_lines(9, 0, 0, 0, 0, None, None, Some(&cleared)).join("\n");
         assert!(lines.contains("0/0 source rows"), "{lines}");
         assert!(lines.contains("BLOCKLIST CLEARED"), "{lines}");
         assert!(lines.contains("filtering nothing"), "{lines}");
@@ -1241,7 +1260,7 @@ mod tests {
         assert!(domains.contains("CLEARED"), "{domains}");
         assert!(domains.contains("UNFILTERED"), "{domains}");
 
-        let legacy = format_reported_lists_lines(9, 0, 0, 0, None, None, None);
+        let legacy = format_reported_lists_lines(9, 0, 0, 0, 0, None, None, None);
         assert_eq!(legacy, vec!["lists:      9 sources"]);
     }
 
@@ -1478,7 +1497,7 @@ mod tests {
             ],
         };
 
-        let refused = format_lists_lines(8, 8, 0, Some(&refusal), None, None).join("\n");
+        let refused = format_lists_lines(8, 8, 8, 0, Some(&refusal), None, None).join("\n");
         assert!(
             !refused.contains("active"),
             "a refused cycle still described its sources as active:\n{refused}"
@@ -1507,7 +1526,7 @@ mod tests {
         // Control arm: without a refusal the line is unchanged, so the
         // assertions above are about the refused state and not about some
         // blanket rewording of the line.
-        let healthy = format_lists_lines(8, 8, 0, None, None, None).join("\n");
+        let healthy = format_lists_lines(8, 8, 8, 0, None, None, None).join("\n");
         assert!(
             healthy.contains("8/8 sources active"),
             "the healthy line changed:\n{healthy}"
@@ -1516,11 +1535,33 @@ mod tests {
 
         // And the pre-existing truncation suffix still works, refusal or
         // not — this line has three states now, not two.
-        let truncated = format_lists_lines(8, 8, 2, None, None, None).join("\n");
+        let truncated = format_lists_lines(8, 8, 8, 2, None, None, None).join("\n");
         assert!(
             truncated.contains("2 REFUSED by max_entries"),
             "{truncated}"
         );
+    }
+
+    #[test]
+    fn cache_loaded_sources_are_named_instead_of_reading_as_down() {
+        let restarted = format_lists_lines(0, 8, 8, 0, None, None, None);
+        assert_eq!(
+            restarted,
+            ["lists:      0/8 sources active, 8 loaded from cache (next fetch pending)"]
+        );
+        let mixed = format_lists_lines(3, 8, 8, 0, None, None, None);
+        assert_eq!(
+            mixed,
+            ["lists:      3/8 sources active, 5 loaded from cache (next fetch pending)"]
+        );
+        // Nothing loaded beyond the active rows, or an older daemon that
+        // reports 0: exactly the line printed before the count existed.
+        for loaded in [8, 0] {
+            assert_eq!(
+                format_lists_lines(8, loaded, 8, 0, None, None, None),
+                ["lists:      8/8 sources active"]
+            );
+        }
     }
 
     #[test]
@@ -1532,7 +1573,7 @@ mod tests {
             generation_degraded: true,
             served_state: ServedState::Complete,
         };
-        let held = format_lists_lines(8, 8, 0, None, None, Some(&hot)).join("\n");
+        let held = format_lists_lines(8, 8, 8, 0, None, None, Some(&hot)).join("\n");
         assert!(held.contains("SOURCE COVERAGE INCOMPLETE"), "{held}");
         assert!(
             held.contains("previous complete generation remains serving"),
@@ -1551,7 +1592,7 @@ mod tests {
             generation_degraded: false,
             served_state: ServedState::Partial,
         };
-        let partial = format_lists_lines(8, 8, 0, None, None, Some(&cold)).join("\n");
+        let partial = format_lists_lines(8, 8, 8, 0, None, None, Some(&cold)).join("\n");
         assert!(partial.contains("SOURCE COVERAGE INCOMPLETE"), "{partial}");
         assert!(partial.contains("partial corpus installed"), "{partial}");
         assert!(partial.contains("8/8 source rows"), "{partial}");
@@ -1567,7 +1608,7 @@ mod tests {
             generation_degraded: true,
             served_state: ServedState::Partial,
         };
-        let held = format_lists_lines(8, 8, 0, None, None, Some(&degraded)).join("\n");
+        let held = format_lists_lines(8, 8, 8, 0, None, None, Some(&degraded)).join("\n");
         assert!(held.contains("partial generation is serving"), "{held}");
         assert!(held.contains("8/8 source rows"), "{held}");
         assert!(
@@ -1609,7 +1650,7 @@ mod tests {
                 generation_degraded: true,
                 served_state,
             };
-            let lines = format_lists_lines(8, 8, 0, None, None, Some(&cycle)).join("\n");
+            let lines = format_lists_lines(8, 8, 8, 0, None, None, Some(&cycle)).join("\n");
             assert!(lines.contains(expected), "{served_state:?}: {lines}");
             assert!(
                 !lines.contains("NO complete generation installed"),
@@ -1619,7 +1660,7 @@ mod tests {
     }
 
     /// A refusal that does not say *when* reads the same on day one and
-    /// on day fourteen — proxmox served a frozen corpus for two weeks and
+    /// on day fourteen — node_b served a frozen corpus for two weeks and
     /// nine cycles with `warden status` printing the identical block every
     /// time. The line is byte-pinned because an operator greps it and a
     /// scraper matches it.
@@ -1635,7 +1676,7 @@ mod tests {
             consecutive: 9,
         };
 
-        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
+        let out = format_lists_lines(8, 8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(
             out.contains(
                 "            FROZEN since 2026-08-04T03:00:00Z (9 refused cycles, \
@@ -1660,7 +1701,7 @@ mod tests {
 
         // Control arm: a refusal with no freeze reported (an older daemon)
         // still renders every pre-existing line, and adds nothing.
-        let no_freeze = format_lists_lines(8, 8, 0, Some(&refusal), None, None).join("\n");
+        let no_freeze = format_lists_lines(8, 8, 8, 0, Some(&refusal), None, None).join("\n");
         assert!(no_freeze.contains("CORPUS REFUSED"), "{no_freeze}");
         assert!(
             !no_freeze.contains("FROZEN since"),
@@ -1670,7 +1711,7 @@ mod tests {
 
         // A later non-installing manager cycle can clear the refusal payload
         // while the standing freeze remains actionable; never hide its age.
-        let healthy = format_lists_lines(8, 8, 0, None, Some(&freeze), None).join("\n");
+        let healthy = format_lists_lines(8, 8, 8, 0, None, Some(&freeze), None).join("\n");
         assert!(healthy.contains("FROZEN since"), "{healthy}");
     }
 
@@ -1689,7 +1730,7 @@ mod tests {
             served_state: ServedState::Complete,
         };
         let refused_lines =
-            format_lists_lines(1, 2, 0, Some(&refusal), None, Some(&refused)).join("\n");
+            format_lists_lines(1, 1, 2, 0, Some(&refusal), None, Some(&refused)).join("\n");
         assert!(refused_lines.contains("CORPUS REFUSED"), "{refused_lines}");
         assert!(refused_lines.contains("supplementary"), "{refused_lines}");
         assert!(!refused_lines.contains("previous corpus retained"));
@@ -1702,7 +1743,7 @@ mod tests {
             generation_degraded: false,
             served_state: ServedState::Complete,
         };
-        let rejected_lines = format_lists_lines(1, 2, 0, None, None, Some(&rejected)).join("\n");
+        let rejected_lines = format_lists_lines(1, 1, 2, 0, None, None, Some(&rejected)).join("\n");
         assert!(
             rejected_lines.contains("CONFIG REJECTED"),
             "{rejected_lines}"
@@ -1735,7 +1776,7 @@ mod tests {
             since: Some(datetime!(2026-08-04 03:00:00 UTC)),
             consecutive: 9,
         };
-        let lists = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
+        let lists = format_lists_lines(8, 8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(
             lists.contains("FROZEN since 2026-08-04T03:00:00Z"),
             "{lists}"
@@ -1762,7 +1803,7 @@ mod tests {
             since: None,
             consecutive: 4,
         };
-        let out = format_lists_lines(8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
+        let out = format_lists_lines(8, 8, 8, 0, Some(&refusal), Some(&freeze), None).join("\n");
         assert!(!out.contains("FROZEN"), "{out}");
         assert!(!out.contains("unknown"), "{out}");
         assert!(out.contains("CORPUS REFUSED"), "{out}");

@@ -488,3 +488,70 @@ fn relocate_fence_refuses_a_corpus_open() {
     std::fs::remove_file(&active).unwrap();
     drop(CorpusStore::open(&master).unwrap());
 }
+
+#[test]
+fn cache_ownership_receipts_bind_the_inode_not_the_device() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    let store = CorpusStore::open(&master).unwrap();
+    let record = |directory: &Path, device: u64, inode: u64| {
+        let meta = std::fs::metadata(directory).unwrap();
+        let name = directory.file_name().unwrap().to_str().unwrap();
+        std::fs::write(
+            store.root.join(format!("cache-owner-{name}")),
+            serde_json::to_vec(&(meta.dev() + device, meta.ino() + inode)).unwrap(),
+        )
+        .unwrap();
+    };
+    let (primary, lease) = store.parser_workspace().unwrap();
+    let primary = primary.keep();
+    drop(lease);
+    record(&primary, 1, 0);
+    store.set_primary_cache_dir(&primary).unwrap();
+    drop(store.lease_primary_cache().unwrap().unwrap());
+    record(&primary, 0, 1);
+    let error = store.set_primary_cache_dir(&primary).unwrap_err();
+    assert!(
+        error.to_string().contains("CorpusCacheOwnershipChanged"),
+        "{error:#}"
+    );
+    record(&primary, 1, 0);
+
+    let (retired, lease) = store.parser_workspace().unwrap();
+    let retired = retired.keep();
+    drop(lease);
+    record(&retired, 0, 1);
+    let Err(error) = CorpusStore::open(&master) else {
+        panic!("a cache with another inode must refuse");
+    };
+    assert!(
+        error.to_string().contains("CorpusCacheOwnershipChanged"),
+        "{error:#}"
+    );
+    assert!(retired.is_dir());
+    record(&retired, 1, 0);
+    CorpusStore::open(&master).unwrap();
+    assert!(!retired.exists());
+    assert!(primary.is_dir());
+}
+
+#[tokio::test]
+async fn acquire_auxiliary_honours_client_timeouts() {
+    // Accepts the connection (kernel backlog) and never answers the TLS hello.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .resolve("silent.example.test", silent.local_addr().unwrap())
+        .build()
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(CorpusStore::open(&root.path().join("config.toml")).unwrap());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        acquire_auxiliary(store, &client, "https://silent.example.test/ips", 1 << 20),
+    )
+    .await
+    .expect("a per-request timeout replaced the client's limit");
+    assert!(result.is_err());
+}

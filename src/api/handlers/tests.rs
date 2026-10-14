@@ -36,7 +36,7 @@ pub(crate) fn test_state_with_stats() -> Arc<ApiState> {
         profiles: None,
         stats: Some(stats),
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -75,7 +75,9 @@ pub(crate) fn test_state_with_rate_limit(limit: u32) -> (Arc<ApiState>, &'static
         profiles: None,
         stats: Some(stats),
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: crate::auth::token::hash_token(TOKEN),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(Some(
+            crate::auth::token::hash_token(TOKEN),
+        ))),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(limit),
         reload_tx,
@@ -157,7 +159,7 @@ fn test_state_with_blocklists() -> Arc<ApiState> {
         profiles: None, // No resolver wired — exact match + substring still work.
         stats: None,
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -190,7 +192,7 @@ fn test_state_no_blocklists() -> Arc<ApiState> {
         profiles: None,
         stats: None,
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -534,7 +536,7 @@ async fn query_domain_reports_block_source() {
         profiles: Some(profiles),
         stats: None,
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -652,7 +654,7 @@ async fn blocklist_stats_plan_aliases_return_the_canonical_response_identity() {
         profiles: None,
         stats: None,
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -786,7 +788,7 @@ fn registry_with_overlapping_substrings() -> Arc<ApiState> {
         profiles: None,
         stats: None,
         config_path: "/tmp/test-config.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -1043,7 +1045,7 @@ fn test_state_with_config_path_and_reload(
         profiles: None,
         stats: None,
         config_path: path,
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -1611,7 +1613,7 @@ async fn h_16_query_domain_rejects_invalid_path_segment_with_400() {
         profiles: None,
         stats: None,
         config_path: "/tmp/unused.toml".into(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -1692,7 +1694,7 @@ async fn h_17_add_list_reload_channel_closed_returns_500_with_restart_hint() {
         profiles: None,
         stats: None,
         config_path: path.clone(),
-        token_hash: String::new(),
+        token_hash: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         rate_limiter: AuthRateLimiter::new(),
         api_rate_limiter: crate::api::rate_limit::ApiRateLimiter::new(60),
         reload_tx,
@@ -2042,4 +2044,51 @@ async fn whitelist_endpoints_are_gone_and_never_touch_config() {
     );
     drop(state);
     std::fs::remove_file(&path).ok();
+}
+
+// ── list writes get the daemon's source-plan preflight ─────────────
+
+/// POST `/api/lists/add` of `id` must answer 400 without writing or
+/// requesting a reload; returns the error text.
+async fn add_list_refusal(initial: &str, suffix: &str, id: &str) -> String {
+    let path = api_mutation_temp_config(initial, suffix);
+    let before = std::fs::read(&path).unwrap();
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(1);
+    let state = test_state_with_config_path_and_reload(path.clone(), reload_tx);
+    let resp = add_list(State(state.clone()), Json(ListBody { id: id.into() }))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = read_body_json(resp).await;
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), reload_rx.recv())
+            .await
+            .is_err(),
+        "a refused source must not request a reload"
+    );
+    drop(state);
+    std::fs::remove_file(&path).ok();
+    body["error"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn add_list_refuses_unknown_only_slug_and_leaves_master_unchanged() {
+    let initial = "schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    let error = add_list_refusal(initial, "addlist-unknown-slug", "privacy/does-not-exist").await;
+    assert!(
+        error.contains("resolved to no usable catalog entries"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn add_list_refuses_65th_source() {
+    let sources = (0..64)
+        .map(|n| format!("\"https://example.com/list-{n}.txt\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let initial = format!("schema_version = 5\n\n[profiles.default]\ndisplay_name = \"Default\"\n\n[upstream]\nservers = [\"192.0.2.1:53\"]\n\n[lists]\nsources = [{sources}]\n");
+    let error = add_list_refusal(&initial, "addlist-65th", "https://example.com/list-64.txt").await;
+    assert!(error.contains("too many list sources"), "{error}");
 }

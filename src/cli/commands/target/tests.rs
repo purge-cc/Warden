@@ -2193,6 +2193,8 @@ ip = "192.0.2.50"
                 .contains("policy is read-only on a cluster secondary"),
             "expected the CS8 refusal, got: {err}"
         );
+        // `config edit` maps exactly this type to exit 2.
+        assert!(err.downcast_ref::<CandidateInvalid>().is_some(), "{err:?}");
     }
 
     fn assert_absent(path: &Path) {
@@ -2364,4 +2366,44 @@ ip = "192.0.2.50"
             "actionable refusal prefix occupies {prefix_cells} cells"
         );
     }
+}
+
+/// A source set boot would refuse is refused before writing, typed so every
+/// caller can tell it from an I/O failure. The gate is the changed keys: a
+/// write that cannot change the source set still lands.
+#[test]
+fn source_plan_refusal_is_typed_and_gated_on_source_keys() {
+    let dir = tmpdir();
+    let master = dir.path().join("config.toml");
+    let base = "schema_version = 5\n\n[server]\ndefault_profile = \"default\"\n\n\
+                [profiles.default]\ndisplay_name = \"Default\"\n\n\
+                [upstream]\nservers = [\"192.0.2.1:53\"]\n";
+    std::fs::write(&master, base).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let (mut doc, _) = read_or_empty_locked(&guard, &master, &master).unwrap();
+    doc.as_table_mut().unwrap().insert(
+        "lists".into(),
+        toml::from_str("sources = [\"privacy/does-not-exist\"]").unwrap(),
+    );
+    let error = write_value_validated_locked(&guard, &master, &master, &doc).unwrap_err();
+    assert!(
+        error.downcast_ref::<CandidateInvalid>().is_some(),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("no usable catalog entries"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&master).unwrap(), base);
+    drop(guard);
+
+    let holding = format!("{base}\n[lists]\nsources = [\"privacy/does-not-exist\"]\n");
+    std::fs::write(&master, &holding).unwrap();
+    let guard = crate::config::write_lock::acquire_for_write(&master).unwrap();
+    let (mut doc, _) = read_or_empty_locked(&guard, &master, &master).unwrap();
+    doc["upstream"]["servers"] = Value::Array(vec![Value::String("192.0.2.2:53".into())]);
+    write_value_validated_locked(&guard, &master, &master, &doc).unwrap();
+    assert!(std::fs::read_to_string(&master)
+        .unwrap()
+        .contains("192.0.2.2:53"));
 }

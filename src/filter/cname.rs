@@ -653,7 +653,9 @@ pub fn walk_response_with_grant(
 
 /// Inspect the branch rooted at `qname` as served to `original` through a
 /// synthetic rewrite edge. The edge consumes one hop and its original name
-/// participates in cycle detection, independently of policy grants.
+/// participates in cycle detection, independently of policy grants. Any
+/// upstream CNAME owned by the original name is malformed, an identical copy
+/// of the bridge included, and no grant applies.
 #[must_use]
 pub(crate) fn walk_response_with_rewrite(
     records: &[Record],
@@ -688,7 +690,15 @@ pub(crate) fn walk_response_with_rewrite(
     // verdict; choosing the answer-wide head would let a decoy branch hide it.
     let mut start = None;
     for record in records {
-        if !is_cname_link(record) || !owner_matches(&record.name, qname) {
+        if !is_cname_link(record) {
+            continue;
+        }
+        // Upstream was asked for the target, so a CNAME at the original name
+        // would sit beside the synthetic bridge: two CNAMEs at one owner.
+        if let Some(o) = original.filter(|o| owner_matches(&record.name, o)) {
+            return malformed_qname_verdict(o);
+        }
+        if !owner_matches(&record.name, qname) {
             continue;
         }
         if let Some(first) = start {
@@ -1135,6 +1145,59 @@ mod tests {
             walk_response_with_grant(&records, "hop0.test", &engine, &profile, None, 16),
             Verdict::Allow,
             "non-rewrite chain keeps its full sixteen-hop budget",
+        );
+    }
+
+    #[test]
+    fn walk_response_with_rewrite_rejects_an_upstream_original_owner_cname() {
+        let engine = FilterEngine::new();
+        let profile = compiled_profile("");
+        let walk = |records: &[Record]| {
+            walk_response_with_rewrite(
+                records,
+                "target.test",
+                Some("original.test"),
+                &engine,
+                &profile,
+                None,
+                16,
+            )
+        };
+        let malformed = Verdict::Block {
+            offending: CompactString::new("original.test"),
+            source: BlockSource::CnameMalformed,
+        };
+        let conflict = [
+            cname_record("original.test", "other.test"),
+            cname_record("target.test", "clean.test"),
+        ];
+        let mixed = cname_record("OrIgInAl.TeSt", "other.test");
+        let served = cname_record("target.test", "clean.test");
+        for (label, records) in [
+            ("conflict beside the bridge", conflict.to_vec()),
+            (
+                "self-loop at the original",
+                vec![cname_record("original.test", "original.test")],
+            ),
+            ("mixed case, first", vec![mixed.clone(), served.clone()]),
+            ("mixed case, last", vec![served.clone(), mixed]),
+            (
+                "identical copy of the bridge",
+                vec![cname_record("original.test", "target.test")],
+            ),
+        ] {
+            assert_eq!(walk(&records), malformed, "{label}");
+        }
+
+        assert_eq!(
+            walk_response_with_grant(&conflict, "target.test", &engine, &profile, None, 16),
+            Verdict::Allow,
+            "without a rewrite there is no original name to protect"
+        );
+        assert_eq!(
+            walk(&[cname_record("decoy.test", "original.test"), served]),
+            Verdict::Allow,
+            "a disjoint branch that only targets the original is not original-owned"
         );
     }
 

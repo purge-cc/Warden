@@ -40,11 +40,23 @@ pub(crate) enum RunState {
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Identity of a root or a renamed object. Equality compares the inode alone,
+/// as for policy transaction records: `st_dev` is not stable across boots.
+/// `device` stays in the receipt format; the same-filesystem check before a
+/// run reads it live. Accepted ceiling: another filesystem of the same type
+/// mounted in place with the same inodes matches, and so does a btrfs
+/// snapshot of the config subvolume swapped in place.
+#[derive(Debug, Clone, Copy, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Inode {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+}
+
+impl PartialEq for Inode {
+    fn eq(&self, other: &Self) -> bool {
+        self.inode == other.inode
+    }
 }
 
 impl Inode {
@@ -337,6 +349,18 @@ mod tests {
 
     fn owner() -> (u32, u32) {
         unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    #[test]
+    fn inode_identity_ignores_the_device_and_keeps_it_in_the_format() {
+        let inode = |device, inode| Inode { device, inode };
+        assert_eq!(inode(1, 5), inode(2, 5));
+        assert_ne!(inode(1, 5), inode(1, 6));
+        assert_eq!(inode(1, 5).pair(), (1, 5));
+        assert_eq!(
+            serde_json::to_value(inode(1, 5)).unwrap(),
+            serde_json::json!({"device": 1, "inode": 5})
+        );
     }
 
     #[test]

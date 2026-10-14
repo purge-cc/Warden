@@ -201,10 +201,10 @@ impl Upstream for UpstreamResolver {
         match self.primary.lookup(name, record_type, ecs.clone()).await {
             Ok(resp) => return Ok(resp),
             Err(DnsError::CircuitBreakerOpen) => {
-                tracing::debug!(domain = %name, "primary circuit-breaker open, trying fallback");
+                tracing::debug!(domain = %name.to_ascii(), "primary circuit-breaker open, trying fallback");
             }
             Err(e) => {
-                tracing::warn!(domain = %name, error = %e, "primary upstream failed, trying fallback");
+                tracing::warn!(domain = %name.to_ascii(), error = %e, "primary upstream failed, trying fallback");
             }
         }
 
@@ -213,7 +213,7 @@ impl Upstream for UpstreamResolver {
             match fallback.lookup(name, record_type, ecs).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    tracing::warn!(domain = %name, error = %e, "fallback upstream also failed");
+                    tracing::warn!(domain = %name.to_ascii(), error = %e, "fallback upstream also failed");
                     return Err(DnsError::AllUpstreamsFailed);
                 }
             }

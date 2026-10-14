@@ -6,3 +6,5 @@
 //! next to their consumer.
 
 pub mod domain;
+#[cfg(test)]
+pub(crate) mod log_capture;

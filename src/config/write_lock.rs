@@ -3,8 +3,6 @@
 //! Every participant must lock the directory first; older side-only lockers cannot
 //! synchronize these readers. Unsupported directory flock fails closed.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::fs::{File, Metadata, OpenOptions};
@@ -404,57 +402,6 @@ impl ConfigWriteLock {
             self.identity.lock_path.display()
         );
         Ok(self.side_lock_owner)
-    }
-
-    /// Admit the canonical master's replacement made by the direct CLI editor.
-    ///
-    /// This is deliberately not a general identity refresh: it examines only
-    /// the canonical leaf beneath the already locked root, without following
-    /// it, and accepts only a regular single-link replacement.
-    pub(crate) fn recapture_canonical_master_after_editor(&self) -> anyhow::Result<()> {
-        let owner = self.admitted_side_lock_owner()?;
-        let name = self
-            .identity
-            .canonical_master
-            .file_name()
-            .context("master filename")?;
-        let file = super::tree_io::inspect_at(&self._root, name)?
-            .context("editor removed the canonical master")?;
-        let meta = file.metadata()?;
-        ensure!(
-            meta.is_file() && meta.nlink() == 1,
-            "editor replacement must be a regular single-link canonical master: {}",
-            self.identity.canonical_master.display()
-        );
-        let ownership = reopen_inspected(&file, libc::O_RDONLY)
-            .context("reopen editor replacement before ownership normalization")?;
-        if (meta.uid(), meta.gid()) != owner && unsafe { libc::geteuid() } == 0 {
-            let rc = unsafe { libc::fchown(ownership.as_raw_fd(), owner.0, owner.1) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error())
-                    .context("preserve editor replacement ownership");
-            }
-            #[cfg(test)]
-            if take_recaptured_owner_sync_failure() {
-                return Err(io::Error::other(
-                    "injected editor replacement ownership sync failure",
-                ))
-                .context("sync editor replacement ownership");
-            }
-            ownership
-                .sync_all()
-                .context("sync editor replacement ownership")?;
-        }
-        let meta = ownership.metadata()?;
-        ensure!(
-            (meta.uid(), meta.gid()) == owner,
-            "editor replacement owner does not match admitted config lock owner {}:{}: {}",
-            owner.0,
-            owner.1,
-            self.identity.canonical_master.display()
-        );
-        *self.master.borrow_mut() = Some(file);
-        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -878,15 +825,13 @@ pub(crate) enum TestEvent {
     BeforeMasterCapture,
     BeforeGuardedValidation,
     AfterGuardedValidation,
-    AfterEditorRecapture,
+    AfterArchivePinned,
 }
 
 #[cfg(test)]
 type TestHook = Box<dyn FnMut(TestEvent)>;
 #[cfg(test)]
 thread_local! { static TEST_HOOK: std::cell::RefCell<Option<TestHook>> = const { std::cell::RefCell::new(None) }; }
-#[cfg(test)]
-thread_local! { static FAIL_RECAPTURED_OWNER_SYNC: Cell<bool> = const { Cell::new(false) }; }
 
 #[cfg(test)]
 pub(crate) fn test_event(event: TestEvent) {
@@ -912,25 +857,6 @@ pub(crate) fn with_test_hook<T>(
     }
     let _reset = Reset(TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
     body()
-}
-
-#[cfg(test)]
-pub(crate) fn with_recaptured_owner_sync_failure<T>(body: impl FnOnce() -> T) -> T {
-    struct Reset(bool);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FAIL_RECAPTURED_OWNER_SYNC.with(|slot| slot.set(self.0));
-        }
-    }
-    let reset = FAIL_RECAPTURED_OWNER_SYNC.with(|slot| Reset(slot.replace(true)));
-    let result = body();
-    drop(reset);
-    result
-}
-
-#[cfg(test)]
-fn take_recaptured_owner_sync_failure() -> bool {
-    FAIL_RECAPTURED_OWNER_SYNC.with(|slot| slot.replace(false))
 }
 
 fn wait_for_flock(file: &File, exclusive: bool, wait: Duration) -> io::Result<()> {

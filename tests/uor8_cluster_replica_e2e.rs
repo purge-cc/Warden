@@ -580,7 +580,7 @@ fn add_deny(primary: &Node, domain: &str, request_id: &str) {
     );
     assert_eq!(
         mutation.status.code(),
-        Some(5),
+        Some(0),
         "primary mutation failed: {}",
         String::from_utf8_lossy(&mutation.stderr)
     );

@@ -164,11 +164,76 @@ pub struct CollisionResolutionV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "FindingDecisionWire")]
 pub struct FindingDecisionV1 {
     pub finding_id: String,
     #[serde(flatten)]
     pub decision: MigrationDecisionV1,
+}
+
+/// Read side of [`FindingDecisionV1`]. serde refuses every flattened key of
+/// an internally tagged enum under `deny_unknown_fields`, so the flat wire
+/// form is read here and each decision takes only its own fields. Serialize
+/// stays on the derive: the choices digest and the plan hash depend on it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingDecisionWire {
+    finding_id: String,
+    decision: WireDecision,
+    kind: Option<MigrationMappingKindV1>,
+    source_id: Option<String>,
+    target_id: Option<String>,
+    repairs: Option<Vec<InactiveRowRepairV1>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireDecision {
+    AcceptV5Semantics,
+    ReplaceMapping,
+    RepairInactiveRows,
+    Defer,
+}
+
+impl TryFrom<FindingDecisionWire> for FindingDecisionV1 {
+    type Error = String;
+
+    fn try_from(wire: FindingDecisionWire) -> Result<Self, Self::Error> {
+        use WireDecision as W;
+        let FindingDecisionWire {
+            finding_id,
+            decision,
+            kind,
+            source_id,
+            target_id,
+            repairs,
+        } = wire;
+        let decision = match (decision, kind, source_id, target_id, repairs) {
+            (W::AcceptV5Semantics, None, None, None, None) => {
+                MigrationDecisionV1::AcceptV5Semantics
+            }
+            (W::ReplaceMapping, Some(kind), Some(source_id), Some(target_id), None) => {
+                MigrationDecisionV1::ReplaceMapping {
+                    kind,
+                    source_id,
+                    target_id,
+                }
+            }
+            (W::RepairInactiveRows, None, None, None, Some(repairs)) => {
+                MigrationDecisionV1::RepairInactiveRows { repairs }
+            }
+            (W::Defer, None, None, None, None) => MigrationDecisionV1::Defer,
+            _ => {
+                return Err(format!(
+                    "finding decision for {finding_id} lacks a field its decision needs or has a field of another decision"
+                ))
+            }
+        };
+        Ok(Self {
+            finding_id,
+            decision,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,5 +304,87 @@ mod tests {
         assert_eq!(first.digest().unwrap(), reordered.digest().unwrap());
         reordered.list_mappings[0].target_id = "three".into();
         assert_ne!(first.digest().unwrap(), reordered.digest().unwrap());
+    }
+
+    #[test]
+    fn finding_decision_round_trips_every_variant() {
+        // Golden values from the derive before the read side changed: the
+        // choices digest and the plan hash serialize these types.
+        let cases = [
+            (
+                FindingDecisionV1 {
+                    finding_id: "f-accept".into(),
+                    decision: MigrationDecisionV1::AcceptV5Semantics,
+                },
+                r#"{"finding_id":"f-accept","decision":"accept_v5_semantics"}"#.to_string(),
+            ),
+            (
+                FindingDecisionV1 {
+                    finding_id: "f-replace".into(),
+                    decision: MigrationDecisionV1::ReplaceMapping {
+                        kind: MigrationMappingKindV1::ProfileList,
+                        source_id: "src".into(),
+                        target_id: "dst".into(),
+                    },
+                },
+                r#"{"finding_id":"f-replace","decision":"replace_mapping","kind":"profile_list","source_id":"src","target_id":"dst"}"#.to_string(),
+            ),
+            (
+                FindingDecisionV1 {
+                    finding_id: "f-repair".into(),
+                    decision: MigrationDecisionV1::RepairInactiveRows {
+                        repairs: vec![InactiveRowRepairV1 {
+                            list_id: "list".into(),
+                            line: 3,
+                            row_digest: "a".repeat(64),
+                            replacement: Some("example.com".into()),
+                        }],
+                    },
+                },
+                format!(
+                    r#"{{"finding_id":"f-repair","decision":"repair_inactive_rows","repairs":[{{"list_id":"list","line":3,"row_digest":"{}","replacement":"example.com"}}]}}"#,
+                    "a".repeat(64)
+                ),
+            ),
+            (
+                FindingDecisionV1 {
+                    finding_id: "f-defer".into(),
+                    decision: MigrationDecisionV1::Defer,
+                },
+                r#"{"finding_id":"f-defer","decision":"defer"}"#.to_string(),
+            ),
+        ];
+        for (decision, golden) in &cases {
+            assert_eq!(&serde_json::to_string(decision).unwrap(), golden);
+            let parsed: FindingDecisionV1 = serde_json::from_str(golden).unwrap();
+            assert_eq!(&parsed, decision);
+        }
+        let mut choices = MigrationChoicesV1::empty("b".repeat(64));
+        choices.finding_decisions = cases.into_iter().map(|(decision, _)| decision).collect();
+        assert_eq!(
+            choices.digest().unwrap(),
+            "4b3d3aaef7946e7b5c8015791690ec2e20d11127ec427e2deedaab546874c042"
+        );
+        let json = serde_json::to_string(&choices).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MigrationChoicesV1>(&json).unwrap(),
+            choices
+        );
+    }
+
+    #[test]
+    fn finding_decision_refuses_unknown_and_foreign_keys() {
+        for json in [
+            r#"{"finding_id":"f","decision":"defer","extra":1}"#,
+            r#"{"finding_id":"f","decision":"accept_v5_semantics","kind":"profile_list"}"#,
+            r#"{"finding_id":"f","decision":"defer","repairs":[]}"#,
+            r#"{"finding_id":"f","decision":"replace_mapping","kind":"profile_list","target_id":"dst"}"#,
+            r#"{"finding_id":"f","decision":"unknown"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<FindingDecisionV1>(json).is_err(),
+                "accepted {json}"
+            );
+        }
     }
 }

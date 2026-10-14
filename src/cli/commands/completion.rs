@@ -49,14 +49,15 @@ impl From<CompletionShell> for Shell {
 }
 
 /// Render the completion script for `shell` to stdout.
+///
+/// The script is built in memory first: `generate` panics with its own text
+/// on a write error, while `print!` lets `warden completion … | head` exit
+/// 141 through the closed-stdout hook in `main`.
 pub fn run(shell: CompletionShell) -> anyhow::Result<()> {
     let mut cmd = Cli::command();
-    generate(
-        Shell::from(shell),
-        &mut cmd,
-        "warden",
-        &mut std::io::stdout(),
-    );
+    let mut script = Vec::new();
+    generate(Shell::from(shell), &mut cmd, "warden", &mut script);
+    print!("{}", String::from_utf8_lossy(&script));
     Ok(())
 }
 

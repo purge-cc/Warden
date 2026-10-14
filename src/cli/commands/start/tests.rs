@@ -133,6 +133,7 @@ async fn failed_dns_bind_does_not_attest_the_runtime_capability() {
         None,
         lease,
         RuntimeCapabilityAttestation::AuthoritativeSchema5Tree,
+        signal(SignalKind::hangup()).unwrap(),
     )
     .await
     .unwrap_err();
@@ -212,6 +213,66 @@ fn unresolved_legacy_recovery_refuses_startup_without_loading_config() {
     assert!(error.contains("v3-to-v4 migration"), "{error}");
     assert!(fence.exists());
     assert_eq!(std::fs::read(&master).unwrap(), original);
+}
+
+#[test]
+fn boot_recovery_error_names_kept_fence_and_next_step() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    std::fs::write(&master, b"[broken").unwrap();
+    let fence = root
+        .path()
+        .join(crate::config::migration_journal::TXN_DIR_NAME);
+    std::fs::create_dir(&fence).unwrap();
+    std::fs::set_permissions(&fence, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = fence.join("format2.setup");
+    std::fs::write(&marker, b"x\n").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = format!(
+        "{:#}",
+        recover_policy_transaction_before_load(&master).unwrap_err()
+    );
+
+    assert!(
+        error.contains("policy-transaction recovery failed before start"),
+        "{error}"
+    );
+    assert!(error.contains("invalid format2 setup marker"), "{error}");
+    assert!(error.contains(&fence.display().to_string()), "{error}");
+    assert!(error.contains("Do not delete it"), "{error}");
+    assert!(error.contains("reset-failed"), "{error}");
+    assert!(fence.exists());
+}
+
+#[test]
+fn boot_recovery_error_without_fence_does_not_name_it() {
+    let root = tempfile::tempdir().unwrap();
+    let master = root.path().join("config.toml");
+    std::fs::write(&master, b"[broken").unwrap();
+    // A temp root is its own state directory; a file blocks the receipt store.
+    std::fs::write(
+        root.path()
+            .join(crate::config::policy_transaction::RECEIPT_DIR),
+        b"",
+    )
+    .unwrap();
+
+    let error = format!(
+        "{:#}",
+        recover_policy_transaction_before_load(&master).unwrap_err()
+    );
+
+    assert!(
+        error.contains("policy-transaction recovery failed before start"),
+        "{error}"
+    );
+    assert!(
+        !error.contains(crate::config::migration_journal::TXN_DIR_NAME),
+        "{error}"
+    );
 }
 
 // ── shared list-manager wiring ───────────────────────────────────
@@ -586,19 +647,23 @@ fn cfg_with_anti_bypass(enabled: bool, domains: &[&str]) -> ConfigV1 {
     c
 }
 
-/// Safe mode inherits `AntiBypassConfig::default()` — on, empty — so
-/// it trips the same predicate as any other install. Honest rather
-/// than noisy: safe mode REFUSEs every query, so nothing bypasses
-/// anything, but the config it reports still says `enabled = true`.
-/// Pinned so the next person to touch safe mode sees the coupling.
+/// Safe mode inherits `AntiBypassConfig::default()` — off, empty — so
+/// it does not trip the toothless-anti-bypass predicate. Safe mode
+/// REFUSEs every query, so nothing bypasses anything, and the config it
+/// reports says so. Pinned so the next person to touch safe mode sees
+/// the coupling.
 #[test]
-fn n1_safe_mode_inherits_the_toothless_shape() {
+fn safe_mode_carries_no_toothless_anti_bypass() {
     use crate::config::schema::validator::anti_bypass_has_no_domain_source;
     assert!(
-        anti_bypass_has_no_domain_source(&safe_mode_config()),
-        "safe mode carries AntiBypassConfig::default() — enabled, empty"
+        !anti_bypass_has_no_domain_source(&safe_mode_config()),
+        "safe mode carries AntiBypassConfig::default() — off, empty"
     );
-    // Control: the predicate is not vacuously true.
+    // Control: the predicate is not vacuously false.
+    assert!(anti_bypass_has_no_domain_source(&cfg_with_anti_bypass(
+        true,
+        &[]
+    )));
     assert!(!anti_bypass_has_no_domain_source(&cfg_with_anti_bypass(
         true,
         &["doh.example.net"]
@@ -1087,6 +1152,9 @@ async fn reload_replacement_worker_panic_is_fatal_to_signal_loop_and_audited() {
                 &mut None,
                 &mut None,
                 &mut std::marker::PhantomData,
+                &mut signal(SignalKind::terminate()).unwrap(),
+                &mut signal(SignalKind::hangup()).unwrap(),
+                false,
             ),
         ),
     )
@@ -2730,11 +2798,9 @@ fn shutdown_unpublishes_list_manager_immediately_after_signal_loop() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn node_rebind_gate_requires_primary_disabled_ip_and_unchanged_live_sources() {
+fn node_rebind_gate_requires_disabled_ip_and_unchanged_live_sources() {
+    // Standalone first: no cluster section at all.
     let mut config = ConfigV1::test_scaffold();
-    config.cluster.enabled = true;
-    config.cluster.membership_version = Some(1);
-    config.cluster.role = crate::config::schema::ClusterRole::Primary;
     config.ip_blocklists.enabled = false;
     let secrets = crate::config::secrets::Secrets::default();
     let live = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
@@ -2759,6 +2825,16 @@ fn node_rebind_gate_requires_primary_disabled_ip_and_unchanged_live_sources() {
         Some(&live),
         &live
     ));
+    // A legacy cluster config without membership rebinds too.
+    config.cluster.enabled = true;
+    config.cluster.membership_version = None;
+    assert!(should_rebind_node_policy(
+        &config,
+        true,
+        true,
+        Some(&live),
+        &live
+    ));
     config.ip_blocklists.enabled = true;
     assert!(!should_rebind_node_policy(
         &config,
@@ -2768,15 +2844,6 @@ fn node_rebind_gate_requires_primary_disabled_ip_and_unchanged_live_sources() {
         &live
     ));
     config.ip_blocklists.enabled = false;
-    config.cluster.role = crate::config::schema::ClusterRole::Secondary;
-    assert!(!should_rebind_node_policy(
-        &config,
-        true,
-        true,
-        Some(&live),
-        &live
-    ));
-    config.cluster.role = crate::config::schema::ClusterRole::Primary;
     config.lists.max_entries += 1;
     let changed = ListsFingerprint::from_config(&config, &secrets, Path::new("."));
     assert!(!should_rebind_node_policy(
@@ -2857,4 +2924,130 @@ async fn schema4_node_bootstrap_refusal_reads_as_plain_text() {
     assert!(message.contains("this candidate requires 5"), "{message}");
     assert!(message.contains("suggestion: "), "{message}");
     assert!(!message.contains("VersionMismatch"), "{message}");
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn failed_rebind_commit_shows_proof_only_for_unchanged_pair() {
+    assert!(rebind_left_pair_unchanged(
+        Some("old"),
+        Ok(Some("old".into()))
+    ));
+    assert!(!rebind_left_pair_unchanged(
+        Some("old"),
+        Ok(Some("new".into()))
+    ));
+    assert!(!rebind_left_pair_unchanged(Some("old"), Ok(None)));
+    assert!(!rebind_left_pair_unchanged(
+        Some("old"),
+        Err(anyhow::anyhow!("pair unreadable"))
+    ));
+}
+
+/// A Partial boot or reload hides the pair proof and leaves the pair
+/// unclaimed; the next complete publication must show and claim it.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn complete_publication_restores_a_hidden_pair_proof() {
+    use crate::cluster::node_control::ActivePairProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::create_dir(dir.path().join("lists")).unwrap();
+    std::fs::write(
+        dir.path().join("lists/fixture.txt"),
+        "blocked.example.com\n",
+    )
+    .unwrap();
+    let mut config = ConfigV1::test_scaffold();
+    config.schema_version = 4;
+    let mut row = wiring_blocklist("fixture", "https://imported.local/fixture.txt", true);
+    row.trust = crate::config::schema::BlocklistTrust::Local;
+    config.blocklists = vec![row];
+    let plan = crate::lists::source_key::ResolvedSourcePlan::build_for_schema(
+        &crate::lists::catalog::Catalog::fallback(),
+        &config.lists.sources,
+        &config.blocklists,
+        &config.profiles,
+        crate::lists::source_key::RowControlDefaults {
+            max_entries: config.lists.max_entries,
+            update_interval_secs: config.lists.update_interval_secs,
+        },
+        config.schema_version,
+    )
+    .unwrap();
+    let bits = crate::lists::source_key::SourceBitMap::from_plan(&plan).unwrap();
+    let masks = bits.project_policy(&config.blocklists, &config.profiles);
+    let mut mgr = ListManager::with_plan_and_tokens(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        plan.clone(),
+        Duration::from_secs(3600),
+        bits,
+        crate::lists::source_key::SourceTokenMap::default(),
+        config.lists.max_body_bytes,
+        config.lists.max_entries,
+        Some(dir.path().join("cache")),
+    );
+    ManagerWiring::from_config(
+        &config,
+        &config_path,
+        &plan,
+        dir.path().to_path_buf(),
+        masks,
+        ListStateWriteback::ReadOnly,
+    )
+    .apply(&mut mgr);
+    let context = nodes_runtime::NodeCorpusRuntime::load(&config_path, &config, true)
+        .unwrap()
+        .unwrap();
+    let provider = context.active_pair_provider(true);
+    provider.set_proof_available(false);
+    let observe = Arc::new(crate::cluster::ClusterObserve::new_secondary(
+        None,
+        "https://192.0.2.10:8053".into(),
+        45,
+    ));
+    let active_policy = || {
+        let mut status = crate::cluster::lifecycle::LifecycleStatus::default();
+        observe.enrich_nodes_status(&mut status);
+        status.active_policy
+    };
+    nodes_runtime::wire_live_manager(
+        &mut mgr,
+        &config,
+        None,
+        Some(&observe),
+        None,
+        Some(&provider),
+    );
+    let artifact = crate::cluster::dto::ArtifactIdentity {
+        primary_lineage: "a".repeat(64),
+        policy_epoch: 1,
+        artifact_hash: "b".repeat(64),
+        config_revision: "c".repeat(64),
+        operator_policy_hash: "d".repeat(64),
+    };
+    // The previous policy's pair is still active in the store.
+    let previous = crate::cluster::dto::ArtifactIdentity {
+        artifact_hash: "e".repeat(64),
+        ..artifact.clone()
+    };
+    context
+        .publish_primary(None, &previous, Vec::new())
+        .unwrap();
+    context
+        .finish_activation(
+            Some(&mut mgr),
+            Some(&observe),
+            None,
+            Some(&artifact),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(provider.enrollment_pair().await.is_err());
+    assert_eq!(active_policy(), None, "the previous pair was claimed");
+    mgr.refresh_with_mode(crate::lists::manager::RefreshMode::Force)
+        .await;
+    assert_eq!(provider.enrollment_pair().await.unwrap().policy, artifact);
+    assert_eq!(active_policy(), Some(artifact));
 }

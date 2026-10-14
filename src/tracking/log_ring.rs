@@ -379,6 +379,107 @@ where
     subscriber(filter, ansi, writer, std::sync::Arc::clone(global())).init();
 }
 
+/// A `MakeWriter` that starts each `fmt` event with its syslog priority:
+/// `<3>` error, `<4>` warn, `<6>` info, `<7>` debug and trace. journald
+/// reads that prefix under its default `SyslogLevelPrefix=yes`, so
+/// `journalctl -p err` finds Warden's errors. Disabled, it passes bytes
+/// through unchanged. The ring never sees the prefix: it records events
+/// through its own visitor, not through this writer.
+///
+/// Only the first line of an event is prefixed, so the hot path never
+/// scans the formatted bytes for newlines; journald stores the
+/// continuation lines of a multi-line message at info.
+pub struct SyslogPrefixed<M> {
+    inner: M,
+    enabled: bool,
+}
+
+impl<M> SyslogPrefixed<M> {
+    pub fn new(inner: M, enabled: bool) -> Self {
+        Self { inner, enabled }
+    }
+
+    fn wrap<W>(&self, inner: W, level: Level) -> PrefixedWriter<W> {
+        let prefix: &'static [u8] = match level {
+            Level::ERROR => b"<3>",
+            Level::WARN => b"<4>",
+            Level::INFO => b"<6>",
+            _ => b"<7>",
+        };
+        PrefixedWriter {
+            inner,
+            prefix: self.enabled.then_some(prefix),
+        }
+    }
+}
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for SyslogPrefixed<M> {
+    type Writer = PrefixedWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.wrap(self.inner.make_writer(), Level::INFO)
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        self.wrap(self.inner.make_writer_for(meta), *meta.level())
+    }
+}
+
+/// The writer [`SyslogPrefixed`] hands the `fmt` layer for one event.
+pub struct PrefixedWriter<W> {
+    inner: W,
+    prefix: Option<&'static [u8]>,
+}
+
+impl<W: std::io::Write> std::io::Write for PrefixedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.prefix.take() {
+            // Prefix and line go out as one inner write, so a locked stdout
+            // cannot put another thread's line between them.
+            Some(prefix) => {
+                self.inner.write_all(&[prefix, buf].concat())?;
+                Ok(buf.len())
+            }
+            None => self.inner.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Whether stdout is the stream systemd connected to the journal.
+/// systemd.exec(5) sets `JOURNAL_STREAM` to that stream's `dev:ino`. The
+/// variable alone is not enough: children inherit it (a shell in a tmux
+/// server started by a user unit) while their stdout is a terminal.
+pub fn stdout_is_journal() -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(fd) = std::io::stdout().as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    let Ok(meta) = std::fs::File::from(fd).metadata() else {
+        return false;
+    };
+    journal_stream_matches(
+        std::env::var_os("JOURNAL_STREAM").as_deref(),
+        meta.dev(),
+        meta.ino(),
+    )
+}
+
+fn journal_stream_matches(value: Option<&std::ffi::OsStr>, dev: u64, ino: u64) -> bool {
+    let Some((d, i)) = value
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|v| v.split_once(':'))
+    else {
+        return false;
+    };
+    d.parse() == Ok(dev) && i.parse() == Ok(ino)
+}
+
 /// Flattens an event's fields into one line: the `message` field first,
 /// then ` key=value` for every other field.
 ///
@@ -651,7 +752,7 @@ mod tests {
     //
     // `set_default` (thread-local), never `set_global_default`: the lib
     // test binary's global slot is already claimed by
-    // `dns::handler::GateRefusalCapture`.
+    // `common::log_capture`.
 
     /// A `MakeWriter` that keeps what the `fmt` layer wrote, so a test can
     /// assert on the LOG FILE side of the composition and not only on the
@@ -818,5 +919,50 @@ mod tests {
         }
         let seen = ring.snapshot(10, None, None);
         assert_eq!(seen[0].target, "purge_warden::tracking::log_ring::tests");
+    }
+
+    #[test]
+    fn syslog_prefix_marks_each_level_and_keeps_the_ring_clean() {
+        for enabled in [true, false] {
+            let ring = Arc::new(LogRing::new(10));
+            let sink = SharedBuf::default();
+            tracing::subscriber::with_default(
+                subscriber(
+                    EnvFilter::new("trace"),
+                    false,
+                    SyslogPrefixed::new(sink.clone(), enabled),
+                    Arc::clone(&ring),
+                ),
+                || {
+                    tracing::error!("syslog prefix probe error");
+                    tracing::warn!("syslog prefix probe warn");
+                    tracing::info!("syslog prefix probe info");
+                    tracing::debug!("syslog prefix probe debug");
+                },
+            );
+            let written = String::from_utf8(sink.0.lock().expect("test writer").clone())
+                .expect("fmt output is utf8");
+            let prefixes: Vec<&str> = written.lines().map(|line| &line[..3]).collect();
+            if enabled {
+                assert_eq!(prefixes, ["<3>", "<4>", "<6>", "<7>"], "{written:?}");
+            } else {
+                assert_eq!(prefixes.len(), 4, "{written:?}");
+                assert!(!written.lines().any(|l| l.starts_with('<')), "{written:?}");
+            }
+            let seen = ring.snapshot(10, None, None);
+            assert_eq!(seen.len(), 3);
+            assert!(seen.iter().all(|e| !e.message.contains('<')), "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn journal_stream_matches_only_its_own_stdout() {
+        let value = |s: &'static str| Some(std::ffi::OsStr::new(s));
+        assert!(journal_stream_matches(value("12:34"), 12, 34));
+        assert!(!journal_stream_matches(value("12:35"), 12, 34));
+        assert!(!journal_stream_matches(None, 12, 34));
+        assert!(!journal_stream_matches(value(""), 12, 34));
+        assert!(!journal_stream_matches(value("garbage"), 12, 34));
+        assert!(!journal_stream_matches(value("12"), 12, 34));
     }
 }

@@ -164,7 +164,11 @@ impl ClusterState {
             .as_secs())?;
         let current = store.current()?;
         let published = match current {
-            Some(current) if current.reservation.config_revision == snapshot.config_revision() => {
+            Some(current)
+                if current.reservation.config_revision == snapshot.config_revision()
+                    && current
+                        .rebuilt_by(|lineage, epoch| snapshot.publication(lineage, epoch))? =>
+            {
                 current
             }
             _ => {
@@ -536,6 +540,51 @@ mod tests {
         assert!(
             !state.converged_for(&desired, now, std::time::Duration::from_secs(45)),
             "fresh acknowledgements for the advertised artifact cannot converge after the primary swapped a different policy"
+        );
+    }
+
+    #[test]
+    fn restart_republishes_a_current_revision_an_older_version_serialized_differently() {
+        let same_revision = |extra: &str| {
+            let config: crate::config::schema::ConfigV5 = toml::from_str(&format!(
+                "schema_version = 5\n[server]\ndefault_profile = \"default\"\n[profiles.default]\ndisplay_name = \"Default\"\n[upstream]\nservers = [\"192.0.2.1:53\"]\n{extra}"
+            ))
+            .unwrap();
+            Arc::new(
+                PolicySnapshot::from_target_v5(
+                    &config,
+                    &crate::config::target_v5::PackBodiesV5::new(Default::default()),
+                    "b".repeat(64),
+                )
+                .unwrap(),
+            )
+        };
+        let root = tempfile::tempdir().unwrap();
+        let master = root.path().join("config.toml");
+        // An older version published these config bytes with another default.
+        let older = ClusterState::new(ClusterRole::Primary, 1, "a".repeat(64), Vec::new());
+        older
+            .update_policy(
+                &acquire_for_migration(&master).unwrap(),
+                same_revision("[anti_bypass]\nenabled = true\n"),
+            )
+            .unwrap();
+        let published = older.policy();
+
+        let current = same_revision("");
+        let restarted = ClusterState::new(ClusterRole::Primary, 1, "a".repeat(64), Vec::new());
+        restarted
+            .update_policy(
+                &acquire_for_migration(&master).unwrap(),
+                Arc::clone(&current),
+            )
+            .unwrap();
+        let manifest = restarted.policy().manifest.clone().unwrap();
+        assert_eq!(manifest.config_revision, current.config_revision());
+        assert!(manifest.policy_epoch > published.epoch);
+        assert_eq!(
+            manifest.policy_toml,
+            super::super::manifest::ObjectRef::of(current.toml())
         );
     }
 }

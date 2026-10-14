@@ -61,7 +61,12 @@ struct SystemdProbe;
 
 impl SupervisorProbe for SystemdProbe {
     fn inspect(&self) -> Result<SupervisorSupport, ManagedRestartError> {
-        inspect_systemd(std::process::id(), &systemctl_path())
+        let pid = std::process::id();
+        inspect_systemd(
+            pid,
+            &systemctl_path(),
+            Path::new(&format!("/proc/{pid}/cgroup")),
+        )
     }
 }
 
@@ -93,6 +98,47 @@ pub fn channel(capacity: usize) -> (ManagedRestartHandle, ManagedRestartReceiver
         ManagedRestartHandle {
             tx,
             probe: Arc::new(SystemdProbe),
+        },
+        ManagedRestartReceiver { rx },
+    )
+}
+
+/// A restart channel whose preflight always finds a supporting unit.
+#[cfg(test)]
+pub(crate) fn supervised_channel() -> (ManagedRestartHandle, ManagedRestartReceiver) {
+    struct Supported;
+    impl SupervisorProbe for Supported {
+        fn inspect(&self) -> Result<SupervisorSupport, ManagedRestartError> {
+            Ok(SupervisorSupport {
+                unit: "purge-warden.service".to_string(),
+                restart_policy: "on-failure".to_string(),
+            })
+        }
+    }
+    let (tx, rx) = mpsc::channel(1);
+    (
+        ManagedRestartHandle {
+            tx,
+            probe: Arc::new(Supported),
+        },
+        ManagedRestartReceiver { rx },
+    )
+}
+
+/// A restart channel whose preflight never finds a supporting unit.
+#[cfg(test)]
+pub(crate) fn unsupervised_channel() -> (ManagedRestartHandle, ManagedRestartReceiver) {
+    struct Unsupervised;
+    impl SupervisorProbe for Unsupervised {
+        fn inspect(&self) -> Result<SupervisorSupport, ManagedRestartError> {
+            Err(ManagedRestartError::NotSupervised)
+        }
+    }
+    let (tx, rx) = mpsc::channel(1);
+    (
+        ManagedRestartHandle {
+            tx,
+            probe: Arc::new(Unsupervised),
         },
         ManagedRestartReceiver { rx },
     )
@@ -144,20 +190,22 @@ fn systemctl_path() -> std::path::PathBuf {
     std::path::PathBuf::from("systemctl")
 }
 
-fn inspect_systemd(pid: u32, systemctl: &Path) -> Result<SupervisorSupport, ManagedRestartError> {
-    let mut unit_command = Command::new(systemctl);
-    unit_command.args([
-        "--system",
-        "--no-pager",
-        "--no-ask-password",
-        "whoami",
-        &pid.to_string(),
-    ]);
-    let unit_output = bounded_output(unit_command, SYSTEMCTL_TIMEOUT)?;
-    if !unit_output.status.success() {
-        return Err(ManagedRestartError::NotSupervised);
-    }
-    let unit = parse_service_unit(&unit_output.stdout)?;
+/// Name the unit from the process cgroup, as `systemctl whoami` does
+/// (systemd 254 and later only), then check its effective properties.
+fn inspect_systemd(
+    pid: u32,
+    systemctl: &Path,
+    cgroup: &Path,
+) -> Result<SupervisorSupport, ManagedRestartError> {
+    let mut listing = String::new();
+    std::fs::File::open(cgroup)
+        .and_then(|file| {
+            file.take(SYSTEMCTL_OUTPUT_LIMIT as u64)
+                .read_to_string(&mut listing)
+        })
+        .map_err(|_| ManagedRestartError::NotSupervised)?;
+    let unit = service_unit_from_cgroup(&listing).ok_or(ManagedRestartError::NotSupervised)?;
+    let unit = parse_service_unit(unit.as_bytes())?;
 
     let mut property_command = Command::new(systemctl);
     property_command.args([
@@ -178,6 +226,18 @@ fn inspect_systemd(pid: u32, systemctl: &Path) -> Result<SupervisorSupport, Mana
         return Err(ManagedRestartError::Inspection(command_stderr(&properties)));
     }
     validate_properties(pid, unit, &properties.stdout)
+}
+
+/// The service in a `/proc/<pid>/cgroup` listing: the `name=systemd` line
+/// of a hybrid hierarchy, else the unified `0::` line. A process in a
+/// nested cgroup keeps the last `.service` component of its path.
+fn service_unit_from_cgroup(listing: &str) -> Option<&str> {
+    let path = listing
+        .lines()
+        .find_map(|line| line.split_once(":name=systemd:").map(|(_, path)| path))
+        .or_else(|| listing.lines().find_map(|line| line.strip_prefix("0::")))?;
+    path.rsplit('/')
+        .find(|component| component.ends_with(".service"))
 }
 
 fn bounded_output(
@@ -466,5 +526,56 @@ mod tests {
         handle.request(permit, request.clone()).await.unwrap();
         assert_eq!(rx.recv().await, Some(request));
         assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn service_unit_comes_from_the_systemd_cgroup_line() {
+        assert_eq!(
+            service_unit_from_cgroup("0::/system.slice/purge-warden.service\n"),
+            Some("purge-warden.service")
+        );
+        assert_eq!(
+            service_unit_from_cgroup(
+                "12:cpu,cpuacct:/system.slice/other.service\n1:name=systemd:/system.slice/purge-warden.service\n0::/system.slice/purge-warden.service\n"
+            ),
+            Some("purge-warden.service")
+        );
+        assert_eq!(
+            service_unit_from_cgroup("0::/system.slice/purge-warden.service/payload\n"),
+            Some("purge-warden.service")
+        );
+        for refused in [
+            "0::/user.slice/user-1000.slice/session-4.scope\n",
+            "",
+            "0::/\n",
+        ] {
+            assert_eq!(service_unit_from_cgroup(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn supervisor_is_found_without_systemctl_whoami() {
+        let directory = tempfile::tempdir().unwrap();
+        // Like systemd 252: no `whoami` verb, `show` answers for the unit.
+        let systemctl = directory.path().join("systemctl");
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\n[ \"$4\" = show ] && [ \"$5\" = purge-warden.service ] || exit 1\nprintf 'MainPID=4242\\nType=simple\\nRestart=on-failure\\nSuccessExitStatus=75\\nRestartForceExitStatus=75\\nRestartPreventExitStatus=\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &systemctl,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let cgroup = directory.path().join("cgroup");
+        std::fs::write(&cgroup, "0::/system.slice/purge-warden.service\n").unwrap();
+
+        let support = inspect_systemd(4242, &systemctl, &cgroup).unwrap();
+        assert_eq!(support.unit(), "purge-warden.service");
+        assert!(matches!(
+            inspect_systemd(4242, &systemctl, &directory.path().join("absent")),
+            Err(ManagedRestartError::NotSupervised)
+        ));
     }
 }

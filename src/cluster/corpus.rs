@@ -432,7 +432,9 @@ impl CorpusStore {
         let identity = (metadata.dev(), metadata.ino());
         if receipt.try_exists()? {
             let previous: (u64, u64) = read_json(&receipt)?;
-            ensure!(previous == identity, "CorpusCacheOwnershipChanged");
+            // st_dev is not stable across boots; the path and inode bind the cache.
+            // See policy_transaction::Inode for the accepted ceiling.
+            ensure!(previous.1 == identity.1, "CorpusCacheOwnershipChanged");
             return Ok(());
         }
         self.write_json(&receipt, &identity)
@@ -463,10 +465,7 @@ impl CorpusStore {
                 Err(error) => return Err(error),
             };
             let metadata = lease.metadata()?;
-            ensure!(
-                (metadata.dev(), metadata.ino()) == expected,
-                "CorpusCacheOwnershipChanged"
-            );
+            ensure!(metadata.ino() == expected.1, "CorpusCacheOwnershipChanged");
             verify_directory(&path)?;
             if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let error = std::io::Error::last_os_error();
@@ -1229,11 +1228,8 @@ pub(crate) async fn acquire_auxiliary(
         })
     })
     .await??;
-    let mut response = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(300))
-        .send()
-        .await?;
+    // No per-request timeout: it would replace the client's limits.
+    let mut response = client.get(url).send().await?;
     ensure!(
         response.status().is_success(),
         "CorpusAuxiliaryOriginFailed: HTTP {}",
@@ -1446,7 +1442,7 @@ fn open_regular(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
-fn is_not_found(error: &anyhow::Error) -> bool {
+pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)

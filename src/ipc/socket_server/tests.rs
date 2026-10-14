@@ -4162,6 +4162,41 @@ async fn status_carries_the_corpus_freeze_over_ipc() {
     }
 }
 
+/// A source serving its verified cache before its first fetch is counted as
+/// loaded but not as active; one with no usable cache is neither.
+#[tokio::test]
+async fn status_counts_cache_loaded_sources_apart_from_active_ones() {
+    use crate::lists::status::ListStatus;
+
+    // The fixture's two rows are both Ok; turn one into a cache load.
+    let state = Arc::new(test_state_with_list_statuses());
+    let reg = state.list_statuses.clone().expect("registry wired");
+    reg.update_for_url(
+        "privacy/ads",
+        ListStatus {
+            cache_loaded: true,
+            ..ListStatus::default()
+        },
+    );
+    reg.update_for_url("https://c.example/list", ListStatus::default());
+    reg.record_cycle_with_qualifiers(
+        crate::lists::status::CycleOutcome::Installed,
+        false,
+        false,
+        1,
+    );
+
+    match dispatch_command(IpcCommand::Status, None, &state).await {
+        IpcResponse::Status {
+            lists_active,
+            lists_loaded,
+            lists_total,
+            ..
+        } => assert_eq!((lists_active, lists_loaded, lists_total), (1, 2, 3)),
+        other => panic!("expected Status, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn status_uses_completed_registry_domain_count() {
     let state = Arc::new(test_state_with_list_statuses());
@@ -6684,4 +6719,56 @@ fn legacy_profile_mount_only_reports_committed_receipts_as_success() {
         assert!(message.contains(&format!("persistence={label}")));
         assert!(message.len() < 512);
     }
+}
+
+#[tokio::test]
+async fn forget_list_is_busy_when_waiters_are_full() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut state = test_state_with_token("token");
+    state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::Running {
+            sender: tx,
+            waiters: Arc::new(tokio::sync::Semaphore::new(0)),
+        },
+    ));
+    let forget = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        handle_forget_list("example".into(), Some(current_euid()), &state),
+    )
+    .await
+    .expect("a forget must not wait without a waiter permit");
+    assert_eq!(forget, ipc_error(IpcError::ListForgetBusy));
+}
+
+#[tokio::test]
+async fn forget_list_completion_times_out() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut state = test_state_with_token("token");
+    state.list_cmd_tx = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ListManagerEndpoint::running(tx),
+    ));
+    let worker = tokio::spawn(async move {
+        let Some(crate::lists::manager::ListManagerCommand::Forget {
+            accepted,
+            completion,
+            ..
+        }) = rx.recv().await
+        else {
+            panic!("test sender must enqueue a forget");
+        };
+        accepted
+            .send(crate::lists::manager::ListManagerCommandDisposition::Queued)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(completion);
+    });
+    let response = handle_forget_list_with_timeouts(
+        "example".into(),
+        Some(current_euid()),
+        &state,
+        force_refresh_timeouts_for_test(),
+    )
+    .await;
+    assert_eq!(response, ipc_error(IpcError::ListForgetCompletionTimeout));
+    worker.await.unwrap();
 }

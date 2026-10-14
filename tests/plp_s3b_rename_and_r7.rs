@@ -386,8 +386,8 @@ fn v1_to_v3_refuses_a_v2_config_instead_of_writing_ignore_everywhere() {
 
 // ── The migration must leave the household still filtering ────────────
 
-const ZIMA: &str = include_str!("fixtures/plp_v2_node_a.toml");
-const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
+const NODE_A: &str = include_str!("fixtures/plp_v2_node_a.toml");
+const NODE_B: &str = include_str!("fixtures/plp_v2_node_b.toml");
 
 /// **The check the rest of this workstream does not make.**
 ///
@@ -410,7 +410,7 @@ const PROXMOX: &str = include_str!("fixtures/plp_v2_node_b.toml");
 /// two real shapes, does every profile still enforce at least one list?
 #[test]
 fn the_live_shapes_still_filter_after_migrating() {
-    for (name, body) in [("zima", ZIMA), ("proxmox", PROXMOX)] {
+    for (name, body) in [("node_a", NODE_A), ("node_b", NODE_B)] {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("config.toml");
         fs::write(&cfg, body).unwrap();

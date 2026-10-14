@@ -226,9 +226,9 @@ impl DnssecValidator {
     fn log_verdict(&self, name: &Name, rtype: RecordType, verdict: ChainResult) {
         match log_level(verdict) {
             tracing::Level::WARN => tracing::warn!(
-                %name, ?rtype, ?verdict, mode = %self.cfg.mode, "DNSSEC validation alarm"
+                name = %name.to_ascii(), ?rtype, ?verdict, mode = %self.cfg.mode, "DNSSEC validation alarm"
             ),
-            _ => tracing::debug!(%name, ?rtype, ?verdict, "DNSSEC validation"),
+            _ => tracing::debug!(name = %name.to_ascii(), ?rtype, ?verdict, "DNSSEC validation"),
         }
     }
 }

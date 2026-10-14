@@ -118,8 +118,8 @@ fn default_tcp_timeout_secs() -> u64 {
 /// enforcement.
 ///
 /// **Named in a code span, deliberately not linked.** `src/cluster/` is behind
-/// `#[cfg(feature = "cluster")]` and that feature is OFF by default, so an
-/// intra-doc link here does not resolve in an ordinary `cargo doc` — and
+/// `#[cfg(feature = "cluster")]`, which a build can leave out, so an
+/// intra-doc link here does not resolve in `cargo doc --no-default-features` — and
 /// `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"` turns that into a build
 /// failure. Any doc reference from ungated code into a feature-gated module
 /// has to stay prose.
@@ -464,8 +464,8 @@ impl ConfigV1 {
 // `the_section_classification_consts_partition_every_config_key`, so a new
 // field must be added to exactly one of them or the suite goes red.
 //
-// Ungated on purpose: `src/cluster/` is behind `#[cfg(feature = "cluster")]`
-// and that feature is OFF by default, but `config::schema::validator` — the
+// Ungated on purpose: `src/cluster/` is behind `#[cfg(feature = "cluster")]`,
+// which a build can leave out, but `config::schema::validator` — the
 // consumer — is always compiled.
 
 /// Every top-level section the primary replicates to a secondary, mirroring
@@ -962,10 +962,10 @@ servers = ["192.0.2.1:53"]
     /// forced the omission to be noticed.
     ///
     /// **It lives here, away from the thing it protects, deliberately.**
-    /// `src/cluster/` is behind `#[cfg(feature = "cluster")]` and that feature is
-    /// OFF by default, so a copy of this test next to the bundle would never fire
-    /// for a contributor running a plain `cargo test` — precisely the
-    /// invisible-to-the-default-build hazard this test exists to catch. The
+    /// `src/cluster/` is behind `#[cfg(feature = "cluster")]`, which a build can
+    /// leave out, so a copy of this test next to the bundle would never fire in
+    /// `cargo test --no-default-features` — precisely the hazard this test
+    /// exists to catch. The
     /// half that needs the feature (the bundle round-trip) stays in
     /// `cluster::policy::tests::the_bundle_replicates_the_label_vocabulary`; this
     /// half names only `ConfigV1`, so it runs for everyone.

@@ -1880,7 +1880,7 @@ fn load_config_inner(
     }
 }
 
-fn project_loaded_v5(loaded: LoadedConfigV5) -> Result<LoadedConfig, Vec<ConfigError>> {
+pub(crate) fn project_loaded_v5(loaded: LoadedConfigV5) -> Result<LoadedConfig, Vec<ConfigError>> {
     let config = loaded.config.validation_projection().map_err(|error| {
         vec![ConfigError::ValidationFailed(
             ErrorContext::new(error.to_string())

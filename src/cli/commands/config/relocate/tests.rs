@@ -953,7 +953,8 @@ fn an_unsettled_tui_journal_refuses_until_it_is_empty() {
     );
     let outcome = assert_refused(&fixture, FORWARD, "recovery-required");
     assert!(
-        outcome.err[0].contains("journal is not empty") && outcome.err[0].contains("`warden tui`"),
+        outcome.err[0].contains("journal is not empty")
+            && outcome.err[0].contains("`warden dashboard`"),
         "{outcome:?}"
     );
     journal(r#"{"phase":"empty"}"#);
@@ -1119,6 +1120,100 @@ fn a_rollback_refuses_a_tree_that_does_not_match_the_receipt() {
         outcome.err[0].contains("already at its target"),
         "{outcome:?}"
     );
+}
+
+/// Forget the bytes of JSON records, which a device number change rewrites.
+fn without_records(mut tree: BTreeMap<PathBuf, Entry>) -> BTreeMap<PathBuf, Entry> {
+    for (path, entry) in &mut tree {
+        if path.extension() == Some(OsStr::new("json")) {
+            entry.digest = None;
+        }
+    }
+    tree
+}
+
+#[test]
+fn a_rollback_after_a_device_number_change_completes() {
+    let steps = Fixture::new().steps(FORWARD);
+    for (index, step) in steps.iter().enumerate() {
+        let fixture = Fixture::new();
+        let before = without_records(tree_without_capability(&fixture));
+        let stopped = with_stop(Stop::AfterReceipt(index), || fixture.run(FORWARD));
+        assert_eq!(stopped.code, exit_codes::FAILURE, "{step} {stopped:?}");
+        assert!(policy_transaction::shift_devices_for_test(&fixture.base) > 0);
+        let undo = fixture.run(REVERSE);
+        assert_eq!(undo.code, 0, "{step} {undo:?}");
+        assert_eq!(
+            without_records(tree_without_capability(&fixture)),
+            before,
+            "{step}"
+        );
+        assert!(committed(&fixture.legacy_master(), "request-1"), "{step}");
+    }
+
+    let packs = steps
+        .iter()
+        .position(|line| line.starts_with("step 6: rename") && line.ends_with("/packs"))
+        .unwrap();
+    let fixture = Fixture::new();
+    let stopped = with_stop(Stop::AfterReceipt(packs), || fixture.run(FORWARD));
+    assert_eq!(stopped.code, exit_codes::FAILURE);
+    policy_transaction::shift_devices_for_test(&fixture.base);
+    let active = fixture.layout.legacy.join(ACTIVE);
+    let original = fs::read(&active).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let moved = json["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .rev()
+        .find(|step| step["action"]["kind"] == "rename" && step["done"] == true)
+        .unwrap();
+    let inode = &mut moved["action"]["object"]["inode"];
+    *inode = inode.as_u64().unwrap().wrapping_add(1).into();
+    fs::write(&active, serde_json::to_vec(&json).unwrap()).unwrap();
+    let outcome = assert_refused_fenced(&fixture, REVERSE);
+    assert!(
+        outcome.err[0].contains("neither at its source nor at its target"),
+        "{outcome:?}"
+    );
+    fs::write(&active, original).unwrap();
+    assert_eq!(fixture.run(REVERSE).code, 0);
+}
+
+#[test]
+fn a_forward_rollback_of_a_reverse_run_after_a_device_number_change_completes() {
+    let probe = Fixture::new();
+    assert_eq!(probe.run(FORWARD).code, 0);
+    for (index, step) in probe.steps(REVERSE).iter().enumerate() {
+        let fixture = Fixture::new();
+        assert_eq!(fixture.run(FORWARD).code, 0);
+        let before = without_records(without_rebound(fixture.tree()));
+        let stopped = with_stop(Stop::AfterReceipt(index), || fixture.run(REVERSE));
+        assert_eq!(stopped.code, exit_codes::FAILURE, "{step} {stopped:?}");
+        assert!(policy_transaction::shift_devices_for_test(&fixture.base) > 0);
+        let undo = fixture.run(FORWARD);
+        assert_eq!(undo.code, 0, "{step} {undo:?}");
+        assert_eq!(
+            without_records(without_rebound(fixture.tree())),
+            before,
+            "{step}"
+        );
+        assert!(committed(&fixture.etc_master(), "request-1"), "{step}");
+    }
+}
+
+#[test]
+fn relocation_in_both_directions_after_device_number_changes_keeps_the_tree_usable() {
+    let fixture = Fixture::new();
+    assert!(policy_transaction::shift_devices_for_test(&fixture.base) > 0);
+    let forward = fixture.run(FORWARD);
+    assert_eq!(forward.code, 0, "{forward:?}");
+    assert_usable(&fixture.etc_master(), "request-2");
+    assert!(policy_transaction::shift_devices_for_test(&fixture.base) > 0);
+    let reverse = fixture.run(REVERSE);
+    assert_eq!(reverse.code, 0, "{reverse:?}");
+    assert_usable(&fixture.legacy_master(), "request-3");
 }
 
 /// A refused rollback keeps the fence and the tree.
@@ -1523,4 +1618,10 @@ fn a_drifted_done_record_does_not_fence_but_refuses_a_reverse_run() {
     assert!(refused(&outcome, "receipt"), "{outcome:?}");
     let reverse = fixture.run(REVERSE);
     assert_eq!(reverse.code, 0, "{reverse:?}");
+}
+
+#[test]
+fn relocate_remedies_never_name_warden_tui() {
+    // `warden tui` is not a command; the remedies name `warden dashboard`.
+    assert!(!include_str!("../relocate.rs").contains("warden tui"));
 }

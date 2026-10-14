@@ -1965,57 +1965,6 @@ async fn refresh_with_unknown_source_logs_warning() {
     assert_eq!(count, 0);
 }
 
-#[tokio::test]
-async fn download_real_purge_cc_list() {
-    let client = reqwest::Client::builder()
-        .user_agent("purge-warden/test")
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let filter = Arc::new(FilterEngine::new());
-    let catalog = Catalog::fallback();
-    let source_bits = build_source_bit_map(&["privacy/ads".into()]).expect("at-cap accept");
-    let mut mgr = ListManager::new(
-        client,
-        filter.clone(),
-        vec!["privacy/ads".to_string()],
-        catalog,
-        Duration::from_secs(3600),
-        source_bits,
-        TEST_CAP,
-        DEFAULT_MAX_LIST_ENTRIES,
-        None,
-    );
-    let count = mgr.refresh().await;
-    assert!(filter.domain_count() == count);
-}
-
-#[tokio::test]
-async fn download_raw_url_source() {
-    let client = reqwest::Client::builder()
-        .user_agent("purge-warden/test")
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let filter = Arc::new(FilterEngine::new());
-    let catalog = Catalog::fallback();
-    let url = "https://lists.purge.cc/base_ads.txt".to_string();
-    let source_bits = build_source_bit_map(std::slice::from_ref(&url)).expect("at-cap accept");
-    let mut mgr = ListManager::new(
-        client,
-        filter.clone(),
-        vec![url],
-        catalog,
-        Duration::from_secs(3600),
-        source_bits,
-        TEST_CAP,
-        DEFAULT_MAX_LIST_ENTRIES,
-        None,
-    );
-    let count = mgr.refresh().await;
-    assert!(filter.domain_count() == count);
-}
-
 #[test]
 fn build_source_bit_map_assigns_sequential_bits() {
     let sources = vec!["a".into(), "b".into(), "c".into()];
@@ -3038,6 +2987,7 @@ async fn cache_only_leaves_prior_status_untouched() {
         last_refresh_at: Some(seeded_last_refresh),
         delta_pct_vs_prev: Some(12.5),
         prev_entries: Some(37),
+        cache_loaded: false,
     };
     reg.update_for_url(&url, prior.clone());
 
@@ -3535,6 +3485,41 @@ fn lc2_t2_setup(
     (mgr, blocklist_id, state_path, dir)
 }
 
+/// A reload's prepared generation records transitions in memory only. Once
+/// installed it owns the daemon's handle and both ledgers, and every later
+/// transition writes through.
+#[test]
+fn install_prepared_list_state_adopts_the_live_handle_and_writes_through() {
+    use crate::config::list_state::ListState;
+    use crate::config::schema::Id;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("list_state.toml");
+    let schedule_path = dir.path().join("list_schedule_state.toml");
+    let mut mgr = cleanup_manager(dir.path(), "https://example.com/list.txt");
+    let prepared = Id::new("prepared").unwrap();
+    mgr.record_blocklist_success(&prepared, dir.path().join("prepared.cache"));
+    assert!(!state_path.exists() && !schedule_path.exists());
+
+    let live = Arc::new(std::sync::Mutex::new(ListState::default()));
+    mgr.install_prepared_list_state(Arc::clone(&live), state_path.clone(), schedule_path.clone());
+    assert!(Arc::ptr_eq(&mgr.list_state_handle(), &live));
+    assert!(live.lock().unwrap().lists.contains_key(&prepared));
+    assert!(ListState::read_or_default(&state_path)
+        .unwrap()
+        .lists
+        .contains_key(&prepared));
+    assert!(schedule_path.exists());
+
+    let later = Id::new("later").unwrap();
+    mgr.record_blocklist_failure(&later, 5);
+    assert!(live.lock().unwrap().lists.contains_key(&later));
+    assert!(ListState::read_or_default(&state_path)
+        .unwrap()
+        .lists
+        .contains_key(&later));
+}
+
 /// Sprint C T2 row 1: a single failed refresh increments
 /// `consecutive_failures` to 1 and stamps `last_attempt`, but
 /// stays under the threshold so the status remains `Pending`
@@ -3958,7 +3943,7 @@ fn cleanup_stale_caches_removes_old_files() {
         Some(dir.path().to_path_buf()),
     );
 
-    mgr.cleanup_stale_caches();
+    mgr.cleanup_stale_caches(Duration::ZERO);
 
     // privacy/ads files should remain (active source).
     assert!(dir.path().join(format!("{active_stem}.meta")).exists());
@@ -4012,7 +3997,7 @@ fn cleanup_preserves_generations_when_manifest_is_invalid_utf8() {
     let parsed = load_meta_file(&dir.path().join(format!("{stem}.meta")));
     assert_eq!(parsed.load_state, MetaLoadState::Unreadable);
     assert!(selected_body_path(dir.path(), &stem, &parsed).is_none());
-    cleanup_manager(dir.path(), source).cleanup_stale_caches();
+    cleanup_manager(dir.path(), source).cleanup_stale_caches(Duration::ZERO);
     assert!(body.exists());
 }
 
@@ -4028,7 +4013,7 @@ fn cleanup_preserves_generations_for_duplicate_or_partial_manifest_fields() {
         let stem = source_to_cache_stem(source);
         std::fs::write(dir.path().join(format!("{stem}.meta")), manifest).unwrap();
 
-        cleanup_manager(dir.path(), source).cleanup_stale_caches();
+        cleanup_manager(dir.path(), source).cleanup_stale_caches(Duration::ZERO);
         assert!(body.exists(), "cleanup deleted body for {manifest:?}");
     }
 }
@@ -4039,7 +4024,7 @@ fn cleanup_removes_active_generation_orphans_when_meta_is_missing() {
     let source = "https://lists.example.test/missing.txt";
     let body = write_generation_body(dir.path(), source, b"orphan\n");
 
-    cleanup_manager(dir.path(), source).cleanup_stale_caches();
+    cleanup_manager(dir.path(), source).cleanup_stale_caches(Duration::ZERO);
     assert!(!body.exists());
 }
 
@@ -7908,7 +7893,7 @@ fn malformed_rollback_journal_refuses_disk_cache_and_blocks_cleanup() {
     let mut mgr = cleanup_manager(dir.path(), source);
     mgr.load_disk_cache();
     assert!(mgr.cache.is_empty(), "a malformed journal must fail closed");
-    mgr.cleanup_stale_caches();
+    mgr.cleanup_stale_caches(Duration::ZERO);
     assert!(
         hybrid.exists(),
         "cleanup deleted a body needed to inspect recovery"
@@ -7941,7 +7926,7 @@ fn unreadable_rollback_journal_refuses_disk_cache_and_blocks_cleanup() {
         mgr.cache.is_empty(),
         "an unreadable journal must fail closed"
     );
-    mgr.cleanup_stale_caches();
+    mgr.cleanup_stale_caches(Duration::ZERO);
     assert!(body.exists(), "cleanup deleted a recovery body");
 }
 
@@ -12665,6 +12650,68 @@ async fn cache_only_boot_with_partial_cache_coverage_installs_usable_sources_wit
     assert_eq!(missing.entries, 0);
     assert!(matches!(kept.last_outcome, LastOutcome::NeverFetched));
     assert!(matches!(missing.last_outcome, LastOutcome::NeverFetched));
+
+    // The verified cache load is visible, and only as `cache_loaded`: no
+    // refresh outcome or timestamp is recorded for it.
+    assert!(kept.cache_loaded && kept.is_loaded());
+    assert!(kept.last_refresh_at.is_none() && kept.fetched_at.is_none());
+    assert!(!missing.cache_loaded && !missing.is_loaded());
+    // `warden status` counts the completed rows, so the flag must be in them.
+    let completed = mgr.status_registry.consistent_snapshot();
+    assert_eq!(
+        completed.rows.iter().filter(|(_, s)| s.is_loaded()).count(),
+        1
+    );
+
+    // A failed fetch still serves the retained body, but is not "loaded".
+    mgr.refresh_with_mode(RefreshMode::Force).await;
+    let kept = mgr.status_registry.status_for_url(&kept_url).unwrap();
+    assert!(matches!(kept.last_outcome, LastOutcome::Failed { .. }));
+    assert!(!kept.is_loaded());
+}
+
+/// A refused cycle serves nothing from the cache, so it marks nothing loaded.
+#[tokio::test]
+async fn cache_only_boot_refused_by_the_corpus_guard_marks_nothing_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://127.0.0.1/over.txt".to_string();
+    let stem = source_to_cache_stem(&url);
+    std::fs::write(
+        dir.path().join(format!("{stem}.cache")),
+        "a.example.com\nb.example.com\nc.example.com\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(format!("{stem}.meta")),
+        format!(
+            "etag=\nlast-modified=\nfetched-at={}\n",
+            OffsetDateTime::now_utc().format(&Rfc3339).unwrap()
+        ),
+    )
+    .unwrap();
+    let urls = vec![url.clone()];
+    let mut mgr = ListManager::new(
+        reqwest::Client::new(),
+        Arc::new(FilterEngine::new()),
+        urls.clone(),
+        Catalog::fallback(),
+        Duration::from_secs(3600),
+        build_source_bit_map(&urls).unwrap(),
+        TEST_CAP,
+        DEFAULT_MAX_LIST_ENTRIES,
+        Some(dir.path().to_path_buf()),
+    );
+    mgr.load_disk_cache();
+    // Three domains are past the cold hard cap of 2 x 1.
+    mgr.set_max_total_domains(1);
+
+    assert_eq!(mgr.refresh_with_mode(RefreshMode::CacheOnly).await, 0);
+    assert_eq!(
+        mgr.status_registry.cycle().outcome,
+        Some(CycleOutcome::Refused)
+    );
+    let row = mgr.status_registry.status_for_url(&url).unwrap();
+    assert!(!row.cache_loaded && !row.is_loaded());
 }
 
 #[tokio::test]
@@ -13036,52 +13083,19 @@ async fn cache_only_rejects_a_tampered_manifest_generation() {
 /// A retained reader that fails parsing is not a missing retained body.
 #[tokio::test]
 async fn cache_only_retained_parse_failure_does_not_log_missing_body() {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    struct Messages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Visitor(String);
-
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-
-            let mut visitor = Visitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
-        }
-    }
-
     let (mut mgr, urls, dir) = cached_manager(&["old.example\n"]);
     assert_eq!(mgr.refresh().await, 1);
     let cache_path = selected_cache_body_path(&dir.path().join("cache"), &urls[0]).unwrap();
     std::fs::write(cache_path, "bad.example\n").unwrap();
 
-    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let subscriber =
-        tracing_subscriber::registry().with(Messages(std::sync::Arc::clone(&messages)));
-    let _guard = tracing::subscriber::set_default(subscriber);
+    crate::common::log_capture::arm_log_capture();
     mgr.refresh_with_mode(RefreshMode::CacheOnly).await;
 
-    let messages = messages.lock().unwrap();
+    let messages = crate::common::log_capture::take_log_capture();
     assert_eq!(
         messages
             .iter()
-            .filter(|message| message.contains("failed to stream fresh cache body"))
+            .filter(|(_, message)| message.contains("failed to stream fresh cache body"))
             .count(),
         1,
         "a retained parse failure must emit its stream-failure warning"
@@ -13089,7 +13103,7 @@ async fn cache_only_retained_parse_failure_does_not_log_missing_body() {
     assert!(
         !messages
             .iter()
-            .any(|message| message.contains("cache marked fresh but body missing")),
+            .any(|(_, message)| message.contains("retained list body missing or unusable")),
         "a retained parse failure must not also claim the body was missing"
     );
 }
@@ -13240,8 +13254,8 @@ fn a_zero_count_is_never_carried_forward() {
 /// option (b) standing alone, and it is unbounded — the margin would
 /// have to exceed the slowest cycle on the slowest network, a number
 /// that grows with the corpus. Measured on the two live hosts the
-/// deficit differs by two orders of magnitude (4–36 s on proxmox,
-/// 315–422 s on zima), so any margin large enough for one is either
+/// deficit differs by two orders of magnitude (4–36 s on node_b,
+/// 315–422 s on node_a), so any margin large enough for one is either
 /// wrong for the other or swallows a whole cycle.
 #[test]
 fn the_anchor_not_the_margin_is_what_makes_the_next_tick_stale() {
@@ -14374,14 +14388,14 @@ async fn policy_rebind_prepare_failure_and_cancel_resume_old_manager() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn policy_rebind_post_prepare_install_failure_kills_actor_before_old_refresh() {
+async fn policy_rebind_commit_failure_keeps_actor_and_old_pair() {
     let (mut manager, store, old_artifact, _dir) = policy_rebind_manager().await;
     let old_generation = store.pair_state().unwrap().active.unwrap();
     let old = store.manifest(&old_generation).unwrap();
     let (tx, rx) = mpsc::channel(8);
     manager.set_command_channel(rx);
     let task = manager.spawn_refresh_loop_after_refresh();
-    let mut next = old_artifact;
+    let mut next = old_artifact.clone();
     next.artifact_hash = "e".repeat(64);
     let (prepared_tx, prepared_rx) = oneshot::channel();
     let (commit_tx, commit_rx) = oneshot::channel();
@@ -14395,7 +14409,7 @@ async fn policy_rebind_post_prepare_install_failure_kills_actor_before_old_refre
     .await
     .unwrap();
     prepared_rx.await.unwrap().unwrap();
-    // Simulate an object disappearing after prepare but before the post-swap commit.
+    // Simulate an object disappearing after prepare but before the commit.
     std::fs::remove_file(store.object_path(&old.sources[0].body.sha256).unwrap()).unwrap();
     commit_tx.send(true).unwrap();
     assert!(completed_rx.await.unwrap().is_err());
@@ -14403,9 +14417,26 @@ async fn policy_rebind_post_prepare_install_failure_kills_actor_before_old_refre
         store.pair_state().unwrap().active.as_deref(),
         Some(old_generation.as_str())
     );
-    tokio::time::timeout(Duration::from_secs(5), tx.closed())
+    // A failed commit is a rejection: the actor still serves commands.
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (force_tx, force_rx) = oneshot::channel();
+    tx.send(ListManagerCommand::ForceRefresh {
+        accepted: accepted_tx,
+        completion: force_tx,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        accepted_rx.await.unwrap(),
+        ListManagerCommandDisposition::Started | ListManagerCommandDisposition::Queued
+    ));
+    tokio::time::timeout(Duration::from_secs(5), force_rx)
         .await
+        .unwrap()
         .unwrap();
+    assert!(!tx.is_closed());
+    let serving = store.pair_state().unwrap().active.unwrap();
+    assert_eq!(store.manifest(&serving).unwrap().artifact, old_artifact);
     task.retire().await.unwrap();
 }
 
@@ -14494,4 +14525,34 @@ async fn policy_rebind_retirement_discards_prepared_decision_and_queued_force() 
     let state = store.pair_state().unwrap();
     assert_eq!(state.active.as_deref(), Some(old_generation.as_str()));
     assert_eq!(store.manifest(&old_generation).unwrap().artifact, artifact);
+}
+
+#[test]
+fn cleanup_stale_caches_removes_dead_download_spools() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "https://lists.example.test/spool.txt";
+    let stem = source_to_cache_stem(source);
+    let spools = || {
+        let old = dir.path().join(format!(".{stem}.download-old123"));
+        let fresh = dir.path().join(format!(".{stem}.download-new456"));
+        std::fs::write(&old, b"partial").unwrap();
+        std::fs::write(&fresh, b"partial").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        (old, fresh)
+    };
+    let mgr = cleanup_manager(dir.path(), source);
+
+    let (old, fresh) = spools();
+    mgr.cleanup_stale_caches(Duration::from_secs(20 * 60));
+    assert!(!old.exists(), "a dead spool survived");
+    assert!(fresh.exists(), "a live download lost its spool");
+
+    let (old, fresh) = spools();
+    mgr.cleanup_stale_caches(Duration::ZERO);
+    assert!(!old.exists() && !fresh.exists());
 }

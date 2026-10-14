@@ -94,6 +94,14 @@ pub const IPC_ERROR_LIST_REFRESH_ACCEPTANCE_DROPPED: &str =
     "list manager dropped the refresh acceptance channel without responding; work may still complete. Do not retry automatically.";
 pub const IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED: &str =
     "list manager dropped the refresh completion channel without responding; work may still complete. Do not retry automatically.";
+pub const IPC_ERROR_LIST_FORGET_BUSY: &str =
+    "too many list refresh or forget requests are already waiting; retry after one completes";
+pub const IPC_ERROR_LIST_FORGET_ENQUEUE_TIMEOUT: &str =
+    "list forget could not be queued within 1 second; it was not accepted";
+pub const IPC_ERROR_LIST_FORGET_ACCEPTANCE_TIMEOUT: &str =
+    "list forget was queued but the manager did not acknowledge it within 5 seconds; work may still complete. Do not retry automatically.";
+pub const IPC_ERROR_LIST_FORGET_COMPLETION_TIMEOUT: &str =
+    "list forget is still running after 15 minutes; work may still complete. Do not retry automatically.";
 
 pub const IPC_ERROR_RELOAD_CHANNEL_CLOSED: &str = "reload channel closed";
 pub const IPC_ERROR_RELOAD_NOT_AVAILABLE: &str = "reload not available";
@@ -267,6 +275,10 @@ pub enum IpcError {
     ListRefreshCompletionTimeout,
     ListRefreshAcceptanceDropped,
     ListRefreshCompletionDropped,
+    ListForgetBusy,
+    ListForgetEnqueueTimeout,
+    ListForgetAcceptanceTimeout,
+    ListForgetCompletionTimeout,
 
     ReloadChannelClosed,
     ReloadNotAvailable,
@@ -386,6 +398,14 @@ impl IpcError {
             }
             Self::ListRefreshCompletionDropped => {
                 IPC_ERROR_LIST_REFRESH_COMPLETION_DROPPED.to_string()
+            }
+            Self::ListForgetBusy => IPC_ERROR_LIST_FORGET_BUSY.to_string(),
+            Self::ListForgetEnqueueTimeout => IPC_ERROR_LIST_FORGET_ENQUEUE_TIMEOUT.to_string(),
+            Self::ListForgetAcceptanceTimeout => {
+                IPC_ERROR_LIST_FORGET_ACCEPTANCE_TIMEOUT.to_string()
+            }
+            Self::ListForgetCompletionTimeout => {
+                IPC_ERROR_LIST_FORGET_COMPLETION_TIMEOUT.to_string()
             }
             Self::ReloadChannelClosed => IPC_ERROR_RELOAD_CHANNEL_CLOSED.to_string(),
             Self::ReloadNotAvailable => IPC_ERROR_RELOAD_NOT_AVAILABLE.to_string(),

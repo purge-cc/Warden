@@ -227,6 +227,15 @@ pub struct ListStatus {
     /// which makes the TUI suppress the badge (correct degradation).
     #[serde(default, with = "rfc3339_option")]
     pub last_refresh_at: Option<OffsetDateTime>,
+    /// A verified cache body for this source is installed while the row
+    /// has never refreshed, as after a restart before the source's next
+    /// due fetch. A cache load is not a refresh: it sets no outcome and no
+    /// timestamp, only this flag. Runtime only, since [`ListStatusRegistry::save`]
+    /// persists baselines; a success replaces it and a failure makes it
+    /// inert (see [`Self::is_loaded`]). `#[serde(default)]` keeps older
+    /// payloads decodable.
+    #[serde(default)]
+    pub cache_loaded: bool,
 }
 
 mod rfc3339_option {
@@ -301,6 +310,18 @@ impl ListStatus {
             // Success path stamps "last good" alongside the attempt
             // timestamp. `from_failure` carries this forward.
             last_refresh_at: Some(fetched_at),
+            cache_loaded: false,
+        }
+    }
+
+    /// Whether this source's domains are in the served corpus by its own
+    /// verified evidence: its last refresh succeeded, or it has never
+    /// refreshed and a verified cache body was loaded for it.
+    pub fn is_loaded(&self) -> bool {
+        match self.last_outcome {
+            LastOutcome::Ok => true,
+            LastOutcome::NeverFetched => self.cache_loaded,
+            LastOutcome::Failed { .. } => false,
         }
     }
 
@@ -454,6 +475,10 @@ pub struct BlocklistStatusDto {
     /// badge suppressed.
     #[serde(default)]
     pub last_refresh_at: Option<String>,
+    /// See [`ListStatus::cache_loaded`]: a never-fetched source serving its
+    /// verified cache. `false` from older daemons.
+    #[serde(default)]
+    pub cache_loaded: bool,
 }
 
 impl BlocklistStatusDto {
@@ -481,6 +506,7 @@ impl BlocklistStatusDto {
             delta_pct_vs_prev: status.delta_pct_vs_prev,
             prev_entries: status.prev_entries,
             last_refresh_at,
+            cache_loaded: status.cache_loaded,
         }
     }
 }
@@ -519,7 +545,7 @@ pub struct CorpusRefusal {
 /// it cannot tell a refusal that started ten minutes ago from one that
 /// has been standing for a fortnight. Those are different incidents: the
 /// first may clear on its own when a list shrinks, the second is a host
-/// that has silently stopped tracking upstream. proxmox ran the second
+/// that has silently stopped tracking upstream. node_b ran the second
 /// for two weeks and nine cycles with every per-source row green.
 ///
 /// So the streak lives on the registry instead of in the payload, and
@@ -902,6 +928,31 @@ impl ListStatusRegistry {
                 strict: true,
             },
         });
+    }
+
+    /// Copy each shared source's refresh history from `live`: last outcome,
+    /// last attempt and last success. A node reload prepares a fresh
+    /// registry, and a source that is not due serves its cached body
+    /// without refreshing, so without this it would read as never fetched.
+    /// Sources match on the plan's slot key; one that is new, or whose URL
+    /// changed, starts fresh.
+    ///
+    /// Counts are not copied. `unique_domains` and `prev_entries` are the
+    /// shrink guard's baseline, and node preparation runs without one;
+    /// `entries` is recounted by the install.
+    pub(crate) fn seed_from(&self, live: &Self) {
+        let live_generation = live.generation.load();
+        for (source, slot) in &self.generation.load().slots {
+            if let Some(live_slot) = live_generation.slots.get(source) {
+                let prior = live_slot.load();
+                slot.store(Arc::new(ListStatus {
+                    last_outcome: prior.last_outcome.clone(),
+                    fetched_at: prior.fetched_at,
+                    last_refresh_at: prior.last_refresh_at,
+                    ..ListStatus::default()
+                }));
+            }
+        }
     }
 
     /// Record — or clear, with `None` — the global corpus guard's verdict
@@ -1767,6 +1818,56 @@ mod tests {
     }
 
     #[test]
+    fn only_a_never_fetched_cache_load_or_a_success_counts_as_loaded() {
+        let now = OffsetDateTime::now_utc();
+        let cached = ListStatus {
+            cache_loaded: true,
+            ..Default::default()
+        };
+        assert!(cached.is_loaded());
+        assert!(!ListStatus::default().is_loaded());
+        let refreshed = ListStatus::from_refresh(1, ParsedCounts::default(), Some(&cached), now);
+        assert!(!refreshed.cache_loaded, "a success replaces the cache flag");
+        assert!(refreshed.is_loaded());
+        let failed = ListStatus::from_failure(Some(&cached), "HTTP 502".into(), now);
+        assert!(!failed.is_loaded(), "a failed source is not loaded");
+    }
+
+    #[test]
+    fn seed_from_copies_refresh_history_but_not_the_guard_baseline() {
+        let now = OffsetDateTime::now_utc();
+        let live = ListStatusRegistry::new(&["kept".into(), "dropped".into()]);
+        live.update_for_url(
+            "kept",
+            ListStatus {
+                entries: 7,
+                unique_domains: 9,
+                prev_entries: Some(6),
+                fetched_at: Some(now),
+                last_refresh_at: Some(now),
+                last_outcome: LastOutcome::Ok,
+                ..Default::default()
+            },
+        );
+        let prepared = ListStatusRegistry::new(&["kept".into(), "added".into()]);
+        prepared.seed_from(&live);
+
+        let kept = prepared.status_for_url("kept").unwrap();
+        assert_eq!(kept.last_outcome, LastOutcome::Ok);
+        assert_eq!(kept.fetched_at, Some(now));
+        assert_eq!(kept.last_refresh_at, Some(now));
+        assert_eq!(
+            (kept.entries, kept.unique_domains, kept.prev_entries),
+            (0, 0, None)
+        );
+        assert_eq!(
+            *prepared.status_for_url("added").unwrap(),
+            ListStatus::default()
+        );
+        assert_eq!(live.status_for_url("kept").unwrap().unique_domains, 9);
+    }
+
+    #[test]
     fn from_failure_carries_forward_last_good() {
         let now = OffsetDateTime::now_utc();
         let prior = ListStatus {
@@ -1781,6 +1882,7 @@ mod tests {
             delta_pct_vs_prev: Some(1.5),
             prev_entries: Some(4925),
             last_refresh_at: Some(now - time::Duration::hours(2)),
+            cache_loaded: false,
         };
         let s = ListStatus::from_failure(Some(&prior), "HTTP 502".into(), now);
         // Counts carried over so the operator still sees "last good" data.
@@ -2615,6 +2717,7 @@ mod tests {
             delta_pct_vs_prev: Some(5.0),
             prev_entries: Some(95),
             last_refresh_at: None,
+            cache_loaded: false,
         };
         let dto = BlocklistStatusDto::from_status("a".into(), Some("a".into()), &status);
         let json = serde_json::to_string(&dto).unwrap();

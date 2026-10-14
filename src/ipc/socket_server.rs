@@ -1483,7 +1483,7 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
         .list_statuses
         .as_ref()
         .map(|reg| reg.consistent_snapshot());
-    let (lists_active, lists_total, lists_truncated) = match &lists_snapshot {
+    let (lists_active, lists_loaded, lists_total, lists_truncated) = match &lists_snapshot {
         Some(snapshot) => {
             let snap = &snapshot.rows;
             let total = snap.len() as u32;
@@ -1491,12 +1491,13 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
                 .iter()
                 .filter(|(_, s)| matches!(s.last_outcome, crate::lists::status::LastOutcome::Ok))
                 .count() as u32;
+            let loaded = snap.iter().filter(|(_, s)| s.is_loaded()).count() as u32;
             // Counted over every source, not just active ones: a later
             // failure must not hide an earlier cap refusal from operators.
             let truncated = snap.iter().filter(|(_, s)| s.parsed_truncated > 0).count() as u32;
-            (active, total, truncated)
+            (active, loaded, total, truncated)
         }
-        None => (0, 0, 0),
+        None => (0, 0, 0, 0),
     };
     // One immutable completed-cycle view: never assemble a mark, source
     // rows, refusal, and freeze from independent atomics here.
@@ -1609,6 +1610,7 @@ async fn handle_status(state: &DaemonState) -> IpcResponse {
         lists_cycle,
         lists_corpus_freeze,
         lists_total,
+        lists_loaded,
         lc2_list_diagnostics,
         resource_budget,
         lists_memory_bytes: Some(state.filter.installed_memory_bytes()),
@@ -1823,11 +1825,27 @@ async fn handle_cache_flush(
 /// Audit log: emits one record per call — operators can grep the audit
 /// stream for unexpected forgets.
 async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonState) -> IpcResponse {
+    handle_forget_list_with_timeouts(id, peer_uid, state, FORCE_REFRESH_TIMEOUTS).await
+}
+
+async fn handle_forget_list_with_timeouts(
+    id: String,
+    peer_uid: Option<u32>,
+    state: &DaemonState,
+    timeouts: ForceRefreshTimeouts,
+) -> IpcResponse {
     use crate::lists::manager::ListManagerCommand;
 
+    // A forget queues behind a running refresh, so it takes a refresh waiter
+    // permit and the same bounds instead of holding an accept slot unbounded.
     let endpoint = state.list_cmd_tx.load();
-    let tx = match endpoint.as_ref() {
-        ListManagerEndpoint::Running { sender, .. } => sender.clone(),
+    let (tx, _waiter) = match endpoint.as_ref() {
+        ListManagerEndpoint::Running { sender, waiters } => {
+            match waiters.clone().try_acquire_owned() {
+                Ok(permit) => (sender.clone(), permit),
+                Err(_) => return ipc_error(IpcError::ListForgetBusy),
+            }
+        }
         ListManagerEndpoint::EmptyStable => return ipc_error(IpcError::ListManagerNotRunning),
         ListManagerEndpoint::Transitioning => return ipc_error(IpcError::ListManagerUnavailable),
     };
@@ -1835,27 +1853,32 @@ async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonSta
 
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    if tx
-        .send(ListManagerCommand::Forget {
+    match tokio::time::timeout(
+        timeouts.enqueue,
+        tx.send(ListManagerCommand::Forget {
             source: id.clone(),
             accepted: accepted_tx,
             completion: completion_tx,
-        })
-        .await
-        .is_err()
+        }),
+    )
+    .await
     {
-        return ipc_error(IpcError::ListManagerChannelClosed);
+        Err(_) => return ipc_error(IpcError::ListForgetEnqueueTimeout),
+        Ok(Err(_)) => return ipc_error(IpcError::ListManagerChannelClosed),
+        Ok(Ok(())) => {}
     }
 
     // Acceptance stays internal for this wire revision: the existing IPC
     // response remains the completed forget result, but a controller that has
     // already retired is detected before we wait on a completion forever.
-    if accepted_rx.await.is_err() {
-        return ipc_error(IpcError::ListManagerNoAck);
+    match tokio::time::timeout(timeouts.acceptance, accepted_rx).await {
+        Err(_) => return ipc_error(IpcError::ListForgetAcceptanceTimeout),
+        Ok(Err(_)) => return ipc_error(IpcError::ListManagerNoAck),
+        Ok(Ok(_)) => {}
     }
 
-    match completion_rx.await {
-        Ok(was_cached) => {
+    match tokio::time::timeout(timeouts.completion, completion_rx).await {
+        Ok(Ok(was_cached)) => {
             tracing::info!(
                 target: "audit",
                 action = "list.forget",
@@ -1866,7 +1889,8 @@ async fn handle_forget_list(id: String, peer_uid: Option<u32>, state: &DaemonSta
             );
             IpcResponse::ListForgotten { id, was_cached }
         }
-        Err(_) => ipc_error(IpcError::ListManagerNoAck),
+        Ok(Err(_)) => ipc_error(IpcError::ListManagerNoAck),
+        Err(_) => ipc_error(IpcError::ListForgetCompletionTimeout),
     }
 }
 

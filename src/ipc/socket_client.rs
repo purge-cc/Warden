@@ -105,11 +105,15 @@ where
 /// - `ReadOnly` commands are sent as-is. No token lookup happens, so
 ///   `warden status` works even on a fresh install with no token.
 /// - Ordinary commands apply [`IPC_TIMEOUT`] independently to connect,
-///   write, and read. `ForceListRefresh` and `OperatorRulesApply` keep the
-///   short connect/write limits but extend the read while waiting for their
-///   terminal response.
+///   write, and read. `ForceListRefresh`, `ForgetList`, `OperatorRulesPlan`
+///   and `OperatorRulesApply` keep the short connect/write limits but extend
+///   the read while waiting for their terminal response.
 pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::Result<IpcResponse> {
-    let timeouts = match command {
+    send_command_with_timeouts(socket_path, command, timeouts_for(command)).await
+}
+
+fn timeouts_for(command: &IpcCommand) -> CommandTimeouts {
+    match command {
         #[cfg(feature = "cluster")]
         IpcCommand::NodesPreview { .. }
         | IpcCommand::NodesApply { .. }
@@ -123,13 +127,15 @@ pub async fn send_command(socket_path: &Path, command: &IpcCommand) -> anyhow::R
         {
             NODES_LIFECYCLE_TIMEOUTS
         }
-        IpcCommand::ForceListRefresh { .. } => FORCE_LIST_REFRESH_TIMEOUTS,
-        IpcCommand::OperatorRulesApply { .. } | IpcCommand::OperatorRulesReplay { .. } => {
-            OPERATOR_RULES_APPLY_TIMEOUTS
+        // A forget queues behind a running refresh on the daemon side.
+        IpcCommand::ForceListRefresh { .. } | IpcCommand::ForgetList { .. } => {
+            FORCE_LIST_REFRESH_TIMEOUTS
         }
+        IpcCommand::OperatorRulesPlan { .. }
+        | IpcCommand::OperatorRulesApply { .. }
+        | IpcCommand::OperatorRulesReplay { .. } => OPERATOR_RULES_APPLY_TIMEOUTS,
         _ => ORDINARY_COMMAND_TIMEOUTS,
-    };
-    send_command_with_timeouts(socket_path, command, timeouts).await
+    }
 }
 
 /// Internal timeout seam keeps tests short without changing the public
@@ -359,6 +365,29 @@ mod tests {
             OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT
         );
         assert!(OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT > IPC_TIMEOUT);
+    }
+
+    #[test]
+    fn waiting_commands_use_long_read_timeouts() {
+        let forget = IpcCommand::ForgetList {
+            id: "example".into(),
+            token: None,
+        };
+        assert_eq!(
+            timeouts_for(&forget).read,
+            FORCE_LIST_REFRESH_RESPONSE_TIMEOUT
+        );
+        let plan = IpcCommand::OperatorRulesPlan {
+            request: None,
+            plan_ref: Some("plan".into()),
+            page: Default::default(),
+            token: None,
+        };
+        assert_eq!(
+            timeouts_for(&plan).read,
+            OPERATOR_RULES_APPLY_RESPONSE_TIMEOUT
+        );
+        assert_eq!(timeouts_for(&IpcCommand::Status).read, IPC_TIMEOUT);
     }
 
     #[tokio::test]

@@ -374,4 +374,28 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK, "metrics hit {n}");
         }
     }
+
+    /// REST auth reads the live hash shared with the IPC state, so a
+    /// reload that swaps it takes effect without a restart.
+    #[tokio::test]
+    async fn rest_auth_follows_a_rotated_token_hash() {
+        use crate::auth::token::hash_token;
+
+        let (state, old) = test_state_with_rate_limit(100);
+        let hash = Arc::clone(&state.token_hash);
+        let router = build_router(state, false).layer(MockConnectInfo(mock_addr()));
+        let status = |token: &'static str| {
+            let router = router.clone();
+            async move { router.oneshot(authed_req(token)).await.unwrap().status() }
+        };
+
+        assert_eq!(status(old).await, StatusCode::OK);
+
+        hash.store(Arc::new(Some(hash_token("new-token"))));
+        assert_eq!(status(old).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("new-token").await, StatusCode::OK);
+
+        hash.store(Arc::new(None));
+        assert_eq!(status("new-token").await, StatusCode::UNAUTHORIZED);
+    }
 }

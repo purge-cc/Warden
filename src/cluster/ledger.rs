@@ -155,8 +155,10 @@ impl<'g> OwnershipStore<'g> {
                 pending: None,
             },
         };
+        // The root binds by path and inode; st_dev is not stable across boots.
+        // See policy_transaction::Inode for the accepted ceiling.
         ensure!(
-            state.root_device == root.dev() && state.root_inode == root.ino(),
+            state.root_inode == root.ino(),
             "ArtifactOwnershipConflict: configuration root was replaced"
         );
         validate_state(&state)?;
@@ -854,7 +856,7 @@ pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()>
     };
     let root = guard.tree_io().root.metadata()?;
     ensure!(
-        (state.root_device, state.root_inode) == (root.dev(), root.ino()),
+        state.root_inode == root.ino(),
         "ArtifactOwnershipConflict: ownership ledger pins another configuration root"
     );
     ensure!(
@@ -864,8 +866,64 @@ pub(crate) fn relocate_settled(guard: &MigrationWriteLock) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Rewrite the root pin of the ownership ledger from `from` to `to`. A pin
-/// already equal to `to` stays, any other refuses. Returns whether it wrote.
+/// Refuse a local restore whose `after` inventory would replace a file the
+/// ownership ledger holds, or delete one when `deletes_unlisted`. Bytes only:
+/// the policy transaction keeps an unchanged member's inode. Reads only.
+pub(crate) fn refuse_owned_changes(
+    guard: &MigrationWriteLock,
+    after: &PolicyRevisionInventory,
+    deletes_unlisted: bool,
+) -> anyhow::Result<()> {
+    let Some((_, state)) = existing_state(guard)? else {
+        return Ok(());
+    };
+    ensure!(
+        state.pending.is_none(),
+        "ArtifactRecoveryRequired: pending ownership intent"
+    );
+    let Some(ledger) = &state.ledger else {
+        return Ok(());
+    };
+    let changed: Vec<&str> = ledger
+        .entries
+        .iter()
+        .filter(|(path, owned)| {
+            match after
+                .members()
+                .iter()
+                .find(|member| member.path() == Path::new(path.as_str()))
+            {
+                Some(member) => !matches!(
+                    member.state(),
+                    PolicyMemberState::Present(bytes) if digest(bytes) == owned.identity.sha256
+                ),
+                None => deletes_unlisted,
+            }
+        })
+        .map(|(path, _)| path.as_str())
+        .collect();
+    ensure!(
+        changed.is_empty(),
+        "refusing restore on a cluster secondary: it would replace files the primary \
+         replicates ({}). Leave the cluster first (`warden cluster leave`, \
+         `warden cluster apply --preview-id ID`, restart), restore an archive taken while \
+         the node was standalone, run `warden cluster revoke <node-id>` and \
+         `warden cluster invite` on the primary, then join again (`warden cluster join`, \
+         `warden cluster apply --preview-id ID`, restart). Steps: \
+         \"Cluster secondaries\" in docs/UPGRADE_RECOVERY.md.",
+        changed
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+/// Rewrite the root pin of the ownership ledger from `from` to `to`, matching
+/// by inode only. A pin already at `to` stays, any other refuses. Returns
+/// whether it wrote.
 pub(crate) fn rebind_root(
     guard: &MigrationWriteLock,
     from: (u64, u64),
@@ -874,12 +932,11 @@ pub(crate) fn rebind_root(
     let Some((files, mut state)) = existing_state(guard)? else {
         return Ok(false);
     };
-    let pin = (state.root_device, state.root_inode);
-    if pin == to {
+    if state.root_inode == to.1 {
         return Ok(false);
     }
     ensure!(
-        pin == from,
+        state.root_inode == from.1,
         "ArtifactOwnershipConflict: ownership ledger pins another configuration root"
     );
     (state.root_device, state.root_inode) = to;
@@ -992,8 +1049,7 @@ fn verify_identity(
         .original_metadata()
         .context("ArtifactOwnershipConflict: owned file missing")?;
     ensure!(
-        meta.dev() == expected.device
-            && meta.ino() == expected.inode
+        meta.ino() == expected.inode
             && meta.uid() == expected.uid
             && meta.gid() == expected.gid
             && meta.mode() & 0o7777 == expected.mode
@@ -1013,8 +1069,7 @@ fn verify_identity(
         .original_metadata()
         .context("ArtifactOwnershipConflict: owned path disappeared")?;
     ensure!(
-        current.dev() == expected.device
-            && current.ino() == expected.inode
+        current.ino() == expected.inode
             && current.uid() == expected.uid
             && current.gid() == expected.gid
             && current.mode() & 0o7777 == expected.mode
@@ -1381,6 +1436,117 @@ mod tests {
             RecoveryStatus::Completed(_)
         ));
         assert!(store.pending().is_none());
+    }
+
+    #[test]
+    fn ownership_survives_a_device_number_change() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&root.path().join("config.toml")).unwrap();
+        let (manifest, objects) = artifact(1, &[("list", "example.org\n")]);
+        let committed = accept(
+            &mut OwnershipStore::open(&guard).unwrap(),
+            &manifest,
+            &objects,
+        );
+        assert!(policy_transaction::shift_devices_for_test(root.path()) > 0);
+        let store = OwnershipStore::open(&guard).unwrap();
+        assert!(store.preflight(&manifest, &[], true).unwrap().replay);
+        drop(store);
+        relocate_settled(&guard).unwrap();
+        let owned = &committed.entries["packs/list.txt"].identity;
+        let moved = MemberIdentity {
+            device: owned.device.wrapping_add(1),
+            ..owned.clone()
+        };
+        verify_identity(&guard, "packs/list.txt", &moved).unwrap();
+        let replaced = MemberIdentity {
+            inode: owned.inode.wrapping_add(1),
+            ..owned.clone()
+        };
+        let error = verify_identity(&guard, "packs/list.txt", &replaced).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("owned inode or metadata changed"),
+            "{error:#}"
+        );
+
+        let live = guard.tree_io().root.metadata().unwrap();
+        let live = (live.dev(), live.ino());
+        assert!(!rebind_root(&guard, (0, 0), live).unwrap());
+        let elsewhere = (live.0, u64::MAX);
+        assert!(rebind_root(&guard, live, elsewhere).unwrap());
+        let error = OwnershipStore::open(&guard).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("configuration root was replaced"),
+            "{error:#}"
+        );
+        let error = relocate_settled(&guard).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pins another configuration root"),
+            "{error:#}"
+        );
+        assert!(rebind_root(&guard, (0, 0), live).is_err());
+        assert!(rebind_root(&guard, elsewhere, live).unwrap());
+        OwnershipStore::open(&guard).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_that_restored_the_same_inode_in_another_boot_keeps_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&root.path().join("config.toml")).unwrap();
+        let receipts = ReceiptStore::open(guard.tree_io().root, &guard).unwrap();
+        let mut store = OwnershipStore::open(&guard).unwrap();
+        let (initial, objects) = artifact(1, &[("list", "example.org\n")]);
+        let committed = accept(&mut store, &initial, &objects);
+        let (candidate, objects) = artifact(
+            2,
+            &[("list", "changed.example\n"), ("new", "new.example\n")],
+        );
+        let before = before_inventory(&store);
+        let after = after_inventory(&before, &candidate, &objects);
+        let plan = store.preflight(&candidate, &[], true).unwrap();
+        let pending = store
+            .begin(
+                plan,
+                &candidate,
+                &before,
+                &after.revision().to_string(),
+                "actor",
+                "aborted",
+            )
+            .unwrap();
+        // The journal recorded the untouched file after the device number moved.
+        let baseline = &pending.before_members["packs/list.txt"].identity;
+        let restored = MemberIdentity {
+            device: baseline.device.wrapping_add(1),
+            ..baseline.clone()
+        };
+        let evidence = OperationEvidence {
+            receipt: pending_receipt(&pending, Persistence::Aborted),
+            operation_manifest: pending.operation_manifest().unwrap(),
+            members: vec![MemberEvidence {
+                path: "packs/list.txt".into(),
+                role: MemberRole::Pack,
+                operation: Some(MemberOperation::Replace),
+                before: Some(MemberBeforeState::from(&restored)),
+                after: None,
+                restored: Some(restored),
+            }],
+        };
+        drop(store);
+        let mut store = OwnershipStore::open(&guard).unwrap();
+        assert_eq!(
+            store.recover(&receipts, &FixedEvidence(evidence)).unwrap(),
+            RecoveryStatus::Aborted
+        );
+        let ledger = store.current().unwrap();
+        assert!(ledger.rollback_proofs.is_empty());
+        assert_eq!(ledger.entries, committed.entries);
     }
 
     #[test]

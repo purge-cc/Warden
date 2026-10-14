@@ -335,10 +335,8 @@ mod tests {
         // tests/fixtures/minimal-v1/config.toml is the canonical
         // one-of-every-entity reference — the happy-path integration
         // shape. Its tag wiring is clean (every
-        // device/profile tag set intersects an enabled list); it does
-        // raise one warning — it omits `[anti_bypass]`, whose
-        // defaults claim a protection that builds no checker. That is a
-        // warning, so the code stays SUCCESS. See
+        // device/profile tag set intersects an enabled list) and it
+        // raises no warning. See
         // `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture`.
         let (_dir, path) = current_fixture("tests/fixtures/minimal-v1/config.toml");
         let rc = run_lint(&path, false).unwrap();
@@ -465,28 +463,9 @@ servers = ["192.0.2.1:53"]
     /// `--strict` must not invent a failure where there is nothing to
     /// warn about. Without this, "strict always exits 2" would satisfy
     /// the test above.
-    ///
-    /// The config is minimal-v1 **plus an explicit `[anti_bypass]`
-    /// opt-out**, derived into a tempdir rather than checked in. It used
-    /// to point straight at the fixture, and that fixture now raises
-    /// one warning by design — see
-    /// `lint_captures_exactly_the_expected_warnings_for_the_reference_fixture`.
-    /// The two requirements are genuinely incompatible in one file:
-    /// minimal-v1 earns its keep by looking like a real install (no
-    /// `[anti_bypass]` section, exactly as `warden init` writes it),
-    /// while this control arm needs a config with *zero* warnings.
-    /// Editing the opt-out into the fixture was tried and reverted — it
-    /// turned this test green and the exact-set pin red, the same
-    /// collision seen from the other side. Deriving it here keeps one
-    /// checked-in shape instead of a near-duplicate fixture free to
-    /// drift from it.
     #[test]
     fn strict_leaves_a_clean_config_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.toml");
-        let mut body = current_fixture_body("tests/fixtures/minimal-v1/config.toml");
-        body.push_str("\n[anti_bypass]\nenabled = false\n");
-        std::fs::write(&path, body).unwrap();
+        let (_dir, path) = current_fixture("tests/fixtures/minimal-v1/config.toml");
 
         let (_, warnings) = lint_collect(&path);
         assert!(
@@ -540,36 +519,16 @@ servers = ["192.0.2.1:53"]
         );
     }
 
-    /// The reference fixture's warning set, pinned **exactly**.
-    ///
-    /// This asserted `warnings.is_empty()` until the anti_bypass warning
-    /// was added. It went red because
-    /// `minimal-v1` omits `[anti_bypass]`, and the section's serde
-    /// defaults are `enabled = true, extra_domains = []` — the state that
-    /// builds no checker at all. The fixture was not edited to silence
-    /// it: omitting the section is precisely what `warden init` writes
-    /// and what both live CTs carry, so the fixture's whole value is that
-    /// it looks like a real install. A diagnostic that fires there is the
-    /// finding, not fixture noise.
-    ///
-    /// Pinned as an exact set rather than relaxed to "contains" — the
-    /// guard this test exists to provide is that a *new, unexpected*
-    /// warning on the reference config fails the suite, and `any()` would
-    /// have thrown that away along with the red.
+    /// The reference fixture is warning-free. A new warning on it needs a
+    /// deliberate decision, not an amended assertion.
     #[test]
     fn lint_captures_exactly_the_expected_warnings_for_the_reference_fixture() {
         let (_dir, path) = current_fixture("tests/fixtures/minimal-v1/config.toml");
         let (result, warnings) = lint_collect(&path);
         assert!(result.is_ok());
-        assert_eq!(
-            warnings.len(),
-            1,
-            "minimal-v1 raises exactly one warning; a new one here needs a \
-             deliberate decision, not an amended assertion: {warnings:?}"
-        );
         assert!(
-            warnings[0].contains("has no domains to block"),
-            "the one expected warning is ANTI_BYPASS_ENABLED_NO_DOMAINS, got: {warnings:?}"
+            warnings.is_empty(),
+            "minimal-v1 raises no warning: {warnings:?}"
         );
     }
 

@@ -63,13 +63,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &App) {
                 && super::nodes::control_status_for_display(app).is_some_and(|status| {
                     super::nodes::is_cancelled_add_cleanup_pending(status, progress)
                 });
-            let can_cancel = progress.kind == crate::cluster::node_control::NodeOperationKind::Add
-                && matches!(
-                    progress.phase,
-                    NodeOperationPhase::PreparingTarget
-                        | NodeOperationPhase::Prepared
-                        | NodeOperationPhase::Paused
-                );
+            let can_cancel = super::nodes::can_cancel(progress);
             let mut actions = Vec::new();
             if can_cancel {
                 actions.push(

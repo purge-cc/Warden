@@ -237,10 +237,6 @@ fn default_tunneling_enabled() -> bool {
     true
 }
 
-fn default_anti_bypass_enabled() -> bool {
-    true
-}
-
 fn default_snapshot_interval_secs() -> u64 {
     120
 }
@@ -1576,15 +1572,15 @@ impl Default for TunnelingConfig {
 /// extra_domains = ["my-vpn-dns.example.com"]
 /// ```
 ///
-/// **`enabled = true` on its own does nothing.** Warden ships no
-/// built-in resolver list — it holds no opinion about which resolvers
-/// exist — so the checker refuses exactly the names below and no others. That
-/// pairing (`enabled` true, `extra_domains` empty) is the *default*, which is
-/// why the validator warns about it on every load rather than staying quiet
-/// about a security setting that is on and inert.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Off by default. Warden ships no built-in resolver list — it holds no
+/// opinion about which resolvers exist — so the checker refuses exactly the
+/// names below and no others. When `enabled` is omitted it follows the list:
+/// listing `extra_domains` turns the checker on. An explicit `enabled` always
+/// wins, so `enabled = true` with no domains is on and inert, and the
+/// validator warns about it on every load.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(from = "AntiBypassToml")]
 pub struct AntiBypassConfig {
-    #[serde(default = "default_anti_bypass_enabled")]
     pub enabled: bool,
     /// The resolver names to refuse — **the whole list, not an addition to
     /// one.** Empty means nothing is refused.
@@ -1592,11 +1588,18 @@ pub struct AntiBypassConfig {
     pub extra_domains: Vec<String>,
 }
 
-impl Default for AntiBypassConfig {
-    fn default() -> Self {
+#[derive(Deserialize)]
+struct AntiBypassToml {
+    enabled: Option<bool>,
+    #[serde(default)]
+    extra_domains: Vec<String>,
+}
+
+impl From<AntiBypassToml> for AntiBypassConfig {
+    fn from(t: AntiBypassToml) -> Self {
         Self {
-            enabled: true,
-            extra_domains: Vec::new(),
+            enabled: t.enabled.unwrap_or(!t.extra_domains.is_empty()),
+            extra_domains: t.extra_domains,
         }
     }
 }
@@ -2036,11 +2039,21 @@ expires_at = "2026-04-13T22:30:00Z"
     }
 
     #[test]
-    fn h10_default_anti_bypass_enabled_isolated() {
-        let s: AntiBypassConfig = toml::from_str("").unwrap();
+    fn anti_bypass_is_off_by_default_and_listed_domains_turn_it_on() {
+        let parse = |src: &str| toml::from_str::<AntiBypassConfig>(src).unwrap().enabled;
+        assert!(!parse(""), "an omitted section is off");
+        assert!(!AntiBypassConfig::default().enabled, "Default is off");
         assert!(
-            s.enabled,
-            "anti_bypass.enabled must default to true via its own helper"
+            parse(r#"extra_domains = ["doh.example.net"]"#),
+            "listing domains without `enabled` turns it on"
+        );
+        assert!(
+            !parse("enabled = false\nextra_domains = [\"doh.example.net\"]"),
+            "an explicit `enabled = false` wins over a listed domain"
+        );
+        assert!(
+            parse("enabled = true"),
+            "an explicit `enabled = true` with no domains stays on"
         );
     }
 

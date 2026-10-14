@@ -101,6 +101,13 @@ pub(crate) fn acquire_for_migration(
     master: &Path,
     pid_file: &Path,
 ) -> anyhow::Result<RuntimeLease> {
+    // Unlike the daemon, a migration never runs on an absent master. Say so
+    // before the lease and PID writes, rather than as a capability mismatch.
+    ensure!(
+        !matches!(master.try_exists(), Ok(false)),
+        "MasterNotFound: config master {} does not exist; pass --config with the path of the existing master",
+        master.display()
+    );
     acquire(master, "offline migration", true, true, Some(pid_file))
 }
 
@@ -378,8 +385,9 @@ fn verify_capability(
         "LeaseCapabilityStale: start this authoritative schema-5 tree once with the current runtime before offline migration"
     );
     ensure!(
+        // st_dev is not stable across boots; the master path and root inode bind.
+        // See policy_transaction::Inode for the accepted ceiling.
         recorded.canonical_master == expected.canonical_master
-            && recorded.root_device == expected.root_device
             && recorded.root_inode == expected.root_inode,
         "LeaseCapabilityMismatch: runtime capability belongs to another config tree"
     );
@@ -536,6 +544,28 @@ mod tests {
         assert!(!tree.join(CAPABILITY_NAME).exists());
     }
 
+    /// `--config` naming a missing master beside a real one resolves to the
+    /// same state directory, whose capability names the real master. The
+    /// operator must hear that the path is wrong, not that the capability
+    /// belongs to another tree.
+    #[test]
+    fn migration_names_a_missing_master_instead_of_a_capability_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let real = master(&root);
+        acquire_for_daemon(&real)
+            .unwrap()
+            .attest_schema5_runtime(5)
+            .unwrap();
+
+        let error = acquire_for_migration(&root.path().join("other.toml"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("MasterNotFound"), "{error}");
+        assert!(error.contains("other.toml"), "{error}");
+        assert!(!root.path().join("other.test.pid").exists());
+    }
+
     #[test]
     fn offline_operation_refuses_a_tree_missing_a_schema5_runtime_capability() {
         let root = tempfile::tempdir().unwrap();
@@ -587,6 +617,30 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("LeaseCapabilityMismatch"));
+    }
+
+    #[test]
+    fn schema5_capability_survives_a_device_number_change() {
+        let root = tempfile::tempdir().unwrap();
+        let master = master(&root);
+        let lease = acquire_for_daemon(&master).unwrap();
+        lease.attest_schema5_runtime(5).unwrap();
+        drop(lease);
+        let identity = super::super::write_lock::ConfigTreeIdentity::resolve(&master).unwrap();
+        let mut recorded = capability(&identity, &identity.open_root(true).unwrap()).unwrap();
+        let path = root.path().join(CAPABILITY_NAME);
+        recorded.root_device = recorded.root_device.wrapping_add(1);
+        write_capability_file(&path, &recorded);
+        verify_capability_read_only(&master).unwrap();
+        drop(acquire_for_migration(&master).unwrap());
+
+        recorded.root_inode = recorded.root_inode.wrapping_add(1);
+        write_capability_file(&path, &recorded);
+        let error = acquire_for_migration(&master).err().unwrap();
+        assert!(
+            error.to_string().contains("LeaseCapabilityMismatch"),
+            "{error:#}"
+        );
     }
 
     #[test]

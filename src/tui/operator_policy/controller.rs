@@ -9,6 +9,7 @@ use crate::operator_rules::{
     Receipt, RuleAction, RulePage, RuleRow,
 };
 use crate::tui::actions::Surface;
+use crate::tui::ipc_poller::ProfileCreateFailure;
 use crate::tui::{actions, App, IpcPoller};
 
 use super::adapter::{AdapterErrorKind, OperatorPolicyAdapter};
@@ -574,6 +575,34 @@ pub(super) async fn startup_resume_probe(
     ))
 }
 
+/// The property-prefix failure `prepare_profile` reports, if any:
+/// `(error, properties_committed)`.
+#[cfg(test)]
+pub(super) async fn prepare_profile_probe(
+    socket: PathBuf,
+    config_path: PathBuf,
+    origin: PolicyOrigin,
+    operations: Vec<Operation>,
+    prefix: ProfilePrefix,
+) -> Option<(String, bool)> {
+    match prepare_profile(
+        socket,
+        config_path,
+        origin,
+        PolicyChange::Operations(operations),
+        prefix,
+    )
+    .await
+    {
+        Err(PreparationFailure::Prefix {
+            error,
+            properties_committed,
+            ..
+        }) => Some((error, properties_committed)),
+        _ => None,
+    }
+}
+
 async fn load_snapshot(config_path: PathBuf) -> Option<Box<crate::tui::app::ConfigSnapshot>> {
     tokio::task::spawn_blocking(move || Box::new(crate::tui::load_config_snapshot(&config_path)))
         .await
@@ -649,11 +678,31 @@ async fn prepare_profile(
             .as_deref()
             .is_some_and(|snapshot| profile_matches_prefix(snapshot, &prefix));
     if !properties_committed {
-        return Err(PreparationFailure::Prefix {
-            error: format!(
+        let error = match property_result {
+            Err(ProfileCreateFailure::Refused(message)) if config.is_some() => {
+                match recovery::abandon_property_pending(
+                    config_path,
+                    origin.clone(),
+                    operations.clone(),
+                    prefix.clone(),
+                )
+                .await
+                {
+                    Ok(()) => format!("profile properties were not applied: {message}"),
+                    Err(error) => format!(
+                        "profile properties were not applied: {message}; \
+                         recovery journal could not be cleared: {}",
+                        format_policy_error(&error)
+                    ),
+                }
+            }
+            result => format!(
                 "profile properties outcome is unknown and was not repeated: {}",
-                property_result.unwrap_err()
+                result.unwrap_err()
             ),
+        };
+        return Err(PreparationFailure::Prefix {
+            error,
             origin,
             prefix,
             config,
@@ -1228,7 +1277,7 @@ async fn begin_apply(app: &mut App, config_path: &Path) -> bool {
                 return ApplyWork::NotSubmitted(error);
             }
             let result = adapter.apply(&attempt.plan).await;
-            let journal_error = observe_result(config_path, &attempt.request, &result).await;
+            let journal_error = observe_submit(config_path, &attempt.request, &result, true).await;
             ApplyWork::Submitted {
                 result: Box::new(result),
                 journal_error,
@@ -1267,13 +1316,33 @@ async fn begin_apply(app: &mut App, config_path: &Path) -> bool {
             apply_current_outcome(app, dialog_id);
             if let Some(error) = journal_error {
                 app.status_err(format!(
-                    "receipt received but recovery journal could not advance: {}",
+                    "the daemon answered but the recovery journal could not advance: {}",
                     format_policy_error(&error)
                 ));
             }
         },
     )
     .await
+}
+
+/// Journal the answer to an apply. A receipt advances the record; a refusal
+/// the daemon returns before recording an intent settles it, so a fresh plan
+/// can be submitted. Anything else leaves the intent unknown.
+pub(super) async fn observe_submit(
+    config_path: PathBuf,
+    request: &crate::operator_rules::BatchRequest,
+    result: &Result<Receipt, AdapterError>,
+    first_send: bool,
+) -> Option<AdapterError> {
+    match result {
+        Ok(_) => observe_result(config_path, request, result).await,
+        Err(error) if super::workflow::refused_before_intent(error, first_send) => {
+            recovery::settle_refused(config_path, request.request_id.clone())
+                .await
+                .err()
+        }
+        Err(_) => None,
+    }
 }
 
 async fn observe_result(
@@ -1441,7 +1510,7 @@ async fn begin_exact_apply(app: &mut App, poller: &IpcPoller, config_path: &Path
                 },
             };
             let result = adapter.apply(&plan).await;
-            let journal_error = observe_result(config_path, &request, &result).await;
+            let journal_error = observe_submit(config_path, &request, &result, false).await;
             (result, journal_error, Some(adapter))
         },
         move |app, _, result| {
@@ -1465,7 +1534,7 @@ async fn begin_exact_apply(app: &mut App, poller: &IpcPoller, config_path: &Path
             }
             if let Some(error) = journal_error {
                 app.status_err(format!(
-                    "exact retry returned a receipt but journal could not advance: {}",
+                    "the exact retry was answered but the journal could not advance: {}",
                     format_policy_error(&error)
                 ));
             }

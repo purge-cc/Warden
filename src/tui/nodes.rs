@@ -402,6 +402,20 @@ pub(crate) fn is_legacy_detached_add_recovery(progress: &NodeOperationProgress) 
         && progress.message == "Review expired; temporary association authorization was revoked."
 }
 
+/// Recovery offers Cancel for an Add until its destination applies. The
+/// daemon still refuses an Add this node did not start.
+pub(crate) fn can_cancel(progress: &NodeOperationProgress) -> bool {
+    progress.kind == NodeOperationKind::Add
+        && matches!(
+            progress.phase,
+            NodeOperationPhase::PreparingTarget
+                | NodeOperationPhase::Prepared
+                | NodeOperationPhase::Paused
+                | NodeOperationPhase::ApplyingPrimary
+                | NodeOperationPhase::RestartingPrimary
+        )
+}
+
 pub(crate) fn is_cancelled_add_cleanup_pending(
     status: &NodeControlStatus,
     progress: &NodeOperationProgress,

@@ -36,7 +36,8 @@
 #                             proceed even though the distro package is
 #                             installed — read the refusal text first
 #   PURGE_DRY_RUN=1           validate a staged bundle and pass --dry-run;
-#                             leave an existing bundle untouched
+#                             leave an existing bundle untouched. --dry-run on
+#                             the command line works the same way
 #
 # Anything else on the command line is forwarded to the installer verbatim:
 #   curl -fsSL https://get.purge.cc | sudo sh -s -- --yes --upstream 10.0.0.1:53
@@ -184,8 +185,8 @@ detect_target() {
 	aarch64 | arm64) TARGET=aarch64-unknown-linux-musl ;;
 	*) die "unsupported architecture: $m
 
-purge-warden publishes x86_64 and aarch64 builds. Build from source instead:
-    https://git.purge.cc — see BUILDING.md" ;;
+purge-warden publishes x86_64 builds only. Build from source instead:
+    https://github.com/purge-cc/Warden — see BUILDING.md" ;;
 	esac
 	[ "$(uname -s 2>/dev/null)" = Linux ] ||
 		die "purge-warden is a Linux systemd service; this host is not Linux."
@@ -267,7 +268,9 @@ download_and_verify() {
 	fetch "$BASE_URL/$VERSION/$ARTIFACT" "$WORKDIR/$ARTIFACT" ||
 		die "download failed: $BASE_URL/$VERSION/$ARTIFACT
 
-If this version exists, the build for $TARGET may not be published."
+If this version exists, the build for $TARGET may not be published.
+Releases after v0.43.0 publish x86_64 builds only. On other architectures,
+build from source: https://github.com/purge-cc/Warden — see BUILDING.md"
 	log "SHA256SUMS"
 	fetch "$BASE_URL/$VERSION/SHA256SUMS" "$WORKDIR/SHA256SUMS" ||
 		die "cannot fetch the checksum manifest — refusing to install an
@@ -437,7 +440,12 @@ run_installer() {
 	exec bash "$installer_root/scripts/install.sh" "$@"
 }
 
+# --dry-run must reach unpack_bundle too, not only the installer: without it
+# the old bundle is replaced before the installer sees the flag.
+read_dry_run_flag() { for arg do case $arg in --dry-run) DRY_RUN=1 ;; esac; done; }
+
 main() {
+	read_dry_run_flag "$@"
 	require_root
 	require_tools
 	check_no_distro_package

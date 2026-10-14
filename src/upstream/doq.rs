@@ -321,7 +321,7 @@ impl Upstream for DoqUpstream {
 
         let mut last_err = None;
         for idx in 0..self.servers.len() {
-            tracing::debug!(server = %self.servers[idx].addr, domain = %name, "DoQ lookup");
+            tracing::debug!(server = %self.servers[idx].addr, domain = %name.to_ascii(), "DoQ lookup");
             match self.try_server(idx, &query_bytes, &expected).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {

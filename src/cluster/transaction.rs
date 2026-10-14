@@ -27,7 +27,11 @@ const PUBLISH_OPERATION: &str = "cluster.artifact.publish";
 const OPERATOR_OPERATION: &str = "operator_rules.batch.v1";
 
 /// File identity bound to a before inventory or verified transaction evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Equality ignores `device`, which is not stable across boots; `device` stays
+/// in the record format. Accepted ceiling: another filesystem of the same type
+/// mounted in place with the same inodes matches, and so does a btrfs snapshot
+/// of the config subvolume swapped in place.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemberIdentity {
     pub sha256: String,
@@ -40,8 +44,9 @@ pub(crate) struct MemberIdentity {
 }
 
 /// Before identity exposed by the verified receipt accessor and checked against
-/// the complete identity already recorded by the ownership baseline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// the complete identity already recorded by the ownership baseline. Equality
+/// ignores `device`, as for [`MemberIdentity`].
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemberBeforeState {
     pub sha256: String,
@@ -51,6 +56,28 @@ pub(crate) struct MemberBeforeState {
     pub mode: u32,
     pub device: u64,
     pub inode: u64,
+}
+
+impl PartialEq for MemberIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256
+            && self.bytes == other.bytes
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+            && self.inode == other.inode
+    }
+}
+
+impl PartialEq for MemberBeforeState {
+    fn eq(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256
+            && self.bytes == other.bytes
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+            && self.inode == other.inode
+    }
 }
 
 impl From<&MemberIdentity> for MemberBeforeState {
@@ -648,6 +675,65 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn member_identity_ignores_the_device_and_keeps_it_in_the_format() {
+        let identity = MemberIdentity {
+            sha256: "a".repeat(64),
+            bytes: 12,
+            uid: 0,
+            gid: 0,
+            mode: 0o640,
+            device: 1,
+            inode: 5,
+        };
+        let moved = MemberIdentity {
+            device: 2,
+            ..identity.clone()
+        };
+        assert_eq!(identity, moved);
+        assert_eq!(
+            MemberBeforeState::from(&identity),
+            MemberBeforeState::from(&moved)
+        );
+        for changed in [
+            MemberIdentity {
+                inode: 6,
+                ..identity.clone()
+            },
+            MemberIdentity {
+                sha256: "b".repeat(64),
+                ..identity.clone()
+            },
+            MemberIdentity {
+                bytes: 13,
+                ..identity.clone()
+            },
+            MemberIdentity {
+                uid: 1,
+                ..identity.clone()
+            },
+            MemberIdentity {
+                gid: 1,
+                ..identity.clone()
+            },
+            MemberIdentity {
+                mode: 0o600,
+                ..identity.clone()
+            },
+        ] {
+            assert_ne!(identity, changed);
+            assert_ne!(
+                MemberBeforeState::from(&identity),
+                MemberBeforeState::from(&changed)
+            );
+        }
+        assert_eq!(serde_json::to_value(&identity).unwrap()["device"], 1);
+        assert_eq!(
+            serde_json::to_value(MemberBeforeState::from(&identity)).unwrap()["device"],
+            1
+        );
+    }
 
     #[test]
     fn recorded_identity_requires_every_field_or_none() {

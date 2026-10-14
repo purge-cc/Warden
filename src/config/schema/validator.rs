@@ -8,7 +8,7 @@
 //! handles everything the type system cannot express on its own.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use time::OffsetDateTime;
 
@@ -164,6 +164,7 @@ pub fn validate_collect_for_schema(
     check_upstream_servers(config, &mut errs);
     check_backup(config, &mut errs);
     check_blocklists(config, &mut errs, warns, secrets);
+    check_ip_blocklists(config, &mut errs);
     check_custom_lists(config, &mut errs);
     check_profiles(config, &blocklist_ids, &admin_rule_ids, &mut errs, warns);
     check_devices(
@@ -680,10 +681,10 @@ pub const SECURITY_TUNNELING_WINDOW_ZERO: &str =
 
 // ── `[anti_bypass]` enabled with nothing to enforce ──────────
 //
-// `AntiBypassConfig::default()` is `enabled = true, extra_domains = []`,
-// and `warden init` never writes the section — so this is the state of
-// essentially every install. Warden ships no compiled-in seed of
-// resolver domains to fall back on, so the resulting set is empty, and
+// `AntiBypassConfig` is off by default, and an omitted `enabled` follows
+// `extra_domains`, so this state needs an explicit `enabled = true` with
+// no domains. Warden ships no compiled-in seed of resolver domains to
+// fall back on, so the resulting set is empty, and
 // `SecurityLayer::from_config` drops the checker to `None` rather than
 // make every query walk a set that cannot match. The drop is right; the
 // silence was the defect. The operator's own config asserts a protection
@@ -716,9 +717,6 @@ pub const ANTI_BYPASS_ENABLED_NO_DOMAINS: &str =
 
 /// Whether `[anti_bypass]` claims to be on while having nothing to
 /// enforce — the condition behind [`ANTI_BYPASS_ENABLED_NO_DOMAINS`].
-///
-/// Shared with the boot-time emitter in `cli::commands::start` so the two
-/// channels cannot drift onto different predicates.
 ///
 /// Deliberately narrow. `SecurityLayer::from_config` has a *second*
 /// silent drop — `security.enabled = false` discards every sub-checker,
@@ -773,10 +771,11 @@ pub const SECURITY_DISABLED_DROPS_ANTI_BYPASS: &str =
 ///
 /// Keyed on `anti_bypass.enabled` alone, **not** on `extra_domains` being
 /// non-empty. An operator with an empty list already gets
-/// [`ANTI_BYPASS_ENABLED_NO_DOMAINS`]; the two conditions overlap on the
-/// default config and that is correct — they are two different reasons
-/// the same section enforces nothing, with two different remedies, and an
-/// operator who fixes one still needs to know about the other.
+/// [`ANTI_BYPASS_ENABLED_NO_DOMAINS`]; the two conditions overlap on an
+/// enabled section with no domains and that is correct — they are two
+/// different reasons the same section enforces nothing, with two
+/// different remedies, and an operator who fixes one still needs to know
+/// about the other.
 pub fn security_master_switch_drops_anti_bypass(config: &ConfigV1) -> bool {
     !config.security.enabled && config.anti_bypass.enabled
 }
@@ -953,11 +952,11 @@ fn check_security(config: &ConfigV1, errs: &mut Vec<ConfigError>, warns: &mut Au
 ///
 /// **Never an error, deliberately.** The daemon load path aborts on any
 /// `ConfigError` and `scripts/install.sh` Phase 3.5 aborts an upgrade on
-/// any non-zero from `warden config lint` — and this is the shape of
-/// essentially every install, both live CTs included. Promoting it would
-/// take working DNS off the air at the next restart to complain about a
-/// config that serves perfectly well. The config is valid; it just does
-/// less than it says.
+/// any non-zero from `warden config lint` — and an explicit
+/// `enabled = true` with no domains is a config that loads and serves.
+/// Promoting it would take working DNS off the air at the next restart
+/// to complain about a config that serves perfectly well. The config is
+/// valid; it just does less than it says.
 ///
 /// Separate from [`check_security`] on purpose: that function returns
 /// early when `security.enabled` is false, and this diagnostic has to
@@ -1857,10 +1856,9 @@ fn check_api(config: &ConfigV1, errs: &mut Vec<ConfigError>, warns: &mut AuditWa
 // ── [[blocklists]] ─────────────────────────────────────────────
 
 /// True if a URL embeds `userinfo` (`scheme://user[:pass]@host/…`).
-/// Dependency-free authority scan (the config layer must not pull in
-/// reqwest/url): take the substring after `://`, cut it at the first
-/// `/`, `?`, or `#` to isolate the authority, and look for `@`. A `@`
-/// elsewhere in the path is correctly ignored.
+/// Plain authority scan, without a URL parser: take the substring after
+/// `://`, cut it at the first `/`, `?`, or `#` to isolate the authority, and
+/// look for `@`. A `@` elsewhere in the path is correctly ignored.
 fn url_has_embedded_userinfo(url: &str) -> bool {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     after_scheme
@@ -1943,14 +1941,10 @@ fn check_level5_refuses_everything(config: &ConfigV1, warns: &mut AuditWarnings)
     warns.push(msg);
 }
 
-/// Authority (host) of a URL, without a URL parser.
+/// Authority (host) of a URL as written, without a URL parser.
 ///
-/// Same constraint as [`url_has_embedded_userinfo`] above: the config layer
-/// must not pull in `url`/`reqwest` — those belong to the fetcher. Hand-rolled
-/// scanning is therefore the sanctioned shape here, and the drift risk it
-/// creates is answered by the cross-check test
-/// `blocklist_url_policy_agrees_with_the_fetcher`, which runs this against the
-/// real [`crate::lists::http_client::validate_list_url`].
+/// Only names the host or shows it in a diagnostic; whether the fetcher
+/// refuses it is asked of [`crate::lists::http_client::validate_list_url`].
 fn url_host_of(url: &str) -> &str {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = after_scheme
@@ -1974,58 +1968,62 @@ fn url_host_of(url: &str) -> &str {
     hostport.split_once(':').map(|(h, _)| h).unwrap_or(hostport)
 }
 
-/// Mirror of `lists::http_client::is_disallowed_ipv4`.
-fn fetch_disallowed_v4(v4: Ipv4Addr) -> bool {
-    if v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || v4.is_unspecified()
-    {
-        return true;
-    }
-    let [a, b, _, _] = v4.octets();
-    // CGNAT: 100.64.0.0/10
-    if a == 100 && (64..=127).contains(&b) {
-        return true;
-    }
-    // "this network": 0.0.0.0/8
-    a == 0
-}
-
-/// Mirror of `lists::http_client::is_disallowed_ipv6`.
-fn fetch_disallowed_v6(v6: Ipv6Addr) -> bool {
-    if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
-        return true;
-    }
-    let segs = v6.segments();
-    // ULA fc00::/7
-    if (segs[0] & 0xfe00) == 0xfc00 {
-        return true;
-    }
-    // Link-local fe80::/10
-    if (segs[0] & 0xffc0) == 0xfe80 {
-        return true;
-    }
-    // IPv4-mapped — forward, so `::ffff:127.0.0.1` is caught like `127.0.0.1`.
-    if let Some(v4) = v6.to_ipv4_mapped() {
-        return fetch_disallowed_v4(v4);
-    }
-    false
-}
-
-/// True when `host` is an IP literal the fetcher refuses to dial.
+/// True when the fetcher (`lists::http_client::validate_list_url`) refuses the
+/// URL's host as a disallowed address, read the way `Url::parse` reads it: an
+/// IPv4 shorthand such as `127.1` counts like `127.0.0.1`. An `http://` URL is
+/// judged as its `https://` twin, since cleartext has a warning of its own.
 ///
 /// A DNS name returns `false`: resolving it here would be a network call in
 /// the validator, and the fetcher's own guard re-checks the resolved address
 /// anyway. This aligns the *statically decidable* half of the policy, which is
 /// the half a lint can honestly own.
-fn host_is_unfetchable(host: &str) -> bool {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => fetch_disallowed_v4(v4),
-        Ok(IpAddr::V6(v6)) => fetch_disallowed_v6(v6),
-        Err(_) => false,
+fn url_host_is_unfetchable(url: &str) -> bool {
+    use crate::lists::http_client::{validate_list_url, UrlGuardError};
+    let https = url
+        .strip_prefix("http://")
+        .map(|rest| format!("https://{rest}"));
+    matches!(
+        validate_list_url(https.as_deref().unwrap_or(url)),
+        Err(UrlGuardError::DisallowedHost(_))
+    )
+}
+
+/// `[ip_blocklists] sources` follow the fetcher rule
+/// (`lists::http_client::validate_list_url`). The daemon skips a source that
+/// breaks it with a warning, so an enabled list could filter nothing while
+/// lint passes; refusing it here also stops the upgrade precheck. The URL is
+/// not echoed: it may carry a credential.
+fn check_ip_blocklists(config: &ConfigV1, errs: &mut Vec<ConfigError>) {
+    use crate::lists::http_client::{validate_list_url, UrlGuardError};
+    if !config.ip_blocklists.enabled {
+        return;
+    }
+    for (i, url) in config.ip_blocklists.sources.iter().enumerate() {
+        let problem = if !url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            "must use https://"
+        } else if url_has_embedded_userinfo(url) {
+            "must not embed credentials"
+        } else if url_host_of(url).is_empty() {
+            "must name a host"
+        } else {
+            // The fetcher's own check, on the host `Url::parse` reads: an IPv4
+            // shorthand such as `127.1` is refused like `127.0.0.1`.
+            match validate_list_url(url) {
+                Ok(()) => continue,
+                Err(UrlGuardError::DisallowedHost(_)) => {
+                    "must not name a private or non-public address"
+                }
+                Err(_) => "must have a valid host and port",
+            }
+        };
+        errs.push(ConfigError::ValidationFailed(
+            ErrorContext::new(format!("ip_blocklists.sources[{i}] {problem}"))
+                .with_entity(format!("ip_blocklists.sources[{i}]"))
+                .with_suggestion("use an https:// URL or remove the source".to_string()),
+        ));
     }
 }
 
@@ -2052,8 +2050,8 @@ fn check_blocklists(
         // `auth_token_ref` (a token from secrets.toml). The fetcher already
         // refuses these (`lists::http_client::validate_list_url`); aligning the
         // validator closes the lint-clean-but-can't-fetch split. The URL is
-        // NOT echoed (it carries the credential). Dependency-free authority
-        // scan — the config layer must not pull in reqwest/url.
+        // NOT echoed (it carries the credential). A plain authority scan;
+        // `blocklist_url_policy_agrees_with_the_fetcher` keeps it in step.
         if url_has_embedded_userinfo(&b.url) {
             errs.push(ConfigError::ValidationFailed(
                 ErrorContext::new(format!(
@@ -2083,9 +2081,8 @@ fn check_blocklists(
             }
             warns.push(msg);
         }
-        let host = url_host_of(&b.url);
-        if host_is_unfetchable(host) {
-            let msg = format_blocklist_url_unfetchable_host(b.id.as_str(), host);
+        if url_host_is_unfetchable(&b.url) {
+            let msg = format_blocklist_url_unfetchable_host(b.id.as_str(), url_host_of(&b.url));
             if warns.emit() {
                 tracing::warn!(target: "audit", blocklist = %b.id.as_str(), "{msg}");
             }

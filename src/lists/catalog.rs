@@ -333,7 +333,7 @@ impl Catalog {
     /// file's shape and the wire `index.json` safe rather than fatal.
     pub fn load_from_disk(dir: &Path) -> Option<Self> {
         let path = dir.join(Self::DISK_FILENAME);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match Self::read_disk_file(dir) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
@@ -355,6 +355,61 @@ impl Catalog {
                 None
             }
         }
+    }
+
+    /// Read [`Self::DISK_FILENAME`] from `dir` without following a symlink
+    /// at `dir` or at the file, without opening anything but a singly linked
+    /// regular file for data, and without reading more than
+    /// [`CATALOG_BODY_MAX_BYTES`]. The daemon user owns the state directory
+    /// that holds the lists cache dir, and root reaches this read through
+    /// config preflight. As in `state_dir::open_for_root`, `dir`'s parent
+    /// (the state directory) is resolved and opened without following
+    /// symlinks; `dir` and the file are reached only through no-follow
+    /// `open_at`.
+    ///
+    /// ponytail: anchors at `dir`'s parent, exact for the default
+    /// single-component `cache_dir`. A nested `cache_dir` still resolves its
+    /// middle components; pass the state directory in if nested ones ship.
+    ///
+    /// ponytail: shares the `index.json` cap; the file is about 3 KB today.
+    /// Filling absent fields can grow a near-cap body past it, which loads
+    /// as a cache miss (a fetch). Give the file its own cap if catalogs
+    /// ever approach 1 MiB.
+    fn read_disk_file(dir: &Path) -> std::io::Result<Vec<u8>> {
+        use crate::config::{state_dir, tree_io, write_lock};
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        let parent = write_lock::resolve_path(parent)
+            .and_then(|resolved| state_dir::open_directory(&resolved))
+            .map_err(|e| e.downcast().unwrap_or_else(std::io::Error::other))?;
+        let lists = write_lock::open_at(&parent, name, libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let inspected = tree_io::inspect_at(&lists, std::ffi::OsStr::new(Self::DISK_FILENAME))?
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        let meta = inspected.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(
+                "persisted catalog is not a regular file",
+            ));
+        }
+        if meta.nlink() != 1 {
+            return Err(std::io::Error::other(
+                "persisted catalog is not singly linked",
+            ));
+        }
+        let mut bytes = Vec::new();
+        write_lock::reopen_inspected(&inspected, libc::O_RDONLY)?
+            .take(CATALOG_BODY_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > CATALOG_BODY_MAX_BYTES {
+            return Err(std::io::Error::other(format!(
+                "persisted catalog exceeds {CATALOG_BODY_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(bytes)
     }
 
     /// Resolve a list ID (e.g. "privacy/ads") to its download URL.
@@ -1028,12 +1083,111 @@ mod tests {
             10_000,
             Some(dir.path().to_path_buf()),
         );
-        mgr.cleanup_stale_caches();
+        mgr.cleanup_stale_caches(Duration::ZERO);
 
         assert!(
             Catalog::load_from_disk(dir.path()).is_some(),
             "cleanup_stale_caches must not eat the catalog — check the filename \
              suffix, it must be neither .cache nor .meta"
         );
+    }
+
+    /// Run `load_from_disk` on a thread so a blocking open fails the test
+    /// instead of hanging it.
+    fn load_within_deadline(dir: &Path) -> Option<Catalog> {
+        let dir = dir.to_path_buf();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sent.send(Catalog::load_from_disk(&dir));
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load_from_disk must not block on the persisted catalog")
+    }
+
+    /// The daemon user can write the lists cache dir: a symlink planted at
+    /// the catalog name must not be followed, even to a valid catalog.
+    #[test]
+    fn symlinked_catalog_on_disk_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        Catalog::fallback()
+            .save_to_disk(elsewhere.path())
+            .expect("save");
+        std::os::unix::fs::symlink(
+            elsewhere.path().join(Catalog::DISK_FILENAME),
+            dir.path().join(Catalog::DISK_FILENAME),
+        )
+        .unwrap();
+        assert!(load_within_deadline(dir.path()).is_none());
+    }
+
+    /// A FIFO at the catalog name is refused at once, not read.
+    #[test]
+    fn fifo_catalog_on_disk_is_none_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(Catalog::DISK_FILENAME);
+        let fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(load_within_deadline(dir.path()).is_none());
+    }
+
+    /// A valid catalog padded past the cap is refused, not read whole.
+    #[test]
+    fn oversized_catalog_on_disk_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = serde_json::to_vec(Catalog::fallback().entries()).unwrap();
+        body.resize(CATALOG_BODY_MAX_BYTES + 1, b' ');
+        std::fs::write(dir.path().join(Catalog::DISK_FILENAME), body).unwrap();
+        assert!(load_within_deadline(dir.path()).is_none());
+    }
+
+    /// The daemon user owns the state directory: a symlink swapped in for
+    /// the lists cache dir must not be followed, even to a valid catalog.
+    #[test]
+    fn symlinked_lists_dir_is_none() {
+        let state = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        Catalog::fallback()
+            .save_to_disk(elsewhere.path())
+            .expect("save");
+        let lists = state.path().join("lists");
+        std::os::unix::fs::symlink(elsewhere.path(), &lists).unwrap();
+        assert!(load_within_deadline(&lists).is_none());
+    }
+
+    /// A second name for the catalog inode is refused, as for the PID lease.
+    #[test]
+    fn hard_linked_catalog_on_disk_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        Catalog::fallback().save_to_disk(dir.path()).expect("save");
+        std::fs::hard_link(
+            dir.path().join(Catalog::DISK_FILENAME),
+            dir.path().join("second-name"),
+        )
+        .unwrap();
+        assert!(load_within_deadline(dir.path()).is_none());
+    }
+
+    /// A directory at the catalog name is refused as one, before any data
+    /// open. The link count alone refuses it only where directories count
+    /// more than one link.
+    #[test]
+    fn directory_at_catalog_name_is_none_without_data_open() {
+        use crate::config::write_lock::{with_test_hook, TestEvent};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(Catalog::DISK_FILENAME)).unwrap();
+        let refused = with_test_hook(
+            |event| assert!(event != TestEvent::BeforeDataOpen),
+            || Catalog::read_disk_file(dir.path()).unwrap_err(),
+        );
+        assert!(
+            refused.to_string().contains("not a regular file"),
+            "{refused}"
+        );
+        assert!(Catalog::load_from_disk(dir.path()).is_none());
     }
 }

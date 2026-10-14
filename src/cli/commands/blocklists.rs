@@ -46,7 +46,12 @@ use crate::config::secrets::secrets_path_for;
 
 #[cfg(test)]
 tokio::task_local! {
-    static PROBE_TIMEOUT_OVERRIDE: std::time::Duration;
+    /// Holds the add probe open: it notifies `.0`, then returns Ok once `.1`
+    /// is notified, so a test can race a write against it with no network.
+    static PROBE_HOLD: (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    );
 }
 use crate::ipc::protocol::{IpcCommand, IpcResponse};
 use crate::ipc::socket_client::send_command;
@@ -930,8 +935,9 @@ pub async fn run_add_silent_with_direction(
     // core repeats these checks for callers that already hold a tree lock.
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
     if !is_url_source(url) {
-        bail!("url must start with http:// or https:// — got \"{url}\"");
+        bail!("url must start with https:// — got \"{url}\"");
     }
+    ensure_fetchable_list_url(url)?;
     if let Some(format) = format {
         parse_format(format)?;
     }
@@ -1037,8 +1043,9 @@ pub(crate) fn run_add_silent_with_direction_locked(
 ) -> anyhow::Result<AddWriteOutcome> {
     let _ = Id::new(id).map_err(|e| anyhow::anyhow!("invalid id: {e}"))?;
     if !is_url_source(url) {
-        bail!("url must start with http:// or https:// — got \"{url}\"");
+        bail!("url must start with https:// — got \"{url}\"");
     }
+    ensure_fetchable_list_url(url)?;
     let parsed_format = match format {
         Some(f) => Some(parse_format(f)?),
         None => None,
@@ -1266,18 +1273,35 @@ pub async fn run_remove(
     // get a uniform "remove of absent" exit code across the entity verbs.
     // If the config won't load, fall through and let run_remove_silent
     // surface the real error.
-    let cascade_log = {
+    let (cascade_log, kept_body) = {
         let guard = crate::config::write_lock::acquire_for_write(config_path)?;
         let now = time::OffsetDateTime::now_utc();
-        let exists =
+        let row_url =
             load_config_for_schema_under_guard(&guard, config_path, TARGET_SCHEMA_VERSION_V5, now)
-                .map(|l| l.config.blocklists.iter().any(|b| b.id.as_str() == id))
-                .unwrap_or(true);
-        if !exists {
+                .map(|l| {
+                    l.config
+                        .blocklists
+                        .into_iter()
+                        .find(|b| b.id.as_str() == id)
+                        .map(|b| b.url)
+                });
+        if let Ok(None) = row_url {
             println!("blocklist \"{id}\" not found — nothing to remove");
             return Ok(());
         }
-        run_remove_silent_locked(&guard, config_path, id, into, false)?
+        // The import-local body stays: it may hold the only copy of the
+        // operator's edits, and another row may name the same file.
+        let kept_body = row_url
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(super::config::relocate::imported_local_name)
+            .map(|name| guard.identity().root.join("lists").join(name))
+            .filter(|path| path.exists());
+        (
+            run_remove_silent_locked(&guard, config_path, id, into, false)?,
+            kept_body,
+        )
     };
     let reload_outcome = ipc_reload::attempt_reload(socket_path).await;
     let outcome = RemoveOutcome {
@@ -1288,6 +1312,13 @@ pub async fn run_remove(
         println!("{line}");
     }
     println!("removed blocklist {id}");
+    if let Some(body) = kept_body {
+        println!(
+            "note: kept the import-local body {}; delete it by hand if you no longer need it. \
+             A later import-local of a different file under the same id refuses while it exists.",
+            body.display()
+        );
+    }
     ipc_reload::report_reload_outcome(&outcome.reload_outcome);
     Ok(())
 }
@@ -1608,8 +1639,9 @@ where
         }
         "url" => {
             if !is_url_source(value) {
-                bail!("url must start with http:// or https://");
+                bail!("url must start with https://");
             }
+            ensure_fetchable_list_url(value)?;
             // Mirror `add`'s dedup gate (run_add_silent, above): refuse to
             // point this list at a URL already owned by a *different*
             // blocklist, otherwise `set url` could silently create two
@@ -1726,15 +1758,31 @@ fn parse_format(s: &str) -> anyhow::Result<BlocklistFormat> {
     }
 }
 
+/// Refuse a list URL the downloader would refuse
+/// ([`validate_list_url`](crate::lists::http_client::validate_list_url)):
+/// such a row is saved and then never downloads. The validator only warns,
+/// so a hand-written row of this kind still loads.
+pub(crate) fn ensure_fetchable_list_url(url: &str) -> anyhow::Result<()> {
+    crate::lists::http_client::validate_list_url(url).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. The list downloader fetches only public https:// URLs; for a file on \
+             this host use warden blocklist import-local <path> --id <id> \
+             --kind <deny|allow|ignore>"
+        )
+    })
+}
+
 /// TUI-facing entry point for
 /// the reachability probe. The TUI Add modal calls this
 /// directly before invoking the per-mode write pipeline so the
 /// inline error message reads identically to the CLI form. Empty
-/// URL is a no-op success (caller already validated the format).
+/// URL is a no-op success (caller already validated the format). A URL
+/// the downloader would refuse is refused here, before any network call.
 pub async fn probe_url_for_tui(url: &str) -> anyhow::Result<()> {
     if url.is_empty() {
         return Ok(());
     }
+    ensure_fetchable_list_url(url)?;
     probe_url_reachable(url).await
 }
 
@@ -1752,11 +1800,18 @@ pub async fn probe_url_for_tui(url: &str) -> anyhow::Result<()> {
 async fn probe_url_reachable(url: &str) -> anyhow::Result<()> {
     use crate::config::schema::validator::format_list_url_not_reachable;
 
+    #[cfg(test)]
+    if let Ok((seen, release)) = PROBE_HOLD.try_with(|hold| hold.clone()) {
+        seen.notify_one();
+        release.notified().await;
+        return Ok(());
+    }
+
     // Build the probe client through the shared list-client builder so the
     // pre-flight uses the same User-Agent / redirect / TLS policy as the
     // daemon's real fetch — a bare reqwest client could pass or fail
     // differently from the actual download. Keep the short 3s probe timeout.
-    let timeout = probe_timeout();
+    let timeout = std::time::Duration::from_secs(3);
     let client = crate::lists::http_client::build_list_client(timeout)
         .map_err(|e| anyhow::anyhow!("{}", format_list_url_not_reachable(url, &e.to_string())))?;
 
@@ -1789,15 +1844,6 @@ async fn probe_url_reachable(url: &str) -> anyhow::Result<()> {
             bail!("{}", format_list_url_not_reachable(url, &detail));
         }
     }
-}
-
-fn probe_timeout() -> std::time::Duration {
-    #[cfg(test)]
-    if let Ok(timeout) = PROBE_TIMEOUT_OVERRIDE.try_with(|timeout| *timeout) {
-        return timeout;
-    }
-
-    std::time::Duration::from_secs(3)
 }
 
 /// Wire token for a format, delegated to the schema enum.

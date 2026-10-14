@@ -745,7 +745,14 @@ async fn export(
             .map_err(storage)?
         );
     } else {
-        std::io::stdout().write_all(&bytes).map_err(storage)?;
+        let mut stdout = std::io::stdout();
+        match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+            Ok(()) => {}
+            // A closed stdout (`… export <id> | head`) exits 141 with no
+            // text, as the closed-stdout hook in `main` does for `println!`.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(141),
+            Err(error) => return Err(storage(error)),
+        }
     }
     Ok(EXIT_OK)
 }
@@ -854,6 +861,14 @@ fn print_error(error: &OperatorRulesError, json: bool) -> anyhow::Result<()> {
 fn receipt_exit(receipt: &Receipt) -> i32 {
     match (receipt.persistence, receipt.changed) {
         (PersistenceState::Committed, false) => EXIT_OK,
+        (PersistenceState::Committed, true)
+            if matches!(
+                receipt.activation.state.as_str(),
+                "applied" | "not_required"
+            ) =>
+        {
+            EXIT_OK
+        }
         (PersistenceState::Committed | PersistenceState::DurabilityUncertain, true) => {
             EXIT_COMMITTED_PENDING
         }
@@ -981,6 +996,23 @@ mod tests {
             diagnostics: vec![],
         };
         assert_eq!(receipt_exit(&receipt), 5);
+        // A committed change is done once it is live or needs no activation;
+        // every other state still owes the operator a check.
+        for (state, code) in [
+            ("applied", 0),
+            ("not_required", 0),
+            ("pending", 5),
+            ("failed", 5),
+            ("unknown", 5),
+            ("superseded", 5),
+        ] {
+            receipt.activation.state = state.into();
+            assert_eq!(receipt_exit(&receipt), code, "{state}");
+        }
+        receipt.activation.state = "applied".into();
+        receipt.persistence = PersistenceState::DurabilityUncertain;
+        assert_eq!(receipt_exit(&receipt), 5);
+        receipt.persistence = PersistenceState::Committed;
         receipt.changed = false;
         assert_eq!(receipt_exit(&receipt), 0);
         receipt.persistence = PersistenceState::Aborted;

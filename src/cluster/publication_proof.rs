@@ -37,7 +37,12 @@ impl Content {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Identity of a member or parent directory in a preparation proof. Equality
+/// compares inode, owner and mode but not `device`, which is not stable across
+/// boots; `device` stays in the proof format. Accepted ceiling: another
+/// filesystem of the same type mounted in place with the same inodes matches,
+/// and so does a btrfs snapshot of the config subvolume swapped in place.
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Inode {
     device: u64,
@@ -45,6 +50,13 @@ struct Inode {
     uid: u32,
     gid: u32,
     mode: u32,
+}
+
+impl PartialEq for Inode {
+    fn eq(&self, other: &Self) -> bool {
+        (self.inode, self.uid, self.gid, self.mode)
+            == (other.inode, other.uid, other.gid, other.mode)
+    }
 }
 
 impl Inode {
@@ -409,4 +421,41 @@ fn insert_parent(
         "publication proof parent limit exceeded"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inode_identity_ignores_the_device_and_keeps_it_in_the_format() {
+        let inode = |device, inode, mode| Inode {
+            device,
+            inode,
+            uid: 0,
+            gid: 0,
+            mode,
+        };
+        assert_eq!(inode(1, 5, 0o640), inode(2, 5, 0o640));
+        assert_ne!(inode(1, 5, 0o640), inode(1, 6, 0o640));
+        assert_ne!(inode(1, 5, 0o640), inode(1, 5, 0o600));
+        assert_ne!(
+            inode(1, 5, 0o640),
+            Inode {
+                uid: 1,
+                ..inode(1, 5, 0o640)
+            }
+        );
+        assert_ne!(
+            inode(1, 5, 0o640),
+            Inode {
+                gid: 1,
+                ..inode(1, 5, 0o640)
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(inode(1, 5, 0o640)).unwrap(),
+            serde_json::json!({"device": 1, "inode": 5, "uid": 0, "gid": 0, "mode": 0o640})
+        );
+    }
 }

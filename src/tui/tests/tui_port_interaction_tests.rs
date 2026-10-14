@@ -781,3 +781,45 @@ async fn restore_row_click_selects_and_restore_button_opens_confirmation() {
         matches!(&app.settings.restore_modal.as_ref().unwrap().stage, RestoreStage::Confirming { point } if point.date == "second")
     );
 }
+
+#[tokio::test]
+async fn double_click_on_choose_does_not_confirm_the_restore_at_80x24() {
+    use backup_restore_modal::{RestoreModal, RestorePoint, RestoreStage};
+    let temp = tempfile::tempdir().unwrap();
+    let poller = IpcPoller::new(&temp.path().join("absent.sock"));
+    let path = temp.path().join("config.toml");
+    let mut app = App::known_standalone_for_test();
+    app.active_leaf = Leaf::Settings;
+    app.settings.restore_modal = Some(RestoreModal {
+        stage: RestoreStage::Picking {
+            entries: ["first", "second"]
+                .into_iter()
+                .map(|name| RestorePoint {
+                    path: temp.path().join(name),
+                    date: name.into(),
+                    age: "recent".into(),
+                    size: "1 KiB".into(),
+                })
+                .collect(),
+            selected: 0,
+        },
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let row = click_text(terminal.backend().buffer(), "second");
+    handle_mouse(&mut app, row, &poller, &path).await;
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let choose = click_text(terminal.backend().buffer(), "Choose");
+    handle_mouse(&mut app, choose, &poller, &path).await;
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    assert_eq!(
+        mouse::action(&app, choose),
+        Some(mouse::MouseAction::OverlayKey(KeyCode::Char('y').into())),
+        "at 80x24 Restore sits where Choose was"
+    );
+    handle_mouse(&mut app, choose, &poller, &path).await;
+    assert!(
+        matches!(&app.settings.restore_modal.as_ref().unwrap().stage, RestoreStage::Confirming { point } if point.date == "second")
+    );
+    assert!(app.pending_action.is_none());
+}

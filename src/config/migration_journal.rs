@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::atomic_write::{hardened_atomic_write_at, AtomicWriteAtOpts};
+use super::policy_transaction::SETUP_MARKER;
 use super::tree_io::{
     inspect_at, rename_noreplace_at, same_inode, CappedRead, PinnedTarget, TargetPlan, TreeIo,
 };
@@ -24,6 +25,8 @@ pub(crate) const CLEANUP_DIR_PREFIX: &str = ".warden-migration.cleanup-";
 pub(crate) const FINALIZED_DIR_PREFIX: &str = ".warden-migration.finalized-";
 pub(crate) const JOURNAL_NAME: &str = "journal.json";
 pub(crate) const JOURNAL_FORMAT_VERSION: u64 = 1;
+/// Section of docs/UPGRADE_RECOVERY.md that fence and boot refusals cite.
+pub(crate) const POLICY_RECOVERY_SECTION: &str = "Interrupted policy transactions";
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 const ORIGINALS_DIR_NAME: &str = "originals";
 const JOURNAL_STAGE_NAME: &str = "journal.staging";
@@ -572,6 +575,8 @@ pub(crate) enum FenceState {
     Empty,
     // The recovery layer must validate the full manifest before using it.
     Journal,
+    // A format2 setup marker or journal: policy_transaction owns recovery.
+    PolicyTransaction { schema_migration: bool },
     Invalid(String),
 }
 
@@ -601,7 +606,19 @@ pub(crate) fn inspect(tree: TreeIo<'_>) -> anyhow::Result<FenceState> {
     }
     let journal = match open_at(&dir, OsStr::new(JOURNAL_NAME), libc::O_PATH, 0) {
         Ok(journal) => journal,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FenceState::Empty),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(
+                match open_at(&dir, OsStr::new(SETUP_MARKER), libc::O_PATH, 0) {
+                    Ok(_) => FenceState::PolicyTransaction {
+                        schema_migration: false,
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => FenceState::Empty,
+                    Err(e) => FenceState::Invalid(format!(
+                        "cannot open setup marker without following symlinks: {e}"
+                    )),
+                },
+            )
+        }
         Err(e) => {
             return Ok(FenceState::Invalid(format!(
                 "cannot open journal without following symlinks: {e}"
@@ -628,6 +645,21 @@ pub(crate) fn inspect(tree: TreeIo<'_>) -> anyhow::Result<FenceState> {
     if bytes.len() as u64 > MAX_JOURNAL_BYTES {
         return Ok(FenceState::Invalid("journal exceeds size limit".into()));
     }
+    // Only name the owner here; policy_transaction validates the journal.
+    if let Ok(peek) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if peek
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(super::policy_transaction::FORMAT_VERSION)
+        {
+            let kind = peek
+                .pointer("/receipt/operation_manifest/kind")
+                .and_then(serde_json::Value::as_str);
+            return Ok(FenceState::PolicyTransaction {
+                schema_migration: kind == Some("v4_to_v5_migration"),
+            });
+        }
+    }
     let master = identity
         .canonical_master
         .file_name()
@@ -638,22 +670,64 @@ pub(crate) fn inspect(tree: TreeIo<'_>) -> anyhow::Result<FenceState> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("unfinished v3-to-v4 migration at {journal}; run `warden migrate v3-to-v4 --from-config {master}` to recover ({detail})")]
+#[derive(Debug)]
 pub(crate) struct FenceRefusal {
     pub(crate) journal: PathBuf,
     master: String,
     detail: String,
+    kind: FenceKind,
 }
+
+#[derive(Debug)]
+enum FenceKind {
+    Legacy,
+    Policy,
+    SchemaMigration,
+}
+
+impl std::fmt::Display for FenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            journal,
+            master,
+            detail,
+            kind,
+        } = self;
+        let fence = journal.parent().unwrap_or(journal).display();
+        let journal = journal.display();
+        match kind {
+            FenceKind::Legacy => write!(f, "unfinished v3-to-v4 migration at {journal}; run `warden migrate v3-to-v4 --from-config {master}` to recover ({detail})"),
+            FenceKind::Policy => write!(f, "unfinished policy transaction at {fence}; restart purge-warden so boot recovery finishes it. Do not delete the fence. See \"{POLICY_RECOVERY_SECTION}\" in docs/UPGRADE_RECOVERY.md ({detail})"),
+            FenceKind::SchemaMigration => write!(f, "unfinished v4-to-v5 migration at {fence}; run the same `warden --config {master} migrate v4-to-v5 --apply-plan <plan> --expect-plan-hash <hash>` again with the retained plan. Do not delete the fence. See \"Manual schema-4 recovery\" in docs/UPGRADE_RECOVERY.md ({detail})"),
+        }
+    }
+}
+
+impl std::error::Error for FenceRefusal {}
 
 pub(crate) fn refuse_normal_access(tree: TreeIo<'_>) -> anyhow::Result<()> {
     let identity = tree.identity;
+    let mut kind = FenceKind::Legacy;
     let detail = match inspect(tree) {
         Ok(FenceState::Absent) => return Ok(()),
         Ok(FenceState::Empty) => "fixed fence exists without a canonical journal".into(),
         Ok(FenceState::Journal) => "journal requires recovery validation".into(),
-        Ok(FenceState::Invalid(reason)) => reason,
-        Err(e) => format!("cannot safely inspect migration fence: {e:#}"),
+        Ok(FenceState::PolicyTransaction { schema_migration }) => {
+            kind = if schema_migration {
+                FenceKind::SchemaMigration
+            } else {
+                FenceKind::Policy
+            };
+            "policy transaction requires recovery".into()
+        }
+        Ok(FenceState::Invalid(reason)) => {
+            kind = untrusted_fence_kind(tree.root);
+            reason
+        }
+        Err(e) => {
+            kind = untrusted_fence_kind(tree.root);
+            format!("cannot safely inspect migration fence: {e:#}")
+        }
     };
     let master = identity.canonical_master.to_string_lossy();
     let master = format!("'{}'", master.replace('\'', "'\\''"));
@@ -661,8 +735,26 @@ pub(crate) fn refuse_normal_access(tree: TreeIo<'_>) -> anyhow::Result<()> {
         journal: identity.txn_dir.join(JOURNAL_NAME),
         master,
         detail,
+        kind,
     }
     .into())
+}
+
+/// Every format2 fence holds the setup marker and a v3-to-v4 fence never
+/// does, so the marker names the owner of a fence that inspect cannot trust.
+fn untrusted_fence_kind(root: &File) -> FenceKind {
+    let marker = open_at(
+        root,
+        OsStr::new(TXN_DIR_NAME),
+        libc::O_PATH | libc::O_DIRECTORY,
+        0,
+    )
+    .and_then(|fence| open_at(&fence, OsStr::new(SETUP_MARKER), libc::O_PATH, 0));
+    if marker.is_ok() {
+        FenceKind::Policy
+    } else {
+        FenceKind::Legacy
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2405,6 +2497,91 @@ mod tests {
             assert!(refuse_normal_access(guard.tree_io()).is_err());
             assert_eq!(std::fs::read_to_string(&journal).unwrap(), bytes);
         }
+    }
+
+    fn fence_refusal_with(name: &str, bytes: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&dir.path().join("config.toml")).unwrap();
+        create_fence(&guard).unwrap();
+        let path = guard.identity().txn_dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = refuse_normal_access(guard.tree_io()).unwrap_err();
+        assert!(error.downcast_ref::<FenceRefusal>().is_some());
+        error.to_string()
+    }
+
+    #[test]
+    fn format2_journal_fence_refusal_names_policy_recovery() {
+        let error = fence_refusal_with(JOURNAL_NAME, r#"{"format_version":2}"#);
+        assert!(error.contains("unfinished policy transaction"), "{error}");
+        assert!(error.contains(POLICY_RECOVERY_SECTION), "{error}");
+        assert!(!error.contains("v3-to-v4"), "{error}");
+        // Plan and other reads refuse on the fence, so a rerun may refuse
+        // again; a restart always runs boot recovery.
+        assert!(error.contains("restart purge-warden"), "{error}");
+        assert!(!error.contains("rerun"), "{error}");
+    }
+
+    #[test]
+    fn setup_only_fence_refusal_names_policy_recovery() {
+        let error = fence_refusal_with(SETUP_MARKER, "2\n");
+        assert!(error.contains("unfinished policy transaction"), "{error}");
+        assert!(error.contains(POLICY_RECOVERY_SECTION), "{error}");
+        assert!(!error.contains("v3-to-v4"), "{error}");
+    }
+
+    #[test]
+    fn unsafe_format2_fence_refusal_names_policy_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_for_migration(&dir.path().join("config.toml")).unwrap();
+        create_fence(&guard).unwrap();
+        let fence = &guard.identity().txn_dir;
+        let journal = fence.join(JOURNAL_NAME);
+        std::fs::write(&journal, r#"{"format_version":2}"#).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let refusal = || {
+            refuse_normal_access(guard.tree_io())
+                .unwrap_err()
+                .to_string()
+        };
+        // Without the setup marker the fence may be a v3-to-v4 one.
+        let error = refusal();
+        assert!(error.contains("v3-to-v4"), "{error}");
+        let marker = fence.join(SETUP_MARKER);
+        std::fs::write(&marker, "2\n").unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for (fence_mode, journal_mode) in [(0o700, 0o640), (0o750, 0o600)] {
+            std::fs::set_permissions(fence, std::fs::Permissions::from_mode(fence_mode)).unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(journal_mode))
+                .unwrap();
+            assert!(matches!(
+                inspect(guard.tree_io()).unwrap(),
+                FenceState::Invalid(_)
+            ));
+            let error = refusal();
+            assert!(error.contains("unfinished policy transaction"), "{error}");
+            assert!(error.contains("unsafe"), "{error}");
+            assert!(!error.contains("v3-to-v4"), "{error}");
+        }
+    }
+
+    #[test]
+    fn v4_to_v5_fence_refusal_names_manual_recovery() {
+        let error = fence_refusal_with(
+            JOURNAL_NAME,
+            r#"{"format_version":2,"receipt":{"operation_manifest":{"kind":"v4_to_v5_migration"}}}"#,
+        );
+        assert!(error.contains("migrate v4-to-v5"), "{error}");
+        assert!(error.contains("Manual schema-4 recovery"), "{error}");
+        assert!(!error.contains("v3-to-v4"), "{error}");
+    }
+
+    #[test]
+    fn recovery_doc_has_cited_headings() {
+        let doc = include_str!("../../docs/UPGRADE_RECOVERY.md");
+        assert!(doc.contains(&format!("\n## {POLICY_RECOVERY_SECTION}\n")));
+        assert!(doc.contains("\n## Manual schema-4 recovery\n"));
     }
 
     #[test]

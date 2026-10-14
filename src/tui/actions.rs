@@ -265,6 +265,10 @@ pub(super) fn render_saving(frame: &mut ratatui::Frame, app: &App) {
     }
     let area = ratatui::layout::Rect::new(area.x, area.bottom() - 1, area.width, 1);
     frame.render_widget(ratatui::widgets::Clear, area);
+    frame.buffer_mut().set_style(
+        area,
+        ratatui::style::Style::default().bg(super::theme::T.bg_main),
+    );
     let label = pending.written.as_deref().unwrap_or(&pending.label);
     let version = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
     let version_width = version.len() as u16;

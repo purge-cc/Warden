@@ -465,6 +465,10 @@ pub(super) fn render_loading(frame: &mut ratatui::Frame, app: &App) {
         let area = frame.area();
         let area = ratatui::layout::Rect::new(area.x, area.bottom() - 1, area.width, 1);
         frame.render_widget(ratatui::widgets::Clear, area);
+        frame.buffer_mut().set_style(
+            area,
+            ratatui::style::Style::default().bg(super::theme::T.bg_main),
+        );
         frame.render_widget(
             ratatui::widgets::Paragraph::new("Loading requested page…"),
             area,

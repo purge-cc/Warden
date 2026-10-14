@@ -46,9 +46,11 @@ pub(crate) const MAX_RECEIPTS: usize = 4096;
 pub(crate) const MIN_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_POLICY_BYTES: u64 = 256 * 1024 * 1024;
+/// Retained undo data per master namespace; operator writes refuse above it.
+pub(crate) const MAX_UNDO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_BLOB_BYTES: u64 = MAX_POLICY_BYTES;
 const MAX_MEMBERS: usize = 4096;
-const SETUP_MARKER: &str = "format2.setup";
+pub(crate) const SETUP_MARKER: &str = "format2.setup";
 const JOURNAL_NEXT: &str = "journal.next";
 const SETUP_STAGE: &str = ".warden-write-policy-setup";
 const WRITE_STAGE_PAYLOAD: &str = "payload";
@@ -594,11 +596,29 @@ pub(crate) struct ReceiptMemberEvidence {
     pub(crate) restored_inode: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Identity of a persisted root, store directory or member. Equality compares
+/// the inode alone: `st_dev` is not stable across boots (btrfs anonymous
+/// devices, device-mapper minors, ZFS, NFS and overlayfs renumber it), so a
+/// record binds to its object by path, through the master namespace and the
+/// descriptor-relative walk from the guard root, plus inode. `device` stays in
+/// the record format and writers keep filling it.
+///
+/// Accepted ceiling: another filesystem of the same type mounted on the root
+/// or store whose root has the same inode passes, and so does a btrfs
+/// snapshot of the config subvolume swapped in place. The transaction
+/// immutables and the member digest, owner, mode and link checks still apply.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Inode {
     device: u64,
     inode: u64,
+}
+
+// ponytail: inode-only identity; a persisted random tree id closes the ceiling above.
+impl PartialEq for Inode {
+    fn eq(&self, other: &Self) -> bool {
+        self.inode == other.inode
+    }
 }
 
 impl Inode {
@@ -959,6 +979,9 @@ fn prepare_with_hook_impl<'g>(
         blob_total <= MAX_BLOB_BYTES,
         "policy transaction blob budget exceeded"
     );
+    if !undo_budget_exempt(&request.origin) {
+        ensure_undo_budget(&store, &owner, blob_total, undo_cap())?;
+    }
     preflight_space(
         tree.root,
         blob_total
@@ -1137,6 +1160,9 @@ fn prepare_repair<'g>(
         blob_total <= MAX_BLOB_BYTES,
         "repair transaction blob budget exceeded"
     );
+    if !undo_budget_exempt(&request.origin) {
+        ensure_undo_budget(&store, &owner, blob_total, undo_cap())?;
+    }
     preflight_space(
         tree.root,
         blob_total
@@ -1241,8 +1267,20 @@ impl PreparedTransaction<'_> {
                 );
                 journal.receipt.failure = Some(failure.chars().take(1024).collect());
                 // The persisted phase controls recovery; an uncertain response never
-                // changes whether the commit decision reached the journal.
-                let _ = write_journal(&self.fence, &self.owner, &journal);
+                // changes whether the commit decision reached the journal. After the
+                // terminal rename this descriptor is the retained undo journal: its
+                // receipt must stay terminal, or member evidence never matches the
+                // reconciled receipt again.
+                let active = inspect_at(self.guard.tree_io().root, OsStr::new(TXN_DIR_NAME))
+                    .ok()
+                    .flatten()
+                    .and_then(|current| {
+                        Some((current.metadata().ok()?, self.fence.metadata().ok()?))
+                    })
+                    .is_some_and(|(current, fence)| same_inode(&current, &fence));
+                if active {
+                    let _ = write_journal(&self.fence, &self.owner, &journal);
+                }
                 let _ = self.receipts.write(&journal, self.guard.tree_io());
                 Ok(journal.receipt.clone())
             }
@@ -2110,7 +2148,6 @@ fn recover_active_impl(
     }
     authorize(&fence, &owner, &journal.borrow())?;
     if unpublished {
-        verify_inventory(guard, &fence, &owner, &journal.borrow(), true, true, false)?;
         remove_unpublished_setup(tree.root, &fence, &owner, &journal.borrow())?;
         return Ok(RecoveryOutcome::SetupRemoved);
     }
@@ -4887,8 +4924,10 @@ fn remove_unpublished_setup(
     owner: &Metadata,
     journal: &Journal,
 ) -> anyhow::Result<()> {
-    // Retain the decoded Setup intent until every partial blob is durably
-    // gone. A death during cleanup can then repeat the same source-only proof.
+    // validate_journal_receipt proved no member was promoted, so the members
+    // were never touched and their inodes need no check: an editor save after
+    // the crash is not drift. Retain the decoded Setup intent until every
+    // partial blob is durably gone, so a death during cleanup repeats the proof.
     for member in &journal.members {
         for state in [member.before.as_ref(), member.after.as_ref()]
             .into_iter()
@@ -4907,6 +4946,64 @@ fn remove_unpublished_setup(
     unlink_at(fence, OsStr::new(JOURNAL_NAME))?;
     fence.sync_all()?;
     remove_setup(root, fence, owner)
+}
+
+/// Migration and cluster replica writes must not fail on the operator cap.
+fn undo_budget_exempt(origin: &str) -> bool {
+    matches!(origin, "migration" | "cluster")
+}
+
+/// Refuse a write whose undo data would push this namespace past `cap`.
+fn ensure_undo_budget(
+    store: &File,
+    owner: &Metadata,
+    incoming: u64,
+    cap: u64,
+) -> anyhow::Result<()> {
+    // ponytail: full scan, up to MAX_RECEIPTS x (2 x MAX_MEMBERS + 3) stats (~33.6 M) per write for this namespace; keep a running total in the store if writes get slow.
+    let mut used = 0_u64;
+    for name in directory_names(store, MAX_RECEIPTS * 2)? {
+        if !is_hash(&name) && !retired_key(&name) {
+            continue;
+        }
+        let dir = private_dir(store, &name, owner, false)?;
+        for member in directory_names(&dir, MAX_MEMBERS * 2 + 3)? {
+            // O_PATH without following symlinks: fstat sees the entry itself.
+            let meta = open_at(&dir, OsStr::new(&member), libc::O_PATH, 0)?.metadata()?;
+            if meta.is_file() {
+                used = used
+                    .checked_add(meta.len())
+                    .context("undo budget overflow")?;
+            }
+        }
+    }
+    ensure!(
+        used.checked_add(incoming).is_some_and(|total| total <= cap),
+        "UndoStoreFull: retained undo data {used} B + {incoming} B exceeds {cap} B; it frees as receipts expire 24 h after each write"
+    );
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn undo_cap() -> u64 {
+    MAX_UNDO_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_UNDO_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn undo_cap() -> u64 {
+    TEST_UNDO_CAP
+        .with(std::cell::Cell::get)
+        .unwrap_or(MAX_UNDO_BYTES)
+}
+
+#[cfg(test)]
+pub(crate) fn set_undo_cap_for_test(cap: Option<u64>) {
+    TEST_UNDO_CAP.with(|cell| cell.set(cap));
 }
 
 fn preflight_space(root: &File, required: u64) -> anyhow::Result<()> {
@@ -5023,6 +5120,16 @@ pub(crate) fn fail_after_prepared_for_test() {
 }
 
 #[cfg(test)]
+pub(crate) fn fail_at_promotion_for_test() {
+    TEST_FAULT.with(|fault| *fault.borrow_mut() = Some((FaultPoint::AfterPromotion, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_at_root_fsync_for_test() {
+    TEST_FAULT.with(|fault| *fault.borrow_mut() = Some((FaultPoint::RootFsync, 0)));
+}
+
+#[cfg(test)]
 pub(crate) fn kill_after_terminal_rename_for_test() {
     TEST_KILL.with(|kill| *kill.borrow_mut() = Some((FaultPoint::AfterTerminalRename, 0)));
 }
@@ -5044,6 +5151,55 @@ pub(crate) fn fail_after_rollback_intent_for_test() {
 
 #[cfg(test)]
 thread_local! { static TEST_KILL: RefCell<Option<(FaultPoint, usize)>> = const { RefCell::new(None) }; }
+
+/// Add one to every `device` and `*_device` number in the JSON records at or
+/// below `path`, as a reboot that renumbers devices does. Files are rewritten
+/// in place, so they keep their inode, owner, mode and link count. Returns the
+/// number of files changed.
+#[cfg(test)]
+pub(crate) fn shift_devices_for_test(path: &Path) -> usize {
+    fn shift(value: &mut serde_json::Value) -> bool {
+        let mut changed = false;
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    match value.as_u64() {
+                        Some(device) if key == "device" || key.ends_with("_device") => {
+                            *value = device.wrapping_add(1).into();
+                            changed = true;
+                        }
+                        _ => changed |= shift(value),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    changed |= shift(item);
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    if meta.is_dir() {
+        return std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| shift_devices_for_test(&entry.unwrap().path()))
+            .sum();
+    }
+    if !meta.is_file() || path.extension() != Some(OsStr::new("json")) {
+        return 0;
+    }
+    let Ok(mut json) = serde_json::from_slice(&std::fs::read(path).unwrap()) else {
+        return 0;
+    };
+    if !shift(&mut json) {
+        return 0;
+    }
+    std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+    1
+}
 
 #[cfg(test)]
 mod tests {
@@ -5274,8 +5430,12 @@ mod tests {
 
         let root = guard.tree_io().root.metadata().unwrap();
         let here = (root.dev(), root.ino());
-        let elsewhere = (u64::MAX, 7);
-        assert!(rebind_root(&guard, &data, (1, 1), elsewhere).is_err());
+        // The identity ignores the device, so `elsewhere` must differ from the
+        // root and the receipt store directory by inode.
+        let store = fs::metadata(receipt.parent().unwrap()).unwrap();
+        let elsewhere = (u64::MAX, u64::MAX);
+        assert!(![root.ino(), store.ino()].contains(&elsewhere.1));
+        assert!(rebind_root(&guard, &data, (u64::MAX - 1, u64::MAX - 1), elsewhere).is_err());
         assert_eq!(rebind_root(&guard, &data, here, elsewhere).unwrap(), 2);
         assert_eq!(rebind_root(&guard, &data, here, elsewhere).unwrap(), 0);
         assert!(lookup_receipt(&guard, "operator-1", "request-1").is_err());
@@ -5892,7 +6052,7 @@ mod tests {
             .admit(tree, &store, unix_seconds().unwrap(), 1)
             .unwrap_err()
             .to_string()
-            .contains("IdempotencyStoreFull"));
+            .starts_with("IdempotencyStoreFull:"));
         assert_eq!(MAX_RECEIPTS, 4096);
         assert_eq!(MIN_RETENTION_SECONDS, 86_400);
         fs::set_permissions(
@@ -7350,6 +7510,217 @@ mod tests {
     }
 
     #[test]
+    fn inode_identity_ignores_the_device_and_keeps_it_in_the_format() {
+        let inode = |device, inode| Inode { device, inode };
+        assert_eq!(inode(1, 5), inode(2, 5));
+        assert_ne!(inode(1, 5), inode(1, 6));
+        assert_eq!(
+            serde_json::to_value(inode(1, 5)).unwrap(),
+            serde_json::json!({"device": 1, "inode": 5})
+        );
+    }
+
+    /// The receipt and the retained undo journal of the fixture request.
+    fn record_paths(fixture: &Fixture, guard: &MigrationWriteLock) -> (PathBuf, PathBuf) {
+        let namespace = master_namespace(guard.canonical_master());
+        let key = request_key("operator-1", "request-1");
+        (
+            fixture
+                .root
+                .path()
+                .join("node-data")
+                .join(RECEIPT_DIR)
+                .join(&namespace)
+                .join(format!("{key}.json")),
+            fixture
+                .root
+                .path()
+                .join(STORE_DIR_NAME)
+                .join(&namespace)
+                .join(&key)
+                .join(JOURNAL_NAME),
+        )
+    }
+
+    /// Move `path` to `original` and copy it back with its modes, owners and
+    /// times. The original stays linked, so the copy cannot reuse its inode.
+    fn replace_with_copy(path: &Path, original: &Path) {
+        fs::rename(path, original).unwrap();
+        let status = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(original)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn committed_records_survive_a_device_number_change() {
+        let fixture = Fixture::new();
+        let committed = {
+            let guard = fixture.guard();
+            apply(
+                &guard,
+                &fixture.request(),
+                &fixture.before,
+                &fixture.after,
+                || Ok(()),
+            )
+            .unwrap()
+        };
+        assert!(shift_devices_for_test(fixture.root.path()) >= 2);
+        let guard = fixture.guard();
+        assert_eq!(recover_active(&guard).unwrap(), RecoveryOutcome::Absent);
+        assert_eq!(
+            lookup_receipt(&guard, "operator-1", "request-1").unwrap(),
+            Some(committed.clone())
+        );
+        let replay = apply(
+            &guard,
+            &fixture.request(),
+            &fixture.before,
+            &fixture.after,
+            || bail!("must not revalidate replay"),
+        )
+        .unwrap();
+        assert_eq!(replay, committed);
+        let RollbackOutcome::Restored(restored) =
+            rollback(&guard, "operator-1", "request-1").unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert!(restored.rollback_restored);
+        fixture.assert_inventory(&fixture.before);
+
+        // Retention reclaims a record written before the change.
+        let fixture = Fixture::new();
+        fixture.prepare(&fixture.guard()).commit().unwrap();
+        shift_devices_for_test(fixture.root.path());
+        let guard = fixture.guard();
+        let tree = guard.tree_io();
+        let receipts = test_receipts(&guard);
+        let owner = tree.identity.owner_metadata(tree.root).unwrap();
+        let undo = open_store(tree, &owner, false).unwrap().unwrap();
+        let key = request_key("operator-1", "request-1");
+        let record = receipts.read(&key, tree).unwrap().unwrap();
+        assert_ne!(record.tree.device, tree.root.metadata().unwrap().dev());
+        receipts.admit(tree, &undo, record.retain_until, 1).unwrap();
+        assert!(receipts.read(&key, tree).unwrap().is_none());
+        assert!(inspect_at(&undo, OsStr::new(&key)).unwrap().is_none());
+    }
+
+    #[test]
+    fn records_with_another_inode_still_refuse_after_a_device_number_change() {
+        for (journal, field, expected) in [
+            (false, "tree", "receipt identity mismatch"),
+            (true, "root", "transaction tree identity mismatch"),
+            (true, "receipt_store", "ReceiptStoreMismatch"),
+        ] {
+            let fixture = Fixture::new();
+            let guard = fixture.guard();
+            fixture.prepare(&guard).commit().unwrap();
+            shift_devices_for_test(fixture.root.path());
+            let (receipt, undo) = record_paths(&fixture, &guard);
+            let path = if journal { undo } else { receipt };
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let inode = json[field]["inode"].as_u64().unwrap();
+            json[field]["inode"] = inode.wrapping_add(1).into();
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            let error = lookup_receipt(&guard, "operator-1", "request-1").unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{field}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_transactions_recover_after_a_device_number_change() {
+        for point in [
+            FaultPoint::BeforePromotion,
+            FaultPoint::AfterPromotionRename,
+            FaultPoint::AfterRollbackStageLink,
+            FaultPoint::RollbackReady,
+            FaultPoint::AfterTerminalRename,
+        ] {
+            let fixture = Fixture::new();
+            child_crash(fixture.root.path(), point, 0, false);
+            assert!(shift_devices_for_test(fixture.root.path()) > 0, "{point:?}");
+            let guard = fixture.guard();
+            let outcome = recover_active(&guard)
+                .unwrap_or_else(|error| panic!("recovery failed at {point:?}: {error:#}"));
+            assert_ne!(outcome, RecoveryOutcome::LegacyActive);
+            let receipt = lookup_receipt(&guard, "operator-1", "request-1").unwrap();
+            if point == FaultPoint::AfterTerminalRename {
+                assert_eq!(receipt.unwrap().persistence, Persistence::Committed);
+                fixture.assert_inventory(&fixture.after);
+            } else {
+                assert!(
+                    receipt.is_none_or(|receipt| receipt.persistence == Persistence::Aborted),
+                    "{point:?}"
+                );
+                fixture.assert_inventory(&fixture.before);
+            }
+            assert_no_write_stages(fixture.root.path());
+            assert_policy_loadable(&fixture, &guard);
+        }
+
+        // A recovery killed in its turn leaves records written in two boots.
+        let fixture = Fixture::new();
+        child_crash(fixture.root.path(), FaultPoint::AfterPromotion, 4, false);
+        shift_devices_for_test(fixture.root.path());
+        child_crash(
+            fixture.root.path(),
+            FaultPoint::AfterRollbackRestoreRename,
+            2,
+            true,
+        );
+        shift_devices_for_test(fixture.root.path());
+        let guard = fixture.guard();
+        assert!(matches!(
+            recover_active(&guard).unwrap(),
+            RecoveryOutcome::Recovered(_)
+        ));
+        fixture.assert_inventory(&fixture.before);
+        assert_no_write_stages(fixture.root.path());
+    }
+
+    #[test]
+    fn a_copied_root_or_receipt_store_still_refuses_after_a_device_number_change() {
+        let fixture = Fixture::new();
+        drop(fixture.prepare(&fixture.guard()));
+        shift_devices_for_test(fixture.root.path());
+        let journal = fs::read(fixture.root.path().join(TXN_DIR_NAME).join(JOURNAL_NAME)).unwrap();
+        let displaced = tempfile::tempdir().unwrap();
+        let detached = displaced.path().join("detached");
+        replace_with_copy(fixture.root.path(), &detached);
+        let error = recover_active(&fixture.guard()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("transaction tree identity mismatch"),
+            "{error:#}"
+        );
+        for root in [fixture.root.path(), detached.as_path()] {
+            assert_eq!(
+                fs::read(root.join(TXN_DIR_NAME).join(JOURNAL_NAME)).unwrap(),
+                journal
+            );
+        }
+
+        let fixture = Fixture::new();
+        fixture.prepare(&fixture.guard()).commit().unwrap();
+        shift_devices_for_test(fixture.root.path());
+        let data = fixture.root.path().join("node-data");
+        replace_with_copy(&data.join(RECEIPT_DIR), &data.join("detached"));
+        let error = lookup_receipt(&fixture.guard(), "operator-1", "request-1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("ReceiptStoreMismatch"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn legacy_base_receipt_without_operator_plan_hash_still_decodes() {
         let encoded = serde_json::json!({
             "revision_scope": "policy_tree_v1",
@@ -7983,6 +8354,155 @@ mod tests {
             ));
             fixture.assert_inventory(&fixture.before);
             assert_no_write_stages(fixture.root.path());
+        }
+    }
+
+    /// Crash before the receipt is durable, then save the master with
+    /// identical bytes the way an editor does (new inode). Recovery must still
+    /// remove the unpublished setup.
+    fn unpublished_recovers_after_identical_rename_save(skip: usize, phase: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        {
+            let guard = fixture.guard();
+            assert!(with_fault(FaultPoint::JournalFsync, skip, || prepare(
+                &guard,
+                &fixture.request(),
+                &fixture.before,
+                &fixture.after,
+                || Ok(())
+            ))
+            .is_err());
+        }
+        let fence = fixture.root.path().join(TXN_DIR_NAME);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(fence.join(JOURNAL_NAME)).unwrap()).unwrap();
+        assert_eq!(journal["phase"], phase);
+        let master = fs::read(fixture.master()).unwrap();
+        let mode = fs::metadata(fixture.master()).unwrap().permissions().mode();
+        let saved = fixture.root.path().join("config.toml.save");
+        fs::write(&saved, &master).unwrap();
+        fs::set_permissions(&saved, fs::Permissions::from_mode(mode)).unwrap();
+        fs::rename(&saved, fixture.master()).unwrap();
+
+        let guard = fixture.guard();
+        assert_eq!(
+            recover_active(&guard).unwrap(),
+            RecoveryOutcome::SetupRemoved
+        );
+        assert_eq!(fs::read(fixture.master()).unwrap(), master);
+        assert!(!fence.exists());
+    }
+
+    #[test]
+    fn unpublished_setup_recovers_after_identical_rename_save() {
+        unpublished_recovers_after_identical_rename_save(0, "setup");
+    }
+
+    #[test]
+    fn unpublished_prepared_recovers_after_identical_rename_save() {
+        unpublished_recovers_after_identical_rename_save(1, "prepared");
+    }
+
+    /// Commit one write, then revert it from `origin` under a 1-byte cap.
+    fn second_write_under_tiny_cap(origin: &str) -> (Fixture, anyhow::Result<BaseReceipt>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_UNDO_CAP.with(|cap| cap.set(None));
+            }
+        }
+        let fixture = Fixture::new();
+        let result = {
+            let guard = fixture.guard();
+            apply(
+                &guard,
+                &fixture.request(),
+                &fixture.before,
+                &fixture.after,
+                || Ok(()),
+            )
+            .unwrap();
+            let request = TransactionRequest {
+                request_id: "request-2".into(),
+                origin: origin.into(),
+                expected_revision: fixture.after.revision(),
+                ..fixture.request()
+            };
+            TEST_UNDO_CAP.with(|cap| cap.set(Some(1)));
+            let _reset = Reset;
+            apply(&guard, &request, &fixture.after, &fixture.before, || Ok(()))
+        };
+        (fixture, result)
+    }
+
+    fn undo_namespace_listing(fixture: &Fixture) -> Vec<String> {
+        let namespace = fixture
+            .root
+            .path()
+            .join(STORE_DIR_NAME)
+            .join(master_namespace(&fixture.master()));
+        let mut names = fs::read_dir(namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn undo_cap_refuses_operator_write() {
+        let (fixture, result) = second_write_under_tiny_cap("cli");
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("UndoStoreFull"), "{error}");
+        fixture.assert_inventory(&fixture.after);
+        assert_eq!(undo_namespace_listing(&fixture).len(), 1);
+        assert!(!fixture.root.path().join(TXN_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn undo_cap_exempts_migration_origin() {
+        let (fixture, result) = second_write_under_tiny_cap("migration");
+
+        assert_eq!(result.unwrap().persistence, Persistence::Committed);
+        fixture.assert_inventory(&fixture.before);
+        assert_eq!(undo_namespace_listing(&fixture).len(), 2);
+    }
+
+    #[test]
+    fn undo_cap_is_two_gib() {
+        assert_eq!(MAX_UNDO_BYTES, 2 << 30);
+    }
+
+    /// After the terminal rename the fence descriptor is the retained undo
+    /// journal. A later failure must not write the uncertain receipt into it,
+    /// or member evidence never matches the reconciled receipt again.
+    #[test]
+    fn a_failure_after_the_terminal_rename_keeps_member_evidence_terminal() {
+        for point in [FaultPoint::AfterTerminalRename, FaultPoint::RootFsync] {
+            let fixture = Fixture::new();
+            let guard = fixture.guard();
+            let transaction = fixture.prepare(&guard);
+            let uncertain = with_fault(point, 0, || transaction.commit()).unwrap();
+            assert_eq!(uncertain.persistence, Persistence::DurabilityUncertain);
+
+            let settled = lookup_receipt(&guard, "operator-1", "request-1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(settled.persistence, Persistence::Committed, "{point:?}");
+            let (evidence_receipt, evidence) = super::lookup_operation_member_evidence(
+                &guard,
+                &test_receipts(&guard),
+                "operator-1",
+                &uncertain.transaction_id,
+            )
+            .unwrap_or_else(|error| panic!("{point:?}: {error:#}"))
+            .unwrap();
+            assert_eq!(evidence_receipt, settled, "{point:?}");
+            assert!(!evidence.is_empty(), "{point:?}");
+            fixture.assert_inventory(&fixture.after);
         }
     }
 }

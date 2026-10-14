@@ -74,6 +74,24 @@ fn drops_discovery_warning(
     }
 }
 
+/// `warden … | head` closes stdout early, and `println!` then panics with
+/// `failed printing to stdout: Broken pipe` (a SIGABRT and a core dump under
+/// the release profile's `panic = "abort"`). Exit 141 (128 + SIGPIPE) quietly
+/// instead; every other panic still reaches the previous hook. SIGPIPE stays
+/// ignored rather than SIG_DFL, because the IPC socket and the `config
+/// backup` tar pipe must keep reporting EPIPE as ordinary errors.
+fn exit_quietly_on_closed_stdout() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if info.payload_as_str().is_some_and(|m| {
+            m.starts_with("failed printing to std") && m.ends_with("(os error 32)")
+        }) {
+            std::process::exit(141);
+        }
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -97,6 +115,13 @@ async fn main() -> anyhow::Result<()> {
     let pid_file = cli::config_discovery::resolve_pid_file(cli.pid_file, &config_path);
 
     let command = cli.command.unwrap_or(cli::Commands::Dashboard);
+    // The daemon and the TUI own their own output; keep their panics intact.
+    if !matches!(
+        command,
+        cli::Commands::Start { .. } | cli::Commands::Dashboard
+    ) {
+        exit_quietly_on_closed_stdout();
+    }
     let discovery_warning = discovery_warning.filter(|w| !drops_discovery_warning(&command, w));
 
     // Load the socket path from the current config (needed by commands that connect to
@@ -156,6 +181,13 @@ async fn main() -> anyhow::Result<()> {
                 cli::commands::start::spawn_daemon(&pid_file, &config_path)?;
                 return Ok(());
             }
+            // Take SIGHUP before any boot work. Its default action ends the
+            // process, systemd does not restart a daemon a signal stopped,
+            // and `systemctl reload` sends it as soon as the unit has forked;
+            // the boot can wait 30 s on each config lock below and much longer
+            // for its lists. A SIGHUP from here on stays pending and is
+            // applied as a reload once the daemon serves.
+            let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
             let runtime_lease = config::runtime_lease::acquire_for_daemon(&config_path)?;
             // Safe mode bypasses every on-disk config file and runs a
             // hardcoded minimum-risk configuration — see
@@ -237,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     cli::commands::start::RuntimeCapabilityAttestation::AuthoritativeSchema5Tree
                 },
+                sighup,
             )
             .await?;
             match outcome {
@@ -1152,15 +1185,26 @@ async fn main() -> anyhow::Result<()> {
         },
 
         cli::Commands::FirewallRules => {
-            // `ConfigV1` derives `Default`, so a missing or broken config
-            // still falls back to the default listen address rather than
-            // failing this command outright.
-            let listen =
-                config::loader::load_current_config(&config_path, time::OffsetDateTime::now_utc())
-                    .map(|loaded| loaded.config)
-                    .unwrap_or_default()
-                    .server
-                    .listen;
+            // Rules for a guessed listen address are worse than none: a
+            // missing or broken config refuses with CONFIG instead of
+            // falling back to the default address.
+            let listen = match config::loader::load_current_config(
+                &config_path,
+                time::OffsetDateTime::now_utc(),
+            ) {
+                Ok(loaded) => loaded.config.server.listen,
+                Err(errs) => {
+                    eprintln!(
+                        "cannot load config {} ({} error(s)):",
+                        config_path.display(),
+                        errs.len()
+                    );
+                    for err in &errs {
+                        eprintln!("  - {err}");
+                    }
+                    std::process::exit(cli::exit_codes::CONFIG);
+                }
+            };
             cli::commands::firewall_rules::run_firewall_rules(listen);
         }
 
@@ -1684,8 +1728,16 @@ fn init_tracing_with_mode(log_level: &str, mode: LogMode) {
             // TUI's Logs leaf reads over IPC. `std::io::stdout` is passed
             // explicitly because that is what `tracing_subscriber::fmt()`
             // defaulted to here — the writer must not change silently while
-            // the composition does.
-            tracking::log_ring::install(filter, ansi, std::io::stdout);
+            // the composition does. Under journald the level prefix sets
+            // each line's PRIORITY; on any other stdout nothing changes.
+            tracking::log_ring::install(
+                filter,
+                ansi,
+                tracking::log_ring::SyslogPrefixed::new(
+                    std::io::stdout,
+                    tracking::log_ring::stdout_is_journal(),
+                ),
+            );
         }
         LogMode::Daemon { logs_dir } => {
             // Best-effort directory creation. If this fails (permission,

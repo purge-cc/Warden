@@ -320,7 +320,7 @@ async fn tmc_add_refuses_an_uppercase_scheme_before_reaching_dedup() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("must start with http://"),
+        err.to_string().contains("must start with https://"),
         "expected the url-shape refusal, got: {err}",
     );
 }
@@ -414,40 +414,26 @@ async fn add_list_result(master: &Path, sock: &Path, id: &str, url: &str) -> any
 
 #[tokio::test]
 async fn add_rechecks_duplicates_after_the_network_probe() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     let dir = tempfile::tempdir().unwrap();
     let master = mk_master(&dir);
     let sock = fake_socket(&dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/list.txt", listener.local_addr().unwrap());
-    let (request_seen_tx, request_seen_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 2048];
-        let _ = stream.read(&mut request).await.unwrap();
-        request_seen_tx.send(()).unwrap();
-        release_rx.await.unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .unwrap();
-    });
+    let url = "https://lists.example.invalid/list.txt";
+    let seen = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
 
     let first_master = master.clone();
     let first_sock = sock.clone();
-    let first_url = url.clone();
     let first = tokio::spawn(
-        PROBE_TIMEOUT_OVERRIDE.scope(Duration::from_secs(30), async move {
+        PROBE_HOLD.scope((seen.clone(), release.clone()), async move {
             run_add(
                 &first_master,
                 &first_sock,
                 "first",
                 None,
-                &first_url,
+                url,
                 None,
                 None,
                 None,
@@ -461,16 +447,13 @@ async fn add_rechecks_duplicates_after_the_network_probe() {
         }),
     );
 
-    // The probe is deliberately held open while the duplicate is inserted.
-    // The scoped test seam gives that first request enough time to observe
-    // the second write without changing the operator-facing probe timeout.
+    // The probe is held open while the duplicate is inserted.
     const HARNESS_TIMEOUT: Duration = Duration::from_secs(30);
-    tokio::time::timeout(HARNESS_TIMEOUT, request_seen_rx)
+    tokio::time::timeout(HARNESS_TIMEOUT, seen.notified())
         .await
-        .expect("the first add must reach its network probe")
-        .unwrap();
-    add_list(&master, &sock, "second", &url).await;
-    release_tx.send(()).unwrap();
+        .expect("the first add must reach its network probe");
+    add_list(&master, &sock, "second", url).await;
+    release.notify_one();
 
     let err = tokio::time::timeout(HARNESS_TIMEOUT, first)
         .await
@@ -479,11 +462,90 @@ async fn add_rechecks_duplicates_after_the_network_probe() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("already added as \"second\""), "{err}");
-    server.await.unwrap();
 
     let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
     assert_eq!(loaded.config.blocklists.len(), 1);
     assert_eq!(loaded.config.blocklists[0].id.as_str(), "second");
+}
+
+/// A URL the list downloader refuses would be saved and then never
+/// download. `blocklist add` and `lists add` refuse it up front and name
+/// import-local, the door for a file on this host.
+#[tokio::test]
+async fn add_refuses_urls_the_downloader_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let sock = fake_socket(&dir);
+    for url in [
+        "http://lists.example.invalid/a.txt",
+        "https://127.0.0.1/a.txt",
+        "https://10.0.0.1/a.txt",
+        "https://u:p@lists.example.invalid/a.txt",
+    ] {
+        let err = add_list_result(&master, &sock, "refused", url)
+            .await
+            .unwrap_err()
+            .to_string();
+        // The hint must be a command that runs as written: `--kind` is required.
+        assert!(
+            err.contains("import-local <path> --id <id> --kind <deny|allow|ignore>"),
+            "{url}: {err}"
+        );
+        assert!(!err.contains("u:p@"), "{url}: the password leaked: {err}");
+    }
+    // `lists add` writes through the same locked core.
+    let err =
+        crate::cli::commands::lists::run_add(&master, &sock, "http://lists.example.invalid/b.txt")
+            .await
+            .unwrap_err();
+    assert!(err.to_string().contains("import-local"), "{err}");
+
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert!(loaded.config.blocklists.is_empty());
+}
+
+#[tokio::test]
+async fn set_url_refuses_urls_the_downloader_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = mk_master(&dir);
+    let sock = fake_socket(&dir);
+    add_list(&master, &sock, "ok", "https://lists.example.invalid/ok.txt").await;
+
+    let err = run_set(
+        &master,
+        &sock,
+        "ok",
+        "url",
+        "http://lists.example.invalid/ok.txt",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("import-local"), "{err}");
+    let loaded = load_current_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+    assert_eq!(
+        loaded.config.blocklists[0].url,
+        "https://lists.example.invalid/ok.txt"
+    );
+
+    // The validator only warns, so a hand-written http:// row still loads.
+    let legacy_dir = tempfile::tempdir().unwrap();
+    let legacy = mk_master(&legacy_dir);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&legacy)
+        .unwrap()
+        .write_all(
+            br#"
+[[blocklists]]
+id = "legacy"
+display_name = "Legacy"
+url = "http://lists.example.invalid/legacy.txt"
+"#,
+        )
+        .unwrap();
+    load_current_config(&legacy, time::OffsetDateTime::now_utc())
+        .expect("a hand-written http:// row must still load");
 }
 
 #[tokio::test]

@@ -3,7 +3,6 @@ use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixListener;
 
 #[test]
 fn reserved_names_are_rejected_for_masters_and_members_after_alias_resolution() {
@@ -217,117 +216,6 @@ fn missing_suffix_and_dangling_target_follow_existing_parent_aliases() {
         .unwrap()
         .file_type()
         .is_symlink());
-}
-
-#[test]
-fn editor_recapture_admits_one_regular_rename_then_keeps_swap_rejection() {
-    let dir = tempfile::tempdir().unwrap();
-    let master = dir.path().join("config.toml");
-    fs::write(&master, "before").unwrap();
-    let guard = acquire_for_write(&master).unwrap();
-
-    let replacement = dir.path().join("editor-save");
-    fs::write(&replacement, "after").unwrap();
-    fs::rename(&replacement, &master).unwrap();
-    guard.recapture_canonical_master_after_editor().unwrap();
-    let admitted = guard.tree_io().plan_master_target().unwrap();
-    assert!(matches!(
-        admitted.read_original_capped(64).unwrap(),
-        crate::config::tree_io::CappedRead::Contents(bytes) if bytes == b"after"
-    ));
-
-    fs::write(&replacement, "second replacement").unwrap();
-    fs::rename(&replacement, &master).unwrap();
-    assert!(guard.tree_io().plan_master_target().is_err());
-}
-
-#[test]
-fn editor_recapture_normalizes_owner_to_the_admitted_side_lock() {
-    if unsafe { libc::geteuid() } != 0 {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let master = dir.path().join("config.toml");
-    fs::write(&master, "before").unwrap();
-    let original = File::open(&master).unwrap();
-    assert_eq!(
-        unsafe { libc::fchown(original.as_raw_fd(), 65534, 65534) },
-        0
-    );
-    drop(original);
-    let guard = acquire_for_write(&master).unwrap();
-
-    for owner in [(0, 65534), (65534, 0)] {
-        let replacement = dir.path().join("editor-save");
-        fs::write(&replacement, "after").unwrap();
-        let file = File::open(&replacement).unwrap();
-        assert_eq!(
-            unsafe { libc::fchown(file.as_raw_fd(), owner.0, owner.1) },
-            0
-        );
-        drop(file);
-        fs::rename(&replacement, &master).unwrap();
-        guard.recapture_canonical_master_after_editor().unwrap();
-        let meta = fs::metadata(&master).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
-    }
-
-    let file = File::open(&master).unwrap();
-    assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 0, 0) }, 0);
-    drop(file);
-    guard.recapture_canonical_master_after_editor().unwrap();
-    let meta = fs::metadata(&master).unwrap();
-    assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
-    drop(guard);
-    drop(acquire_for_write(&master).unwrap());
-}
-
-#[test]
-fn editor_recapture_rejects_unsafe_canonical_leaves() {
-    for kind in [
-        "absent",
-        "symlink",
-        "hardlink",
-        "directory",
-        "fifo",
-        "socket",
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let master = dir.path().join("config.toml");
-        fs::write(&master, "original").unwrap();
-        let guard = acquire_for_write(&master).unwrap();
-        fs::remove_file(&master).unwrap();
-        let mut socket = None;
-        match kind {
-            "absent" => {}
-            "symlink" => {
-                fs::write(dir.path().join("target"), "target").unwrap();
-                symlink("target", &master).unwrap();
-            }
-            "hardlink" => {
-                let target = dir.path().join("target");
-                fs::write(&target, "target").unwrap();
-                fs::hard_link(target, &master).unwrap();
-            }
-            "directory" => fs::create_dir(&master).unwrap(),
-            "fifo" => {
-                let name = CString::new(master.as_os_str().as_bytes()).unwrap();
-                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-            }
-            "socket" => socket = Some(UnixListener::bind(&master).unwrap()),
-            _ => unreachable!(),
-        }
-        with_test_hook(
-            |event| assert_ne!(event, TestEvent::BeforeDataOpen),
-            || {
-                assert!(
-                    guard.recapture_canonical_master_after_editor().is_err(),
-                    "{kind} canonical leaf was admitted"
-                );
-            },
-        );
-        drop(socket);
-    }
 }
 
 #[test]

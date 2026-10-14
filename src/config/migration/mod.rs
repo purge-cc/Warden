@@ -7,7 +7,7 @@ pub use choices::{
     MigrationChoicesV1, MigrationDecisionV1, MigrationMappingKindV1,
 };
 pub use v4_to_v5::{
-    apply, check, finalize, lint_migration_origins, lint_migration_origins_with_bodies, plan,
-    rollback, ApplyReceiptV1, FinalizeResultV1, MigrationFindingV1, MigrationLintFindingV1,
-    MigrationPlanV1, RollbackResultV1,
+    apply, finalize, lint_migration_origins, lint_migration_origins_with_bodies, plan, rollback,
+    ApplyReceiptV1, FinalizeResultV1, MigrationFindingV1, MigrationLintFindingV1, MigrationPlanV1,
+    RollbackResultV1,
 };

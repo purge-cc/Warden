@@ -574,7 +574,9 @@ lists = {}
             Err(_) => panic!("test state unexpectedly shared"),
         };
         state.config_path = master;
-        state.token_hash = crate::auth::token::hash_token(TOKEN);
+        state.token_hash = Arc::new(arc_swap::ArcSwap::from_pointee(Some(
+            crate::auth::token::hash_token(TOKEN),
+        )));
         state.operator_rule_jobs = Some(client.clone());
         crate::api::routes::build_router(Arc::new(state), false).layer(MockConnectInfo(
             "192.0.2.10:43100".parse::<std::net::SocketAddr>().unwrap(),

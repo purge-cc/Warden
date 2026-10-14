@@ -11,11 +11,10 @@
 pub mod api;
 pub mod auth;
 pub mod cli;
-/// Primary/secondary cluster replication serve-side. Feature-gated
-/// (`cluster`, default OFF) so a node that does not replicate compiles none of
-/// it. The `[cluster]` config section is parsed unconditionally
-/// (`config::schema::cluster`); this module is the serve logic that
-/// activates when `cluster.enabled && role == primary`.
+/// Cluster replication: primary publication, node membership and secondary
+/// pull. Feature-gated (`cluster`), on by default; `--no-default-features`
+/// builds without it. The `[cluster]` config section is parsed in every
+/// build (`config::schema::cluster`).
 #[cfg(feature = "cluster")]
 pub mod cluster;
 pub mod common;

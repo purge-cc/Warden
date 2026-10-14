@@ -284,18 +284,29 @@ fn apply_with_runtime(
             return Err(error);
         }
     };
-    ensure!(
-        receipt.persistence == Persistence::Committed && !receipt.rollback_restored,
-        "ArtifactRecoveryRequired: policy transaction has not committed"
-    );
-    let evidence = resolver
-        .lookup(&guard, &receipts, &actor, &request_id)?
-        .context("ArtifactRecoveryRequired: committed member evidence is unavailable")?;
-    ensure!(
-        evidence.receipt == receipt,
-        "ArtifactIntentMismatch: receipt changed before ownership completion"
-    );
-    let ledger = ownership.complete(&evidence)?;
+    let ledger = if receipt.persistence == Persistence::Committed && !receipt.rollback_restored {
+        let evidence = resolver
+            .lookup(&guard, &receipts, &actor, &request_id)?
+            .context("ArtifactRecoveryRequired: committed member evidence is unavailable")?;
+        ensure!(
+            evidence.receipt == receipt,
+            "ArtifactIntentMismatch: receipt changed before ownership completion"
+        );
+        ownership.complete(&evidence)?
+    } else {
+        // Settle the failed commit while this guard still holds the tree:
+        // recovery rolls it back or finishes it, and the ledger follows.
+        recover_policy(&guard, &receipts)?;
+        match ownership.recover(&receipts, resolver)? {
+            RecoveryStatus::Completed(ledger) => *ledger,
+            RecoveryStatus::Aborted => anyhow::bail!(
+                "ArtifactRecoveryRequired: policy transaction rolled back; live policy unchanged"
+            ),
+            RecoveryStatus::NoPending | RecoveryStatus::AwaitingReceipt => {
+                anyhow::bail!("ArtifactRecoveryRequired: policy transaction has not committed")
+            }
+        }
+    };
     if validated.config.cluster.membership_version == Some(1) {
         let store = super::corpus::CorpusStore::open(config_path)?;
         let corpus = store.manifest_for_artifact(&ledger.manifest.artifact_hash)?;
@@ -522,6 +533,7 @@ mod tests {
         test_support::*, MemberEvidence, OperationBinding, OperationEvidence,
     };
     use super::*;
+    use crate::cli::commands::config::restore;
     use crate::config::policy_transaction::{MemberOperation, MemberRole};
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -1194,6 +1206,138 @@ profile = "default"
         assert!(load_with_resolver(&path, &resolver).unwrap().is_none());
         assert_eq!(fs::read_to_string(&path).unwrap(), MASTER);
         apply_with_resolver(&path, &manifest, &objects, &resolver).unwrap();
+    }
+
+    fn pending_intent(path: &Path) -> bool {
+        let guard = acquire_for_migration(path).unwrap();
+        let pending = OwnershipStore::open(&guard).unwrap().pending().is_some();
+        pending
+    }
+
+    #[test]
+    fn apply_returns_the_new_ledger_when_the_final_fsync_fails() {
+        let (root, path) = receiver();
+        let (manifest, objects) = artifact(1, &[("list", "example.org\n")]);
+        policy_transaction::fail_at_root_fsync_for_test();
+        let ledger =
+            apply_with_resolver(&path, &manifest, &objects, &ExistingReceiptAdapter).unwrap();
+        assert_eq!(ledger.manifest, manifest);
+        assert!(root.path().join(BUNDLE_PATH).exists());
+        assert!(!pending_intent(&path));
+        assert_eq!(load_persisted(&path).unwrap(), Some(ledger));
+    }
+
+    #[test]
+    fn apply_rolls_back_at_once_when_promotion_fails() {
+        let (root, path) = receiver();
+        let (first, objects) = artifact(1, &[("list", "example.org\n")]);
+        let ledger = apply_with_resolver(&path, &first, &objects, &ExistingReceiptAdapter).unwrap();
+        let live = |name: &str| fs::read(root.path().join(name)).unwrap();
+        let before = (live(BUNDLE_PATH), live("packs/list.txt"));
+
+        let (second, objects) = artifact(2, &[("list", "changed.example\n")]);
+        policy_transaction::fail_at_promotion_for_test();
+        let error =
+            apply_with_resolver(&path, &second, &objects, &ExistingReceiptAdapter).unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!((live(BUNDLE_PATH), live("packs/list.txt")), before);
+        assert!(!pending_intent(&path));
+        let kept = load_persisted(&path).unwrap().unwrap();
+        assert_eq!(kept.manifest, first);
+        assert_eq!(kept.transaction_id, ledger.transaction_id);
+        apply_with_resolver(&path, &second, &objects, &ExistingReceiptAdapter).unwrap();
+    }
+
+    // ── local restore on a secondary ────────────────────────
+
+    /// A `tar -czf ARCHIVE -C TREE .` of `files`; restore's own helper is private.
+    fn archive_of(files: &[(&str, Vec<u8>)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let (tree, archive) = (dir.path().join("tree"), dir.path().join("a.tar.gz"));
+        for (name, bytes) in files {
+            fs::create_dir_all(tree.join(name).parent().unwrap()).unwrap();
+            fs::write(tree.join(name), bytes).unwrap();
+        }
+        let mut tar = std::process::Command::new("tar");
+        tar.arg("-czf").arg(&archive).arg("-C").arg(&tree).arg(".");
+        assert!(tar.status().unwrap().success());
+        (dir, archive)
+    }
+
+    fn applied_secondary() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Manifest,
+        BTreeMap<String, Arc<[u8]>>,
+    ) {
+        let (root, path) = receiver();
+        let (manifest, objects) = artifact(1, &[("list", "example.org\n")]);
+        apply_with_resolver(&path, &manifest, &objects, &ExistingReceiptAdapter).unwrap();
+        (root, path, manifest, objects)
+    }
+
+    #[test]
+    fn restore_on_a_secondary_refuses_to_replace_owned_files() {
+        let (root, path, manifest, objects) = applied_secondary();
+        let live = |name: &str| fs::read(root.path().join(name)).unwrap();
+        let bundle = live(BUNDLE_PATH);
+        let (_dir, archive) = archive_of(&[
+            ("config.toml", live("config.toml")),
+            (BUNDLE_PATH, [bundle.as_slice(), b"\n# changed\n"].concat()),
+            ("packs/list.txt", live("packs/list.txt")),
+        ]);
+        let error = restore::restore_archive(&path, &archive).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("replicates") && error.contains(BUNDLE_PATH),
+            "{error}"
+        );
+        assert!(!error.contains("packs/list.txt"), "{error}");
+        let doc = include_str!("../../docs/UPGRADE_RECOVERY.md");
+        assert!(
+            error.contains("\"Cluster secondaries\"") && doc.contains("\n## Cluster secondaries\n"),
+            "{error}"
+        );
+        // The primary refuses the rejoin until it revokes the node.
+        assert!(
+            error.contains("`warden cluster revoke <node-id>`"),
+            "{error}"
+        );
+        assert_eq!(live(BUNDLE_PATH), bundle);
+        apply_with_resolver(&path, &manifest, &objects, &ExistingReceiptAdapter).unwrap();
+    }
+
+    #[test]
+    fn restore_on_a_secondary_refuses_to_delete_owned_files() {
+        let (root, path, manifest, objects) = applied_secondary();
+        // An archive taken as a member before the first sync: the same
+        // membership, but only its own master.
+        let (_dir, archive) = archive_of(&[("config.toml", MASTER.into())]);
+        let error = restore::restore_archive(&path, &archive).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("replicates") && error.contains("packs/list.txt"),
+            "{error}"
+        );
+        assert!(root.path().join(BUNDLE_PATH).exists());
+        assert!(root.path().join("packs/list.txt").exists());
+        apply_with_resolver(&path, &manifest, &objects, &ExistingReceiptAdapter).unwrap();
+    }
+
+    #[test]
+    fn restore_on_a_secondary_allows_unchanged_owned_files() {
+        let (root, path, manifest, objects) = applied_secondary();
+        let live = |name: &str| fs::read(root.path().join(name)).unwrap();
+        let (_dir, archive) = archive_of(&[
+            ("config.toml", live("config.toml")),
+            (BUNDLE_PATH, live(BUNDLE_PATH)),
+            ("packs/list.txt", live("packs/list.txt")),
+        ]);
+        assert!(matches!(
+            restore::restore_archive(&path, &archive).unwrap(),
+            restore::RestoreOutcome::Restored { changed: false, .. }
+        ));
+        apply_with_resolver(&path, &manifest, &objects, &ExistingReceiptAdapter).unwrap();
     }
 
     #[test]

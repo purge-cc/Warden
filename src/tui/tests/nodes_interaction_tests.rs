@@ -50,6 +50,7 @@ fn control(operations: Vec<NodeOperationProgress>) -> NodeControlStatus {
             last_seen_at: None,
             last_error: None,
         }],
+        runtime_problems: Vec::new(),
     }
 }
 fn ready_app() -> App {
@@ -652,4 +653,160 @@ async fn review_dispatch_failure_keeps_the_add_form_recoverable() {
     assert!(
         matches!(app.nodes.dialog.as_ref(), Some(NodesDialog::Form(draft)) if draft.error.is_some() && draft.token == "token")
     );
+}
+
+#[tokio::test]
+async fn shift_characters_reach_node_form_fields_and_ctrl_s_still_previews() {
+    let mut app = ready_app();
+    handle_nodes_key(&mut app, key(KeyCode::Char('a')), &poller()).await;
+    let Some(NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() else {
+        panic!("add form")
+    };
+    draft.focus = 0;
+    draft.name.clear();
+    for event in [
+        KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT),
+        key(KeyCode::Char('o')),
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+    ] {
+        handle_nodes_dialog_key(&mut app, event, &poller()).await;
+    }
+    let Some(NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() else {
+        panic!("add form")
+    };
+    assert_eq!(draft.name, "No!");
+
+    draft.focus = 2;
+    for event in [
+        KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        key(KeyCode::Char('b')),
+    ] {
+        handle_nodes_dialog_key(&mut app, event, &poller()).await;
+    }
+    let Some(NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() else {
+        panic!("add form")
+    };
+    assert_eq!(draft.token, "Ab");
+    let mut terminal = Terminal::new(TestBackend::new(125, 36)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let paint = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(paint.contains("••"), "typed token must render masked");
+    assert!(
+        !paint.contains("Ab"),
+        "typed token must never render verbatim"
+    );
+
+    let Some(NodesDialog::Form(draft)) = app.nodes.dialog.as_mut() else {
+        panic!("add form")
+    };
+    draft.focus = 0;
+    for event in [
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    ] {
+        handle_nodes_dialog_key(&mut app, event, &poller()).await;
+    }
+    let Some(NodesDialog::Form(draft)) = app.nodes.dialog.as_ref() else {
+        panic!("add form")
+    };
+    assert_eq!(draft.name, "No!", "Ctrl and Alt chords must not type");
+    assert!(draft.error.is_some(), "Ctrl+S must still run the preview");
+}
+
+#[tokio::test]
+async fn expired_edit_review_offers_no_cancel_and_no_resume() {
+    let progress = NodeOperationProgress {
+        operation_id: "expired-edit".into(),
+        kind: NodeOperationKind::Edit,
+        phase: NodeOperationPhase::Cancelled,
+        target_node_id: "node-peer".into(),
+        message: "Review expired before apply; nothing changed. Prepare the operation again."
+            .into(),
+        last_verified_at: None,
+        recover_until: Some(1),
+        restart_steps: Vec::new(),
+    };
+    let mut app = ready_app();
+    app.node_control_status = Some(control(vec![progress.clone()]));
+    assert!(tabs::nodes::build_rows(&app)
+        .iter()
+        .any(|row| row.id == "node-peer" && !row.status.starts_with("recovery")));
+    handle_nodes_key(&mut app, key(KeyCode::Char('u')), &poller()).await;
+    assert!(app.nodes.dialog.is_none());
+
+    app.nodes.dialog = Some(NodesDialog::Recovery {
+        progress,
+        error: None,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(125, 36)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+    let paint = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(paint.contains("Review expired before apply"));
+    assert!(!paint.contains("Resume"));
+    assert!(!paint.contains("c cancel"));
+    for code in [KeyCode::Char('c'), KeyCode::Enter] {
+        handle_nodes_dialog_key(&mut app, key(code), &poller()).await;
+        assert!(matches!(
+            app.nodes.dialog.as_ref(),
+            Some(NodesDialog::Recovery { error: None, .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn admitted_add_offers_cancel_until_the_destination_applies() {
+    for (phase, offered) in [
+        (NodeOperationPhase::ApplyingPrimary, true),
+        (NodeOperationPhase::RestartingPrimary, true),
+        (NodeOperationPhase::ApplyingTarget, false),
+    ] {
+        let progress = NodeOperationProgress {
+            operation_id: "admitted-add".into(),
+            kind: NodeOperationKind::Add,
+            phase,
+            target_node_id: "node-peer".into(),
+            message: "Primary membership saved; waiting for its verified restart.".into(),
+            last_verified_at: None,
+            recover_until: Some(1),
+            restart_steps: Vec::new(),
+        };
+        let mut app = ready_app();
+        app.node_control_status = Some(control(vec![progress.clone()]));
+        app.nodes.dialog = Some(NodesDialog::Recovery {
+            progress,
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(125, 36)).unwrap();
+        terminal.draw(|frame| ui::render(frame, &mut app)).unwrap();
+        let paint = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(paint.contains("c cancel"), offered, "{phase:?}");
+        handle_nodes_dialog_key(&mut app, key(KeyCode::Char('c')), &poller()).await;
+        // Without a daemon socket, a sent Cancel comes back as an error.
+        assert_eq!(
+            matches!(
+                app.nodes.dialog.as_ref(),
+                Some(NodesDialog::Recovery { error: Some(_), .. })
+            ),
+            offered,
+            "{phase:?}"
+        );
+    }
 }

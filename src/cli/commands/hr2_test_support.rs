@@ -76,9 +76,10 @@ pub fn seed_token_for_test(home: &Path) {
 /// the literal twice.
 pub const SEEDED_TOKEN: &str = "ps_hr2-test-token";
 
-/// Process-global mutex for HR2 tests that mutate `$HOME` /
-/// `$XDG_CONFIG_HOME`. Shared across all five module test suites.
-static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+/// Process-global mutex for every lib test that mutates `$HOME` /
+/// `$XDG_CONFIG_HOME`: the five HR2 module suites and the welcome-banner
+/// tests in `tui::welcome_banner`, which take it with `blocking_lock()`.
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Guard returned by [`env_home`]: restores the prior env on drop.
 ///

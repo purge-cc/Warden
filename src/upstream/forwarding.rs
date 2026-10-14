@@ -133,7 +133,7 @@ impl Upstream for ForwardingRouter {
         // MUST call `lookup_domain` (which takes the already-normalised domain)
         // and never this `lookup`, so a future caller does not silently
         // reintroduce a per-query allocation here.
-        let domain_str = name.to_string();
+        let domain_str = name.to_ascii();
         let domain = domain_str
             .strip_suffix('.')
             .unwrap_or(&domain_str)

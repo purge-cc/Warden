@@ -137,16 +137,14 @@ const EXCLUDED: &[(&str, &str)] = &[
 ///   answer to the question asked.
 /// - `config backup` archives whatever is on disk. Backing up a *broken*
 ///   config is arguably the point of having the command.
-/// - `firewall-rules` is the one worth revisiting: `main.rs` deliberately
-///   falls back to `ConfigV1::default()` on an unloadable config, so it
-///   emits iptables rules for the *default* listen address while the
-///   operator's real one is unknown. Flagged to the orchestrator rather
-///   than changed — the leniency is explicit and predates this sprint.
+///
+/// `firewall-rules` LEFT this list in an earlier fix. It fell back to the default
+/// listen address on an unloadable config, so it printed rules for a port
+/// the operator may not use. It now refuses with `CONFIG`.
 const KNOWN_ZERO: &[&str] = &[
     "audit tail",
     "config backup",
     "config render-default",
-    "firewall-rules",
     "lists remove",
     "local-dns remove",
     "security tunneling unexempt",
@@ -574,6 +572,7 @@ fn the_named_regressions_stay_fixed() {
         (&["lists", "refresh"], SUCCESS, CONFIG_CODE),
         (&["config", "lint"], SUCCESS, CONFIG_CODE),
         (&["resolve", "127.0.0.1"], SUCCESS, CONFIG_CODE),
+        (&["firewall-rules"], SUCCESS, CONFIG_CODE),
     ];
 
     for (argv, valid_code, broken_code) in cases {
@@ -826,4 +825,190 @@ fn report_the_fence_boundary() {
             .collect::<Vec<_>>()
             .join("\n  ")
     );
+}
+
+/// A foreground `lists refresh` that cannot take its PID-file lease still
+/// fails, and says how to proceed. A non-root caller hits this once systemd
+/// removes /run/purge-warden after a stop; a regular file standing in for
+/// the PID directory gives the same Io failure for root too. A PID file the
+/// caller cannot open is a running daemon's beside a live socket, so the
+/// refresh goes through it; otherwise the file is most likely stale.
+#[test]
+fn a_refresh_without_its_pid_lease_names_the_way_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "").unwrap();
+
+    let leaf = Leaf {
+        path: "lists refresh".into(),
+        args: vec!["lists".into(), "refresh".into()],
+    };
+    let run = run_leaf(&leaf, &config, &blocker.join("warden.pid"));
+
+    assert_eq!(
+        run.code,
+        Some(purge_warden::cli::exit_codes::FAILURE),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("warden --pid-file <path> lists refresh"),
+        "{}",
+        run.stderr
+    );
+
+    let read_only = dir.path().join("read-only.pid");
+    std::fs::write(&read_only, "").unwrap();
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&read_only)
+        .is_ok()
+    {
+        return; // root ignores the mode, so there is no EACCES to observe
+    }
+    let run = run_leaf(&leaf, &config, &read_only);
+    assert_eq!(
+        run.code,
+        Some(purge_warden::cli::exit_codes::FAILURE),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("the PID file is stale: remove it as root"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("`warden --pid-file <path> lists refresh` as the service user"),
+        "{}",
+        run.stderr
+    );
+
+    let live = tempfile::tempdir().unwrap();
+    let run = run_leaf(&leaf, &write_live_socket_config(live.path()), &read_only);
+    assert!(
+        run.stderr
+            .contains("could not request typed list refresh from live daemon"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("cannot acquire PID-file lease"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// `blocklist remove` of an import-local list exits 0, drops the row, keeps
+/// the copied body, and says where that body is: it may hold the only copy
+/// of the operator's edits, and another row may share it.
+#[test]
+fn blocklist_remove_names_the_kept_import_local_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = write_valid_config(&root);
+    let seed = root.join("seed.txt");
+    std::fs::write(&seed, "bad.example\n").unwrap();
+    let warden = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_warden"))
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let seed = seed.to_str().unwrap();
+    let import = warden(&[
+        "blocklist",
+        "import-local",
+        seed,
+        "--id",
+        "mycompany",
+        "--kind",
+        "deny",
+    ]);
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    assert!(std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("mycompany"));
+
+    let remove = warden(&["blocklist", "remove", "mycompany"]);
+    let stdout = String::from_utf8_lossy(&remove.stdout);
+    assert_eq!(remove.status.code(), Some(SUCCESS), "{stdout}");
+    let body = root.join("lists").join("mycompany.txt");
+    assert!(
+        stdout.contains(&format!(
+            "note: kept the import-local body {}; delete it by hand",
+            body.display()
+        )),
+        "{stdout}"
+    );
+    assert!(body.is_file());
+    assert!(!std::fs::read_to_string(&config)
+        .unwrap()
+        .contains("mycompany"));
+}
+
+/// A valid config whose socket has a listener that accepts and drops every
+/// connection: the refresh probes it as live, then its IPC request fails.
+fn write_live_socket_config(dir: &Path) -> std::path::PathBuf {
+    let config = write_valid_config(dir);
+    let socket = dir.join("live.sock");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("/nonexistent/fence.sock", socket.to_str().unwrap());
+    std::fs::write(&config, text).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || listener.incoming().for_each(drop));
+    config
+}
+
+/// A user who cannot use the node corpus refreshes only through a live
+/// daemon and takes no PID lease on the way: the lease would create the run
+/// directory and PID file, and one another user owns breaks the next daemon
+/// start.
+#[cfg(feature = "cluster")]
+#[test]
+fn an_unusable_corpus_refreshes_through_a_live_daemon_without_a_lease() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_live_socket_config(dir.path());
+    let corpus = dir.path().join(".warden-node-corpus");
+    std::fs::create_dir(&corpus).unwrap();
+    std::fs::set_permissions(&corpus, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run_dir = dir.path().join("run");
+
+    let leaf = Leaf {
+        path: "lists refresh".into(),
+        args: vec!["lists".into(), "refresh".into()],
+    };
+    let run = run_leaf(&leaf, &config, &run_dir.join("warden.pid"));
+
+    assert_eq!(
+        run.code,
+        Some(purge_warden::cli::exit_codes::FAILURE),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("could not request typed list refresh from live daemon"),
+        "{}",
+        run.stderr
+    );
+    assert!(!run_dir.exists(), "the refresh took the PID lease");
 }

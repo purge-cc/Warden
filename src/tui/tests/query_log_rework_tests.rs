@@ -384,3 +384,38 @@ async fn query_log_period_window_applies_three_hours_and_discard_preserves_it() 
         );
     }
 }
+
+#[test]
+fn control_and_bidi_characters_in_query_data_never_reach_the_terminal() {
+    let hostile = "evil\x1b[31m\u{202E}x.test";
+    let mut app = query_app(3);
+    app.query_log.entries[0].domain = hostile.into();
+    app.query_log.table_state.select(Some(0));
+    for detail in [false, true] {
+        app.query_log.detail = detail.then(|| {
+            crate::tui::query_log_detail::QueryLogDetail::open({
+                let mut entry = row(0);
+                entry.domain = hostile.into();
+                entry
+            })
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw_frame(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<&str> = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            symbols
+                .iter()
+                .all(|symbol| !symbol.contains('\x1b') && !symbol.contains('\u{202E}')),
+            "detail {detail}:\n{}",
+            dump(buffer)
+        );
+        assert!(
+            symbols.iter().any(|symbol| symbol.contains('\u{FFFD}')),
+            "detail {detail}:\n{}",
+            dump(buffer)
+        );
+    }
+}

@@ -321,3 +321,92 @@ async fn held_rules_on_different_lists_apply_as_one_batch() {
     let _ = supervisor_shutdown.send(());
     supervisor_task.await.unwrap();
 }
+
+/// A plan that expired before Apply is refused before the daemon records an
+/// intent, so the submitted journal settles instead of blocking recovery.
+#[tokio::test]
+async fn expired_plan_refusal_on_the_real_socket_settles_the_journal() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    let socket_path = temp.path().join("warden.sock");
+    std::fs::create_dir(temp.path().join("packs")).unwrap();
+    std::fs::write(
+        &config_path,
+        concat!(
+            "schema_version = 5\n",
+            "[upstream]\nservers = [\"192.0.2.1:53\"]\n",
+            "[server]\ndefault_profile = \"household\"\n",
+            "[profiles.household]\ndisplay_name = \"Whole household\"\nlists = {}\n",
+        ),
+    )
+    .unwrap();
+
+    let service = Arc::new(OperatorRulesService::new(config_path.clone()));
+    let (supervisor, jobs) = OperatorRuleJobSupervisor::new(
+        service,
+        OperatorRuleJobConfig {
+            plan_ttl: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+        None,
+        Arc::new(|_| {}),
+    );
+    jobs.recover().await.unwrap();
+    let (supervisor_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_task = tokio::spawn(supervisor.run(shutdown_rx));
+    let token = "test-tui-expired-plan";
+    let state = Arc::new(daemon_state(token, config_path.clone(), jobs));
+    let server_task = spawn_ipc_server(socket_path.clone(), state).await.unwrap();
+    register_test_token(&socket_path, token);
+
+    let base_revision = read_catalog(socket_path.clone())
+        .await
+        .unwrap()
+        .metadata
+        .config_revision;
+    let adapter = OperatorPolicyAdapter::connect(socket_path.clone())
+        .await
+        .unwrap();
+    let operations = vec![Operation::CreateList {
+        id: "expired".into(),
+        display_name: "Expired".into(),
+        description: String::new(),
+        into: None,
+    }];
+    let mut workflow = OperatorPolicyWorkflow::new(base_revision, operations).unwrap();
+    let planning = workflow.begin_plan().unwrap();
+    let plan = adapter
+        .create_plan(planning.request.clone(), planning.page)
+        .await
+        .unwrap();
+    super::recovery::begin_submitted(
+        config_path.clone(),
+        super::PolicyOrigin::Mount,
+        planning.request.clone(),
+        plan.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let result = adapter.apply(&plan).await;
+    assert_eq!(
+        result.as_ref().unwrap_err().code(),
+        crate::operator_rules::ErrorCode::PlanConflict
+    );
+    assert!(super::controller::observe_submit(
+        config_path.clone(),
+        &planning.request,
+        &result,
+        true
+    )
+    .await
+    .is_none());
+    assert!(super::recovery::load(config_path).await.unwrap().is_none());
+
+    server_task.abort();
+    let _ = server_task.await;
+    let _ = supervisor_shutdown.send(());
+    supervisor_task.await.unwrap();
+}

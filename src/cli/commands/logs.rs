@@ -89,20 +89,26 @@ pub async fn run_logs(
                 println!("(no log entries)");
             } else {
                 for e in &entries {
-                    let name = e.client_name.as_deref().unwrap_or(&e.client_ip);
-                    println!(
-                        "{} {:<16} {:<40} {:<8} {}",
-                        e.timestamp,
-                        name,
-                        e.domain,
-                        e.result,
-                        format_time(e.response_time_us),
-                    );
+                    println!("{}", text_line(e));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// One `--format text` row. Query data can hold control and bidi characters;
+/// they print as U+FFFD so they cannot drive the operator's terminal.
+fn text_line(e: &QueryLogDto) -> String {
+    let name = e.client_name.as_deref().unwrap_or(&e.client_ip);
+    format!(
+        "{} {:<16} {:<40} {:<8} {}",
+        e.timestamp,
+        crate::tui::text::terminal_safe(name),
+        crate::tui::text::terminal_safe(&e.domain),
+        e.result,
+        format_time(e.response_time_us),
+    )
 }
 
 fn print_csv(entries: &[QueryLogDto]) {
@@ -216,5 +222,26 @@ mod tests {
         assert_eq!(csv_escape("@cmd"), "\"'@cmd\"");
         // A formula trigger only in the MIDDLE is harmless → untouched.
         assert_eq!(csv_escape("a=b"), "a=b");
+    }
+
+    #[test]
+    fn text_line_replaces_terminal_controls_in_query_data() {
+        let entry = QueryLogDto {
+            timestamp: "2026-10-12T10:00:00Z".into(),
+            client_ip: "192.0.2.10".into(),
+            client_name: Some("lab\u{202E}pc".into()),
+            domain: "evil\x1b[31m.example.com".into(),
+            query_type: "A".into(),
+            result: "ALLOWED".into(),
+            response_time_us: 120,
+            cname_chain_via: None,
+        };
+        let line = text_line(&entry);
+        assert!(
+            !line.contains('\x1b') && !line.contains('\u{202E}'),
+            "{line:?}"
+        );
+        assert!(line.contains("evil\u{FFFD}[31m.example.com"), "{line:?}");
+        assert!(line.contains("lab\u{FFFD}pc"), "{line:?}");
     }
 }

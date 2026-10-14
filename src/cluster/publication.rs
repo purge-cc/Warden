@@ -49,6 +49,23 @@ pub(crate) struct PublishedArtifact {
     pub receipt_id: String,
 }
 
+impl PublishedArtifact {
+    /// True when `build` reproduces this publication at its own lineage and
+    /// epoch. A config revision keys config bytes only: another version can
+    /// serialize the same bytes into a different policy, which must be
+    /// published anew rather than reused.
+    pub(crate) fn rebuilt_by(
+        &self,
+        build: impl FnOnce(&str, u64) -> anyhow::Result<PublicationCandidate>,
+    ) -> anyhow::Result<bool> {
+        let reservation = &self.reservation;
+        Ok(
+            build(&reservation.primary_lineage, reservation.policy_epoch)?.artifact_hash
+                == reservation.artifact_hash,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ManifestDelivery {
     pub artifact: PublishedArtifact,

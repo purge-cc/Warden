@@ -16,6 +16,7 @@
 //! | [`FAILURE`] (1) | the operation failed |
 //! | [`CONFIG`]  (2) | the configuration could not be loaded, or is invalid |
 //! | [`NEGATIVE`] (3) | "the answer is no" — the diagnostic verbs only |
+//! | 141 | stdout was closed by its reader (`warden … \| head`): 128 + SIGPIPE, no text; every verb except `start` and `dashboard` |
 //!
 //! [`NEGATIVE`] is the one that earns its keep. `warden query <domain>`
 //! answering BLOCKED and `warden resolve <ip>` answering REFUSED are not
@@ -35,7 +36,8 @@
 //! | `config diff <other>` | the two configs differ |
 //!
 //! A mutating verb must never return 3; "the change did not happen" is a
-//! [`FAILURE`], not an answer.
+//! [`FAILURE`], not an answer. The custom-list verbs below are the one
+//! exception: their 3 is a conflict.
 //!
 //! `config diff` joined the list because it had the exact defect the code
 //! was created to remove: it returned [`FAILURE`] when it found
@@ -43,6 +45,28 @@
 //! script "these differ" apart from "the comparison itself broke" — and
 //! the second is the one that must abort a restore. Finding a difference
 //! is the verb succeeding.
+//!
+//! # The custom-list and profile mount verbs
+//!
+//! `custom-list` and `profile mount`/`unmount` follow the operator-rules
+//! receipt contract instead (`src/cli/commands/custom_list.rs`):
+//!
+//! | Code | Meaning |
+//! |------|---------|
+//! | 0 | a read, a valid plan, a no-op, or a committed change whose activation is `applied` or `not_required` |
+//! | 2 | invalid input or validation failure |
+//! | 3 | conflict: revision, row, plan, idempotency, stale cursor, already exists, list mounted |
+//! | 4 | failed before the commit (prepared or aborted), or the daemon's reply was lost and the change may have committed: check before a retry |
+//! | 5 | committed but not active yet: activation `pending`, `failed`, `unknown` or `superseded`, or durability uncertain |
+//!
+//! A lost reply carries no operation id, so `warden custom-list operation
+//! <operation-id>` cannot look it up. Rerun the command with the same
+//! `--request-id` (an `apply --plan` file keeps its own): a used request id
+//! never commits twice. The rerun prints the stored receipt, or exits 3
+//! ("request_id was already used") when the config revision has moved and
+//! `--expect-revision` does not pin the first run's. Without `--request-id`
+//! each run draws a fresh id, so read the state first (`warden custom-list
+//! show <id>`, `warden profile show <id>`).
 //!
 //! # Collision with clap: usage errors are also 2
 //!

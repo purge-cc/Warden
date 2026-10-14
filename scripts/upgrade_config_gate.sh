@@ -33,12 +33,15 @@ HEALTH_INTERVAL=${WARDEN_UPGRADE_HEALTH_INTERVAL_SECS:-1}
 FORWARD_TIMEOUT=${WARDEN_UPGRADE_FORWARD_TIMEOUT_SECS:-300}
 RECOVERY_TIMEOUT=${WARDEN_UPGRADE_RECOVERY_TIMEOUT_SECS:-15}
 RECOVERY_INTERVAL=${WARDEN_UPGRADE_RECOVERY_INTERVAL_SECS:-1}
+# Accepted schema-4 migration findings; empty means none.
+MIGRATION_CHOICES=${WARDEN_UPGRADE_MIGRATION_CHOICES:-}
 BIN_BACKUP="${BIN_DEST}.s6-old"; UNIT_BACKUP="${UNIT_DEST}.s6-old"
 transaction_started=false; healthy=false; finalized=false; cleanup_running=false
-timer_was_active=false; old_elf_saved=false; old_unit_saved=false
+timer_was_active=false; entry_failed=false; old_elf_saved=false; old_unit_saved=false
 old_elf_id=""; old_unit_id=""
 critical_rename=false; pending_signal_rc=0
 SCHEMA=""; WORK=""; source_revision=""; receipt_id=""; candidate_revision=""
+STATE_DIR=""; PUB_STORE=""; STORE_SNAP=""; store_saved=false
 TRANSACTION_PID=$$
 export TRANSACTION_PID
 
@@ -52,6 +55,10 @@ Custom health probes require WARDEN_UPGRADE_BLOCK_RESPONSE=zero|nxdomain|refused
 By default the allow name must prove a positive answer and the block name must prove the exact
 expected block response for the loopback client. Fully restrictive profiles must explicitly set
 WARDEN_UPGRADE_HEALTH_CONTRACT=block_all; that contract skips only the positive allow proof.
+WARDEN_UPGRADE_MIGRATION_CHOICES=<absolute path> passes a schema-4 choices file to the v4-to-v5
+check and plan. It must be a regular file owned by root, not group or world writable. Its
+directory and each parent must be a real directory owned by root and, if group or others can
+write it, sticky.
 USAGE
 }
 die() { echo "upgrade-gate: $*" >&2; exit 1; }
@@ -72,6 +79,18 @@ work_root_private() {
 		[[ $p == / ]] && return 0
 		p=${p%/*}; p=${p:-/}
 	done
+}
+
+# The choices file accepts migration findings, so only root may have written
+# it. Print what is wrong with it; print nothing when it is safe.
+choices_unsafe() {
+	local m d=${1%/*}
+	[[ $1 == /* ]] || { echo "is not an absolute path"; return; }
+	regular_file "$1" || { echo "is not a regular file, or is a symlink"; return; }
+	m=$(stat -c %u:%a "$1") || { echo "cannot be inspected"; return; }
+	[[ ${m%%:*} == 0 || ${m%%:*} == "$EUID" ]] || { echo "is not owned by root"; return; }
+	(( (8#${m#*:} & 8#022) == 0 )) || { echo "is group or world writable"; return; }
+	work_root_private "${d:-/}" || echo "is in a directory that another user can change"
 }
 
 # Return active (0), inactive (1), or unable to confirm state (2). The
@@ -164,6 +183,21 @@ wait_active() {
 		bounded "$deadline" sleep "$sleep_for" || return 1
 	done
 }
+# Type=simple reads active as soon as the daemon runs, also when it fails at
+# boot and systemd starts it again after RestartSec, and the daemon binds its
+# listener only at the end of its boot, after its lists load. So only a
+# listener answer while the unit is still active proves the old daemon got
+# past boot. It gets the candidate's health window, at least the recovery one.
+old_answers() {
+	local deadline=$((SECONDS + (HEALTH_TIMEOUT > RECOVERY_TIMEOUT ? HEALTH_TIMEOUT : RECOVERY_TIMEOUT)))
+	while unit_active_by "$deadline" "$SERVICE"; do
+		if bounded "$deadline" dig "@$DNS_SERVER" +time=1 +tries=1 +norec localhost >/dev/null 2>&1; then
+			unit_active_by "$deadline" "$SERVICE"; return
+		fi
+		bounded "$deadline" sleep "$RECOVERY_INTERVAL" || return 1
+	done
+	return 1
+}
 stop_and_confirm_by() {
 	local deadline=$1 unit=$2 state
 	bounded "$deadline" systemctl stop "$unit" || :
@@ -240,6 +274,58 @@ restore_old_artifacts_by() {
 	executable_file "$BIN_DEST" && regular_file "$UNIT_DEST" || restore_ok=false
 	"$restore_ok"
 }
+# True when a changed store namespace has a higher high-water policy epoch
+# than the snapshot (none counts as 0), or when either epoch cannot be read.
+# The daemon user owns the store: read only regular files, bounded.
+store_epoch_rose() {
+	local deadline=$1 f saved old new re='"high_water":([0-9]+)'
+	for f in "$PUB_STORE"/*/state.json; do
+		[[ -e $f || -L $f ]] || continue
+		regular_file "$f" && new=$(bounded "$deadline" head -c 65536 -- "$f") || return 0
+		saved=$STORE_SNAP/${PUB_STORE##*/}/${f#"$PUB_STORE"/}; old=0
+		if [[ -n $STORE_SNAP ]] && [[ -e $saved || -L $saved ]]; then
+			regular_file "$saved" && old=$(bounded "$deadline" head -c 65536 -- "$saved") || return 0
+			[[ $new == "$old" ]] && continue
+			[[ $old =~ $re ]] || return 0
+			old=${BASH_REMATCH[1]}
+		fi
+		[[ $new =~ $re ]] || return 0
+		(( 10#${BASH_REMATCH[1]} > 10#$old )) && return 0
+	done
+	return 1
+}
+# Only an effective [cluster] that reads enabled = false proves no secondary.
+# ponytail: any enabled primary counts, also one with no enrolled secondary;
+# reading the member roster would let that one roll back too.
+standalone_by() {
+	local out
+	out=$(bounded "$1" "$BINARY" --config "$MASTER" config show --section cluster 2>/dev/null) || return 1
+	[[ $'\n'$out$'\n' == *$'\nenabled = false\n'* ]]
+}
+# Replace the whole store with the snapshot, which also drops every file the
+# candidate added. Without a snapshot there was no store before the upgrade.
+# The daemon user can rename entries in the state directory, so root writes
+# only through a cwd proved to be a fresh root-only child of it, never by
+# path, and puts the complete copy in place with renames.
+restore_store_by() {
+	local deadline=$1 parent stage
+	[[ -n $STORE_SNAP || -e $PUB_STORE || -L $PUB_STORE ]] || return 0
+	if [[ -z $STORE_SNAP ]]; then
+		bounded "$deadline" rm -rf "$PUB_STORE" || return 1
+	else
+		parent=$(stat -c %d:%i -- "$STATE_DIR") && stage=$(bounded "$deadline" mktemp -d "$PUB_STORE.XXXXXX") || return 1
+		if ! ( cd -P -- "$stage" && [[ $(stat -c %u:%a .) == "$EUID:700" && $(stat -c %d:%i ..) == "$parent" ]] &&
+			bounded "$deadline" cp -aT -- "$STORE_SNAP/${PUB_STORE##*/}" . ) || ! bounded "$deadline" sync -f "$STATE_DIR"; then
+			bounded "$deadline" rm -rf "$stage"; return 1
+		fi
+		if [[ -e $PUB_STORE || -L $PUB_STORE ]] && ! bounded "$deadline" mv -T "$PUB_STORE" "$stage.old"; then
+			bounded "$deadline" rm -rf "$stage"; return 1
+		fi
+		bounded "$deadline" mv -T "$stage" "$PUB_STORE" || return 1
+		bounded "$deadline" rm -rf "$stage.old" || return 1
+	fi
+	bounded "$deadline" sync -f "$STATE_DIR"
+}
 
 recover() {
 	local original_rc=$1 rollback_ok=true restore_ok=true old_started=false containment_deadline rollback_deadline restore_deadline v4_rc
@@ -247,6 +333,12 @@ recover() {
 	containment_deadline=$((SECONDS + RECOVERY_TIMEOUT))
 	if ! contain_participants_by "$containment_deadline"; then
 		echo "upgrade-gate: RECOVERY REQUIRED: participant containment was not confirmed; config and recovery artifacts were not modified." >&2 || :
+		return 75
+	fi
+	# A secondary refuses a policy epoch lower than one it fetched: after the
+	# candidate published a newer one on a cluster primary, keep the candidate.
+	if "$store_saved" && store_epoch_rose "$((SECONDS + RECOVERY_TIMEOUT))" && ! standalone_by "$((SECONDS + RECOVERY_TIMEOUT))"; then
+		echo "upgrade-gate: RECOVERY REQUIRED: the candidate published a newer cluster policy epoch, and this node may be a cluster primary whose secondaries refuse a lower one, so nothing was rolled back. The candidate ELF, unit and config stay in place, stopped; the old ELF and unit remain as .s6-old, and the publication store saved before the upgrade is in ${STORE_SNAP:-no directory: there was no store} (end state c under \"End states after exit 75\" in $RECOVERY_DOC)." >&2 || :
 		return 75
 	fi
 	# Rollback and artifact restoration have separate finite windows: a hung
@@ -264,6 +356,11 @@ recover() {
 				*) rollback_ok=false ;;
 			esac ;;
 	esac
+	# The store goes back first: killed in between, the candidate boots on the
+	# old store, never the old daemon on the candidate's. Its copy gets the
+	# forward snapshot's window, so a large store cannot use up the old ELF and
+	# unit restore's own.
+	if "$store_saved"; then restore_store_by "$((SECONDS + FORWARD_TIMEOUT))" || restore_ok=false; fi
 	restore_deadline=$((SECONDS + RECOVERY_TIMEOUT))
 	restore_old_artifacts_by "$restore_deadline" || restore_ok=false
 	# Never start the old daemon until candidate rollback has proved the old config.
@@ -278,20 +375,36 @@ recover() {
 	bounded "$restore_deadline" systemctl daemon-reload || restore_ok=false
 	if "$restore_ok"; then
 		bounded "$restore_deadline" systemctl reset-failed "$SERVICE" || true
-		if bounded "$restore_deadline" systemctl start "$SERVICE" && wait_active "$restore_deadline" "$SERVICE"; then old_started=true; fi
+		if "$entry_failed"; then
+			# The old daemon was failed before the upgrade: start it once and
+			# do not wait. Type=simple reads active until a daemon that cannot
+			# start exits, so no single sample proves it runs.
+			bounded "$restore_deadline" systemctl start "$SERVICE" || true
+			old_started=true
+		elif bounded "$restore_deadline" systemctl start "$SERVICE" && wait_active "$restore_deadline" "$SERVICE" && old_answers; then old_started=true; fi
 	fi
 	if ! "$old_started"; then
 		echo "upgrade-gate: RECOVERY REQUIRED: participant containment, rollback, restore, reload, or old-daemon restart was not confirmed; backup timer was not resumed and evidence is preserved." >&2 || :
 		return 75
 	fi
+	# The old daemon was started on the restored store: the snapshot is spent.
+	[[ -z $STORE_SNAP ]] || bounded "$((SECONDS + RECOVERY_TIMEOUT))" rm -rf "$STORE_SNAP" || :
 	if "$timer_was_active"; then
 		restore_deadline=$((SECONDS + RECOVERY_TIMEOUT))
 		if ! bounded "$restore_deadline" systemctl start "$BACKUP_TIMER" || ! wait_active "$restore_deadline" "$BACKUP_TIMER"; then
-		echo "upgrade-gate: RECOVERY REQUIRED: old daemon recovered but backup timer could not be restored." >&2 || :
+		if "$entry_failed"; then
+			echo "upgrade-gate: RECOVERY REQUIRED: exact old ELF and unit were restored, but backup timer could not be restored." >&2 || :
+		else
+			echo "upgrade-gate: RECOVERY REQUIRED: old daemon recovered but backup timer could not be restored." >&2 || :
+		fi
 		return 75
 		fi
 	fi
-	echo "upgrade-gate: transaction failed; complete schema-$SCHEMA state and old daemon were restored." >&2 || :
+	if "$entry_failed"; then
+		echo "upgrade-gate: transaction failed; the exact old ELF and unit were restored. The old daemon was failed before this upgrade; it was started once, unconfirmed, and DNS may still be down. See \"Upgrading a failed daemon\" in $RECOVERY_DOC." >&2 || :
+	else
+		echo "upgrade-gate: transaction failed; complete schema-$SCHEMA state and old daemon were restored." >&2 || :
+	fi
 	return "$original_rc"
 }
 on_exit() {
@@ -357,12 +470,20 @@ if [[ -n $ALLOW_NAME_EXPLICIT || -n $BLOCK_NAME_EXPLICIT ]] && [[ -z $BLOCK_RESP
 	exit 2
 fi
 command -v timeout >/dev/null 2>&1 && timeout -k 1s 1s true >/dev/null 2>&1 || { echo "upgrade-gate: usable timeout command is required before maintenance" >&2; exit 2; }
+command -v dig >/dev/null 2>&1 || { echo "upgrade-gate: dig is required for the health checks; install bind-utils or dnsutils. Nothing was changed." >&2; exit 2; }
 if ! candidate_id=$(file_id "$BINARY") || ! installed_id=$(file_id "$BIN_DEST") || ! old_unit_id=$(file_id "$UNIT_DEST") || [[ ! $candidate_id =~ ^[0-9]+:[0-9]+$ || ! $installed_id =~ ^[0-9]+:[0-9]+$ || ! $old_unit_id =~ ^[0-9]+:[0-9]+$ ]]; then
 	echo "upgrade-gate: cannot determine executable identities" >&2; exit 2
 fi
 old_elf_id=$installed_id
 [[ $candidate_id != "$installed_id" ]] || { echo "upgrade-gate: candidate and installed ELF must differ" >&2; exit 2; }
+[[ ! -e $BIN_BACKUP && ! -L $BIN_BACKUP && ! -e $UNIT_BACKUP && ! -L $UNIT_BACKUP ]] || { echo "upgrade-gate: refusing pre-existing .s6-old recovery evidence; nothing was changed. An earlier upgrade was killed (SIGKILL, power loss or crash) or failed and kept the old ELF and unit. First look for a non-empty receipt.json in the newest $WORK_ROOT/purge-warden-v4-to-v5.* directory, created by that upgrade: if one exists, follow \"Manual schema-4 recovery\" in $RECOVERY_DOC. Otherwise, if $BIN_BACKUP --config $MASTER config lint passes, the old version still reads this config: with $BACKUP_TIMER, $BACKUP_SERVICE and $SERVICE stopped, move $BIN_BACKUP back to $BIN_DEST and $UNIT_BACKUP back to $UNIT_DEST (each that exists), put the publication store back from the newest $WORK_ROOT/purge-warden-store.* directory created by that upgrade, only if ls -ld shows it as drwx------ root root and it holds .warden-cluster-publications (see \"Publication store snapshot\" in $RECOVERY_DOC), run systemctl daemon-reload, start $SERVICE and, if systemctl is-enabled reports it enabled, $BACKUP_TIMER, then upgrade again. If lint fails, follow \"End states after exit 75\" in $RECOVERY_DOC." >&2; exit 2; }
 [[ ! -e $BIN_BACKUP && ! -L $BIN_BACKUP && ! -e $UNIT_BACKUP && ! -L $UNIT_BACKUP ]] || { echo "upgrade-gate: refusing pre-existing .s6-old recovery evidence; nothing was changed. An earlier upgrade was killed (SIGKILL, power loss or crash) or failed and kept the old ELF and unit. First look for a non-empty receipt.json in the newest $WORK_ROOT/purge-warden-v4-to-v5.* directory, created by that upgrade: if one exists, follow \"Manual schema-4 recovery\" in $RECOVERY_DOC. Otherwise, if $BIN_BACKUP --config $MASTER config lint passes, the old version still reads this config: with $BACKUP_TIMER, $BACKUP_SERVICE and $SERVICE stopped, move $BIN_BACKUP back to $BIN_DEST and $UNIT_BACKUP back to $UNIT_DEST (each that exists), run systemctl daemon-reload, start $SERVICE and, if systemctl is-enabled reports it enabled, $BACKUP_TIMER, then upgrade again. If lint fails, follow \"End states after exit 75\" in $RECOVERY_DOC." >&2; exit 2; }
+choice_args=()
+if [[ -n $MIGRATION_CHOICES ]]; then
+	choices_problem=$(choices_unsafe "$MIGRATION_CHOICES")
+	[[ -z $choices_problem ]] || { echo "upgrade-gate: WARDEN_UPGRADE_MIGRATION_CHOICES $MIGRATION_CHOICES $choices_problem; nothing was changed." >&2; exit 2; }
+	choice_args=(--choices "$MIGRATION_CHOICES")
+fi
 if "$DRY_RUN"; then
 	echo "upgrade-gate: [dry] candidate schema detection; schema 3: check, quiesce, preserve, migrate v3-to-v4, lint, install, health, finalize"
 	echo "upgrade-gate: [dry] schema 4: v4-to-v5 check, quiesce, preserve, re-check, plan, apply, lint, install, health, stop, finalize, restart; schema 5: quiesce, preserve, lint, install, health"
@@ -374,7 +495,12 @@ fi
 if ! check_output=$("$BINARY" migrate v3-to-v4 --from-config "$MASTER" --check 2>/dev/null); then
 	# v3-to-v4 refuses schema 5; only a clean candidate lint proves it.
 	if ! "$BINARY" --config "$MASTER" config lint >&2; then
-		echo "upgrade-gate: candidate check refused: the candidate cannot read $MASTER as schema 3, 4 or 5; nothing was changed. For a schema-3 or schema-4 master, see why with: <candidate> migrate v3-to-v4 --from-config $MASTER --check" >&2; exit 3
+		# Read-only rerun: its stderr names why a schema-3 or schema-4 master is refused.
+		# For schema 5 the lint above gave the reason, so its schema refusal is dropped.
+		# A test in src/cli/commands/migrate/v3_to_v4.rs pins the matched prefix.
+		why=$("$BINARY" migrate v3-to-v4 --from-config "$MASTER" --check 2>&1 >/dev/null) || :
+		[[ -z $why || $why == *'cannot check schema_version = 5;'* ]] || printf '%s\n' "$why" >&2
+		echo "upgrade-gate: candidate check refused: the candidate cannot read $MASTER as schema 3, 4 or 5; nothing was changed. For a schema-3 or schema-4 master, see why with: $BINARY migrate v3-to-v4 --from-config $MASTER --check" >&2; exit 3
 	fi
 	SCHEMA=5
 elif [[ $check_output == 'config is already schema 4 and valid' ]]; then
@@ -385,24 +511,45 @@ else
 	SCHEMA=3
 fi
 [[ -z $check_output ]] || printf '%s\n' "$check_output"
+[[ -z $MIGRATION_CHOICES || $SCHEMA == 4 ]] || echo "upgrade-gate: schema $SCHEMA has no v4-to-v5 findings; WARDEN_UPGRADE_MIGRATION_CHOICES is ignored"
 if [[ $SCHEMA == 4 ]]; then
 	work_root_private "$WORK_ROOT" || { echo "upgrade-gate: plan/receipt root $WORK_ROOT must be an absolute path of real directories owned by root, each sticky if group or others can write it; nothing was changed." >&2; exit 2; }
 	re=$'^source revision: ([0-9a-f]{64})\nplan hash: [0-9a-f]{64}\nfindings: [0-9]+\napply blocked: false$'
-	if ! v4_check=$("$BINARY" --config "$MASTER" migrate v4-to-v5 --check) || [[ ! $v4_check =~ $re ]]; then
+	if ! v4_check=$("$BINARY" --config "$MASTER" migrate v4-to-v5 "${choice_args[@]}" --check) || [[ ! $v4_check =~ $re ]]; then
 		printf '%s\n' "$v4_check" >&2
-		echo "upgrade-gate: v4-to-v5 check failed or found changes that block apply; nothing was changed. Review them with: <candidate> --config $MASTER migrate v4-to-v5 --check --json" >&2; exit 3
+		echo "upgrade-gate: v4-to-v5 check failed or found changes that block apply; nothing was changed. Review them with: $BINARY --config $MASTER migrate v4-to-v5 --check --json. To accept them, write a choices file and set WARDEN_UPGRADE_MIGRATION_CHOICES to it: see \"Migration findings\" in $RECOVERY_DOC." >&2; exit 3
 	fi
 	source_revision=${BASH_REMATCH[1]}
 	printf '%s\n' "$v4_check"
 fi
+# The publication store the old daemon reads lives in the node state
+# directory: beside the master, or /var/lib/<x> for an /etc/<x> master
+# (for_config_parent in src/config/state_dir.rs). The hermetic harness
+# replaces the mapped directory with WARDEN_UPGRADE_STATE_DIR.
+STATE_DIR=$(realpath -e -- "$MASTER") || die "cannot resolve the master path"
+STATE_DIR=${STATE_DIR%/*}
+if [[ $STATE_DIR == /etc/?* ]]; then STATE_DIR=${STATE_DIR#/etc/}; STATE_DIR=/var/lib/${STATE_DIR%%/*}; fi
+STATE_DIR=${WARDEN_UPGRADE_STATE_DIR:-$STATE_DIR}
+# Root may have made /var/lib/<x> a symlink: resolve it as the daemon does
+# (open_for_root), so the restore's parent check compares real directories.
+if [[ -e $STATE_DIR ]]; then STATE_DIR=$(realpath -e -- "$STATE_DIR") || die "cannot resolve the state directory"; fi
+PUB_STORE=$STATE_DIR/.warden-cluster-publications
+if [[ -e $PUB_STORE || -L $PUB_STORE ]] && ! work_root_private "$WORK_ROOT"; then
+	echo "upgrade-gate: publication store snapshot root $WORK_ROOT must be an absolute path of real directories owned by root, each sticky if group or others can write it; nothing was changed." >&2; exit 2
+fi
 echo "upgrade-gate: candidate reports config schema $SCHEMA"
 
 # Entry refusal is non-mutating; capture timer policy before maintenance begins.
+# Schema 5 also accepts a failed old daemon: its swap changes no config, and a
+# failure after quiesce puts the exact old ELF and unit back.
 if unit_active "$SERVICE"; then :; else
 	state=$?
 	[[ $state -eq 1 ]] || die "cannot confirm old daemon state"
-	[[ $SCHEMA != 5 ]] || die "old daemon must be active before S6 cutover; nothing was changed. If an earlier v4-to-v5 upgrade ended with RECOVERY REQUIRED, the installed binary may be older than this schema-5 master and unable to start. See \"End states after exit 75\" in $RECOVERY_DOC."
-	die "old daemon must be active before S6 cutover"
+	[[ $SCHEMA == 5 ]] || die "old daemon must be active before S6 cutover"
+	old_state=$(systemctl show -p ActiveState --value "$SERVICE") || die "cannot confirm old daemon state"
+	[[ $old_state == failed ]] || die "old daemon must be active or failed before S6 cutover; it is ${old_state:-unknown}, so nothing was changed. Wait until it is active or failed, or start it, then rerun. See \"Upgrading a failed daemon\" in $RECOVERY_DOC."
+	entry_failed=true
+	echo "upgrade-gate: old daemon is failed; a failure after quiesce restores the exact old ELF and unit and starts the old daemon once, unconfirmed"
 fi
 if unit_active "$BACKUP_TIMER"; then timer_was_active=true; else
 	state=$?; [[ $state -eq 1 ]] || die "cannot confirm backup timer state"
@@ -482,6 +629,19 @@ finish_pending_signal
 if ! "$old_elf_saved" || ! "$old_unit_saved"; then
 	die "old ELF and daemon unit were not both preserved before migration"
 fi
+# A candidate commits its own publication records at boot, and an older
+# build cannot start on them. Save the store with owners and modes in a fresh
+# root-only directory; recovery puts it back before the old daemon starts.
+# Only a complete, synced copy gets the store's name.
+if [[ -e $PUB_STORE || -L $PUB_STORE ]]; then
+	STORE_SNAP=$(mktemp -d "$WORK_ROOT/purge-warden-store.XXXXXX")
+	echo "upgrade-gate: publication store snapshot: $STORE_SNAP" >&2
+	forward cp -aT "$PUB_STORE" "$STORE_SNAP/partial"
+	forward sync -f "$STORE_SNAP"
+	forward mv "$STORE_SNAP/partial" "$STORE_SNAP/${PUB_STORE##*/}"
+	forward sync -f "$STORE_SNAP"
+fi
+store_saved=true
 case $SCHEMA in
 	3) forward "$BINARY" migrate v3-to-v4 --from-config "$MASTER" ;;
 	4)
@@ -490,7 +650,7 @@ case $SCHEMA in
 		# /var/tmp survives a reboot, so a manual --rollback keeps its receipt.
 		WORK=$(mktemp -d "$WORK_ROOT/purge-warden-v4-to-v5.XXXXXX")
 		echo "upgrade-gate: v4-to-v5 plan and receipt: $WORK" >&2
-		plan_output=$(forward "$BINARY" --config "$MASTER" migrate v4-to-v5 --plan "$WORK/plan.json")
+		plan_output=$(forward "$BINARY" --config "$MASTER" migrate v4-to-v5 "${choice_args[@]}" --plan "$WORK/plan.json")
 		re='^wrote migration plan .+ \(([0-9a-f]{64})\)$'
 		[[ $plan_output =~ $re ]] || die "v4-to-v5 --plan did not report a plan hash"
 		forward "$BINARY" --config "$MASTER" migrate v4-to-v5 --apply-plan "$WORK/plan.json" --expect-plan-hash "${BASH_REMATCH[1]}" >"$WORK/receipt.json"
@@ -631,4 +791,5 @@ if ! bounded "$post_health_deadline" rm -f "$BIN_BACKUP" "$UNIT_BACKUP" || ! syn
 	exit 75
 fi
 [[ -z $WORK ]] || bounded "$post_health_deadline" rm -rf "$WORK" || :
+[[ -z $STORE_SNAP ]] || bounded "$post_health_deadline" rm -rf "$STORE_SNAP" || :
 echo "upgrade-gate: S6 schema-$SCHEMA upgrade transaction completed" || :

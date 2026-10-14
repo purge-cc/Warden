@@ -211,6 +211,40 @@ pub(super) async fn discard_property_committed(
     .await
 }
 
+/// Clear a property-first intent whose profile update the daemon provably
+/// never applied (`ProfileCreateFailure::Refused`). Exact match only.
+pub(super) async fn abandon_property_pending(
+    config_path: PathBuf,
+    expected_origin: PolicyOrigin,
+    expected_operations: Vec<Operation>,
+    expected_prefix: ProfilePrefix,
+) -> Result<(), AdapterError> {
+    run_store(config_path, move |store| {
+        let Some(JournalState::PropertyPending {
+            origin,
+            operations,
+            prefix,
+        }) = read_locked(store)?
+        else {
+            return Err(journal_error(
+                ErrorCode::RecoveryConflict,
+                "property recovery journal is not pending",
+            ));
+        };
+        if origin != expected_origin
+            || operations != expected_operations
+            || prefix != expected_prefix
+        {
+            return Err(journal_error(
+                ErrorCode::RecoveryConflict,
+                "property recovery journal does not match the refused update",
+            ));
+        }
+        write_locked(store, JournalState::Empty)
+    })
+    .await
+}
+
 pub(super) async fn begin_submitted(
     config_path: PathBuf,
     origin: PolicyOrigin,
@@ -309,6 +343,55 @@ pub(super) async fn observe_receipt(
                 prefix_outcome,
                 operation_id: Some(operation_id),
             }
+        };
+        write_locked(store, state)
+    })
+    .await
+}
+
+/// Settle a submitted intent the daemon refused before recording it (see
+/// `workflow::refused_before_intent`). Without a profile prefix nothing is
+/// outstanding; with one, the committed properties stay on record so the
+/// re-planned mount suffix resumes from `PropertyCommitted`.
+pub(super) async fn settle_refused(
+    config_path: PathBuf,
+    request_id: String,
+) -> Result<(), AdapterError> {
+    run_store(config_path, move |store| {
+        let Some(JournalState::Submitted {
+            origin,
+            request,
+            apply,
+            prefix,
+            prefix_outcome,
+            operation_id,
+        }) = read_locked(store)?
+        else {
+            return Err(journal_error(
+                ErrorCode::RecoveryConflict,
+                "submitted recovery journal is missing",
+            ));
+        };
+        if request.request_id != request_id || apply.request_id != request_id {
+            return Err(journal_error(
+                ErrorCode::IdempotencyConflict,
+                "refusal identity does not match the recovery journal",
+            ));
+        }
+        if operation_id.is_some() {
+            return Err(journal_error(
+                ErrorCode::RecoveryConflict,
+                "the daemon already reported an operation for this request",
+            ));
+        }
+        let state = match *prefix {
+            None => JournalState::Empty,
+            Some(prefix) => JournalState::PropertyCommitted {
+                origin,
+                operations: request.operations,
+                prefix,
+                message: prefix_outcome.unwrap_or_default(),
+            },
         };
         write_locked(store, state)
     })

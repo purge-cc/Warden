@@ -97,10 +97,25 @@ pub(crate) async fn enroll(
         .context("primary TLS connection or enrollment failed")?;
     ensure!(
         response.status().is_success(),
-        "primary refused enrollment ({})",
-        response.status()
+        "{}",
+        enrollment_refused(response.status(), &credential.node_id)
     );
     Ok(())
+}
+
+/// The primary answers every enrollment refusal with 403. After `cluster
+/// leave` it still lists the node (membership.rs "node identity already
+/// enrolled"), so the rejoin needs a revoke there first.
+fn enrollment_refused(status: reqwest::StatusCode, node_id: &str) -> String {
+    let hint = if status == reqwest::StatusCode::FORBIDDEN {
+        format!(
+            "; if this node left the cluster, the primary still lists it until \
+             `warden cluster revoke {node_id}` runs on the primary"
+        )
+    } else {
+        String::new()
+    };
+    format!("primary refused enrollment ({status}){hint}")
 }
 
 pub(crate) async fn activate(credential: &SecondaryCredential) -> anyhow::Result<()> {
@@ -355,4 +370,24 @@ pub(crate) async fn refresh_roster(
         files.write("roster-cache.json", &serde_json::to_vec(&roster)?)
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refused_enrollment_names_the_revoke_step_only_for_403() {
+        let refused = enrollment_refused(reqwest::StatusCode::FORBIDDEN, "node-a");
+        assert!(refused.starts_with("primary refused enrollment (403 Forbidden)"));
+        assert!(
+            refused
+                .contains("the primary still lists it until `warden cluster revoke node-a` runs"),
+            "{refused}"
+        );
+        assert_eq!(
+            enrollment_refused(reqwest::StatusCode::TOO_MANY_REQUESTS, "node-a"),
+            "primary refused enrollment (429 Too Many Requests)"
+        );
+    }
 }

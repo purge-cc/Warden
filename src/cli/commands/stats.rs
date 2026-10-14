@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::ipc::protocol::{IpcCommand, IpcResponse};
+use crate::ipc::protocol::{DomainCount, IpcCommand, IpcResponse};
 use crate::ipc::socket_client;
 
 /// Warn when `--limit` asked for more rows than the daemon sent.
@@ -26,6 +26,17 @@ fn warn_if_truncated(requested: usize, received: usize) {
     }
 }
 
+/// One top-N row. The domain comes from the daemon and lands on a
+/// terminal, so control and bidi characters become U+FFFD.
+pub(super) fn top_line(rank: usize, entry: &DomainCount) -> String {
+    format!(
+        "  {:>2}. {:<40} {} hits",
+        rank,
+        crate::tui::text::terminal_safe(&entry.domain),
+        entry.count
+    )
+}
+
 pub async fn run_top_blocked(socket_path: &Path, limit: usize, json: bool) -> anyhow::Result<()> {
     let resp = socket_client::send_command(socket_path, &IpcCommand::TrackingStats { token: None })
         .await?;
@@ -38,7 +49,7 @@ pub async fn run_top_blocked(socket_path: &Path, limit: usize, json: bool) -> an
             } else {
                 println!("Top blocked domains:");
                 for (i, entry) in top_blocked.iter().take(limit).enumerate() {
-                    println!("  {:>2}. {:<40} {} hits", i + 1, entry.domain, entry.count);
+                    println!("{}", top_line(i + 1, entry));
                 }
                 if top_blocked.is_empty() {
                     println!("  (no data yet)");
@@ -63,7 +74,7 @@ pub async fn run_top_queried(socket_path: &Path, limit: usize, json: bool) -> an
             } else {
                 println!("Top queried domains:");
                 for (i, entry) in top_queried.iter().take(limit).enumerate() {
-                    println!("  {:>2}. {:<40} {} hits", i + 1, entry.domain, entry.count);
+                    println!("{}", top_line(i + 1, entry));
                 }
                 if top_queried.is_empty() {
                     println!("  (no data yet)");
@@ -200,6 +211,20 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_line_replaces_terminal_controls_in_the_domain() {
+        let entry = DomainCount {
+            domain: "evil\x1b[31m.example.com".into(),
+            count: 7,
+            count_24h: 0,
+            scope: None,
+        };
+        let line = top_line(1, &entry);
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(line.contains("evil\u{FFFD}[31m.example.com"), "{line:?}");
+        assert!(line.ends_with(" 7 hits"), "{line:?}");
+    }
 
     #[test]
     fn days_to_date_matches_time_crate_across_boundaries() {

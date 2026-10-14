@@ -1,20 +1,31 @@
-//! `warden config edit` — open the config file in `$EDITOR` then validate.
+//! `warden config edit` — edit a private copy of the master in `$EDITOR`,
+//! then validate it and write it back.
 //!
-//! The editor opens the config file as-is, and post-edit schema-5
-//! validation runs through the held write capability. For fresh files it is
-//! given the init scaffold via [`crate::cli::commands::init::default_config`]
+//! The editor gets a 0600 copy in a fresh 0700 temp directory, never a path
+//! in the config directory, which the daemon user can write. Changed bytes
+//! are validated and committed through the held write capability; refused
+//! or aborted edits stay in that copy. Unchanged bytes get the post-edit
+//! schema-5 validation only. For fresh files the master is first given the
+//! init scaffold via [`crate::cli::commands::init::default_config`]
 //! plus the `[backup]` block from [`crate::cli::commands::init::backup_config_for`].
 //!
 //! The editor invocation is a direct
-//! `Command::new(binary).args(extra).arg(config_path)` so shell metacharacters
+//! `Command::new(binary).args(extra).arg(copy)` so shell metacharacters
 //! in paths are never interpreted. The first-boot scaffold is written through
 //! [`crate::config::atomic_write::hardened_atomic_create_only_at`] with an
 //! explicit `0o640` mode.
 
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::cli::commands::init::{backup_config_for, default_config};
+use crate::cli::commands::target::{
+    commit_prevalidated_single_write, prepare_raw_validated_single_locked,
+    read_raw_or_empty_locked, CandidateInvalid, ConfigCommitDisposition,
+};
 use crate::cli::exit_codes::{CONFIG, SUCCESS};
 use crate::config::atomic_write::{hardened_atomic_create_only_at, AtomicCreateOnlyAtOpts};
 use crate::config::loader::{
@@ -23,18 +34,20 @@ use crate::config::loader::{
 use crate::config::migration_journal;
 use crate::config::write_lock;
 
-/// Open the config in `$EDITOR`; on exit, run the current loader + validator
-/// and print any resulting errors.
+/// Open a private copy of the config in `$EDITOR`; on exit, validate it with
+/// the current loader + validator and write it only if valid.
 ///
 /// Returns the intended process exit code: [`CONFIG`] when the file the
-/// operator just saved does not validate, [`SUCCESS`] otherwise. Before
+/// operator just saved does not validate (the live config stays unchanged
+/// and the copy is kept), [`SUCCESS`] otherwise. Before
 /// this the validator's output was printed and then discarded, so
 /// `warden config edit && systemctl reload purge-warden` would happily
 /// reload a config the daemon refuses — the one command sequence the
 /// post-edit validation exists to protect.
 ///
-/// A failure to *launch* the editor stays an `Err` (exit 1): that is the
-/// operation failing, not the configuration being invalid.
+/// A failure to *launch* the editor, a non-zero editor exit, or a failed
+/// write stays an `Err` (exit 1): that is the operation failing, not the
+/// configuration being invalid.
 pub fn run_edit(config_path: &Path) -> anyhow::Result<i32> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     run_edit_with_raw_editor_runner(config_path, &editor, |binary, extra_args, target| {
@@ -103,41 +116,116 @@ fn run_edit_with_runner(
         );
     }
 
-    let status = runner(binary, extra_args, &canonical_master)?;
+    // The guard pins the tree, but the daemon user can still replace a file
+    // in the config directory. Root's editor therefore never gets a live
+    // path: it edits a private copy, and only validated bytes are written.
+    let original = read_raw_or_empty_locked(&guard, config_path, &canonical_master)?
+        .0
+        .unwrap_or_default();
+    let copy_dir = tempfile::Builder::new()
+        .prefix("warden-edit-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .context("cannot create a private directory for the edit")?;
+    let copy = copy_dir.path().join(COPY_NAME);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&copy)
+        .context("cannot create the private edit copy")?;
+    file.write_all(original.as_bytes())
+        .and_then(|()| file.sync_all())
+        .context("cannot write the private edit copy")?;
+    drop(file);
 
-    guard.recapture_canonical_master_after_editor()?;
-    #[cfg(test)]
-    write_lock::test_event(write_lock::TestEvent::AfterEditorRecapture);
-
+    let status = runner(binary, extra_args, &copy)?;
     if !status.success() {
-        anyhow::bail!("{} exited with {}", binary, status);
+        anyhow::bail!(
+            "{binary} exited with {status}; config unchanged; {}",
+            keep(copy_dir)
+        );
+    }
+    let edited = match std::fs::read(&copy).map(String::from_utf8) {
+        Ok(Ok(edited)) => edited,
+        Ok(Err(_)) => anyhow::bail!(
+            "the edited copy is not UTF-8; config unchanged; {}",
+            keep(copy_dir)
+        ),
+        Err(error) => anyhow::bail!("cannot read the edited copy: {error}; config unchanged"),
+    };
+
+    if edited == original {
+        drop(copy_dir);
+        #[cfg(test)]
+        write_lock::test_event(write_lock::TestEvent::BeforeGuardedValidation);
+        verify_post_editor_integrity(&guard)?;
+
+        // Validate after editing via the current loader so the operator sees
+        // any typos / cross-ref misses with file:line attribution.
+        let now = time::OffsetDateTime::now_utc();
+        let validation =
+            load_config_v5_executable_under_editor_guard(&guard, &canonical_master, now);
+        #[cfg(test)]
+        write_lock::test_event(write_lock::TestEvent::AfterGuardedValidation);
+        verify_post_editor_integrity(&guard)?;
+        return match validation {
+            Ok(_) => {
+                println!("config is valid");
+                Ok(SUCCESS)
+            }
+            Err(EditorGuardedLoadFailure::Diagnostics(errs)) => {
+                eprintln!("config has {} error(s):", errs.len());
+                for e in &errs {
+                    eprintln!("  - {e}");
+                }
+                Ok(CONFIG)
+            }
+            Err(EditorGuardedLoadFailure::Operational(err)) => Err(err),
+        };
     }
 
-    #[cfg(test)]
-    write_lock::test_event(write_lock::TestEvent::BeforeGuardedValidation);
-    verify_post_editor_integrity(&guard)?;
-
-    // Validate after editing via the current loader so the operator sees
-    // any typos / cross-ref misses with file:line attribution.
-    let now = time::OffsetDateTime::now_utc();
-    let validation = load_config_v5_executable_under_editor_guard(&guard, &canonical_master, now);
-    #[cfg(test)]
-    write_lock::test_event(write_lock::TestEvent::AfterGuardedValidation);
-    verify_post_editor_integrity(&guard)?;
-    match validation {
-        Ok(_) => {
+    let prepared = verify_post_editor_integrity(&guard).and_then(|()| {
+        prepare_raw_validated_single_locked(&guard, &canonical_master, &canonical_master, edited)
+    });
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) if error.downcast_ref::<CandidateInvalid>().is_some() => {
+            eprintln!("{error}");
+            eprintln!("not applied; config unchanged; {}", keep(copy_dir));
+            return Ok(CONFIG);
+        }
+        Err(error) => anyhow::bail!(
+            "edit not applied: {error:#}; config unchanged; {}",
+            keep(copy_dir)
+        ),
+    };
+    match commit_prevalidated_single_write(prepared) {
+        Ok(()) => {
             println!("config is valid");
             Ok(SUCCESS)
         }
-        Err(EditorGuardedLoadFailure::Diagnostics(errs)) => {
-            eprintln!("config has {} error(s):", errs.len());
-            for e in &errs {
-                eprintln!("  - {e}");
-            }
-            Ok(CONFIG)
+        Err(error) if error.disposition() == ConfigCommitDisposition::Uncertain => {
+            anyhow::bail!(
+                "edit state is uncertain: {error}; recovery required; {}",
+                keep(copy_dir)
+            )
         }
-        Err(EditorGuardedLoadFailure::Operational(err)) => Err(err),
+        Err(error) => anyhow::bail!(
+            "edit not applied: {error}; config unchanged; {}",
+            keep(copy_dir)
+        ),
     }
+}
+
+const COPY_NAME: &str = "config.toml";
+
+/// Keep the private copy after a refusal so the operator's edits survive.
+fn keep(copy_dir: tempfile::TempDir) -> String {
+    format!(
+        "your edits are kept in {} (a temp directory, removed at reboot)",
+        copy_dir.keep().join(COPY_NAME).display()
+    )
 }
 
 /// The `/etc` master gets the package seed's `[backup] dir` under `/var/lib`:
@@ -253,20 +341,35 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn edit_runner_uses_canonical_target_and_preserves_master_alias() {
+    fn edit_runner_gets_a_private_copy_and_preserves_master_alias() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real.toml");
         let alias = tmp.path().join("alias.toml");
         fs::write(&real, valid_config()).unwrap();
         symlink("real.toml", &alias).unwrap();
+        let mut copy = std::path::PathBuf::new();
 
         let code = run_edit_with_runner(&alias, "editor", &[], |_, _, target| {
-            assert_eq!(target, real);
+            copy = target.to_path_buf();
+            let dir = target.parent().unwrap();
+            assert!(!target.starts_with(tmp.path()), "{}", target.display());
+            assert!(dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("warden-edit-"));
+            assert_eq!(fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(target).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(fs::read_to_string(target).unwrap(), valid_config());
             Ok(successful_status())
         })
         .unwrap();
 
         assert_eq!(code, SUCCESS);
+        assert!(
+            !copy.parent().unwrap().exists(),
+            "an unchanged copy is dropped"
+        );
         assert!(fs::symlink_metadata(&alias)
             .unwrap()
             .file_type()
@@ -284,12 +387,13 @@ mod tests {
         symlink("real/config.toml", &alias).unwrap();
 
         let code = run_edit_with_runner(&alias, "editor", &[], |_, _, target| {
-            assert_eq!(target, real);
-            assert!(target.exists(), "scaffold must precede editor launch");
+            assert_ne!(target, real);
+            assert!(real.exists(), "scaffold must precede editor launch");
             assert_eq!(
-                fs::metadata(target).unwrap().permissions().mode() & 0o777,
+                fs::metadata(&real).unwrap().permissions().mode() & 0o777,
                 0o640
             );
+            assert_eq!(fs::read(target).unwrap(), fs::read(&real).unwrap());
             let saved = target.with_extension("editor-save");
             fs::write(&saved, valid_config()).unwrap();
             fs::rename(saved, target).unwrap();
@@ -298,6 +402,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(code, SUCCESS);
+        assert_eq!(fs::read_to_string(&real).unwrap(), valid_config());
+        assert_eq!(fs::metadata(&real).unwrap().mode() & 0o777, 0o640);
         assert!(fs::symlink_metadata(&alias)
             .unwrap()
             .file_type()
@@ -325,34 +431,35 @@ mod tests {
 
         assert_eq!(
             run_edit_with_runner(&alias, "editor", &[], |_, _, target| {
-                let master = fs::metadata(target).unwrap();
-                let lock =
-                    fs::metadata(target.parent().unwrap().join(".warden-config.lock")).unwrap();
-                assert_eq!((master.uid(), master.gid()), (65534, 65534));
+                let live = fs::metadata(&master).unwrap();
+                let lock = fs::metadata(real_dir.join(".warden-config.lock")).unwrap();
+                assert_eq!((live.uid(), live.gid()), (65534, 65534));
                 assert_eq!((lock.uid(), lock.gid()), (65534, 65534));
-                assert_eq!(master.mode() & 0o777, 0o640);
+                assert_eq!(live.mode() & 0o777, 0o640);
                 fs::write(target, valid_config()).unwrap();
                 Ok(successful_status())
             })
             .unwrap(),
             SUCCESS
         );
+        let live = fs::metadata(&master).unwrap();
+        assert_eq!((live.uid(), live.gid()), (65534, 65534));
+        assert_eq!(live.mode() & 0o777, 0o640);
+        assert_eq!(fs::read_to_string(&master).unwrap(), valid_config());
         drop(crate::config::write_lock::acquire_for_write(&master).unwrap());
 
         let failed = real_dir.join("failed.toml");
+        let mut copy = std::path::PathBuf::new();
         assert!(
             run_edit_with_runner(&failed, "editor", &[], |_, _, target| {
-                assert_eq!(
-                    (
-                        fs::metadata(target).unwrap().uid(),
-                        fs::metadata(target).unwrap().gid()
-                    ),
-                    (65534, 65534)
-                );
+                let scaffold = fs::metadata(&failed).unwrap();
+                assert_eq!((scaffold.uid(), scaffold.gid()), (65534, 65534));
+                copy = target.to_path_buf();
                 Ok(failing_status())
             })
             .is_err()
         );
+        fs::remove_dir_all(copy.parent().unwrap()).unwrap();
         let lock = fs::metadata(real_dir.join(".warden-config.lock")).unwrap();
         let scaffold = fs::metadata(&failed).unwrap();
         assert_eq!((scaffold.uid(), scaffold.gid()), (65534, 65534));
@@ -404,32 +511,56 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn edit_keeps_invalid_rename_bytes_live_after_schema_validation() {
+    fn edit_refuses_invalid_changed_bytes_and_keeps_the_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let master = tmp.path().join("config.toml");
         fs::write(&master, valid_config()).unwrap();
         let invalid = "schema_version = 5\n[server]\ndefault_profile = \"missing\"\n";
-        let observed_validation = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&observed_validation);
-        let renamed = crate::config::write_lock::with_test_hook(
-            move |event| {
-                if event == crate::config::write_lock::TestEvent::OverlayResolved {
-                    observed.store(1, Ordering::SeqCst);
-                }
-            },
-            || {
-                run_edit_with_runner(&master, "editor", &[], |_, _, target| {
-                    let saved = target.with_extension("editor-save");
-                    fs::write(&saved, invalid).unwrap();
-                    fs::rename(saved, target).unwrap();
-                    Ok(successful_status())
-                })
-                .unwrap()
-            },
+        let mut copy = std::path::PathBuf::new();
+        let code = run_edit_with_runner(&master, "editor", &[], |_, _, target| {
+            copy = target.to_path_buf();
+            let saved = target.with_extension("editor-save");
+            fs::write(&saved, invalid).unwrap();
+            fs::rename(saved, target).unwrap();
+            Ok(successful_status())
+        })
+        .unwrap();
+        assert_eq!(code, CONFIG);
+        assert_eq!(fs::read_to_string(&master).unwrap(), valid_config());
+        assert_eq!(fs::read_to_string(&copy).unwrap(), invalid);
+        fs::remove_dir_all(copy.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_never_writes_through_a_master_swapped_for_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let master = tmp.path().join("config.toml");
+        fs::write(&master, valid_config()).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "outside\n").unwrap();
+        let changed = format!("{}# changed\n", valid_config());
+        let mut copy = std::path::PathBuf::new();
+        let result = run_edit_with_runner(&master, "editor", &[], |_, _, target| {
+            // The daemon user swaps the master while root's editor is open.
+            fs::remove_file(&master).unwrap();
+            symlink(outside.path(), &master).unwrap();
+            copy = target.to_path_buf();
+            fs::write(target, &changed).unwrap();
+            Ok(successful_status())
+        });
+        let error = result.expect_err("a swapped master must be refused");
+        assert!(
+            error.to_string().contains(&copy.display().to_string()),
+            "{error}"
         );
-        assert_eq!(renamed, CONFIG);
-        assert_eq!(observed_validation.load(Ordering::SeqCst), 1);
-        assert_eq!(fs::read_to_string(&master).unwrap(), invalid);
+        assert_eq!(fs::read_to_string(outside.path()).unwrap(), "outside\n");
+        assert!(fs::symlink_metadata(&master)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&copy).unwrap(), changed);
+        fs::remove_dir_all(copy.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -638,25 +769,23 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn edit_recaptures_a_saved_file_before_reporting_a_nonzero_editor_exit() {
+    fn edit_keeps_the_live_master_after_a_nonzero_editor_exit() {
         let tmp = tempfile::tempdir().unwrap();
         let master = tmp.path().join("config.toml");
         fs::write(&master, valid_config()).unwrap();
         let saved_bytes = format!("{}# saved despite nonzero\n", valid_config());
-        let recaptured = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&recaptured);
+        let mut copy = std::path::PathBuf::new();
         let result = crate::config::write_lock::with_test_hook(
-            move |event| match event {
-                crate::config::write_lock::TestEvent::AfterEditorRecapture => {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                }
-                crate::config::write_lock::TestEvent::BeforeGuardedValidation => {
-                    panic!("nonzero editor exit must skip validation");
-                }
-                _ => {}
+            |event| {
+                assert_ne!(
+                    event,
+                    crate::config::write_lock::TestEvent::BeforeGuardedValidation,
+                    "nonzero editor exit must skip validation"
+                );
             },
             || {
                 run_edit_with_runner(&master, "editor", &[], |_, _, target| {
+                    copy = target.to_path_buf();
                     let saved = target.with_extension("editor-save");
                     fs::write(&saved, &saved_bytes).unwrap();
                     fs::rename(saved, target).unwrap();
@@ -664,71 +793,15 @@ mod tests {
                 })
             },
         );
-        assert!(result.is_err());
-        assert_eq!(recaptured.load(Ordering::SeqCst), 1);
-        assert_eq!(fs::read_to_string(&master).unwrap(), saved_bytes);
-        drop(crate::config::write_lock::acquire_for_write(&master).unwrap());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn edit_nonzero_save_recaptures_changed_owner_when_privileged() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let master = tmp.path().join("config.toml");
-        fs::write(&master, valid_config()).unwrap();
-        let original = fs::File::open(&master).unwrap();
-        assert_eq!(
-            unsafe { libc::fchown(original.as_raw_fd(), 65534, 65534) },
-            0
-        );
-        drop(original);
-        let saved_bytes = format!("{}# root editor save\n", valid_config());
-
+        let error = result.expect_err("a nonzero editor exit is an error");
+        assert!(error.to_string().contains("config unchanged"), "{error}");
         assert!(
-            run_edit_with_runner(&master, "editor", &[], |_, _, target| {
-                let saved = target.with_extension("editor-save");
-                fs::write(&saved, &saved_bytes).unwrap();
-                fs::rename(saved, target).unwrap();
-                Ok(failing_status())
-            })
-            .is_err()
+            error.to_string().contains(&copy.display().to_string()),
+            "{error}"
         );
-        assert_eq!(fs::read_to_string(&master).unwrap(), saved_bytes);
-        let meta = fs::metadata(&master).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
-        drop(crate::config::write_lock::acquire_for_write(&master).unwrap());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn edit_reports_recaptured_owner_sync_failure_and_releases_the_guard() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let master = tmp.path().join("config.toml");
-        fs::write(&master, valid_config()).unwrap();
-        let original = fs::File::open(&master).unwrap();
-        assert_eq!(
-            unsafe { libc::fchown(original.as_raw_fd(), 65534, 65534) },
-            0
-        );
-        drop(original);
-
-        let result = crate::config::write_lock::with_recaptured_owner_sync_failure(|| {
-            run_edit_with_runner(&master, "editor", &[], |_, _, target| {
-                let saved = target.with_extension("editor-save");
-                fs::write(&saved, valid_config()).unwrap();
-                fs::rename(saved, target).unwrap();
-                Ok(successful_status())
-            })
-        });
-        assert!(result.is_err());
-        let meta = fs::metadata(&master).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (65534, 65534));
+        assert_eq!(fs::read_to_string(&master).unwrap(), valid_config());
+        assert_eq!(fs::read_to_string(&copy).unwrap(), saved_bytes);
+        fs::remove_dir_all(copy.parent().unwrap()).unwrap();
         drop(crate::config::write_lock::acquire_for_write(&master).unwrap());
     }
 
@@ -981,7 +1054,7 @@ servers = ["192.0.2.1:53"]
             let cfg: crate::config::schema::ConfigV5 =
                 toml::from_str(&fs::read_to_string(target).unwrap()).unwrap();
             assert!(cfg.backup.dir.is_none());
-            assert_eq!(cfg.backup.resolve_dir(target), tmp.path().join("backups"));
+            assert_eq!(cfg.backup.resolve_dir(&master), tmp.path().join("backups"));
             Ok(std::process::ExitStatus::from_raw(0))
         })
         .unwrap();

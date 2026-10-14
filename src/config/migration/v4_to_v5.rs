@@ -38,6 +38,20 @@ use crate::operator_rules::{
 
 const SOURCE_SCHEMA: u32 = 4;
 const ACTOR: &str = "migration-v4-to-v5";
+/// The only upgrade route for a schema-4 cluster secondary: it leaves while
+/// still on the old version, upgrades alone, and joins the upgraded primary.
+const SECONDARY_UPGRADE_ROUTE: &str = "a cluster secondary cannot be upgraded in place. \
+    1) On this secondary, still on the old version, run `warden cluster leave` \
+    (add `--upstream <addr:port>` if it asks). \
+    2) Upgrade this node as a standalone node. \
+    3) Upgrade the primary. \
+    4) On the primary, run `warden cluster create --migrate-legacy --san <primary address>`, \
+    then `warden cluster apply --preview-id <id>`, then \
+    `systemctl restart purge-warden`. \
+    5) On the primary, run `warden cluster invite`. \
+    6) On this node, run `warden cluster join --peer <primary https origin> \
+    --invitation-file <file>`, then `warden cluster apply --preview-id <id>`, then \
+    restart it.";
 const OPERATION: &str = "config.migrate.v4-to-v5.v1";
 const BOOTSTRAP_AUTHORIZATION: &str = "offline_v4_to_v5_executable_v1";
 const PLAN_HASH_DOMAIN: &[u8] = b"warden/uor/v4-to-v5/plan/v1\0";
@@ -223,10 +237,6 @@ struct BuiltCandidate {
     inventory: Option<PolicyRevisionInventory>,
 }
 
-pub fn check(master: &Path) -> anyhow::Result<MigrationPlanV1> {
-    plan(master, None)
-}
-
 pub fn plan(master: &Path, choices: Option<MigrationChoicesV1>) -> anyhow::Result<MigrationPlanV1> {
     let guard = write_lock::acquire_for_read(master)?;
     let now = OffsetDateTime::now_utc();
@@ -239,7 +249,7 @@ pub fn plan(master: &Path, choices: Option<MigrationChoicesV1>) -> anyhow::Resul
         SOURCE_SCHEMA,
         now,
     )?;
-    Ok(build(&snapshot, &loaded, choices)?.plan)
+    Ok(build(&snapshot, &loaded, choices, now)?.plan)
 }
 
 pub fn apply(
@@ -329,7 +339,7 @@ pub fn apply_with_pid_file(
         SOURCE_SCHEMA,
         now,
     )?;
-    let candidate = build(&snapshot, &loaded, Some(supplied_plan.choices.clone()))?;
+    let candidate = build(&snapshot, &loaded, Some(supplied_plan.choices.clone()), now)?;
     ensure!(
         candidate.plan.plan_hash == supplied_plan.plan_hash,
         "StalePlan: source tree or planner result changed; re-plan is required"
@@ -340,7 +350,7 @@ pub fn apply_with_pid_file(
     );
     ensure!(
         !(loaded.config.cluster.enabled && loaded.config.cluster.role == ClusterRole::Secondary),
-        "ClusterLocalPolicyConflict: migrate a secondary only through an isolated deployment workflow"
+        "ClusterLocalPolicyConflict: {SECONDARY_UPGRADE_ROUTE}"
     );
     let after = candidate
         .inventory
@@ -551,6 +561,7 @@ fn build(
     snapshot: &PolicyRevisionSnapshot,
     loaded: &LoadedConfig,
     choices: Option<MigrationChoicesV1>,
+    now: OffsetDateTime,
 ) -> anyhow::Result<BuiltCandidate> {
     let source_revision = snapshot.revision().to_string();
     let source_operator_policy_hash =
@@ -888,18 +899,20 @@ fn build(
 
     if historical.config.cluster.enabled && historical.config.cluster.role == ClusterRole::Secondary
     {
-        record_finding(&mut findings, finding(
-            FindingCodeV1::ClusterLocalPolicyConflict,
-            "cluster:secondary".into(),
-            "a secondary migration requires an isolated deployment and replication reconciliation"
-                .into(),
-            EquivalenceV1::Unproven,
-            None,
-            None,
-            None,
-            vec!["defer"],
-            &source_digest,
-        ))?;
+        record_finding(
+            &mut findings,
+            finding(
+                FindingCodeV1::ClusterLocalPolicyConflict,
+                "cluster:secondary".into(),
+                SECONDARY_UPGRADE_ROUTE.into(),
+                EquivalenceV1::Unproven,
+                None,
+                None,
+                None,
+                vec!["defer"],
+                &source_digest,
+            ),
+        )?;
     }
     let structural_block = findings.iter().any(|finding| {
         finding.blocking
@@ -909,9 +922,7 @@ fn build(
             )
     });
     if !structural_block {
-        if let Err(error) =
-            validate_target_in_memory(&target, &target_packs, OffsetDateTime::UNIX_EPOCH)
-        {
+        if let Err(error) = validate_target_in_memory(&target, &target_packs, now) {
             record_finding(
                 &mut findings,
                 finding(
@@ -2645,7 +2656,7 @@ servers = ["192.0.2.1:53"]
             OffsetDateTime::UNIX_EPOCH,
         )
         .unwrap();
-        let candidate = build(&snapshot, &loaded, None).unwrap();
+        let candidate = build(&snapshot, &loaded, None, OffsetDateTime::UNIX_EPOCH).unwrap();
         let inventory = candidate.inventory.as_ref().unwrap();
         let config: ConfigV5 = inventory
             .members()
@@ -3974,5 +3985,47 @@ servers = ["192.0.2.1:53"]
             );
             assert_eq!(tree_bytes(root.path()), before, "{tamper}");
         }
+    }
+
+    #[test]
+    fn past_retired_entry_migrates_without_a_finding() {
+        let body = format!(
+            "{}\n[[retired]]\nid = \"old-profile\"\ntype = \"profile\"\nretired_at = \"2020-01-01T00:00:00Z\"\n",
+            simple()
+        );
+        let (_root, master) = fixture(&body);
+        let plan = plan(&master, None).unwrap();
+        assert!(
+            plan.findings
+                .iter()
+                .all(|finding| finding.code != FindingCodeV1::TargetBudgetExceeded),
+            "{:#?}",
+            plan.findings
+        );
+        assert!(!plan.blocked, "{:#?}", plan.findings);
+    }
+
+    #[test]
+    fn cluster_secondary_is_blocked_with_leave_and_rejoin_steps() {
+        let (_root, master) = fixture(&format!(
+            "schema_version = 4\n\n[cluster]\nenabled = true\nrole = \"secondary\"\n\
+             peer = \"https://192.0.2.10:8053\"\ntoken_hash = \"{}\"\n",
+            "00".repeat(32)
+        ));
+        let plan = plan(&master, None).unwrap();
+        assert!(plan.blocked, "{:#?}", plan.findings);
+        let secondary: Vec<_> = plan
+            .findings
+            .iter()
+            .filter(|finding| finding.code == FindingCodeV1::ClusterLocalPolicyConflict)
+            .collect();
+        assert_eq!(secondary.len(), 1, "{:#?}", plan.findings);
+        let cause = &secondary[0].cause;
+        assert!(
+            cause.contains("cluster leave")
+                && cause.contains("--migrate-legacy --san <primary address>")
+                && cause.ends_with("then restart it."),
+            "{cause}"
+        );
     }
 }

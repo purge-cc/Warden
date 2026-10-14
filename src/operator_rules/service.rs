@@ -1619,6 +1619,13 @@ fn failure_receipt(
 ) -> Result<Receipt, Error> {
     let error = match recovery {
         Ok(Some(receipt)) => return Ok(receipt),
+        // A full store refuses before the intent and receipt exist.
+        Ok(None) if initial.is_none() && capacity_refusal(failure) => {
+            return Err(Error::new(
+                ErrorCode::AdmissionRejected,
+                format!("{failure:#}"),
+            ));
+        }
         Ok(None) => Error::new(
             ErrorCode::RecoveryRequired,
             format!("{phase} failed: {failure:#}; recovery found no terminal receipt"),
@@ -1639,6 +1646,12 @@ fn failure_receipt(
     }
     receipt.diagnostics.push(bounded_diagnostic(error.message));
     Ok(receipt)
+}
+
+/// The receipt and undo stores name their capacity refusals by prefix.
+fn capacity_refusal(error: &anyhow::Error) -> bool {
+    let cause = error.root_cause().to_string();
+    cause.starts_with("UndoStoreFull:") || cause.starts_with("IdempotencyStoreFull:")
 }
 
 /// A publication failure must not erase a terminal policy result.
@@ -3294,5 +3307,25 @@ hours = "00:00-23:59"
         assert_eq!(audited.activation.state, "not_required");
         assert_eq!(audited.audit, "recorded");
         assert!(service.pending_completions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_undo_store_rejects_admission_without_recovery() {
+        let (_temp, service) = fixture();
+        let proposal = request(&service, "undo-full", vec![create()]);
+        policy_transaction::set_undo_cap_for_test(Some(1));
+        let error = service
+            .apply_with_prepared(&actor(), &proposal, TransportLimits::IPC, |_| {
+                panic!("a full undo store refuses before the receipt")
+            })
+            .unwrap_err();
+        policy_transaction::set_undo_cap_for_test(None);
+        assert_eq!(error.code, ErrorCode::AdmissionRejected, "{error}");
+        assert!(error.message.starts_with("UndoStoreFull:"), "{error}");
+        assert!(!error.message.contains("recovery"), "{error}");
+        assert_eq!(
+            apply(&service, &proposal).persistence,
+            PersistenceState::Committed
+        );
     }
 }

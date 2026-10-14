@@ -114,32 +114,10 @@ impl ExternalDirectoryPlan {
             self.dirs.last().context("external directory ancestor")?,
             libc::O_RDONLY | libc::O_DIRECTORY,
         )?;
+        // A new directory takes its parent's owner, so a root run does not
+        // leave a directory the daemon user cannot write.
         for name in self.missing {
-            check_basename(&name)?;
-            #[cfg(test)]
-            super::write_lock::test_event(super::write_lock::TestEvent::BeforeMkdir);
-            let c_name = CString::new(name.as_bytes())?;
-            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o750) };
-            let created = rc == 0;
-            if !created {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(error.into());
-                }
-            }
-            let file = inspect_at(&parent, &name)?.context("external directory disappeared")?;
-            let metadata = file.metadata()?;
-            ensure!(
-                !metadata.file_type().is_symlink() && metadata.is_dir(),
-                "external output component is not a directory: {:?}",
-                name
-            );
-            let next = reopen_inspected(&file, libc::O_RDONLY | libc::O_DIRECTORY)?;
-            if created {
-                next.sync_all()?;
-                parent.sync_all()?;
-            }
-            parent = next;
+            parent = mkdir_open(&parent, &name)?;
         }
         Ok(parent)
     }

@@ -97,6 +97,41 @@ fn truncate(value: &str, cells: usize, tail: bool) -> String {
     }
 }
 
+/// Characters that would act on the terminal instead of being shown: C0/C1
+/// controls (ESC starts colour, cursor and title sequences) and the
+/// bidirectional marks and overrides that reorder the rest of a row.
+fn is_terminal_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Replace every cell that holds a terminal-unsafe character with U+FFFD.
+/// Runs once on the finished frame, so text that reached a widget without
+/// going through this module still cannot reach the terminal.
+pub(crate) fn scrub_buffer(buf: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buf.content {
+        if cell.symbol().chars().any(is_terminal_unsafe) {
+            cell.set_symbol("\u{FFFD}");
+        }
+    }
+}
+
+/// `value` with every terminal-unsafe character replaced by U+FFFD.
+pub(crate) fn terminal_safe(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.chars().any(is_terminal_unsafe) {
+        value
+            .chars()
+            .map(|c| if is_terminal_unsafe(c) { '\u{FFFD}' } else { c })
+            .collect::<String>()
+            .into()
+    } else {
+        value.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +158,28 @@ mod tests {
             }
         }
         assert_eq!(wrap("hello world", 6), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn terminal_unsafe_characters_become_replacement_characters() {
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 5, 1));
+        for (x, symbol) in ["\x1b", "\u{202E}", "\u{2067}", "a", "c\u{200F}"]
+            .into_iter()
+            .enumerate()
+        {
+            buf[(x as u16, 0)].set_symbol(symbol);
+        }
+        scrub_buffer(&mut buf);
+        let symbols: Vec<&str> = (0..5).map(|x| buf[(x, 0)].symbol()).collect();
+        assert_eq!(
+            symbols,
+            ["\u{FFFD}", "\u{FFFD}", "\u{FFFD}", "a", "\u{FFFD}"]
+        );
+
+        assert_eq!(terminal_safe("a\x1bb\u{2067}"), "a\u{FFFD}b\u{FFFD}");
+        assert!(matches!(
+            terminal_safe("ok"),
+            std::borrow::Cow::Borrowed("ok")
+        ));
     }
 }

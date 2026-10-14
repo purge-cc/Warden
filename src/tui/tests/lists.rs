@@ -194,8 +194,16 @@ fn status_of_renders_each_outcome_branch() {
     let (label, _) = status_of(&s_never);
     assert_eq!(label, "never");
 
+    let s_cached = BlocklistStatusDto {
+        last_outcome: "never_fetched".into(),
+        cache_loaded: true,
+        ..Default::default()
+    };
+    assert_eq!(status_of(&s_cached), ("cached".to_string(), T.text_muted));
+
     let s_failed = BlocklistStatusDto {
         last_outcome: "failed: HTTP 502".into(),
+        cache_loaded: true,
         ..Default::default()
     };
     let (label, _) = status_of(&s_failed);

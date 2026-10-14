@@ -768,6 +768,12 @@ mod tests {
         ) -> anyhow::Result<super::super::node_control::ActivePolicyCorpus> {
             anyhow::bail!("unused test provider")
         }
+
+        async fn verified_pair(
+            &self,
+        ) -> anyhow::Result<Option<super::super::node_control::ActivePolicyCorpus>> {
+            Ok(None)
+        }
     }
 
     fn headers_with(inm: &str) -> HeaderMap {

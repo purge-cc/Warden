@@ -56,6 +56,20 @@ fn generation_degraded_lines(state: ServedState) -> [String; 2] {
     ]
 }
 
+/// The refresh routes that work on a stock install. Only the service user
+/// can use the daemon's list cache and pass its IPC peer-uid check, and
+/// systemd removes the default PID directory when the daemon stops, so with
+/// no daemon that user needs `--pid-file` with a path it can create.
+const REFRESH_ROUTES: &str = "run `warden lists refresh` as the service user (the `warden` \
+     wrapper drops root to it), with the daemon running; while no daemon can start, run \
+     `warden --pid-file <path> lists refresh` as the service user, with a <path> it can create.";
+
+/// Why the refresh cannot use the daemon's list cache, and the way out.
+#[cfg(feature = "cluster")]
+fn unusable_cache_message(error: &anyhow::Error) -> String {
+    format!("cannot use the daemon's list cache: {error:#}\nhint: {REFRESH_ROUTES}")
+}
+
 /// Classify the completed cycle, not delivery of its request.
 fn completed_refresh_exit(snapshot: &ListRegistrySnapshotDto) -> i32 {
     let cycle = snapshot.cycle;
@@ -180,9 +194,11 @@ fn render_completed_refresh(snapshot: &ListRegistrySnapshotDto, ceiling: Option<
 /// correctly here rather than reporting "no list sources configured".
 ///
 /// **Cache directory.** Reuses [`lists_cache_dir`] from `start.rs` so
-/// the foreground tool writes into the same FHS-aware path as the
-/// daemon (`/var/lib/<pkg>/lists/` on prod, `<config-parent>/<cache_dir>`
-/// on dev).
+/// the foreground tool uses the same FHS-aware path as the daemon
+/// (`/var/lib/<pkg>/lists/` on prod, `<config-parent>/<cache_dir>` on
+/// dev) for the catalog and, without a node corpus, for list bodies.
+/// When the node corpus store records a list cache, the refresh writes
+/// that cache instead: it is the one the next start serves.
 pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i32> {
     // Resolve this command's socket here, not in `main`: an invalid config
     // must return CONFIG rather than escaping through anyhow as exit 1.
@@ -203,6 +219,19 @@ pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i
     };
     let socket_path = &loaded.config.socket.path;
 
+    // A user who cannot use the node corpus can refresh only through a live
+    // daemon, so it never takes the lease: the lease would create the run
+    // directory and PID file, and one another user owns breaks the next
+    // daemon start.
+    #[cfg(feature = "cluster")]
+    if let Err(error) = crate::cluster::corpus::CorpusStore::open_existing(config_path) {
+        if probe_socket(socket_path).await == SocketProbe::Live {
+            return Ok(refresh_through_daemon(socket_path).await);
+        }
+        eprintln!("{}", unusable_cache_message(&error));
+        return Ok(FAILURE);
+    }
+
     // This lease is the decision, not a prior liveness observation. Holding it
     // through foreground work excludes a concurrent daemon start and its list
     // state writes. A held lease belongs to a daemon (or another refresh), so
@@ -211,10 +240,30 @@ pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i
         Ok(lease) => Some(lease),
         Err(pid::PidLockError::AlreadyRunning(_)) => None,
         Err(pid::PidLockError::Io(error)) => {
+            // A PID file this user cannot open beside a live socket is the
+            // daemon's. Otherwise it is most likely a stale one another user
+            // such as root left behind, and a second lease path is safe only
+            // while no daemon can start.
+            let unopenable = error.kind() == ErrorKind::PermissionDenied && pid_file.exists();
+            if unopenable && probe_socket(socket_path).await == SocketProbe::Live {
+                return Ok(refresh_through_daemon(socket_path).await);
+            }
             eprintln!(
                 "cannot acquire PID-file lease {}: {error}",
                 pid_file.display()
             );
+            if unopenable {
+                eprintln!(
+                    "hint: if no daemon is running, the PID file is stale: remove it as root, \
+                     then {REFRESH_ROUTES}"
+                );
+            } else {
+                eprintln!(
+                    "hint: run `warden --pid-file <path> lists refresh` to take the lease \
+                     elsewhere (only while no daemon can start), or start the daemon so the \
+                     refresh runs through it."
+                );
+            }
             return Ok(FAILURE);
         }
     };
@@ -234,41 +283,7 @@ pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i
             eprintln!("cannot determine whether the configured IPC socket is live; refusing foreground refresh");
             return Ok(FAILURE);
         }
-        RefreshRoute::TypedIpc => {
-            // Once a held lease or a live socket is observed, IPC failure is
-            // terminal: foreground work could overlap the daemon's writes.
-            match send_command(socket_path, &IpcCommand::ForceListRefresh { token: None }).await {
-                Ok(IpcResponse::ListRefreshCompleted {
-                    disposition,
-                    snapshot,
-                    max_total_domains,
-                }) => {
-                    println!("list refresh accepted: {}", disposition.as_str());
-                    render_completed_refresh(&snapshot, max_total_domains);
-                    return Ok(completed_refresh_exit(&snapshot));
-                }
-                Ok(IpcResponse::Error { message }) => {
-                    if message == crate::ipc::errors::IPC_ERROR_INVALID_COMMAND {
-                        eprintln!(
-                            "live daemon and CLI are incompatible: typed list refresh is unsupported. \
-                             Restart or upgrade the daemon before retrying."
-                        );
-                    } else {
-                        eprintln!("live daemon refused list refresh: {message}");
-                    }
-                }
-                Ok(other) => {
-                    eprintln!(
-                        "live daemon and CLI are incompatible: typed list refresh is unsupported \
-                         ({other:?}). Restart or upgrade the daemon before retrying."
-                    );
-                }
-                Err(error) => {
-                    eprintln!("could not request typed list refresh from live daemon: {error}");
-                }
-            }
-            return Ok(FAILURE);
-        }
+        RefreshRoute::TypedIpc => return Ok(refresh_through_daemon(socket_path).await),
     }
 
     // No daemon socket is reachable and the lease remains held for this whole
@@ -297,6 +312,43 @@ pub async fn run_update(config_path: &Path, pid_file: &Path) -> anyhow::Result<i
     Ok(completed_refresh_exit(&snapshot))
 }
 
+/// Send the refresh to the live daemon. Once a held lease or a live socket
+/// is observed, IPC failure is terminal: foreground work could overlap the
+/// daemon's writes.
+async fn refresh_through_daemon(socket_path: &Path) -> i32 {
+    match send_command(socket_path, &IpcCommand::ForceListRefresh { token: None }).await {
+        Ok(IpcResponse::ListRefreshCompleted {
+            disposition,
+            snapshot,
+            max_total_domains,
+        }) => {
+            println!("list refresh accepted: {}", disposition.as_str());
+            render_completed_refresh(&snapshot, max_total_domains);
+            return completed_refresh_exit(&snapshot);
+        }
+        Ok(IpcResponse::Error { message }) => {
+            if message == crate::ipc::errors::IPC_ERROR_INVALID_COMMAND {
+                eprintln!(
+                    "live daemon and CLI are incompatible: typed list refresh is unsupported. \
+                     Restart or upgrade the daemon before retrying."
+                );
+            } else {
+                eprintln!("live daemon refused list refresh: {message}");
+            }
+        }
+        Ok(other) => {
+            eprintln!(
+                "live daemon and CLI are incompatible: typed list refresh is unsupported \
+                 ({other:?}). Restart or upgrade the daemon before retrying."
+            );
+        }
+        Err(error) => {
+            eprintln!("could not request typed list refresh from live daemon: {error}");
+        }
+    }
+    FAILURE
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketProbe {
     Live,
@@ -322,7 +374,8 @@ fn select_refresh_route(lease_acquired: bool, socket_probe: SocketProbe) -> Refr
     }
 }
 
-/// Probe only after owning the foreground lease. A live unlinked daemon PID
+/// Foreground needs this probe after owning the lease; a probe without the
+/// lease may only choose IPC or a refusal. A live unlinked daemon PID
 /// file is still caught by its socket; all uncertain transport states fail
 /// closed instead of being mistaken for a stopped daemon.
 async fn probe_socket(socket_path: &Path) -> SocketProbe {
@@ -384,6 +437,17 @@ async fn refresh_foreground_filter(
     let client = crate::lists::http_client::build_bulk_list_client()?;
     let lists_dir = lists_cache_dir(config_path, config);
 
+    // The next start serves the node list cache the corpus store records,
+    // so refresh that one, under its lease; the catalog stays in lists_dir.
+    // Lease it before the catalog write, so a refusal changes nothing.
+    #[cfg(feature = "cluster")]
+    let node_cache = match crate::cluster::corpus::CorpusStore::open_existing(config_path)
+        .and_then(|store| store.map(|store| store.lease_primary_cache()).transpose())
+    {
+        Ok(cache) => cache.flatten(),
+        Err(e) => anyhow::bail!("{}", unusable_cache_message(&e)),
+    };
+
     let catalog = super::start::fetch_catalog_or_fallback(
         &client,
         &lists_dir,
@@ -435,6 +499,13 @@ async fn refresh_foreground_filter(
         .map_err(|e| anyhow::anyhow!("secrets file rejected: {e}"))?;
     let source_tokens = SourceTokenMap::from_plan(&source_plan, &secrets);
 
+    #[cfg(feature = "cluster")]
+    let cache_dir = node_cache
+        .as_ref()
+        .map_or(lists_dir, |(dir, _lease)| dir.clone());
+    #[cfg(not(feature = "cluster"))]
+    let cache_dir = lists_dir;
+
     let mut mgr = ListManager::with_plan_and_tokens(
         client,
         filter.clone(),
@@ -444,7 +515,7 @@ async fn refresh_foreground_filter(
         source_tokens,
         config.lists.max_body_bytes,
         config.lists.max_entries,
-        Some(lists_dir),
+        Some(cache_dir),
     );
     mgr.status_registry().sync_plan(&source_plan);
 
@@ -793,5 +864,118 @@ servers = ["192.0.2.1:53"]
             ),
             "a daemon start must not acquire the PID file while refresh owns it"
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    fn has_meta(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".meta")
+        })
+    }
+
+    /// The next start serves the cache the node corpus records, so a
+    /// foreground refresh must write there, not into the lists directory.
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_refresh_writes_recorded_primary_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let master = write_direction_fixture(tmp.path());
+        let store = crate::cluster::corpus::CorpusStore::open(&master).unwrap();
+        let (workspace, lease) = store.parser_workspace().unwrap();
+        let recorded = workspace.keep();
+        drop(lease);
+        store.set_primary_cache_dir(&recorded).unwrap();
+
+        let loaded = loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        refresh_foreground_filter(&master, &loaded.config)
+            .await
+            .unwrap();
+        assert!(has_meta(&recorded));
+        assert!(!has_meta(&tmp.path().join("lists")));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreground_refresh_refuses_unusable_daemon_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let master = write_direction_fixture(tmp.path());
+        let store = crate::cluster::corpus::CorpusStore::open(&master).unwrap();
+        let (workspace, lease) = store.parser_workspace().unwrap();
+        let recorded = workspace.keep();
+        drop(lease);
+        store.set_primary_cache_dir(&recorded).unwrap();
+        drop(store);
+        std::fs::set_permissions(
+            tmp.path().join(".warden-node-corpus"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let catalog = tmp.path().join("lists").join("catalog.json");
+        std::fs::write(&catalog, "{}").unwrap();
+
+        let loaded = loader::load_config(&master, time::OffsetDateTime::now_utc()).unwrap();
+        let Err(error) = refresh_foreground_filter(&master, &loaded.config).await else {
+            panic!("an unusable daemon cache was ignored");
+        };
+        let error = format!("{error:#}");
+        // Both routes name the service user: the daemon refuses IPC from any
+        // other uid, so "start the daemon" alone is no way out.
+        assert!(
+            error.contains(
+                "run `warden lists refresh` as the service user (the `warden` wrapper drops \
+                 root to it), with the daemon running"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("`warden --pid-file <path> lists refresh` as the service user"),
+            "{error}"
+        );
+        assert!(!error.contains("start the daemon so"), "{error}");
+        assert!(!has_meta(&recorded));
+        assert!(!has_meta(&tmp.path().join("lists")));
+        // Smoke check only: the catalog is written only after a successful
+        // fetch, so this pins the lease-before-catalog order only on a host
+        // that reaches the catalog URL.
+        assert_eq!(std::fs::read_to_string(&catalog).unwrap(), "{}");
+    }
+
+    /// A refusal must leave nothing behind: a run directory or PID file
+    /// another user owns breaks the next daemon start.
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_refresh_leaves_no_pid_file_or_catalog_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let master = write_direction_fixture(tmp.path());
+        let config = std::fs::read_to_string(&master)
+            .unwrap()
+            .replace("schema_version = 4", "schema_version = 5");
+        let socket = tmp.path().join("control.sock");
+        std::fs::write(
+            &master,
+            format!("{config}\n[socket]\npath = \"{}\"\n", socket.display()),
+        )
+        .unwrap();
+        drop(crate::cluster::corpus::CorpusStore::open(&master).unwrap());
+        std::fs::set_permissions(
+            tmp.path().join(".warden-node-corpus"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let catalog = tmp.path().join("lists").join("catalog.json");
+        std::fs::write(&catalog, "{}").unwrap();
+        let run_dir = tmp.path().join("run");
+
+        let code = run_update(&master, &run_dir.join("warden.pid")).await;
+
+        assert!(!run_dir.exists(), "the refusal created the PID directory");
+        assert_eq!(std::fs::read_to_string(&catalog).unwrap(), "{}");
+        assert_eq!(code.unwrap(), FAILURE);
     }
 }

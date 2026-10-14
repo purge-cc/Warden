@@ -53,7 +53,7 @@ fn now() -> OffsetDateTime {
 /// is pinned by `tests/plp_s5a_retired_tags_key.rs`, which is where it
 /// belongs; carrying it here as well would make eleven tests about `lists`
 /// overrides depend on the strip.
-const ZIMA_SHAPE: &str = r#"
+const NODE_A_SHAPE: &str = r#"
 schema_version = 4
 
 [upstream]
@@ -98,7 +98,8 @@ url = "https://lists.purge.cc/content/gambling.txt"
 /// would pass while a new field quietly changed `block_all`; this will not.
 #[test]
 fn plp_s2_pre_s2_config_deserialises_with_profiles_unchanged() {
-    let cfg: ConfigV1 = toml::from_str(ZIMA_SHAPE).expect("the live host's shape must still parse");
+    let cfg: ConfigV1 =
+        toml::from_str(NODE_A_SHAPE).expect("the live host's shape must still parse");
 
     let expected_default = Profile {
         ..Default::default()
@@ -127,7 +128,7 @@ fn plp_s2_pre_s2_config_deserialises_with_profiles_unchanged() {
 /// change that lands on the other by accident.
 #[test]
 fn plp_s2_pre_s2_config_leaves_blocklist_base_at_deny() {
-    let cfg: ConfigV1 = toml::from_str(ZIMA_SHAPE).unwrap();
+    let cfg: ConfigV1 = toml::from_str(NODE_A_SHAPE).unwrap();
     assert_eq!(cfg.blocklists.len(), 4);
     for b in &cfg.blocklists {
         assert_eq!(
@@ -147,7 +148,7 @@ fn plp_s2_pre_s2_config_leaves_blocklist_base_at_deny() {
 /// each, rather than the other way round).
 #[test]
 fn plp_s2_pre_s2_config_still_validates() {
-    let cfg: ConfigV1 = toml::from_str(ZIMA_SHAPE).unwrap();
+    let cfg: ConfigV1 = toml::from_str(NODE_A_SHAPE).unwrap();
     assert!(
         validate(&cfg, now()).is_ok(),
         "S2 must not make an existing config invalid: {:?}",
@@ -167,7 +168,7 @@ fn plp_s2_pre_s2_config_still_validates() {
 #[test]
 fn plp_s2_lists_override_parses_under_its_documented_wire_name() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.finance]
 lists = {{ privacy-ads = "deny", privacy-tracking = "allow", content-gambling = "ignore" }}
 "#
@@ -198,9 +199,9 @@ lists = {{ privacy-ads = "deny", privacy-tracking = "allow", content-gambling = 
 /// starts losing information and this test is where it shows.
 #[test]
 fn plp_s2_absent_and_explicitly_empty_lists_are_the_same_state() {
-    let absent: ConfigV1 = toml::from_str(ZIMA_SHAPE).unwrap();
+    let absent: ConfigV1 = toml::from_str(NODE_A_SHAPE).unwrap();
     let explicit: ConfigV1 = toml::from_str(&format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.empty-override]
 lists = {{}}
 "#
@@ -223,7 +224,7 @@ lists = {{}}
 #[test]
 fn plp_s2_unknown_list_policy_token_is_refused() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.finance]
 lists = {{ privacy-ads = "redirect" }}
 "#
@@ -326,7 +327,7 @@ fn plp_s2_non_empty_lists_round_trips() {
 #[test]
 fn plp_s2_validator_refuses_override_for_unknown_list() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.finance]
 lists = {{ no-such-list = "deny" }}
 "#
@@ -361,7 +362,7 @@ lists = {{ no-such-list = "deny" }}
 #[test]
 fn plp_s2_validator_reports_every_unknown_list_not_just_the_first() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.finance]
 lists = {{ ghost-one = "deny", ghost-two = "allow", privacy-ads = "deny" }}
 "#
@@ -391,14 +392,14 @@ lists = {{ ghost-one = "deny", ghost-two = "allow", privacy-ads = "deny" }}
 ///
 /// **`plp-s4b`: the `allow` override moved onto a consented list, and the
 /// reason is a real behaviour change, not test maintenance.** This arm used
-/// to allow `privacy-ads`, which `ZIMA_SHAPE` declares with no `trust` key —
+/// to allow `privacy-ads`, which `NODE_A_SHAPE` declares with no `trust` key —
 /// and `BlocklistTrust`'s default is `RemoteUnsigned`, not `Local`. S4b added
 /// a load-time refusal for an `allow` override on a remote list whose row
 /// carries no `accept_unsigned_allow`, so this config is now correctly
 /// refused: the consent gate that already guarded `base = allow` at list
 /// scope now also guards it at override scope.
 ///
-/// The fix appends a consented list rather than editing `ZIMA_SHAPE`. That
+/// The fix appends a consented list rather than editing `NODE_A_SHAPE`. That
 /// const documents itself as the shape measured on the live host verbatim, so
 /// adding an ack to it would have made its provenance a lie to keep a test
 /// green — and the id it would have been added to is the one the assertion
@@ -406,7 +407,7 @@ lists = {{ ghost-one = "deny", ghost-two = "allow", privacy-ads = "deny" }}
 #[test]
 fn plp_s2_validator_accepts_override_for_a_list_that_exists() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [[blocklists]]
 id = "vendor-allow"
 display_name = "Consented allow-direction source"
@@ -439,7 +440,7 @@ lists = {{ vendor-allow = "allow", content-gambling = "ignore" }}
 fn plp_s2_list_policy_wire_tokens_round_trip_from_outside_the_crate() {
     for p in [ListPolicy::Deny, ListPolicy::Allow, ListPolicy::Ignore] {
         let src = format!(
-            r#"{ZIMA_SHAPE}
+            r#"{NODE_A_SHAPE}
 [profiles.probe]
 lists = {{ privacy-ads = "{}" }}
 "#,
@@ -473,7 +474,7 @@ lists = {{ privacy-ads = "{}" }}
 #[test]
 fn plp_s2_malformed_id_in_key_position_is_refused() {
     let src = format!(
-        r#"{ZIMA_SHAPE}
+        r#"{NODE_A_SHAPE}
 [profiles.finance]
 lists = {{ "Bad Id" = "deny" }}
 "#

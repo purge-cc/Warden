@@ -263,8 +263,14 @@ pub async fn auth_middleware(
         }
     };
 
-    // Verify token
-    if !verify_token(token, &state.token_hash) {
+    // Verify token against the live hash. Load and compare in one
+    // statement so no ArcSwap guard is held across `next.run(...).await`.
+    let valid = state
+        .token_hash
+        .load()
+        .as_deref()
+        .is_some_and(|hash| verify_token(token, hash));
+    if !valid {
         let locked = state.rate_limiter.record_failure(&ip);
         tracing::warn!(
             target: "audit",

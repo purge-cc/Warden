@@ -12,7 +12,9 @@ mod workflow;
 
 pub(crate) use adapter::AdapterError;
 #[cfg(test)]
-pub(crate) use adapter::{register_test_token, OperatorPolicyAdapter, RetainedPlan};
+pub(crate) use adapter::{
+    register_test_token, test_token_for, OperatorPolicyAdapter, RetainedPlan,
+};
 pub(crate) use controller::{
     handle_key, open, open_profile_after, read_catalog, read_rule_counts, read_rules,
     spawn_startup_resume, PolicyCatalog, PolicyChange, PolicyDialog, PolicyOrigin,

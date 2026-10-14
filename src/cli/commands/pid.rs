@@ -386,15 +386,181 @@ pub fn write_pid_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read a PID from the PID file.
-pub fn read_pid_file(path: &Path) -> anyhow::Result<u32> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read PID file {}: {}", path.display(), e))?;
+/// Largest PID file accepted. A PID and a newline take at most 11 bytes.
+const MAX_PID_FILE_BYTES: u64 = 64;
+
+/// Open a PID file without following a link and read a checked PID from it.
+///
+/// The file must be a regular file with one link, and at most
+/// [`MAX_PID_FILE_BYTES`] are read, so an error never quotes more than that.
+/// The open file is returned so a lock probe can use the same inode.
+fn open_pid_file(path: &Path) -> anyhow::Result<(std::fs::File, std::fs::Metadata, i32)> {
+    let unreadable =
+        |e: std::io::Error| anyhow::anyhow!("cannot read PID file {}: {e}", path.display());
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(unreadable)?;
+    let metadata = file.metadata().map_err(unreadable)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "refusing PID file {}: not a regular file with one link",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_PID_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let oversized = bytes.len() as u64 > MAX_PID_FILE_BYTES;
+    bytes.truncate(MAX_PID_FILE_BYTES as usize);
+    let content = String::from_utf8_lossy(&bytes);
+    anyhow::ensure!(
+        !oversized,
+        "invalid PID in {}: longer than {MAX_PID_FILE_BYTES} bytes ({:?}...)",
+        path.display(),
+        content
+    );
     let pid: u32 = content
         .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid PID in {}: {:?}", path.display(), content.trim()))?;
+    let pid =
+        checked_pid(pid).map_err(|e| anyhow::anyhow!("{e} (from PID file {})", path.display()))?;
+    Ok((file, metadata, pid))
+}
+
+/// Read a PID from the PID file.
+pub fn read_pid_file(path: &Path) -> anyhow::Result<u32> {
+    let (_, _, pid) = open_pid_file(path)?;
+    // `checked_pid` admits only 1..=i32::MAX.
+    Ok(pid as u32)
+}
+
+/// The PID in `pid_file`, only when that process holds the file's `flock`
+/// and runs as the file's owner.
+///
+/// "Locked" alone does not prove the PID inside belongs to the holder: the
+/// daemon user can rewrite the file, and an offline lease holds the lock
+/// without rewriting it. So `/proc/locks` must name the file's PID as the
+/// holder of this inode number, and that process's real and effective uid must
+/// be the file owner's. The read, the probe and the inode compare share one
+/// descriptor.
+fn verified_daemon_pid(pid_file: &Path) -> anyhow::Result<i32> {
+    let (file, metadata, pid) = open_pid_file(pid_file)?;
+    // SAFETY: the descriptor is live and the probe never blocks.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // SAFETY: same descriptor; release the probe at once.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        anyhow::bail!(
+            "PID file {} is not held by a running daemon (stale, or the daemon is stopped)",
+            pid_file.display()
+        );
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        anyhow::bail!(
+            "cannot probe the lock on PID file {}: {error}",
+            pid_file.display()
+        );
+    }
+    let refuse = |reason: String| {
+        anyhow::anyhow!(
+            "refusing to signal PID {pid} from PID file {}: {reason}",
+            pid_file.display()
+        )
+    };
+    listed_holder_matches(
+        || std::fs::read_to_string("/proc/locks"),
+        pid,
+        metadata.ino(),
+    )
+    .map_err(refuse)?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|e| refuse(format!("cannot read its status: {e}")))?;
+    uid_matches(&status, metadata.uid()).map_err(refuse)?;
     Ok(pid)
+}
+
+const NO_HOLDER_LISTED: &str = "no process is listed as holding its lock";
+
+/// [`flock_holder_matches`] on fresh readings of `/proc/locks` until one lists
+/// a holder for `ino`.
+///
+/// `/proc/locks` is a seq_file: every `read()` walks the lock list again by
+/// index, so a lock that another process releases between two reads can drop
+/// the next line out of that reading. The caller's probe already proved the
+/// inode is locked, so a reading with no holder is taken again. A reading can
+/// lose or repeat lines but never invent one: another holder is refused at once.
+// ponytail: 5 readings; a holder hidden by lock churn on every one is refused.
+fn listed_holder_matches(
+    mut read_locks: impl FnMut() -> std::io::Result<String>,
+    pid: i32,
+    ino: u64,
+) -> Result<(), String> {
+    let mut result = Err(NO_HOLDER_LISTED.to_owned());
+    for _ in 0..5 {
+        let locks = read_locks().map_err(|e| format!("cannot read /proc/locks: {e}"))?;
+        result = flock_holder_matches(&locks, pid, ino);
+        if !matches!(&result, Err(reason) if reason == NO_HOLDER_LISTED) {
+            break;
+        }
+    }
+    result
+}
+
+/// Check `/proc/locks`: an active `FLOCK ... WRITE` lock on inode `ino` must
+/// belong to `pid`. Waiter lines (`->`) are skipped. The kernel prints
+/// `MAJ:MIN:INODE` with the inode in decimal.
+///
+/// The device is not compared: `/proc/locks` prints the superblock device,
+/// and on btrfs subvolumes and some overlayfs setups `fstat`'s `st_dev`
+/// differs from it, which refused a real daemon's PID file there. The probe
+/// already proved this inode is locked, and the uid check in
+/// [`verified_daemon_pid`] carries the security property.
+// ponytail: inode and PID only; compare the device too, against the
+// superblock device in /proc/self/mountinfo, if a stronger tie is needed.
+fn flock_holder_matches(locks: &str, pid: i32, ino: u64) -> Result<(), String> {
+    let mut holders = Vec::new();
+    for line in locks.lines().filter(|line| !line.contains("->")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, "FLOCK", _, "WRITE", holder, device, ..] = fields.as_slice() else {
+            continue;
+        };
+        let parts: Vec<&str> = device.split(':').collect();
+        let [_, _, inode] = parts.as_slice() else {
+            continue;
+        };
+        if inode.parse::<u64>() != Ok(ino) {
+            continue;
+        }
+        if holder.parse::<i32>() == Ok(pid) {
+            return Ok(());
+        }
+        holders.push(*holder);
+    }
+    Err(if holders.is_empty() {
+        NO_HOLDER_LISTED.to_owned()
+    } else {
+        format!("its lock is held by PID {}", holders.join(", "))
+    })
+}
+
+/// Check `/proc/PID/status`: the real and effective uid must both be `uid`.
+fn uid_matches(status: &str, uid: u32) -> Result<(), String> {
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .ok_or("its status has no Uid line")?;
+    let mut ids = line.split_whitespace().map(str::parse::<u32>);
+    match (ids.next(), ids.next()) {
+        (Some(Ok(real)), Some(Ok(effective))) if real == uid && effective == uid => Ok(()),
+        (Some(Ok(real)), Some(Ok(effective))) => Err(format!(
+            "it runs as uid {real} (effective {effective}), not as the PID file owner (uid {uid})"
+        )),
+        _ => Err("its status has a malformed Uid line".to_owned()),
+    }
 }
 
 /// Validate a PID read from a (possibly corrupt or hostile) PID file before it
@@ -530,28 +696,30 @@ pub fn is_process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Send a signal by name (`"TERM"`, `"HUP"`) to a single process.
+/// Send a signal by name (`"TERM"`, `"HUP"`) to the daemon that holds the
+/// lock on `pid_file`, and return the PID signalled.
 ///
-/// Calls `libc::kill` directly after [`checked_pid`] validation, so a corrupt
-/// or hostile PID file can never turn this into a `kill(0, …)` / `kill(-N, …)`
-/// process-group BROADCAST (the folded `stop`/`update` zero-broadcast class).
-pub fn send_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
-    let p = checked_pid(pid)?;
+/// [`verified_daemon_pid`] runs first, so a stale, rewritten or hostile PID
+/// file never reaches `kill`, and [`checked_pid`] keeps a bad value from
+/// turning this into a `kill(0, …)` / `kill(-N, …)` process-group broadcast.
+pub fn send_signal(pid_file: &Path, signal: &str) -> anyhow::Result<i32> {
     let sig = match signal {
         "TERM" => libc::SIGTERM,
         "HUP" => libc::SIGHUP,
         other => anyhow::bail!("unsupported signal name: SIG{other}"),
     };
-    // SAFETY: `p` is validated > 0, so this targets exactly one process; the
+    let pid = verified_daemon_pid(pid_file)?;
+    // ponytail: the PID can still be reused between the check and `kill`;
+    // `pidfd_open` plus `pidfd_send_signal` would close that window.
+    // SAFETY: `pid` is validated > 0, so this targets exactly one process; the
     // kernel's permission check still gates delivery to processes we may signal.
-    let rc = unsafe { libc::kill(p, sig) };
+    let rc = unsafe { libc::kill(pid, sig) };
     if rc == 0 {
-        Ok(())
+        Ok(pid)
     } else {
         anyhow::bail!(
-            "failed to send SIG{} to PID {}: {}",
-            signal,
-            pid,
+            "failed to send SIG{signal} to PID {pid} from PID file {}: {}",
+            pid_file.display(),
             std::io::Error::last_os_error()
         )
     }
@@ -1158,7 +1326,10 @@ mod tests {
     fn send_signal_refuses_zero_pid_before_kill() {
         // pid==0 would broadcast to the caller's process group via kill(0,SIG);
         // checked_pid must reject it before any signal is delivered.
-        let err = send_signal(0, "TERM").unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero.pid");
+        std::fs::write(&path, "0").unwrap();
+        let err = send_signal(&path, "TERM").unwrap_err();
         assert!(
             err.to_string().contains("out of range"),
             "0 must be refused before signalling: {err}"
@@ -1168,8 +1339,180 @@ mod tests {
     #[test]
     fn send_signal_rejects_unknown_signal_name() {
         // Only TERM/HUP are mapped; anything else is a programming error, not a
-        // silent no-op.
-        assert!(send_signal(std::process::id(), "KILL").is_err());
+        // silent no-op. The name is mapped before the PID file is opened.
+        let dir = tempfile::tempdir().unwrap();
+        let err = send_signal(&dir.path().join("absent.pid"), "KILL").unwrap_err();
+        assert!(err.to_string().contains("unsupported signal name"), "{err}");
+    }
+
+    #[test]
+    fn flock_holder_parser_accepts_only_the_holder_of_the_same_inode() {
+        let line =
+            |pid: &str, device: &str| format!("7: FLOCK  ADVISORY  WRITE {pid} {device} 0 EOF\n");
+        assert_eq!(
+            flock_holder_matches(&line("4242", "fe:01:9876"), 4242, 9876),
+            Ok(())
+        );
+        // Another PID holds the lock: the refusal names it.
+        assert_eq!(
+            flock_holder_matches(&line("5151", "fe:01:9876"), 4242, 9876),
+            Err("its lock is held by PID 5151".to_owned())
+        );
+        // A waiter is not a holder, even with the right PID.
+        let waiter = "7: -> FLOCK  ADVISORY  WRITE 4242 fe:01:9876 0 EOF\n";
+        assert_eq!(
+            flock_holder_matches(waiter, 4242, 9876),
+            Err("no process is listed as holding its lock".to_owned())
+        );
+        // The right PID on another inode, or a malformed device field, does
+        // not count.
+        for device in ["fe:01:9877", "fe:01:09876x", "fe:9876", "9876"] {
+            assert_eq!(
+                flock_holder_matches(&line("4242", device), 4242, 9876),
+                Err("no process is listed as holding its lock".to_owned()),
+                "{device}"
+            );
+        }
+        // A read lock or a POSIX lock is not the daemon's exclusive flock.
+        for other in [
+            "7: FLOCK  ADVISORY  READ 4242 fe:01:9876 0 EOF\n",
+            "7: POSIX  ADVISORY  WRITE 4242 fe:01:9876 0 EOF\n",
+        ] {
+            assert!(flock_holder_matches(other, 4242, 9876).is_err(), "{other}");
+        }
+    }
+
+    /// A lock released elsewhere between two reads of `/proc/locks` can drop
+    /// the holder line from one reading: the next reading finds it. Another
+    /// holder is refused without a second reading, and a holder that never
+    /// shows up is refused after five.
+    #[test]
+    fn a_holder_line_dropped_from_one_reading_is_found_in_the_next() {
+        let line = |pid: &str| format!("7: FLOCK  ADVISORY  WRITE {pid} fe:01:9876 0 EOF\n");
+        let mut readings = [String::new(), line("4242")].into_iter();
+        assert_eq!(
+            listed_holder_matches(|| Ok(readings.next().unwrap()), 4242, 9876),
+            Ok(())
+        );
+        let mut reads = 0;
+        assert_eq!(
+            listed_holder_matches(
+                || {
+                    reads += 1;
+                    Ok(line("5151"))
+                },
+                4242,
+                9876
+            ),
+            Err("its lock is held by PID 5151".to_owned())
+        );
+        assert_eq!(reads, 1);
+        let mut reads = 0;
+        assert_eq!(
+            listed_holder_matches(
+                || {
+                    reads += 1;
+                    Ok(String::new())
+                },
+                4242,
+                9876
+            ),
+            Err(NO_HOLDER_LISTED.to_owned())
+        );
+        assert_eq!(reads, 5);
+        assert_eq!(
+            listed_holder_matches(|| Err(std::io::Error::other("x")), 4242, 9876),
+            Err("cannot read /proc/locks: x".to_owned())
+        );
+    }
+
+    /// `/proc/locks` prints the superblock device, which differs from the
+    /// `st_dev` of a file on a btrfs subvolume or some overlayfs setups: the
+    /// holder still matches on inode and PID.
+    #[test]
+    fn flock_holder_parser_ignores_the_device_number() {
+        for device in ["00:2d:9876", "fe:02:9876", "08:10a:9876"] {
+            assert_eq!(
+                flock_holder_matches(
+                    &format!("7: FLOCK  ADVISORY  WRITE 4242 {device} 0 EOF\n"),
+                    4242,
+                    9876
+                ),
+                Ok(()),
+                "{device}"
+            );
+        }
+    }
+
+    #[test]
+    fn uid_parser_requires_real_and_effective_owner() {
+        let status = |uid: &str| format!("Name:\twarden\nUid:\t{uid}\nGid:\t0\t0\t0\t0\n");
+        assert_eq!(uid_matches(&status("990\t990\t990\t990"), 990), Ok(()));
+        assert_eq!(
+            uid_matches(&status("0\t0\t0\t0"), 990),
+            Err("it runs as uid 0 (effective 0), not as the PID file owner (uid 990)".to_owned())
+        );
+        assert!(uid_matches(&status("990\t0\t990\t990"), 990).is_err());
+        assert!(uid_matches(&status("0\t990\t990\t990"), 990).is_err());
+        assert_eq!(
+            uid_matches("Name:\twarden\n", 990),
+            Err("its status has no Uid line".to_owned())
+        );
+        assert_eq!(
+            uid_matches(&status("x"), 990),
+            Err("its status has a malformed Uid line".to_owned())
+        );
+    }
+
+    #[test]
+    fn verified_daemon_pid_accepts_the_lock_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.pid");
+        let _lock = acquire_pid_lock(&path).unwrap();
+        assert_eq!(
+            verified_daemon_pid(&path).unwrap(),
+            i32::try_from(std::process::id()).unwrap()
+        );
+    }
+
+    #[test]
+    fn verified_daemon_pid_refuses_an_unlocked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.pid");
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        let err = verified_daemon_pid(&path).unwrap_err().to_string();
+        assert!(err.contains("not held by a running daemon"), "{err}");
+    }
+
+    #[test]
+    fn pid_file_reader_refuses_links_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.pid");
+        std::fs::write(&real, std::process::id().to_string()).unwrap();
+
+        let symlink = dir.path().join("symlink.pid");
+        std::os::unix::fs::symlink(&real, &symlink).unwrap();
+        assert!(read_pid_file(&symlink).is_err());
+
+        let hardlink = dir.path().join("hardlink.pid");
+        std::fs::hard_link(&real, &hardlink).unwrap();
+        let err = read_pid_file(&hardlink).unwrap_err().to_string();
+        assert!(err.contains("one link"), "{err}");
+        std::fs::remove_file(&hardlink).unwrap();
+        assert_eq!(read_pid_file(&real).unwrap(), std::process::id());
+
+        let oversized = dir.path().join("oversized.pid");
+        std::fs::write(&oversized, format!("1{}TAIL", " ".repeat(70))).unwrap();
+        let err = read_pid_file(&oversized).unwrap_err().to_string();
+        assert!(err.contains("longer than 64 bytes"), "{err}");
+        assert!(
+            !err.contains("TAIL"),
+            "the error must quote at most 64 bytes: {err}"
+        );
+
+        let directory = dir.path().join("directory.pid");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(read_pid_file(&directory).is_err());
     }
 
     #[test]

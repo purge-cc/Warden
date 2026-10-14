@@ -170,7 +170,7 @@ pub fn status(master: &Path) -> anyhow::Result<LifecycleStatus> {
     status_locked(&guard, &loaded)
 }
 
-fn status_locked(
+pub(crate) fn status_locked(
     guard: &MigrationWriteLock,
     loaded: &LoadedConfigV5,
 ) -> anyhow::Result<LifecycleStatus> {

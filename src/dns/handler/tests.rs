@@ -94,7 +94,7 @@ fn test_client() -> IpAddr {
 
 /// neutrality-01 — a default install builds NO anti-bypass checker.
 ///
-/// `anti_bypass.enabled` still defaults to `true`, but with the
+/// `anti_bypass.enabled` defaults to `false`, and with the
 /// compiled-in provider list gone the resulting set is empty. Keeping
 /// a `Some(_)` there would make every query walk its subdomains
 /// against a set that can never match. `None` is both the honest
@@ -123,6 +123,23 @@ fn neutrality01_operator_supplied_domain_still_builds_the_checker() {
         .as_ref()
         .expect("an operator-listed domain must produce a checker");
     assert!(ab.is_bypass_domain("foo.doh.example.net"));
+}
+
+/// An explicit `enabled = true` with no domains is dropped to `None`
+/// too: the default config never reaches the empty-set branch now.
+#[test]
+fn neutrality01_enabled_with_no_domains_builds_no_checker() {
+    let layer = SecurityLayer::from_config(
+        &SecurityConfig::default(),
+        &crate::config::settings::AntiBypassConfig {
+            enabled: true,
+            extra_domains: vec![],
+        },
+    );
+    assert!(
+        layer.anti_bypass.is_none(),
+        "enabled with an empty domain set must not become a per-query check"
+    );
 }
 
 /// Live-confirmed regression: every IPv4 PTR was REFUSED under default
@@ -2674,8 +2691,18 @@ async fn rewrite_bridge_ignores_unchecked_first_owner_on_fetch_and_warm_cache() 
     }
 }
 
+/// A composed chain that returns to the original name is blocked on the
+/// fresh fetch and on the warm cache. It also covers upstream CNAMEs owned
+/// by the original name, which no grant can admit.
 #[tokio::test]
 async fn rewrite_composed_chain_rejects_return_to_original_on_fetch_and_cache() {
+    let original_conflict = || {
+        vec![
+            cname_record("original.example.", "other.example.", 60),
+            cname_record("target.example.", "clean.example.", 60),
+            a_record("clean.example.", 60),
+        ]
+    };
     for (label, records, pack, depth, blocked) in [
         (
             "direct cycle",
@@ -2728,6 +2755,58 @@ async fn rewrite_composed_chain_rejects_return_to_original_on_fetch_and_cache() 
             "",
             16,
             false,
+        ),
+        (
+            "original-owned CNAME beside the bridge",
+            original_conflict(),
+            "",
+            16,
+            true,
+        ),
+        (
+            "original-owned self-loop",
+            vec![
+                cname_record("ORIGINAL.example.", "original.example.", 60),
+                a_record("target.example.", 60),
+            ],
+            "",
+            16,
+            true,
+        ),
+        (
+            "mixed-case original-owned CNAME after the chain",
+            vec![
+                cname_record("target.example.", "clean.example.", 60),
+                a_record("clean.example.", 60),
+                cname_record("OrIgInAl.ExAmPlE.", "other.example.", 60),
+            ],
+            "",
+            16,
+            true,
+        ),
+        (
+            "original-owned CNAME with an original grant",
+            original_conflict(),
+            "@@original.example",
+            16,
+            true,
+        ),
+        (
+            "original-owned CNAME with a grant on its target",
+            original_conflict(),
+            "@@other.example",
+            16,
+            true,
+        ),
+        (
+            "identical copy of the bridge",
+            vec![
+                cname_record("original.example.", "target.example.", 60),
+                a_record("target.example.", 60),
+            ],
+            "",
+            16,
+            true,
         ),
     ] {
         let upstream = Arc::new(FixedResponseUpstream::new(
@@ -2951,6 +3030,8 @@ async fn rewrite_composed_chain_rejects_warm_cached_cycle_and_counts_bridge_dept
     }
 }
 
+/// The stale-fallback twin of the fetch and cache test above. It also
+/// covers upstream CNAMEs owned by the original name.
 #[tokio::test]
 async fn rewrite_composed_chain_rejects_return_to_original_on_stale_fallback() {
     for (records, pack, depth, blocked) in [
@@ -2989,6 +3070,25 @@ async fn rewrite_composed_chain_rejects_return_to_original_on_stale_fallback() {
             "",
             16,
             false,
+        ),
+        (
+            vec![
+                cname_record("original.example.", "other.example.", 60),
+                cname_record("target.example.", "clean.example.", 60),
+                a_record("clean.example.", 60),
+            ],
+            "",
+            16,
+            true,
+        ),
+        (
+            vec![
+                cname_record("ORIGINAL.example.", "original.example.", 60),
+                a_record("target.example.", 60),
+            ],
+            "",
+            16,
+            true,
         ),
     ] {
         let mut cfg = cache_test_config();
@@ -3832,106 +3932,6 @@ async fn closed_gate_warns_once_then_stays_quiet() {
 /// would be worse still — the filter would then decide the answer.
 const GATE_REFUSAL_MARKER: &str = "no filter generation";
 
-thread_local! {
-    /// Levels of gate-refusal events seen on THIS thread, in order.
-    /// `Some` only between [`arm_gate_refusal_capture`] and
-    /// [`take_gate_refusal_levels`]; libtest gives each test its own
-    /// thread and `#[tokio::test]` is a current-thread runtime, so
-    /// no other test can write here.
-    static GATE_REFUSAL_LEVELS: std::cell::RefCell<Option<Vec<tracing::Level>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Pulls the formatted `message` field out of an event. `tracing`
-/// exposes it only through the visitor API — there is no
-/// `event.message()`.
-struct MessageVisitor(String);
-
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
-        }
-    }
-}
-
-/// A minimal `tracing::Subscriber` that files gate-refusal events
-/// into the armed thread's buffer and drops everything else.
-///
-/// **Installed GLOBALLY, and it has to be** — the obvious design is
-/// a `tracing_subscriber::Layer` under
-/// `tracing::subscriber::set_default`, thread-local so it cannot
-/// disturb neighbours. That version is *flaky*: measured 8 failures
-/// in 16 runs. `tracing` caches each callsite's `Interest` in a
-/// process-global slot, so a neighbouring test that drives a refusal
-/// with no subscriber on its thread (there are several) can get
-/// `Interest::never()` cached for the `warn!` callsite, after which
-/// this thread's subscriber is never consulted for it and the
-/// capture silently loses the event. A global default is registered
-/// in that cache, so every callsite resolves to `always` and the
-/// capture is deterministic. Neighbours stay unaffected: their
-/// thread has no buffer armed, so `event` returns after one
-/// thread-local read.
-struct GateRefusalCapture;
-
-impl tracing::Subscriber for GateRefusalCapture {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        // `try_with` because this can run while a thread is being
-        // torn down and its thread-locals are already destroyed.
-        let _ = GATE_REFUSAL_LEVELS.try_with(|cell| {
-            let Ok(mut slot) = cell.try_borrow_mut() else {
-                return;
-            };
-            let Some(levels) = slot.as_mut() else {
-                return; // not the capturing thread — the common case
-            };
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            if visitor.0.contains(GATE_REFUSAL_MARKER) {
-                levels.push(*event.metadata().level());
-            }
-        });
-    }
-
-    // Spans are irrelevant here and deliberately not stored: this
-    // subscriber is live for every test in the binary once armed.
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-    fn enter(&self, _span: &tracing::span::Id) {}
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-/// Install the capture (once per process) and start recording on
-/// this thread.
-fn arm_gate_refusal_capture() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        tracing::subscriber::set_global_default(GateRefusalCapture)
-            .expect("no other lib test may install a global tracing subscriber");
-    });
-    // Other tests use scoped subscribers, so either the WARN or DEBUG
-    // callsite may already have cached its interest before this capture
-    // was installed. Refresh both before arming the per-thread buffer.
-    tracing::callsite::rebuild_interest_cache();
-    GATE_REFUSAL_LEVELS.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
-}
-
-/// Stop recording on this thread and return what was seen, in order.
-fn take_gate_refusal_levels() -> Vec<tracing::Level> {
-    GATE_REFUSAL_LEVELS.with(|cell| {
-        cell.borrow_mut()
-            .take()
-            .expect("capture was never armed on this thread")
-    })
-}
-
 /// The first refusal logs at WARN, every one after at DEBUG —
 /// asserted on the **levels themselves**, which is the half
 /// [`closed_gate_warns_once_then_stays_quiet`] structurally cannot
@@ -3946,12 +3946,12 @@ fn take_gate_refusal_levels() -> Vec<tracing::Level> {
 /// different one, and a capture that silently caught nothing yields
 /// an empty vec and fails rather than passing vacuously.
 ///
-/// See [`GateRefusalCapture`] for why the subscriber is installed
-/// globally rather than per-thread — the per-thread version was
+/// See [`crate::common::log_capture`] for why the capture is a global
+/// subscriber rather than a scoped one — the scoped version was
 /// measurably flaky, and a flaky log-capture test is worse than none.
 #[tokio::test]
 async fn closed_gate_logs_warn_first_then_debug() {
-    arm_gate_refusal_capture();
+    crate::common::log_capture::arm_log_capture();
 
     let upstream = Arc::new(RecordingUpstream::default());
     let handler =
@@ -3963,12 +3963,122 @@ async fn closed_gate_logs_warn_first_then_debug() {
     assert_eq!(first.rcode(), Some(ResponseCode::ServFail));
     assert_eq!(second.rcode(), Some(ResponseCode::ServFail));
 
+    let levels: Vec<_> = crate::common::log_capture::take_log_capture()
+        .into_iter()
+        .filter(|(_, message)| message.contains(GATE_REFUSAL_MARKER))
+        .map(|(level, _)| level)
+        .collect();
     assert_eq!(
-        take_gate_refusal_levels(),
+        levels,
         vec![tracing::Level::WARN, tracing::Level::DEBUG],
         "the FIRST refusal must warn and every one after must drop to \
          debug. Swapping the two arms keeps `gate_refusal_logged` \
          behaving identically while flooding the journal from the \
          second packet on"
     );
+}
+
+// ── IDN and control bytes in query names ─────────────────────────────────
+
+fn name_request(qname: Name, record_type: RecordType) -> Request {
+    use hickory_net::xfer::Protocol;
+    use hickory_proto::op::{Message, Query};
+    use std::net::SocketAddr;
+
+    let mut msg = Message::new(0x2607, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(qname, record_type));
+    let bytes = msg.to_vec().unwrap();
+    let src = SocketAddr::new(IpAddr::V4(NET_NAME_CLIENT), 40000);
+    Request::from_bytes(bytes, src, Protocol::Udp).unwrap()
+}
+
+fn escape_label_name() -> Name {
+    Name::from_labels(vec![b"a\x1bb".to_vec(), b"test".to_vec()]).unwrap()
+}
+
+fn handler_with_default_security(upstream: Arc<RecordingUpstream>) -> ForwardHandler {
+    ForwardHandler::new(
+        upstream,
+        Arc::new(FilterEngine::new()),
+        DnsCache::new(&crate::config::settings::CacheConfig::default()),
+        Some(resolver_with_network_name("lab-host", false, None)),
+        None,
+        Some(Arc::new(default_security_layer())),
+        None,
+        None,
+        None,
+        60,
+        None,
+        0.0,
+        16,
+    )
+}
+
+#[test]
+fn ascii_domain_keeps_punycode_and_escapes_control_bytes() {
+    let idn = Name::from_ascii("xn--mnchen-3ya.de.").unwrap();
+    assert_eq!(ascii_domain(&idn), "xn--mnchen-3ya.de");
+    let escaped = ascii_domain(&escape_label_name());
+    assert_eq!(escaped, "a\\033b.test");
+    assert!(!escaped.contains('\x1b'));
+
+    let filter = filter_with_blocked(&["xn--mnchen-3ya.de"]);
+    let records = vec![cname_record(
+        "alias.example.com.",
+        "xn--mnchen-3ya.de.",
+        300,
+    )];
+    assert_eq!(
+        cname_chain_blocked(&records, 16, |t| filter.is_blocked(t)).as_deref(),
+        Some("xn--mnchen-3ya.de"),
+        "a punycode block entry matches a punycode CNAME target"
+    );
+}
+
+#[tokio::test]
+async fn idn_query_passes_the_default_security_checks() {
+    let upstream = Arc::new(RecordingUpstream::default());
+    let handler = handler_with_default_security(Arc::clone(&upstream));
+    let sink = drive(
+        &handler,
+        &net_name_request("xn--mnchen-3ya.de", RecordType::A),
+    )
+    .await;
+    assert_ne!(sink.rcode(), Some(ResponseCode::Refused));
+    assert_eq!(upstream.calls(), 1);
+}
+
+#[tokio::test]
+async fn control_byte_query_is_refused_by_the_default_security_checks() {
+    let upstream = Arc::new(RecordingUpstream::default());
+    let handler = handler_with_default_security(Arc::clone(&upstream));
+    let sink = drive(&handler, &name_request(escape_label_name(), RecordType::A)).await;
+    assert_eq!(sink.rcode(), Some(ResponseCode::Refused));
+    assert_eq!(upstream.calls(), 0);
+}
+
+#[tokio::test]
+async fn punycode_block_entry_blocks_the_query_with_security_off() {
+    // Without the security layer the rules are the only gate: they must see
+    // the `xn--` form the list holds, not hickory's Unicode rendering.
+    let upstream = Arc::new(RecordingUpstream::default());
+    let handler = handler_with(
+        resolver_with_pack_and_rewrite("||xn--mnchen-3ya.de^", vec![]),
+        Arc::clone(&upstream),
+        60,
+        None,
+    );
+    let sink = drive(
+        &handler,
+        &net_name_request("xn--mnchen-3ya.de", RecordType::A),
+    )
+    .await;
+    assert_eq!(
+        upstream.calls(),
+        0,
+        "a blocked name must not reach the upstream"
+    );
+    assert_eq!(sink.answers().len(), 1, "expected the block answer");
+    assert_eq!(sink.answers()[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
 }

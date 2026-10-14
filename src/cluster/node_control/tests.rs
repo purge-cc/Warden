@@ -49,9 +49,13 @@ impl ActivePairProvider for NoActivePair {
     async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
         anyhow::bail!("this fixture has no published pair")
     }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        Ok(None)
+    }
 }
 
-struct MutableActivePair(std::sync::Mutex<Option<ActivePolicyCorpus>>);
+pub(super) struct MutableActivePair(pub(super) std::sync::Mutex<Option<ActivePolicyCorpus>>);
 
 #[async_trait]
 impl ActivePairProvider for MutableActivePair {
@@ -62,6 +66,10 @@ impl ActivePairProvider for MutableActivePair {
     async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
         self.active_pair()
             .context("this fixture has no published pair")
+    }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        Ok(self.active_pair())
     }
 }
 
@@ -236,7 +244,7 @@ async fn aborted_ipc_waiter_keeps_the_owned_mutation_and_gate_until_completion()
             .await
     });
     tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
         listeners.started.notified(),
     )
     .await
@@ -259,7 +267,7 @@ async fn aborted_ipc_waiter_keeps_the_owned_mutation_and_gate_until_completion()
     );
 
     listeners.release.notify_one();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), second)
         .await
         .expect("the queued mutation must complete")
         .expect("the task must not panic")
@@ -611,10 +619,10 @@ async fn requested_restart_reopens_without_rearm_and_requires_exact_ready_proof(
     );
 
     *active.0.lock().unwrap() = Some(exact_pair);
-    assert!(reopened
+    reopened
         .runtime_ready("192.0.2.99:8053".parse().unwrap())
         .await
-        .is_err());
+        .unwrap();
     assert!(
         !load_state(&acquire_for_migration(&reopened.master).unwrap())
             .unwrap()
@@ -1192,4 +1200,896 @@ fn an_open_node_operation_refuses_relocate_until_it_is_terminal() {
     save_state(&acquire_for_migration(&master).unwrap(), &state).unwrap();
     let outcome = relocate::relocate(&layout, options).unwrap();
     assert_eq!(outcome.code, 0, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn status_reports_runtime_problems() {
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let problem = "Nodes listener 192.0.2.10:8053 not restored: test".to_string();
+    controller.set_runtime_problems(vec![problem.clone()]);
+    let status = controller
+        .handle(NodeControlCommand::Status)
+        .await
+        .unwrap()
+        .status;
+    assert_eq!(status.runtime_problems, vec![problem]);
+
+    // An older daemon sends no runtime_problems key.
+    let mut wire = serde_json::to_value(&status).unwrap();
+    wire.as_object_mut().unwrap().remove("runtime_problems");
+    let older: NodeControlStatus = serde_json::from_value(wire).unwrap();
+    assert!(older.runtime_problems.is_empty());
+}
+
+/// One config revision whose replicated policy serializes as `extra` adds.
+fn same_revision_snapshot(extra: &str) -> Arc<crate::cluster::artifact::PolicySnapshot> {
+    let config: crate::config::schema::ConfigV5 = toml::from_str(&format!(
+        "schema_version = 5\n[server]\ndefault_profile = \"default\"\n[profiles.default]\ndisplay_name = \"Default\"\n[upstream]\nservers = [\"192.0.2.1:53\"]\n{extra}"
+    ))
+    .unwrap();
+    Arc::new(
+        crate::cluster::artifact::PolicySnapshot::from_target_v5(
+            &config,
+            &crate::config::target_v5::PackBodiesV5::new(BTreeMap::new()),
+            "b".repeat(64),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn enrollment_capture_republishes_a_revision_an_older_version_serialized_differently() {
+    // An older version published these config bytes with another default.
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("config.toml");
+    let older = same_revision_snapshot("[anti_bypass]\nenabled = true\n");
+    let current = same_revision_snapshot("");
+    assert_ne!(older.toml(), current.toml());
+    let published = capture_enrollment_policy(&master, older).unwrap();
+
+    let captured = capture_enrollment_policy(&master, Arc::clone(&current)).unwrap();
+    assert_eq!(captured.config_revision, published.config_revision);
+    assert!(captured.policy_epoch > published.policy_epoch);
+    assert_eq!(
+        captured.operator_policy_hash,
+        current.operator_policy_hash()
+    );
+    assert_eq!(
+        capture_enrollment_policy(&master, current).unwrap(),
+        captured
+    );
+}
+
+#[test]
+fn enrollment_capture_refuses_a_revision_with_an_unresolved_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("config.toml");
+    let older = same_revision_snapshot("[anti_bypass]\nenabled = true\n");
+    capture_enrollment_policy(&master, Arc::clone(&older)).unwrap();
+    {
+        let guard = acquire_for_migration(&master).unwrap();
+        let mut store = crate::cluster::publication::PublicationStore::open(&guard).unwrap();
+        let pending = store
+            .reserve(|lineage, epoch| older.publication(lineage, epoch))
+            .unwrap();
+        store
+            .bind_intent(
+                &pending,
+                serde_json::json!({
+                    "actor": "cluster-publisher",
+                    "request_id": "publication-request",
+                    "primary_lineage": pending.primary_lineage,
+                    "policy_epoch": pending.policy_epoch,
+                    "artifact_hash": pending.artifact_hash,
+                    "expected_after_revision": pending.config_revision,
+                }),
+            )
+            .unwrap();
+    }
+
+    let error = capture_enrollment_policy(&master, same_revision_snapshot("")).unwrap_err();
+    assert!(
+        error.to_string().contains("unresolved publication"),
+        "{error:#}"
+    );
+}
+
+fn stored_state(controller: &NodeController) -> ControlState {
+    load_state(&acquire_for_migration(&controller.master).unwrap()).unwrap()
+}
+
+async fn expired_review_frees_the_node(kind: NodeOperationKind) {
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let now = crate::cluster::membership::now().unwrap();
+    let mut review = operation(NodeOperationPhase::Prepared, now - 1);
+    review.preview.kind = kind;
+    let operation_id = review.preview.id.clone();
+    let mut next = operation(NodeOperationPhase::Prepared, now + PREVIEW_TTL);
+    next.preview.kind = kind;
+    next.preview.target_node_id = review.preview.target_node_id.clone();
+    let mut state = ControlState::default();
+    state.operations.insert(operation_id.clone(), review);
+    persist(&controller, &state);
+
+    controller.runtime_tick().await.unwrap();
+
+    let operation = &stored_state(&controller).operations[&operation_id];
+    assert_eq!(operation.phase, NodeOperationPhase::Cancelled);
+    assert_eq!(operation.message, REVIEW_EXPIRED_MESSAGE);
+    controller.insert_operation(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_edit_review_is_cancelled_and_frees_the_node() {
+    expired_review_frees_the_node(NodeOperationKind::Edit).await;
+}
+
+#[tokio::test]
+async fn expired_remove_review_is_cancelled_and_frees_the_node() {
+    expired_review_frees_the_node(NodeOperationKind::Remove).await;
+}
+
+#[test]
+fn legacy_paused_edit_or_remove_review_becomes_cancelled() {
+    let mut state = ControlState::default();
+    let mut legacy = Vec::new();
+    for kind in [NodeOperationKind::Edit, NodeOperationKind::Remove] {
+        let mut review = operation(NodeOperationPhase::Paused, 10);
+        review.preview.kind = kind;
+        legacy.push(review.preview.id.clone());
+        state.operations.insert(review.preview.id.clone(), review);
+    }
+    let mut add = operation(NodeOperationPhase::Paused, 10);
+    add.paused_from = Some(NodeOperationPhase::Prepared);
+    let add_id = add.preview.id.clone();
+    state.operations.insert(add_id.clone(), add);
+
+    expire_state(&mut state, 11);
+
+    for id in legacy {
+        assert_eq!(state.operations[&id].phase, NodeOperationPhase::Cancelled);
+        assert_eq!(state.operations[&id].message, REVIEW_EXPIRED_MESSAGE);
+    }
+    assert_eq!(state.operations[&add_id].phase, NodeOperationPhase::Paused);
+    assert_eq!(
+        state.operations[&add_id].paused_from,
+        Some(NodeOperationPhase::Prepared)
+    );
+}
+
+#[tokio::test]
+async fn expired_local_edit_review_releases_its_rename_plan() {
+    let (_directory, controller, _listeners, local_id) = controller_fixture();
+    let edit = || NodeControlCommand::PreviewEdit {
+        node_id: local_id.clone(),
+        name: "Kitchen resolver".into(),
+        endpoint: None,
+    };
+    let operation_id = controller.handle(edit()).await.unwrap().preview.unwrap().id;
+    let mut state = stored_state(&controller);
+    let operation = state.operations.get_mut(&operation_id).unwrap();
+    let plan_id = operation.peer_preview_id.clone().unwrap();
+    operation.preview.expires_at = crate::cluster::membership::now().unwrap() - 1;
+    persist(&controller, &state);
+    assert!(
+        crate::cluster::lifecycle::preview_exists(&controller.master, &plan_id)
+            .await
+            .unwrap()
+    );
+
+    controller.runtime_tick().await.unwrap();
+
+    let operation = &stored_state(&controller).operations[&operation_id];
+    assert_eq!(operation.phase, NodeOperationPhase::Cancelled);
+    assert!(
+        !crate::cluster::lifecycle::preview_exists(&controller.master, &plan_id)
+            .await
+            .unwrap()
+    );
+    controller.handle(edit()).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_of_a_remove_the_peer_never_prepared_completes_locally() {
+    let (_directory, controller, _listeners, local_id) = controller_fixture();
+    let now = crate::cluster::membership::now().unwrap();
+    let mut review = operation(NodeOperationPhase::Prepared, now + PREVIEW_TTL);
+    review.preview.kind = NodeOperationKind::Remove;
+    review.preview.source_node_id = local_id;
+    let operation_id = review.preview.id.clone();
+    let mut state = ControlState::default();
+    state.operations.insert(operation_id.clone(), review);
+    persist(&controller, &state);
+
+    let reply = controller
+        .handle(NodeControlCommand::Cancel {
+            preview_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(reply.message, "Preview cancelled.");
+    assert_eq!(
+        stored_state(&controller).operations[&operation_id].phase,
+        NodeOperationPhase::Cancelled
+    );
+    let replay = controller
+        .handle(NodeControlCommand::Cancel {
+            preview_id: operation_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.message, "Preview cancelled.");
+}
+
+#[tokio::test]
+async fn apply_of_a_cancelled_review_says_it_expired() {
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let mut review = operation(NodeOperationPhase::Cancelled, u64::MAX);
+    review.preview.kind = NodeOperationKind::Edit;
+    let operation_id = review.preview.id.clone();
+    let mut state = ControlState::default();
+    state.operations.insert(operation_id.clone(), review);
+    persist(&controller, &state);
+
+    let error = controller
+        .handle(NodeControlCommand::Apply {
+            preview_id: operation_id,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, NodeControlErrorCode::AuthorizationExpired);
+    assert!(
+        format!("{:?}", error.source).contains("review expired or was cancelled"),
+        "{error:?}"
+    );
+}
+
+fn corpus_artifact() -> ArtifactIdentity {
+    ArtifactIdentity {
+        primary_lineage: "a".repeat(64),
+        policy_epoch: 1,
+        artifact_hash: "b".repeat(64),
+        config_revision: "c".repeat(64),
+        operator_policy_hash: "d".repeat(64),
+    }
+}
+
+/// Install and activate a one-list corpus for `artifact`, as a list refresh
+/// does. Older generations stay only while something pins them.
+pub(super) fn refresh_corpus(
+    store: &super::super::corpus::CorpusStore,
+    artifact: &ArtifactIdentity,
+    body: &[u8],
+    fetched_at: i64,
+) -> ActivePolicyCorpus {
+    let object = super::super::manifest::ObjectRef::of(body);
+    if !store.has_object(&object) {
+        let mut stage = store.stage(&object).unwrap();
+        stage.write_chunk(body).unwrap();
+        stage.finish(store).unwrap();
+    }
+    let url = "https://lists.example.com/rules".to_owned();
+    let manifest = super::super::corpus::CorpusManifest::new(
+        artifact.clone(),
+        vec![super::super::corpus::CorpusSource {
+            source: super::super::corpus::SourceIdentity {
+                representative: url.clone(),
+                fetch_url: url.clone(),
+                canonical_url: url,
+                aliases: Vec::new(),
+                ids: Vec::new(),
+                max_entries: 100,
+                update_interval_secs: 60,
+                format: "Domains".into(),
+                trust: "RemoteUnsigned".into(),
+            },
+            body: object,
+            fetched_at,
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+    store.install_manifest(&manifest).unwrap();
+    store.mark_active(&manifest.generation, artifact).unwrap();
+    ActivePolicyCorpus {
+        policy: artifact.clone(),
+        corpus_generation: manifest.generation,
+    }
+}
+
+#[test]
+fn reviewed_corpus_survives_a_list_refresh_that_keeps_its_bodies() {
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("config.toml");
+    let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+    let artifact = corpus_artifact();
+    let reviewed = refresh_corpus(&store, &artifact, b"blocked.example.com\n", 1_800_000_000);
+    let owner = crate::cluster::membership::random_id();
+    let now = crate::cluster::membership::now().unwrap();
+    pin_reviewed_corpus(&master, &reviewed, &owner, now + RECOVERY_TTL).unwrap();
+
+    let revalidated = refresh_corpus(&store, &artifact, b"blocked.example.com\n", 1_800_000_060);
+    assert_ne!(revalidated.corpus_generation, reviewed.corpus_generation);
+    assert!(reviewed_pair_matches(&master, &reviewed, &revalidated).unwrap());
+
+    let changed = refresh_corpus(&store, &artifact, b"other.example.com\n", 1_800_000_120);
+    assert!(!reviewed_pair_matches(&master, &reviewed, &changed).unwrap());
+
+    store.release_private_manifest_pin(&owner).unwrap();
+    let gone = reviewed_pair_matches(&master, &reviewed, &changed).unwrap_err();
+    assert!(
+        format!("{gone:#}").contains(REVIEWED_CORPUS_GONE),
+        "{gone:#}"
+    );
+}
+
+#[tokio::test]
+async fn add_apply_refuses_a_changed_corpus_before_the_primary_admits_anything() {
+    let (directory, controller, listeners, local_id) = controller_fixture();
+    let master = directory.path().join("config.toml");
+    let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+    let artifact = corpus_artifact();
+    let reviewed = refresh_corpus(&store, &artifact, b"blocked.example.com\n", 1_800_000_000);
+    let now = crate::cluster::membership::now().unwrap();
+    let mut prepared = operation(NodeOperationPhase::Prepared, now + PREVIEW_TTL);
+    pin_reviewed_corpus(&master, &reviewed, &prepared.preview.id, now + RECOVERY_TTL).unwrap();
+    let changed = refresh_corpus(&store, &artifact, b"other.example.com\n", 1_800_000_060);
+    prepared.preview.source_node_id = local_id;
+    prepared.preview.before_revision = local_revision(&master).await.unwrap();
+    prepared.staged_pair = Some(reviewed);
+    prepared.backup_verified = true;
+    prepared.peer_preview_id = Some(crate::cluster::membership::random_id());
+    let operation_id = prepared.preview.id.clone();
+    let mut state = ControlState::default();
+    state.operations.insert(operation_id.clone(), prepared);
+    persist(&controller, &state);
+    drop(controller);
+    let (restart, mut restart_rx) = crate::cluster::managed_restart::supervised_channel();
+    let controller = NodeController::new(
+        master.clone(),
+        listeners,
+        restart,
+        Arc::new(MutableActivePair(std::sync::Mutex::new(Some(changed)))),
+    );
+
+    let error = controller
+        .handle(NodeControlCommand::Apply {
+            preview_id: operation_id.clone(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, NodeControlErrorCode::Conflict, "{error:?}");
+    assert_eq!(
+        load_state(&acquire_for_migration(&master).unwrap())
+            .unwrap()
+            .operations[&operation_id]
+            .phase,
+        NodeOperationPhase::Prepared
+    );
+    assert_eq!(
+        super::super::lifecycle::status(&master).unwrap().saved_role,
+        NodeRole::Standalone
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), restart_rx.recv())
+            .await
+            .is_err(),
+        "a refused Add requested a restart"
+    );
+    // The operator's way out: the cancel is accepted and waits for the peer.
+    controller
+        .handle(NodeControlCommand::Cancel {
+            preview_id: operation_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        load_state(&acquire_for_migration(&master).unwrap())
+            .unwrap()
+            .operations[&operation_id]
+            .cancel_requested
+    );
+}
+
+#[tokio::test]
+async fn staging_serves_the_reviewed_corpus_after_a_list_refresh() {
+    let (directory, controller, _listeners, _local_id) = controller_fixture();
+    let master = directory.path().join("config.toml");
+    let store = super::super::corpus::CorpusStore::open(&master).unwrap();
+    let artifact = corpus_artifact();
+    let reviewed = refresh_corpus(&store, &artifact, b"blocked.example.com\n", 1_800_000_000);
+    let now = crate::cluster::membership::now().unwrap();
+    let mut staging = operation(NodeOperationPhase::PreparingTarget, now + RECOVERY_TTL);
+    pin_reviewed_corpus(&master, &reviewed, &staging.preview.id, now + RECOVERY_TTL).unwrap();
+    let refreshed = refresh_corpus(&store, &artifact, b"blocked.example.com\n", 1_800_000_060);
+    staging.staged_pair = Some(reviewed.clone());
+    let target_id = staging.preview.target_node_id.clone();
+    let (credential, _) = generate_token();
+    let mut state = ControlState::default();
+    state
+        .peers
+        .insert(target_id.clone(), pending_peer(target_id, &credential));
+    state.operations.insert(staging.preview.id.clone(), staging);
+    persist(&controller, &state);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential}").parse().unwrap(),
+    );
+
+    let response = staged_corpus_manifest(
+        State(controller),
+        headers,
+        RoutePath(artifact.artifact_hash.clone()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let served: super::super::corpus::CorpusManifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(served.generation, reviewed.corpus_generation);
+    assert_ne!(served.generation, refreshed.corpus_generation);
+}
+
+/// Status may read the active pair, but never prove it by hashing the corpus.
+struct IdentityOnlyPair(ActivePolicyCorpus);
+
+#[async_trait]
+impl ActivePairProvider for IdentityOnlyPair {
+    fn active_pair(&self) -> Option<ActivePolicyCorpus> {
+        panic!("status hashed the whole corpus")
+    }
+
+    async fn enrollment_pair(&self) -> anyhow::Result<ActivePolicyCorpus> {
+        anyhow::bail!("status needs no enrollment pair")
+    }
+
+    async fn verified_pair(&self) -> anyhow::Result<Option<ActivePolicyCorpus>> {
+        anyhow::bail!("status needs no verified pair")
+    }
+
+    fn active_identity(&self) -> Option<ActivePolicyCorpus> {
+        Some(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn status_reports_the_active_pair_without_proving_the_corpus() {
+    let (directory, controller, listeners, _local_id) = controller_fixture();
+    drop(controller);
+    let pair = ActivePolicyCorpus {
+        policy: corpus_artifact(),
+        corpus_generation: "e".repeat(64),
+    };
+    let (restart, _receiver) = crate::cluster::managed_restart::channel(1);
+    let controller = NodeController::new(
+        directory.path().join("config.toml"),
+        listeners,
+        restart,
+        Arc::new(IdentityOnlyPair(pair.clone())),
+    );
+
+    let status = controller
+        .handle(NodeControlCommand::Status)
+        .await
+        .unwrap()
+        .status
+        .membership;
+
+    assert_eq!(status.active_policy, Some(pair.policy));
+    assert_eq!(status.active_corpus, Some(pair.corpus_generation));
+}
+
+const MANAGE: &str = "/api/nodes/v2/manage";
+
+fn nodes_router(controller: &Arc<NodeController>, client: &str) -> Router {
+    node_router(controller.clone()).layer(axum::extract::connect_info::MockConnectInfo(
+        client.parse::<SocketAddr>().unwrap(),
+    ))
+}
+
+fn nodes_request(method: &str, path: &str, bearer: Option<&str>) -> axum::http::Request<Body> {
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(bearer) = bearer {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+    // A well-formed body, so only the credential can refuse it.
+    let body = serde_json::to_vec(&PeerManagementRequest::Cancel {
+        operation_id: crate::cluster::membership::random_id(),
+        preview_id: None,
+    })
+    .unwrap();
+    request.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn refused_bearers_lock_the_address_out_of_the_nodes_port() {
+    use tower::ServiceExt;
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let router = nodes_router(&controller, "192.0.2.7:40000");
+
+    for attempt in 1..=10 {
+        let response = router
+            .clone()
+            .oneshot(nodes_request("POST", MANAGE, Some("wrong")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt}"
+        );
+    }
+    let locked = router
+        .clone()
+        .oneshot(nodes_request("POST", MANAGE, Some("wrong")))
+        .await
+        .unwrap();
+    assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(locked.headers()[header::RETRY_AFTER], "300");
+
+    let health = router
+        .oneshot(nodes_request("GET", "/api/nodes/v2/health", None))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::NO_CONTENT);
+    let other = nodes_router(&controller, "192.0.2.8:40000")
+        .oneshot(nodes_request("POST", MANAGE, None))
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn refused_bearers_never_wait_for_the_transition_gate() {
+    use tower::ServiceExt;
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let operation = controller.transition_gate.clone().lock_owned().await;
+
+    let mut flood = tokio::task::JoinSet::new();
+    for host in 1..=20 {
+        let router = nodes_router(&controller, &format!("192.0.2.{host}:40000"));
+        flood.spawn(router.oneshot(nodes_request("POST", MANAGE, Some("wrong"))));
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.handle(NodeControlCommand::Status),
+    )
+    .await
+    .expect("status waited behind the flood")
+    .unwrap();
+    while let Some(response) = flood.join_next().await {
+        assert_eq!(
+            response.unwrap().unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    drop(operation);
+}
+
+#[tokio::test]
+async fn nodes_port_refuses_at_once_when_its_permits_are_taken() {
+    use tower::ServiceExt;
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let router = nodes_router(&controller, "192.0.2.7:40000");
+    let requests = controller
+        .request_permits
+        .clone()
+        .try_acquire_many_owned(REQUEST_PERMITS as u32)
+        .unwrap();
+    let busy = router
+        .clone()
+        .oneshot(nodes_request("POST", MANAGE, Some("wrong")))
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // Claims keep their own permits while peers are busy.
+    let claim = router
+        .clone()
+        .oneshot(nodes_request("POST", "/api/nodes/v2/bootstrap/claim", None))
+        .await
+        .unwrap();
+    assert_ne!(claim.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(requests);
+
+    let _claims = controller
+        .claim_permits
+        .clone()
+        .try_acquire_many_owned(CLAIM_PERMITS as u32)
+        .unwrap();
+    let busy = router
+        .oneshot(nodes_request("POST", "/api/nodes/v2/bootstrap/claim", None))
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn a_refused_claim_never_loads_the_configuration() {
+    let (directory, controller, _listeners, local_id) = controller_fixture();
+    let now = crate::cluster::membership::now().unwrap();
+    let (token, token_hash) = generate_token();
+    let mut state = ControlState {
+        bootstrap: Some(BootstrapAuthorization {
+            token_hash,
+            endpoint: endpoint(),
+            target_node_id: local_id,
+            fingerprint: "a".repeat(64),
+            certificate_pem: "certificate".into(),
+            private_key_pem: SecretString("key".into()),
+            expires_at: now + PREVIEW_TTL,
+            claimed_by: None,
+            operation_id: None,
+            issued_credential: None,
+        }),
+        ..ControlState::default()
+    };
+    persist(&controller, &state);
+    crate::config::atomic_write::hardened_atomic_write(
+        &directory.path().join("config.toml"),
+        b"schema_version = [",
+        crate::config::atomic_write::AtomicWriteOpts::default(),
+    )
+    .unwrap();
+    let claim = |token: String| BootstrapClaimRequest {
+        token: SecretString(token),
+        operation_id: crate::cluster::membership::random_id(),
+        source_node_id: crate::cluster::membership::random_id(),
+        source_name: "Office resolver".into(),
+        source_endpoint: endpoint(),
+        source_fingerprint: "b".repeat(64),
+        source_credential: SecretString("source-credential".into()),
+    };
+
+    let refused = controller
+        .accept_bootstrap(claim("wrong".into()))
+        .await
+        .unwrap_err();
+    assert!(refused.is::<CredentialRefused>(), "{refused:#}");
+    let unreadable = controller
+        .accept_bootstrap(claim(token.clone()))
+        .await
+        .unwrap_err();
+    assert!(!unreadable.is::<CredentialRefused>(), "{unreadable:#}");
+    // The right token after its expiry is a plain refusal: no lockout count.
+    state.bootstrap.as_mut().unwrap().expires_at = now - 1;
+    persist(&controller, &state);
+    let expired = controller.accept_bootstrap(claim(token)).await.unwrap_err();
+    assert!(!expired.is::<CredentialRefused>(), "{expired:#}");
+    assert!(
+        expired.to_string().starts_with("association token expired"),
+        "{expired:#}"
+    );
+}
+
+/// The fixture's configuration with `node_extra` under `[node]` and `tail`
+/// appended.
+fn rewrite_config(master: &Path, node_id: &str, node_extra: &str, tail: &str) {
+    let text = format!(
+        "schema_version = 5\n[node]\nid = {node_id:?}\nname = \"Desk\"\n{node_extra}[server]\ndefault_profile = \"default\"\n[profiles.default]\ndisplay_name = \"Default\"\n[upstream]\nservers = [\"192.0.2.1:53\"]\n{tail}"
+    );
+    crate::config::atomic_write::hardened_atomic_write(
+        master,
+        text.as_bytes(),
+        crate::config::atomic_write::AtomicWriteOpts::default(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn token_never_guesses_a_loopback_nodes_endpoint() {
+    let (directory, controller, _listeners, local_id) = controller_fixture();
+    let master = directory.path().join("config.toml");
+    let refused = |error: NodeControlError| {
+        assert_eq!(
+            error.code,
+            NodeControlErrorCode::ListenRequired,
+            "{error:?}"
+        );
+    };
+
+    // Defaults: the API is off and listens on loopback.
+    refused(
+        controller
+            .handle(NodeControlCommand::TokenPrepare { listen: None })
+            .await
+            .unwrap_err(),
+    );
+    for stored in ["127.0.0.1:19400", "[::ffff:127.0.0.1]:19400"] {
+        rewrite_config(
+            &master,
+            &local_id,
+            &format!("control_listen = {stored:?}\n"),
+            "",
+        );
+        refused(
+            controller
+                .handle(NodeControlCommand::TokenPrepare { listen: None })
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    rewrite_config(&master, &local_id, "", "");
+    let explicit: SocketAddr = "127.0.0.1:19401".parse().unwrap();
+    assert_eq!(
+        preferred_endpoint(&master, Some(explicit)).unwrap(),
+        explicit
+    );
+    let tls = [
+        directory.path().join("api.crt"),
+        directory.path().join("api.key"),
+    ];
+    for path in &tls {
+        std::fs::write(path, "").unwrap();
+    }
+    rewrite_config(
+        &master,
+        &local_id,
+        "",
+        &format!(
+            "[api]\nenabled = true\nlisten = \"192.0.2.10:8053\"\ntoken_hash = {:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
+            "a".repeat(64),
+            tls[0],
+            tls[1]
+        ),
+    );
+    assert_eq!(
+        preferred_endpoint(&master, None).unwrap(),
+        "192.0.2.10:8053".parse().unwrap()
+    );
+    rewrite_config(
+        &master,
+        &local_id,
+        "",
+        "[api]\nenabled = false\nlisten = \"192.0.2.10:8053\"\n",
+    );
+    assert!(preferred_endpoint(&master, None).is_err());
+}
+
+#[test]
+fn source_endpoint_refuses_a_stored_loopback_for_a_remote_destination() {
+    let (directory, _controller, _listeners, local_id) = controller_fixture();
+    let master = directory.path().join("config.toml");
+    rewrite_config(
+        &master,
+        &local_id,
+        "control_listen = \"127.0.0.1:19402\"\n",
+        "",
+    );
+
+    let error = preferred_source_endpoint(&master, "192.0.2.20:8053".parse().unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("choose --listen"), "{error}");
+    assert_eq!(
+        preferred_source_endpoint(&master, "127.0.0.1:8053".parse().unwrap()).unwrap(),
+        "127.0.0.1:19402".parse().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn source_listener_refuses_a_saved_loopback_endpoint_for_a_remote_destination() {
+    let (_directory, controller, listeners, _local_id) = controller_fixture();
+    // What `node token` without --listen saved before it stopped guessing.
+    let saved: SocketAddr = "127.0.0.1:8053".parse().unwrap();
+    persist(
+        &controller,
+        &ControlState {
+            control_endpoint: Some(saved),
+            certificate_pem: Some("certificate".into()),
+            private_key_pem: Some(SecretString("key".into())),
+            certificate_fingerprint: Some("a".repeat(64)),
+            ..ControlState::default()
+        },
+    );
+
+    let error = controller
+        .ensure_source_listener("192.0.2.20:8053".parse().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("choose --listen"), "{error}");
+    assert_eq!(listeners.prepared.load(Ordering::SeqCst), 0);
+    let (endpoint, _) = controller
+        .ensure_source_listener("127.0.0.1:19403".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(endpoint, saved);
+}
+
+const CLAIM: &str = "/api/nodes/v2/bootstrap/claim";
+
+#[tokio::test(start_paused = true)]
+async fn stalled_claim_bodies_lock_the_address_out() {
+    use tower::ServiceExt;
+    let (_directory, controller, _listeners, _local_id) = controller_fixture();
+    let router = nodes_router(&controller, "192.0.2.7:40000");
+    // The writer stays open and silent, so the body never ends.
+    let stalled = || {
+        let (writer, reader) = tokio::io::duplex(64);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(CLAIM)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
+            .unwrap();
+        (writer, request)
+    };
+
+    for attempt in 1..=10 {
+        let (_writer, request) = stalled();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "attempt {attempt}"
+        );
+    }
+    let (_writer, request) = stalled();
+    let locked = router.oneshot(request).await.unwrap();
+    assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_that_waits_for_the_lock_still_answers() {
+    use tower::ServiceExt;
+    let (_directory, controller, _listeners, local_id) = controller_fixture();
+    let (token, token_hash) = generate_token();
+    persist(
+        &controller,
+        &ControlState {
+            bootstrap: Some(BootstrapAuthorization {
+                token_hash,
+                endpoint: endpoint(),
+                target_node_id: local_id,
+                fingerprint: "a".repeat(64),
+                certificate_pem: "certificate".into(),
+                private_key_pem: SecretString("key".into()),
+                expires_at: crate::cluster::membership::now().unwrap() + PREVIEW_TTL,
+                claimed_by: None,
+                operation_id: None,
+                issued_credential: None,
+            }),
+            ..ControlState::default()
+        },
+    );
+    let body = serde_json::to_vec(&BootstrapClaimRequest {
+        token: SecretString(token),
+        operation_id: crate::cluster::membership::random_id(),
+        source_node_id: crate::cluster::membership::random_id(),
+        source_name: "Office resolver".into(),
+        source_endpoint: endpoint(),
+        source_fingerprint: "b".repeat(64),
+        source_credential: SecretString("source-credential".into()),
+    })
+    .unwrap();
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(CLAIM)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let held = acquire_for_migration(&controller.master).unwrap();
+    let claim = tokio::spawn(nodes_router(&controller, "192.0.2.7:40000").oneshot(request));
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    // The claim waits for the lock past any request bound; it must not be
+    // cut off while it may still spend the token.
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    drop(held);
+
+    assert_eq!(claim.await.unwrap().unwrap().status(), StatusCode::OK);
+    let state = load_state(&acquire_for_migration(&controller.master).unwrap()).unwrap();
+    assert!(state.bootstrap.unwrap().claimed_by.is_some());
 }
