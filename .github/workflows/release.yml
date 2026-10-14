@@ -114,66 +114,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.verify.outputs.version }}
-        run: gh release create "$TAG" --title "$TAG" --draft --verify-tag --notes-file "docs/releases/$VERSION.md"
+        run: gh release create "$TAG" --title "$TAG" --draft --prerelease --verify-tag --notes-file "docs/releases/$VERSION.md"
       - name: Refresh existing draft notes
         if: steps.existing-release.outputs.exists == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.verify.outputs.version }}
-        run: gh release edit "$TAG" --notes-file "docs/releases/$VERSION.md"
-
-  binaries:
-    name: binary (${{ matrix.target }})
-    needs: [verify, create-release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: 1.94.0
-      - name: Build and upload ${{ matrix.target }}
-        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
-        with:
-          bin: warden
-          target: ${{ matrix.target }}
-          archive: warden-$tag-$target
-          locked: true
-          ref: refs/tags/${{ github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$TAG" --prerelease --notes-file "docs/releases/$VERSION.md"
 
   publish-release:
     name: publish release
-    needs: [create-release, binaries]
+    needs: create-release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Publish draft after all assets upload
+      # A pre-release never becomes the latest release. It is marked latest,
+      # with the qualified bundle that get.purge.cc serves attached, when
+      # get.purge.cc makes this version stable.
+      - name: Publish draft as a pre-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
-          for expected in \
-            "warden-$TAG-x86_64-unknown-linux-gnu.tar.gz" \
-            "warden-$TAG-aarch64-unknown-linux-musl.tar.gz"
-          do
-            if ! grep -Fxq "$expected" <<< "$assets"; then
-              printf 'Draft release is missing required asset: %s\n' "$expected" >&2
-              exit 1
-            fi
-          done
-          gh release edit "$TAG" --draft=false
+        run: gh release edit "$TAG" --draft=false --prerelease

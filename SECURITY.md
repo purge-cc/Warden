@@ -61,26 +61,33 @@ process is not an open resolver.
 
 ## Dependency advisory policy
 
-`cargo audit` runs in CI on every push to `main`, on pull requests that
-touch `Cargo.lock` / `Cargo.toml`, and on a weekly schedule (see
+`cargo audit` runs in CI when a push or a pull request changes
+`Cargo.lock` or `Cargo.toml`, on a weekly schedule, and on demand (see
 `.github/workflows/audit.yml`).
 
-- **Vulnerability advisories fail the build** and block release — resolve
-  before tagging.
+- **Vulnerability advisories fail the `audit` workflow.** The release
+  workflow does not run it: before tagging, check that the last `audit`
+  run passed and resolve any advisory.
 - **Unmaintained / yanked / notice** warnings do not fail CI but are
   triaged: patch-bump, swap to a maintained alternative, or document a
   deferral with rationale.
 
-Currently deferred (kept in sync with the `--ignore` set in
-`.github/workflows/audit.yml`):
+Currently deferred. `.github/workflows/audit.yml` ignores the four rustls
+advisories below; the other entries are warnings, which do not fail CI:
 
-- `hickory-proto` — `RUSTSEC-2026-0118` (NSEC3 closest-encloser proof enters
-  an unbounded loop): **no fixed release exists**. Not exposed — DNSSEC
-  validation is a default-off cargo feature, and even with `--features dnssec`
-  warden uses its own NSEC3 implementation with iteration caps, never
-  hickory's `verify_nsec3`.
-- `hickory-proto` — `RUSTSEC-2026-0119` (CPU exhaustion via O(n²) name
-  compression on message encoding): fixed in `hickory-proto 0.26`, which is a
-  breaking API migration tracked as a fast-follow. Mitigated meanwhile:
-  warden's answers are small/canned and response rate limiting bounds
-  amplification, so practical exploitability is low.
+- `rustls 0.23.45` — `RUSTSEC-2026-0346`, `RUSTSEC-2026-0347`,
+  `RUSTSEC-2026-0348` and `RUSTSEC-2026-0349`, published on 2026-10-14 and
+  fixed in `rustls 0.23.46`, which the next release ships. Not reachable in
+  warden: it uses the ring crypto provider, which offers no post-quantum key
+  exchange to downgrade (`-0349`); rustls is built without its `brotli`
+  feature (`-0348`); warden configures no Encrypted Client Hello (`-0347`);
+  and warden never formats rustls session values or forwards rustls log
+  records (`-0346`).
+- `lru 0.12.5` — `RUSTSEC-2026-0002` (unsound `IterMut`) and
+  `RUSTSEC-2026-0253` (panic safety of `LruCache::pop`). Transitive through
+  `ratatui 0.29.0`. Not reachable: warden uses no `lru` API, and ratatui
+  0.29.0 calls only `resize` and `get_or_insert`. A ratatui upgrade removes
+  it.
+- `paste 1.0.15` — `RUSTSEC-2024-0436` (unmaintained, no fixed release).
+  Transitive through `ratatui 0.29.0`, compile-time macros only. The same
+  ratatui upgrade removes it.

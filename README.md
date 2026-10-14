@@ -38,7 +38,7 @@
 curl -fsSL https://get.purge.cc | sudo sh
 ```
 
-Downloads the release for this machine (`x86_64` or `aarch64`), checks SHA-256, and runs the installer. It detects the LAN, writes a working config, installs the hardened systemd unit, and proves filtering with a live `dig`.
+Downloads the x86_64 release, checks SHA-256, and runs the installer. It detects the LAN, writes a working config, installs the hardened systemd unit, and proves filtering with a live `dig`. On other architectures, build from source as below.
 
 Linux + systemd, and a free port 53. Preview first:
 
@@ -90,7 +90,7 @@ Commented options: [`config/default.toml`](config/default.toml). How config is m
 
 - Linux with systemd (Debian 12+, Ubuntu 22.04+, Fedora 40+, RHEL 9+ and derivatives)
 - Port 53 (the installer can silence `systemd-resolved`'s stub listener)
-- A few hundred MB of RAM for typical home lists; a Pi 4 is plenty
+- A few hundred MB of RAM for typical home lists; a Pi 4 is plenty (build from source on ARM)
 
 **Not in this repo:** a web UI, Docker images, or a recursive DNS server.
 

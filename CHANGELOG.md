@@ -7,6 +7,16 @@ prints at `/stable`. This tree's crate version is in `Cargo.toml`.
 
 - No user-visible changes recorded yet.
 
+## [0.44.0](docs/releases/0.44.0.md)
+
+- A fix for 0.42.0 and 0.43.0 hosts on btrfs and similar filesystems that
+  stopped after a reboot, release bundles for x86_64 only, an upgrade that
+  accepts 0.41 migration findings, upgrades a failed 0.42.0 or 0.43.0
+  daemon and gives the steps for 0.41 cluster secondaries, start-up and
+  reload that keep DNS serving through list, Nodes and certificate
+  problems, restores that never change cluster membership, IDN names in
+  `xn--` form, Nodes hardening, and fixes to the terminal UI and the CLI.
+
 ## [0.43.0](docs/releases/0.43.0.md)
 
 - Query Log rules held and applied as one batch, fresh installs with the
