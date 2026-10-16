@@ -59,7 +59,7 @@ system tools (`curl`, `rustup`) on the host.
 A musl aarch64 build is fully static and has zero runtime library
 dependencies.
 
-## Cross-compile for aarch64 (Raspberry Pi and other ARM boxes)
+## Cross-compile for aarch64 (ARM boxes)
 
 ```bash
 rustup target add aarch64-unknown-linux-musl

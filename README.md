@@ -90,7 +90,7 @@ Commented options: [`config/default.toml`](config/default.toml). How config is m
 
 - Linux with systemd (Debian 12+, Ubuntu 22.04+, Fedora 40+, RHEL 9+ and derivatives)
 - Port 53 (the installer can silence `systemd-resolved`'s stub listener)
-- A few hundred MB of RAM for typical home lists; a Pi 4 is plenty (build from source on ARM)
+- About 600 MB of resident RAM with the default block lists (measured: 14.4 million domains, 586 MiB), and more briefly during a list refresh. Smaller list sets use less, roughly 40 to 50 MB per million domains. The release bundle is x86_64; on ARM, build from source. A small device such as a Raspberry Pi needs a small list set.
 
 **Not in this repo:** a web UI, Docker images, or a recursive DNS server.
 
